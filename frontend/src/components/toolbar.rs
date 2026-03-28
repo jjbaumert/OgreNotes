@@ -117,6 +117,16 @@ pub fn Toolbar(
                 <button class="toolbar-btn" disabled title="Blockquote">"\u{201C}"</button>
                 <button class="toolbar-btn" disabled title="Horizontal Rule">"--"</button>
             </div>
+
+            <div class="toolbar-separator"></div>
+
+            <div class="toolbar-group">
+                <button
+                    class="toolbar-btn"
+                    title="Insert Image"
+                    on:click=move |_| on_command.run(ToolbarCommand::UploadImage)
+                >"\u{1F4F7}"</button>
+            </div>
         </div>
     }
 }
@@ -131,4 +141,5 @@ pub enum ToolbarCommand {
     ToggleCode,
     SetParagraph,
     SetHeading(u8),
+    UploadImage,
 }

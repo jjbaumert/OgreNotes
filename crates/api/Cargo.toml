@@ -23,5 +23,8 @@ aws-config = { workspace = true }
 aws-sdk-dynamodb = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 
+reqwest = { version = "0.12", features = ["json"] }
+urlencoding = "2"
+
 [dev-dependencies]
 proptest = { workspace = true }

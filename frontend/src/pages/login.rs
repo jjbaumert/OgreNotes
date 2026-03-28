@@ -58,10 +58,9 @@ pub fn LoginPage() -> impl IntoView {
                 <button
                     class="login-btn"
                     on:click=on_oauth_login
-                    style="background: #333; opacity: 0.5;"
-                    disabled=true
+                    style="background: #333;"
                 >
-                    "Sign in with GitHub (coming soon)"
+                    "Sign in with GitHub"
                 </button>
             </div>
         </div>

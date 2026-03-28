@@ -1,18 +1,20 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use yrs::{
-    Doc, ReadTxn, Transact, WriteTxn,
+    Any, Doc, Out, ReadTxn, Transact, WriteTxn,
     Update,
     updates::decoder::Decode,
+    types::Attrs,
+    types::text::{Diff, YChange},
     types::xml::{Xml, XmlElementPrelim, XmlFragment, XmlOut, XmlTextPrelim},
-    types::GetString,
+    types::{GetString, Text},
 };
 
-use super::model::{Fragment, Node, NodeType};
+use super::model::{Fragment, Mark, MarkType, Node, NodeType};
 
 /// Convert an editor document model to yrs Y.Doc state bytes.
-///
-/// **MVP limitation:** Inline marks (bold, italic, link, etc.) are NOT preserved
-/// in the yrs representation. Only document structure and text content survive
-/// the roundtrip. Mark support will be added when the collab sync is fully wired.
+/// Inline marks (bold, italic, link, etc.) are preserved as yrs formatting attributes.
 pub fn doc_to_ydoc_bytes(doc: &Node) -> Vec<u8> {
     let ydoc = Doc::new();
 
@@ -53,9 +55,7 @@ pub fn ydoc_bytes_to_doc(bytes: &[u8]) -> Result<Node, BridgeError> {
 
     for i in 0..len {
         if let Some(child) = fragment.get(&txn, i) {
-            if let Some(node) = read_xml_out(&txn, &child) {
-                children.push(node);
-            }
+            children.extend(read_xml_out(&txn, &child));
         }
     }
 
@@ -88,12 +88,11 @@ fn write_node_to_fragment(
 ) {
     match node {
         Node::Text { text, marks } => {
-            // Insert text into the fragment.
-            // MVP: marks are not stored in yrs formatting attributes.
-            // Full mark support requires yrs Text::format() with proper Attrs,
-            // which will be added when the collab sync is fully wired.
-            let _text_ref = fragment.insert(txn, index, XmlTextPrelim::new(text));
-            let _ = marks;
+            let text_ref = fragment.insert(txn, index, XmlTextPrelim::new(text));
+            if !marks.is_empty() {
+                let attrs = marks_to_attrs(marks);
+                text_ref.format(txn, 0, text.len() as u32, attrs);
+            }
         }
         Node::Element {
             node_type,
@@ -126,9 +125,10 @@ fn write_node_to_element(
     match node {
         Node::Text { text, marks } => {
             let text_ref = element.insert(txn, index, XmlTextPrelim::new(text));
-            // Formatting via marks would use text_ref.format() in a full implementation
-            let _ = text_ref;
-            let _ = marks;
+            if !marks.is_empty() {
+                let attrs = marks_to_attrs(marks);
+                text_ref.format(txn, 0, text.len() as u32, attrs);
+            }
         }
         Node::Element {
             node_type,
@@ -152,11 +152,12 @@ fn write_node_to_element(
 
 // ─── Read yrs to model ──────────────────────────────────────────
 
-fn read_xml_out<T: ReadTxn>(txn: &T, out: &XmlOut) -> Option<Node> {
+fn read_xml_out<T: ReadTxn>(txn: &T, out: &XmlOut) -> Vec<Node> {
     match out {
         XmlOut::Element(el) => {
-            let tag = el.tag();
-            let node_type = tag_to_node_type(&tag)?;
+            let Some(node_type) = tag_to_node_type(&el.tag()) else {
+                return vec![];
+            };
 
             // Read attributes
             let mut attrs = node_type.default_attrs();
@@ -169,28 +170,41 @@ fn read_xml_out<T: ReadTxn>(txn: &T, out: &XmlOut) -> Option<Node> {
             let len = el.len(txn);
             for i in 0..len {
                 if let Some(child) = el.get(txn, i) {
-                    if let Some(node) = read_xml_out(txn, &child) {
-                        children.push(node);
-                    }
+                    children.extend(read_xml_out(txn, &child));
                 }
             }
 
-            Some(Node::element_with_attrs(
+            vec![Node::element_with_attrs(
                 node_type,
                 attrs,
                 Fragment::from(children),
-            ))
+            )]
         }
         XmlOut::Text(text) => {
-            let content = text.get_string(txn);
-            if content.is_empty() {
-                return None;
+            // Use diff() to get formatted text chunks with their marks
+            let diffs: Vec<Diff<YChange>> = text.diff(txn, YChange::identity);
+            let mut nodes = Vec::new();
+            for diff in diffs {
+                if let Out::Any(Any::String(s)) = &diff.insert {
+                    let text_str: &str = s.as_ref();
+                    if text_str.is_empty() {
+                        continue;
+                    }
+                    let marks = diff
+                        .attributes
+                        .as_ref()
+                        .map(|a| attrs_to_marks(a))
+                        .unwrap_or_default();
+                    if marks.is_empty() {
+                        nodes.push(Node::text(text_str));
+                    } else {
+                        nodes.push(Node::text_with_marks(text_str, marks));
+                    }
+                }
             }
-            // For MVP, text nodes from yrs don't carry mark formatting
-            // (full mark support requires reading yrs text formatting attributes)
-            Some(Node::text(&content))
+            nodes
         }
-        _ => None,
+        _ => vec![],
     }
 }
 
@@ -233,18 +247,74 @@ fn tag_to_node_type(tag: &str) -> Option<NodeType> {
     }
 }
 
-// mark_type_to_attr will be needed when yrs text formatting is implemented.
-// For now, marks are not preserved in the yrs bridge (MVP limitation).
-#[allow(dead_code)]
-fn mark_type_to_attr(mt: super::model::MarkType) -> &'static str {
+// ─── Mark ↔ yrs attribute conversion ────────────────────────────
+
+fn mark_type_to_attr(mt: MarkType) -> &'static str {
     match mt {
-        super::model::MarkType::Bold => "bold",
-        super::model::MarkType::Italic => "italic",
-        super::model::MarkType::Underline => "underline",
-        super::model::MarkType::Strike => "strike",
-        super::model::MarkType::Code => "code",
-        super::model::MarkType::Link => "link",
+        MarkType::Bold => "bold",
+        MarkType::Italic => "italic",
+        MarkType::Underline => "underline",
+        MarkType::Strike => "strike",
+        MarkType::Code => "code",
+        MarkType::Link => "link",
     }
+}
+
+fn attr_to_mark_type(attr: &str) -> Option<MarkType> {
+    match attr {
+        "bold" => Some(MarkType::Bold),
+        "italic" => Some(MarkType::Italic),
+        "underline" => Some(MarkType::Underline),
+        "strike" => Some(MarkType::Strike),
+        "code" => Some(MarkType::Code),
+        "link" => Some(MarkType::Link),
+        _ => None,
+    }
+}
+
+/// Convert editor marks to yrs formatting attributes.
+fn marks_to_attrs(marks: &[Mark]) -> Attrs {
+    let mut attrs = Attrs::new();
+    for mark in marks {
+        let key = mark_type_to_attr(mark.mark_type);
+        let value = if mark.mark_type == MarkType::Link {
+            // Serialize link attributes (href, target, rel) as JSON
+            let json = serde_json::to_string(&mark.attrs).unwrap_or_else(|_| "{}".to_string());
+            Any::String(Arc::from(json.as_str()))
+        } else {
+            Any::Bool(true)
+        };
+        attrs.insert(Arc::from(key), value);
+    }
+    attrs
+}
+
+/// Convert yrs formatting attributes back to editor marks.
+fn attrs_to_marks(attrs: &Attrs) -> Vec<Mark> {
+    let mut marks = Vec::new();
+    for (key, value) in attrs {
+        let key_str: &str = key.as_ref();
+        if let Some(mark_type) = attr_to_mark_type(key_str) {
+            match mark_type {
+                MarkType::Link => {
+                    if let Any::String(json) = value {
+                        let link_attrs: HashMap<String, String> =
+                            serde_json::from_str(json.as_ref()).unwrap_or_default();
+                        let mut mark = Mark::new(MarkType::Link);
+                        mark.attrs = link_attrs;
+                        marks.push(mark);
+                    }
+                }
+                _ => {
+                    if *value != Any::Null {
+                        marks.push(Mark::new(mark_type));
+                    }
+                }
+            }
+        }
+    }
+    super::model::normalize_marks(&mut marks);
+    marks
 }
 
 // ─── Tests ──────────────────────────────────────────────────────
@@ -360,6 +430,98 @@ mod tests {
             restored.child(1).unwrap().node_type(),
             Some(NodeType::HorizontalRule)
         );
+    }
+
+    #[test]
+    fn roundtrip_bold_text() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text_with_marks(
+                    "bold text",
+                    vec![Mark::new(MarkType::Bold)],
+                )]),
+            )]),
+        );
+        let bytes = doc_to_ydoc_bytes(&doc);
+        let restored = ydoc_bytes_to_doc(&bytes).unwrap();
+        let para = restored.child(0).unwrap();
+        let text = para.child(0).unwrap();
+        assert_eq!(text.text_content(), "bold text");
+        assert!(text.marks().iter().any(|m| m.mark_type == MarkType::Bold));
+    }
+
+    #[test]
+    fn roundtrip_multiple_marks() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text_with_marks(
+                    "bold italic",
+                    vec![Mark::new(MarkType::Bold), Mark::new(MarkType::Italic)],
+                )]),
+            )]),
+        );
+        let bytes = doc_to_ydoc_bytes(&doc);
+        let restored = ydoc_bytes_to_doc(&bytes).unwrap();
+        let para = restored.child(0).unwrap();
+        let text = para.child(0).unwrap();
+        assert!(text.marks().iter().any(|m| m.mark_type == MarkType::Bold));
+        assert!(text.marks().iter().any(|m| m.mark_type == MarkType::Italic));
+    }
+
+    #[test]
+    fn roundtrip_link_with_href() {
+        let link = Mark::new(MarkType::Link)
+            .with_attr("href", "https://example.com")
+            .with_attr("target", "_blank");
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text_with_marks("click here", vec![link])]),
+            )]),
+        );
+        let bytes = doc_to_ydoc_bytes(&doc);
+        let restored = ydoc_bytes_to_doc(&bytes).unwrap();
+        let para = restored.child(0).unwrap();
+        let text = para.child(0).unwrap();
+        assert_eq!(text.text_content(), "click here");
+        let link_mark = text.marks().iter().find(|m| m.mark_type == MarkType::Link).unwrap();
+        assert_eq!(link_mark.attrs.get("href").unwrap(), "https://example.com");
+        assert_eq!(link_mark.attrs.get("target").unwrap(), "_blank");
+    }
+
+    #[test]
+    fn roundtrip_mixed_marks_and_plain() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![
+                    Node::text("plain "),
+                    Node::text_with_marks("bold", vec![Mark::new(MarkType::Bold)]),
+                    Node::text(" end"),
+                ]),
+            )]),
+        );
+        let bytes = doc_to_ydoc_bytes(&doc);
+        let restored = ydoc_bytes_to_doc(&bytes).unwrap();
+        let para = restored.child(0).unwrap();
+        // Should have 3 text nodes: plain, bold, plain
+        assert_eq!(para.text_content(), "plain bold end");
+        // Find the bold part
+        let mut found_bold = false;
+        for i in 0..para.child_count() {
+            let child = para.child(i).unwrap();
+            if child.text_content().contains("bold") {
+                assert!(child.marks().iter().any(|m| m.mark_type == MarkType::Bold));
+                found_bold = true;
+            }
+        }
+        assert!(found_bold, "Should have a bold text node");
     }
 
     #[test]

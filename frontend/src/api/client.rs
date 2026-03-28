@@ -27,7 +27,7 @@ pub struct AuthState {
 }
 
 /// Get the current time as Unix milliseconds.
-fn now_ms() -> f64 {
+pub fn now_ms() -> f64 {
     #[cfg(target_arch = "wasm32")]
     {
         js_sys::Date::now()

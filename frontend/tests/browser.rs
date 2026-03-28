@@ -528,6 +528,22 @@ fn backspace_mid_text_deletes_character() {
     cleanup(&container);
 }
 
+#[wasm_bindgen_test]
+fn backspace_with_cross_block_selection_merges() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), two_para_doc());
+
+    // Select from position 3 (after "He") to position 10 (after "Wo")
+    set_selection(&view, 3, 10);
+    dispatch_before_input(view.container(), "deleteContentBackward", None);
+
+    let state = apply_all(&view, &txns);
+    assert_eq!(state.doc.child_count(), 1, "Should merge into one paragraph");
+    assert_eq!(state.doc.child(0).unwrap().text_content(), "Herld");
+
+    cleanup(&container);
+}
+
 // ─── Stored Marks / Split Block Tests ──────────────────────────
 
 #[wasm_bindgen_test]

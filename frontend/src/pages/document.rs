@@ -147,6 +147,7 @@ pub fn DocumentPage() -> impl IntoView {
                                 on_change: on_change.clone(),
                                 on_state_change: on_state_change.clone(),
                                 command_signal: toolbar_command,
+                                doc_id: current_id.get_untracked(),
                             } />
                         }.into_any()
                     } else {

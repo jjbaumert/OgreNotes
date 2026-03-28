@@ -1,10 +1,15 @@
 use leptos::prelude::*;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::{Rc, Weak};
+use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 
+use crate::api::blobs;
 use crate::editor::commands;
-use crate::editor::model::{MarkType, Node};
+use crate::editor::model::{Fragment, MarkType, Node, NodeType, Slice};
 use crate::editor::plugins::HistoryPlugin;
+use crate::editor::selection::Selection;
 use crate::editor::state::{EditorState, Transaction};
 use crate::editor::view::EditorView;
 use crate::editor::yrs_bridge;
@@ -22,6 +27,8 @@ pub struct EditorProps {
     pub on_state_change: Callback<EditorState>,
     /// Signal for receiving toolbar commands.
     pub command_signal: ReadSignal<Option<ToolbarCommand>>,
+    /// Document ID (needed for blob upload).
+    pub doc_id: String,
 }
 
 /// The main editor component. Wraps EditorView in a Leptos component.
@@ -155,6 +162,153 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             }
             ToolbarCommand::SetHeading(level) => {
                 commands::set_heading(level, &state, Some(&dispatch_fn));
+            }
+            ToolbarCommand::UploadImage => {
+                let doc_id = props.doc_id.clone();
+                let view_ref_img = Rc::clone(&view_ref_cmd);
+                let history_img = Rc::clone(&history_ref_cmd);
+                let on_change_img = on_change_cmd.clone();
+                let on_state_change_img = on_state_change_cmd.clone();
+
+                // Create a hidden file input and trigger the file picker
+                if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+                    if let Ok(input) = document.create_element("input") {
+                        let _ = input.set_attribute("type", "file");
+                        let _ = input.set_attribute("accept", "image/*");
+                        let _ = input.set_attribute("style", "display:none");
+                        let _ = document.body().unwrap().append_child(&input);
+
+                        let input_el = input.clone();
+                        let on_change_closure = Closure::wrap(Box::new(move |_: web_sys::Event| {
+                            let input_el = input_el.clone();
+                            let doc_id = doc_id.clone();
+                            let view_ref = Rc::clone(&view_ref_img);
+                            let history = Rc::clone(&history_img);
+                            let on_change = on_change_img.clone();
+                            let on_state_change = on_state_change_img.clone();
+
+                            leptos::task::spawn_local(async move {
+                                let html_input: web_sys::HtmlInputElement =
+                                    input_el.clone().dyn_into().unwrap();
+                                let Some(files) = html_input.files() else { return };
+                                let Some(file) = files.get(0) else { return };
+
+                                let filename = file.name();
+                                let content_type = file.type_();
+                                let content_type = if content_type.is_empty() {
+                                    "application/octet-stream".to_string()
+                                } else {
+                                    content_type
+                                };
+
+                                // Read file bytes
+                                let array_buffer = match wasm_bindgen_futures::JsFuture::from(
+                                    file.array_buffer(),
+                                ).await {
+                                    Ok(ab) => ab,
+                                    Err(_) => return,
+                                };
+                                let bytes = js_sys::Uint8Array::new(&array_buffer).to_vec();
+
+                                // Upload flow: get presigned URL → PUT to S3 → get download URL
+                                let upload = match blobs::request_upload_url(
+                                    &doc_id, &filename, &content_type,
+                                ).await {
+                                    Ok(u) => u,
+                                    Err(e) => {
+                                        web_sys::console::error_1(
+                                            &format!("Upload URL failed: {e}").into(),
+                                        );
+                                        return;
+                                    }
+                                };
+
+                                if let Err(e) = blobs::upload_to_s3(
+                                    &upload.upload_url, &bytes, &content_type,
+                                ).await {
+                                    web_sys::console::error_1(
+                                        &format!("S3 upload failed: {e}").into(),
+                                    );
+                                    return;
+                                }
+
+                                let download_url = match blobs::request_download_url(
+                                    &doc_id, &upload.blob_id, &upload.key,
+                                ).await {
+                                    Ok(u) => u,
+                                    Err(e) => {
+                                        web_sys::console::error_1(
+                                            &format!("Download URL failed: {e}").into(),
+                                        );
+                                        return;
+                                    }
+                                };
+
+                                // Insert image node after the current block
+                                let v = view_ref.borrow();
+                                let Some(v) = v.as_ref() else { return };
+                                let state = v.state();
+                                let mut attrs = HashMap::new();
+                                attrs.insert("src".to_string(), download_url);
+                                attrs.insert("alt".to_string(), filename);
+                                let img = Node::element_with_attrs(
+                                    NodeType::Image,
+                                    attrs,
+                                    Fragment::empty(),
+                                );
+                                // Find the end of the current top-level block to insert after it.
+                                // Walk doc children to find the block containing the cursor.
+                                let cursor = state.selection.from();
+                                let insert_pos = {
+                                    let mut offset = 0;
+                                    let mut found = None;
+                                    if let Node::Element { content, .. } = &state.doc {
+                                        for child in &content.children {
+                                            let size = child.node_size();
+                                            if cursor >= offset && cursor < offset + size {
+                                                found = Some(offset + size);
+                                                break;
+                                            }
+                                            offset += size;
+                                        }
+                                    }
+                                    found.unwrap_or(state.doc.content_size())
+                                };
+                                let slice = Slice::new(Fragment::from(vec![img]), 0, 0);
+                                let mut txn_result = state.transaction().replace(insert_pos, insert_pos, slice);
+                                // Place cursor after the image
+                                if let Ok(ref mut txn) = txn_result {
+                                    txn.selection = Selection::cursor(insert_pos + 1);
+                                }
+                                if let Ok(txn) = txn_result {
+                                    let old_state = v.state();
+                                    history.borrow_mut().record(&txn, &old_state.doc);
+                                    let new_state = old_state.apply(txn);
+                                    v.update_state(new_state.clone());
+                                    on_state_change.run(new_state.clone());
+                                    let doc_bytes = yrs_bridge::doc_to_ydoc_bytes(&new_state.doc);
+                                    on_change.run(doc_bytes);
+                                }
+
+                                // Clean up the file input
+                                input_el.remove();
+                            });
+                        }) as Box<dyn Fn(web_sys::Event)>);
+
+                        input
+                            .add_event_listener_with_callback(
+                                "change",
+                                on_change_closure.as_ref().unchecked_ref(),
+                            )
+                            .unwrap_or(());
+                        on_change_closure.forget(); // prevent drop
+
+                        // Trigger file picker
+                        if let Ok(html_input) = input.clone().dyn_into::<web_sys::HtmlElement>() {
+                            html_input.click();
+                        }
+                    }
+                }
             }
         }
     });

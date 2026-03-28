@@ -18,6 +18,7 @@ js-sys = "0.3"
 gloo-net = { version = "0.6", features = ["http"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 console_error_panic_hook = "0.1"
+urlencoding = "2"
 yrs = "0.21"
 
 [dependencies.web-sys]
@@ -59,6 +60,10 @@ features = [
     "InputEventInit",
     "KeyboardEventInit",
     "History",
+    "File",
+    "FileList",
+    "Blob",
+    "MouseEvent",
 ]
 
 [dev-dependencies]

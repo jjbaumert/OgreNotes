@@ -79,10 +79,10 @@ pub struct TokenResponse {
 
 /// GET /auth/callback -- exchange OAuth code for tokens.
 async fn callback(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<CallbackParams>,
-) -> Result<Json<TokenResponse>, ApiError> {
-    let _code_verifier = {
+) -> Result<Response, ApiError> {
+    let code_verifier = {
         let mut flows = PENDING_FLOWS.lock().unwrap();
         let flow = flows
             .remove(&params.state)
@@ -92,12 +92,60 @@ async fn callback(
         flow.code_verifier
     };
 
-    let _ = params.code;
+    // Exchange authorization code for GitHub access token
+    let github_token = exchange_code_for_token(
+        &params.code,
+        &code_verifier,
+        &state.config.oauth_client_id,
+        &state.config.oauth_client_secret,
+        &state.config.oauth_redirect_uri,
+    )
+    .await?;
 
-    Err(ApiError::BadRequest(
-        "OAuth token exchange not yet implemented -- use POST /api/v1/auth/dev-login for development"
-            .to_string(),
-    ))
+    // Fetch user profile from GitHub
+    let gh_profile = fetch_github_profile(&github_token).await?;
+
+    // Find or create user in our database
+    let profile = ogrenotes_auth::user::OAuthProfile {
+        email: gh_profile.email,
+        name: gh_profile.name,
+        avatar_url: gh_profile.avatar_url,
+    };
+
+    let user = ogrenotes_auth::user::find_or_create_user(
+        &state.user_repo,
+        &state.folder_repo,
+        &profile,
+    )
+    .await?;
+
+    // Create session and generate tokens
+    let session = ogrenotes_auth::session::create_session(
+        &state.session_repo,
+        &user.user_id,
+        Some("github-oauth"),
+    )
+    .await?;
+
+    let access_token = ogrenotes_auth::jwt::create_access_token(
+        &user.user_id,
+        &user.email,
+        &state.config.jwt_secret,
+    )?;
+
+    // Redirect to frontend with tokens in URL fragment (not query params for security)
+    let redirect_url = format!(
+        "{}/#access_token={}&refresh_token={}&session_id={}&user_id={}&email={}&name={}",
+        state.config.frontend_origin,
+        urlencoding::encode(&access_token),
+        urlencoding::encode(&session.refresh_token),
+        urlencoding::encode(&session.session_id),
+        urlencoding::encode(&user.user_id),
+        urlencoding::encode(&user.email),
+        urlencoding::encode(&user.name),
+    );
+
+    Ok(Redirect::temporary(&redirect_url).into_response())
 }
 
 #[derive(Deserialize)]
@@ -210,4 +258,113 @@ async fn dev_login(
         email: user.email,
         name: user.name,
     }))
+}
+
+// ─── GitHub OAuth helpers ──────────────────────────────────────
+
+#[derive(Deserialize)]
+struct GitHubTokenResponse {
+    access_token: String,
+}
+
+async fn exchange_code_for_token(
+    code: &str,
+    code_verifier: &str,
+    client_id: &str,
+    client_secret: &str,
+    redirect_uri: &str,
+) -> Result<String, ApiError> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://github.com/login/oauth/access_token")
+        .header("Accept", "application/json")
+        .form(&[
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("code", code),
+            ("code_verifier", code_verifier),
+            ("redirect_uri", redirect_uri),
+        ])
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("GitHub token exchange failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ApiError::Internal(format!(
+            "GitHub token exchange error: {body}"
+        )));
+    }
+
+    let token_resp: GitHubTokenResponse = resp
+        .json()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to parse GitHub token: {e}")))?;
+
+    Ok(token_resp.access_token)
+}
+
+struct GitHubProfile {
+    email: String,
+    name: String,
+    avatar_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GitHubUser {
+    email: Option<String>,
+    name: Option<String>,
+    login: String,
+    avatar_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GitHubEmail {
+    email: String,
+    primary: bool,
+    verified: bool,
+}
+
+async fn fetch_github_profile(access_token: &str) -> Result<GitHubProfile, ApiError> {
+    let client = reqwest::Client::new();
+
+    let user: GitHubUser = client
+        .get("https://api.github.com/user")
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("User-Agent", "OgreNotes")
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("GitHub user fetch failed: {e}")))?
+        .json()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to parse GitHub user: {e}")))?;
+
+    // If email is not public, fetch from /user/emails
+    let email = if let Some(email) = user.email {
+        email
+    } else {
+        let emails: Vec<GitHubEmail> = client
+            .get("https://api.github.com/user/emails")
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("User-Agent", "OgreNotes")
+            .send()
+            .await
+            .map_err(|e| ApiError::Internal(format!("GitHub emails fetch failed: {e}")))?
+            .json()
+            .await
+            .map_err(|e| ApiError::Internal(format!("Failed to parse GitHub emails: {e}")))?;
+
+        emails
+            .iter()
+            .find(|e| e.primary && e.verified)
+            .or_else(|| emails.iter().find(|e| e.verified))
+            .map(|e| e.email.clone())
+            .ok_or_else(|| ApiError::BadRequest("No verified email found".to_string()))?
+    };
+
+    Ok(GitHubProfile {
+        email,
+        name: user.name.unwrap_or(user.login),
+        avatar_url: user.avatar_url,
+    })
 }

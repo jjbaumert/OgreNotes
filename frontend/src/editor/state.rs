@@ -145,9 +145,44 @@ impl Transaction {
     }
 
     /// Delete the current selection.
+    /// When the selection spans multiple blocks, merges the remaining content
+    /// of the first and last blocks into a single block.
     pub fn delete_selection(self) -> Result<Self, StepError> {
         let from = self.selection.from();
         let to = self.selection.to();
+        if from == to {
+            return Ok(self);
+        }
+
+        // Check if from and to are in different blocks
+        let from_block = find_block_at(&self.doc, from);
+        let to_block = find_block_at(&self.doc, to);
+
+        if let (Some(fb), Some(tb)) = (&from_block, &to_block) {
+            if fb.offset != tb.offset {
+                // Cross-block selection: merge remaining content into one block
+                let before_offset = from - fb.content_start;
+                let after_offset = to - tb.content_start;
+                let before_content = fb.content.cut(0, before_offset);
+                let after_content = tb.content.cut(after_offset, tb.content.size());
+                let merged_content = before_content.append_fragment(after_content);
+                let merged = Node::Element {
+                    node_type: fb.node_type,
+                    attrs: fb.attrs.clone(),
+                    content: merged_content,
+                    marks: vec![],
+                };
+
+                let replace_from = fb.offset;
+                let replace_to = tb.offset + tb.node_size;
+                let slice = Slice::new(Fragment::from(vec![merged]), 0, 0);
+                let mut txn = self.replace(replace_from, replace_to, slice)?;
+                txn.selection = Selection::cursor(from);
+                return Ok(txn);
+            }
+        }
+
+        // Same block or couldn't find blocks: simple delete
         self.delete(from, to)
     }
 
@@ -907,6 +942,50 @@ mod tests {
             ..state
         };
         assert!(state.transaction().join_backward().is_err());
+    }
+
+    // ── delete_selection across blocks ──
+
+    #[test]
+    fn delete_selection_cross_block_merges() {
+        let state = EditorState::create_default(two_para_doc());
+        // Select from position 3 (after "He") to position 10 (after "Wo")
+        let state = EditorState {
+            selection: Selection::text(3, 10),
+            ..state
+        };
+        let txn = state.transaction().delete_selection().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 1, "Should merge into one paragraph");
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "Herld");
+        assert_eq!(new_state.selection.from(), 3);
+    }
+
+    #[test]
+    fn delete_selection_same_block_simple_delete() {
+        let state = EditorState::create_default(simple_doc());
+        let state = EditorState {
+            selection: Selection::text(1, 6),
+            ..state
+        };
+        let txn = state.transaction().delete_selection().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 1);
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), " world");
+    }
+
+    #[test]
+    fn delete_selection_entire_second_block() {
+        let state = EditorState::create_default(two_para_doc());
+        // Select from end of para1 (position 6) to end of para2 (position 13)
+        let state = EditorState {
+            selection: Selection::text(6, 13),
+            ..state
+        };
+        let txn = state.transaction().delete_selection().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 1);
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "Hello");
     }
 
     #[test]
