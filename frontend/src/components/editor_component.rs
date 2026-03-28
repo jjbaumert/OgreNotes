@@ -106,7 +106,15 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             return;
         };
 
-        let state = view.state();
+        // Sync DOM selection to model before executing the command,
+        // so toolbar actions see the user's actual selection, not a stale cursor.
+        let state = {
+            let mut s = view.state();
+            if let Some(dom_sel) = view.read_dom_selection() {
+                s.selection = dom_sel;
+            }
+            s
+        };
         let history = Rc::clone(&history_ref_cmd);
         let on_change = on_change_cmd.clone();
         let on_state_change = on_state_change_cmd.clone();

@@ -134,7 +134,7 @@ main() {
     echo ""
     echo -e "${GREEN}  ╔═══════════════════════════════╗${NC}"
     echo -e "${GREEN}  ║       🟢  OgreNotes  🟢       ║${NC}"
-    echo -e "${GREEN}  ║     Documents with teeth.      ║${NC}"
+    echo -e "${GREEN}  ║     Documents with teeth.     ║${NC}"
     echo -e "${GREEN}  ╚═══════════════════════════════╝${NC}"
     echo ""
 

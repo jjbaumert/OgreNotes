@@ -23,6 +23,8 @@ pub struct EditorView {
     just_composed: Rc<RefCell<bool>>,
     /// Stored (event_name, closure) pairs for cleanup in destroy().
     listeners: Vec<(&'static str, Closure<dyn Fn(web_sys::Event)>)>,
+    /// selectionchange listener (attached to document, not container).
+    selectionchange_closure: Option<Closure<dyn Fn(web_sys::Event)>>,
 }
 
 impl EditorView {
@@ -52,6 +54,7 @@ impl EditorView {
             composing,
             just_composed,
             listeners: Vec::new(),
+            selectionchange_closure: None,
         };
 
         view.render();
@@ -64,11 +67,19 @@ impl EditorView {
         self.state.borrow().clone()
     }
 
-    /// Update the state and re-render.
+    /// Update the state. Re-renders the DOM only if the document changed;
+    /// for selection-only changes, just syncs the selection without
+    /// destroying and rebuilding DOM nodes.
     pub fn update_state(&self, new_state: EditorState) {
+        let doc_changed = self.state.borrow().doc != new_state.doc;
         *self.state.borrow_mut() = new_state;
         if !*self.composing.borrow() {
-            self.render();
+            if doc_changed {
+                self.render();
+            } else {
+                let sel = self.state.borrow().selection.clone();
+                self.sync_selection_to_dom(&sel);
+            }
         }
     }
 
@@ -96,6 +107,7 @@ impl EditorView {
     }
 
     /// Sync the model selection to the browser's DOM selection.
+    /// Preserves direction (backward selections where anchor > head).
     fn sync_selection_to_dom(&self, selection: &Selection) {
         let Some(window) = web_sys::window() else {
             return;
@@ -103,25 +115,28 @@ impl EditorView {
         let Some(dom_sel) = window.get_selection().ok().flatten() else {
             return;
         };
-        let Some(document) = window.document() else {
-            return;
-        };
 
-        let from = selection.from();
-        let to = selection.to();
+        let anchor = selection.anchor();
+        let head = selection.head();
 
-        if let Some((from_node, from_offset)) = find_dom_position(&self.container, from) {
-            if let Ok(range) = document.create_range() {
-                let _ = range.set_start(&from_node, from_offset as u32);
-                if selection.empty() {
-                    let _ = range.collapse_with_to_start(true);
-                } else if let Some((to_node, to_offset)) =
-                    find_dom_position(&self.container, to)
-                {
-                    let _ = range.set_end(&to_node, to_offset as u32);
-                }
+        if let Some((anchor_node, anchor_offset)) = find_dom_position(&self.container, anchor) {
+            if selection.empty() {
+                // Cursor: collapse to anchor
                 dom_sel.remove_all_ranges().unwrap_or(());
-                dom_sel.add_range(&range).unwrap_or(());
+                let _ = dom_sel.collapse_with_offset(
+                    Some(&anchor_node),
+                    anchor_offset as u32,
+                );
+            } else if let Some((head_node, head_offset)) =
+                find_dom_position(&self.container, head)
+            {
+                // Range: use setBaseAndExtent to preserve direction
+                let _ = dom_sel.set_base_and_extent(
+                    &anchor_node,
+                    anchor_offset as u32,
+                    &head_node,
+                    head_offset as u32,
+                );
             }
         }
     }
@@ -253,7 +268,10 @@ impl EditorView {
                         if state_with_sel.selection.empty() {
                             let pos = state_with_sel.selection.from();
                             if pos > 0 {
-                                if let Ok(txn) = state_with_sel.transaction().delete(pos - 1, pos) {
+                                // Try joining with previous block first (backspace at block start)
+                                if let Ok(txn) = state_with_sel.transaction().join_backward() {
+                                    dispatch(txn);
+                                } else if let Ok(txn) = state_with_sel.transaction().delete(pos - 1, pos) {
                                     dispatch(txn);
                                 }
                             }
@@ -352,6 +370,38 @@ impl EditorView {
             }
         }) as Box<dyn Fn(web_sys::Event)>);
         self.add_listener("compositionend", on_comp_end);
+
+        // selectionchange — sync DOM selection to model so toolbar updates
+        // when the user moves the cursor (click, arrow keys).
+        // This event fires on the document, not the container.
+        let state_sel = Rc::clone(&self.state);
+        let dispatch_sel = Rc::clone(&self.dispatch);
+        let container_sel = self.container.clone();
+        let composing_sel = Rc::clone(&self.composing);
+
+        let on_selectionchange = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+            if *composing_sel.borrow() {
+                return;
+            }
+            if let Some(sel) = read_dom_selection_from(&container_sel) {
+                let current = state_sel.borrow();
+                if current.selection != sel {
+                    drop(current);
+                    let state = state_sel.borrow().clone();
+                    let txn = state.transaction().set_selection(sel);
+                    dispatch_sel(txn);
+                }
+            }
+        }) as Box<dyn Fn(web_sys::Event)>);
+
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            doc.add_event_listener_with_callback(
+                "selectionchange",
+                on_selectionchange.as_ref().unchecked_ref(),
+            )
+            .unwrap_or(());
+        }
+        self.selectionchange_closure = Some(on_selectionchange);
     }
 
     /// Add an event listener and store it for cleanup.
@@ -373,7 +423,7 @@ impl EditorView {
         self.container.set_inner_html("");
     }
 
-    /// Remove all event listeners from the container.
+    /// Remove all event listeners from the container and document.
     fn remove_listeners(&mut self) {
         for (event, closure) in &self.listeners {
             self.container
@@ -384,6 +434,16 @@ impl EditorView {
                 .unwrap_or(());
         }
         self.listeners.clear();
+
+        if let Some(closure) = self.selectionchange_closure.take() {
+            if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                doc.remove_event_listener_with_callback(
+                    "selectionchange",
+                    closure.as_ref().unchecked_ref(),
+                )
+                .unwrap_or(());
+            }
+        }
     }
 }
 
@@ -492,7 +552,16 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
 }
 
 /// Render children of a Fragment into a DOM Element.
+/// Appends a `<br>` to empty blocks so the browser gives them height and
+/// allows the cursor to be placed inside them.
 fn render_children(doc: &Document, parent: &Element, content: &super::model::Fragment) {
+    if content.children.is_empty() {
+        if let Ok(br) = doc.create_element("br") {
+            let _ = br.set_attribute("data-sentinel", "");
+            let _ = parent.append_child(&br);
+        }
+        return;
+    }
     for child in &content.children {
         if let Some(child_dom) = render_node(doc, child) {
             parent.append_child(&child_dom).unwrap_or_else(|_| child_dom);
@@ -592,6 +661,9 @@ fn find_in_element(
                     return Some(result);
                 }
             } else if is_leaf_tag(&tag) {
+                if is_sentinel(el) {
+                    continue; // skip rendering-only <br>
+                }
                 if target == *pos {
                     return Some((element.clone().into(), i as usize));
                 }
@@ -672,6 +744,9 @@ fn dom_to_model_walk(
                     return Some(result);
                 }
             } else if is_leaf_tag(&tag) {
+                if is_sentinel(el) {
+                    continue; // skip rendering-only <br>
+                }
                 if child.is_same_node(Some(target_node)) {
                     return Some(*pos);
                 }
@@ -706,7 +781,7 @@ fn dom_node_model_size(node: &DomNode) -> usize {
                 }
                 size
             } else if is_leaf_tag(&tag) {
-                1
+                if is_sentinel(el) { 0 } else { 1 }
             } else {
                 let children = el.child_nodes();
                 let mut size = 2; // open + close
@@ -734,6 +809,11 @@ fn is_mark_tag(tag: &str) -> bool {
 
 fn is_leaf_tag(tag: &str) -> bool {
     matches!(tag, "hr" | "br" | "img")
+}
+
+/// Check if a DOM element is a sentinel `<br>` (rendering artifact, not a model node).
+fn is_sentinel(el: &Element) -> bool {
+    el.has_attribute("data-sentinel")
 }
 
 /// Read DOM selection from a container element.

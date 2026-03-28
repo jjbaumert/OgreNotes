@@ -31,8 +31,14 @@ pub fn Toolbar(
         }).unwrap_or(false)
     };
 
+    // Prevent toolbar mousedown from stealing focus from the editor.
+    // This keeps the browser selection intact when clicking toolbar buttons.
+    let on_mousedown = |ev: web_sys::MouseEvent| {
+        ev.prevent_default();
+    };
+
     view! {
-        <div class="toolbar">
+        <div class="toolbar" on:mousedown=on_mousedown>
             // Inline marks
             <div class="toolbar-group">
                 <button

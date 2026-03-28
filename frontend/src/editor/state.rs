@@ -162,7 +162,9 @@ impl Transaction {
         let from = self.selection.from();
         let to = self.selection.to();
 
-        // Build text node with stored marks if present
+        // Build text node with appropriate marks:
+        // - Some(marks): use explicitly set stored marks (from toggle commands)
+        // - None: inherit marks from the text at the cursor position
         let text_node = if let Some(ref marks) = self.stored_marks {
             if marks.is_empty() {
                 Node::text(text)
@@ -170,7 +172,12 @@ impl Transaction {
                 Node::text_with_marks(text, marks.clone())
             }
         } else {
-            Node::text(text)
+            let inherited = super::commands::marks_at_pos(&self.doc, from);
+            if inherited.is_empty() {
+                Node::text(text)
+            } else {
+                Node::text_with_marks(text, inherited)
+            }
         };
 
         let content = Fragment::from(vec![text_node]);
@@ -245,6 +252,45 @@ impl Transaction {
         let mut txn = txn.replace(from, end, slice)?;
         txn.selection = Selection::cursor(from + first_size + 1);
         txn.stored_marks = None;
+        Ok(txn)
+    }
+
+    /// Join the current block with the previous block.
+    /// Used when backspace is pressed at the start of a block.
+    /// Merges the current block's content into the end of the previous block.
+    pub fn join_backward(self) -> Result<Self, StepError> {
+        let pos = self.selection.from();
+        let block = find_block_at(&self.doc, pos)
+            .ok_or_else(|| StepError("cursor not in a block".into()))?;
+
+        // Only join if cursor is at the very start of the block's content
+        if pos != block.content_start {
+            return Err(StepError("cursor not at block start".into()));
+        }
+
+        // Find the previous sibling textblock by searching just before this block
+        if block.offset == 0 {
+            return Err(StepError("no previous block to join with".into()));
+        }
+        let prev = find_block_at(&self.doc, block.offset - 1)
+            .ok_or_else(|| StepError("no previous textblock".into()))?;
+
+        // Merge: replace both blocks with one block (prev type) containing combined content
+        let merged_content = prev.content.append_fragment(block.content);
+        let merged = Node::Element {
+            node_type: prev.node_type,
+            attrs: prev.attrs,
+            content: merged_content,
+            marks: vec![],
+        };
+        let cursor_pos = prev.offset + prev.node_size - 1; // end of prev's original content
+
+        let from = prev.offset;
+        let end = block.offset + block.node_size;
+        let slice = Slice::new(Fragment::from(vec![merged]), 0, 0);
+
+        let mut txn = self.replace(from, end, slice)?;
+        txn.selection = Selection::cursor(cursor_pos);
         Ok(txn)
     }
 
@@ -551,6 +597,50 @@ mod tests {
         assert!(para.child(0).unwrap().marks().is_empty());
     }
 
+    #[test]
+    fn insert_text_inherits_marks_from_cursor_position() {
+        // Doc with bold "Hello" + plain " world"
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![
+                    Node::text_with_marks("Hello", vec![Mark::new(MarkType::Bold)]),
+                    Node::text(" world"),
+                ]),
+            )]),
+        );
+        let state = EditorState::create_default(doc);
+        // Cursor at position 3 (inside "Hello", which is bold)
+        let state = EditorState {
+            selection: Selection::cursor(3),
+            ..state
+        };
+
+        // Insert "X" with no stored marks — should inherit bold
+        let txn = state.transaction().insert_text("X").unwrap();
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        // "HeXllo" should all be bold
+        let first = para.child(0).unwrap();
+        assert!(first.marks().iter().any(|m| m.mark_type == MarkType::Bold));
+        assert!(first.text_content().contains('X'));
+    }
+
+    #[test]
+    fn insert_text_no_marks_in_plain_text() {
+        let state = EditorState::create_default(simple_doc());
+        let state = EditorState {
+            selection: Selection::cursor(3),
+            ..state
+        };
+        let txn = state.transaction().insert_text("X").unwrap();
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        // All text should be plain
+        assert!(para.child(0).unwrap().marks().is_empty());
+    }
+
     // ── Selection tracking ──
 
     #[test]
@@ -777,5 +867,55 @@ mod tests {
         assert_eq!(item.child_count(), 2);
         assert_eq!(item.child(0).unwrap().text_content(), "He");
         assert_eq!(item.child(1).unwrap().text_content(), "llo");
+    }
+
+    // ── join_backward ──
+
+    #[test]
+    fn join_backward_merges_paragraphs() {
+        let state = EditorState::create_default(two_para_doc());
+        // Cursor at start of second paragraph's content
+        // para1: offset 0, size 7 (open + "Hello" + close), content_start 1
+        // para2: offset 7, size 7, content_start 8
+        let state = EditorState {
+            selection: Selection::cursor(8),
+            ..state
+        };
+        let txn = state.transaction().join_backward().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 1);
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "HelloWorld");
+        // Cursor should be where the join happened (after "Hello")
+        assert_eq!(new_state.selection.from(), 6);
+    }
+
+    #[test]
+    fn join_backward_at_first_block_returns_error() {
+        let state = EditorState::create_default(simple_doc());
+        let state = EditorState {
+            selection: Selection::cursor(1), // start of first paragraph content
+            ..state
+        };
+        assert!(state.transaction().join_backward().is_err());
+    }
+
+    #[test]
+    fn join_backward_not_at_block_start_returns_error() {
+        let state = EditorState::create_default(two_para_doc());
+        let state = EditorState {
+            selection: Selection::cursor(9), // middle of second paragraph
+            ..state
+        };
+        assert!(state.transaction().join_backward().is_err());
+    }
+
+    #[test]
+    fn split_block_on_empty_paragraph() {
+        // Empty doc has one empty paragraph, cursor at position 1
+        let state = EditorState::empty();
+        assert_eq!(state.selection.from(), 1);
+        let txn = state.transaction().split_block().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 2);
     }
 }

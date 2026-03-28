@@ -3,6 +3,10 @@ name = "ogrenotes-frontend"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "ogrenotes_frontend"
+path = "src/lib.rs"
+
 [dependencies]
 leptos = { version = "0.7", features = ["csr"] }
 leptos_router = "0.7"
@@ -52,4 +56,10 @@ features = [
     "DomTokenList",
     "CssStyleDeclaration",
     "Performance",
+    "InputEventInit",
+    "KeyboardEventInit",
+    "History",
 ]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

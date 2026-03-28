@@ -109,11 +109,17 @@ fn mark_active_at_cursor(state: &EditorState, mark_type: MarkType) -> bool {
 /// If the cursor is at the start of a paragraph (no preceding text), returns
 /// the marks of the first text node.
 fn marks_at_cursor(state: &EditorState) -> Vec<Mark> {
-    let pos = state.selection.from();
-    let Some(rp) = resolve(&state.doc, pos) else {
+    marks_at_pos(&state.doc, state.selection.from())
+}
+
+/// Get the marks at a given document position.
+/// Returns the marks of the text node to the left of (or containing) the position.
+/// Used by both commands (for stored marks) and insert_text (for mark inheritance).
+pub fn marks_at_pos(doc: &Node, pos: usize) -> Vec<Mark> {
+    let Some(rp) = resolve(doc, pos) else {
         return vec![];
     };
-    let parent = rp.node_at(rp.depth, &state.doc);
+    let parent = rp.node_at(rp.depth, doc);
     let offset = rp.parent_offset();
 
     // Walk children to find the text node at or just before the cursor
