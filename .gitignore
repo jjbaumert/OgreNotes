@@ -1,4 +1,6 @@
 /target
+frontend/dist/
+frontend/target/
 .claude
 .idea
 .env

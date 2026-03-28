@@ -1,0 +1,21 @@
+{
+  "BlockPublicAccess": {
+    "BlockPublicAcls": true,
+    "IgnorePublicAcls": true,
+    "BlockPublicPolicy": true,
+    "RestrictPublicBuckets": true
+  },
+  "LifecycleRules": [
+    {
+      "ID": "expire-tmp-objects-7-days",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "tmp/"
+      },
+      "Expiration": {
+        "Days": 7
+      },
+      "_comment": "Only applies to objects under tmp/. Document snapshots and blobs are NOT affected. To clean a dev bucket manually: aws s3 rm s3://BUCKET --recursive"
+    }
+  ]
+}

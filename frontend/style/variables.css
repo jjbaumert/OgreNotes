@@ -1,0 +1,44 @@
+:root {
+  /* Primary */
+  --color-primary: #2D5F2D;
+  --color-primary-hover: #245024;
+  --color-secondary: #5C3D2E;
+  --color-bg: #F5F0E8;
+  --color-surface: #FFFFFF;
+  --color-text: #1A1A1A;
+  --color-text-secondary: #6B6B6B;
+  --color-border: #E8E4DC;
+  --color-mist: #E8E4DC;
+
+  /* Status */
+  --color-success: #4A7C4A;
+  --color-warning: #D4920B;
+  --color-error: #C0392B;
+  --color-link: #2980B9;
+  --color-collab: #7B5EA7;
+
+  /* Typography */
+  --font-ui: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'Cascadia Code', monospace;
+  --font-doc-heading: 'Inter', system-ui, sans-serif;
+  --font-doc-body: 'Inter', system-ui, sans-serif;
+
+  /* Spacing */
+  --space-unit: 4px;
+  --space-xs: calc(var(--space-unit) * 1);
+  --space-sm: calc(var(--space-unit) * 2);
+  --space-md: calc(var(--space-unit) * 4);
+  --space-lg: calc(var(--space-unit) * 6);
+  --space-xl: calc(var(--space-unit) * 8);
+
+  /* Layout */
+  --content-max-width: 720px;
+  --sidebar-width: 240px;
+  --sidebar-collapsed: 48px;
+  --toolbar-height: 44px;
+
+  /* Borders */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+}

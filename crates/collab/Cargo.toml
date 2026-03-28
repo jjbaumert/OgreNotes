@@ -1,0 +1,15 @@
+[package]
+name = "ogrenotes-collab"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ogrenotes-common = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+yrs = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

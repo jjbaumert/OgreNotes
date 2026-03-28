@@ -1,6 +1,72 @@
-[package]
-name = "ogre"
+[workspace]
+resolver = "3"
+members = [
+    "crates/common",
+    "crates/storage",
+    "crates/auth",
+    "crates/collab",
+    "crates/api",
+]
+exclude = [
+    "frontend",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# IDs
+nanoid = "0.4"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# AWS
+aws-config = "1"
+aws-sdk-dynamodb = "1"
+aws-sdk-s3 = "1"
+serde_dynamo = { version = "4.3", features = ["aws-sdk-dynamodb+1"] }
+
+# CRDT
+yrs = "0.21"
+
+# Redis
+fred = "9"
+
+# Web framework
+axum = { version = "0.8", features = ["ws", "multipart"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Auth
+jsonwebtoken = "9"
+oauth2 = "4"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.9"
+urlencoding = "2"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Testing
+proptest = "1"
+test-strategy = "0.4"
+
+# Workspace crates
+ogrenotes-common = { path = "crates/common" }
+ogrenotes-storage = { path = "crates/storage" }
+ogrenotes-auth = { path = "crates/auth" }
+ogrenotes-collab = { path = "crates/collab" }

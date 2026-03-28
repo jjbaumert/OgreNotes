@@ -1,0 +1,27 @@
+[package]
+name = "ogrenotes-api"
+version.workspace = true
+edition.workspace = true
+default-run = "ogrenotes-api"
+
+[dependencies]
+ogrenotes-common = { workspace = true }
+ogrenotes-storage = { workspace = true }
+ogrenotes-auth = { workspace = true }
+ogrenotes-collab = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-dynamodb = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
