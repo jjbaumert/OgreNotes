@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use super::model::{Fragment, Mark, MarkType, Node, NodeType, Slice};
-use super::state::{EditorState, Transaction};
+use super::selection::Selection;
+use super::state::{find_block_at, EditorState, Transaction};
+use super::transform::Step;
 
 /// An input rule that matches text typed at the end of a line and transforms it.
 pub struct InputRule {
@@ -135,7 +137,21 @@ fn blockquote_rule() -> InputRule {
             }
         }),
         handler: Box::new(|state, from, to, _| {
+            // Delete trigger text, then wrap the block in a blockquote
             let txn = state.transaction().delete(from, to).ok()?;
+            let cursor = txn.selection.from();
+            let block = find_block_at(&txn.doc, cursor)?;
+
+            let bq = Node::element(NodeType::Blockquote);
+            let wrapper = Slice::new(Fragment::from(vec![bq]), 1, 1);
+            let txn = txn.step(Step::ReplaceAround {
+                from: block.offset,
+                to: block.offset + block.node_size,
+                gap_from: block.offset,
+                gap_to: block.offset + block.node_size,
+                insert: wrapper,
+                structure: true,
+            }).ok()?;
             Some(txn)
         }),
     }
@@ -152,8 +168,7 @@ fn bullet_list_rule(trigger: &'static str) -> InputRule {
             }
         }),
         handler: Box::new(|state, from, to, _| {
-            let txn = state.transaction().delete(from, to).ok()?;
-            Some(txn)
+            wrap_block_after_delete(state, from, to, NodeType::BulletList, NodeType::ListItem)
         }),
     }
 }
@@ -169,8 +184,7 @@ fn ordered_list_rule() -> InputRule {
             }
         }),
         handler: Box::new(|state, from, to, _| {
-            let txn = state.transaction().delete(from, to).ok()?;
-            Some(txn)
+            wrap_block_after_delete(state, from, to, NodeType::OrderedList, NodeType::ListItem)
         }),
     }
 }
@@ -186,8 +200,7 @@ fn task_list_rule(trigger: &'static str) -> InputRule {
             }
         }),
         handler: Box::new(|state, from, to, _| {
-            let txn = state.transaction().delete(from, to).ok()?;
-            Some(txn)
+            wrap_block_after_delete(state, from, to, NodeType::TaskList, NodeType::TaskItem)
         }),
     }
 }
@@ -203,7 +216,29 @@ fn task_list_checked_rule(trigger: &'static str) -> InputRule {
             }
         }),
         handler: Box::new(|state, from, to, _| {
+            // Same as task_list but the item starts checked
             let txn = state.transaction().delete(from, to).ok()?;
+            let cursor = txn.selection.from();
+            let block = find_block_at(&txn.doc, cursor)?;
+
+            let mut attrs = HashMap::new();
+            attrs.insert("checked".to_string(), "true".to_string());
+            let item = Node::Element {
+                node_type: NodeType::TaskItem,
+                attrs,
+                content: Fragment::empty(),
+                marks: vec![],
+            };
+            let list = Node::element_with_content(NodeType::TaskList, Fragment::from(vec![item]));
+            let wrapper = Slice::new(Fragment::from(vec![list]), 2, 2);
+            let txn = txn.step(Step::ReplaceAround {
+                from: block.offset,
+                to: block.offset + block.node_size,
+                gap_from: block.offset,
+                gap_to: block.offset + block.node_size,
+                insert: wrapper,
+                structure: true,
+            }).ok()?;
             Some(txn)
         }),
     }
@@ -219,15 +254,48 @@ fn hr_rule() -> InputRule {
                 None
             }
         }),
-        handler: Box::new(|state, from, to, _| {
-            // Replace trigger text with a horizontal rule node
+        handler: Box::new(|state, from, _to, _| {
+            // Replace the entire paragraph with HR + a new empty paragraph
+            let block = find_block_at(&state.doc, from)?;
             let hr = Node::element(NodeType::HorizontalRule);
-            let content = Fragment::from(vec![hr]);
+            let new_para = Node::element_with_content(NodeType::Paragraph, Fragment::empty());
+            let content = Fragment::from(vec![hr, new_para]);
             let slice = Slice::new(content, 0, 0);
-            let txn = state.transaction().replace(from, to, slice).ok()?;
+            let mut txn = state
+                .transaction()
+                .replace(block.offset, block.offset + block.node_size, slice)
+                .ok()?;
+            // Place cursor inside the new empty paragraph (HR size=1, +1 for para open)
+            txn.selection = Selection::cursor(block.offset + 2);
             Some(txn)
         }),
     }
+}
+
+/// Helper: delete trigger text, then wrap the resulting block in a list.
+fn wrap_block_after_delete(
+    state: &EditorState,
+    from: usize,
+    to: usize,
+    list_type: NodeType,
+    item_type: NodeType,
+) -> Option<Transaction> {
+    let txn = state.transaction().delete(from, to).ok()?;
+    let cursor = txn.selection.from();
+    let block = find_block_at(&txn.doc, cursor)?;
+
+    let item = Node::element(item_type);
+    let list = Node::element_with_content(list_type, Fragment::from(vec![item]));
+    let wrapper = Slice::new(Fragment::from(vec![list]), 2, 2);
+    let txn = txn.step(Step::ReplaceAround {
+        from: block.offset,
+        to: block.offset + block.node_size,
+        gap_from: block.offset,
+        gap_to: block.offset + block.node_size,
+        insert: wrapper,
+        structure: true,
+    }).ok()?;
+    Some(txn)
 }
 
 // ─── Inline Mark Rules ──────────────────────────────────────────
@@ -481,35 +549,51 @@ mod tests {
     }
 
     #[test]
-    fn bullet_list_star_matches() {
+    fn bullet_list_star_creates_list() {
         let rules = default_input_rules();
         let state = make_state("* ");
-        let txn = check_input_rules(&rules, &state, "* ", 1);
-        assert!(txn.is_some());
+        let txn = check_input_rules(&rules, &state, "* ", 1).unwrap();
+        let new_state = state.apply(txn);
+        let list = new_state.doc.child(0).unwrap();
+        assert_eq!(list.node_type(), Some(NodeType::BulletList));
+        let item = list.child(0).unwrap();
+        assert_eq!(item.node_type(), Some(NodeType::ListItem));
     }
 
     #[test]
-    fn bullet_list_dash_matches() {
+    fn bullet_list_dash_creates_list() {
         let rules = default_input_rules();
         let state = make_state("- ");
-        let txn = check_input_rules(&rules, &state, "- ", 1);
-        assert!(txn.is_some());
+        let txn = check_input_rules(&rules, &state, "- ", 1).unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child(0).unwrap().node_type(), Some(NodeType::BulletList));
     }
 
     #[test]
-    fn ordered_list_matches() {
+    fn ordered_list_creates_list() {
         let rules = default_input_rules();
         let state = make_state("1. ");
-        let txn = check_input_rules(&rules, &state, "1. ", 1);
-        assert!(txn.is_some());
+        let txn = check_input_rules(&rules, &state, "1. ", 1).unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child(0).unwrap().node_type(), Some(NodeType::OrderedList));
     }
 
     #[test]
-    fn task_list_matches() {
+    fn task_list_creates_list() {
         let rules = default_input_rules();
         let state = make_state("[ ] ");
-        let txn = check_input_rules(&rules, &state, "[ ] ", 1);
-        assert!(txn.is_some());
+        let txn = check_input_rules(&rules, &state, "[ ] ", 1).unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child(0).unwrap().node_type(), Some(NodeType::TaskList));
+    }
+
+    #[test]
+    fn blockquote_creates_blockquote() {
+        let rules = default_input_rules();
+        let state = make_state("> ");
+        let txn = check_input_rules(&rules, &state, "> ", 1).unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child(0).unwrap().node_type(), Some(NodeType::Blockquote));
     }
 
     #[test]
@@ -526,6 +610,25 @@ mod tests {
         let state = make_state("___");
         let txn = check_input_rules(&rules, &state, "___", 1);
         assert!(txn.is_some());
+    }
+
+    #[test]
+    fn hr_creates_hr_and_new_paragraph() {
+        let rules = default_input_rules();
+        let state = make_state("---");
+        let txn = check_input_rules(&rules, &state, "---", 1).unwrap();
+        let new_state = state.apply(txn);
+        // First child should be the horizontal rule
+        assert_eq!(
+            new_state.doc.child(0).unwrap().node_type(),
+            Some(NodeType::HorizontalRule)
+        );
+        // Second child should be an empty paragraph for the cursor
+        let para = new_state.doc.child(1).unwrap();
+        assert_eq!(para.node_type(), Some(NodeType::Paragraph));
+        assert_eq!(para.text_content(), "");
+        // Cursor should be inside the new paragraph
+        assert_eq!(new_state.selection.from(), 2);
     }
 
     #[test]

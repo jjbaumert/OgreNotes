@@ -60,7 +60,9 @@ pub fn DocumentPage() -> impl IntoView {
         });
     });
 
-    // Auto-save with a 500ms delay to batch rapid changes
+    // Auto-save with debouncing: only the latest change within 500ms triggers a save.
+    // A generation counter ensures overlapping saves are cancelled.
+    let save_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let save_doc_id = current_id.clone();
     let on_change = Callback::new(move |bytes: Vec<u8>| {
         let id = save_doc_id.get_untracked();
@@ -69,15 +71,40 @@ pub fn DocumentPage() -> impl IntoView {
         }
         let current_title = title.get_untracked();
 
-        leptos::task::spawn_local(async move {
-            // Simple delay to batch rapid keystrokes
-            gloo_timers::future::TimeoutFuture::new(500).await;
+        // Increment generation to cancel any pending save
+        let generation = save_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let gen_ref = std::sync::Arc::clone(&save_generation);
 
-            if let Err(e) = documents::put_content(&id, &bytes).await {
-                web_sys::console::error_1(
-                    &format!("Auto-save failed: {e}").into(),
-                );
+        leptos::task::spawn_local(async move {
+            // Debounce: wait 500ms, then check if we're still the latest change
+            gloo_timers::future::TimeoutFuture::new(500).await;
+            if gen_ref.load(std::sync::atomic::Ordering::Relaxed) != generation {
+                return; // A newer change superseded this one
             }
+
+            // Save with retry on 409 conflict
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                match documents::put_content(&id, &bytes).await {
+                    Ok(()) => break,
+                    Err(crate::api::client::ApiClientError::Http(409, _)) if attempts < 3 => {
+                        // Conflict: the server version was incremented by a concurrent save.
+                        // Brief pause then retry — the server re-reads the latest version
+                        // on each PUT, so the next attempt should succeed.
+                        gloo_timers::future::TimeoutFuture::new(100).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        web_sys::console::error_1(
+                            &format!("Auto-save failed: {e}").into(),
+                        );
+                        break;
+                    }
+                }
+            }
+
+            // Save title (no conflict risk — title updates are idempotent)
             if let Err(e) = documents::update_document_title(&id, &current_title).await {
                 web_sys::console::error_1(
                     &format!("Title save failed: {e}").into(),

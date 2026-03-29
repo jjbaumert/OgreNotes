@@ -1,7 +1,7 @@
 use leptos::prelude::*;
 
 use crate::editor::commands;
-use crate::editor::model::MarkType;
+use crate::editor::model::{MarkType, NodeType};
 use crate::editor::state::EditorState;
 
 /// Formatting toolbar with active state tracking.
@@ -28,6 +28,30 @@ pub fn Toolbar(
     let is_para = move || -> bool {
         editor_state.get().map(|state| {
             commands::is_paragraph(&state)
+        }).unwrap_or(false)
+    };
+
+    let in_bullet = move || -> bool {
+        editor_state.get().map(|state| {
+            commands::is_in_list(&state, NodeType::BulletList)
+        }).unwrap_or(false)
+    };
+
+    let in_ordered = move || -> bool {
+        editor_state.get().map(|state| {
+            commands::is_in_list(&state, NodeType::OrderedList)
+        }).unwrap_or(false)
+    };
+
+    let in_task = move || -> bool {
+        editor_state.get().map(|state| {
+            commands::is_in_list(&state, NodeType::TaskList)
+        }).unwrap_or(false)
+    };
+
+    let in_bq = move || -> bool {
+        editor_state.get().map(|state| {
+            commands::is_in_blockquote(&state)
         }).unwrap_or(false)
     };
 
@@ -109,13 +133,37 @@ pub fn Toolbar(
 
             <div class="toolbar-separator"></div>
 
-            // Lists and blocks (not yet wired -- need ReplaceAroundStep)
+            // Lists and blocks
             <div class="toolbar-group">
-                <button class="toolbar-btn" disabled title="Bullet List">"\u{2022}"</button>
-                <button class="toolbar-btn" disabled title="Ordered List">"1."</button>
-                <button class="toolbar-btn" disabled title="Task List">"\u{2610}"</button>
-                <button class="toolbar-btn" disabled title="Blockquote">"\u{201C}"</button>
-                <button class="toolbar-btn" disabled title="Horizontal Rule">"--"</button>
+                <button
+                    class="toolbar-btn"
+                    class:active=in_bullet
+                    title="Bullet List"
+                    on:click=move |_| on_command.run(ToolbarCommand::ToggleBulletList)
+                >"\u{2022}"</button>
+                <button
+                    class="toolbar-btn"
+                    class:active=in_ordered
+                    title="Ordered List"
+                    on:click=move |_| on_command.run(ToolbarCommand::ToggleOrderedList)
+                >"1."</button>
+                <button
+                    class="toolbar-btn"
+                    class:active=in_task
+                    title="Task List"
+                    on:click=move |_| on_command.run(ToolbarCommand::ToggleTaskList)
+                >"\u{2610}"</button>
+                <button
+                    class="toolbar-btn"
+                    class:active=in_bq
+                    title="Blockquote"
+                    on:click=move |_| on_command.run(ToolbarCommand::ToggleBlockquote)
+                >"\u{201C}"</button>
+                <button
+                    class="toolbar-btn"
+                    title="Horizontal Rule"
+                    on:click=move |_| on_command.run(ToolbarCommand::InsertHorizontalRule)
+                >"--"</button>
             </div>
 
             <div class="toolbar-separator"></div>
@@ -141,5 +189,10 @@ pub enum ToolbarCommand {
     ToggleCode,
     SetParagraph,
     SetHeading(u8),
+    ToggleBulletList,
+    ToggleOrderedList,
+    ToggleTaskList,
+    ToggleBlockquote,
+    InsertHorizontalRule,
     UploadImage,
 }

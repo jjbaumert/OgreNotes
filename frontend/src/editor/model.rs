@@ -362,6 +362,19 @@ impl Node {
         }
     }
 
+    /// Extract a Slice from a document between two positions.
+    /// Positions are document-level (0-based within the doc content).
+    pub fn slice(&self, from: usize, to: usize) -> Slice {
+        let Node::Element { content, .. } = self else {
+            return Slice::empty();
+        };
+        if from >= to {
+            return Slice::empty();
+        }
+        let cut = content.cut(from, to);
+        Slice::new(cut, 0, 0)
+    }
+
     /// Create a simple document with a single empty paragraph.
     pub fn empty_doc() -> Self {
         Node::element_with_content(
@@ -1011,5 +1024,78 @@ mod tests {
         assert_eq!(slice.size(), 0);
         assert_eq!(slice.open_start, 0);
         assert_eq!(slice.open_end, 0);
+    }
+
+    // ── Node::slice ──
+
+    #[test]
+    fn node_slice_within_block() {
+        // Doc > Paragraph("Hello world")
+        // Positions: Para(0..13), content 1..12, "Hello world" at 1..12
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("Hello world")]),
+            )]),
+        );
+        // Select "lo wo" (positions 4..9)
+        let slice = doc.slice(4, 9);
+        assert!(!slice.content.children.is_empty());
+        // Should contain partial paragraph with "lo wo"
+        let text: String = slice.content.children.iter().map(|c| c.text_content()).collect();
+        assert!(text.contains("lo wo"), "Expected 'lo wo', got: {text}");
+    }
+
+    #[test]
+    fn node_slice_cross_block() {
+        // Doc > [Paragraph("Hello"), Paragraph("World")]
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("Hello")]),
+                ),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("World")]),
+                ),
+            ]),
+        );
+        // Select from "llo" to "Wor" (positions 3..10)
+        let slice = doc.slice(3, 10);
+        assert_eq!(slice.content.children.len(), 2);
+    }
+
+    #[test]
+    fn node_slice_with_marks() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![
+                    Node::text_with_marks("Hello", vec![Mark::new(MarkType::Bold)]),
+                    Node::text(" world"),
+                ]),
+            )]),
+        );
+        // Select "Hello" (positions 1..6)
+        let slice = doc.slice(1, 6);
+        let text: String = slice.content.children.iter().map(|c| c.text_content()).collect();
+        assert!(text.contains("Hello"), "Expected 'Hello', got: {text}");
+    }
+
+    #[test]
+    fn node_slice_empty_range() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("Hello")]),
+            )]),
+        );
+        let slice = doc.slice(3, 3);
+        assert!(slice.content.children.is_empty());
     }
 }

@@ -47,6 +47,7 @@ impl EditorView {
         let composing = Rc::new(RefCell::new(false));
         let just_composed = Rc::new(RefCell::new(false));
 
+
         let mut view = Self {
             container,
             state,
@@ -177,6 +178,12 @@ impl EditorView {
             );
 
             if handled {
+                super::debug::log("keydown", "handled", &[
+                    ("key", &key),
+                    ("ctrl", &ctrl.to_string()),
+                    ("shift", &shift.to_string()),
+                    ("alt", &alt.to_string()),
+                ]);
                 event.prevent_default();
             }
         }) as Box<dyn Fn(web_sys::Event)>);
@@ -221,6 +228,10 @@ impl EditorView {
                     if let Some(text) = data {
                         if !text.is_empty() {
                             if let Some(sel) = read_dom_selection_from(&container2) {
+                                super::debug::log("input", "insertText", &[
+                                    ("data", &text),
+                                    ("pos", &sel.from().to_string()),
+                                ]);
                                 let state_with_sel = EditorState {
                                     selection: sel,
                                     ..current_state
@@ -232,10 +243,15 @@ impl EditorView {
                                     if let Some((text_before, block_start)) =
                                         super::input_rules::get_block_text_before(&post_insert.doc, cursor)
                                     {
+                                        super::debug::log("input", "checking input rules", &[
+                                            ("text_before", &text_before),
+                                            ("block_start", &block_start.to_string()),
+                                        ]);
                                         let rules = super::input_rules::default_input_rules();
                                         if let Some(rule_txn) = super::input_rules::check_input_rules(
                                             &rules, &post_insert, &text_before, block_start,
                                         ) {
+                                            super::debug::log("input", "input rule matched", &[]);
                                             // Combine insert + rule steps into one transaction
                                             let rule_sel = rule_txn.selection.clone();
                                             let all_steps: Vec<_> = insert_txn.steps.iter().cloned()
@@ -249,10 +265,14 @@ impl EditorView {
                                                 combined.selection = rule_sel;
                                                 dispatch(combined);
                                                 return;
+                                            } else {
+                                                super::debug::error("input", "failed to combine input rule steps");
                                             }
                                         }
                                     }
                                     dispatch(insert_txn);
+                                } else {
+                                    super::debug::error("input", "insert_text failed");
                                 }
                             }
                         }
@@ -267,12 +287,63 @@ impl EditorView {
                         };
                         if state_with_sel.selection.empty() {
                             let pos = state_with_sel.selection.from();
+                            super::debug::log("backspace", "at cursor", &[
+                                ("pos", &pos.to_string()),
+                            ]);
                             if pos > 0 {
                                 // Try joining with previous block first (backspace at block start)
                                 if let Ok(txn) = state_with_sel.transaction().join_backward() {
+                                    super::debug::log("backspace", "join_backward succeeded", &[]);
                                     dispatch(txn);
-                                } else if let Ok(txn) = state_with_sel.transaction().delete(pos - 1, pos) {
-                                    dispatch(txn);
+                                } else {
+                                    // join_backward failed. Check if we're at block start
+                                    // for list-specific handling, otherwise just delete a char.
+                                    let block = super::state::find_block_at(&state_with_sel.doc, pos);
+                                    let at_block_start = block.map_or(false, |b| pos == b.content_start);
+
+                                    if at_block_start {
+                                        // At block start with no previous textblock to join.
+                                        // If in a nested list item, dedent it.
+                                        // If in a top-level list item, unwrap to paragraph.
+                                        let item = super::state::find_item_at(&state_with_sel.doc, pos);
+                                        let is_nested = item.is_some() && {
+                                            let container = super::state::find_container_at(&state_with_sel.doc, pos);
+                                            container.map_or(false, |c| {
+                                                super::state::find_item_at(&state_with_sel.doc, c.offset).is_some()
+                                            })
+                                        };
+
+                                        if is_nested {
+                                            super::commands::lift_list_item(
+                                                &state_with_sel, Some(&|txn: super::state::Transaction| {
+                                                    dispatch(txn);
+                                                }),
+                                            );
+                                            super::debug::log("backspace", "dedent nested list item", &[]);
+                                        } else if item.is_some() {
+                                            if let Ok(txn) = state_with_sel.transaction().lift_from_list() {
+                                                let cursor_after = txn.selection.from();
+                                                super::debug::log("backspace", "lift_from_list succeeded", &[
+                                                    ("cursor_after", &cursor_after.to_string()),
+                                                ]);
+                                                dispatch(txn);
+                                            }
+                                        }
+                                    }
+
+                                    // Fallback: delete a single character (works for mid-text
+                                    // and any case where the above didn't dispatch)
+                                    if !at_block_start {
+                                        if let Ok(txn) = state_with_sel.transaction().delete(pos - 1, pos) {
+                                            super::debug::log("backspace", "delete char", &[
+                                                ("from", &(pos - 1).to_string()),
+                                                ("to", &pos.to_string()),
+                                            ]);
+                                            dispatch(txn);
+                                        } else {
+                                            super::debug::warn("backspace", "delete char failed");
+                                        }
+                                    }
                                 }
                             }
                         } else if let Ok(txn) = state_with_sel.transaction().delete_selection() {
@@ -291,7 +362,10 @@ impl EditorView {
                             let pos = state_with_sel.selection.from();
                             let max = state_with_sel.doc.content_size();
                             if pos < max {
-                                if let Ok(txn) =
+                                // Try joining with next block first (delete at block end)
+                                if let Ok(txn) = state_with_sel.transaction().join_forward() {
+                                    dispatch(txn);
+                                } else if let Ok(txn) =
                                     state_with_sel.transaction().delete(pos, pos + 1)
                                 {
                                     dispatch(txn);
@@ -305,18 +379,66 @@ impl EditorView {
                 "insertParagraph" => {
                     event.prevent_default();
                     if let Some(sel) = read_dom_selection_from(&container2) {
+                        super::debug::log("enter", "split_block", &[
+                            ("pos", &sel.from().to_string()),
+                        ]);
                         let state_with_sel = EditorState {
                             selection: sel,
                             ..current_state
                         };
                         if let Ok(txn) = state_with_sel.transaction().split_block() {
                             dispatch(txn);
+                        } else {
+                            super::debug::error("enter", "split_block failed");
+                        }
+                    }
+                }
+                "insertLineBreak" | "insertSoftLineBreak" => {
+                    // Shift+Enter: insert a hard break (<br>) without splitting the block
+                    event.prevent_default();
+                    if let Some(sel) = read_dom_selection_from(&container2) {
+                        let state_with_sel = EditorState {
+                            selection: sel,
+                            ..current_state
+                        };
+                        let from = state_with_sel.selection.from();
+                        let to = state_with_sel.selection.to();
+                        let br_node = super::model::Node::element(
+                            super::model::NodeType::HardBreak,
+                        );
+                        let content = super::model::Fragment::from(vec![br_node]);
+                        let slice = super::model::Slice::new(content, 0, 0);
+                        if let Ok(txn) = state_with_sel.transaction().replace(from, to, slice) {
+                            dispatch(txn);
+                        }
+                    }
+                }
+                "deleteWordBackward" => {
+                    event.prevent_default();
+                    if let Some(sel) = read_dom_selection_from(&container2) {
+                        let state_with_sel = EditorState {
+                            selection: sel,
+                            ..current_state.clone()
+                        };
+                        if let Ok(txn) = state_with_sel.transaction().delete_word_backward() {
+                            dispatch(txn);
+                        }
+                    }
+                }
+                "deleteWordForward" => {
+                    event.prevent_default();
+                    if let Some(sel) = read_dom_selection_from(&container2) {
+                        let state_with_sel = EditorState {
+                            selection: sel,
+                            ..current_state.clone()
+                        };
+                        if let Ok(txn) = state_with_sel.transaction().delete_word_forward() {
+                            dispatch(txn);
                         }
                     }
                 }
                 // Prevent unhandled input types from mutating DOM without model update
-                "deleteWordBackward" | "deleteWordForward"
-                | "deleteSoftLineBackward" | "deleteSoftLineForward"
+                "deleteSoftLineBackward" | "deleteSoftLineForward"
                 | "deleteHardLineBackward" | "deleteHardLineForward"
                 | "insertFromPaste" | "insertFromDrop"
                 | "historyUndo" | "historyRedo" => {
@@ -370,6 +492,202 @@ impl EditorView {
             }
         }) as Box<dyn Fn(web_sys::Event)>);
         self.add_listener("compositionend", on_comp_end);
+
+        // copy — serialize selection to clipboard
+        let state_copy = Rc::clone(&self.state);
+        let container_copy = self.container.clone();
+        let on_copy = Closure::wrap(Box::new(move |event: web_sys::Event| {
+            event.prevent_default();
+            let Some(ce) = event.dyn_ref::<web_sys::ClipboardEvent>() else { return };
+            let Some(clipboard_data) = ce.clipboard_data() else { return };
+            let Some(sel) = read_dom_selection_from(&container_copy) else { return };
+
+            let state = state_copy.borrow().clone();
+            let state_with_sel = EditorState {
+                selection: sel,
+                ..state
+            };
+            let slice = state_with_sel.selected_slice();
+            if slice.content.children.is_empty() {
+                return;
+            }
+
+            let html = super::clipboard::serialize_to_html(&slice);
+            let text = super::clipboard::serialize_to_text(&slice);
+            clipboard_data.set_data("text/html", &html).ok();
+            clipboard_data.set_data("text/plain", &text).ok();
+        }) as Box<dyn Fn(web_sys::Event)>);
+        self.add_listener("copy", on_copy);
+
+        // cut — copy to clipboard + delete selection
+        let state_cut = Rc::clone(&self.state);
+        let dispatch_cut = Rc::clone(&self.dispatch);
+        let container_cut = self.container.clone();
+        let on_cut = Closure::wrap(Box::new(move |event: web_sys::Event| {
+            event.prevent_default();
+            let Some(ce) = event.dyn_ref::<web_sys::ClipboardEvent>() else { return };
+            let Some(clipboard_data) = ce.clipboard_data() else { return };
+            let Some(sel) = read_dom_selection_from(&container_cut) else { return };
+
+            let state = state_cut.borrow().clone();
+            let state_with_sel = EditorState {
+                selection: sel,
+                ..state
+            };
+            let slice = state_with_sel.selected_slice();
+            if slice.content.children.is_empty() {
+                return;
+            }
+
+            let html = super::clipboard::serialize_to_html(&slice);
+            let text = super::clipboard::serialize_to_text(&slice);
+            clipboard_data.set_data("text/html", &html).ok();
+            clipboard_data.set_data("text/plain", &text).ok();
+
+            // Delete the selection
+            if let Ok(txn) = state_with_sel.transaction().delete_selection() {
+                dispatch_cut(txn);
+            }
+        }) as Box<dyn Fn(web_sys::Event)>);
+        self.add_listener("cut", on_cut);
+
+        // paste — read clipboard and insert content
+        let state_paste = Rc::clone(&self.state);
+        let dispatch_paste = Rc::clone(&self.dispatch);
+        let container_paste = self.container.clone();
+        let on_paste = Closure::wrap(Box::new(move |event: web_sys::Event| {
+            event.prevent_default();
+            let Some(ce) = event.dyn_ref::<web_sys::ClipboardEvent>() else { return };
+            let Some(clipboard_data) = ce.clipboard_data() else { return };
+            let Some(sel) = read_dom_selection_from(&container_paste) else { return };
+
+            let state = state_paste.borrow().clone();
+            let state_with_sel = EditorState {
+                selection: sel,
+                ..state
+            };
+
+            // Try HTML first, fall back to plain text
+            let html = clipboard_data.get_data("text/html").unwrap_or_default();
+            let slice = if !html.is_empty() {
+                super::debug::log("paste", "parsing HTML", &[
+                    ("len", &html.len().to_string()),
+                ]);
+                super::clipboard::parse_from_html(&html)
+            } else {
+                let text = clipboard_data.get_data("text/plain").unwrap_or_default();
+                if text.is_empty() {
+                    return;
+                }
+                super::debug::log("paste", "parsing plain text", &[
+                    ("len", &text.len().to_string()),
+                ]);
+                super::clipboard::parse_from_text(&text)
+            };
+
+            if slice.content.children.is_empty() {
+                super::debug::warn("paste", "parsed slice is empty");
+                return;
+            }
+
+            // Determine paste context and strategy
+            let pos = state_with_sel.selection.from();
+            let in_list = super::state::find_item_at(&state_with_sel.doc, pos).is_some();
+            super::debug::log("paste", "context", &[
+                ("pos", &pos.to_string()),
+                ("in_list", &in_list.to_string()),
+                ("slice_children", &slice.content.children.len().to_string()),
+            ]);
+            let pasting_list = slice.content.children.iter().any(|n| matches!(
+                n.node_type(),
+                Some(super::model::NodeType::BulletList)
+                    | Some(super::model::NodeType::OrderedList)
+                    | Some(super::model::NodeType::TaskList)
+            ));
+
+            if in_list && pasting_list {
+                // Pasting list items into a list: extract items from the pasted list
+                // and insert them as siblings in the current list.
+                // Non-list content (e.g., a stray Heading captured by the selection)
+                // is converted to list items to avoid inserting invalid children.
+                let mut items = Vec::new();
+                for node in &slice.content.children {
+                    if let Some(nt) = node.node_type() {
+                        if matches!(nt,
+                            super::model::NodeType::BulletList
+                            | super::model::NodeType::OrderedList
+                            | super::model::NodeType::TaskList
+                        ) {
+                            // Extract list items from the pasted list
+                            for j in 0..node.child_count() {
+                                if let Some(item) = node.child(j) {
+                                    items.push(item.clone());
+                                }
+                            }
+                        } else if matches!(nt,
+                            super::model::NodeType::ListItem
+                            | super::model::NodeType::TaskItem
+                        ) {
+                            // Already a list item — use as-is
+                            items.push(node.clone());
+                        } else {
+                            // Non-list content (Heading, Paragraph, etc.):
+                            // wrap in a ListItem if it has text, otherwise skip
+                            let text = node.text_content();
+                            if !text.trim().is_empty() {
+                                let para = super::model::Node::element_with_content(
+                                    super::model::NodeType::Paragraph,
+                                    super::model::Fragment::from(vec![
+                                        super::model::Node::text(&text),
+                                    ]),
+                                );
+                                items.push(super::model::Node::element_with_content(
+                                    super::model::NodeType::ListItem,
+                                    super::model::Fragment::from(vec![para]),
+                                ));
+                            }
+                            // Empty non-list nodes (like the stray empty Heading) are dropped
+                        }
+                    }
+                }
+                let item_info = super::state::find_item_at(&state_with_sel.doc, pos);
+                if let Some(item) = item_info {
+                    let item_text = item.content.children.iter()
+                        .map(|c| c.text_content())
+                        .collect::<String>();
+                    let item_is_empty = item_text.trim().is_empty();
+
+                    let item_slice = super::model::Slice::new(
+                        super::model::Fragment::from(items), 0, 0,
+                    );
+
+                    if item_is_empty {
+                        // Empty bullet: replace it with the pasted items
+                        let from = item.offset;
+                        let to = item.offset + item.node_size;
+                        if let Ok(txn) = state_with_sel.transaction().replace(from, to, item_slice) {
+                            dispatch_paste(txn);
+                        }
+                    } else {
+                        // Non-empty bullet: insert pasted items before the current item
+                        let insert_pos = item.offset;
+                        if let Ok(txn) = state_with_sel.transaction().replace(insert_pos, insert_pos, item_slice) {
+                            dispatch_paste(txn);
+                        }
+                    }
+                }
+            } else {
+                // Normal paste: fit to block context
+                let parent_type = super::state::find_block_at(&state_with_sel.doc, pos)
+                    .map(|b| b.node_type)
+                    .unwrap_or(super::model::NodeType::Doc);
+                let fitted = super::clipboard::fit_slice_to_context(slice, parent_type);
+                if let Ok(txn) = state_with_sel.transaction().replace_selection(fitted) {
+                    dispatch_paste(txn);
+                }
+            }
+        }) as Box<dyn Fn(web_sys::Event)>);
+        self.add_listener("paste", on_paste);
 
         // selectionchange — sync DOM selection to model so toolbar updates
         // when the user moves the cursor (click, arrow keys).
@@ -598,7 +916,7 @@ fn create_mark_element(doc: &Document, mark: &Mark) -> Option<Element> {
 }
 
 /// Check that a URL uses a safe protocol.
-fn is_safe_url(url: &str) -> bool {
+pub(crate) fn is_safe_url(url: &str) -> bool {
     let lower = url.trim().to_lowercase();
     lower.starts_with("https://")
         || lower.starts_with("http://")

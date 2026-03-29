@@ -41,6 +41,34 @@ impl EditorState {
         Self::create(doc, default_schema())
     }
 
+    /// Extract the selected content as a Slice for clipboard operations.
+    /// Strips empty boundary artifacts that can appear when the browser selection
+    /// lands on a block boundary (e.g., an empty Heading captured at the edge).
+    pub fn selected_slice(&self) -> Slice {
+        let from = self.selection.from();
+        let to = self.selection.to();
+        if from == to {
+            return Slice::empty();
+        }
+        let slice = self.doc.slice(from, to);
+        // Filter out empty non-leaf blocks at the edges of the slice
+        let trimmed: Vec<Node> = slice
+            .content
+            .children
+            .into_iter()
+            .filter(|node| match node {
+                Node::Text { text, .. } => !text.is_empty(),
+                Node::Element { node_type, .. } => {
+                    node_type.is_leaf() || !node.text_content().is_empty()
+                }
+            })
+            .collect();
+        if trimmed.is_empty() {
+            return Slice::empty();
+        }
+        Slice::new(Fragment::from(trimmed), 0, 0)
+    }
+
     /// Create an initial state with an empty document and default schema.
     pub fn empty() -> Self {
         Self::create_default(Node::empty_doc())
@@ -147,6 +175,7 @@ impl Transaction {
     /// Delete the current selection.
     /// When the selection spans multiple blocks, merges the remaining content
     /// of the first and last blocks into a single block.
+    /// For cross-item selections within a list, operates at the item level.
     pub fn delete_selection(self) -> Result<Self, StepError> {
         let from = self.selection.from();
         let to = self.selection.to();
@@ -160,7 +189,42 @@ impl Transaction {
 
         if let (Some(fb), Some(tb)) = (&from_block, &to_block) {
             if fb.offset != tb.offset {
-                // Cross-block selection: merge remaining content into one block
+                // Cross-block selection. Check if both blocks are in list items.
+                let from_item = find_item_at(&self.doc, from);
+                let to_item = find_item_at(&self.doc, to);
+
+                if let (Some(fi), Some(ti)) = (&from_item, &to_item) {
+                    if fi.offset != ti.offset {
+                        // Cross-item selection: merge at the item level.
+                        // Keep content before selection in first item,
+                        // content after selection in last item, merge into one item.
+                        let before_offset = from - fb.content_start;
+                        let after_offset = to - tb.content_start;
+                        let before_content = fb.content.cut(0, before_offset);
+                        let after_content = tb.content.cut(after_offset, tb.content.size());
+                        let merged_content = before_content.append_fragment(after_content);
+                        let merged_para = Node::Element {
+                            node_type: fb.node_type,
+                            attrs: fb.attrs.clone(),
+                            content: merged_content,
+                            marks: vec![],
+                        };
+                        let merged_item = Node::element_with_content(
+                            fi.node_type,
+                            Fragment::from(vec![merged_para]),
+                        );
+
+                        let replace_from = fi.offset;
+                        let replace_to = ti.offset + ti.node_size;
+                        let slice = Slice::new(Fragment::from(vec![merged_item]), 0, 0);
+                        let mut txn = self.replace(replace_from, replace_to, slice)?;
+                        txn.selection = Selection::cursor(from);
+                        return Ok(txn);
+                    }
+                }
+
+                // Cross-block but not cross-item (or not in a list):
+                // merge the two blocks directly
                 let before_offset = from - fb.content_start;
                 let after_offset = to - tb.content_start;
                 let before_content = fb.content.cut(0, before_offset);
@@ -271,23 +335,80 @@ impl Transaction {
         let before_content = block.content.cut(0, inner_pos);
         let after_content = block.content.cut(inner_pos, block.content.size());
 
-        let first = Node::Element {
-            node_type: block.node_type,
-            attrs: block.attrs,
-            content: before_content,
-            marks: vec![],
-        };
-        let first_size = first.node_size();
-        let second = Node::element_with_content(NodeType::Paragraph, after_content);
+        // Check if we're inside a list item — if so, split at the item level
+        if let Some(item) = find_item_at(&txn.doc, pos) {
+            let first_para = Node::Element {
+                node_type: block.node_type,
+                attrs: block.attrs.clone(),
+                content: before_content,
+                marks: vec![],
+            };
+            let second_para =
+                Node::element_with_content(NodeType::Paragraph, after_content);
 
-        let slice = Slice::new(Fragment::from(vec![first, second]), 0, 0);
-        let from = block.offset;
-        let end = block.offset + block.node_size;
+            // Find the index of the split paragraph within the list item's children
+            let mut para_index = 0;
+            let mut child_offset = item.content_start;
+            for (i, child) in item.content.children.iter().enumerate() {
+                if child_offset == block.offset {
+                    para_index = i;
+                    break;
+                }
+                child_offset += child.node_size();
+            }
 
-        let mut txn = txn.replace(from, end, slice)?;
-        txn.selection = Selection::cursor(from + first_size + 1);
-        txn.stored_marks = None;
-        Ok(txn)
+            // First item: children before the split paragraph + first half
+            let mut first_children: Vec<Node> =
+                item.content.children[..para_index].to_vec();
+            first_children.push(first_para);
+            let first_item = Node::Element {
+                node_type: item.node_type,
+                attrs: item.attrs.clone(),
+                content: Fragment::from(first_children),
+                marks: vec![],
+            };
+            let first_item_size = first_item.node_size();
+
+            // Second item: second half + children after the split paragraph
+            let mut second_children = vec![second_para];
+            second_children
+                .extend(item.content.children[para_index + 1..].iter().cloned());
+            let second_item = Node::element_with_content(
+                item.node_type,
+                Fragment::from(second_children),
+            );
+
+            let slice =
+                Slice::new(Fragment::from(vec![first_item, second_item]), 0, 0);
+            let mut txn =
+                txn.replace(item.offset, item.offset + item.node_size, slice)?;
+            // Cursor inside second item's first paragraph content:
+            // item.offset + first_item_size + 1 (item open) + 1 (para open)
+            txn.selection =
+                Selection::cursor(item.offset + first_item_size + 2);
+            txn.stored_marks = None;
+            Ok(txn)
+        } else {
+            // Not in a list item — split at the paragraph level
+            let first = Node::Element {
+                node_type: block.node_type,
+                attrs: block.attrs,
+                content: before_content,
+                marks: vec![],
+            };
+            let first_size = first.node_size();
+            let second =
+                Node::element_with_content(NodeType::Paragraph, after_content);
+
+            let slice = Slice::new(Fragment::from(vec![first, second]), 0, 0);
+            let from = block.offset;
+            let end = block.offset + block.node_size;
+
+            let mut txn = txn.replace(from, end, slice)?;
+            txn.selection = Selection::cursor(from + first_size + 1);
+            txn.stored_marks = None;
+            Ok(txn)
+        }
     }
 
     /// Join the current block with the previous block.
@@ -329,6 +450,185 @@ impl Transaction {
         Ok(txn)
     }
 
+    /// Lift the current list item out of its list.
+    /// Used when backspace is pressed at the start of a list item and
+    /// there's no previous textblock to join with.
+    ///
+    /// Behavior:
+    /// - If the item is the first (or only) item and the list is at the doc level:
+    ///   unwrap it to a plain paragraph before the remaining list.
+    /// - If the item is not the first item: join its content with the previous item.
+    pub fn lift_from_list(self) -> Result<Self, StepError> {
+        let pos = self.selection.from();
+
+        // Must be at the start of a block inside a list item
+        let block = find_block_at(&self.doc, pos)
+            .ok_or_else(|| StepError("cursor not in a block".into()))?;
+        if pos != block.content_start {
+            return Err(StepError("cursor not at block start".into()));
+        }
+
+        let item = find_item_at(&self.doc, pos)
+            .ok_or_else(|| StepError("not in a list item".into()))?;
+        let container = find_container_at(&self.doc, pos)
+            .ok_or_else(|| StepError("not in a container".into()))?;
+
+        // Check if this is the first item in the list by position
+        let is_first_item = item.offset == container.offset + 1;
+
+        if is_first_item {
+            // First item: unwrap from the list.
+            // Extract the paragraph content out as a standalone paragraph
+            // and keep the remaining items (if any) in the list.
+            let para = Node::element_with_content(
+                NodeType::Paragraph,
+                block.content.clone(),
+            );
+
+            // Check if there are remaining items after this one in the list
+            let item_end = item.offset + item.node_size;
+            let container_content_end = container.offset + container.node_size - 1;
+            let has_remaining = item_end < container_content_end;
+
+            if has_remaining {
+                // Replace just this item with the paragraph; keep remaining items in the list
+                // Strategy: replace from container start through this item's end
+                // with the paragraph + a new list containing remaining items
+                // Simpler: replace just the first item with a paragraph BEFORE the list,
+                // and remove the item from inside the list.
+                //
+                // Replace the range [container.offset .. item_end] with just the paragraph.
+                // This removes the list open + first item, leaving remaining items orphaned.
+                // Instead, replace the whole list and rebuild:
+                // [paragraph, list(remaining_items)]
+                //
+                // We can't easily extract remaining items without the list content.
+                // Use doc.slice to get remaining list content.
+                let remaining_slice = self.doc.slice(item_end, container_content_end);
+                let remaining_list = Node::element_with_content(
+                    container.node_type,
+                    remaining_slice.content,
+                );
+                let replacement = vec![para, remaining_list];
+                let slice = Slice::new(Fragment::from(replacement), 0, 0);
+                let mut txn = self.replace(
+                    container.offset,
+                    container.offset + container.node_size,
+                    slice,
+                )?;
+                txn.selection = Selection::cursor(container.offset + 1);
+                Ok(txn)
+            } else {
+                // Only item: replace the entire list with just the paragraph
+                let slice = Slice::new(Fragment::from(vec![para]), 0, 0);
+                let mut txn = self.replace(
+                    container.offset,
+                    container.offset + container.node_size,
+                    slice,
+                )?;
+                txn.selection = Selection::cursor(container.offset + 1);
+                Ok(txn)
+            }
+        } else {
+            // Non-first item: merge current item's content into the previous item.
+            // Find previous item by walking the list's children directly.
+            let list_slice = self.doc.slice(container.offset, container.offset + container.node_size);
+            let list_node = list_slice.content.children.first()
+                .ok_or_else(|| StepError("expected list element".into()))?;
+
+            // Find previous item index and offset
+            let mut prev_item_idx = 0;
+            let mut child_offset = container.offset + 1;
+            for i in 0..list_node.child_count() {
+                let child = list_node.child(i)
+                    .ok_or_else(|| StepError("missing list child".into()))?;
+                if child_offset == item.offset {
+                    break;
+                }
+                prev_item_idx = i;
+                child_offset += child.node_size();
+            }
+
+            let prev_item_node = list_node.child(prev_item_idx)
+                .ok_or_else(|| StepError("no previous item".into()))?;
+            let prev_item_offset = item.offset - prev_item_node.node_size();
+
+            // Merge: take prev item's children, append current block content to last paragraph
+            let mut merged_children: Vec<Node> = Vec::new();
+            for i in 0..prev_item_node.child_count() {
+                if let Some(child) = prev_item_node.child(i) {
+                    merged_children.push(child.clone());
+                }
+            }
+
+            if let Some(last) = merged_children.last_mut() {
+                if let Node::Element { content: last_content, .. } = last {
+                    let merged = last_content.clone().append_fragment(block.content.clone());
+                    *last_content = merged;
+                }
+            }
+
+            // If current item has additional children beyond the first paragraph, append them
+            for i in 1..item.content.children.len() {
+                merged_children.push(item.content.children[i].clone());
+            }
+
+            // Cursor: end of the original prev item's last paragraph content.
+            // prev_item_offset + 1 (item open) + original children sizes - 1 (last para close)
+            // = prev_item_offset + prev_item_node.node_size() - 2
+            let cursor_pos = prev_item_offset + prev_item_node.node_size() - 2;
+
+            let merged_item = Node::element_with_content(
+                item.node_type,
+                Fragment::from(merged_children),
+            );
+
+            let slice = Slice::new(Fragment::from(vec![merged_item]), 0, 0);
+            let mut txn = self.replace(prev_item_offset, item.offset + item.node_size, slice)?;
+            txn.selection = Selection::cursor(cursor_pos);
+            Ok(txn)
+        }
+    }
+
+    /// Join the current block with the next block.
+    /// Used when delete forward is pressed at the end of a block.
+    /// Merges the next block's content into the end of the current block.
+    pub fn join_forward(self) -> Result<Self, StepError> {
+        let pos = self.selection.from();
+        let block = find_block_at(&self.doc, pos)
+            .ok_or_else(|| StepError("cursor not in a block".into()))?;
+
+        let block_content_end = block.offset + block.node_size - 1;
+
+        // Only join if cursor is at the very end of the block's content
+        if pos != block_content_end {
+            return Err(StepError("cursor not at block end".into()));
+        }
+
+        // Find the next sibling textblock by searching just after this block
+        let after_block = block.offset + block.node_size;
+        let next = find_block_at(&self.doc, after_block + 1)
+            .ok_or_else(|| StepError("no next textblock".into()))?;
+
+        // Merge: replace both blocks with one block (current type) containing combined content
+        let merged_content = block.content.append_fragment(next.content);
+        let merged = Node::Element {
+            node_type: block.node_type,
+            attrs: block.attrs,
+            content: merged_content,
+            marks: vec![],
+        };
+        let cursor_pos = pos; // cursor stays where it was
+
+        let from = block.offset;
+        let end = next.offset + next.node_size;
+        let slice = Slice::new(Fragment::from(vec![merged]), 0, 0);
+
+        let mut txn = self.replace(from, end, slice)?;
+        txn.selection = Selection::cursor(cursor_pos);
+        Ok(txn)
+    }
+
     /// Set the selection explicitly.
     pub fn set_selection(mut self, selection: Selection) -> Self {
         self.selection = selection;
@@ -345,6 +645,79 @@ impl Transaction {
     pub fn set_meta(mut self, key: &str, value: &str) -> Self {
         self.meta.insert(key.to_string(), value.to_string());
         self
+    }
+
+    /// Delete the word before the cursor (Ctrl+Backspace).
+    /// Scans backward from cursor to find word boundary, then deletes the range.
+    pub fn delete_word_backward(self) -> Result<Self, StepError> {
+        let pos = self.selection.from();
+        let to = self.selection.to();
+
+        // If there's a selection, just delete it
+        if pos != to {
+            return self.delete(pos, to);
+        }
+
+        let block = find_block_at(&self.doc, pos)
+            .ok_or_else(|| StepError("cursor not in a block".into()))?;
+
+        let text: String = block.content.children.iter().map(|c| c.text_content()).collect();
+        let offset = pos - block.content_start;
+        let chars: Vec<char> = text.chars().collect();
+
+        if offset == 0 {
+            // At start of block — try joining backward instead
+            return self.join_backward();
+        }
+
+        // Scan backward: skip whitespace, then skip word chars
+        let mut i = offset;
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+
+        let delete_from = block.content_start + i;
+        self.delete(delete_from, pos)
+    }
+
+    /// Delete the word after the cursor (Ctrl+Delete).
+    /// Scans forward from cursor to find word boundary, then deletes the range.
+    pub fn delete_word_forward(self) -> Result<Self, StepError> {
+        let pos = self.selection.from();
+        let to = self.selection.to();
+
+        // If there's a selection, just delete it
+        if pos != to {
+            return self.delete(pos, to);
+        }
+
+        let block = find_block_at(&self.doc, pos)
+            .ok_or_else(|| StepError("cursor not in a block".into()))?;
+
+        let text: String = block.content.children.iter().map(|c| c.text_content()).collect();
+        let offset = pos - block.content_start;
+        let chars: Vec<char> = text.chars().collect();
+        let len = chars.len();
+
+        if offset >= len {
+            // At end of block — try joining forward instead
+            return self.join_forward();
+        }
+
+        // Scan forward: skip word chars, then skip whitespace
+        let mut i = offset;
+        while i < len && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < len && chars[i].is_whitespace() {
+            i += 1;
+        }
+
+        let delete_to = block.content_start + i;
+        self.delete(pos, delete_to)
     }
 
     /// Mark that the view should scroll the selection into view.
@@ -365,19 +738,29 @@ impl Transaction {
 
 // ─── Helpers ───────────────────────────────────────────────────
 
-struct BlockInfo {
-    offset: usize,
-    node_size: usize,
-    content_start: usize,
-    node_type: NodeType,
-    attrs: HashMap<String, String>,
-    content: Fragment,
+pub(crate) struct BlockInfo {
+    pub offset: usize,
+    pub node_size: usize,
+    pub content_start: usize,
+    pub node_type: NodeType,
+    pub attrs: HashMap<String, String>,
+    pub content: Fragment,
+}
+
+/// Info about a container node (list or blockquote) that wraps a textblock.
+pub(crate) struct ContainerInfo {
+    /// Offset of the container in its parent's content (absolute position).
+    pub offset: usize,
+    /// Total node size of the container.
+    pub node_size: usize,
+    /// The container's node type.
+    pub node_type: NodeType,
 }
 
 /// Find the innermost text-containing block node at the given position.
 /// Recurses into container blocks (lists, blockquote) to find the
 /// Paragraph/Heading/CodeBlock that actually holds inline content.
-fn find_block_at(doc: &Node, pos: usize) -> Option<BlockInfo> {
+pub(crate) fn find_block_at(doc: &Node, pos: usize) -> Option<BlockInfo> {
     let Node::Element { content, .. } = doc else {
         return None;
     };
@@ -424,6 +807,188 @@ fn find_block_in_children(
         offset += child_size;
     }
     None
+}
+
+/// Find the list item (ListItem or TaskItem) that contains the position, if any.
+pub(crate) fn find_item_at(doc: &Node, pos: usize) -> Option<BlockInfo> {
+    let Node::Element { content, .. } = doc else {
+        return None;
+    };
+    find_item_in_children(&content.children, pos, 0)
+}
+
+fn find_item_in_children(
+    children: &[Node],
+    pos: usize,
+    mut offset: usize,
+) -> Option<BlockInfo> {
+    for child in children {
+        let child_size = child.node_size();
+        if let Node::Element {
+            node_type,
+            attrs,
+            content: child_content,
+            ..
+        } = child
+        {
+            if !node_type.is_leaf() {
+                let content_start = offset + 1;
+                let content_end = offset + child_size - 1;
+                if pos >= content_start && pos <= content_end {
+                    if matches!(node_type, NodeType::ListItem | NodeType::TaskItem) {
+                        // Check for a deeper nested item first
+                        if let Some(inner) = find_item_in_children(
+                            &child_content.children,
+                            pos,
+                            content_start,
+                        ) {
+                            return Some(inner);
+                        }
+                        // No deeper item — this is the innermost
+                        return Some(BlockInfo {
+                            offset,
+                            node_size: child_size,
+                            content_start,
+                            node_type: *node_type,
+                            attrs: attrs.clone(),
+                            content: child_content.clone(),
+                        });
+                    }
+                    // Recurse deeper
+                    return find_item_in_children(
+                        &child_content.children,
+                        pos,
+                        content_start,
+                    );
+                }
+            }
+        }
+        offset += child_size;
+    }
+    None
+}
+
+/// Find the nearest container (list or blockquote) ancestor at a given position.
+/// Searches through the doc tree to find if the textblock at `pos` is inside
+/// a container like BulletList, OrderedList, TaskList, or Blockquote.
+pub(crate) fn find_container_at(doc: &Node, pos: usize) -> Option<ContainerInfo> {
+    let Node::Element { content, .. } = doc else {
+        return None;
+    };
+    find_container_in_children(&content.children, pos, 0)
+}
+
+fn find_container_in_children(
+    children: &[Node],
+    pos: usize,
+    mut offset: usize,
+) -> Option<ContainerInfo> {
+    for child in children {
+        let child_size = child.node_size();
+        if let Node::Element {
+            node_type,
+            content: child_content,
+            ..
+        } = child
+        {
+            if !node_type.is_leaf() {
+                let content_start = offset + 1;
+                let content_end = offset + child_size - 1;
+                if pos >= content_start && pos <= content_end {
+                    if is_container_type(*node_type) {
+                        // Found a container. Check if there's a deeper container inside.
+                        if let Some(inner) = find_container_in_children(
+                            &child_content.children,
+                            pos,
+                            content_start,
+                        ) {
+                            return Some(inner);
+                        }
+                        // No deeper container -- this is the innermost one.
+                        return Some(ContainerInfo {
+                            offset,
+                            node_size: child_size,
+                            node_type: *node_type,
+                        });
+                    }
+                    // Not a container -- recurse to find one deeper
+                    return find_container_in_children(
+                        &child_content.children,
+                        pos,
+                        content_start,
+                    );
+                }
+            }
+        }
+        offset += child_size;
+    }
+    None
+}
+
+/// Find the innermost container of a specific type at a given position.
+/// Unlike `find_container_at` which returns the innermost container of ANY type,
+/// this searches for the innermost container matching `target_type` specifically.
+/// This correctly handles nested containers like Blockquote[BulletList[...]].
+pub(crate) fn find_container_of_type(doc: &Node, pos: usize, target_type: NodeType) -> Option<ContainerInfo> {
+    let Node::Element { content, .. } = doc else {
+        return None;
+    };
+    find_typed_container_in_children(&content.children, pos, 0, target_type)
+}
+
+fn find_typed_container_in_children(
+    children: &[Node],
+    pos: usize,
+    mut offset: usize,
+    target_type: NodeType,
+) -> Option<ContainerInfo> {
+    for child in children {
+        let child_size = child.node_size();
+        if let Node::Element {
+            node_type,
+            content: child_content,
+            ..
+        } = child
+        {
+            if !node_type.is_leaf() {
+                let content_start = offset + 1;
+                let content_end = offset + child_size - 1;
+                if pos >= content_start && pos <= content_end {
+                    // Check if there's a deeper match inside
+                    let inner = find_typed_container_in_children(
+                        &child_content.children,
+                        pos,
+                        content_start,
+                        target_type,
+                    );
+                    if inner.is_some() {
+                        return inner;
+                    }
+                    // No deeper match -- check if THIS node matches
+                    if *node_type == target_type {
+                        return Some(ContainerInfo {
+                            offset,
+                            node_size: child_size,
+                            node_type: *node_type,
+                        });
+                    }
+                    return None; // pos is inside this child but it's not the target type
+                }
+            }
+        }
+        offset += child_size;
+    }
+    None
+}
+
+fn is_container_type(nt: NodeType) -> bool {
+    matches!(
+        nt,
+        NodeType::BulletList
+            | NodeType::OrderedList
+            | NodeType::TaskList
+            | NodeType::Blockquote
+    )
 }
 
 // ─── Tests ──────────────────────────────────────────────────────
@@ -872,7 +1437,7 @@ mod tests {
     }
 
     #[test]
-    fn split_block_in_list_produces_two_paragraphs() {
+    fn split_block_in_list_creates_two_list_items() {
         // doc > bulletList > listItem > paragraph("Hello")
         let doc = Node::element_with_content(
             NodeType::Doc,
@@ -896,12 +1461,23 @@ mod tests {
         };
         let txn = state.transaction().split_block().unwrap();
         let new_state = state.apply(txn);
-        // The ListItem should now have two paragraphs
+        // The BulletList should now have two ListItems
         let list = new_state.doc.child(0).unwrap();
-        let item = list.child(0).unwrap();
-        assert_eq!(item.child_count(), 2);
-        assert_eq!(item.child(0).unwrap().text_content(), "He");
-        assert_eq!(item.child(1).unwrap().text_content(), "llo");
+        assert_eq!(list.child_count(), 2);
+        let item1 = list.child(0).unwrap();
+        assert_eq!(item1.node_type(), Some(NodeType::ListItem));
+        assert_eq!(item1.text_content(), "He");
+        let item2 = list.child(1).unwrap();
+        assert_eq!(item2.node_type(), Some(NodeType::ListItem));
+        assert_eq!(item2.text_content(), "llo");
+        // Cursor should be inside the second item's paragraph
+        // item1: offset 1, size = 1 + (1+2+1) + 1 = 6
+        // item2: offset 7, content_start 8, para at 8, para content_start 9
+        // So cursor at position 9... let's verify:
+        // Actually: item1 at offset 1, first_item_size for ListItem("He"):
+        //   ListItem open(1) + Paragraph("He")(1+2+1=4) + ListItem close(1) = 6
+        // cursor = item.offset + first_item_size + 2 = 1 + 6 + 2 = 9
+        assert_eq!(new_state.selection.from(), 9);
     }
 
     // ── join_backward ──
@@ -942,6 +1518,332 @@ mod tests {
             ..state
         };
         assert!(state.transaction().join_backward().is_err());
+    }
+
+    // ── join_forward ──
+
+    #[test]
+    fn join_forward_merges_paragraphs() {
+        let state = EditorState::create_default(two_para_doc());
+        // Cursor at end of first paragraph's content
+        // para1: offset 0, size 7, content_end = 6
+        let state = EditorState {
+            selection: Selection::cursor(6),
+            ..state
+        };
+        let txn = state.transaction().join_forward().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 1);
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "HelloWorld");
+        // Cursor should stay at position 6
+        assert_eq!(new_state.selection.from(), 6);
+    }
+
+    #[test]
+    fn join_forward_at_last_block_returns_error() {
+        let state = EditorState::create_default(simple_doc());
+        // "Hello world" = 11 chars, para content_end = 12
+        let state = EditorState {
+            selection: Selection::cursor(12),
+            ..state
+        };
+        assert!(state.transaction().join_forward().is_err());
+    }
+
+    #[test]
+    fn join_forward_not_at_block_end_returns_error() {
+        let state = EditorState::create_default(two_para_doc());
+        let state = EditorState {
+            selection: Selection::cursor(3), // middle of first paragraph
+            ..state
+        };
+        assert!(state.transaction().join_forward().is_err());
+    }
+
+    // ── paste list items into empty list item ──
+
+    #[test]
+    fn replace_empty_list_item_with_items() {
+        // doc > BulletList > ListItem > Paragraph(empty)
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::ListItem,
+                    Fragment::from(vec![Node::element(NodeType::Paragraph)]),
+                )]),
+            )]),
+        );
+        // BulletList(0) > ListItem(1) > Para(2..3) > empty
+        // ListItem: offset=1, node_size=4
+        let state = EditorState {
+            selection: Selection::cursor(3),
+            ..EditorState::create_default(doc)
+        };
+
+        // Pasted items: two ListItems
+        let items = vec![
+            Node::element_with_content(
+                NodeType::ListItem,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("item1")]),
+                )]),
+            ),
+            Node::element_with_content(
+                NodeType::ListItem,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("item2")]),
+                )]),
+            ),
+        ];
+        let item_slice = Slice::new(Fragment::from(items), 0, 0);
+
+        // Replace the empty item (offset 1, size 4) with the two new items
+        let txn = state.transaction().replace(1, 5, item_slice).unwrap();
+        let new_state = state.apply(txn);
+
+        // Should still have one BulletList with two items
+        let list = new_state.doc.child(0).unwrap();
+        assert_eq!(list.node_type(), Some(NodeType::BulletList), "Should remain a BulletList");
+        assert_eq!(list.child_count(), 2, "Should have 2 items");
+        assert_eq!(list.child(0).unwrap().text_content(), "item1");
+        assert_eq!(list.child(1).unwrap().text_content(), "item2");
+    }
+
+    #[test]
+    fn replace_empty_item_at_end_of_list() {
+        // doc > BulletList > [ListItem("existing"), ListItem(empty)]
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("existing")]),
+                        )]),
+                    ),
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element(NodeType::Paragraph)]),
+                    ),
+                ]),
+            )]),
+        );
+        // BulletList(0), ListItem1(1) size=12, ListItem2(13) size=4
+        // ListItem2: offset=13, content_start=14, Para(14) size=2
+        // Cursor in empty para at position 15
+        let state = EditorState {
+            selection: Selection::cursor(15),
+            ..EditorState::create_default(doc)
+        };
+
+        let item = find_item_at(&state.doc, 15).unwrap();
+        assert_eq!(item.offset, 13);
+        assert_eq!(item.node_size, 4);
+
+        // Replace the empty item with two new items
+        let items = vec![
+            Node::element_with_content(
+                NodeType::ListItem,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("pasted1")]),
+                )]),
+            ),
+            Node::element_with_content(
+                NodeType::ListItem,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("pasted2")]),
+                )]),
+            ),
+        ];
+        let item_slice = Slice::new(Fragment::from(items), 0, 0);
+        let txn = state.transaction().replace(13, 17, item_slice).unwrap();
+        let new_state = state.apply(txn);
+
+        // Should be ONE list with 3 items
+        assert_eq!(new_state.doc.child_count(), 1, "Should be one block (BulletList)");
+        let list = new_state.doc.child(0).unwrap();
+        assert_eq!(list.node_type(), Some(NodeType::BulletList));
+        assert_eq!(list.child_count(), 3, "Should have 3 items: existing + 2 pasted");
+        assert_eq!(list.child(0).unwrap().text_content(), "existing");
+        assert_eq!(list.child(1).unwrap().text_content(), "pasted1");
+        assert_eq!(list.child(2).unwrap().text_content(), "pasted2");
+    }
+
+    // ── lift_from_list ──
+
+    #[test]
+    fn lift_sole_item_from_list() {
+        // doc > BulletList > ListItem > Paragraph("text")
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::ListItem,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::Paragraph,
+                        Fragment::from(vec![Node::text("text")]),
+                    )]),
+                )]),
+            )]),
+        );
+        // Cursor at start of paragraph content (position 3)
+        let state = EditorState {
+            selection: Selection::cursor(3),
+            ..EditorState::create_default(doc)
+        };
+        let txn = state.transaction().lift_from_list().unwrap();
+        let new_state = state.apply(txn);
+
+        // Should be a plain paragraph, no list
+        assert_eq!(new_state.doc.child_count(), 1);
+        assert_eq!(new_state.doc.child(0).unwrap().node_type(), Some(NodeType::Paragraph));
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "text");
+    }
+
+    #[test]
+    fn lift_first_item_keeps_remaining_list() {
+        // doc > BulletList > [ListItem("first"), ListItem("second")]
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("first")]),
+                        )]),
+                    ),
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("second")]),
+                        )]),
+                    ),
+                ]),
+            )]),
+        );
+        // Cursor at start of "first" (position 3)
+        let state = EditorState {
+            selection: Selection::cursor(3),
+            ..EditorState::create_default(doc)
+        };
+        let txn = state.transaction().lift_from_list().unwrap();
+        let new_state = state.apply(txn);
+
+        // Should be: Paragraph("first") + BulletList > ListItem("second")
+        assert_eq!(new_state.doc.child_count(), 2);
+        assert_eq!(new_state.doc.child(0).unwrap().node_type(), Some(NodeType::Paragraph));
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "first");
+        let list = new_state.doc.child(1).unwrap();
+        assert_eq!(list.node_type(), Some(NodeType::BulletList));
+        assert_eq!(list.child_count(), 1);
+        assert_eq!(list.child(0).unwrap().text_content(), "second");
+    }
+
+    #[test]
+    fn backspace_joins_second_list_item_with_first() {
+        // doc > BulletList > [ListItem("first"), ListItem("second")]
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("first")]),
+                        )]),
+                    ),
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("second")]),
+                        )]),
+                    ),
+                ]),
+            )]),
+        );
+        // Cursor at start of "second" content
+        // ListItem1(1): size=8, ListItem2(9): Para(10), content_start=11
+        // Wait: "first" is 5 chars. Para = 1+5+1=7. ListItem = 1+7+1=9.
+        // ListItem1: offset=1, size=9. ListItem2: offset=10, Para at 11, content_start=12.
+        let state = EditorState {
+            selection: Selection::cursor(12),
+            ..EditorState::create_default(doc)
+        };
+        let txn = state.transaction().lift_from_list().unwrap();
+        let new_state = state.apply(txn);
+
+        // Should join "second" with "first" in one item
+        let list = new_state.doc.child(0).unwrap();
+        assert_eq!(list.node_type(), Some(NodeType::BulletList));
+        assert_eq!(list.child_count(), 1);
+        assert_eq!(list.child(0).unwrap().text_content(), "firstsecond");
+    }
+
+    #[test]
+    fn backspace_joins_third_item_with_second() {
+        // doc > BulletList > [ListItem("asdf1"), ListItem("asdf2"), ListItem("asdf3")]
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("asdf1")]),
+                        )]),
+                    ),
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("asdf2")]),
+                        )]),
+                    ),
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("asdf3")]),
+                        )]),
+                    ),
+                ]),
+            )]),
+        );
+        // Positions: "asdf1"=5 chars, Para=7, ListItem=9
+        // BulletList(0) > ListItem1(1, size=9) > ListItem2(10, size=9) > ListItem3(19, size=9)
+        // ListItem3(19) > Para(20) > content_start=21
+        let state = EditorState {
+            selection: Selection::cursor(21),
+            ..EditorState::create_default(doc)
+        };
+        let txn = state.transaction().lift_from_list().unwrap();
+        let new_state = state.apply(txn);
+
+        // Should join "asdf3" into "asdf2", leaving 2 items
+        let list = new_state.doc.child(0).unwrap();
+        assert_eq!(list.node_type(), Some(NodeType::BulletList));
+        assert_eq!(list.child_count(), 2, "Should have 2 items after join");
+        assert_eq!(list.child(0).unwrap().text_content(), "asdf1");
+        assert_eq!(list.child(1).unwrap().text_content(), "asdf2asdf3");
     }
 
     // ── delete_selection across blocks ──

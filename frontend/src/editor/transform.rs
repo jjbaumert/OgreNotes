@@ -23,6 +23,13 @@ impl StepMap {
         }
     }
 
+    /// Create a StepMap with multiple ranges.
+    /// Ranges must be specified in **output-adjusted** coordinates:
+    /// each range's start accounts for the size changes from all previous ranges.
+    pub fn multi(ranges: Vec<(usize, usize, usize)>) -> Self {
+        Self { ranges }
+    }
+
     /// Map a position through this step's changes.
     /// `bias`: -1 = prefer left side of insertion, 1 = prefer right side.
     pub fn map(&self, mut pos: usize, bias: i32) -> usize {
@@ -101,6 +108,20 @@ pub enum Step {
         node_type: NodeType,
         attrs: HashMap<String, String>,
     },
+    /// Replace the structure around content, preserving the content in a "gap".
+    /// Positions: `from <= gap_from <= gap_to <= to`.
+    /// The content at `gap_from..gap_to` is preserved.
+    /// The structure at `from..gap_from` and `gap_to..to` is replaced
+    /// with the wrapper described by `insert` (Slice with open_start/open_end
+    /// indicating the depth of the gap in the wrapper).
+    ReplaceAround {
+        from: usize,
+        to: usize,
+        gap_from: usize,
+        gap_to: usize,
+        insert: Slice,
+        structure: bool,
+    },
 }
 
 /// Error from applying a step.
@@ -122,6 +143,9 @@ impl Step {
             Step::RemoveMark { from, to, mark } => apply_remove_mark(doc, *from, *to, mark),
             Step::SetAttr { pos, attr, value } => apply_set_attr(doc, *pos, attr, value),
             Step::SetNodeType { pos, node_type, attrs } => apply_set_node_type(doc, *pos, node_type, attrs),
+            Step::ReplaceAround { from, to, gap_from, gap_to, insert, structure } => {
+                apply_replace_around(doc, *from, *to, *gap_from, *gap_to, insert, *structure)
+            }
         }
     }
 
@@ -165,6 +189,44 @@ impl Step {
                     attrs: old_attrs,
                 }
             }
+            Step::ReplaceAround { from, to, gap_from, gap_to, insert, structure } => {
+                // The inverse must reconstruct the old wrapper from the original doc.
+                // The old wrapper structure is the content at from..to with the gap
+                // content (gap_from..gap_to) replaced by an empty placeholder.
+                let before_gap = *gap_from - *from;
+                let after_gap = *to - *gap_to;
+                let old_insert = if before_gap == 0 && after_gap == 0 {
+                    Slice::empty()
+                } else {
+                    // Extract the full node(s) at from..to from the original doc,
+                    // then hollow out the gap content. The simplest approach:
+                    // reconstruct the wrapper with empty content at the gap.
+                    let full_slice = doc_slice(doc, *from, *to);
+                    // The wrapper is the full_slice with gap content replaced by nothing.
+                    // The gap is at relative offset gap_from-from in the slice.
+                    // Use open_start = before_gap, open_end = after_gap to indicate
+                    // the gap depth (number of boundary bytes before/after the gap).
+                    let hollowed = hollow_out(&full_slice.content, before_gap, after_gap);
+                    Slice::new(hollowed, before_gap, after_gap)
+                };
+
+                // In the result doc, compute the new positions.
+                // The insert replaced from..gap_from (before_gap bytes) with insert.open_start bytes
+                // and gap_to..to (after_gap bytes) with insert.open_end bytes.
+                let new_gap_from = *from + insert.open_start;
+                let gap_size = *gap_to - *gap_from;
+                let new_gap_to = new_gap_from + gap_size;
+                let new_to = new_gap_to + insert.open_end;
+
+                Step::ReplaceAround {
+                    from: *from,
+                    to: new_to,
+                    gap_from: new_gap_from,
+                    gap_to: new_gap_to,
+                    insert: old_insert,
+                    structure: *structure,
+                }
+            }
         }
     }
 
@@ -196,6 +258,16 @@ impl Step {
                 node_type: *node_type,
                 attrs: attrs.clone(),
             },
+            Step::ReplaceAround { from, to, gap_from, gap_to, insert, structure } => {
+                Step::ReplaceAround {
+                    from: mapping.map(*from, 1),
+                    to: mapping.map(*to, -1),
+                    gap_from: mapping.map(*gap_from, -1),
+                    gap_to: mapping.map(*gap_to, 1),
+                    insert: insert.clone(),
+                    structure: *structure,
+                }
+            }
         }
     }
 }
@@ -276,6 +348,138 @@ fn replace_in_doc(node: &Node, from: usize, to: usize, slice: &Slice) -> Result<
         content: new_content,
         marks: marks.clone(),
     })
+}
+
+/// Apply ReplaceAround: replace structure around content while preserving the gap.
+fn apply_replace_around(
+    doc: &Node,
+    from: usize,
+    to: usize,
+    gap_from: usize,
+    gap_to: usize,
+    insert: &Slice,
+    _structure: bool,
+) -> Result<(Node, StepMap), StepError> {
+    if from > gap_from || gap_from > gap_to || gap_to > to {
+        return Err(StepError("invalid ReplaceAround positions".into()));
+    }
+
+    // 1. Extract the gap content (the content to preserve)
+    let gap_content = if gap_from < gap_to {
+        doc_slice(doc, gap_from, gap_to)
+    } else {
+        Slice::empty()
+    };
+
+    // 2. Build the full replacement: wrapper structure with gap content inside
+    let replacement = if insert.size() == 0 && insert.open_start == 0 {
+        // No wrapper -- just the gap content (unwrapping)
+        gap_content
+    } else {
+        // Place gap content inside the wrapper at depth open_start
+        let filled = fill_gap(&insert.content, insert.open_start, &gap_content.content)?;
+        Slice::new(filled, 0, 0)
+    };
+
+    // 3. Replace from..to with the filled wrapper
+    let new_doc = replace_in_doc(doc, from, to, &replacement)?;
+
+    // 4. Build multi-range StepMap for correct cursor mapping.
+    // The step replaces two disjoint regions:
+    //   - from..gap_from (old opening structure) -> insert.open_start bytes
+    //   - gap_to..to (old closing structure) -> insert.open_end bytes
+    let before_gap_size = gap_from - from;
+    let after_gap_size = to - gap_to;
+    let insert_before = insert.open_start;
+    let insert_after = insert.open_end;
+
+    // Range 1 is in original coordinates.
+    // Range 2 must be in output-adjusted coordinates (after range 1 has shifted positions).
+    let adjusted_gap_to = if insert_before >= before_gap_size {
+        gap_to + (insert_before - before_gap_size)
+    } else {
+        gap_to - (before_gap_size - insert_before)
+    };
+
+    let map = StepMap::multi(vec![
+        (from, before_gap_size, insert_before),
+        (adjusted_gap_to, after_gap_size, insert_after),
+    ]);
+
+    Ok((new_doc, map))
+}
+
+/// Place gap content inside a wrapper fragment at the given depth.
+/// Descends `depth` levels into the fragment (always following the last child)
+/// and inserts the gap content there.
+fn fill_gap(wrapper: &Fragment, depth: usize, gap_content: &Fragment) -> Result<Fragment, StepError> {
+    if depth == 0 {
+        // At the gap level: place gap content here, replacing any placeholder children
+        return Ok(gap_content.clone());
+    }
+
+    if wrapper.children.is_empty() {
+        return Err(StepError("wrapper has no children at required depth".into()));
+    }
+
+    // Descend into the last child
+    let mut children = wrapper.children.clone();
+    let last_idx = children.len() - 1;
+    match &children[last_idx] {
+        Node::Element { node_type, attrs, content, marks } => {
+            let inner = fill_gap(content, depth - 1, gap_content)?;
+            children[last_idx] = Node::Element {
+                node_type: *node_type,
+                attrs: attrs.clone(),
+                content: inner,
+                marks: marks.clone(),
+            };
+            Ok(Fragment::from(children))
+        }
+        _ => Err(StepError("cannot descend into text node in wrapper".into())),
+    }
+}
+
+/// Hollow out a fragment by removing the innermost content while preserving
+/// the wrapper structure. `before_gap` is the number of boundary bytes before
+/// the gap, `after_gap` is the number after. Each boundary byte corresponds
+/// to one level of nesting (the open or close of an element).
+fn hollow_out(fragment: &Fragment, before_gap: usize, after_gap: usize) -> Fragment {
+    if before_gap == 0 && after_gap == 0 {
+        return Fragment::empty();
+    }
+    if fragment.children.is_empty() {
+        return fragment.clone();
+    }
+
+    // We need to descend before_gap levels into the fragment to find where the
+    // gap content starts, then empty it out. The wrapper is the outer structure.
+    hollow_out_inner(fragment, before_gap)
+}
+
+fn hollow_out_inner(fragment: &Fragment, depth: usize) -> Fragment {
+    if depth == 0 {
+        // At the gap level: return empty content (the gap placeholder)
+        return Fragment::empty();
+    }
+
+    let mut children = fragment.children.clone();
+    if children.is_empty() {
+        return fragment.clone();
+    }
+
+    // Descend into the last child (which contains the gap path)
+    let last_idx = children.len() - 1;
+    if let Node::Element { node_type, attrs, content, marks } = &children[last_idx] {
+        let inner = hollow_out_inner(content, depth - 1);
+        children[last_idx] = Node::Element {
+            node_type: *node_type,
+            attrs: attrs.clone(),
+            content: inner,
+            marks: marks.clone(),
+        };
+    }
+    Fragment::from(children)
 }
 
 /// Apply AddMark: add a mark to all text in from..to.
@@ -711,6 +915,27 @@ impl Transform {
         Ok(t)
     }
 
+    /// Wrap content at from..to in wrapper nodes, preserving the content.
+    /// gap_from..gap_to is the content to preserve.
+    /// insert is the wrapper structure with open_start/open_end indicating gap depth.
+    pub fn wrap_around(
+        self,
+        from: usize,
+        to: usize,
+        gap_from: usize,
+        gap_to: usize,
+        insert: Slice,
+    ) -> Result<Self, StepError> {
+        self.step(Step::ReplaceAround {
+            from,
+            to,
+            gap_from,
+            gap_to,
+            insert,
+            structure: true,
+        })
+    }
+
     /// Map a position through all steps applied so far.
     pub fn map_pos(&self, pos: usize, bias: i32) -> usize {
         let mut result = pos;
@@ -1069,5 +1294,220 @@ mod tests {
         }
         .apply(&doc);
         assert!(result.is_err());
+    }
+
+    // ── ReplaceAround Step ──
+
+    fn make_wrapper(outer: NodeType, inner: NodeType) -> Slice {
+        // Build: Outer[Inner[]] with open_start=2, open_end=2
+        // meaning the gap is 2 levels deep inside the wrapper
+        let inner_node = Node::element(inner);
+        let outer_node = Node::element_with_content(outer, Fragment::from(vec![inner_node]));
+        Slice::new(Fragment::from(vec![outer_node]), 2, 2)
+    }
+
+    fn make_single_wrapper(wrapper_type: NodeType) -> Slice {
+        // Build: Wrapper[] with open_start=1, open_end=1
+        let wrapper = Node::element(wrapper_type);
+        Slice::new(Fragment::from(vec![wrapper]), 1, 1)
+    }
+
+    #[test]
+    fn wrap_paragraph_in_bullet_list() {
+        let doc = simple_doc(); // Doc[Paragraph["Hello world"]]
+        // Paragraph is at offset 0 in doc content, size 13 (2 + 11 chars)
+        let para_size = doc.child(0).unwrap().node_size();
+        assert_eq!(para_size, 13);
+
+        let wrapper = make_wrapper(NodeType::BulletList, NodeType::ListItem);
+        let step = Step::ReplaceAround {
+            from: 0,
+            to: para_size,
+            gap_from: 0,
+            gap_to: para_size,
+            insert: wrapper,
+            structure: true,
+        };
+
+        let (new_doc, map) = step.apply(&doc).unwrap();
+
+        // New doc should be Doc[BulletList[ListItem[Paragraph["Hello world"]]]]
+        let bullet_list = new_doc.child(0).unwrap();
+        assert_eq!(bullet_list.node_type(), Some(NodeType::BulletList));
+        let list_item = bullet_list.child(0).unwrap();
+        assert_eq!(list_item.node_type(), Some(NodeType::ListItem));
+        let para = list_item.child(0).unwrap();
+        assert_eq!(para.node_type(), Some(NodeType::Paragraph));
+        assert_eq!(para.text_content(), "Hello world");
+
+        // Verify position mapping: old pos 1 (start of "Hello") -> new pos 3
+        assert_eq!(map.map(1, 1), 3);
+        // Old pos 12 (end of text) -> new pos 14
+        assert_eq!(map.map(12, 1), 14);
+    }
+
+    #[test]
+    fn unwrap_list_to_paragraph() {
+        // Start with Doc[BulletList[ListItem[Paragraph["Hello world"]]]]
+        let para = Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("Hello world")]),
+        );
+        let list_item = Node::element_with_content(
+            NodeType::ListItem,
+            Fragment::from(vec![para]),
+        );
+        let bullet_list = Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![list_item]),
+        );
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![bullet_list]),
+        );
+
+        // BulletList is at offset 0, size 17 (2 + 2 + 13)
+        let list_size = doc.child(0).unwrap().node_size();
+        assert_eq!(list_size, 17);
+
+        // gap_from = 2 (after BulletList open + ListItem open)
+        // gap_to = 15 (before ListItem close + BulletList close)
+        let step = Step::ReplaceAround {
+            from: 0,
+            to: list_size,
+            gap_from: 2,
+            gap_to: list_size - 2,
+            insert: Slice::empty(),
+            structure: true,
+        };
+
+        let (new_doc, map) = step.apply(&doc).unwrap();
+
+        // Should be Doc[Paragraph["Hello world"]]
+        let first = new_doc.child(0).unwrap();
+        assert_eq!(first.node_type(), Some(NodeType::Paragraph));
+        assert_eq!(first.text_content(), "Hello world");
+
+        // Position mapping: old pos 3 (start of "H" inside list) -> new pos 1
+        assert_eq!(map.map(3, 1), 1);
+    }
+
+    #[test]
+    fn wrap_paragraph_in_blockquote() {
+        let doc = simple_doc();
+        let para_size = doc.child(0).unwrap().node_size();
+
+        let wrapper = make_single_wrapper(NodeType::Blockquote);
+        let step = Step::ReplaceAround {
+            from: 0,
+            to: para_size,
+            gap_from: 0,
+            gap_to: para_size,
+            insert: wrapper,
+            structure: true,
+        };
+
+        let (new_doc, map) = step.apply(&doc).unwrap();
+
+        let bq = new_doc.child(0).unwrap();
+        assert_eq!(bq.node_type(), Some(NodeType::Blockquote));
+        let para = bq.child(0).unwrap();
+        assert_eq!(para.text_content(), "Hello world");
+
+        // Pos 1 -> 2 (shifted by 1 for blockquote boundary)
+        assert_eq!(map.map(1, 1), 2);
+    }
+
+    #[test]
+    fn wrap_invert_roundtrip() {
+        let doc = simple_doc();
+        let para_size = doc.child(0).unwrap().node_size();
+
+        let wrapper = make_wrapper(NodeType::BulletList, NodeType::ListItem);
+        let step = Step::ReplaceAround {
+            from: 0,
+            to: para_size,
+            gap_from: 0,
+            gap_to: para_size,
+            insert: wrapper,
+            structure: true,
+        };
+
+        let (wrapped_doc, _) = step.apply(&doc).unwrap();
+        assert_ne!(doc, wrapped_doc);
+
+        let inverse = step.invert(&doc);
+        let (restored, _) = inverse.apply(&wrapped_doc).unwrap();
+        assert_eq!(doc, restored);
+    }
+
+    #[test]
+    fn unwrap_invert_roundtrip() {
+        let para = Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("Test")]),
+        );
+        let list_item = Node::element_with_content(
+            NodeType::ListItem,
+            Fragment::from(vec![para]),
+        );
+        let bullet_list = Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![list_item]),
+        );
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![bullet_list]),
+        );
+
+        let list_size = doc.child(0).unwrap().node_size();
+        let step = Step::ReplaceAround {
+            from: 0,
+            to: list_size,
+            gap_from: 2,
+            gap_to: list_size - 2,
+            insert: Slice::empty(),
+            structure: true,
+        };
+
+        let (unwrapped, _) = step.apply(&doc).unwrap();
+        let inverse = step.invert(&doc);
+        let (restored, _) = inverse.apply(&unwrapped).unwrap();
+        assert_eq!(doc, restored);
+    }
+
+    #[test]
+    fn stepmap_multi_range() {
+        // Wrapping: insert 2 boundaries at start and 2 at end of a 7-size node
+        let map = StepMap::multi(vec![(0, 0, 2), (9, 0, 2)]);
+
+        // Before content: stays
+        assert_eq!(map.map(0, -1), 0);
+        // Inside content: shifts by 2 (opening wrappers)
+        assert_eq!(map.map(1, 1), 3);
+        assert_eq!(map.map(6, 1), 8);
+        // After content (old pos 7): shifts by 2, then at second insertion point
+        assert_eq!(map.map(7, -1), 9);
+    }
+
+    #[test]
+    fn stepmap_multi_range_unwrap() {
+        // Unwrapping: remove 2 boundaries from start and 2 from end
+        let map = StepMap::multi(vec![(0, 2, 0), (7, 2, 0)]);
+
+        // Inside content (old pos 3): shifted by -2
+        assert_eq!(map.map(3, 1), 1);
+        // After content (old pos 9): shifted by -2, then at second range, -2 more
+        // Actually: range 1 (0, 2, 0): pos 9 > 2, shift to 9-2=7.
+        // range 2 (7, 2, 0): pos 7 == start and old_size==2, end=9.
+        // 7 is at start, bias 1 -> stays at 7? No, pos 7 == start with bias -1 stays at 7.
+        // Let me check: pos=7, start=7, end=9, old_size=2, new_size=0.
+        // pos is inside changed range. pos == start && bias <= 0 -> stays at start = 7.
+        // With bias 1: pos is inside, goes to start + new_size = 7 + 0 = 7.
+        // Actually for pos 9 (after list): range 1: 9 > 2, shift to 7. range 2: 7 is inside [7..9], not > end.
+        // For bias 1: pos==7, start==7, but old_size != 0, so it's "inside the range".
+        // bias >= 0, so... let's check: pos==start && bias<=0 -> no (bias is 1).
+        // pos==end (9)? 7 != 9. So we fall to "inside deleted range" with bias > 0: pos = 7 + 0 = 7.
+        assert_eq!(map.map(9, 1), 7);
     }
 }

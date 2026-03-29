@@ -1,4 +1,5 @@
 pub mod clipboard;
+pub mod debug;
 pub mod commands;
 pub mod input_rules;
 pub mod keymap;

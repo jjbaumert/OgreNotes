@@ -39,17 +39,24 @@ USER#<user_id>            PROFILE                   name, email, avatar_url, cre
 USER#<user_id>            SESSION#<session_id>      expires_at, device_info
 WORKSPACE#<ws_id>         METADATA                  name, owner_id, plan, created_at
 WORKSPACE#<ws_id>         MEMBER#<user_id>          role, joined_at
-DOC#<doc_id>              METADATA                  title, workspace_id, owner_id, created_at, updated_at
-DOC#<doc_id>              SNAPSHOT#<version>        s3_key, size_bytes, crdt_clock
-DOC#<doc_id>              COLLAB#<session_id>       user_id, cursor_pos, last_seen
+DOC#<doc_id>              METADATA                  title, workspace_id, owner_id, created_at, updated_at,
+                                                    snapshot_version, snapshot_s3_key
+DOC#<doc_id>              SNAPSHOT#<version>        s3_key, size_bytes, crdt_clock  (Phase 2: version history)
+DOC#<doc_id>              UPDATE#<clock>            update_bytes, user_id, created_at (Phase 2: CRDT op log)
+DOC#<doc_id>              COLLAB#<session_id>       user_id, cursor_pos, last_seen  (Phase 2: presence)
 THREAD#<thread_id>        METADATA                  doc_id, created_by, created_at
 THREAD#<thread_id>        MSG#<timestamp>#<msg_id>  user_id, content, reactions
 ```
 
-**GSI recommendations:**
-- `GSI1`: `workspace_id` → list all docs/members in a workspace
-- `GSI2`: `user_id` → list all workspaces/docs a user has access to
-- `GSI3`: `doc_id` + `updated_at` → recent activity feed per document
+**GSIs (phased):**
+
+| GSI | PK | SK | Purpose | Phase |
+|-----|----|----|---------|-------|
+| GSI1 | `owner_id` | `updated_at` | List user's documents, sorted by recent | MVP |
+| GSI2 | `parent_id` | `title` | List folder children, sorted alphabetically | MVP |
+| GSI3 | `workspace_id` | `updated_at` | List workspace docs/members | Phase 2 |
+| GSI4 | `user_id` | `created_at` | List user's workspaces, sessions, activity | Phase 2 |
+| GSI5 | `doc_id` | `updated_at` | Activity feed per document | Phase 2 |
 
 ### Redis (Ephemeral / Real-Time State)
 

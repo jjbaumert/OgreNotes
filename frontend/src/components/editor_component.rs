@@ -157,11 +157,34 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                 commands::toggle_mark(MarkType::Code, &state, Some(&dispatch_fn));
             }
             ToolbarCommand::SetParagraph => {
-                // MVP: converting heading -> paragraph requires ReplaceAroundStep.
-                // For now, this is a no-op.
+                commands::set_paragraph(&state, Some(&dispatch_fn));
             }
             ToolbarCommand::SetHeading(level) => {
                 commands::set_heading(level, &state, Some(&dispatch_fn));
+            }
+            ToolbarCommand::ToggleBulletList => {
+                commands::toggle_list(
+                    NodeType::BulletList, NodeType::ListItem,
+                    &state, Some(&dispatch_fn),
+                );
+            }
+            ToolbarCommand::ToggleOrderedList => {
+                commands::toggle_list(
+                    NodeType::OrderedList, NodeType::ListItem,
+                    &state, Some(&dispatch_fn),
+                );
+            }
+            ToolbarCommand::ToggleTaskList => {
+                commands::toggle_list(
+                    NodeType::TaskList, NodeType::TaskItem,
+                    &state, Some(&dispatch_fn),
+                );
+            }
+            ToolbarCommand::ToggleBlockquote => {
+                commands::toggle_blockquote(&state, Some(&dispatch_fn));
+            }
+            ToolbarCommand::InsertHorizontalRule => {
+                commands::insert_horizontal_rule(&state, Some(&dispatch_fn));
             }
             ToolbarCommand::UploadImage => {
                 let doc_id = props.doc_id.clone();

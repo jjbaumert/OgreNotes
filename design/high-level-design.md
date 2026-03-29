@@ -101,23 +101,36 @@ ogrenotes/
 PK                        SK                        Attributes
 ---------------------------------------------------------------------
 USER#<user_id>            PROFILE                   name, email, avatar_url, created_at
-USER#<user_id>            SESSION#<session_id>      expires_at, device_info
+USER#<user_id>            SESSION#<session_id>      refresh_token_hash, expires_at,
+                                                    created_at, device_info
 WORKSPACE#<ws_id>         METADATA                  name, owner_id, plan, created_at
 WORKSPACE#<ws_id>         MEMBER#<user_id>          role, joined_at
-DOC#<doc_id>              METADATA                  title, type, workspace_id, owner_id, created_at
-DOC#<doc_id>              SNAPSHOT#<version>         s3_key, size_bytes, crdt_clock
-DOC#<doc_id>              COLLAB#<session_id>        user_id, cursor_pos, last_seen
+DOC#<doc_id>              METADATA                  title, doc_type, workspace_id, owner_id,
+                                                    created_at, updated_at,
+                                                    snapshot_version, snapshot_s3_key
+DOC#<doc_id>              SNAPSHOT#<version>         s3_key, size_bytes, crdt_clock  (Phase 2: version history)
+DOC#<doc_id>              UPDATE#<clock>             update_bytes, user_id, created_at (Phase 2: CRDT op log)
+DOC#<doc_id>              COLLAB#<session_id>        user_id, cursor_pos, last_seen  (Phase 2: presence)
 THREAD#<thread_id>        METADATA                  doc_id, created_by, created_at
 THREAD#<thread_id>        MSG#<timestamp>#<msg_id>   user_id, content, reactions
-FOLDER#<folder_id>        METADATA                  title, color, parent_id, inherit_mode
+FOLDER#<folder_id>        METADATA                  title, color, parent_id, owner_id, folder_type,
+                                                    created_at, updated_at,
+                                                    inherit_mode (Phase 2: permission inheritance)
 FOLDER#<folder_id>        CHILD#<thread_or_folder>   type (thread|folder)
 FOLDER#<folder_id>        MEMBER#<user_id>           access_level
 ```
 
 **GSIs:**
-- `GSI1`: workspace_id -> docs/members
-- `GSI2`: user_id -> workspaces/docs
-- `GSI3`: doc_id + updated_at -> activity feed
+
+| GSI | PK | SK | Purpose | Phase |
+|-----|----|----|---------|-------|
+| `GSI1` | `owner_id` | `updated_at` | List user's documents, sorted by recent | MVP |
+| `GSI2` | `parent_id` | `title` | List folder children, sorted alphabetically | MVP |
+| `GSI3` | `workspace_id` | `updated_at` | List workspace docs/members | Phase 2 (when workspaces are introduced) |
+| `GSI4` | `user_id` | `created_at` | List user's workspaces, sessions, activity | Phase 2 |
+| `GSI5` | `doc_id` | `updated_at` | Activity feed per document | Phase 2 (notifications) |
+
+MVP ships with GSI1 and GSI2 only. Later GSIs are additive -- DynamoDB supports adding GSIs without downtime. See [mvp-detailed-design.md](mvp-detailed-design.md) "GSI Migration Path" section for details.
 
 ### S3 Object Layout
 
@@ -180,6 +193,8 @@ Client reconnects
           -> Client is in sync
 ```
 
+**MVP note:** Phase 1 uses REST `PUT /documents/:id/content` for full-state saves (no WebSocket, no op log, no compaction). Phase 2 introduces WebSocket sync with a binary message protocol, `UPDATE#` op log writes, and idle compaction. The REST endpoint remains as a fallback. See [mvp-detailed-design.md](mvp-detailed-design.md) "Phase 2 Transition: REST Save to WebSocket Sync" for the full protocol spec.
+
 > Details: [technical-stack.md](technical-stack.md), [rich-text-editor.md](rich-text-editor.md)
 
 ---
@@ -195,6 +210,8 @@ Client reconnects
 | **Transform** | Steps (insert, delete, mark, split, join, wrap, lift) with position mapping | [rich-text-editor.md](rich-text-editor.md) §3 |
 | **View** | contenteditable rendering, DOM mutation observation, input handling, IME | [rich-text-editor.md](rich-text-editor.md) §10 |
 | **Extensions** | Nodes, marks, and functionality plugins | [rich-text-editor.md](rich-text-editor.md) §12-15 |
+
+**Schema duality:** The document schema (node types, mark types, content rules) is defined in two locations: the `collab` crate (server-side, for yrs tag mapping and export) and `frontend/editor` (client-side WASM, for editor validation and transforms). These compile to different targets and cannot share a single module. A cross-schema consistency test in the collab crate validates that both sides agree on node types, mark types, tag names, content rules, and mark exclusion. See [mvp-detailed-design.md](mvp-detailed-design.md) "Schema Duality" section.
 
 ### Quip-Specific Editor Features
 
@@ -260,7 +277,7 @@ Features: @mentions (people, documents, @everyone), emoji reactions, typing indi
 | SAML 2.0 SSO | Enterprise IdP integration (Okta, Azure AD, etc.) |
 | MFA | Hardware keys, authenticator apps |
 
-Tokens expire every 30 days with refresh. Sessions configurable per platform.
+Two-token model: short-lived access tokens (JWT, 15 minutes) in the response body, and long-lived refresh tokens (30 days) in HttpOnly cookies. Sessions configurable per platform.
 
 ### Authorization
 
@@ -274,6 +291,8 @@ Four permission levels enforced on every API call and WebSocket message:
 | Can View | 3 | No | No | No | Yes |
 
 Permissions flow through folder inheritance (overridable via restricted folders). Link sharing adds company-wide or external access with granular controls.
+
+**Implementation:** Authorization is enforced via permission-checking Axum extractors (`ViewableDoc`, `EditableDoc`, `OwnedDoc`, and equivalents for folders). MVP extractors degenerate to ownership checks; Phase 2 adds ACL row lookups (`FOLDER#/MEMBER#` rows) without changing route handler signatures. See [mvp-detailed-design.md](mvp-detailed-design.md) "Authorization Model" for the per-endpoint permission matrix and refactoring plan.
 
 > Details: [authentication.md](authentication.md), [sharing-permissions.md](sharing-permissions.md), [security-concerns.md](security-concerns.md)
 
@@ -329,6 +348,18 @@ Variable substitution at copy time via `[[variable_name]]` double-bracket syntax
 | **Bulk export** | Async API with delta support; 36,000 docs/hour rate limit |
 
 API accepts HTML or Markdown for document creation (no binary file upload endpoint). PDF export limited to 40,000 cells for spreadsheets; charts excluded.
+
+**Export format roadmap:**
+
+| Format | Phase | Notes |
+|--------|-------|-------|
+| HTML | MVP | Implemented in `collab/export.rs` |
+| Markdown | MVP | Implemented in `collab/export.rs` |
+| DOCX | Phase 3 | Ships alongside spreadsheet import/export |
+| XLSX | Phase 3 | Requires spreadsheet engine |
+| PDF | Phase 3 | Async generation via background worker |
+| LaTeX | Phase 5 | Low priority |
+| Bulk export | Phase 4 | Requires admin console + background workers |
 
 > Details: [import-export.md](import-export.md)
 
@@ -524,6 +555,16 @@ The application shell (sidebar, toolbar, file browser, search, sharing dialogs) 
 | **Admin** | User management, events, quarantine, governance |
 | **SCIM** | User/group provisioning (v2.0) |
 
+### API Conventions
+
+- All responses are JSON with **camelCase** keys
+- Errors use a consistent shape: `{"error": "<code>", "message": "<human-readable>"}`
+- List endpoints use cursor-based pagination: `{"items": [...], "nextCursor": "<opaque>"}`
+- Document content endpoints use `application/octet-stream` (binary yrs state)
+- Concurrency control via DynamoDB condition expressions (optimistic locking on `snapshot_version`)
+
+> Details: [mvp-detailed-design.md](mvp-detailed-design.md) (Response Format, Pagination, Concurrency Control sections)
+
 ### Rate Limits
 
 | Scope | Limit |
@@ -532,6 +573,8 @@ The application shell (sidebar, toolbar, file browser, search, sharing dialogs) 
 | Per user (admin) | 100 req/min, 1,500 req/hr |
 | Per organization | 600 req/min |
 | Bulk export | 36,000 docs/hr |
+
+Rate limiting is stub-only in MVP (Phase 4 activates Redis-backed sliding window counters).
 
 > Details: [quip-clean-room.md](quip-clean-room.md)
 
@@ -571,12 +614,18 @@ Quip Slides was retired January 2021. OgreNotes may implement a simplified slide
 
 ### Phase 2 -- Collaboration
 
+- **Workspace/organization entity** (`WORKSPACE#` rows, GSI3/GSI4, default workspace creation, migration of existing MVP docs into user's default workspace)
 - Real-time multi-user editing via yrs + WebSocket
 - Cursor presence and awareness
 - Comments (inline + document-level)
 - Chat (1:1, group, document-attached)
 - Notifications (in-app + email)
 - Sharing with permission levels
+- Block menu (floating per-paragraph menu for heading, list, insert options)
+- `@` menu (universal inserter: people, documents, tables, images, embeds)
+- Document outline (auto-generated ToC from headings)
+- Edit history (per-section diffs with author attribution, version restoration)
+- Archive and Pinned system folders
 
 ### Phase 3 -- Spreadsheets
 
@@ -595,6 +644,9 @@ Quip Slides was retired January 2021. OgreNotes may implement a simplified slide
 - Search (full-text indexing)
 - Templates with mail merge
 - Audit logging and compliance
+- Backup and recovery (scheduled DynamoDB exports to S3 `backups/<date>/`, point-in-time recovery)
+- Automated trash cleanup (30-day soft-delete expiry via background worker)
+- Redis-backed rate limiting (replacing MVP stub)
 
 ### Phase 5 -- Polish
 
@@ -605,6 +657,9 @@ Quip Slides was retired January 2021. OgreNotes may implement a simplified slide
 - Command palette
 - Import/export for all formats
 - Bulk operations
+- Accessibility (ARIA attributes, keyboard navigation, screen reader support)
+- Internationalization (i18n, RTL text support, locale handling)
+- Performance budgets (page load time, time-to-interactive, API response time SLAs)
 
 ---
 

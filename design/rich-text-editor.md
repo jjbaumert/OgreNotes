@@ -429,7 +429,11 @@ Text patterns that trigger document transformations while typing.
 
 ## 8. Key Bindings
 
-### Default Keymap
+### Default Keymap (ProseMirror/TipTap Reference)
+
+The table below documents the standard ProseMirror/TipTap key bindings.
+Our implementation follows Quip shortcuts where they differ (see `mvp-detailed-design.md`
+for the actual MVP keymap and `editor-features.md` for the Quip reference).
 
 | Key | Command |
 |-----|---------|
@@ -461,6 +465,15 @@ Text patterns that trigger document transformations while typing.
 | `Ctrl+Shift+J` | textAlign justify |
 
 Key specification supports modifiers: `Mod` (Ctrl on PC, Cmd on Mac), `Ctrl`, `Alt`, `Shift`, `Meta`.
+
+**Implementation notes (where Quip diverges from ProseMirror):**
+- Strike: Quip uses `Ctrl+Shift+X` (we bind both `Ctrl+Shift+X` and `Ctrl+Shift+S`)
+- Code: Quip uses `Ctrl+Shift+K` (we bind both `Ctrl+Shift+K` and `Ctrl+E`)
+- Bullet list: Quip uses `Ctrl+Shift+L` (we bind this instead of `Ctrl+Shift+8`)
+- Highlight, text alignment, goToNextCell: not implemented in MVP
+- Tab/Shift-Tab: always consumed (`preventDefault`) when inside a list, even when indent/dedent is not possible
+- `Ctrl+Backspace` / `Ctrl+Delete`: word deletion (handled via `deleteWordBackward`/`deleteWordForward` beforeinput)
+- `Shift+Enter`: handled via `insertLineBreak` beforeinput, not keymap
 
 Multiple keymaps are supported with priority ordering -- first match wins.
 
@@ -667,8 +680,8 @@ Default 100. Higher values load first, affecting plugin order and schema precede
 |------|---------|----------|------------|------------|
 | **Bold** | `<strong>` | `Ctrl+B` | `**text**` | - |
 | **Italic** | `<em>` | `Ctrl+I` | `*text*` | - |
-| **Strike** | `<s>` | `Ctrl+Shift+S` | `~~text~~` | - |
-| **Code** | `<code>` | `Ctrl+E` | `` `text` `` | Excludes all other marks |
+| **Strike** | `<s>` | `Ctrl+Shift+S` / `Ctrl+Shift+X` | `~~text~~` | - |
+| **Code** | `<code>` | `Ctrl+E` / `Ctrl+Shift+K` | `` `text` `` | Excludes all other marks |
 | **Underline** | `<u>` | `Ctrl+U` | - | - |
 | **Link** | `<a>` | - | Autolink on type/paste | - |
 | **Highlight** | `<mark>` | `Ctrl+Shift+H` | `==text==` | - |

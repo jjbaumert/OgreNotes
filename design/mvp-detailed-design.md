@@ -21,15 +21,19 @@ Ship a single-user collaborative document editor that proves the core architectu
 ## What Does NOT Ship (But Is Designed For)
 
 - Multi-user real-time collaboration (Phase 2)
+- Workspace/organization entity (Phase 2)
 - Comments and chat (Phase 2)
 - Notifications (Phase 2)
 - Sharing and permissions beyond owner (Phase 2)
+- Block menu, `@` menu, document outline, edit history (Phase 2)
+- Archive and Pinned system folders (Phase 2)
 - Spreadsheets (Phase 3)
 - Search (Phase 4)
 - Admin console, SCIM, SSO, MFA (Phase 4)
 - Templates (Phase 4)
 - Mobile optimization (Phase 5)
 - Embeds / integrations (Phase 5)
+- Command palette, typography themes, dark mode (Phase 5)
 
 ---
 
@@ -59,7 +63,9 @@ ogrenotes/
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── document.rs        # Y.Doc lifecycle: create, load, apply update, snapshot
-│   │   │   ├── schema.rs          # Document schema definition (node types, marks, validation)
+│   │   │   ├── schema.rs          # Document schema: node types, marks, yrs tag mapping
+│   │   │   │                      # NOTE: Mirrors frontend/editor/model.rs NodeType/MarkType.
+│   │   │   │                      # See "Schema Duality" section below.
 │   │   │   ├── snapshot.rs        # Serialize/deserialize Y.Doc state to/from bytes
 │   │   │   └── export.rs          # Y.Doc -> HTML, Y.Doc -> Markdown
 │   │   └── Cargo.toml
@@ -93,7 +99,7 @@ ogrenotes/
 │   └── common/                    # Shared types
 │       ├── src/
 │       │   ├── lib.rs
-│       │   ├── id.rs              # ID generation (nanoid or ulid)
+│       │   ├── id.rs              # ID generation (nanoid, 21 chars, URL-safe)
 │       │   ├── error.rs           # Shared error types
 │       │   ├── time.rs            # Timestamp helpers (microsecond precision)
 │       │   └── config.rs          # Shared config types
@@ -190,6 +196,54 @@ FOLDER#<folder_id>          MEMBER#<user_id>            access_level, added_at
 | **GSI1** | `owner_id` | `updated_at` | List user's documents, sorted by recent |
 | **GSI2** | `parent_id` | `title` | List folder children, sorted alphabetically |
 
+### GSI Migration Path
+
+MVP ships with GSI1 (`owner_id -> updated_at`) and GSI2 (`parent_id -> title`). The high-level design requires additional GSIs for workspaces, cross-user queries, and activity feeds. These are added incrementally -- DynamoDB supports adding GSIs to an existing table without downtime or data migration.
+
+**Migration plan:**
+
+| Phase | GSI Added | PK | SK | Notes |
+|-------|-----------|----|----|-------|
+| MVP | GSI1 | `owner_id` | `updated_at` | Already exists. Stays permanently -- user-scoped doc listing is always needed. |
+| MVP | GSI2 | `parent_id` | `title` | Already exists. Stays permanently -- folder child listing is always needed. |
+| Phase 2 | GSI3 | `workspace_id` | `updated_at` | Added when `WORKSPACE#` rows are introduced. Requires backfilling `workspace_id` on existing DOC# rows (one-time migration script). |
+| Phase 2 | GSI4 | `user_id` | `created_at` | For listing user's workspaces, sessions, and cross-entity activity. |
+| Phase 2 | GSI5 | `doc_id` | `updated_at` | For per-document activity feed (edits, comments, shares). |
+
+**Key constraint:** GSI1 and GSI2 are not replaced -- they are supplemented. Existing queries continue to work. New GSIs project onto the same table rows (single-table design) using attributes that MVP already writes or that Phase 2 adds.
+
+**Backfill required for GSI3:** When workspaces ship, existing DOC# METADATA rows need a `workspace_id` attribute added. A migration script assigns all existing docs to the user's default workspace. The GSI backfills automatically once the attribute is present.
+
+### Workspace Introduction (Phase 2)
+
+MVP has no workspace/organization concept. The high-level design's `WORKSPACE#` rows, workspace-scoped GSIs, and multi-tenant queries are introduced in Phase 2 as a prerequisite for sharing and collaboration. The migration path:
+
+1. **Phase 2 adds `WORKSPACE#` rows:**
+   ```
+   PK                          SK                          Attributes
+   --------------------------------------------------------------------------
+   WORKSPACE#<ws_id>           METADATA                    name, owner_id, plan, created_at
+   WORKSPACE#<ws_id>           MEMBER#<user_id>            role, joined_at
+   ```
+
+2. **Default workspace creation:** When a user first upgrades to Phase 2, a migration creates a default `WORKSPACE#` for that user and assigns all their existing documents to it.
+
+3. **DOC# backfill:** A one-time script adds `workspace_id` to every `DOC#<doc_id>/METADATA` row, pointing to the owner's default workspace.
+
+4. **GSI3 activation:** After the backfill, `GSI3` (`workspace_id -> updated_at`) begins serving workspace-scoped queries.
+
+5. **API changes:** Document creation gains an optional `workspace_id` parameter (defaults to user's default workspace). All existing endpoints continue to work -- workspace scoping is additive to owner-based access.
+
+### Snapshot Storage Strategy
+
+The high-level design shows `DOC#<doc_id>/SNAPSHOT#<version>` rows for version history. **MVP does not use SNAPSHOT# rows.** Instead, the latest snapshot reference is stored directly on the `DOC#<doc_id>/METADATA` row as `snapshot_version` and `snapshot_s3_key`.
+
+**Why:** MVP is single-user with no version history UI. Storing the snapshot reference on METADATA avoids an extra DynamoDB query on every document open. The S3 key uses `docs/{doc_id}/snapshots/{version}.bin`, so previous versions remain in S3 but are not referenced (they become orphans until cleanup).
+
+**Phase 2 transition:** When edit history ships (Phase 2), `SNAPSHOT#<version>` rows are added alongside the METADATA reference. Each compaction cycle writes both a new SNAPSHOT# row (for history) and updates the METADATA (for fast latest-version lookup). A backfill script can retroactively create SNAPSHOT# rows from the existing S3 objects if version history for pre-Phase-2 documents is desired.
+
+**S3 orphan cleanup:** MVP's overwrite-style saves leave previous snapshot files in S3. A lifecycle rule or cleanup script should periodically remove unreferenced snapshot files. This is low priority since individual snapshots are small (typically < 10KB).
+
 ### Future-Proofing Notes
 
 - `FOLDER#/MEMBER#` rows exist from day one even though MVP is single-user. Phase 2 adds rows for shared users.
@@ -197,6 +251,7 @@ FOLDER#<folder_id>          MEMBER#<user_id>            access_level, added_at
 - `access_level` field uses the 4-level enum (`OWN`, `EDIT`, `COMMENT`, `VIEW`) from day one. MVP only writes `OWN`.
 - `doc_type` field supports `document`, `spreadsheet`, `chat` from day one. MVP only creates `document`.
 - No `THREAD#/MSG#` rows in MVP. The PK/SK pattern is reserved.
+- No `WORKSPACE#` rows in MVP. Introduced in Phase 2 with a migration path (see "Workspace Introduction" above).
 
 ---
 
@@ -282,9 +337,141 @@ All responses are JSON with camelCase keys. Errors follow a consistent shape:
 
 HTTP status codes: 200 (ok), 201 (created), 204 (no content), 400 (bad request), 401 (unauthorized), 403 (forbidden), 404 (not found), 429 (rate limited), 500 (internal error).
 
+### Pagination
+
+List endpoints (`GET /folders/:id` children) return all results in MVP. Phase 2 adds cursor-based pagination:
+
+```json
+{
+  "items": [...],
+  "nextCursor": "opaque_string_or_null"
+}
+```
+
+The cursor is an opaque base64-encoded DynamoDB `ExclusiveStartKey`. Clients pass `?cursor=<value>` to get the next page. Default page size is 50; maximum is 200. The `GET /folders/:id` response already returns children sorted by GSI2 (`parent_id -> title`), so the cursor maps naturally to the DynamoDB last-evaluated-key.
+
+MVP can return all children without pagination because folder sizes are small in single-user mode. The response shape should include `nextCursor: null` from day one so clients don't break when pagination activates.
+
+### Concurrency Control
+
+MVP uses optimistic concurrency for document content saves via `snapshot_version`:
+
+- `PUT /documents/:id/content` includes a conditional write: `snapshot_version = :expected_version`. If another save raced ahead, the request fails with 409 Conflict.
+- Metadata updates (`PATCH /documents/:id`) do **not** use ETags in MVP. Phase 2 adds `If-Match` / `ETag` headers for metadata when multiple users can edit.
+
+This is already implemented -- `doc_repo.rs` uses a DynamoDB condition expression on `snapshot_version`.
+
+### CORS Policy
+
+MVP CORS configuration (implemented in `api/src/main.rs` via `tower-http`):
+
+| Setting | Value | Rationale |
+|---|---|---|
+| Allowed origins | `FRONTEND_ORIGIN` env var (e.g., `http://localhost:8080`) | Single frontend origin in MVP |
+| Allowed methods | `GET, POST, PUT, PATCH, DELETE, OPTIONS` | All REST methods used by the API |
+| Allowed headers | `Authorization, Content-Type` | JWT bearer token + JSON/binary body |
+| Expose headers | `Content-Type` | Clients need to read response content type |
+| Max age | 3600 seconds | Cache preflight for 1 hour |
+| Credentials | true | Required for HttpOnly refresh token cookie |
+
+Phase 2 may add multiple allowed origins if desktop/mobile apps have different origins.
+
+### Input Limits
+
+| Limit | Value | Enforcement |
+|---|---|---|
+| Document title | 500 characters max | API validation (400 if exceeded) |
+| Folder title | 200 characters max | API validation |
+| Folder nesting depth | 10 levels max | API validation on create/move |
+| Document content size | 10 MB max | API validation (`MAX_CONTENT_SIZE` constant) |
+| Blob upload size | 25 MB max | S3 presigned URL `Content-Length` condition |
+| Allowed blob MIME types | `image/png, image/jpeg, image/gif, image/webp, image/svg+xml, application/pdf, text/plain, text/csv, application/zip` | S3 presigned URL `Content-Type` condition |
+| Folder color | 0-11 | Clamped in storage model |
+
+**SVG safety note:** SVG files can contain JavaScript. Blob download URLs should include `Content-Disposition: attachment` to prevent inline rendering in the browser. This is enforced via the presigned URL response headers.
+
+### Redis in MVP
+
+Redis is configured in the environment (`REDIS_URL`) and included in `docker-compose.yml`, but **no code path uses Redis in MVP**. The `fred` crate is a dependency for Phase 2 readiness. MVP uses DynamoDB for all persistence and has no pubsub, presence, caching, or rate limiting backed by Redis.
+
+Phase 2 activates Redis for: presence tracking, cursor broadcasting, CRDT update pubsub, and session caching. Phase 4 adds Redis-backed rate limiting.
+
+### Authorization Model
+
+MVP enforces a two-layer authorization chain. Phase 2 extends it to a three-layer chain without changing the route handler signatures.
+
+#### MVP Authorization Chain
+
+```
+Request
+  -> Layer 1: AuthUser extractor (JWT validation -> user_id)
+  -> Layer 2: Resource ownership check (owner_id == user_id)
+  -> Handler logic
+```
+
+Layer 1 is the `AuthUser` Axum extractor in `middleware/auth.rs`. Layer 2 is currently inline in each handler -- `get_verified_doc()` for documents and manual `folder.owner_id != user_id` checks for folders.
+
+#### Phase 2 Authorization Chain
+
+```
+Request
+  -> Layer 1: AuthUser extractor (JWT validation -> user_id)
+  -> Layer 2: Permission resolver (check FOLDER#/MEMBER# ACL rows -> access_level)
+  -> Layer 3: Permission guard (required_level <= user's access_level)
+  -> Handler logic
+```
+
+#### Refactoring Plan for Phase 2
+
+The MVP's `get_verified_doc()` and inline ownership checks are replaced with **permission-checking extractors** that encode the required access level:
+
+```rust
+// Phase 2 extractors (replace inline ownership checks)
+
+/// Extracts a document the user can view (access_level >= VIEW).
+struct ViewableDoc(DocumentMeta);
+
+/// Extracts a document the user can edit (access_level >= EDIT).
+struct EditableDoc(DocumentMeta);
+
+/// Extracts a document the user owns (access_level == OWN).
+struct OwnedDoc(DocumentMeta);
+
+/// Same pattern for folders:
+struct ViewableFolder(FolderMeta);
+struct EditableFolder(FolderMeta);
+struct OwnedFolder(FolderMeta);
+```
+
+Each extractor:
+1. Extracts the resource ID from the URL path
+2. Loads the resource metadata from DynamoDB
+3. Looks up the user's `FOLDER#/MEMBER#` row (or document ACL) for access_level
+4. Returns `403 Forbidden` if the user lacks the required level
+5. Returns the resource metadata if authorized
+
+**MVP compatibility:** In MVP, all these extractors degenerate to the ownership check (`owner_id == user_id`). Phase 2 adds ACL row lookups. Route handlers don't change -- they just switch from `get_verified_doc()` to the appropriate extractor.
+
+**Endpoint permission requirements:**
+
+| Endpoint | Required Level | Notes |
+|---|---|---|
+| `GET /documents/:id` | VIEW | Read metadata |
+| `PATCH /documents/:id` | OWN | Only owner can rename/move |
+| `DELETE /documents/:id` | OWN | Only owner can delete |
+| `GET /documents/:id/content` | VIEW | Read content |
+| `PUT /documents/:id/content` | EDIT | Write content |
+| `GET /documents/:id/export/:format` | VIEW | Export is a read operation |
+| `POST /documents/:id/blobs` | EDIT | Upload requires edit access |
+| `GET /documents/:id/blobs/:blob_id` | VIEW | Download is a read operation |
+| `GET /folders/:id` | VIEW | List folder contents |
+| `PATCH /folders/:id` | OWN | Only owner can modify folder |
+| `DELETE /folders/:id` | OWN | Only owner can delete folder |
+| `POST /folders/:id/children` | EDIT | Add to folder requires edit |
+| `DELETE /folders/:id/children/:child_id` | EDIT | Remove from folder requires edit |
+
 ### Future-Proofing Notes
 
-- All endpoints require `Authorization: Bearer <token>`. Phase 2 adds per-document permission checks inside each handler -- the middleware structure is already in place.
 - Document content endpoints use binary (`application/octet-stream`) for yrs state. Phase 2 replaces PUT with WebSocket-based sync; the GET endpoint remains for initial load.
 - Folder children endpoints support both `doc` and `folder` child types. The same endpoints work when documents belong to multiple folders in Phase 2.
 
@@ -399,30 +586,36 @@ Attributes: refresh_token_hash, expires_at (30 days), device_info, created_at
 
 ### Keyboard Shortcuts (MVP)
 
-| Key | Command |
-|-----|---------|
-| `Ctrl+B` | toggleBold |
-| `Ctrl+I` | toggleItalic |
-| `Ctrl+U` | toggleUnderline |
-| `Ctrl+Shift+S` | toggleStrike |
-| `Ctrl+E` | toggleCode |
-| `Ctrl+K` | Insert/edit link |
-| `Ctrl+Alt+0` | setParagraph |
-| `Ctrl+Alt+1-3` | setHeading(level) |
-| `Ctrl+Shift+8` | toggleBulletList |
-| `Ctrl+Shift+7` | toggleOrderedList |
-| `Ctrl+Shift+9` | toggleTaskList |
-| `Ctrl+Shift+B` | toggleBlockquote |
-| `Ctrl+Alt+C` | toggleCodeBlock |
-| `Ctrl+Z` | Undo |
-| `Ctrl+Shift+Z` | Redo |
-| `Ctrl+A` | Select all |
-| `Enter` | Split block / new list item |
-| `Shift+Enter` | Hard break |
-| `Tab` | Indent list item |
-| `Shift+Tab` | Outdent list item |
-| `Backspace` | Join backward / delete selection |
-| `Delete` | Join forward / delete selection |
+Shortcuts follow the Quip interface (see `editor-features.md`). ProseMirror-style alternatives are also bound where they don't conflict.
+
+| Key | Command | Notes |
+|-----|---------|-------|
+| `Ctrl+B` | toggleBold | |
+| `Ctrl+I` | toggleItalic | |
+| `Ctrl+U` | toggleUnderline | |
+| `Ctrl+Shift+X` | toggleStrike | Quip shortcut |
+| `Ctrl+Shift+S` | toggleStrike | ProseMirror alternative |
+| `Ctrl+Shift+K` | toggleCode | Quip shortcut |
+| `Ctrl+E` | toggleCode | ProseMirror alternative |
+| `Ctrl+Alt+0` | setParagraph | |
+| `Ctrl+Alt+1-3` | setHeading(level) | |
+| `Ctrl+Shift+L` | toggleBulletList | Quip shortcut |
+| `Ctrl+A` | Select all | |
+| `Enter` | Split block / new list item | In list items, creates a new item |
+| `Shift+Enter` | Hard break (`<br>`) | Handled via `insertLineBreak` beforeinput |
+| `Tab` | Indent list item | Consumed (preventDefault) even when not applicable |
+| `Shift+Tab` | Outdent list item | Consumed (preventDefault) even when not applicable |
+| `Ctrl+Backspace` | Delete word backward | |
+| `Ctrl+Delete` | Delete word forward | |
+| `Backspace` | Join backward / delete char / delete selection | |
+| `Delete` | Join forward / delete char / delete selection | |
+| `Ctrl+S` | Consumed (no-op) | Prevents browser save dialog |
+| `Ctrl+P` | Consumed (no-op) | Prevents browser print dialog |
+
+**Not yet implemented (events consumed but no action):**
+`Ctrl+Z` (undo), `Ctrl+Shift+Z` (redo), `Ctrl+V` (paste), `Ctrl+K` (link),
+`Ctrl+Shift+7` (ordered list), `Ctrl+Shift+9` (task list),
+`Ctrl+Shift+B` (blockquote), `Ctrl+Alt+C` (code block).
 
 ### Editor Architecture
 
@@ -470,9 +663,36 @@ In MVP, the yrs bridge handles **local persistence only** (no real-time sync):
 
 The bridge maps between the editor's typed document tree and yrs's `Y.XmlFragment`/`Y.XmlElement`/`Y.XmlText` types. Block nodes become XmlElements; inline content uses XmlText with formatting attributes as marks.
 
+### Schema Duality
+
+The document schema is defined in **two places** that must stay synchronized:
+
+| Location | Purpose | Compilation Target |
+|---|---|---|
+| `crates/collab/src/schema.rs` | Server-side: yrs tag mapping, export, CRDT operations | Native Rust (server) |
+| `frontend/src/editor/model.rs` + `frontend/src/editor/schema.rs` | Client-side: editor model, content validation, transforms | WASM (browser) |
+
+**Why two definitions exist:**
+
+The collab crate runs on the server (native Rust) and maps node/mark types to yrs `XmlElement` tag names for CRDT serialization. The frontend editor runs in the browser (WASM) and needs a richer schema model (`NodeSpec` with `inline_content`, `atom`, `defining`, `isolating`, `allowed_marks`, `default_attrs`, etc.) to drive content validation and editing commands. These concerns are architecturally distinct and compile to different targets, so they cannot share a single Rust module without introducing a shared crate that cross-compiles to both targets.
+
+**What must stay synchronized:**
+
+1. **Node type enum variants** -- both must define the same set of node types (Doc, Paragraph, Heading, BulletList, OrderedList, ListItem, TaskList, TaskItem, Blockquote, CodeBlock, HorizontalRule, HardBreak, Image).
+2. **Mark type enum variants** -- both must define the same set (Bold, Italic, Underline, Strike, Code, Link).
+3. **Tag names** -- collab's `NodeType::tag_name()` must match the tag names the yrs bridge in `frontend/editor/yrs_bridge.rs` expects.
+4. **Content rules** -- collab's `NodeType::valid_children()` must agree with the frontend's `NodeSpec::valid_children`. A document valid on the server must also be valid in the editor, and vice versa.
+5. **Mark exclusion** -- collab's `MarkType::excludes_all()` must agree with the frontend's `MarkSpec::exclude_all`.
+
+**Validation mechanism:**
+
+A cross-schema consistency test must be maintained that verifies all five invariants above. This test lives in `crates/collab/tests/` and imports the collab schema, comparing it against a hardcoded expected set that mirrors the frontend definition. When adding a node or mark type to either side, the test fails until both are updated.
+
+Future consideration: if a shared `ogrenotes-schema` crate that compiles to both native and WASM becomes practical, unification is preferred. Until then, the two definitions plus the consistency test are the accepted pattern.
+
 ### Future-Proofing Notes
 
-- The schema definition is extensible. Adding `table`, `spreadsheet`, `embed`, `mention` nodes in later phases requires only adding NodeSpec entries and NodeView implementations -- no schema system changes.
+- The schema definition is extensible. Adding `table`, `spreadsheet`, `embed`, `mention` nodes in later phases requires only adding NodeSpec entries and NodeView implementations -- no schema system changes. **Both schema locations must be updated together** (see Schema Duality above).
 - The yrs bridge is designed for bidirectional sync from day one. Phase 2 adds WebSocket transport and remote update application, but the bridge logic is the same.
 - The plugin system exists in MVP (history, input rules, keymap are all plugins). Phase 2 adds collaboration cursor plugin, comments plugin, etc.
 - The command pattern (check applicability vs execute) enables toolbar state (grayed-out buttons) from day one.
@@ -561,7 +781,7 @@ CSS custom properties for theming from day one:
 }
 ```
 
-Document themes (Phase 2+) swap the `--font-doc-*` properties. Dark mode (Phase 2+) swaps all color properties via a `[data-theme="dark"]` selector.
+Document themes (Phase 5) swap the `--font-doc-*` properties. Dark mode (Phase 5) swaps all color properties via a `[data-theme="dark"]` selector.
 
 ---
 
@@ -572,7 +792,7 @@ Document themes (Phase 2+) swap the `--font-doc-*` properties. Dark mode (Phase 
 ```
 1. User clicks "New Document"
 2. Frontend calls POST /api/v1/documents { title: "Untitled" }
-3. Server generates doc_id (nanoid, 11 chars)
+3. Server generates doc_id (nanoid, 21 chars, 126 bits entropy)
 4. Server creates DOC#<doc_id>/METADATA in DynamoDB
 5. Server creates empty Y.Doc, serializes to S3 snapshot
 6. Server adds FOLDER#<folder_id>/CHILD#<doc_id> for current folder
@@ -616,11 +836,83 @@ Document themes (Phase 2+) swap the `--font-doc-*` properties. Dark mode (Phase 
 6. After 30 days: background job permanently deletes DOC# rows and S3 objects
 ```
 
-### Future-Proofing Notes
+### Phase 2 Transition: REST Save to WebSocket Sync
 
-- Phase 2 replaces auto-save with WebSocket-based streaming. The `PUT /content` endpoint remains as a fallback save mechanism.
-- Phase 2 uses the DynamoDB `UPDATE#` rows as a real-time op log (one row per yrs update from any user). MVP writes full snapshots instead but the rows are available.
-- The 30-day trash retention requires a scheduled cleanup process. MVP can use a manual script; Phase 4 adds a proper background worker.
+MVP uses `PUT /documents/:id/content` to upload a full Y.Doc snapshot on every auto-save. Phase 2 replaces this with real-time incremental sync over WebSocket. This is the most significant architectural change between phases.
+
+#### Coexistence During Transition
+
+Both mechanisms exist in Phase 2. The WebSocket path is primary; the REST path is a fallback:
+
+| Mechanism | When Used | What It Does |
+|---|---|---|
+| **WebSocket (primary)** | Active editing session with open connection | Streams yrs updates incrementally as the user types |
+| **PUT /content (fallback)** | Connection lost, reconnect failed, explicit manual save | Uploads full Y.Doc state as a snapshot |
+| **GET /content** | Initial document open, reconnect | Returns full Y.Doc state (snapshot + pending op log) |
+
+#### WebSocket Protocol
+
+```
+1. Client opens WebSocket to /api/v1/documents/:id/ws
+2. Client sends single-use auth token in first message
+3. Server validates token, loads Y.Doc state (S3 snapshot + UPDATE# rows)
+4. Server sends sync-step-1: full state vector
+5. Client responds with sync-step-2: diff (what server is missing)
+6. Server sends sync-step-2: diff (what client is missing)
+7. Both sides are in sync
+8. --- Streaming phase ---
+9. Client sends yrs update bytes on each edit
+10. Server applies update to server-side Y.Doc
+11. Server appends UPDATE#<clock> row to DynamoDB
+12. Server publishes update to Redis pubsub channel doc:<doc_id>
+13. Other API instances receive via pubsub, fan out to their clients
+14. Client receives updates from other users, merges via CRDT
+```
+
+**WebSocket authentication:** The client first calls `POST /api/v1/documents/:id/ws-token` to get a single-use token (short TTL, 30 seconds). This token is sent as the first WebSocket message. This avoids putting JWTs in WebSocket URL query params (which appear in server logs).
+
+**Message format:** All WebSocket messages are binary frames containing raw yrs update bytes, prefixed by a 1-byte message type:
+
+| Type Byte | Direction | Payload |
+|---|---|---|
+| `0x00` | Client -> Server | Auth token (UTF-8 string) |
+| `0x01` | Bidirectional | yrs sync message (sync-step-1, sync-step-2, or update) |
+| `0x02` | Bidirectional | yrs awareness update (cursor position, user info) |
+| `0x03` | Server -> Client | Error (UTF-8 JSON: `{"error": "...", "message": "..."}`) |
+
+#### Op Log and Compaction
+
+In Phase 2, every yrs update is persisted as a `DOC#<doc_id>/UPDATE#<clock>` row:
+
+```
+PK: DOC#<doc_id>
+SK: UPDATE#<lamport_clock>
+Attributes: update_bytes (Binary), user_id, created_at
+```
+
+**Compaction (idle snapshot):** When a document has no edits for 60 seconds:
+
+1. Server serializes the full Y.Doc state to S3 as a new snapshot
+2. Server updates `DOC#<doc_id>/METADATA` with new `snapshot_version` and `snapshot_s3_key`
+3. Server deletes all `UPDATE#` rows with clock ≤ the snapshot's clock
+4. Next client load reads only the fresh snapshot (no replay needed)
+
+**Why this matters:** Without compaction, the UPDATE# row count grows unboundedly. Load time degrades as more rows must be replayed. The 60-second idle threshold balances write amplification (snapshot is larger than an update) against read performance.
+
+#### MVP Preparation
+
+MVP already has the UPDATE# row schema in DynamoDB but never writes to it. Phase 2 activates this write path. No schema migration is needed -- only code changes in the API's document content handlers and the addition of the WebSocket route.
+
+### Trash Cleanup
+
+Soft-deleted documents remain in DynamoDB and S3 for 30 days. After 30 days they must be permanently deleted. The cleanup mechanism evolves across phases:
+
+| Phase | Mechanism | Details |
+|---|---|---|
+| MVP | Manual script | Run `cargo run --bin trash-cleanup` on demand. Queries `DOC#` rows where `is_deleted=true` and `deleted_at < now - 30 days`. Deletes DOC# rows, S3 snapshots, and FOLDER#/CHILD# references. |
+| Phase 4 | Scheduled background worker | A long-running task (or Lambda) runs daily. Same logic as the manual script but automated and with metrics/alerting. |
+
+The query uses GSI1 (`owner_id -> updated_at`) to find candidate documents, filtered by `is_deleted` and `deleted_at`. This is not index-optimal (scan + filter) but acceptable since the number of deleted documents is small. Phase 4 may add a dedicated GSI (`is_deleted -> deleted_at`) if volume warrants it.
 
 ---
 
@@ -768,7 +1060,7 @@ tests/
 | Test | Description |
 |------|-------------|
 | `id_uniqueness` | Generate 10,000 IDs, assert no duplicates |
-| `id_length` | Generated IDs are exactly 11 characters |
+| `id_length` | Generated IDs are exactly 21 characters (126 bits entropy) |
 | `id_alphabet` | IDs contain only URL-safe characters |
 | `timestamp_microsecond_precision` | `now_usec()` returns microseconds since epoch |
 | `timestamp_roundtrip` | `usec -> DateTime -> usec` preserves value |
@@ -779,7 +1071,7 @@ tests/
 | Property | Description |
 |----------|-------------|
 | `prop_id_is_url_safe` | For any generated ID, all characters are in `[A-Za-z0-9_-]` |
-| `prop_id_length_invariant` | For any generated ID, length is always 11 |
+| `prop_id_length_invariant` | For any generated ID, length is always 21 |
 
 ---
 
@@ -951,18 +1243,28 @@ tests/
 
 #### `frontend/editor` (WASM unit tests)
 
-Run with `wasm-pack test --headless --chrome` or `wasm-bindgen-test`.
+Run with `wasm-pack test --headless --firefox` (or `--chrome` if ChromeDriver version matches).
+
+Unit tests are inline `#[cfg(test)]` modules within each editor source file.
+Browser integration tests use `wasm-bindgen-test` in a single file:
 
 ```
+src/editor/
+├── model.rs         # model unit tests
+├── schema.rs        # schema validation tests
+├── transform.rs     # step/transform tests
+├── commands.rs      # command unit tests
+├── input_rules.rs   # input rule unit tests
+├── selection.rs     # selection tests
+├── state.rs         # transaction/split/join tests
+├── position.rs      # position resolution tests
+└── view.rs          # view rendering tests
+
 tests/
-├── model_test.rs
-├── schema_test.rs
-├── transform_test.rs
-├── commands_test.rs
-├── input_rules_test.rs
-├── selection_test.rs
-└── clipboard_test.rs
+└── browser.rs       # 111 browser integration tests (wasm-bindgen-test)
 ```
+
+Current totals: **298 unit tests** + **111 browser integration tests**.
 
 **Model tests:**
 
@@ -1031,11 +1333,16 @@ tests/
 | `set_paragraph_from_heading` | `setParagraph` converts h2 back to paragraph |
 | `toggle_bullet_list` | Wraps paragraphs in bullet list |
 | `toggle_bullet_list_off` | Unwraps list items back to paragraphs |
-| `indent_list_item` | Tab sinks list item one level |
-| `outdent_list_item` | Shift+Tab lifts list item one level |
-| `split_list_item` | Enter in middle of list item creates two items |
-| `split_empty_list_item_exits` | Enter on empty list item lifts out of list |
-| `insert_hard_break` | Shift+Enter inserts `<br>` without splitting block |
+| `indent_list_item` | Tab sinks list item one level (cursor stays in indented item) |
+| `indent_first_item_consumes_tab` | Tab on first list item is a no-op but prevents focus escape |
+| `outdent_list_item` | Shift+Tab lifts list item one level (cursor stays in lifted item) |
+| `outdent_top_level_consumes_tab` | Shift+Tab at top level is a no-op but prevents focus escape |
+| `split_list_item` | Enter in middle of list item creates two list items (not two paragraphs in one item) |
+| `split_empty_list_item_exits` | Enter on empty list item lifts out of list (not yet implemented) |
+| `insert_hard_break` | Shift+Enter inserts `<br>` without splitting block (via `insertLineBreak` beforeinput) |
+| `join_forward` | Delete at end of block merges with next block (cursor stays at join point) |
+| `delete_word_backward` | Ctrl+Backspace deletes word before cursor (skips whitespace, then word chars) |
+| `delete_word_forward` | Ctrl+Delete deletes word after cursor (skips word chars, then whitespace) |
 | `delete_selection` | With selection, delete removes selected content |
 | `select_all` | selectAll selects from start to end of document |
 
@@ -1055,11 +1362,15 @@ tests/
 | `gt_space_creates_blockquote` | `> ` wraps in blockquote |
 | `triple_backtick_creates_code` | ` ``` ` creates code block |
 | `triple_backtick_with_lang` | ` ```rust ` creates code block with language attr |
-| `triple_dash_creates_hr` | `---` creates horizontal rule |
+| `triple_dash_creates_hr` | `---` replaces paragraph with horizontal rule + new empty paragraph (cursor in new paragraph) |
+| `triple_underscore_creates_hr` | `___` creates horizontal rule (same behavior as `---`) |
 | `double_asterisk_bolds` | `**text**` applies bold mark |
 | `single_asterisk_italicizes` | `*text*` applies italic mark |
 | `backtick_creates_code` | `` `text` `` applies code mark |
-| `input_rule_undoable` | After rule fires, Ctrl+Z reverts to the typed text |
+| `double_underscore_bolds` | `__text__` applies bold mark |
+| `single_underscore_italicizes` | `_text_` applies italic mark |
+| `hash_mid_line_no_effect` | `# ` in middle of text does not convert |
+| `input_rule_undoable` | After rule fires, Ctrl+Z reverts to the typed text (not yet implemented) |
 
 **Selection tests:**
 
@@ -1275,8 +1586,8 @@ cargo test --workspace
 cargo test -p collab
 cargo test -p auth
 
-# WASM editor tests (requires browser/headless chrome)
-cd frontend && wasm-pack test --headless --chrome
+# WASM editor tests (requires headless browser)
+cd frontend && wasm-pack test --headless --firefox
 
 # Integration tests (requires AWS dev resources + Redis)
 cargo test --test '*' -- --test-threads=1
@@ -1359,6 +1670,25 @@ API_PORT=3000
 FRONTEND_ORIGIN=http://localhost:8080
 ```
 
+### Deployment (MVP)
+
+MVP deployment is minimal -- single-instance, no orchestration:
+
+| Component | MVP Deployment | Production (Phase 4+) |
+|---|---|---|
+| API server | Single EC2 instance or ECS task | Auto-scaling ECS service behind ALB |
+| Frontend | Static files served by API or S3 + CloudFront | S3 + CloudFront CDN |
+| DynamoDB | On-demand capacity, single table | On-demand or provisioned with auto-scaling |
+| S3 | Single bucket, default encryption | Versioned bucket with lifecycle rules |
+| Redis | Not used in MVP | ElastiCache cluster in private subnet |
+| CI/CD | GitHub Actions: `cargo test --workspace` + `wasm-pack test` | Full pipeline: test, build, deploy to staging, smoke test, promote to prod |
+| Monitoring | Structured tracing logs to stdout | CloudWatch Logs + Metrics, or Datadog/Grafana |
+| Secrets | `.env` file (local dev) | AWS Secrets Manager or SSM Parameter Store |
+
+MVP does not require a load balancer, auto-scaling, or multi-AZ setup. A single process handles all requests. The stateless API design (no in-memory document state in MVP) means horizontal scaling in Phase 2+ is straightforward -- add instances behind an ALB.
+
+Production deployment design is deferred to Phase 4 (Enterprise). The key prerequisite is that Phase 2's WebSocket support requires sticky sessions or a shared room registry (via Redis), which changes the deployment model.
+
 ---
 
 ## Key Dependencies (Cargo.toml)
@@ -1431,7 +1761,7 @@ gloo = "0.11"
 | **Doc type field** | Only `document` in MVP | Phase 3 `spreadsheet` and Phase 2 `chat` use the same metadata pattern |
 | **Presigned URLs for blobs** | Clients never touch S3 directly | Same pattern scales to any file size; no credential management |
 | **JWT with minimal claims** | Simple auth | Phase 4 adds org/role claims; old JWTs still validate (missing claims = deny) |
-| **CSS custom properties** | One theme | Phase 2 dark mode and document themes swap variables, no CSS rewrite |
+| **CSS custom properties** | One theme | Phase 5 dark mode and document themes swap variables, no CSS rewrite |
 | **Editor plugin system** | History + keymap + input rules | Phase 2 adds collab cursor, comments, decorations as plugins |
 | **Command pattern** | Toolbar state works | Phase 2 command palette lists all registered commands automatically |
 | **Binary content endpoint** | Simple save/load | Phase 2 WebSocket replaces save; GET stays for initial load + reconnect |

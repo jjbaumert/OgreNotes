@@ -295,4 +295,188 @@ mod tests {
         assert_eq!(NodeType::from_tag("unknown"), None);
         assert_eq!(MarkType::from_attr("unknown"), None);
     }
+
+    // ── Cross-schema consistency tests ──────────────────────────────
+    //
+    // These tests verify that the collab crate's schema matches the
+    // expected set defined in the frontend editor (model.rs + schema.rs).
+    // If a node or mark type is added/removed on either side, these
+    // tests must be updated to reflect the change on BOTH sides.
+    //
+    // See "Schema Duality" in design/mvp-detailed-design.md.
+
+    /// All MVP node types. Must match frontend/src/editor/model.rs NodeType enum.
+    const ALL_NODE_TYPES: &[NodeType] = &[
+        NodeType::Doc,
+        NodeType::Paragraph,
+        NodeType::Heading,
+        NodeType::BulletList,
+        NodeType::OrderedList,
+        NodeType::ListItem,
+        NodeType::TaskList,
+        NodeType::TaskItem,
+        NodeType::Blockquote,
+        NodeType::CodeBlock,
+        NodeType::HorizontalRule,
+        NodeType::HardBreak,
+        NodeType::Image,
+    ];
+
+    /// All MVP mark types. Must match frontend/src/editor/model.rs MarkType enum.
+    const ALL_MARK_TYPES: &[MarkType] = &[
+        MarkType::Bold,
+        MarkType::Italic,
+        MarkType::Underline,
+        MarkType::Strike,
+        MarkType::Code,
+        MarkType::Link,
+    ];
+
+    #[test]
+    fn cross_schema_node_type_count() {
+        // If this fails, a node type was added to or removed from the collab
+        // schema without updating the expected set. Update ALL_NODE_TYPES and
+        // the corresponding frontend/src/editor/model.rs NodeType enum.
+        assert_eq!(ALL_NODE_TYPES.len(), 13, "expected 13 MVP node types");
+    }
+
+    #[test]
+    fn cross_schema_mark_type_count() {
+        assert_eq!(ALL_MARK_TYPES.len(), 6, "expected 6 MVP mark types");
+    }
+
+    #[test]
+    fn cross_schema_all_node_tags_roundtrip() {
+        // Every node type must have a tag name, and from_tag must recover it.
+        for nt in ALL_NODE_TYPES {
+            let tag = nt.tag_name();
+            assert_eq!(
+                NodeType::from_tag(tag),
+                Some(*nt),
+                "tag roundtrip failed for {tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_schema_all_mark_attrs_roundtrip() {
+        for mt in ALL_MARK_TYPES {
+            let attr = mt.attr_name();
+            assert_eq!(
+                MarkType::from_attr(attr),
+                Some(*mt),
+                "attr roundtrip failed for {attr}"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_schema_tag_names() {
+        // Tag names must match what the yrs bridge in the frontend expects.
+        let expected: &[(&str, NodeType)] = &[
+            ("doc", NodeType::Doc),
+            ("paragraph", NodeType::Paragraph),
+            ("heading", NodeType::Heading),
+            ("bullet_list", NodeType::BulletList),
+            ("ordered_list", NodeType::OrderedList),
+            ("list_item", NodeType::ListItem),
+            ("task_list", NodeType::TaskList),
+            ("task_item", NodeType::TaskItem),
+            ("blockquote", NodeType::Blockquote),
+            ("code_block", NodeType::CodeBlock),
+            ("horizontal_rule", NodeType::HorizontalRule),
+            ("hard_break", NodeType::HardBreak),
+            ("image", NodeType::Image),
+        ];
+        for (tag, nt) in expected {
+            assert_eq!(nt.tag_name(), *tag, "tag mismatch for {nt:?}");
+        }
+    }
+
+    #[test]
+    fn cross_schema_mark_attr_names() {
+        let expected: &[(&str, MarkType)] = &[
+            ("bold", MarkType::Bold),
+            ("italic", MarkType::Italic),
+            ("underline", MarkType::Underline),
+            ("strike", MarkType::Strike),
+            ("code", MarkType::Code),
+            ("link", MarkType::Link),
+        ];
+        for (attr, mt) in expected {
+            assert_eq!(mt.attr_name(), *attr, "attr name mismatch for {mt:?}");
+        }
+    }
+
+    #[test]
+    fn cross_schema_code_mark_excludes_all() {
+        // Must match frontend MarkSpec for Code: exclude_all: true
+        assert!(MarkType::Code.excludes_all());
+        // All others must NOT exclude all
+        for mt in ALL_MARK_TYPES {
+            if *mt != MarkType::Code {
+                assert!(!mt.excludes_all(), "{mt:?} should not exclude all");
+            }
+        }
+    }
+
+    #[test]
+    fn cross_schema_leaf_nodes() {
+        // Must match frontend NodeSpec: leaf: true
+        let expected_leaves = [NodeType::HorizontalRule, NodeType::HardBreak, NodeType::Image];
+        for nt in ALL_NODE_TYPES {
+            let is_leaf = expected_leaves.contains(nt);
+            assert_eq!(nt.is_leaf(), is_leaf, "leaf mismatch for {nt:?}");
+        }
+    }
+
+    #[test]
+    fn cross_schema_inline_nodes() {
+        // Must match frontend: only HardBreak is inline
+        for nt in ALL_NODE_TYPES {
+            let expected = *nt == NodeType::HardBreak;
+            assert_eq!(nt.is_inline(), expected, "inline mismatch for {nt:?}");
+        }
+    }
+
+    #[test]
+    fn cross_schema_valid_children() {
+        // Must match frontend default_schema() NodeSpec::valid_children.
+        // Doc children:
+        assert_eq!(
+            NodeType::Doc.valid_children(),
+            &[
+                NodeType::Paragraph, NodeType::Heading, NodeType::BulletList,
+                NodeType::OrderedList, NodeType::TaskList, NodeType::Blockquote,
+                NodeType::CodeBlock, NodeType::HorizontalRule, NodeType::Image,
+            ]
+        );
+        // List containers:
+        assert_eq!(NodeType::BulletList.valid_children(), &[NodeType::ListItem]);
+        assert_eq!(NodeType::OrderedList.valid_children(), &[NodeType::ListItem]);
+        assert_eq!(NodeType::TaskList.valid_children(), &[NodeType::TaskItem]);
+        // ListItem / TaskItem:
+        let list_item_children = &[
+            NodeType::Paragraph, NodeType::BulletList, NodeType::OrderedList,
+            NodeType::TaskList, NodeType::Blockquote, NodeType::CodeBlock,
+        ];
+        assert_eq!(NodeType::ListItem.valid_children(), list_item_children);
+        assert_eq!(NodeType::TaskItem.valid_children(), list_item_children);
+        // Blockquote:
+        assert_eq!(
+            NodeType::Blockquote.valid_children(),
+            &[
+                NodeType::Paragraph, NodeType::Heading, NodeType::BulletList,
+                NodeType::OrderedList, NodeType::TaskList, NodeType::Blockquote,
+                NodeType::CodeBlock, NodeType::HorizontalRule, NodeType::Image,
+            ]
+        );
+        // Text containers and leaves have no element children:
+        assert!(NodeType::Paragraph.valid_children().is_empty());
+        assert!(NodeType::Heading.valid_children().is_empty());
+        assert!(NodeType::CodeBlock.valid_children().is_empty());
+        assert!(NodeType::HorizontalRule.valid_children().is_empty());
+        assert!(NodeType::HardBreak.valid_children().is_empty());
+        assert!(NodeType::Image.valid_children().is_empty());
+    }
 }

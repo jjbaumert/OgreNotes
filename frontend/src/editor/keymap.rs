@@ -1,5 +1,5 @@
 use super::commands;
-use super::model::MarkType;
+use super::model::{MarkType, NodeType};
 use super::state::{EditorState, Transaction};
 
 /// A keyboard shortcut specification.
@@ -109,14 +109,25 @@ pub fn default_keymap() -> Keymap {
         .bind("Mod-i", Box::new(|s, d| commands::toggle_mark(MarkType::Italic, s, d)))
         .bind("Mod-u", Box::new(|s, d| commands::toggle_mark(MarkType::Underline, s, d)))
         .bind("Mod-Shift-s", Box::new(|s, d| commands::toggle_mark(MarkType::Strike, s, d)))
+        .bind("Mod-Shift-x", Box::new(|s, d| commands::toggle_mark(MarkType::Strike, s, d)))
         .bind("Mod-e", Box::new(|s, d| commands::toggle_mark(MarkType::Code, s, d)))
+        .bind("Mod-Shift-k", Box::new(|s, d| commands::toggle_mark(MarkType::Code, s, d)))
         // Headings
         .bind("Mod-Alt-1", Box::new(|s, d| commands::set_heading(1, s, d)))
         .bind("Mod-Alt-2", Box::new(|s, d| commands::set_heading(2, s, d)))
         .bind("Mod-Alt-3", Box::new(|s, d| commands::set_heading(3, s, d)))
+        // Block commands
+        .bind("Mod-Alt-0", Box::new(|s, d| commands::set_paragraph(s, d)))
+        .bind("Mod-Shift-l", Box::new(|s, d| commands::toggle_list(NodeType::BulletList, NodeType::ListItem, s, d)))
         // Text commands
         .bind("Mod-a", Box::new(commands::select_all))
-        // Note: Shift-Enter is handled by beforeinput's insertParagraph handler
+        // List indent / dedent
+        .bind("Tab", Box::new(|s, d| commands::sink_list_item(s, d)))
+        .bind("Shift-Tab", Box::new(|s, d| commands::lift_list_item(s, d)))
+        // Consume browser shortcuts to prevent default browser actions
+        .bind("Mod-s", Box::new(|_, _| true)) // prevent browser save dialog
+        .bind("Mod-p", Box::new(|_, _| true)) // prevent browser print dialog
+        // Note: Shift-Enter is handled by beforeinput's insertLineBreak handler
         // in view.rs, not via keymap, to avoid double-dispatch.
 }
 

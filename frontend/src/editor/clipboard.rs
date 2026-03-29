@@ -19,27 +19,367 @@ pub fn serialize_to_text(slice: &Slice) -> String {
 }
 
 /// Parse HTML string into a document Slice.
-/// For MVP, this handles basic inline HTML tags.
+/// In WASM, uses the browser's DomParser for correct HTML handling.
+/// In non-WASM tests, falls back to tag stripping.
 pub fn parse_from_html(html: &str) -> Slice {
-    // Simplified HTML parsing for MVP:
-    // Strip all tags and return plain text.
-    // A full parser would use html5ever, but for the MVP
-    // we just extract text content.
-    let text = strip_tags(html);
-    if text.is_empty() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        parse_from_html_dom(html)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let text = strip_tags(html);
+        if text.is_empty() {
+            return Slice::empty();
+        }
+        Slice::new(Fragment::from(vec![Node::text(&text)]), 0, 0)
+    }
+}
+
+/// Parse HTML using the browser's DomParser (WASM only).
+#[cfg(target_arch = "wasm32")]
+fn parse_from_html_dom(html: &str) -> Slice {
+    use wasm_bindgen::JsCast;
+
+    let parser = match web_sys::DomParser::new() {
+        Ok(p) => p,
+        Err(_) => return Slice::empty(),
+    };
+    let doc = match parser.parse_from_string(html, web_sys::SupportedType::TextHtml) {
+        Ok(d) => d,
+        Err(_) => return Slice::empty(),
+    };
+    let Some(body) = doc.body() else {
+        return Slice::empty();
+    };
+
+    let mut nodes = Vec::new();
+    walk_dom_children(&body, &[], &mut nodes, false);
+
+    if nodes.is_empty() {
         return Slice::empty();
     }
-    let content = Fragment::from(vec![Node::text(&text)]);
-    Slice::new(content, 0, 0)
+    Slice::new(Fragment::from(nodes), 0, 0)
+}
+
+/// Recursively walk DOM children and build model nodes.
+#[cfg(target_arch = "wasm32")]
+fn walk_dom_children(
+    parent: &web_sys::Node,
+    active_marks: &[Mark],
+    out: &mut Vec<Node>,
+    inline_context: bool,
+) {
+    use wasm_bindgen::JsCast;
+
+    let children = parent.child_nodes();
+    for i in 0..children.length() {
+        let Some(child) = children.item(i) else { continue };
+
+        match child.node_type() {
+            web_sys::Node::TEXT_NODE => {
+                let text = child.text_content().unwrap_or_default();
+                if !text.is_empty() {
+                    if active_marks.is_empty() {
+                        out.push(Node::text(&text));
+                    } else {
+                        out.push(Node::text_with_marks(&text, active_marks.to_vec()));
+                    }
+                }
+            }
+            web_sys::Node::ELEMENT_NODE => {
+                let Some(el) = child.dyn_ref::<web_sys::Element>() else { continue };
+                let tag = el.tag_name().to_lowercase();
+
+                // Security: skip dangerous elements entirely
+                if matches!(tag.as_str(), "script" | "style" | "iframe" | "object" | "embed" | "link" | "meta") {
+                    continue;
+                }
+
+                // Check if this is a mark (inline formatting) element
+                if let Some(mark) = tag_to_mark(&tag, el) {
+                    let mut new_marks = active_marks.to_vec();
+                    new_marks.push(mark);
+                    walk_dom_children(&child, &new_marks, out, inline_context);
+                    continue;
+                }
+
+                // Check if this is a known block element
+                if let Some(node_type) = tag_to_block_type(&tag) {
+                    let mut children_nodes = Vec::new();
+
+                    match node_type {
+                        NodeType::Heading => {
+                            let level = match tag.as_str() {
+                                "h1" => "1", "h2" => "2", "h3" => "3",
+                                "h4" => "4", "h5" => "5", "h6" => "6",
+                                _ => "1",
+                            };
+                            walk_dom_children(&child, &[], &mut children_nodes, true);
+                            let mut attrs = std::collections::HashMap::new();
+                            attrs.insert("level".to_string(), level.to_string());
+                            out.push(Node::element_with_attrs(
+                                NodeType::Heading, attrs,
+                                Fragment::from(children_nodes),
+                            ));
+                        }
+                        NodeType::CodeBlock => {
+                            // For <pre>, look for <code> child and extract language
+                            let mut lang = String::new();
+                            let code_el = el.query_selector("code").ok().flatten();
+                            let text_source = code_el.as_ref()
+                                .map(|c| c.dyn_ref::<web_sys::Node>().unwrap())
+                                .unwrap_or(&child);
+                            if let Some(code) = &code_el {
+                                let class = code.class_name();
+                                if let Some(l) = class.strip_prefix("language-") {
+                                    lang = l.to_string();
+                                }
+                            }
+                            let text = text_source.text_content().unwrap_or_default();
+                            let mut attrs = std::collections::HashMap::new();
+                            if !lang.is_empty() {
+                                attrs.insert("language".to_string(), lang);
+                            }
+                            let content = if text.is_empty() {
+                                Fragment::empty()
+                            } else {
+                                Fragment::from(vec![Node::text(&text)])
+                            };
+                            out.push(Node::element_with_attrs(NodeType::CodeBlock, attrs, content));
+                        }
+                        NodeType::HorizontalRule => {
+                            out.push(Node::element(NodeType::HorizontalRule));
+                        }
+                        NodeType::HardBreak => {
+                            out.push(Node::element(NodeType::HardBreak));
+                        }
+                        NodeType::Image => {
+                            let src = el.get_attribute("src").unwrap_or_default();
+                            if super::view::is_safe_url(&src) {
+                                let mut attrs = std::collections::HashMap::new();
+                                attrs.insert("src".to_string(), src);
+                                if let Some(alt) = el.get_attribute("alt") {
+                                    attrs.insert("alt".to_string(), alt);
+                                }
+                                out.push(Node::element_with_attrs(
+                                    NodeType::Image, attrs, Fragment::empty(),
+                                ));
+                            }
+                        }
+                        NodeType::BulletList | NodeType::OrderedList => {
+                            walk_dom_children(&child, &[], &mut children_nodes, false);
+                            out.push(Node::element_with_content(
+                                node_type, Fragment::from(children_nodes),
+                            ));
+                        }
+                        NodeType::ListItem => {
+                            walk_dom_children(&child, &[], &mut children_nodes, false);
+                            // If list item has no block children, wrap inline content in paragraph
+                            let all_inline = children_nodes.iter().all(|n| matches!(n, Node::Text { .. }) || n.is_leaf());
+                            if all_inline {
+                                let para = Node::element_with_content(
+                                    NodeType::Paragraph, Fragment::from(children_nodes),
+                                );
+                                out.push(Node::element_with_content(
+                                    NodeType::ListItem, Fragment::from(vec![para]),
+                                ));
+                            } else {
+                                out.push(Node::element_with_content(
+                                    NodeType::ListItem, Fragment::from(children_nodes),
+                                ));
+                            }
+                        }
+                        _ => {
+                            // Paragraph, Blockquote, etc.
+                            walk_dom_children(&child, &[], &mut children_nodes, true);
+                            out.push(Node::element_with_content(
+                                node_type, Fragment::from(children_nodes),
+                            ));
+                        }
+                    }
+                    continue;
+                }
+
+                // Unknown element: treat as transparent container, recurse
+                walk_dom_children(&child, active_marks, out, inline_context);
+            }
+            _ => {} // Skip comments, processing instructions, etc.
+        }
+    }
+}
+
+/// Map an HTML tag to a mark type.
+#[cfg(target_arch = "wasm32")]
+fn tag_to_mark(tag: &str, el: &web_sys::Element) -> Option<Mark> {
+    match tag {
+        "strong" | "b" => Some(Mark::new(MarkType::Bold)),
+        "em" | "i" => Some(Mark::new(MarkType::Italic)),
+        "u" => Some(Mark::new(MarkType::Underline)),
+        "s" | "del" | "strike" => Some(Mark::new(MarkType::Strike)),
+        "code" => Some(Mark::new(MarkType::Code)),
+        "a" => {
+            let href = el.get_attribute("href").unwrap_or_default();
+            if super::view::is_safe_url(&href) {
+                Some(Mark::new(MarkType::Link).with_attr("href", &href))
+            } else {
+                None // unsafe link — treat as plain text
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Map an HTML tag to a block node type.
+#[cfg(target_arch = "wasm32")]
+fn tag_to_block_type(tag: &str) -> Option<NodeType> {
+    match tag {
+        "p" => Some(NodeType::Paragraph),
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => Some(NodeType::Heading),
+        "ul" => Some(NodeType::BulletList),
+        "ol" => Some(NodeType::OrderedList),
+        "li" => Some(NodeType::ListItem),
+        "blockquote" => Some(NodeType::Blockquote),
+        "pre" => Some(NodeType::CodeBlock),
+        "hr" => Some(NodeType::HorizontalRule),
+        "br" => Some(NodeType::HardBreak),
+        "img" => Some(NodeType::Image),
+        _ => None,
+    }
 }
 
 /// Parse plain text into a Slice.
+/// Multi-line text is split into separate paragraphs.
 pub fn parse_from_text(text: &str) -> Slice {
     if text.is_empty() {
         return Slice::empty();
     }
-    let content = Fragment::from(vec![Node::text(text)]);
-    Slice::new(content, 0, 0)
+    let lines: Vec<&str> = text.split('\n').collect();
+    if lines.len() == 1 {
+        // Single line: inline content
+        Slice::new(Fragment::from(vec![Node::text(text)]), 0, 0)
+    } else {
+        // Multi-line: each line becomes a paragraph
+        let paras: Vec<Node> = lines
+            .iter()
+            .map(|line| {
+                if line.is_empty() {
+                    Node::element(NodeType::Paragraph)
+                } else {
+                    Node::element_with_content(
+                        NodeType::Paragraph,
+                        Fragment::from(vec![Node::text(line)]),
+                    )
+                }
+            })
+            .collect();
+        Slice::new(Fragment::from(paras), 0, 0)
+    }
+}
+
+// ─── Context Fitting ────────────────────────────────────────────
+
+/// Adjust a parsed Slice so its content is valid within the target parent node type.
+/// For example, pasting a Heading inside a ListItem converts it to a Paragraph.
+pub fn fit_slice_to_context(slice: Slice, parent_type: NodeType) -> Slice {
+    if slice.content.children.is_empty() {
+        return slice;
+    }
+
+    let fitted: Vec<Node> = slice
+        .content
+        .children
+        .into_iter()
+        .flat_map(|node| fit_node(node, parent_type))
+        .collect();
+
+    if fitted.is_empty() {
+        return Slice::empty();
+    }
+    Slice::new(Fragment::from(fitted), slice.open_start, slice.open_end)
+}
+
+/// Fit a single node into the target parent context.
+fn fit_node(node: Node, parent_type: NodeType) -> Vec<Node> {
+    match &node {
+        Node::Text { .. } => {
+            // Text nodes are valid inline content anywhere that accepts inline
+            if parent_type.is_textblock() || parent_type == NodeType::CodeBlock {
+                vec![node]
+            } else {
+                // Wrap in a paragraph for block contexts
+                vec![Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![node]),
+                )]
+            }
+        }
+        Node::Element { node_type, content, .. } => {
+            match node_type {
+                // Headings are not valid in list items — downgrade to paragraph
+                NodeType::Heading if !is_valid_child(parent_type, *node_type) => {
+                    vec![Node::element_with_content(
+                        NodeType::Paragraph,
+                        content.clone(),
+                    )]
+                }
+                // Other block nodes that aren't valid — extract content as paragraphs
+                nt if !nt.is_leaf() && !is_valid_child(parent_type, *node_type) => {
+                    // Extract inline content into a paragraph
+                    let text = node.text_content();
+                    if text.is_empty() {
+                        vec![]
+                    } else {
+                        vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text(&text)]),
+                        )]
+                    }
+                }
+                _ => vec![node],
+            }
+        }
+    }
+}
+
+/// Check if a node type is valid as a child of the given parent type.
+fn is_valid_child(parent_type: NodeType, child_type: NodeType) -> bool {
+    match parent_type {
+        NodeType::Doc => matches!(
+            child_type,
+            NodeType::Paragraph
+                | NodeType::Heading
+                | NodeType::BulletList
+                | NodeType::OrderedList
+                | NodeType::TaskList
+                | NodeType::Blockquote
+                | NodeType::CodeBlock
+                | NodeType::HorizontalRule
+                | NodeType::Image
+        ),
+        NodeType::ListItem | NodeType::TaskItem => matches!(
+            child_type,
+            NodeType::Paragraph
+                | NodeType::BulletList
+                | NodeType::OrderedList
+                | NodeType::TaskList
+                | NodeType::Blockquote
+                | NodeType::CodeBlock
+        ),
+        NodeType::Blockquote => matches!(
+            child_type,
+            NodeType::Paragraph
+                | NodeType::Heading
+                | NodeType::BulletList
+                | NodeType::OrderedList
+                | NodeType::TaskList
+                | NodeType::CodeBlock
+                | NodeType::HorizontalRule
+        ),
+        // Textblocks (Paragraph, Heading, CodeBlock) only accept inline content
+        _ if parent_type.is_textblock() => false,
+        _ => true,
+    }
 }
 
 // ─── HTML Rendering ─────────────────────────────────────────────
@@ -430,5 +770,63 @@ mod tests {
         assert!(html.contains("&quot;"));
         // The class attribute value should contain the escaped version
         assert!(html.contains("language-rust&quot;"));
+    }
+
+    // ── fit_slice_to_context ──
+
+    #[test]
+    fn fit_heading_in_list_item_becomes_paragraph() {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("level".to_string(), "1".to_string());
+        let heading = Node::element_with_attrs(
+            NodeType::Heading,
+            attrs,
+            Fragment::from(vec![Node::text("Title")]),
+        );
+        let slice = Slice::new(Fragment::from(vec![heading]), 0, 0);
+        let fitted = fit_slice_to_context(slice, NodeType::ListItem);
+
+        assert_eq!(fitted.content.children.len(), 1);
+        let node = &fitted.content.children[0];
+        assert_eq!(node.node_type(), Some(NodeType::Paragraph));
+        assert_eq!(node.text_content(), "Title");
+    }
+
+    #[test]
+    fn fit_paragraph_in_doc_unchanged() {
+        let para = Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("Hello")]),
+        );
+        let slice = Slice::new(Fragment::from(vec![para]), 0, 0);
+        let fitted = fit_slice_to_context(slice, NodeType::Doc);
+
+        assert_eq!(fitted.content.children.len(), 1);
+        assert_eq!(
+            fitted.content.children[0].node_type(),
+            Some(NodeType::Paragraph)
+        );
+    }
+
+    // ── parse_from_text multiline ──
+
+    #[test]
+    fn parse_text_multiline_creates_paragraphs() {
+        let slice = parse_from_text("Hello\nWorld");
+        assert_eq!(slice.content.children.len(), 2);
+        assert_eq!(
+            slice.content.children[0].node_type(),
+            Some(NodeType::Paragraph)
+        );
+        assert_eq!(slice.content.children[0].text_content(), "Hello");
+        assert_eq!(slice.content.children[1].text_content(), "World");
+    }
+
+    #[test]
+    fn parse_text_single_line_is_inline() {
+        let slice = parse_from_text("Hello");
+        assert_eq!(slice.content.children.len(), 1);
+        // Single line: inline text, no paragraph wrapper
+        assert!(matches!(slice.content.children[0], Node::Text { .. }));
     }
 }
