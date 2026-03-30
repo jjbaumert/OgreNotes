@@ -67,6 +67,10 @@ features = [
     "FileList",
     "Blob",
     "MouseEvent",
+    "WebSocket",
+    "MessageEvent",
+    "BinaryType",
+    "CloseEvent",
 ]
 
 [dev-dependencies]

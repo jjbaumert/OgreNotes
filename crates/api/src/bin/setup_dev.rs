@@ -52,6 +52,7 @@ async fn main() {
         .attribute_definitions(attr_def("updated_at", ScalarAttributeType::N))
         .attribute_definitions(attr_def("parent_id_gsi", ScalarAttributeType::S))
         .attribute_definitions(attr_def("title", ScalarAttributeType::S))
+        .attribute_definitions(attr_def("doc_id_gsi", ScalarAttributeType::S))
         // GSI1: owner -> updated_at (list user's docs by recent)
         .global_secondary_indexes(
             GlobalSecondaryIndex::builder()
@@ -92,6 +93,32 @@ async fn main() {
                 .key_schema(
                     KeySchemaElement::builder()
                         .attribute_name("title")
+                        .key_type(KeyType::Range)
+                        .build()
+                        .unwrap(),
+                )
+                .projection(
+                    Projection::builder()
+                        .projection_type(ProjectionType::All)
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        // GSI5: doc_id -> updated_at (per-document threads/activity)
+        .global_secondary_indexes(
+            GlobalSecondaryIndex::builder()
+                .index_name("GSI5-docid-updated")
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name("doc_id_gsi")
+                        .key_type(KeyType::Hash)
+                        .build()
+                        .unwrap(),
+                )
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name("updated_at")
                         .key_type(KeyType::Range)
                         .build()
                         .unwrap(),

@@ -64,3 +64,13 @@ pub async fn put_content(id: &str, data: &[u8]) -> Result<(), ApiClientError> {
 pub async fn export_document(id: &str, format: &str) -> Result<String, ApiClientError> {
     api_get(&format!("/documents/{id}/export/{format}")).await
 }
+
+#[derive(Deserialize)]
+pub struct WsTokenResponse {
+    pub token: String,
+}
+
+/// Request a single-use WebSocket authentication token for a document.
+pub async fn request_ws_token(id: &str) -> Result<WsTokenResponse, ApiClientError> {
+    api_post(&format!("/documents/{id}/ws-token"), &serde_json::json!({})).await
+}

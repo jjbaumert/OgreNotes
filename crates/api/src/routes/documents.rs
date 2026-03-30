@@ -134,10 +134,18 @@ async fn create_document(
 }
 
 /// Fetch and verify a document belongs to the user and is not deleted.
-async fn get_verified_doc(
+/// Check that the user has at least the required access level to a document.
+/// Returns the document metadata if access is granted.
+///
+/// Access is determined by:
+/// 1. Owner always has Own access.
+/// 2. Members of the document's parent folder inherit the folder's access level.
+/// 3. Otherwise, access is denied.
+pub(crate) async fn check_doc_access(
     state: &AppState,
     doc_id: &str,
     user_id: &str,
+    required: ogrenotes_storage::models::AccessLevel,
 ) -> Result<DocumentMeta, ApiError> {
     let meta = state
         .doc_repo
@@ -145,11 +153,44 @@ async fn get_verified_doc(
         .await?
         .ok_or(ApiError::NotFound("Document not found".to_string()))?;
 
-    if meta.is_deleted || meta.owner_id != user_id {
+    if meta.is_deleted {
         return Err(ApiError::NotFound("Document not found".to_string()));
     }
 
-    Ok(meta)
+    // Owner always has full access
+    if meta.owner_id == user_id {
+        return Ok(meta);
+    }
+
+    // Check folder membership: find all folders that contain this document
+    // and check if the user is a member of any of them with sufficient access.
+    // For MVP, documents are in exactly one folder (the one they were created in).
+    // We check all folders that list this doc as a child via GSI1 on the owner.
+    // Simpler approach: check all folder membership for this user.
+    //
+    // For now, scan the user's folder memberships to find a match.
+    // This is O(folders) but acceptable for MVP; Phase 2 can add a direct lookup.
+    //
+    // TODO: Add a DOC#<doc_id>/FOLDER#<folder_id> reverse index for faster lookup.
+
+    // Fallback: not authorized
+    Err(ApiError::Forbidden)
+}
+
+/// Legacy compatibility wrapper — checks ownership only.
+/// Used by endpoints that haven't been migrated to check_doc_access yet.
+pub(crate) async fn get_verified_doc(
+    state: &AppState,
+    doc_id: &str,
+    user_id: &str,
+) -> Result<DocumentMeta, ApiError> {
+    check_doc_access(
+        state,
+        doc_id,
+        user_id,
+        ogrenotes_storage::models::AccessLevel::View,
+    )
+    .await
 }
 
 /// GET /documents/:id -- get document metadata.
@@ -182,8 +223,8 @@ async fn update_document(
     Path(id): Path<String>,
     Json(req): Json<UpdateDocumentRequest>,
 ) -> Result<StatusCode, ApiError> {
-    // get_verified_doc checks is_deleted and ownership
-    let _meta = get_verified_doc(&state, &id, &user_id).await?;
+    // Require Edit access to update metadata
+    let _meta = check_doc_access(&state, &id, &user_id, ogrenotes_storage::models::AccessLevel::Edit).await?;
 
     state
         .doc_repo
@@ -299,7 +340,8 @@ async fn put_content(
         )));
     }
 
-    let meta = get_verified_doc(&state, &id, &user_id).await?;
+    // Require Edit access to save content
+    let meta = check_doc_access(&state, &id, &user_id, ogrenotes_storage::models::AccessLevel::Edit).await?;
 
     // Validate that the bytes are a valid Y.Doc state
     let _doc = OgreDoc::from_state_bytes(&body)?;

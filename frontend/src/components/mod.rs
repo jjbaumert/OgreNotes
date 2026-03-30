@@ -1,4 +1,11 @@
+pub mod at_menu;
+pub mod block_menu;
+pub mod chat_panel;
+pub mod conversation_pane;
+pub mod document_outline;
 pub mod editor_component;
 pub mod file_browser;
+pub mod notification_bell;
+pub mod share_dialog;
 pub mod sidebar;
 pub mod toolbar;

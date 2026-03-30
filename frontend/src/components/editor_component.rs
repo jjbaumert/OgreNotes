@@ -81,8 +81,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             };
 
             let old_state = view.state();
-            history_dispatch.borrow_mut().record(&txn, &old_state.doc);
-
+            // History recording is handled by the view's dispatch wrapper.
             let new_state = old_state.apply(txn);
             view.update_state(new_state.clone());
             on_state_change.run(new_state.clone());
@@ -93,7 +92,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             }
         };
 
-        let editor_view = EditorView::new(html_element, state, dispatch);
+        let editor_view = EditorView::new(html_element, state, dispatch, Rc::clone(&history_ref_init));
         *view_ref_init.borrow_mut() = Some(editor_view);
     });
 
@@ -331,6 +330,19 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                             html_input.click();
                         }
                     }
+                }
+            }
+            ToolbarCommand::Undo => {
+                // Drop the history borrow before dispatch_fn, which re-borrows it.
+                let txn = history_ref_cmd.borrow_mut().undo(&state);
+                if let Some(txn) = txn {
+                    dispatch_fn(txn);
+                }
+            }
+            ToolbarCommand::Redo => {
+                let txn = history_ref_cmd.borrow_mut().redo(&state);
+                if let Some(txn) = txn {
+                    dispatch_fn(txn);
                 }
             }
         }

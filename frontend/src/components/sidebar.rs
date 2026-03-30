@@ -1,4 +1,5 @@
 use leptos::prelude::*;
+use super::chat_panel::ChatPanel;
 
 #[component]
 pub fn Sidebar() -> impl IntoView {
@@ -46,6 +47,10 @@ pub fn Sidebar() -> impl IntoView {
                 <div class="sidebar-item" style="color: rgba(255,255,255,0.4); font-style: italic;">
                     "No pinned items"
                 </div>
+            </div>
+
+            <div style:display=move || if collapsed.get() { "none" } else { "block" }>
+                <ChatPanel />
             </div>
         </nav>
     }

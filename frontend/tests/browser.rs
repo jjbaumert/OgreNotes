@@ -49,9 +49,12 @@ fn create_editor(
     let txns = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let txns_clone = std::rc::Rc::clone(&txns);
     let state = EditorState::create_default(doc);
+    let history = std::rc::Rc::new(std::cell::RefCell::new(
+        ogrenotes_frontend::editor::plugins::HistoryPlugin::new(),
+    ));
     let view = EditorView::new(container, state, move |txn: Transaction| {
         txns_clone.borrow_mut().push(txn);
-    });
+    }, history);
     (view, txns)
 }
 
@@ -3354,6 +3357,67 @@ fn full_flow_type_bullets_delete_all_then_backspace_bullet() {
     cleanup(&container);
 }
 
+// ─── Undo/Redo Tests ──────────────────────────────────────────
+
+#[wasm_bindgen_test]
+fn ctrl_z_undoes_text_insertion() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), simple_doc());
+
+    // Type "X" at start
+    set_cursor(&view, 1);
+    dispatch_before_input(view.container(), "insertText", Some("X"));
+    let state = apply_all(&view, &txns);
+    txns.borrow_mut().clear();
+    view.update_state(state.clone());
+    assert_eq!(state.doc.child(0).unwrap().text_content(), "XHello world");
+
+    // Ctrl+Z to undo — dispatches undo txn which is collected in txns
+    dispatch_keydown(view.container(), "z", true, false, false);
+    let state = apply_all(&view, &txns);
+    assert_eq!(
+        state.doc.child(0).unwrap().text_content(),
+        "Hello world",
+        "Undo should restore original text"
+    );
+
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn ctrl_shift_z_redoes_after_undo() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), simple_doc());
+
+    // Type "X"
+    set_cursor(&view, 1);
+    dispatch_before_input(view.container(), "insertText", Some("X"));
+    let state = apply_all(&view, &txns);
+    txns.borrow_mut().clear();
+    view.update_state(state);
+    assert_eq!(view.state().doc.child(0).unwrap().text_content(), "XHello world");
+
+    // Undo
+    dispatch_keydown(view.container(), "z", true, false, false);
+    let state = apply_all(&view, &txns);
+    txns.borrow_mut().clear();
+    view.update_state(state);
+    assert_eq!(view.state().doc.child(0).unwrap().text_content(), "Hello world");
+
+    // Redo
+    dispatch_keydown(view.container(), "z", true, true, false);
+    let state = apply_all(&view, &txns);
+    assert_eq!(
+        state.doc.child(0).unwrap().text_content(),
+        "XHello world",
+        "Redo should restore the typed text"
+    );
+
+    cleanup(&container);
+}
+
+// ─── Clipboard / HTML Parsing Tests ───────────────────────────
+
 use ogrenotes_frontend::editor::clipboard;
 
 #[wasm_bindgen_test]
@@ -3615,6 +3679,54 @@ fn backspace_on_empty_sole_list_item_unwraps() {
     // Should become an empty paragraph, no list
     assert_eq!(state.doc.child(0).unwrap().node_type(), Some(NodeType::Paragraph));
     assert_eq!(state.doc.child_count(), 1);
+
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn enter_on_empty_list_item_exits_list() {
+    // Create a list with two items, second one empty
+    let doc = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::ListItem,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::Paragraph,
+                        Fragment::from(vec![Node::text("item1")]),
+                    )]),
+                ),
+                Node::element_with_content(
+                    NodeType::ListItem,
+                    Fragment::from(vec![Node::element(NodeType::Paragraph)]),
+                ),
+            ]),
+        )]),
+    );
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), doc);
+
+    // BulletList(0) > ListItem1(1, size=9) > ListItem2(10, size=4)
+    // ListItem2 > Para(11) > content_start=12 (empty)
+    // But wait: "item1" = 5 chars. Para = 7. ListItem1 = 9. So ListItem2 at offset 10.
+    // ListItem2 > Para(11) size=2. content_start=12.
+    // Actually: ListItem1 = 1 + (1+5+1) + 1 = 9. Offset 1, end 10.
+    // ListItem2 offset 10, size = 1 + 2 + 1 = 4. Para at 11, content at 12.
+    set_cursor(&view, 12);
+    dispatch_before_input(view.container(), "insertParagraph", None);
+
+    let state = apply_all(&view, &txns);
+
+    // The empty item should have exited the list.
+    // Result: BulletList with 1 item + a paragraph
+    assert_eq!(state.doc.child_count(), 2, "Should have list + paragraph");
+    let list = state.doc.child(0).unwrap();
+    assert_eq!(list.node_type(), Some(NodeType::BulletList));
+    assert_eq!(list.child_count(), 1, "List should have 1 item left");
+    assert_eq!(list.child(0).unwrap().text_content(), "item1");
+    assert_eq!(state.doc.child(1).unwrap().node_type(), Some(NodeType::Paragraph));
 
     cleanup(&container);
 }

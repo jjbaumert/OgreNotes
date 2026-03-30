@@ -21,6 +21,8 @@ mod inner {
 
     thread_local! {
         static ENABLED: Cell<bool> = const { Cell::new(false) };
+        /// Timestamp of last window.__ogre_debug check (ms since epoch).
+        static LAST_CHECK: Cell<f64> = const { Cell::new(0.0) };
     }
 
     /// Enable debug logging.
@@ -34,22 +36,29 @@ mod inner {
     }
 
     /// Check if debug logging is enabled.
-    /// Also checks `window.__ogre_debug` so it can be toggled from the browser console:
-    ///   `window.__ogre_debug = true`
+    /// Checks `window.__ogre_debug` at most once per second to avoid
+    /// expensive WASM-JS boundary crossings on every call.
     pub fn is_enabled() -> bool {
         ENABLED.with(|e| {
             if e.get() {
                 return true;
             }
-            // Check window.__ogre_debug for runtime toggle from browser console
-            if let Some(window) = web_sys::window() {
-                if let Ok(val) = js_sys::Reflect::get(&window, &"__ogre_debug".into()) {
-                    if val.is_truthy() {
-                        return true;
+            // Throttled check of window.__ogre_debug (once per second)
+            LAST_CHECK.with(|lc| {
+                let now = js_sys::Date::now();
+                if now - lc.get() > 1000.0 {
+                    lc.set(now);
+                    if let Some(window) = web_sys::window() {
+                        if let Ok(val) = js_sys::Reflect::get(&window, &"__ogre_debug".into()) {
+                            if val.is_truthy() {
+                                e.set(true); // Cache it so subsequent calls are fast
+                                return true;
+                            }
+                        }
                     }
                 }
-            }
-            false
+                false
+            })
         })
     }
 

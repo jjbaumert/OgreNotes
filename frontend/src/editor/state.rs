@@ -335,8 +335,59 @@ impl Transaction {
         let before_content = block.content.cut(0, inner_pos);
         let after_content = block.content.cut(inner_pos, block.content.size());
 
-        // Check if we're inside a list item — if so, split at the item level
+        // Check if we're inside a list item — if so, handle empty items specially
         if let Some(item) = find_item_at(&txn.doc, pos) {
+            // Check if the current list item is empty (paragraph with no text)
+            let item_text: String = item.content.children.iter()
+                .map(|c| c.text_content())
+                .collect();
+            let item_is_empty = item_text.trim().is_empty();
+
+            if item_is_empty {
+                // Empty list item on Enter: dedent if nested, exit list if top-level.
+                let container = find_container_at(&txn.doc, pos);
+                let is_nested = container.as_ref().map_or(false, |c| {
+                    find_item_at(&txn.doc, c.offset).is_some()
+                });
+
+                if is_nested {
+                    // Nested empty item: dedent (same as Shift-Tab)
+                    return txn.lift_from_list();
+                }
+
+                // Top-level empty item: remove from list, insert empty paragraph after list.
+                if let Some(ref c) = container {
+                    let is_first = item.offset == c.offset + 1;
+                    let is_only = item.node_size == c.node_size - 2; // list open + close
+
+                    if is_only {
+                        // Only item in list: replace entire list with empty paragraph
+                        let para = Node::element(NodeType::Paragraph);
+                        let slice = Slice::new(Fragment::from(vec![para]), 0, 0);
+                        let mut result = txn.replace(c.offset, c.offset + c.node_size, slice)?;
+                        result.selection = Selection::cursor(c.offset + 1);
+                        result.stored_marks = None;
+                        return Ok(result);
+                    }
+
+                    // Remove this item from the list, add empty paragraph after the list
+                    let item_end = item.offset + item.node_size;
+                    let list_end = c.offset + c.node_size;
+
+                    // Delete the empty item
+                    let mut result = txn.delete(item.offset, item_end)?;
+
+                    // After deletion, the list end shifted. Insert paragraph after the list.
+                    let new_list_end = list_end - item.node_size;
+                    let para = Node::element(NodeType::Paragraph);
+                    let para_slice = Slice::new(Fragment::from(vec![para]), 0, 0);
+                    result = result.replace(new_list_end, new_list_end, para_slice)?;
+                    result.selection = Selection::cursor(new_list_end + 1);
+                    result.stored_marks = None;
+                    return Ok(result);
+                }
+            }
+
             let first_para = Node::Element {
                 node_type: block.node_type,
                 attrs: block.attrs.clone(),
@@ -424,11 +475,21 @@ impl Transaction {
             return Err(StepError("cursor not at block start".into()));
         }
 
-        // Find the previous sibling textblock by searching just before this block
+        // Find the previous sibling textblock by searching just before this block.
+        // Try block.offset - 1 first (adjacent textblock), then block.offset - 2
+        // (handles the case where the previous element is a container like a list —
+        // offset-1 is the container's close boundary, offset-2 is inside its content).
         if block.offset == 0 {
             return Err(StepError("no previous block to join with".into()));
         }
         let prev = find_block_at(&self.doc, block.offset - 1)
+            .or_else(|| {
+                if block.offset >= 2 {
+                    find_block_at(&self.doc, block.offset - 2)
+                } else {
+                    None
+                }
+            })
             .ok_or_else(|| StepError("no previous textblock".into()))?;
 
         // Merge: replace both blocks with one block (prev type) containing combined content

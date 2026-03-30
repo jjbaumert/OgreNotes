@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod collab;
 mod components;
 pub mod editor;
 mod pages;

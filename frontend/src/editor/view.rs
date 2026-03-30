@@ -21,6 +21,8 @@ pub struct EditorView {
     composing: Rc<RefCell<bool>>,
     /// Guard to suppress the beforeinput event immediately after compositionend.
     just_composed: Rc<RefCell<bool>>,
+    /// History plugin for undo/redo (shared with editor component).
+    history: Rc<RefCell<super::plugins::HistoryPlugin>>,
     /// Stored (event_name, closure) pairs for cleanup in destroy().
     listeners: Vec<(&'static str, Closure<dyn Fn(web_sys::Event)>)>,
     /// selectionchange listener (attached to document, not container).
@@ -33,6 +35,7 @@ impl EditorView {
         container: HtmlElement,
         state: EditorState,
         dispatch: impl Fn(Transaction) + 'static,
+        history: Rc<RefCell<super::plugins::HistoryPlugin>>,
     ) -> Self {
         container
             .set_attribute("contenteditable", "true")
@@ -43,10 +46,20 @@ impl EditorView {
         container.class_list().add_1("editor-content").unwrap_or(());
 
         let state = Rc::new(RefCell::new(state));
-        let dispatch = Rc::new(dispatch) as Rc<dyn Fn(Transaction)>;
+        // Wrap the external dispatch to automatically record to history.
+        // Uses try_borrow to avoid RefCell conflicts when the keydown handler
+        // dispatches undo/redo while already borrowing the state.
+        let history_for_dispatch = Rc::clone(&history);
+        let state_for_dispatch = Rc::clone(&state);
+        let external_dispatch = Rc::new(dispatch) as Rc<dyn Fn(Transaction)>;
+        let dispatch: Rc<dyn Fn(Transaction)> = Rc::new(move |txn: Transaction| {
+            if let Ok(state_ref) = state_for_dispatch.try_borrow() {
+                history_for_dispatch.borrow_mut().record(&txn, &state_ref.doc);
+            }
+            external_dispatch(txn);
+        });
         let composing = Rc::new(RefCell::new(false));
         let just_composed = Rc::new(RefCell::new(false));
-
 
         let mut view = Self {
             container,
@@ -54,6 +67,7 @@ impl EditorView {
             dispatch,
             composing,
             just_composed,
+            history,
             listeners: Vec::new(),
             selectionchange_closure: None,
         };
@@ -153,6 +167,7 @@ impl EditorView {
         let composing = Rc::clone(&self.composing);
         let state_kd = Rc::clone(&self.state);
         let dispatch_kd = Rc::clone(&self.dispatch);
+        let history_kd = Rc::clone(&self.history);
         let keymap = super::keymap::default_keymap();
 
         let on_keydown = Closure::wrap(Box::new(move |event: web_sys::Event| {
@@ -168,6 +183,34 @@ impl EditorView {
             let meta = ke.meta_key();
             let shift = ke.shift_key();
             let alt = ke.alt_key();
+            let mod_key = ctrl || meta;
+
+            // Handle undo/redo directly (needs HistoryPlugin access).
+            // Important: drop the history borrow BEFORE calling dispatch,
+            // because dispatch records to history (which borrows it again).
+            if mod_key && !alt {
+                let current_state = state_kd.borrow().clone();
+                if key.to_lowercase() == "z" && !shift {
+                    event.prevent_default();
+                    let txn = history_kd.borrow_mut().undo(&current_state);
+                    if let Some(txn) = txn {
+                        super::debug::log("keydown", "undo", &[]);
+                        dispatch_kd(txn);
+                    }
+                    return;
+                }
+                if (key.to_lowercase() == "z" && shift)
+                    || (key.to_lowercase() == "y" && !shift)
+                {
+                    event.prevent_default();
+                    let txn = history_kd.borrow_mut().redo(&current_state);
+                    if let Some(txn) = txn {
+                        super::debug::log("keydown", "redo", &[]);
+                        dispatch_kd(txn);
+                    }
+                    return;
+                }
+            }
 
             let current_state = state_kd.borrow().clone();
 
@@ -243,10 +286,6 @@ impl EditorView {
                                     if let Some((text_before, block_start)) =
                                         super::input_rules::get_block_text_before(&post_insert.doc, cursor)
                                     {
-                                        super::debug::log("input", "checking input rules", &[
-                                            ("text_before", &text_before),
-                                            ("block_start", &block_start.to_string()),
-                                        ]);
                                         let rules = super::input_rules::default_input_rules();
                                         if let Some(rule_txn) = super::input_rules::check_input_rules(
                                             &rules, &post_insert, &text_before, block_start,
@@ -301,6 +340,8 @@ impl EditorView {
                                     let block = super::state::find_block_at(&state_with_sel.doc, pos);
                                     let at_block_start = block.map_or(false, |b| pos == b.content_start);
 
+                                    let mut handled = false;
+
                                     if at_block_start {
                                         // At block start with no previous textblock to join.
                                         // If in a nested list item, dedent it.
@@ -320,6 +361,7 @@ impl EditorView {
                                                 }),
                                             );
                                             super::debug::log("backspace", "dedent nested list item", &[]);
+                                            handled = true;
                                         } else if item.is_some() {
                                             if let Ok(txn) = state_with_sel.transaction().lift_from_list() {
                                                 let cursor_after = txn.selection.from();
@@ -327,13 +369,20 @@ impl EditorView {
                                                     ("cursor_after", &cursor_after.to_string()),
                                                 ]);
                                                 dispatch(txn);
+                                                handled = true;
                                             }
+                                        }
+
+                                        // At block start, not in a list, join_backward failed:
+                                        // This shouldn't happen now that join_backward searches
+                                        // deeper, but log it if it does.
+                                        if !handled {
+                                            super::debug::warn("backspace", "at block start with no action available");
                                         }
                                     }
 
-                                    // Fallback: delete a single character (works for mid-text
-                                    // and any case where the above didn't dispatch)
-                                    if !at_block_start {
+                                    // Fallback: delete a single character (works for mid-text)
+                                    if !handled && !at_block_start {
                                         if let Ok(txn) = state_with_sel.transaction().delete(pos - 1, pos) {
                                             super::debug::log("backspace", "delete char", &[
                                                 ("from", &(pos - 1).to_string()),
@@ -572,6 +621,7 @@ impl EditorView {
             let slice = if !html.is_empty() {
                 super::debug::log("paste", "parsing HTML", &[
                     ("len", &html.len().to_string()),
+                    ("preview", &html.chars().take(500).collect::<String>()),
                 ]);
                 super::clipboard::parse_from_html(&html)
             } else {
@@ -677,13 +727,85 @@ impl EditorView {
                     }
                 }
             } else {
-                // Normal paste: fit to block context
-                let parent_type = super::state::find_block_at(&state_with_sel.doc, pos)
-                    .map(|b| b.node_type)
-                    .unwrap_or(super::model::NodeType::Doc);
+                // Determine paste context.
+                // If the pasted content contains block-level nodes (headings, lists, etc.),
+                // fit to Doc context so they're preserved. Otherwise fit to the current block.
+                let has_blocks = slice.content.children.iter().any(|n| {
+                    matches!(
+                        n.node_type(),
+                        Some(super::model::NodeType::Heading)
+                            | Some(super::model::NodeType::BulletList)
+                            | Some(super::model::NodeType::OrderedList)
+                            | Some(super::model::NodeType::TaskList)
+                            | Some(super::model::NodeType::Blockquote)
+                            | Some(super::model::NodeType::CodeBlock)
+                            | Some(super::model::NodeType::HorizontalRule)
+                    )
+                });
+
+                let parent_type = if has_blocks {
+                    super::model::NodeType::Doc
+                } else {
+                    super::state::find_block_at(&state_with_sel.doc, pos)
+                        .map(|b| b.node_type)
+                        .unwrap_or(super::model::NodeType::Doc)
+                };
+
                 let fitted = super::clipboard::fit_slice_to_context(slice, parent_type);
-                if let Ok(txn) = state_with_sel.transaction().replace_selection(fitted) {
-                    dispatch_paste(txn);
+
+                if has_blocks {
+                    // Block-level paste: replace at the block level, not inside the paragraph.
+                    // Split the current block at the cursor, sandwich pasted blocks between halves.
+                    if let Some(block) = super::state::find_block_at(&state_with_sel.doc, pos) {
+                        let before_offset = pos - block.content_start;
+                        let after_offset = pos - block.content_start;
+                        let before_content = block.content.cut(0, before_offset);
+                        let after_content = block.content.cut(after_offset, block.content.size());
+
+                        let mut nodes = Vec::new();
+
+                        // Add the "before" part of the current block if it has content
+                        if !before_content.children.is_empty()
+                            && before_content.children.iter().any(|n| !n.text_content().is_empty())
+                        {
+                            nodes.push(super::model::Node::Element {
+                                node_type: block.node_type,
+                                attrs: block.attrs.clone(),
+                                content: before_content,
+                                marks: vec![],
+                            });
+                        }
+
+                        // Add all pasted blocks
+                        nodes.extend(fitted.content.children);
+
+                        // Add the "after" part of the current block if it has content
+                        if !after_content.children.is_empty()
+                            && after_content.children.iter().any(|n| !n.text_content().is_empty())
+                        {
+                            nodes.push(super::model::Node::element_with_content(
+                                super::model::NodeType::Paragraph,
+                                after_content,
+                            ));
+                        }
+
+                        let block_slice = super::model::Slice::new(
+                            super::model::Fragment::from(nodes),
+                            0,
+                            0,
+                        );
+                        if let Ok(txn) = state_with_sel
+                            .transaction()
+                            .replace(block.offset, block.offset + block.node_size, block_slice)
+                        {
+                            dispatch_paste(txn);
+                        }
+                    }
+                } else {
+                    // Inline paste: insert into the current block
+                    if let Ok(txn) = state_with_sel.transaction().replace_selection(fitted) {
+                        dispatch_paste(txn);
+                    }
                 }
             }
         }) as Box<dyn Fn(web_sys::Event)>);

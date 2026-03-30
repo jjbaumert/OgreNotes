@@ -14,6 +14,12 @@ pub struct User {
     pub home_folder_id: String,
     pub private_folder_id: String,
     pub trash_folder_id: String,
+    /// Archive folder (Phase 2): documents removed from active view but not deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_folder_id: Option<String>,
+    /// Pinned folder (Phase 2): starred/favorited documents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_folder_id: Option<String>,
 
     pub created_at: i64,
     pub updated_at: i64,
@@ -45,6 +51,8 @@ mod tests {
             home_folder_id: new_id(),
             private_folder_id: new_id(),
             trash_folder_id: new_id(),
+            archive_folder_id: Some(new_id()),
+            pinned_folder_id: Some(new_id()),
             created_at: now,
             updated_at: now,
         }

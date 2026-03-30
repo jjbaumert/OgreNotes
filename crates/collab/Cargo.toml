@@ -10,6 +10,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 yrs = { workspace = true }
 tracing = { workspace = true }
+fred = { workspace = true }
+tokio = { workspace = true }
+dashmap = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

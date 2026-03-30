@@ -184,8 +184,8 @@ impl FolderRepo {
         items.iter().map(|item| folder_child_from_item(item, folder_id)).collect()
     }
 
-    /// Add a member to a folder.
-    async fn add_member(&self, member: &FolderMember) -> Result<(), RepoError> {
+    /// Add a member to a folder (or update if already exists).
+    pub async fn add_member(&self, member: &FolderMember) -> Result<(), RepoError> {
         let mut item = HashMap::new();
         item.insert("PK".to_string(), AttributeValue::S(member.pk()));
         item.insert("SK".to_string(), AttributeValue::S(member.sk()));
@@ -209,6 +209,58 @@ impl FolderRepo {
 
         self.db
             .put_item(item)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Get a specific member's access level for a folder.
+    pub async fn get_member(
+        &self,
+        folder_id: &str,
+        user_id: &str,
+    ) -> Result<Option<FolderMember>, RepoError> {
+        let pk = format!("FOLDER#{folder_id}");
+        let sk = format!("MEMBER#{user_id}");
+        let item = self
+            .db
+            .get_item(&pk, &sk)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+
+        match item {
+            Some(item) => Ok(Some(folder_member_from_item(&item, folder_id)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all members of a folder.
+    pub async fn list_members(
+        &self,
+        folder_id: &str,
+    ) -> Result<Vec<FolderMember>, RepoError> {
+        let pk = format!("FOLDER#{folder_id}");
+        let items = self
+            .db
+            .query(&pk, Some("MEMBER#"))
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+
+        items
+            .iter()
+            .map(|item| folder_member_from_item(item, folder_id))
+            .collect()
+    }
+
+    /// Remove a member from a folder.
+    pub async fn remove_member(
+        &self,
+        folder_id: &str,
+        user_id: &str,
+    ) -> Result<(), RepoError> {
+        let pk = format!("FOLDER#{folder_id}");
+        let sk = format!("MEMBER#{user_id}");
+        self.db
+            .delete_item(&pk, &sk)
             .await
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
@@ -270,6 +322,22 @@ fn folder_from_item(item: &HashMap<String, AttributeValue>) -> Result<Folder, Re
         folder_type,
         created_at: get_n(item, "created_at")?,
         updated_at: get_n(item, "updated_at")?,
+    })
+}
+
+fn folder_member_from_item(
+    item: &HashMap<String, AttributeValue>,
+    folder_id: &str,
+) -> Result<FolderMember, RepoError> {
+    let access_str = get_s(item, "access_level")?;
+    let access_level: AccessLevel = serde_json::from_str(&format!("\"{access_str}\""))
+        .map_err(|e| RepoError::MissingField(format!("access_level: {e}")))?;
+
+    Ok(FolderMember {
+        folder_id: folder_id.to_string(),
+        user_id: get_s(item, "user_id")?,
+        access_level,
+        added_at: get_n(item, "added_at")?,
     })
 }
 

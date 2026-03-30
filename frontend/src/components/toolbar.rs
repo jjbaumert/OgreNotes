@@ -63,6 +63,22 @@ pub fn Toolbar(
 
     view! {
         <div class="toolbar" on:mousedown=on_mousedown>
+            // Undo / Redo
+            <div class="toolbar-group">
+                <button
+                    class="toolbar-btn"
+                    title="Undo (Ctrl+Z)"
+                    on:click=move |_| on_command.run(ToolbarCommand::Undo)
+                >"\u{21B6}"</button>
+                <button
+                    class="toolbar-btn"
+                    title="Redo (Ctrl+Shift+Z)"
+                    on:click=move |_| on_command.run(ToolbarCommand::Redo)
+                >"\u{21B7}"</button>
+            </div>
+
+            <div class="toolbar-separator"></div>
+
             // Inline marks
             <div class="toolbar-group">
                 <button
@@ -195,4 +211,6 @@ pub enum ToolbarCommand {
     ToggleBlockquote,
     InsertHorizontalRule,
     UploadImage,
+    Undo,
+    Redo,
 }

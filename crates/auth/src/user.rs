@@ -38,6 +38,8 @@ pub async fn find_or_create_user(
     let home_folder_id = new_id();
     let private_folder_id = new_id();
     let trash_folder_id = new_id();
+    let archive_folder_id = new_id();
+    let pinned_folder_id = new_id();
 
     let user = User {
         user_id: user_id.clone(),
@@ -47,6 +49,8 @@ pub async fn find_or_create_user(
         home_folder_id: home_folder_id.clone(),
         private_folder_id: private_folder_id.clone(),
         trash_folder_id: trash_folder_id.clone(),
+        archive_folder_id: Some(archive_folder_id.clone()),
+        pinned_folder_id: Some(pinned_folder_id.clone()),
         created_at: now,
         updated_at: now,
     };
@@ -69,15 +73,24 @@ pub async fn find_or_create_user(
     }
 }
 
-/// Create the three system folders for a new user.
+/// Create system folders for a new user.
+/// NOTE: Folder creation is not atomic — if one put fails, earlier folders persist
+/// without the later ones. This is a known limitation. DynamoDB TransactWriteItems
+/// (max 100 items per transaction) could be used for atomicity in a future iteration.
 async fn create_system_folders(folder_repo: &FolderRepo, user: &User) -> Result<(), AuthError> {
     let now = user.created_at;
 
-    let system_folders = [
+    let mut system_folders: Vec<(&str, &str)> = vec![
         ("Home", &user.home_folder_id),
         ("Private", &user.private_folder_id),
         ("Trash", &user.trash_folder_id),
     ];
+    if let Some(ref id) = user.archive_folder_id {
+        system_folders.push(("Archive", id));
+    }
+    if let Some(ref id) = user.pinned_folder_id {
+        system_folders.push(("Pinned", id));
+    }
 
     for (title, folder_id) in &system_folders {
         let folder = Folder {

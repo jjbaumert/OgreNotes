@@ -5,6 +5,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
+use fred::prelude::*;
 use ogrenotes_common::config::AppConfig;
 use ogrenotes_storage::dynamo::DynamoClient;
 use ogrenotes_storage::s3::S3Client;
@@ -40,8 +41,23 @@ async fn main() {
     let dynamo = DynamoClient::new(dynamo_client, config.table_name());
     let s3 = S3Client::new(s3_client, config.s3_bucket.clone());
 
+    // Connect to Redis
+    let redis_config = fred::types::RedisConfig::from_url(&config.redis_url)
+        .expect("invalid REDIS_URL");
+    let redis_client = fred::prelude::RedisClient::new(redis_config, None, None, None);
+    redis_client.connect();
+    redis_client
+        .wait_for_connect()
+        .await
+        .expect("failed to connect to Redis");
+    tracing::info!("connected to Redis at {}", config.redis_url);
+
+    let redis_pubsub = ogrenotes_collab::redis_pubsub::RedisPubSub::new(
+        std::sync::Arc::new(redis_client),
+    );
+
     // Build app state
-    let state = AppState::new(config.clone(), dynamo, s3);
+    let state = AppState::new(config.clone(), dynamo, s3, redis_pubsub);
 
     // Build CORS layer with explicit headers (not Any, which is rejected with credentials)
     let cors = CorsLayer::new()

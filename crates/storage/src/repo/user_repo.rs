@@ -128,6 +128,12 @@ fn user_to_item(user: &User) -> HashMap<String, AttributeValue> {
     item.insert("home_folder_id".to_string(), AttributeValue::S(user.home_folder_id.clone()));
     item.insert("private_folder_id".to_string(), AttributeValue::S(user.private_folder_id.clone()));
     item.insert("trash_folder_id".to_string(), AttributeValue::S(user.trash_folder_id.clone()));
+    if let Some(ref id) = user.archive_folder_id {
+        item.insert("archive_folder_id".to_string(), AttributeValue::S(id.clone()));
+    }
+    if let Some(ref id) = user.pinned_folder_id {
+        item.insert("pinned_folder_id".to_string(), AttributeValue::S(id.clone()));
+    }
     item.insert("created_at".to_string(), AttributeValue::N(user.created_at.to_string()));
     item.insert("updated_at".to_string(), AttributeValue::N(user.updated_at.to_string()));
     item
@@ -142,6 +148,8 @@ fn user_from_item(item: &HashMap<String, AttributeValue>) -> Result<User, RepoEr
         home_folder_id: get_s(item, "home_folder_id")?,
         private_folder_id: get_s(item, "private_folder_id")?,
         trash_folder_id: get_s(item, "trash_folder_id")?,
+        archive_folder_id: item.get("archive_folder_id").and_then(|v| v.as_s().ok()).cloned(),
+        pinned_folder_id: item.get("pinned_folder_id").and_then(|v| v.as_s().ok()).cloned(),
         created_at: get_n(item, "created_at")?,
         updated_at: get_n(item, "updated_at")?,
     })

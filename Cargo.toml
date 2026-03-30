@@ -43,6 +43,9 @@ yrs = "0.21"
 # Redis
 fred = "9"
 
+# Concurrency
+dashmap = "6"
+
 # Web framework
 axum = { version = "0.8", features = ["ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }

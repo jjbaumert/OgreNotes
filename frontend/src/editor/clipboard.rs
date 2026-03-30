@@ -79,6 +79,17 @@ fn walk_dom_children(
         match child.node_type() {
             web_sys::Node::TEXT_NODE => {
                 let text = child.text_content().unwrap_or_default();
+                // Skip whitespace-only text nodes (common in web page HTML indentation)
+                // but keep spaces inside inline context (they're meaningful between words)
+                if text.is_empty() || (!inline_context && text.trim().is_empty()) {
+                    continue;
+                }
+                // Collapse runs of whitespace in pasted content
+                let text = if inline_context {
+                    text
+                } else {
+                    text.trim().to_string()
+                };
                 if !text.is_empty() {
                     if active_marks.is_empty() {
                         out.push(Node::text(&text));
@@ -201,8 +212,28 @@ fn walk_dom_children(
                     continue;
                 }
 
-                // Unknown element: treat as transparent container, recurse
-                walk_dom_children(&child, active_marks, out, inline_context);
+                // Unknown block-level elements (div, section, article, header, footer, main, nav, aside, figure):
+                // treat as paragraph-like if they contain inline content, transparent if they contain blocks.
+                if is_block_level_tag(&tag) {
+                    let mut children_nodes = Vec::new();
+                    walk_dom_children(&child, &[], &mut children_nodes, false);
+
+                    if children_nodes.is_empty() {
+                        // Empty block — skip
+                    } else if children_nodes.iter().all(|n| matches!(n, Node::Text { .. }) || n.is_leaf()) {
+                        // All inline content — wrap in paragraph
+                        out.push(Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(children_nodes),
+                        ));
+                    } else {
+                        // Contains block children — add them directly (transparent)
+                        out.extend(children_nodes);
+                    }
+                } else {
+                    // Unknown inline element (span, font, etc.): transparent, preserve marks
+                    walk_dom_children(&child, active_marks, out, inline_context);
+                }
             }
             _ => {} // Skip comments, processing instructions, etc.
         }
@@ -228,6 +259,17 @@ fn tag_to_mark(tag: &str, el: &web_sys::Element) -> Option<Mark> {
         }
         _ => None,
     }
+}
+
+/// Check if an HTML tag is a block-level element that should create paragraph structure.
+#[cfg(target_arch = "wasm32")]
+fn is_block_level_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "div" | "section" | "article" | "header" | "footer"
+            | "main" | "nav" | "aside" | "figure" | "figcaption"
+            | "details" | "summary" | "address" | "center"
+    )
 }
 
 /// Map an HTML tag to a block node type.

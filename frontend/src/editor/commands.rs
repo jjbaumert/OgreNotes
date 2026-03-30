@@ -499,30 +499,114 @@ fn item_type_for_list(list_type: NodeType) -> NodeType {
     }
 }
 
-/// Wrap the current textblock in a list (ListType > ItemType > existing block).
+/// Wrap selected textblocks in a list.
+/// If the selection spans multiple blocks, all blocks become list items in one list.
 fn wrap_in_list(
     state: &EditorState,
     list_type: NodeType,
     item_type: NodeType,
 ) -> Option<Transaction> {
-    let pos = state.selection.from();
-    let block = find_block_at(&state.doc, pos)?;
+    let from = state.selection.from();
+    let to = state.selection.to();
 
-    // Build wrapper: ListType[ItemType[]] with gap at depth 2
-    let item_node = Node::element(item_type);
-    let list_node = Node::element_with_content(list_type, Fragment::from(vec![item_node]));
-    let wrapper = Slice::new(Fragment::from(vec![list_node]), 2, 2);
+    // Find all top-level blocks that overlap with the selection
+    let blocks = find_blocks_in_range(&state.doc, from, to);
 
-    let step = Step::ReplaceAround {
-        from: block.offset,
-        to: block.offset + block.node_size,
-        gap_from: block.offset,
-        gap_to: block.offset + block.node_size,
-        insert: wrapper,
-        structure: true,
+    if blocks.is_empty() {
+        return None;
+    }
+
+    if blocks.len() == 1 {
+        // Single block: use ReplaceAround for efficiency
+        let block = &blocks[0];
+        let item_node = Node::element(item_type);
+        let list_node = Node::element_with_content(list_type, Fragment::from(vec![item_node]));
+        let wrapper = Slice::new(Fragment::from(vec![list_node]), 2, 2);
+
+        let step = Step::ReplaceAround {
+            from: block.offset,
+            to: block.offset + block.node_size,
+            gap_from: block.offset,
+            gap_to: block.offset + block.node_size,
+            insert: wrapper,
+            structure: true,
+        };
+
+        return state.transaction().step(step).ok();
+    }
+
+    // Multiple blocks: wrap each as a ListItem, then replace the range with a single list
+    let first_offset = blocks[0].offset;
+    let last_end = blocks.last().unwrap().offset + blocks.last().unwrap().node_size;
+
+    let mut items = Vec::new();
+    for block in &blocks {
+        // Clone the block and wrap it in a ListItem
+        let block_node = extract_node_at(&state.doc, block.offset)?;
+        items.push(Node::element_with_content(
+            item_type,
+            Fragment::from(vec![block_node]),
+        ));
+    }
+
+    let list = Node::element_with_content(list_type, Fragment::from(items));
+    let slice = Slice::new(Fragment::from(vec![list]), 0, 0);
+
+    state.transaction().replace(first_offset, last_end, slice).ok()
+}
+
+/// Find all top-level textblocks whose position ranges overlap with [from, to].
+fn find_blocks_in_range(
+    doc: &Node,
+    from: usize,
+    to: usize,
+) -> Vec<super::state::BlockInfo> {
+    let Node::Element { content, .. } = doc else {
+        return Vec::new();
     };
 
-    state.transaction().step(step).ok()
+    let mut results = Vec::new();
+    let mut offset = 0;
+
+    for child in &content.children {
+        let child_size = child.node_size();
+        let child_end = offset + child_size;
+
+        if let Node::Element { node_type, attrs, content: child_content, .. } = child {
+            if node_type.is_textblock() {
+                // Check if this block overlaps with the selection
+                let content_start = offset + 1;
+                if child_end > from && offset < to {
+                    results.push(super::state::BlockInfo {
+                        offset,
+                        node_size: child_size,
+                        content_start,
+                        node_type: *node_type,
+                        attrs: attrs.clone(),
+                        content: child_content.clone(),
+                    });
+                }
+            } else if !node_type.is_leaf() {
+                // Container block (list, blockquote) — check if it overlaps
+                // but don't recurse into it for this operation
+                if child_end > from && offset < to {
+                    // For non-textblocks that overlap, include them as-is
+                    results.push(super::state::BlockInfo {
+                        offset,
+                        node_size: child_size,
+                        content_start: offset + 1,
+                        node_type: *node_type,
+                        attrs: attrs.clone(),
+                        content: child_content.clone(),
+                    });
+                }
+            }
+        }
+
+        offset += child_size;
+    }
+
+    results
 }
 
 /// Wrap the current textblock in a blockquote.
