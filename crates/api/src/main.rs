@@ -10,6 +10,7 @@ use ogrenotes_common::config::AppConfig;
 use ogrenotes_storage::dynamo::DynamoClient;
 use ogrenotes_storage::s3::S3Client;
 
+mod compaction;
 mod error;
 mod middleware;
 mod routes;
@@ -58,6 +59,15 @@ async fn main() {
 
     // Build app state
     let state = AppState::new(config.clone(), dynamo, s3, redis_pubsub);
+
+    // Start background compaction task (checks every 60s, compacts rooms idle > 5min).
+    let _compaction_handle = compaction::spawn_compaction_task(
+        state.room_registry.clone(),
+        state.doc_repo.clone(),
+        state.snapshot_repo.clone(),
+        std::time::Duration::from_secs(60),
+        5 * 60 * 1000, // 5 minutes in ms
+    );
 
     // Build CORS layer with explicit headers (not Any, which is rejected with credentials)
     let cors = CorsLayer::new()

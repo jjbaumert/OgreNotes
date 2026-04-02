@@ -7,15 +7,23 @@ use crate::api::client;
 pub fn LoginPage() -> impl IntoView {
     let (error, set_error) = signal::<Option<String>>(None);
     let (loading, set_loading) = signal(false);
+    let (dev_name, set_dev_name) = signal("Dev User".to_string());
+    let (dev_email, set_dev_email) = signal("dev@ogrenotes.local".to_string());
     let navigate = use_navigate();
 
     // Dev login for local development (bypasses OAuth)
     let on_dev_login = move |_| {
+        let name = dev_name.get_untracked();
+        let email = dev_email.get_untracked();
+        if name.trim().is_empty() || email.trim().is_empty() {
+            set_error.set(Some("Name and email are required".to_string()));
+            return;
+        }
         set_loading.set(true);
         set_error.set(None);
         let navigate = navigate.clone();
         leptos::task::spawn_local(async move {
-            match client::dev_login("dev@ogrenotes.local", "Dev User").await {
+            match client::dev_login(&email, &name).await {
                 Ok(_auth) => {
                     navigate("/", Default::default());
                 }
@@ -45,6 +53,23 @@ pub fn LoginPage() -> impl IntoView {
                         {e}
                     </div>
                 })}
+
+                <input
+                    type="text"
+                    class="login-input"
+                    placeholder="Display name"
+                    prop:value=move || dev_name.get()
+                    on:input=move |e| set_dev_name.set(event_target_value(&e))
+                    style="margin-bottom: 8px; width: 100%; padding: 8px; border: 1px solid var(--color-border); border-radius: 4px; font-size: 14px;"
+                />
+                <input
+                    type="email"
+                    class="login-input"
+                    placeholder="Email"
+                    prop:value=move || dev_email.get()
+                    on:input=move |e| set_dev_email.set(event_target_value(&e))
+                    style="margin-bottom: 12px; width: 100%; padding: 8px; border: 1px solid var(--color-border); border-radius: 4px; font-size: 14px;"
+                />
 
                 <button
                     class="login-btn"

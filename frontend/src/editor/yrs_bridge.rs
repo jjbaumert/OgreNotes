@@ -257,6 +257,8 @@ fn mark_type_to_attr(mt: MarkType) -> &'static str {
         MarkType::Strike => "strike",
         MarkType::Code => "code",
         MarkType::Link => "link",
+        MarkType::TextColor => "textColor",
+        MarkType::Highlight => "highlight",
     }
 }
 
@@ -268,6 +270,8 @@ fn attr_to_mark_type(attr: &str) -> Option<MarkType> {
         "strike" => Some(MarkType::Strike),
         "code" => Some(MarkType::Code),
         "link" => Some(MarkType::Link),
+        "textColor" => Some(MarkType::TextColor),
+        "highlight" => Some(MarkType::Highlight),
         _ => None,
     }
 }
@@ -277,12 +281,14 @@ fn marks_to_attrs(marks: &[Mark]) -> Attrs {
     let mut attrs = Attrs::new();
     for mark in marks {
         let key = mark_type_to_attr(mark.mark_type);
-        let value = if mark.mark_type == MarkType::Link {
-            // Serialize link attributes (href, target, rel) as JSON
-            let json = serde_json::to_string(&mark.attrs).unwrap_or_else(|_| "{}".to_string());
-            Any::String(Arc::from(json.as_str()))
-        } else {
-            Any::Bool(true)
+        let value = match mark.mark_type {
+            // Marks with attrs (link href, text color, highlight color) → JSON string
+            MarkType::Link | MarkType::TextColor | MarkType::Highlight => {
+                let json = serde_json::to_string(&mark.attrs).unwrap_or_else(|_| "{}".to_string());
+                Any::String(Arc::from(json.as_str()))
+            }
+            // Simple boolean marks
+            _ => Any::Bool(true),
         };
         attrs.insert(Arc::from(key), value);
     }
@@ -296,12 +302,12 @@ fn attrs_to_marks(attrs: &Attrs) -> Vec<Mark> {
         let key_str: &str = key.as_ref();
         if let Some(mark_type) = attr_to_mark_type(key_str) {
             match mark_type {
-                MarkType::Link => {
+                MarkType::Link | MarkType::TextColor | MarkType::Highlight => {
                     if let Any::String(json) = value {
-                        let link_attrs: HashMap<String, String> =
+                        let parsed_attrs: HashMap<String, String> =
                             serde_json::from_str(json.as_ref()).unwrap_or_default();
-                        let mut mark = Mark::new(MarkType::Link);
-                        mark.attrs = link_attrs;
+                        let mut mark = Mark::new(mark_type);
+                        mark.attrs = parsed_attrs;
                         marks.push(mark);
                     }
                 }

@@ -46,6 +46,8 @@ impl UserRepo {
     pub async fn get_by_email(&self, email: &str) -> Result<Option<User>, RepoError> {
         // For MVP: scan all USER#/PROFILE items and filter by email.
         // Phase 2: add a GSI on email for efficient lookup.
+        // Note: no `limit` — DynamoDB limit applies to items *evaluated*, not *returned*.
+        // With a filter, a low limit may skip the target item entirely.
         let result = self
             .db
             .inner()
@@ -54,7 +56,6 @@ impl UserRepo {
             .filter_expression("SK = :sk AND email = :email")
             .expression_attribute_values(":sk", AttributeValue::S("PROFILE".to_string()))
             .expression_attribute_values(":email", AttributeValue::S(email.to_string()))
-            .limit(1)
             .send()
             .await
             .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
@@ -62,6 +63,35 @@ impl UserRepo {
         match result.items {
             Some(items) if !items.is_empty() => Ok(Some(user_from_item(&items[0])?)),
             _ => Ok(None),
+        }
+    }
+
+    /// Search users by email or name prefix (case-insensitive).
+    /// Returns up to 10 matches. Uses DynamoDB scan — acceptable for MVP.
+    pub async fn search_users(&self, query: &str) -> Result<Vec<User>, RepoError> {
+        let query_lower = query.to_lowercase();
+        let result = self
+            .db
+            .inner()
+            .scan()
+            .table_name(self.db.table_name())
+            .filter_expression(
+                "SK = :sk AND (contains(email, :q) OR contains(#n, :q))",
+            )
+            .expression_attribute_values(":sk", AttributeValue::S("PROFILE".to_string()))
+            .expression_attribute_values(":q", AttributeValue::S(query_lower))
+            .expression_attribute_names("#n", "name")
+            .send()
+            .await
+            .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+
+        match result.items {
+            Some(items) => items
+                .iter()
+                .take(10)
+                .map(|item| user_from_item(item))
+                .collect(),
+            None => Ok(Vec::new()),
         }
     }
 

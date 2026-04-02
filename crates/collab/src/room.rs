@@ -211,6 +211,18 @@ impl RoomRegistry {
     pub fn room_count(&self) -> usize {
         self.rooms.len()
     }
+
+    /// List all room doc_ids that are idle (no clients, last edit > threshold).
+    pub async fn idle_rooms(&self, idle_threshold_ms: u64) -> Vec<String> {
+        let mut idle = Vec::new();
+        for entry in self.rooms.iter() {
+            let room = entry.value();
+            if room.client_count().await == 0 && room.ms_since_last_edit() >= idle_threshold_ms {
+                idle.push(entry.key().clone());
+            }
+        }
+        idle
+    }
 }
 
 impl Default for RoomRegistry {

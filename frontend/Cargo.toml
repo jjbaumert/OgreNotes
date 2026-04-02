@@ -33,6 +33,7 @@ features = [
     "HtmlElement",
     "HtmlDivElement",
     "HtmlInputElement",
+    "HtmlTextAreaElement",
     "HtmlBrElement",
     "HtmlImageElement",
     "HtmlAnchorElement",
@@ -71,6 +72,7 @@ features = [
     "MessageEvent",
     "BinaryType",
     "CloseEvent",
+    "DomRect",
 ]
 
 [dev-dependencies]

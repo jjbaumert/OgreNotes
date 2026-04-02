@@ -38,6 +38,9 @@ impl ThreadRepo {
             AttributeValue::S(serde_json::to_string(&thread.status).unwrap().trim_matches('"').to_string()),
         );
         item.insert("created_by".to_string(), AttributeValue::S(thread.created_by.clone()));
+        if let Some(ref bid) = thread.block_id {
+            item.insert("block_id".to_string(), AttributeValue::S(bid.clone()));
+        }
         if let Some(start) = thread.anchor_start {
             item.insert("anchor_start".to_string(), AttributeValue::N(start.to_string()));
         }
@@ -330,6 +333,11 @@ fn thread_from_item(
         .cloned()
         .unwrap_or_default();
 
+    let block_id = item
+        .get("block_id")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.to_string());
+
     Ok(Thread {
         thread_id: thread_id.to_string(),
         doc_id: get_s(item, "doc_id")?,
@@ -338,6 +346,7 @@ fn thread_from_item(
         created_by: get_s(item, "created_by")?,
         title,
         member_ids,
+        block_id,
         anchor_start,
         anchor_end,
         created_at: get_n(item, "created_at")?,

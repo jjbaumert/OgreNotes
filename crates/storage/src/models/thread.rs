@@ -43,10 +43,13 @@ pub struct Thread {
     /// Participant user IDs (for chat/DM threads).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_ids: Vec<String>,
-    /// For inline comments: start position in the document.
+    /// For inline comments: the block ID this comment is anchored to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_id: Option<String>,
+    /// For inline comments: start position in the document (legacy).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anchor_start: Option<u32>,
-    /// For inline comments: end position in the document.
+    /// For inline comments: end position in the document (legacy).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anchor_end: Option<u32>,
     pub created_at: i64,
@@ -99,6 +102,7 @@ mod tests {
             created_by: "user1".to_string(),
             title: None,
             member_ids: Vec::new(),
+            block_id: None,
             anchor_start: None,
             anchor_end: None,
             created_at: 1000000,

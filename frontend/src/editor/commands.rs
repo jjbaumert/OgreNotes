@@ -90,6 +90,100 @@ pub fn toggle_mark(
     true
 }
 
+/// Toggle a mark with specific attributes on the current selection.
+/// Used for link marks which carry an href attribute.
+/// If the mark is already present, removes it. Otherwise adds with the given attrs.
+pub fn toggle_link(
+    href: &str,
+    state: &EditorState,
+    dispatch: Option<&dyn Fn(Transaction)>,
+) -> bool {
+    let from = state.selection.from();
+    let to = state.selection.to();
+
+    // Links require a range selection
+    if state.selection.empty() {
+        return false;
+    }
+
+    if let Some(rp) = resolve(&state.doc, from) {
+        let parent = rp.node_at(rp.depth, &state.doc);
+        if let Some(nt) = parent.node_type() {
+            if !state.schema.can_apply_mark(nt, MarkType::Link) {
+                return false;
+            }
+        }
+    }
+
+    if let Some(dispatch) = dispatch {
+        let all_have_link = range_all_have_mark(&state.doc, from, to, MarkType::Link);
+
+        if all_have_link {
+            // Remove link mark
+            let mark = Mark::new(MarkType::Link);
+            if let Ok(txn) = state.transaction().remove_mark(from, to, mark) {
+                dispatch(txn);
+            }
+        } else {
+            // Add link mark with href
+            let mut mark = Mark::new(MarkType::Link);
+            mark.attrs.insert("href".to_string(), href.to_string());
+            if let Ok(txn) = state.transaction().add_mark(from, to, mark) {
+                dispatch(txn);
+            }
+        }
+    }
+    true
+}
+
+/// Toggle a color-based mark (TextColor or Highlight) on the current selection.
+/// If `color` is empty, removes the mark. Otherwise adds/replaces it.
+pub fn toggle_color_mark(
+    mark_type: MarkType,
+    color: &str,
+    state: &EditorState,
+    dispatch: Option<&dyn Fn(Transaction)>,
+) -> bool {
+    let from = state.selection.from();
+    let to = state.selection.to();
+
+    if state.selection.empty() {
+        return false;
+    }
+
+    if let Some(rp) = resolve(&state.doc, from) {
+        let parent = rp.node_at(rp.depth, &state.doc);
+        if let Some(nt) = parent.node_type() {
+            if !state.schema.can_apply_mark(nt, mark_type) {
+                return false;
+            }
+        }
+    }
+
+    if let Some(dispatch) = dispatch {
+        if color.is_empty() {
+            // Remove the mark
+            let mark = Mark::new(mark_type);
+            if let Ok(txn) = state.transaction().remove_mark(from, to, mark) {
+                dispatch(txn);
+            }
+        } else {
+            // Remove any existing color mark, then add new one — single transaction.
+            let remove_mark = Mark::new(mark_type);
+            let mut add_mark = Mark::new(mark_type);
+            add_mark.attrs.insert("color".to_string(), color.to_string());
+            let txn = state
+                .transaction()
+                .remove_mark(from, to, remove_mark)
+                .and_then(|t| t.add_mark(from, to, add_mark));
+            if let Ok(txn) = txn {
+                dispatch(txn);
+            }
+        }
+    }
+    true
+}
+
 /// Public version for toolbar state queries.
 pub fn mark_active_at_cursor_public(state: &EditorState, mark_type: MarkType) -> bool {
     state
@@ -282,6 +376,38 @@ pub fn set_heading(
     }
 }
 
+/// Convert the current block to a code block.
+pub fn set_code_block(
+    state: &EditorState,
+    dispatch: Option<&dyn Fn(Transaction)>,
+) -> bool {
+    let pos = state.selection.from();
+    let Some(rp) = resolve(&state.doc, pos) else {
+        return false;
+    };
+
+    let parent = rp.node_at(rp.depth, &state.doc);
+    let parent_type = parent.node_type();
+
+    match parent_type {
+        Some(NodeType::CodeBlock) => true, // already a code block
+        Some(NodeType::Paragraph) | Some(NodeType::Heading) => {
+            if let Some(dispatch) = dispatch {
+                let abs_pos = rp.start(rp.depth) - 1;
+                if let Ok(txn) = state.transaction().step(Step::SetNodeType {
+                    pos: abs_pos,
+                    node_type: NodeType::CodeBlock,
+                    attrs: HashMap::new(),
+                }) {
+                    dispatch(txn);
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Check if the cursor is in a paragraph (for toolbar state).
 pub fn is_paragraph(state: &EditorState) -> bool {
     let pos = state.selection.from();
@@ -312,6 +438,16 @@ pub fn heading_level(state: &EditorState) -> Option<u8> {
 pub fn is_in_list(state: &EditorState, list_type: NodeType) -> bool {
     let pos = state.selection.from();
     find_container_of_type(&state.doc, pos, list_type).is_some()
+}
+
+/// Check if the cursor is in a code block.
+pub fn is_in_code_block(state: &EditorState) -> bool {
+    let pos = state.selection.from();
+    let Some(rp) = resolve(&state.doc, pos) else {
+        return false;
+    };
+    let parent = rp.node_at(rp.depth, &state.doc);
+    parent.node_type() == Some(NodeType::CodeBlock)
 }
 
 /// Check if the cursor is inside a blockquote.

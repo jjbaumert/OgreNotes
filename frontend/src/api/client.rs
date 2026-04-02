@@ -199,6 +199,38 @@ pub async fn api_post<T: DeserializeOwned, B: Serialize>(
     handle_response(resp).await
 }
 
+/// Make an authenticated POST request with JSON body, expecting no response body.
+pub async fn api_post_empty<B: Serialize>(path: &str, body: &B) -> Result<(), ApiClientError> {
+    let url = format!("{API_BASE}{path}");
+    let mut req = Request::post(&url).header("Content-Type", "application/json");
+
+    if let Some(token) = get_token() {
+        req = req.header("Authorization", &format!("Bearer {token}"));
+    }
+
+    let body_str =
+        serde_json::to_string(body).map_err(|e| ApiClientError::Serialize(e.to_string()))?;
+    let resp = req
+        .body(body_str)
+        .map_err(|e| ApiClientError::Network(e.to_string()))?
+        .send()
+        .await
+        .map_err(|e| ApiClientError::Network(e.to_string()))?;
+
+    if resp.status() == 401 {
+        redirect_to_login();
+        return Err(ApiClientError::Unauthorized);
+    }
+
+    if !resp.ok() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(ApiClientError::Http(status, text));
+    }
+
+    Ok(())
+}
+
 /// Make an authenticated PATCH request with JSON body.
 pub async fn api_patch<B: Serialize>(path: &str, body: &B) -> Result<(), ApiClientError> {
     let url = format!("{API_BASE}{path}");

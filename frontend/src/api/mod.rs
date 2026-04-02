@@ -1,4 +1,10 @@
 pub mod blobs;
+pub mod chats;
 pub mod client;
+pub mod comments;
 pub mod documents;
 pub mod folders;
+pub mod history;
+pub mod notifications;
+pub mod sharing;
+pub mod users;

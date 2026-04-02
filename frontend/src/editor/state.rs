@@ -1090,7 +1090,9 @@ mod tests {
     #[test]
     fn create_empty_state() {
         let state = EditorState::empty();
-        assert_eq!(state.doc, Node::empty_doc());
+        assert_eq!(state.doc.node_type(), Some(NodeType::Doc));
+        assert_eq!(state.doc.child_count(), 1);
+        assert_eq!(state.doc.child(0).unwrap().node_type(), Some(NodeType::Paragraph));
         assert_eq!(state.selection.head(), 1);
         assert!(state.selection.empty());
         assert!(state.stored_marks.is_none());

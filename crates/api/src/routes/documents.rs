@@ -11,7 +11,7 @@ use ogrenotes_common::id::new_id;
 use ogrenotes_common::time::now_usec;
 use ogrenotes_storage::models::document::DocumentMeta;
 use ogrenotes_storage::models::folder::FolderChild;
-use ogrenotes_storage::models::{ChildType, DocType};
+use ogrenotes_storage::models::{AccessLevel, ChildType, DocType};
 
 use crate::error::ApiError;
 use crate::middleware::auth::AuthUser;
@@ -50,6 +50,8 @@ fn default_title() -> String {
 struct DocumentResponse {
     id: String,
     title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    folder_id: Option<String>,
     doc_type: String,
     created_at: i64,
     updated_at: i64,
@@ -110,6 +112,7 @@ async fn create_document(
         doc_id: doc_id.clone(),
         title: req.title.clone(),
         owner_id: user_id,
+        folder_id: Some(folder_id),
         doc_type: DocType::Document,
         snapshot_version: 1,
         snapshot_s3_key: Some(format!("docs/{doc_id}/snapshots/1.bin")),
@@ -126,6 +129,7 @@ async fn create_document(
         Json(DocumentResponse {
             id: doc_id,
             title: req.title,
+            folder_id: meta.folder_id.clone(),
             doc_type: DocType::Document.as_str().to_string(),
             created_at: now,
             updated_at: now,
@@ -162,19 +166,32 @@ pub(crate) async fn check_doc_access(
         return Ok(meta);
     }
 
-    // Check folder membership: find all folders that contain this document
-    // and check if the user is a member of any of them with sufficient access.
-    // For MVP, documents are in exactly one folder (the one they were created in).
-    // We check all folders that list this doc as a child via GSI1 on the owner.
-    // Simpler approach: check all folder membership for this user.
-    //
-    // For now, scan the user's folder memberships to find a match.
-    // This is O(folders) but acceptable for MVP; Phase 2 can add a direct lookup.
-    //
-    // TODO: Add a DOC#<doc_id>/FOLDER#<folder_id> reverse index for faster lookup.
+    // Check folder membership: the document stores its parent folder_id.
+    // Look up the user's membership in that folder.
+    if let Some(ref folder_id) = meta.folder_id {
+        if let Ok(Some(member)) = state.folder_repo.get_member(folder_id, user_id).await {
+            // Check that the member's access level is sufficient.
+            if access_level_satisfies(&member.access_level, &required) {
+                return Ok(meta);
+            }
+        }
+    }
 
-    // Fallback: not authorized
     Err(ApiError::Forbidden)
+}
+
+/// Check if `have` access level is at least as permissive as `need`.
+/// Own > Edit > Comment > View.
+fn access_level_satisfies(have: &AccessLevel, need: &AccessLevel) -> bool {
+    fn rank(level: &AccessLevel) -> u8 {
+        match level {
+            AccessLevel::Own => 4,
+            AccessLevel::Edit => 3,
+            AccessLevel::Comment => 2,
+            AccessLevel::View => 1,
+        }
+    }
+    rank(have) >= rank(need)
 }
 
 /// Legacy compatibility wrapper — checks ownership only.
@@ -204,6 +221,7 @@ async fn get_document(
     Ok(Json(DocumentResponse {
         id: meta.doc_id,
         title: meta.title,
+        folder_id: meta.folder_id,
         doc_type: meta.doc_type.as_str().to_string(),
         created_at: meta.created_at,
         updated_at: meta.updated_at,
@@ -273,11 +291,12 @@ async fn delete_document(
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or(ApiError::Internal("User not found".to_string()))?;
 
-    // Remove from source folder if provided
-    if let Some(Json(req)) = delete_req {
-        if let Some(source_id) = req.source_folder_id {
-            let _ = state.folder_repo.remove_child(&source_id, &id).await;
-        }
+    // Remove from source folder (explicit request body, or fall back to stored folder_id).
+    let source_folder = delete_req
+        .and_then(|Json(req)| req.source_folder_id)
+        .or(meta.folder_id.clone());
+    if let Some(source_id) = source_folder {
+        let _ = state.folder_repo.remove_child(&source_id, &id).await;
     }
 
     // Add to trash folder

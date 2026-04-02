@@ -7,6 +7,8 @@ use super::client::{api_delete, api_get, api_get_bytes, api_patch, api_post, api
 pub struct DocumentResponse {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub folder_id: Option<String>,
     pub doc_type: String,
     pub created_at: i64,
     pub updated_at: i64,

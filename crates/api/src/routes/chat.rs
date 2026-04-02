@@ -10,6 +10,7 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 
 use ogrenotes_common::time::now_usec;
+use ogrenotes_storage::models::notification::{NotifType, Notification};
 use ogrenotes_storage::models::thread::{Message, Thread, ThreadStatus, ThreadType};
 
 use crate::error::ApiError;
@@ -181,6 +182,7 @@ async fn create_chat(
         created_by: user_id,
         title: body.title,
         member_ids,
+        block_id: None,
         anchor_start: None,
         anchor_end: None,
         created_at: now,
@@ -327,7 +329,7 @@ async fn send_message(
     let msg = Message {
         thread_id: id.clone(),
         message_id: nanoid::nanoid!(16),
-        user_id,
+        user_id: user_id.clone(),
         content: body.content,
         created_at: now,
         updated_at: None,
@@ -335,6 +337,31 @@ async fn send_message(
 
     state.thread_repo.add_message(&msg).await?;
     state.thread_repo.bump_updated_at(&id, now).await?;
+
+    // Notify other chat members about the new message.
+    let notif_repo = state.notification_repo.clone();
+    let members = thread.member_ids.clone();
+    let sender = user_id.clone();
+    let chat_id = id.clone();
+    tokio::spawn(async move {
+        for member_id in members {
+            if member_id == sender {
+                continue;
+            }
+            let notif = Notification {
+                notif_id: nanoid::nanoid!(16),
+                user_id: member_id,
+                notif_type: NotifType::ChatMessage,
+                doc_id: None,
+                thread_id: Some(chat_id.clone()),
+                actor_id: sender.clone(),
+                message: "sent a message in chat".to_string(),
+                read: false,
+                created_at: now,
+            };
+            let _ = notif_repo.create(&notif).await;
+        }
+    });
 
     Ok(StatusCode::CREATED)
 }

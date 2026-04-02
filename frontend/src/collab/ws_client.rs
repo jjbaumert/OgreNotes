@@ -17,6 +17,8 @@ use yrs::updates::encoder::Encode;
 use crate::editor::model::Node;
 use crate::editor::yrs_bridge;
 
+use serde::{Deserialize, Serialize};
+
 // Protocol constants (must match crates/collab/src/protocol.rs)
 const MSG_AUTH: u8 = 0x00;
 const MSG_SYNC_STEP1: u8 = 0x01;
@@ -24,6 +26,27 @@ const MSG_SYNC_STEP2: u8 = 0x02;
 const MSG_UPDATE: u8 = 0x03;
 const MSG_AWARENESS: u8 = 0x04;
 const MSG_ERROR: u8 = 0xFF;
+
+/// Color palette for collaborator cursors (must match backend).
+const CURSOR_COLORS: [&str; 12] = [
+    "#E57373", "#64B5F6", "#81C784", "#FFB74D",
+    "#BA68C8", "#4DD0E1", "#F06292", "#AED581",
+    "#FFD54F", "#7986CB", "#4DB6AC", "#A1887F",
+];
+
+/// JSON payload for awareness messages (matches backend AwarenessState).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AwarenessPayload {
+    user_id: String,
+    name: String,
+    color: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor_pos: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selection_anchor: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selection_head: Option<u32>,
+}
 
 /// State of the WebSocket connection.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -36,6 +59,20 @@ pub enum ConnectionState {
 
 /// Callback for when the document is updated by a remote collaborator.
 pub type OnRemoteUpdate = Box<dyn Fn(Node)>;
+
+/// Remote user's cursor/selection state for presence rendering.
+#[derive(Debug, Clone)]
+pub struct RemoteCursor {
+    pub user_id: String,
+    pub name: String,
+    pub color: String,
+    pub cursor_pos: Option<u32>,
+    pub selection_anchor: Option<u32>,
+    pub selection_head: Option<u32>,
+}
+
+/// Callback for when remote cursors change.
+pub type OnAwarenessUpdate = Box<dyn Fn(Vec<RemoteCursor>)>;
 
 /// WebSocket collaboration client.
 /// Maintains a yrs Doc for incremental sync and bridges to the editor model.
@@ -50,6 +87,10 @@ pub struct CollabClient {
     doc_id: String,
     /// Callback when remote update changes the document.
     on_remote_update: Rc<RefCell<Option<OnRemoteUpdate>>>,
+    /// Callback when remote cursors change.
+    on_awareness_update: Rc<RefCell<Option<OnAwarenessUpdate>>>,
+    /// Remote user awareness states.
+    remote_cursors: Rc<RefCell<std::collections::HashMap<String, RemoteCursor>>>,
     /// Stored closures (prevent GC).
     _closures: Rc<RefCell<Vec<Closure<dyn Fn(web_sys::Event)>>>>,
 }
@@ -74,6 +115,8 @@ impl CollabClient {
             ydoc: Rc::new(RefCell::new(ydoc)),
             doc_id,
             on_remote_update: Rc::new(RefCell::new(None)),
+            on_awareness_update: Rc::new(RefCell::new(None)),
+            remote_cursors: Rc::new(RefCell::new(std::collections::HashMap::new())),
             _closures: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -81,6 +124,11 @@ impl CollabClient {
     /// Set the callback for remote document updates.
     pub fn set_on_remote_update(&self, callback: OnRemoteUpdate) {
         *self.on_remote_update.borrow_mut() = Some(callback);
+    }
+
+    /// Set the callback for remote awareness updates (cursor presence).
+    pub fn set_on_awareness_update(&self, callback: OnAwarenessUpdate) {
+        *self.on_awareness_update.borrow_mut() = Some(callback);
     }
 
     /// Get the current connection state.
@@ -123,6 +171,8 @@ impl CollabClient {
         let ydoc_for_msg = Rc::clone(&ydoc);
         let ws_for_msg = Rc::clone(&ws_ref);
         let on_remote_for_msg = Rc::clone(&on_remote);
+        let on_awareness_for_msg = Rc::clone(&self.on_awareness_update);
+        let remote_cursors_for_msg = Rc::clone(&self.remote_cursors);
         let flag_for_msg = std::sync::Arc::clone(&connected_flag);
         let on_message = Closure::wrap(Box::new(move |event: web_sys::Event| {
             let Some(me) = event.dyn_ref::<MessageEvent>() else { return };
@@ -198,6 +248,31 @@ impl CollabClient {
                         }
                     }
                 }
+                MSG_AWARENESS => {
+                    // Remote user's cursor/selection update.
+                    if let Ok(state) = serde_json::from_slice::<AwarenessPayload>(payload) {
+                        let color_idx = (state.color as usize) % CURSOR_COLORS.len();
+                        let cursor = RemoteCursor {
+                            user_id: state.user_id.clone(),
+                            name: state.name.clone(),
+                            color: CURSOR_COLORS[color_idx].to_string(),
+                            cursor_pos: state.cursor_pos,
+                            selection_anchor: state.selection_anchor,
+                            selection_head: state.selection_head,
+                        };
+                        remote_cursors_for_msg.borrow_mut().insert(state.user_id, cursor);
+
+                        // Notify callback with all remote cursors.
+                        if let Some(callback) = on_awareness_for_msg.borrow().as_ref() {
+                            let cursors: Vec<RemoteCursor> = remote_cursors_for_msg
+                                .borrow()
+                                .values()
+                                .cloned()
+                                .collect();
+                            callback(cursors);
+                        }
+                    }
+                }
                 MSG_ERROR => {
                     if let Ok(error) = std::str::from_utf8(payload) {
                         web_sys::console::error_1(&format!("WebSocket error: {error}").into());
@@ -238,30 +313,38 @@ impl CollabClient {
 
     /// Send a local editor change as a yrs incremental update.
     /// Called by the editor dispatch when the document changes.
+    ///
+    /// Optimization: captures the state vector from our stored ydoc *before*
+    /// converting the new editor model. The diff is computed against that
+    /// snapshot, so we only send what actually changed. The old approach
+    /// created a fresh yrs::Doc on every keystroke.
     pub fn send_update(&self, new_doc: &Node) {
         if *self.state.borrow() != ConnectionState::Synced {
             return;
         }
 
-        // Convert the full editor model to yrs bytes
+        // Capture our current state vector BEFORE any mutation.
+        let our_sv = {
+            let ydoc = self.ydoc.borrow();
+            ydoc.transact().state_vector()
+        };
+
+        // Convert the new editor model to yrs full-state bytes.
         let new_bytes = yrs_bridge::doc_to_ydoc_bytes(new_doc);
 
-        // Create a fresh yrs Doc from the new state, compute diff against our stored doc
-        let new_ydoc = yrs::Doc::new();
+        // Decode the new state into a temporary doc to compute the diff.
+        let tmp_doc = yrs::Doc::new();
         {
-            let mut txn = new_ydoc.transact_mut();
+            let mut txn = tmp_doc.transact_mut();
             if let Ok(update) = yrs::Update::decode_v1(&new_bytes) {
                 let _ = txn.apply_update(update);
             }
         }
 
-        // Compute what changed: encode the new state as an update from our current state vector
-        let ydoc = self.ydoc.borrow();
-        let our_sv = ydoc.transact().state_vector();
-        let diff = new_ydoc.transact().encode_state_as_update_v1(&our_sv);
-        drop(ydoc);
+        // Encode only the changes relative to our stored state.
+        let diff = tmp_doc.transact().encode_state_as_update_v1(&our_sv);
 
-        // Apply the diff to our stored yrs doc to keep it in sync
+        // Apply the diff to our stored ydoc to keep it in sync.
         {
             let mut ydoc = self.ydoc.borrow_mut();
             let mut txn = ydoc.transact_mut();
@@ -270,11 +353,34 @@ impl CollabClient {
             }
         }
 
-        // Send the diff over WebSocket
-        if !diff.is_empty() {
+        // Send the diff over WebSocket (skip if empty/no-op).
+        // A minimal yrs update with no changes is 2 bytes; real changes are longer.
+        if diff.len() > 2 {
             if let Some(ws) = self.ws.borrow().as_ref() {
                 let mut msg = vec![MSG_UPDATE];
                 msg.extend_from_slice(&diff);
+                let _ = ws.send_with_u8_array(&msg);
+            }
+        }
+    }
+
+    /// Send local cursor/selection position as an awareness update.
+    pub fn send_awareness(&self, user_id: &str, name: &str, color: u8, cursor_pos: Option<u32>, selection_anchor: Option<u32>, selection_head: Option<u32>) {
+        if *self.state.borrow() != ConnectionState::Synced {
+            return;
+        }
+        let payload = AwarenessPayload {
+            user_id: user_id.to_string(),
+            name: name.to_string(),
+            color,
+            cursor_pos,
+            selection_anchor,
+            selection_head,
+        };
+        if let Ok(json) = serde_json::to_vec(&payload) {
+            if let Some(ws) = self.ws.borrow().as_ref() {
+                let mut msg = vec![MSG_AWARENESS];
+                msg.extend_from_slice(&json);
                 let _ = ws.send_with_u8_array(&msg);
             }
         }

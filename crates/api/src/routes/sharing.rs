@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use ogrenotes_common::time::now_usec;
 use ogrenotes_storage::models::folder::FolderMember;
+use ogrenotes_storage::models::notification::{NotifType, Notification};
 use ogrenotes_storage::models::AccessLevel;
 
 use crate::error::ApiError;
@@ -37,6 +38,8 @@ struct AddMemberRequest {
 #[serde(rename_all = "camelCase")]
 struct MemberResponse {
     user_id: String,
+    name: String,
+    email: String,
     access_level: AccessLevel,
     added_at: i64,
 }
@@ -71,18 +74,22 @@ async fn list_members(
     }
 
     let members = state.folder_repo.list_members(&folder_id).await?;
-    let response = MembersListResponse {
-        members: members
-            .into_iter()
-            .map(|m| MemberResponse {
-                user_id: m.user_id,
-                access_level: m.access_level,
-                added_at: m.added_at,
-            })
-            .collect(),
-    };
+    let mut response_members = Vec::new();
+    for m in members {
+        let (name, email) = match state.user_repo.get_by_id(&m.user_id).await {
+            Ok(Some(user)) => (user.name, user.email),
+            _ => (m.user_id.clone(), String::new()),
+        };
+        response_members.push(MemberResponse {
+            user_id: m.user_id,
+            name,
+            email,
+            access_level: m.access_level,
+            added_at: m.added_at,
+        });
+    }
 
-    Ok(axum::Json(response))
+    Ok(axum::Json(MembersListResponse { members: response_members }))
 }
 
 /// POST /folders/:id/members — add or update a member's access to a folder.
@@ -131,6 +138,25 @@ async fn add_member(
     };
 
     state.folder_repo.add_member(&member).await?;
+
+    // Notify the target user that they've been granted access.
+    let notif_repo = state.notification_repo.clone();
+    let target = member.user_id.clone();
+    let actor = user_id.clone();
+    tokio::spawn(async move {
+        let notif = Notification {
+            notif_id: nanoid::nanoid!(16),
+            user_id: target,
+            notif_type: NotifType::Shared,
+            doc_id: None,
+            thread_id: None,
+            actor_id: actor,
+            message: format!("shared a folder with you"),
+            read: false,
+            created_at: now_usec(),
+        };
+        let _ = notif_repo.create(&notif).await;
+    });
 
     Ok(StatusCode::NO_CONTENT)
 }

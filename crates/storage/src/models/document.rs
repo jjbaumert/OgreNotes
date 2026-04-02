@@ -9,6 +9,9 @@ pub struct DocumentMeta {
     pub doc_id: String,
     pub title: String,
     pub owner_id: String,
+    /// The folder this document belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<String>,
     pub doc_type: DocType,
     pub snapshot_version: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,6 +93,7 @@ mod tests {
             doc_id: new_id(),
             title: "Test Document".to_string(),
             owner_id: new_id(),
+            folder_id: None,
             doc_type: DocType::Document,
             snapshot_version: 1,
             snapshot_s3_key: Some("docs/abc/snapshots/1.bin".to_string()),

@@ -239,6 +239,41 @@ impl DocRepo {
             })
             .collect()
     }
+    /// Delete UPDATE# rows for a document that were created before `before_usec`.
+    /// Used after compaction snapshots to prune only updates included in the snapshot.
+    pub async fn delete_updates_before(
+        &self,
+        doc_id: &str,
+        before_usec: i64,
+    ) -> Result<usize, RepoError> {
+        let pk = format!("DOC#{doc_id}");
+        let items = self
+            .db
+            .query(&pk, Some("UPDATE#"))
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+
+        let mut count = 0;
+        for item in &items {
+            // Only delete if created_at < before_usec
+            let created_at = item
+                .get("created_at")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<i64>().ok())
+                .unwrap_or(i64::MAX);
+            if created_at >= before_usec {
+                continue;
+            }
+            if let Some(sk) = item.get("SK").and_then(|v| v.as_s().ok()) {
+                self.db
+                    .delete_item(&pk, sk)
+                    .await
+                    .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
 }
 
 fn doc_meta_to_item(meta: &DocumentMeta) -> HashMap<String, AttributeValue> {
@@ -246,6 +281,9 @@ fn doc_meta_to_item(meta: &DocumentMeta) -> HashMap<String, AttributeValue> {
     item.insert("doc_id".to_string(), AttributeValue::S(meta.doc_id.clone()));
     item.insert("title".to_string(), AttributeValue::S(meta.title.clone()));
     item.insert("owner_id".to_string(), AttributeValue::S(meta.owner_id.clone()));
+    if let Some(ref fid) = meta.folder_id {
+        item.insert("folder_id".to_string(), AttributeValue::S(fid.clone()));
+    }
     item.insert(
         "doc_type".to_string(),
         AttributeValue::S(serde_json::to_string(&meta.doc_type).unwrap().trim_matches('"').to_string()),
@@ -272,6 +310,7 @@ fn doc_meta_from_item(item: &HashMap<String, AttributeValue>) -> Result<Document
         doc_id: get_s(item, "doc_id")?,
         title: get_s(item, "title")?,
         owner_id: get_s(item, "owner_id")?,
+        folder_id: item.get("folder_id").and_then(|v| v.as_s().ok()).cloned(),
         doc_type,
         snapshot_version: get_n_u64(item, "snapshot_version")?,
         snapshot_s3_key: item.get("snapshot_s3_key").and_then(|v| v.as_s().ok()).cloned(),

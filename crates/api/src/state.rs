@@ -6,6 +6,7 @@ use ogrenotes_storage::repo::doc_repo::DocRepo;
 use ogrenotes_storage::repo::folder_repo::FolderRepo;
 use ogrenotes_storage::repo::notification_repo::NotificationRepo;
 use ogrenotes_storage::repo::session_repo::SessionRepo;
+use ogrenotes_storage::repo::snapshot_repo::SnapshotRepo;
 use ogrenotes_storage::repo::thread_repo::ThreadRepo;
 use ogrenotes_storage::repo::user_repo::UserRepo;
 use ogrenotes_storage::s3::S3Client;
@@ -21,6 +22,7 @@ pub struct AppState {
     pub session_repo: Arc<SessionRepo>,
     pub thread_repo: Arc<ThreadRepo>,
     pub notification_repo: Arc<NotificationRepo>,
+    pub snapshot_repo: Arc<SnapshotRepo>,
     pub room_registry: Arc<RoomRegistry>,
     pub redis_pubsub: Arc<RedisPubSub>,
 }
@@ -37,6 +39,7 @@ impl AppState {
         let folder_repo = Arc::new(FolderRepo::new(dynamo.clone()));
         let thread_repo = Arc::new(ThreadRepo::new(dynamo.clone()));
         let notification_repo = Arc::new(NotificationRepo::new(dynamo.clone()));
+        let snapshot_repo = Arc::new(SnapshotRepo::new(dynamo.clone()));
         let session_repo = Arc::new(SessionRepo::new(dynamo));
 
         Self {
@@ -47,6 +50,7 @@ impl AppState {
             session_repo,
             thread_repo,
             notification_repo,
+            snapshot_repo,
             room_registry: Arc::new(RoomRegistry::new()),
             redis_pubsub: Arc::new(redis_pubsub),
         }

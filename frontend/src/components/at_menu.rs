@@ -1,5 +1,7 @@
 use leptos::prelude::*;
 
+use crate::api::users;
+
 /// @ menu: triggered by typing `@` in the editor.
 /// Provides typeahead search for people, documents, and insertion options.
 #[component]
@@ -17,15 +19,34 @@ pub fn AtMenu(
     /// Callback to close the menu.
     on_close: Callback<()>,
 ) -> impl IntoView {
-    #[allow(unused_variables)]
     let (results, set_results) = signal::<Vec<AtMenuItem>>(Vec::new());
 
-    // TODO: Search users and documents based on query
-    // Effect::new(move |_| {
-    //     let q = query.get();
-    //     if q.is_empty() { return; }
-    //     // API call to search
-    // });
+    // Search users based on query.
+    Effect::new(move |_| {
+        if !visible.get() {
+            return;
+        }
+        let q = query.get();
+        if q.is_empty() {
+            set_results.set(Vec::new());
+            return;
+        }
+        leptos::task::spawn_local(async move {
+            if let Ok(resp) = users::search_users(&q).await {
+                let items: Vec<AtMenuItem> = resp
+                    .users
+                    .into_iter()
+                    .map(|u| AtMenuItem {
+                        id: u.user_id,
+                        label: format!("{} ({})", u.name, u.email),
+                        icon: "@".to_string(),
+                        item_type: AtMenuItemType::User,
+                    })
+                    .collect();
+                set_results.set(items);
+            }
+        });
+    });
 
     view! {
         <Show when=move || visible.get()>

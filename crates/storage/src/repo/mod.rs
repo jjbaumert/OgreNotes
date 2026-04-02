@@ -2,6 +2,7 @@ pub mod doc_repo;
 pub mod folder_repo;
 pub mod notification_repo;
 pub mod session_repo;
+pub mod snapshot_repo;
 pub mod thread_repo;
 pub mod user_repo;
 

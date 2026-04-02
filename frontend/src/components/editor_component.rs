@@ -182,8 +182,23 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             ToolbarCommand::ToggleBlockquote => {
                 commands::toggle_blockquote(&state, Some(&dispatch_fn));
             }
+            ToolbarCommand::SetCodeBlock => {
+                commands::set_code_block(&state, Some(&dispatch_fn));
+            }
             ToolbarCommand::InsertHorizontalRule => {
                 commands::insert_horizontal_rule(&state, Some(&dispatch_fn));
+            }
+            ToolbarCommand::ToggleLink(ref href) => {
+                commands::toggle_link(href, &state, Some(&dispatch_fn));
+            }
+            ToolbarCommand::ToggleTextColor(ref color) => {
+                commands::toggle_color_mark(MarkType::TextColor, color, &state, Some(&dispatch_fn));
+            }
+            ToolbarCommand::ToggleHighlight(ref color) => {
+                commands::toggle_color_mark(MarkType::Highlight, color, &state, Some(&dispatch_fn));
+            }
+            ToolbarCommand::InsertComment => {
+                // Handled by document page, not editor component — pass through as no-op.
             }
             ToolbarCommand::UploadImage => {
                 let doc_id = props.doc_id.clone();

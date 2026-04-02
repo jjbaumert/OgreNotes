@@ -254,11 +254,45 @@ fn tag_to_mark(tag: &str, el: &web_sys::Element) -> Option<Mark> {
             if super::view::is_safe_url(&href) {
                 Some(Mark::new(MarkType::Link).with_attr("href", &href))
             } else {
-                None // unsafe link — treat as plain text
+                None
             }
+        }
+        "span" => {
+            let style = el.get_attribute("style").unwrap_or_default();
+            if let Some(color) = extract_css_color(&style, "color") {
+                if super::view::is_safe_color(&color) {
+                    return Some(Mark::new(MarkType::TextColor).with_attr("color", &color));
+                }
+            }
+            None
+        }
+        "mark" => {
+            let style = el.get_attribute("style").unwrap_or_default();
+            if let Some(color) = extract_css_color(&style, "background") {
+                if super::view::is_safe_color(&color) {
+                    return Some(Mark::new(MarkType::Highlight).with_attr("color", &color));
+                }
+            }
+            // Plain <mark> with no inline style — default yellow highlight
+            Some(Mark::new(MarkType::Highlight).with_attr("color", "#FFF176"))
         }
         _ => None,
     }
+}
+
+/// Extract a CSS property value from an inline style string.
+/// e.g. `extract_css_color("color: #E53935; font-size: 14px", "color")` → Some("#E53935")
+fn extract_css_color(style: &str, property: &str) -> Option<String> {
+    for part in style.split(';') {
+        let part = part.trim();
+        if let Some(rest) = part.strip_prefix(property) {
+            let rest = rest.trim();
+            if let Some(value) = rest.strip_prefix(':') {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Check if an HTML tag is a block-level element that should create paragraph structure.
@@ -477,6 +511,14 @@ fn open_mark_tag(mark: &Mark) -> String {
                 .unwrap_or_default();
             format!("<a{href}>")
         }
+        MarkType::TextColor => {
+            let color = mark.attrs.get("color").map(|c| html_escape_attr(c)).unwrap_or_default();
+            format!("<span style=\"color: {color}\">")
+        }
+        MarkType::Highlight => {
+            let color = mark.attrs.get("color").map(|c| html_escape_attr(c)).unwrap_or_default();
+            format!("<mark style=\"background: {color}\">")
+        }
     }
 }
 
@@ -488,6 +530,8 @@ fn close_mark_tag(mark: &Mark) -> String {
         MarkType::Strike => "</s>".to_string(),
         MarkType::Code => "</code>".to_string(),
         MarkType::Link => "</a>".to_string(),
+        MarkType::TextColor => "</span>".to_string(),
+        MarkType::Highlight => "</mark>".to_string(),
     }
 }
 

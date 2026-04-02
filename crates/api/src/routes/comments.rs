@@ -10,6 +10,7 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 
 use ogrenotes_common::time::now_usec;
+use ogrenotes_storage::models::notification::{NotifType, Notification};
 use ogrenotes_storage::models::thread::{Message, Thread, ThreadStatus, ThreadType};
 
 use crate::error::ApiError;
@@ -39,6 +40,9 @@ pub fn thread_router() -> Router<AppState> {
 #[serde(rename_all = "camelCase")]
 struct CreateThreadRequest {
     thread_type: ThreadType,
+    /// Block ID this comment is anchored to (for inline comments).
+    #[serde(default)]
+    block_id: Option<String>,
     #[serde(default)]
     anchor_start: Option<u32>,
     #[serde(default)]
@@ -68,6 +72,8 @@ struct ThreadResponse {
     thread_type: ThreadType,
     status: ThreadStatus,
     created_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     anchor_start: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,6 +136,7 @@ async fn list_threads(
                 thread_type: t.thread_type,
                 status: t.status,
                 created_by: t.created_by,
+                block_id: t.block_id,
                 anchor_start: t.anchor_start,
                 anchor_end: t.anchor_end,
                 created_at: t.created_at,
@@ -157,13 +164,26 @@ async fn create_thread(
     )
     .await?;
 
-    // Inline comments must have anchor positions
-    if body.thread_type == ThreadType::Inline
-        && (body.anchor_start.is_none() || body.anchor_end.is_none())
-    {
-        return Err(ApiError::BadRequest(
-            "Inline comments require anchor_start and anchor_end".to_string(),
-        ));
+    // Inline comments must have a valid block_id.
+    if body.thread_type == ThreadType::Inline {
+        match &body.block_id {
+            None => {
+                return Err(ApiError::BadRequest(
+                    "Inline comments require a blockId".to_string(),
+                ));
+            }
+            Some(bid) => {
+                // Validate block_id format: alphanumeric only, 4-32 chars.
+                if bid.len() < 4
+                    || bid.len() > 32
+                    || !bid.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    return Err(ApiError::BadRequest(
+                        "blockId must be 4-32 alphanumeric characters".to_string(),
+                    ));
+                }
+            }
+        }
     }
 
     let now = now_usec();
@@ -177,6 +197,7 @@ async fn create_thread(
         created_by: user_id.clone(),
         title: None,
         member_ids: Vec::new(),
+        block_id: body.block_id,
         anchor_start: body.anchor_start,
         anchor_end: body.anchor_end,
         created_at: now,
@@ -191,7 +212,7 @@ async fn create_thread(
             let msg = Message {
                 thread_id: thread_id.clone(),
                 message_id: nanoid::nanoid!(16),
-                user_id,
+                user_id: user_id.clone(),
                 content,
                 created_at: now,
                 updated_at: None,
@@ -199,6 +220,31 @@ async fn create_thread(
             state.thread_repo.add_message(&msg).await?;
         }
     }
+
+    // Notify document owner about the new comment thread.
+    let notif_repo = state.notification_repo.clone();
+    let notif_doc_id = doc_id.clone();
+    let notif_actor = user_id.clone();
+    let notif_thread_id = thread_id.clone();
+    let doc_repo = state.doc_repo.clone();
+    tokio::spawn(async move {
+        if let Ok(Some(meta)) = doc_repo.get(&notif_doc_id).await {
+            if meta.owner_id != notif_actor {
+                let notif = Notification {
+                    notif_id: nanoid::nanoid!(16),
+                    user_id: meta.owner_id,
+                    notif_type: NotifType::Commented,
+                    doc_id: Some(notif_doc_id),
+                    thread_id: Some(notif_thread_id),
+                    actor_id: notif_actor,
+                    message: "commented on your document".to_string(),
+                    read: false,
+                    created_at: now_usec(),
+                };
+                let _ = notif_repo.create(&notif).await;
+            }
+        }
+    });
 
     Ok((
         StatusCode::CREATED,
@@ -300,18 +346,40 @@ async fn add_message(
     }
 
     let msg = Message {
-        thread_id,
+        thread_id: thread_id.clone(),
         message_id: nanoid::nanoid!(16),
-        user_id,
+        user_id: user_id.clone(),
         content: body.content,
         created_at: now_usec(),
         updated_at: None,
     };
 
+    let now = msg.created_at;
     state.thread_repo.add_message(&msg).await?;
 
     // Bump thread's updated_at timestamp so it appears at the top of listings
-    state.thread_repo.bump_updated_at(&msg.thread_id, now_usec()).await?;
+    state.thread_repo.bump_updated_at(&thread_id, now_usec()).await?;
+
+    // Notify thread creator about the new reply.
+    if thread.created_by != user_id {
+        let notif_repo = state.notification_repo.clone();
+        let notif_user = thread.created_by.clone();
+        let notif_doc_id = thread.doc_id.clone();
+        tokio::spawn(async move {
+            let notif = Notification {
+                notif_id: nanoid::nanoid!(16),
+                user_id: notif_user,
+                notif_type: NotifType::Commented,
+                doc_id: Some(notif_doc_id),
+                thread_id: Some(thread_id),
+                actor_id: user_id,
+                message: "replied to your comment".to_string(),
+                read: false,
+                created_at: now,
+            };
+            let _ = notif_repo.create(&notif).await;
+        });
+    }
 
     Ok(StatusCode::CREATED)
 }

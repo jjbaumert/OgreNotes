@@ -1,5 +1,26 @@
 use std::collections::HashMap;
 
+/// Generate a random block ID (8 alphanumeric chars).
+/// Uses Math.random in WASM, or a simple counter in tests.
+pub fn generate_block_id() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut id = String::with_capacity(8);
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        for _ in 0..8 {
+            let idx = (js_sys::Math::random() * CHARS.len() as f64) as usize;
+            id.push(CHARS[idx % CHARS.len()] as char);
+        }
+        id
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        format!("blk{:05}", COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// Mark types for inline formatting.
 /// Ordered by canonical sort priority (lower = applied first/outermost).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -10,6 +31,8 @@ pub enum MarkType {
     Underline = 3,
     Strike = 4,
     Code = 5,
+    TextColor = 6,
+    Highlight = 7,
 }
 
 impl MarkType {
@@ -127,6 +150,19 @@ impl NodeType {
         matches!(self, NodeType::HorizontalRule | NodeType::Image)
     }
 
+    /// Whether this node type is a commentable block (gets a blockId).
+    pub fn is_commentable(&self) -> bool {
+        matches!(
+            self,
+            NodeType::Paragraph
+                | NodeType::Heading
+                | NodeType::ListItem
+                | NodeType::TaskItem
+                | NodeType::CodeBlock
+                | NodeType::Blockquote
+        )
+    }
+
     /// Whether this node type contains inline content (text).
     /// Paragraph, Heading, and CodeBlock hold text directly.
     /// Container blocks (lists, blockquote) hold other blocks, not text.
@@ -209,9 +245,13 @@ impl Node {
 
     /// Create an element node with no children and default attrs.
     pub fn element(node_type: NodeType) -> Self {
+        let mut attrs = node_type.default_attrs();
+        if node_type.is_commentable() {
+            attrs.entry("blockId".to_string()).or_insert_with(generate_block_id);
+        }
         Node::Element {
             node_type,
-            attrs: node_type.default_attrs(),
+            attrs,
             content: Fragment::empty(),
             marks: vec![],
         }
@@ -219,9 +259,13 @@ impl Node {
 
     /// Create an element node with children and default attrs.
     pub fn element_with_content(node_type: NodeType, content: Fragment) -> Self {
+        let mut attrs = node_type.default_attrs();
+        if node_type.is_commentable() {
+            attrs.entry("blockId".to_string()).or_insert_with(generate_block_id);
+        }
         Node::Element {
             node_type,
-            attrs: node_type.default_attrs(),
+            attrs,
             content,
             marks: vec![],
         }
@@ -235,12 +279,53 @@ impl Node {
     ) -> Self {
         let mut merged = node_type.default_attrs();
         merged.extend(attrs);
+        if node_type.is_commentable() {
+            merged.entry("blockId".to_string()).or_insert_with(generate_block_id);
+        }
         Node::Element {
             node_type,
             attrs: merged,
             content,
             marks: vec![],
         }
+    }
+
+    /// Get the block ID of this element node (if it has one).
+    pub fn block_id(&self) -> Option<&str> {
+        match self {
+            Node::Element { attrs, .. } => attrs.get("blockId").map(|s| s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Find the block ID at a given model position in a document.
+    /// Recursively walks the node tree to find the commentable block containing `pos`.
+    pub fn block_id_at(&self, pos: usize) -> Option<String> {
+        fn find_in_children(children: &[Node], pos: usize) -> Option<String> {
+            let mut offset = 0;
+            for child in children {
+                let size = child.node_size();
+                // Strict > on left: position at `offset` is the open boundary, not inside the child.
+                if pos > offset && pos < offset + size {
+                    if let Some(id) = child.block_id() {
+                        return Some(id.to_string());
+                    }
+                    // Recurse into container elements (lists, blockquote, doc).
+                    if let Node::Element { content, .. } = child {
+                        let inner_pos = pos - offset - 1;
+                        return find_in_children(&content.children, inner_pos);
+                    }
+                }
+                offset += size;
+            }
+            None
+        }
+
+        let Node::Element { content, .. } = self else {
+            return None;
+        };
+        // Doc-level: positions start at 0 (before content), first child content starts at 1.
+        find_in_children(&content.children, pos)
     }
 
     /// Create a copy of this element with different content.
@@ -298,6 +383,29 @@ impl Node {
                 content.children.iter().map(|c| c.text_content()).collect()
             }
         }
+    }
+
+    /// Get text content before a given model position within the same block.
+    /// Returns None if position is out of bounds.
+    pub fn text_before(&self, pos: usize) -> Option<String> {
+        let Node::Element { content, .. } = self else {
+            return None;
+        };
+        // Find which top-level block contains `pos`
+        let mut offset = 0;
+        for child in &content.children {
+            let size = child.node_size();
+            if pos >= offset && pos < offset + size {
+                // pos is inside this child block
+                let inner_pos = (pos - offset).saturating_sub(1);
+                let full_text = child.text_content();
+                let chars: Vec<char> = full_text.chars().collect();
+                let clamped = inner_pos.min(chars.len());
+                return Some(chars[..clamped].iter().collect());
+            }
+            offset += size;
+        }
+        None
     }
 
     /// The "size" of this node for position calculations.

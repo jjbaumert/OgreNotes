@@ -212,6 +212,38 @@ impl EditorView {
                 }
             }
 
+            // Handle Ctrl+K for link insertion (needs window.prompt).
+            if mod_key && !shift && !alt && key.to_lowercase() == "k" {
+                event.prevent_default();
+                let current_state = state_kd.borrow().clone();
+                // Check if link is already active — if so, remove it
+                let has_link = super::commands::mark_active_at_cursor_public(
+                    &current_state,
+                    super::model::MarkType::Link,
+                );
+                if has_link || current_state.selection.empty() {
+                    // Remove link or do nothing for cursor with no link
+                    if has_link {
+                        super::commands::toggle_link("", &current_state, Some(&|txn| {
+                            dispatch_kd(txn);
+                        }));
+                    }
+                } else {
+                    // Prompt for URL
+                    if let Some(window) = web_sys::window() {
+                        if let Ok(Some(href)) = window.prompt_with_message("Enter URL:") {
+                            let href = href.trim().to_string();
+                            if !href.is_empty() {
+                                super::commands::toggle_link(&href, &current_state, Some(&|txn| {
+                                    dispatch_kd(txn);
+                                }));
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
             let current_state = state_kd.borrow().clone();
 
             let handled = keymap.handle(
@@ -930,11 +962,17 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                         _ => "h1",
                     };
                     let el = doc.create_element(tag).ok()?;
+                    if let Some(bid) = attrs.get("blockId") {
+                        el.set_attribute("data-block-id", bid).ok()?;
+                    }
                     render_children(doc, &el, content);
                     return Some(el.into());
                 }
                 NodeType::CodeBlock => {
                     let pre = doc.create_element("pre").ok()?;
+                    if let Some(bid) = attrs.get("blockId") {
+                        pre.set_attribute("data-block-id", bid).ok()?;
+                    }
                     let code = doc.create_element("code").ok()?;
                     if let Some(lang) = attrs.get("language") {
                         if !lang.is_empty() {
@@ -964,6 +1002,11 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
             // Generic element rendering
             let tag = node_type_to_tag(*node_type);
             let el = doc.create_element(tag).ok()?;
+
+            // Set block ID for commentable blocks
+            if let Some(bid) = attrs.get("blockId") {
+                el.set_attribute("data-block-id", bid).ok()?;
+            }
 
             // Set data attributes for special types
             match node_type {
@@ -1018,13 +1061,14 @@ fn create_mark_element(doc: &Document, mark: &Mark) -> Option<Element> {
         MarkType::Strike => "s",
         MarkType::Code => "code",
         MarkType::Link => "a",
+        MarkType::TextColor => "span",
+        MarkType::Highlight => "mark",
     };
 
     let el = doc.create_element(tag).ok()?;
 
     if mark.mark_type == MarkType::Link {
         if let Some(href) = mark.attrs.get("href") {
-            // Validate URL protocol to prevent XSS
             if is_safe_url(href) {
                 el.set_attribute("href", href).ok()?;
             }
@@ -1032,6 +1076,22 @@ fn create_mark_element(doc: &Document, mark: &Mark) -> Option<Element> {
         el.set_attribute("rel", "noopener noreferrer nofollow")
             .ok()?;
         el.set_attribute("target", "_blank").ok()?;
+    }
+
+    if mark.mark_type == MarkType::TextColor {
+        if let Some(color) = mark.attrs.get("color") {
+            if is_safe_color(color) {
+                el.set_attribute("style", &format!("color: {color}")).ok()?;
+            }
+        }
+    }
+
+    if mark.mark_type == MarkType::Highlight {
+        if let Some(color) = mark.attrs.get("color") {
+            if is_safe_color(color) {
+                el.set_attribute("style", &format!("background: {color}")).ok()?;
+            }
+        }
     }
 
     Some(el)
@@ -1044,6 +1104,22 @@ pub(crate) fn is_safe_url(url: &str) -> bool {
         || lower.starts_with("http://")
         || lower.starts_with("mailto:")
         || lower.starts_with('/')
+}
+
+/// Check that a color value is safe (hex color or named color, no script injection).
+pub(crate) fn is_safe_color(color: &str) -> bool {
+    let c = color.trim();
+    // Allow hex colors: #RGB, #RRGGBB, #RRGGBBAA
+    if c.starts_with('#') && c.len() <= 9 && c[1..].chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return true;
+    }
+    // Allow simple named colors
+    matches!(
+        c.to_lowercase().as_str(),
+        "red" | "blue" | "green" | "orange" | "purple" | "yellow" | "pink"
+            | "brown" | "gray" | "grey" | "black" | "white" | "cyan" | "magenta"
+            | "inherit" | "transparent"
+    )
 }
 
 /// Map a NodeType to an HTML tag name.
@@ -1243,7 +1319,7 @@ fn dom_node_model_size(node: &DomNode) -> usize {
 fn is_mark_tag(tag: &str) -> bool {
     matches!(
         tag,
-        "strong" | "b" | "em" | "i" | "u" | "s" | "del" | "code" | "a"
+        "strong" | "b" | "em" | "i" | "u" | "s" | "del" | "code" | "a" | "span" | "mark"
     )
 }
 
