@@ -385,6 +385,51 @@ impl Node {
         }
     }
 
+    /// Compute a hash of the full document structure including node types, marks, and attributes.
+    /// Used for change detection in collab sync (unlike text_content which ignores formatting).
+    pub fn structural_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash_structure(&mut hasher);
+        hasher.finish()
+    }
+
+    fn hash_structure(&self, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        match self {
+            Node::Text { text, marks } => {
+                0u8.hash(hasher); // tag for Text
+                text.hash(hasher);
+                marks.len().hash(hasher);
+                for mark in marks {
+                    (mark.mark_type as u8).hash(hasher);
+                    mark.attrs.len().hash(hasher);
+                    for (k, v) in &mark.attrs {
+                        k.hash(hasher);
+                        v.hash(hasher);
+                    }
+                }
+            }
+            Node::Element { node_type, attrs, content, marks } => {
+                1u8.hash(hasher); // tag for Element
+                (*node_type as u8).hash(hasher);
+                attrs.len().hash(hasher);
+                for (k, v) in attrs {
+                    k.hash(hasher);
+                    v.hash(hasher);
+                }
+                marks.len().hash(hasher);
+                for mark in marks {
+                    (mark.mark_type as u8).hash(hasher);
+                }
+                content.children.len().hash(hasher);
+                for child in &content.children {
+                    child.hash_structure(hasher);
+                }
+            }
+        }
+    }
+
     /// Get text content before a given model position within the same block.
     /// Returns None if position is out of bounds.
     pub fn text_before(&self, pos: usize) -> Option<String> {

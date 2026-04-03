@@ -149,8 +149,16 @@ async fn get_folder(
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or(ApiError::NotFound("Folder not found".to_string()))?;
 
+    // Check access: owner or folder member.
     if folder.owner_id != user_id {
-        return Err(ApiError::NotFound("Folder not found".to_string()));
+        let member = state
+            .folder_repo
+            .get_member(&id, &user_id)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        if member.is_none() {
+            return Err(ApiError::NotFound("Folder not found".to_string()));
+        }
     }
 
     let children = state

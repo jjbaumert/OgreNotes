@@ -143,6 +143,26 @@ main() {
     start_redis
 
     case "${1:-}" in
+        dev)
+            export DEV_MODE=true
+            log "DEV MODE enabled (dev-login endpoint active)"
+            build_backend
+            setup_aws || true
+
+            run_backend
+            sleep 2
+            run_frontend
+
+            echo ""
+            log "OgreNotes is running! (DEV MODE)"
+            log "  Frontend:  http://localhost:8080"
+            log "  API:       http://localhost:${API_PORT:-3000}"
+            log ""
+            log "Press Ctrl+C to stop both servers."
+            echo ""
+
+            wait
+            ;;
         setup)
             setup_aws
             ;;
@@ -164,14 +184,13 @@ main() {
             log "Backend tests passed."
             cd frontend && cargo test && cd ..
             log "Frontend tests passed."
-            log "All 328 tests passed."
             ;;
         *)
             build_backend
             setup_aws || true
 
             run_backend
-            sleep 2  # let backend start before frontend proxy connects
+            sleep 2
             run_frontend
 
             echo ""

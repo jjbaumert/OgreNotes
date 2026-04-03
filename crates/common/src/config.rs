@@ -21,6 +21,9 @@ pub struct AppConfig {
     // Server
     pub api_port: u16,
     pub frontend_origin: String,
+
+    /// Enable dev-only features (dev-login endpoint). MUST be false in production.
+    pub dev_mode: bool,
 }
 
 /// Manual Debug implementation that redacts secrets.
@@ -61,6 +64,7 @@ impl AppConfig {
             jwt_secret: env_required("JWT_SECRET"),
             api_port,
             frontend_origin: env_or("FRONTEND_ORIGIN", "http://localhost:8080"),
+            dev_mode: env_or("DEV_MODE", "false") == "true",
         }
     }
 
@@ -96,6 +100,7 @@ mod tests {
             jwt_secret: "my-jwt-secret-key".into(),
             api_port: 3000,
             frontend_origin: "http://localhost:8080".into(),
+            dev_mode: false,
         };
         let debug_output = format!("{config:?}");
         assert!(!debug_output.contains("super-secret-value"));

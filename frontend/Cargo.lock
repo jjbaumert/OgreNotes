@@ -1029,6 +1029,8 @@ name = "ogrenotes-frontend"
 version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
+ "futures-channel",
+ "futures-util",
  "gloo-net",
  "gloo-timers",
  "js-sys",

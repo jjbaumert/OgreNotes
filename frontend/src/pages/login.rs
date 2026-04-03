@@ -10,6 +10,8 @@ pub fn LoginPage() -> impl IntoView {
     let (dev_name, set_dev_name) = signal("Dev User".to_string());
     let (dev_email, set_dev_email) = signal("dev@ogrenotes.local".to_string());
     let navigate = use_navigate();
+    let navigate2 = navigate.clone();
+    let navigate3 = navigate.clone();
 
     // Dev login for local development (bypasses OAuth)
     let on_dev_login = move |_| {
@@ -77,8 +79,49 @@ pub fn LoginPage() -> impl IntoView {
                     disabled=loading
                     style="margin-bottom: 8px;"
                 >
-                    {move || if loading.get() { "Signing in..." } else { "Dev Login (local)" }}
+                    {move || if loading.get() { "Signing in..." } else { "Dev Login (custom)" }}
                 </button>
+
+                <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+                    <button
+                        class="login-btn"
+                        disabled=loading
+                        style="flex: 1; background: #2E7D32;"
+                        on:click={
+                            let navigate = navigate2.clone();
+                            move |_| {
+                                set_loading.set(true);
+                                set_error.set(None);
+                                let navigate = navigate.clone();
+                                leptos::task::spawn_local(async move {
+                                    match client::dev_login("alice@ogrenotes.local", "Alice").await {
+                                        Ok(_) => { navigate("/", Default::default()); }
+                                        Err(e) => { set_error.set(Some(e.to_string())); set_loading.set(false); }
+                                    }
+                                });
+                            }
+                        }
+                    >"\u{1F469} Alice"</button>
+                    <button
+                        class="login-btn"
+                        disabled=loading
+                        style="flex: 1; background: #1565C0;"
+                        on:click={
+                            let navigate = navigate3.clone();
+                            move |_| {
+                                set_loading.set(true);
+                                set_error.set(None);
+                                let navigate = navigate.clone();
+                                leptos::task::spawn_local(async move {
+                                    match client::dev_login("bob@ogrenotes.local", "Bob").await {
+                                        Ok(_) => { navigate("/", Default::default()); }
+                                        Err(e) => { set_error.set(Some(e.to_string())); set_loading.set(false); }
+                                    }
+                                });
+                            }
+                        }
+                    >"\u{1F468} Bob"</button>
+                </div>
 
                 <button
                     class="login-btn"

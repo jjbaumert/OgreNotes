@@ -2,15 +2,23 @@
 //!
 //! Connects to the server's WebSocket endpoint, handles the yrs sync protocol,
 //! and bridges between the editor's Transaction system and yrs incremental updates.
+//!
+//! ## Architecture
+//!
+//! Each `CollabClient` maintains a **single persistent `yrs::Doc`** for the session.
+//! Local edits are applied to this Doc via `sync_model_to_ydoc`, and an
+//! `observe_update_v1` callback captures incremental update bytes for transmission.
+//! Remote updates are applied via `apply_update` on the same Doc, and a boolean flag
+//! prevents the observer from re-sending remote changes.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{MessageEvent, WebSocket};
 
-use yrs::{Doc, ReadTxn, StateVector, Transact, Update, WriteTxn};
+use yrs::{ReadTxn, Transact};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 
@@ -18,6 +26,33 @@ use crate::editor::model::Node;
 use crate::editor::yrs_bridge;
 
 use serde::{Deserialize, Serialize};
+
+/// RAII guard that sets `is_applying_remote` to `true` on creation and resets
+/// to `false` on drop. Ensures the flag is always reset even if yrs panics
+/// (WASM catches panics as JS exceptions without unwinding, but Drop still runs
+/// for values in the current scope).
+struct RemoteApplyGuard(Rc<Cell<bool>>);
+
+impl RemoteApplyGuard {
+    fn new(flag: &Rc<Cell<bool>>) -> Self {
+        flag.set(true);
+        Self(Rc::clone(flag))
+    }
+}
+
+impl Drop for RemoteApplyGuard {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+/// Configurable debounce for outgoing WS updates (ms).
+/// Reduced from 50ms since incremental updates are tiny.
+pub const WS_SEND_DEBOUNCE_MS: u32 = 16;
+
+/// Configurable debounce for incoming WS update model conversion (ms).
+/// Reduced from 30ms since apply_update is fast on incremental payloads.
+pub const WS_RECV_DEBOUNCE_MS: u32 = 16;
 
 // Protocol constants (must match crates/collab/src/protocol.rs)
 const MSG_AUTH: u8 = 0x00;
@@ -75,13 +110,14 @@ pub struct RemoteCursor {
 pub type OnAwarenessUpdate = Box<dyn Fn(Vec<RemoteCursor>)>;
 
 /// WebSocket collaboration client.
-/// Maintains a yrs Doc for incremental sync and bridges to the editor model.
+/// Maintains a **persistent** yrs Doc for incremental sync.
 pub struct CollabClient {
     /// WebSocket connection (None if disconnected).
     ws: Rc<RefCell<Option<WebSocket>>>,
     /// Connection state.
     state: Rc<RefCell<ConnectionState>>,
-    /// The yrs Doc that accumulates all updates (local and remote).
+    /// The persistent yrs Doc that accumulates all updates (local and remote).
+    /// Never replaced mid-session — preserves client_id for correct CRDT behavior.
     ydoc: Rc<RefCell<yrs::Doc>>,
     /// Document ID.
     doc_id: String,
@@ -93,6 +129,12 @@ pub struct CollabClient {
     remote_cursors: Rc<RefCell<std::collections::HashMap<String, RemoteCursor>>>,
     /// Stored closures (prevent GC).
     _closures: Rc<RefCell<Vec<Closure<dyn Fn(web_sys::Event)>>>>,
+    /// Incremental updates queued by observe_update_v1 for sending.
+    pending_updates: Rc<RefCell<Vec<Vec<u8>>>>,
+    /// Flag to suppress observer when applying remote updates.
+    is_applying_remote: Rc<Cell<bool>>,
+    /// Subscription for observe_update_v1 (must stay alive).
+    _update_sub: yrs::Subscription,
 }
 
 impl CollabClient {
@@ -109,6 +151,20 @@ impl CollabClient {
             }
         }
 
+        // Set up incremental update observer
+        let pending_updates: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let is_applying_remote: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
+        let pending_ref = Rc::clone(&pending_updates);
+        let remote_flag_ref = Rc::clone(&is_applying_remote);
+
+        let update_sub = ydoc.observe_update_v1(move |_txn, event| {
+            // Only queue local changes; skip when applying remote updates
+            if !remote_flag_ref.get() {
+                pending_ref.borrow_mut().push(event.update.clone());
+            }
+        }).expect("observe_update_v1 should not fail on a fresh Doc");
+
         Self {
             ws: Rc::new(RefCell::new(None)),
             state: Rc::new(RefCell::new(ConnectionState::Disconnected)),
@@ -118,6 +174,9 @@ impl CollabClient {
             on_awareness_update: Rc::new(RefCell::new(None)),
             remote_cursors: Rc::new(RefCell::new(std::collections::HashMap::new())),
             _closures: Rc::new(RefCell::new(Vec::new())),
+            pending_updates,
+            is_applying_remote,
+            _update_sub: update_sub,
         }
     }
 
@@ -152,14 +211,15 @@ impl CollabClient {
 
         ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
 
-        let token = token.to_string();
+        let _token = token.to_string();
         let state = Rc::clone(&self.state);
         let ydoc = Rc::clone(&self.ydoc);
         let ws_ref = Rc::clone(&self.ws);
         let on_remote = Rc::clone(&self.on_remote_update);
         let closures = Rc::clone(&self._closures);
+        let is_applying_remote = Rc::clone(&self.is_applying_remote);
 
-        // onopen: mark connected (auth is via URL query param)
+        // onopen: mark connected
         let state_for_open = Rc::clone(&state);
         let on_open = Closure::wrap(Box::new(move |_: web_sys::Event| {
             *state_for_open.borrow_mut() = ConnectionState::Connected;
@@ -174,6 +234,8 @@ impl CollabClient {
         let on_awareness_for_msg = Rc::clone(&self.on_awareness_update);
         let remote_cursors_for_msg = Rc::clone(&self.remote_cursors);
         let flag_for_msg = std::sync::Arc::clone(&connected_flag);
+        let is_remote_for_msg = Rc::clone(&is_applying_remote);
+        let recv_generation = Rc::new(std::cell::Cell::new(0u64));
         let on_message = Closure::wrap(Box::new(move |event: web_sys::Event| {
             let Some(me) = event.dyn_ref::<MessageEvent>() else { return };
             let Ok(buf) = me.data().dyn_into::<js_sys::ArrayBuffer>() else { return };
@@ -215,7 +277,8 @@ impl CollabClient {
                         ("size", &payload.len().to_string()),
                     ]);
                     {
-                        let mut ydoc = ydoc_for_msg.borrow_mut();
+                        let _guard = RemoteApplyGuard::new(&is_remote_for_msg);
+                        let ydoc = ydoc_for_msg.borrow();
                         let mut txn = ydoc.transact_mut();
                         if let Ok(update) = yrs::Update::decode_v1(payload) {
                             let _ = txn.apply_update(update);
@@ -225,28 +288,37 @@ impl CollabClient {
                     flag_for_msg.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 MSG_UPDATE => {
-                    // Remote incremental update — apply to our yrs Doc
+                    // Remote incremental update — apply to persistent Doc
                     crate::editor::debug::log("collab", "received update", &[
                         ("size", &payload.len().to_string()),
                     ]);
-                    let mut ydoc = ydoc_for_msg.borrow_mut();
-                    let mut txn = ydoc.transact_mut();
-                    if let Ok(update) = yrs::Update::decode_v1(payload) {
-                        let _ = txn.apply_update(update);
-                    }
-                    drop(txn);
-
-                    // Convert the updated yrs doc to editor model
-                    let txn = ydoc.transact();
-                    let state_bytes = txn.encode_state_as_update_v1(&yrs::StateVector::default());
-                    drop(txn);
-                    drop(ydoc);
-
-                    if let Ok(doc) = yrs_bridge::ydoc_bytes_to_doc(&state_bytes) {
-                        if let Some(callback) = on_remote_for_msg.borrow().as_ref() {
-                            callback(doc);
+                    {
+                        let _guard = RemoteApplyGuard::new(&is_remote_for_msg);
+                        let ydoc = ydoc_for_msg.borrow();
+                        let mut txn = ydoc.transact_mut();
+                        if let Ok(update) = yrs::Update::decode_v1(payload) {
+                            let _ = txn.apply_update(update);
                         }
                     }
+
+                    // Debounce the model read-back + callback
+                    let recv_gen = recv_generation.get() + 1;
+                    recv_generation.set(recv_gen);
+                    let gen_ref = recv_generation.clone();
+                    let on_remote_ref = on_remote_for_msg.clone();
+                    let ydoc_ref = ydoc_for_msg.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        gloo_timers::future::TimeoutFuture::new(WS_RECV_DEBOUNCE_MS).await;
+                        if gen_ref.get() != recv_gen {
+                            return;
+                        }
+                        let ydoc = ydoc_ref.borrow();
+                        if let Ok(doc) = yrs_bridge::read_doc_from_ydoc(&ydoc) {
+                            if let Some(callback) = on_remote_ref.borrow().as_ref() {
+                                callback(doc);
+                            }
+                        }
+                    });
                 }
                 MSG_AWARENESS => {
                     // Remote user's cursor/selection update.
@@ -311,54 +383,36 @@ impl CollabClient {
         cls.push(on_error);
     }
 
-    /// Send a local editor change as a yrs incremental update.
-    /// Called by the editor dispatch when the document changes.
+    /// Send a local editor change as an incremental yrs update.
     ///
-    /// Optimization: captures the state vector from our stored ydoc *before*
-    /// converting the new editor model. The diff is computed against that
-    /// snapshot, so we only send what actually changed. The old approach
-    /// created a fresh yrs::Doc on every keystroke.
+    /// Applies the model diff to the persistent Doc via `sync_model_to_ydoc`.
+    /// The `observe_update_v1` callback captures only the incremental bytes,
+    /// which are then sent over WebSocket. This preserves the Doc's client_id
+    /// and produces minimal network payloads.
     pub fn send_update(&self, new_doc: &Node) {
         if *self.state.borrow() != ConnectionState::Synced {
+            crate::editor::debug::log("collab", "send_update skipped (not synced)", &[]);
             return;
         }
 
-        // Capture our current state vector BEFORE any mutation.
-        let our_sv = {
+        // Apply model diff to persistent Doc — observer captures incremental bytes
+        {
             let ydoc = self.ydoc.borrow();
-            ydoc.transact().state_vector()
-        };
-
-        // Convert the new editor model to yrs full-state bytes.
-        let new_bytes = yrs_bridge::doc_to_ydoc_bytes(new_doc);
-
-        // Decode the new state into a temporary doc to compute the diff.
-        let tmp_doc = yrs::Doc::new();
-        {
-            let mut txn = tmp_doc.transact_mut();
-            if let Ok(update) = yrs::Update::decode_v1(&new_bytes) {
-                let _ = txn.apply_update(update);
-            }
+            yrs_bridge::sync_model_to_ydoc(&ydoc, new_doc);
         }
 
-        // Encode only the changes relative to our stored state.
-        let diff = tmp_doc.transact().encode_state_as_update_v1(&our_sv);
-
-        // Apply the diff to our stored ydoc to keep it in sync.
-        {
-            let mut ydoc = self.ydoc.borrow_mut();
-            let mut txn = ydoc.transact_mut();
-            if let Ok(update) = yrs::Update::decode_v1(&diff) {
-                let _ = txn.apply_update(update);
-            }
+        // Drain pending updates and send each as an Update message
+        let updates: Vec<Vec<u8>> = self.pending_updates.borrow_mut().drain(..).collect();
+        if updates.is_empty() {
+            crate::editor::debug::log("collab", "send_update: no changes detected", &[]);
         }
-
-        // Send the diff over WebSocket (skip if empty/no-op).
-        // A minimal yrs update with no changes is 2 bytes; real changes are longer.
-        if diff.len() > 2 {
+        for update_bytes in &updates {
+            crate::editor::debug::log("collab", "sending incremental update", &[
+                ("size", &update_bytes.len().to_string()),
+            ]);
             if let Some(ws) = self.ws.borrow().as_ref() {
                 let mut msg = vec![MSG_UPDATE];
-                msg.extend_from_slice(&diff);
+                msg.extend_from_slice(update_bytes);
                 let _ = ws.send_with_u8_array(&msg);
             }
         }

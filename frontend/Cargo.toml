@@ -73,7 +73,10 @@ features = [
     "BinaryType",
     "CloseEvent",
     "DomRect",
+    "Navigator",
 ]
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+futures-channel = "0.3"
+futures-util = "0.3"

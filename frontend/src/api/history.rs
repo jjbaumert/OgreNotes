@@ -5,7 +5,6 @@ use super::client::{api_get, api_get_bytes, ApiClientError};
 #[serde(rename_all = "camelCase")]
 pub struct VersionEntry {
     pub version: u64,
-    pub s3_key: String,
     pub size_bytes: u64,
     pub created_at: i64,
 }

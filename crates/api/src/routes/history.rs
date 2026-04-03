@@ -19,7 +19,6 @@ pub fn router() -> Router<AppState> {
 #[serde(rename_all = "camelCase")]
 struct VersionEntry {
     version: u64,
-    s3_key: String,
     size_bytes: u64,
     created_at: i64,
 }
@@ -51,7 +50,6 @@ async fn list_versions(
         .into_iter()
         .map(|s| VersionEntry {
             version: s.version,
-            s3_key: s.s3_key,
             size_bytes: s.size_bytes,
             created_at: s.created_at,
         })
@@ -59,12 +57,10 @@ async fn list_versions(
 
     // Always include the current live version.
     if let Ok(Some(meta)) = state.doc_repo.get(&id).await {
-        if let Some(ref s3_key) = meta.snapshot_s3_key {
-            // Avoid duplicating if the latest snapshot was just written.
+        if meta.snapshot_s3_key.is_some() {
             if !versions.iter().any(|v| v.version == meta.snapshot_version) {
                 versions.push(VersionEntry {
                     version: meta.snapshot_version,
-                    s3_key: s3_key.clone(),
                     size_bytes: 0,
                     created_at: meta.updated_at,
                 });

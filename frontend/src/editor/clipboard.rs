@@ -284,11 +284,17 @@ fn tag_to_mark(tag: &str, el: &web_sys::Element) -> Option<Mark> {
 /// e.g. `extract_css_color("color: #E53935; font-size: 14px", "color")` → Some("#E53935")
 fn extract_css_color(style: &str, property: &str) -> Option<String> {
     for part in style.split(';') {
-        let part = part.trim();
-        if let Some(rest) = part.strip_prefix(property) {
-            let rest = rest.trim();
-            if let Some(value) = rest.strip_prefix(':') {
-                return Some(value.trim().to_string());
+        let trimmed = part.trim();
+        // Match property name exactly: must be followed by optional whitespace then ':'
+        if let Some(after_prop) = trimmed.strip_prefix(property) {
+            let after_trimmed = after_prop.trim_start();
+            if let Some(value) = after_trimmed.strip_prefix(':') {
+                // Ensure the property was a complete word (not a prefix of a longer property).
+                // E.g., "background" should not match "background-color".
+                let first_char_after = after_prop.chars().next();
+                if first_char_after == Some(':') || first_char_after == Some(' ') || after_prop.is_empty() {
+                    return Some(value.trim().to_string());
+                }
             }
         }
     }

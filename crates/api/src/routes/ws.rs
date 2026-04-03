@@ -65,6 +65,7 @@ struct WsQuery {
 
 /// WebSocket upgrade handler.
 /// The client must pass the single-use token as a query parameter.
+/// (The token is single-use via Redis GETDEL, so URL logging exposure is time-limited.)
 async fn ws_upgrade(
     State(state): State<AppState>,
     Path(doc_id): Path<String>,
@@ -171,38 +172,50 @@ async fn handle_ws(
             match msg {
                 Message::Binary(data) => {
                     let data = data.to_vec();
+                    // Reject oversized messages to prevent OOM DoS.
+                    if data.len() > 1_048_576 {
+                        tracing::warn!(client_id, size = data.len(), "WS message too large, dropping");
+                        continue;
+                    }
                     if let Some((msg_type, payload)) = decode_message(&data) {
                         match msg_type {
                             MessageType::SyncStep1 => {
-                                // Client sent their state vector — respond with diff
+                                tracing::debug!(client_id, payload_len = payload.len(), "received SyncStep1");
                                 if let Ok(diff) = room_for_recv.encode_diff(payload).await {
+                                    tracing::debug!(client_id, diff_len = diff.len(), "sending SyncStep2 response");
                                     let response = encode_message(MessageType::SyncStep2, &diff);
                                     room_for_recv.send_to_client(client_id, response).await;
                                 }
                             }
-                            MessageType::SyncStep2 | MessageType::Update => {
-                                // Apply the update to the room's document
-                                if room_for_recv.apply_update(payload).await.is_ok() {
-                                    // Broadcast to other clients
-                                    let broadcast_msg = encode_message(MessageType::Update, payload);
-                                    room_for_recv.broadcast(client_id, broadcast_msg.clone()).await;
+                            MessageType::SyncStep2 => {
+                                tracing::debug!(client_id, payload_len = payload.len(), "received SyncStep2 (applying, no broadcast)");
+                                let _ = room_for_recv.apply_update(payload).await;
+                            }
+                            MessageType::Update => {
+                                tracing::debug!(client_id, payload_len = payload.len(), "received Update");
+                                match room_for_recv.apply_update(payload).await {
+                                    Ok(()) => {
+                                        let num_clients = room_for_recv.client_count().await;
+                                        tracing::debug!(client_id, num_clients, "applied update, broadcasting");
+                                        let broadcast_msg = encode_message(MessageType::Update, payload);
+                                        room_for_recv.broadcast(client_id, broadcast_msg.clone()).await;
 
-                                    // Publish to Redis for multi-instance fanout
-                                    let _ = state.redis_pubsub.publish_update(&doc_id, &broadcast_msg).await;
+                                        let _ = state.redis_pubsub.publish_update(&doc_id, &broadcast_msg).await;
 
-                                    // Persist to DynamoDB op log.
-                                    // Clock uses microsecond timestamp + nanoid suffix
-                                    // to guarantee uniqueness even under concurrent writes.
-                                    let ts = ogrenotes_common::time::now_usec();
-                                    let clock = format!("{}_{}", ts, nanoid::nanoid!(8));
-                                    let update = ogrenotes_storage::models::document::DocUpdate {
-                                        doc_id: doc_id.clone(),
-                                        clock,
-                                        update_bytes: payload.to_vec(),
-                                        user_id: user_id.clone(),
-                                        created_at: ts,
-                                    };
-                                    let _ = state.doc_repo.append_update(&update).await;
+                                        let ts = ogrenotes_common::time::now_usec();
+                                        let clock = format!("{}_{}", ts, nanoid::nanoid!(8));
+                                        let update = ogrenotes_storage::models::document::DocUpdate {
+                                            doc_id: doc_id.clone(),
+                                            clock,
+                                            update_bytes: payload.to_vec(),
+                                            user_id: user_id.clone(),
+                                            created_at: ts,
+                                        };
+                                        let _ = state.doc_repo.append_update(&update).await;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(client_id, error = %e, "failed to apply update");
+                                    }
                                 }
                             }
                             MessageType::Awareness => {

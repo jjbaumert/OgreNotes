@@ -39,6 +39,9 @@ pub fn DocumentPage() -> impl IntoView {
     let (content_loaded, set_content_loaded) = signal(false);
     let (editor_state, set_editor_state) = signal::<Option<EditorState>>(None);
     let (toolbar_command, set_toolbar_command) = signal::<Option<ToolbarCommand>>(None);
+    // Remote document state — set by the collab callback, consumed by EditorComponent
+    // to update the contenteditable DOM when a collaborator makes changes.
+    let (remote_state, set_remote_state) = signal::<Option<EditorState>>(None);
     let (outline_visible, set_outline_visible) = signal(false);
     let (share_visible, set_share_visible) = signal(false);
     let (folder_id, set_folder_id) = signal::<Option<String>>(None);
@@ -67,6 +70,9 @@ pub fn DocumentPage() -> impl IntoView {
     // CollabClient lives in Rc (not Send) — only used from Effects and editor dispatch
     let collab_client: std::rc::Rc<std::cell::RefCell<Option<CollabClient>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
+    // Track which doc_id the current CollabClient is for, so we can reuse it on reconnect.
+    let collab_doc_id: std::rc::Rc<std::cell::RefCell<String>> =
+        std::rc::Rc::new(std::cell::RefCell::new(String::new()));
 
     // Reactively load document when the ID changes
     Effect::new(move |_| {
@@ -104,10 +110,16 @@ pub fn DocumentPage() -> impl IntoView {
         });
     });
 
+    // Flag to suppress the send_update Effect when state changes come from remote updates.
+    // Prevents feedback loops (remote → set_editor_state → send_update → echo back).
+    let remote_update_flag = std::rc::Rc::new(std::cell::Cell::new(false));
+
     // Connect WebSocket for real-time collaboration after content loads.
     let collab_for_ws = std::rc::Rc::clone(&collab_client);
+    let collab_doc_id_for_ws = std::rc::Rc::clone(&collab_doc_id);
     let ws_doc_id = current_id.clone();
     let ws_connected_for_ws = std::sync::Arc::clone(&ws_connected);
+    let remote_flag_for_ws = std::rc::Rc::clone(&remote_update_flag);
     Effect::new(move |_| {
         if !content_loaded.get() {
             return;
@@ -117,62 +129,79 @@ pub fn DocumentPage() -> impl IntoView {
             return;
         }
 
-        // Disconnect existing client if document ID changed
-        if let Some(old_client) = collab_for_ws.borrow_mut().take() {
-            old_client.disconnect();
+        let is_same_doc = *collab_doc_id_for_ws.borrow() == id;
+
+        if is_same_doc {
+            // Same document — reuse the existing CollabClient and its persistent
+            // yrs::Doc (preserves client_id and CRDT clock). Just disconnect the
+            // old WebSocket; the reconnect code below will open a fresh one.
+            if let Some(ref client) = *collab_for_ws.borrow() {
+                client.disconnect();
+            }
+        } else {
+            // Different document — drop the old client entirely and create a new one.
+            if let Some(old_client) = collab_for_ws.borrow_mut().take() {
+                old_client.disconnect();
+            }
+
+            let initial_bytes = initial_content.get_untracked();
+            let client = CollabClient::new(
+                id.clone(),
+                initial_bytes.as_deref(),
+            );
+
+            // Set up remote update callback.
+            // Preserves the local cursor/selection position when remote changes arrive.
+            // Sets `remote_state` which the EditorComponent watches to update the DOM,
+            // and also sets `remote_flag` so the send Effect skips this change.
+            let editor_state_for_ws = editor_state.clone();
+            let set_remote_state_ws = set_remote_state.clone();
+            let remote_flag_for_ws = remote_flag_for_ws.clone();
+            client.set_on_remote_update(Box::new(move |doc| {
+                let selection = editor_state_for_ws.get_untracked()
+                    .map(|s| s.selection.clone());
+                let mut state = crate::editor::state::EditorState::create_default(doc);
+                if let Some(sel) = selection {
+                    let max = state.doc.content_size();
+                    let from = sel.from().min(max);
+                    let to = sel.to().min(max);
+                    if from == to {
+                        state.selection = crate::editor::selection::Selection::cursor(from);
+                    } else {
+                        state.selection = crate::editor::selection::Selection::text(from, to);
+                    }
+                }
+                remote_flag_for_ws.set(true);
+                set_remote_state_ws.set(Some(state));
+            }));
+
+            // Set up awareness callback for remote cursor presence.
+            client.set_on_awareness_update(Box::new(move |cursors| {
+                set_remote_cursors.set(cursors);
+            }));
+
+            *collab_for_ws.borrow_mut() = Some(client);
+            *collab_doc_id_for_ws.borrow_mut() = id.clone();
         }
 
-        let initial_bytes = initial_content.get_untracked();
-        let client = CollabClient::new(
-            id.clone(),
-            initial_bytes.as_deref(),
-        );
-
-        // Set up remote update callback.
-        // Preserves the local cursor/selection position when remote changes arrive.
-        let editor_state_for_ws = editor_state.clone();
-        let set_editor_state_ws = set_editor_state.clone();
-        client.set_on_remote_update(Box::new(move |doc| {
-            // Preserve current selection from existing state
-            let selection = editor_state_for_ws.get_untracked()
-                .map(|s| s.selection.clone());
-            let mut state = crate::editor::state::EditorState::create_default(doc);
-            if let Some(sel) = selection {
-                // Clamp selection to document bounds
-                let max = state.doc.content_size();
-                let from = sel.from().min(max);
-                let to = sel.to().min(max);
-                if from == to {
-                    state.selection = crate::editor::selection::Selection::cursor(from);
-                } else {
-                    state.selection = crate::editor::selection::Selection::text(from, to);
-                }
-            }
-            set_editor_state_ws.set(Some(state));
-        }));
-
-        // Set up awareness callback for remote cursor presence.
-        client.set_on_awareness_update(Box::new(move |cursors| {
-            set_remote_cursors.set(cursors);
-        }));
-
-        let collab_ref = std::rc::Rc::clone(&collab_for_ws);
-        *collab_ref.borrow_mut() = Some(client);
-
-        // Request a ws-token and connect
+        // Request a ws-token and connect (shared by both same-doc reconnect and new-doc).
         let collab_for_connect = std::rc::Rc::clone(&collab_for_ws);
         let ws_connected_for_connect = std::sync::Arc::clone(&ws_connected_for_ws);
         leptos::task::spawn_local(async move {
             match documents::request_ws_token(&id).await {
                 Ok(resp) => {
-                    // Build WebSocket URL from current page origin
                     let origin = web_sys::window()
                         .and_then(|w| w.location().origin().ok())
                         .unwrap_or_default();
                     let ws_origin = if origin.starts_with("https") {
                         origin.replacen("https", "wss", 1)
                     } else {
-                        origin.replacen("http", "ws", 1)
+                        let api_origin = origin.replacen("http", "ws", 1);
+                        if api_origin.contains(":8080") {
+                            api_origin.replace(":8080", ":3000")
+                        } else {
+                            api_origin
+                        }
                     };
                     let ws_url = format!(
                         "{ws_origin}/api/v1/documents/{id}/ws?token={}",
@@ -188,35 +217,55 @@ pub fn DocumentPage() -> impl IntoView {
                 }
                 Err(e) => {
                     crate::editor::debug::warn("collab", &format!("ws-token request failed: {e}"));
-                    // Silently fall back to REST — the on_change callback handles this
                 }
             }
         });
     });
 
     // Send incremental yrs updates over WebSocket when connected.
-    // This Effect watches the editor_state signal and sends updates via the CollabClient.
+    // Debounced: rapid keystrokes are batched into fewer WS sends.
     let collab_for_send = std::rc::Rc::clone(&collab_client);
     let (prev_doc_hash, set_prev_doc_hash) = signal(0u64);
+    let send_generation = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    let remote_flag_for_send = std::rc::Rc::clone(&remote_update_flag);
     Effect::new(move |_| {
         let Some(state) = editor_state.get() else { return };
-        // Simple change detection via text content hash
-        let hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            state.doc.text_content().hash(&mut hasher);
-            hasher.finish()
-        };
+
+        // Skip remote-originated state changes to prevent feedback loops.
+        if remote_flag_for_send.get() {
+            remote_flag_for_send.set(false);
+            // Still update the hash so the next local change is detected correctly.
+            set_prev_doc_hash.set(state.doc.structural_hash());
+            return;
+        }
+
+        let hash = state.doc.structural_hash();
         if hash == prev_doc_hash.get_untracked() {
-            return; // No change
+            return;
         }
         set_prev_doc_hash.set(hash);
 
-        if let Some(ref client) = *collab_for_send.borrow() {
-            if client.is_synced() {
-                client.send_update(&state.doc);
+        // Debounce: increment generation, spawn a delayed send.
+        // If another change arrives before the timeout, the generation
+        // check will skip the stale send.
+        let send_gen = send_generation.get() + 1;
+        send_generation.set(send_gen);
+        let gen_ref = send_generation.clone();
+        let collab = collab_for_send.clone();
+        let doc = state.doc.clone();
+        leptos::task::spawn_local(async move {
+            gloo_timers::future::TimeoutFuture::new(
+                crate::collab::ws_client::WS_SEND_DEBOUNCE_MS,
+            ).await;
+            if gen_ref.get() != send_gen {
+                return; // Superseded by a newer change
             }
-        }
+            if let Some(ref client) = *collab.borrow() {
+                if client.is_synced() {
+                    client.send_update(&doc);
+                }
+            }
+        });
     });
 
     // Send local cursor/selection position as awareness updates.
@@ -517,12 +566,24 @@ pub fn DocumentPage() -> impl IntoView {
             DocAction::CopyLink => {
                 if let Some(window) = web_sys::window() {
                     if let Ok(href) = window.location().href() {
-                        // Safe clipboard write: pass URL as argument to avoid injection.
-                        let func = js_sys::Function::new_with_args(
-                            "text",
-                            "navigator.clipboard.writeText(text)",
-                        );
-                        let _ = func.call1(&wasm_bindgen::JsValue::NULL, &href.into());
+                        // Use wasm_bindgen to call clipboard.writeText safely (no eval/Function).
+                        let promise = js_sys::Reflect::get(
+                            &window.navigator(),
+                            &"clipboard".into(),
+                        )
+                        .and_then(|clip| {
+                            js_sys::Reflect::get(&clip, &"writeText".into())
+                        })
+                        .and_then(|func| {
+                            func.dyn_into::<js_sys::Function>()
+                        });
+                        if let Ok(write_text) = promise {
+                            let clip = js_sys::Reflect::get(
+                                &window.navigator(),
+                                &"clipboard".into(),
+                            ).unwrap_or(wasm_bindgen::JsValue::NULL);
+                            let _ = write_text.call1(&clip, &href.into());
+                        }
                     }
                 }
             }
@@ -622,6 +683,7 @@ pub fn DocumentPage() -> impl IntoView {
                                 on_change: on_change.clone(),
                                 on_state_change: on_state_change.clone(),
                                 command_signal: toolbar_command,
+                                remote_state: remote_state,
                                 doc_id: current_id.get_untracked(),
                             } />
                         }.into_any()

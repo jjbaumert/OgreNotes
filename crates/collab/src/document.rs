@@ -74,6 +74,22 @@ impl OgreDoc {
             .map_err(|e| DocError::ApplyUpdate(e.to_string()))
     }
 
+    /// Replace the document state entirely with new state bytes.
+    /// Used when a client sends its full state rather than an incremental diff.
+    #[deprecated(note = "Use apply_update with incremental updates instead")]
+    pub fn replace_state(&mut self, state_bytes: &[u8]) -> Result<(), DocError> {
+        let new_doc = yrs::Doc::new();
+        {
+            let mut txn = new_doc.transact_mut();
+            let update = Update::decode_v1(state_bytes)
+                .map_err(|e| DocError::DecodeState(e.to_string()))?;
+            txn.apply_update(update)
+                .map_err(|e| DocError::ApplyUpdate(e.to_string()))?;
+        }
+        self.doc = new_doc;
+        Ok(())
+    }
+
     /// Get the current state vector (for computing diffs).
     pub fn state_vector(&self) -> Vec<u8> {
         let txn = self.doc.transact();

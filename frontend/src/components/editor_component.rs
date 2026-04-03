@@ -27,6 +27,9 @@ pub struct EditorProps {
     pub on_state_change: Callback<EditorState>,
     /// Signal for receiving toolbar commands.
     pub command_signal: ReadSignal<Option<ToolbarCommand>>,
+    /// Signal for receiving remote document updates from collaborators.
+    /// When set, the editor replaces its document content and re-renders.
+    pub remote_state: ReadSignal<Option<EditorState>>,
     /// Document ID (needed for blob upload).
     pub doc_id: String,
 }
@@ -94,6 +97,22 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
 
         let editor_view = EditorView::new(html_element, state, dispatch, Rc::clone(&history_ref_init));
         *view_ref_init.borrow_mut() = Some(editor_view);
+    });
+
+    // Apply remote document updates from collaborators.
+    let view_ref_remote = Rc::clone(&view_ref);
+    let on_state_change_remote = props.on_state_change.clone();
+    let remote_state_signal = props.remote_state;
+    Effect::new(move |_| {
+        let Some(new_state) = remote_state_signal.get() else {
+            return;
+        };
+        let view = view_ref_remote.borrow();
+        let Some(view) = view.as_ref() else {
+            return;
+        };
+        view.update_state(new_state.clone());
+        on_state_change_remote.run(new_state);
     });
 
     // Process toolbar commands reactively

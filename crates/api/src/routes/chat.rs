@@ -239,6 +239,11 @@ async fn add_member(
         ));
     }
 
+    // Verify the target user exists.
+    if state.user_repo.get_by_id(&body.user_id).await?.is_none() {
+        return Err(ApiError::NotFound("User not found".to_string()));
+    }
+
     state.thread_repo.add_chat_member(&id, &body.user_id).await?;
 
     Ok(StatusCode::NO_CONTENT)

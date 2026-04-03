@@ -482,8 +482,18 @@ async fn request_upload_url(
         )));
     }
 
+    // Sanitize filename to prevent S3 path traversal.
+    let safe_filename: String = req
+        .filename
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+        .collect();
+    if safe_filename.is_empty() || safe_filename.starts_with('.') {
+        return Err(ApiError::BadRequest("Invalid filename".to_string()));
+    }
+
     let blob_id = new_id();
-    let key = format!("blobs/{id}/{blob_id}/{}", req.filename);
+    let key = format!("blobs/{id}/{blob_id}/{safe_filename}");
 
     let url = state
         .doc_repo

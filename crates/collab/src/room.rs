@@ -96,6 +96,15 @@ impl Room {
         Ok(())
     }
 
+    /// Replace the document state entirely (used when clients send full state).
+    #[deprecated(note = "Use apply_update with incremental updates instead")]
+    #[allow(deprecated)]
+    pub async fn replace_state(&self, state_bytes: &[u8]) -> Result<(), super::document::DocError> {
+        self.doc.write().await.replace_state(state_bytes)?;
+        self.last_edit.store(current_time_ms(), Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Get the full document state as bytes (for snapshots).
     pub async fn to_state_bytes(&self) -> Vec<u8> {
         self.doc.read().await.to_state_bytes()

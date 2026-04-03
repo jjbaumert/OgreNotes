@@ -39,6 +39,12 @@ async fn login(State(state): State<AppState>) -> Result<Response, ApiError> {
         let now = ogrenotes_common::time::now_usec();
         let ten_minutes_usec = 10 * 60 * 1_000_000;
         flows.retain(|_, f| now - f.created_at < ten_minutes_usec);
+        // Cap the map to prevent memory DoS from parallel login floods.
+        if flows.len() >= 10_000 {
+            return Err(ApiError::BadRequest(
+                "Too many pending login requests. Try again later.".to_string(),
+            ));
+        }
         flows.insert(
             auth_state.clone(),
             PendingFlow {
@@ -220,10 +226,14 @@ fn default_dev_name() -> String {
 
 /// POST /auth/dev-login -- create or find a user and return tokens directly.
 /// For local development only. Bypasses OAuth.
+/// Requires DEV_MODE=true in environment; returns 404 otherwise.
 async fn dev_login(
     State(state): State<AppState>,
     Json(req): Json<DevLoginRequest>,
 ) -> Result<Json<TokenResponse>, ApiError> {
+    if !state.config.dev_mode {
+        return Err(ApiError::NotFound("Not found".to_string()));
+    }
     let profile = ogrenotes_auth::user::OAuthProfile {
         email: req.email,
         name: req.name,
