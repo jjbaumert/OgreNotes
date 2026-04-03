@@ -1391,6 +1391,136 @@ mod tests {
         assert_eq!(result.text_content(), "FirstSecond");
     }
 
+    /// Verify that two Docs loaded from the same bytes produce equal Node trees.
+    /// This matters because view.update_state skips re-render when doc == old_doc.
+    #[test]
+    fn two_docs_from_same_bytes_produce_equal_nodes() {
+        let model = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_attrs(
+                    NodeType::Heading,
+                    [("blockId".into(), "h1".into()), ("level".into(), "1".into())].into(),
+                    Fragment::from(vec![Node::text("Title")]),
+                ),
+                Node::element_with_attrs(
+                    NodeType::Paragraph,
+                    [("blockId".into(), "p1".into())].into(),
+                    Fragment::from(vec![
+                        Node::text("plain "),
+                        Node::text_with_marks("bold", vec![Mark::new(MarkType::Bold)]),
+                    ]),
+                ),
+            ]),
+        );
+        let bytes = doc_to_ydoc_bytes(&model);
+
+        // Path 1: ydoc_bytes_to_doc (used by EditorComponent init)
+        let doc_a = ydoc_bytes_to_doc(&bytes).unwrap();
+
+        // Path 2: apply_update + read_doc_from_ydoc (used by CollabClient SyncStep2 callback)
+        let ydoc = Doc::new();
+        {
+            let mut txn = ydoc.transact_mut();
+            txn.apply_update(Update::decode_v1(&bytes).unwrap()).unwrap();
+        }
+        let doc_b = read_doc_from_ydoc(&ydoc).unwrap();
+
+        assert_eq!(doc_a, doc_b, "both paths should produce identical Node trees");
+    }
+
+    /// Simulates a page refresh: snapshot + pending updates → full state → reload.
+    /// Verifies no content duplication occurs.
+    #[test]
+    fn refresh_after_incremental_edits_no_duplication() {
+        // 1. Original snapshot (like S3)
+        let original = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::Paragraph,
+                [("blockId".into(), "b1".into())].into(),
+                Fragment::from(vec![Node::text("Hello")]),
+            )]),
+        );
+        let snapshot_bytes = doc_to_ydoc_bytes(&original);
+
+        // 2. Client session: load snapshot, make edits, capture incremental updates
+        let client_doc = Doc::new();
+        {
+            let mut txn = client_doc.transact_mut();
+            txn.apply_update(Update::decode_v1(&snapshot_bytes).unwrap()).unwrap();
+        }
+        let captured: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let cap = Rc::clone(&captured);
+        let _sub = client_doc.observe_update_v1(move |_txn, event| {
+            cap.borrow_mut().push(event.update.clone());
+        }).unwrap();
+
+        // Make several edits (like typing + Enter)
+        let edit1 = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::Paragraph,
+                [("blockId".into(), "b1".into())].into(),
+                Fragment::from(vec![Node::text("Hello world")]),
+            )]),
+        );
+        sync_model_to_ydoc(&client_doc, &edit1);
+
+        let edit2 = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_attrs(
+                    NodeType::Paragraph,
+                    [("blockId".into(), "b1".into())].into(),
+                    Fragment::from(vec![Node::text("Hello world")]),
+                ),
+                Node::element_with_attrs(
+                    NodeType::Paragraph,
+                    [("blockId".into(), "b2".into())].into(),
+                    Fragment::from(vec![Node::text("Second line")]),
+                ),
+            ]),
+        );
+        sync_model_to_ydoc(&client_doc, &edit2);
+
+        // 3. Simulate REST get_content: snapshot + pending updates → full state bytes
+        let server_doc = Doc::new();
+        {
+            let mut txn = server_doc.transact_mut();
+            txn.apply_update(Update::decode_v1(&snapshot_bytes).unwrap()).unwrap();
+            for update_bytes in captured.borrow().iter() {
+                txn.apply_update(Update::decode_v1(update_bytes).unwrap()).unwrap();
+            }
+        }
+        let refreshed_bytes = {
+            let txn = server_doc.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+
+        // 4. Simulate page refresh: load from refreshed_bytes
+        let refreshed_doc = ydoc_bytes_to_doc(&refreshed_bytes).unwrap();
+        assert_eq!(refreshed_doc.child_count(), 2, "should have exactly 2 paragraphs");
+        assert_eq!(refreshed_doc.child(0).unwrap().text_content(), "Hello world");
+        assert_eq!(refreshed_doc.child(1).unwrap().text_content(), "Second line");
+
+        // 5. Also check: sync_model_to_ydoc on the refreshed state produces no changes
+        let ydoc2 = Doc::new();
+        {
+            let mut txn = ydoc2.transact_mut();
+            txn.apply_update(Update::decode_v1(&refreshed_bytes).unwrap()).unwrap();
+        }
+        let captured2: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let cap2 = Rc::clone(&captured2);
+        let _sub2 = ydoc2.observe_update_v1(move |_txn, event| {
+            cap2.borrow_mut().push(event.update.clone());
+        }).unwrap();
+
+        sync_model_to_ydoc(&ydoc2, &refreshed_doc);
+        assert_eq!(captured2.borrow().len(), 0,
+            "syncing the refreshed doc against its own state should produce no updates");
+    }
+
     use std::cell::RefCell;
     use std::rc::Rc;
 }
