@@ -1144,7 +1144,7 @@ fn node_type_to_tag(nt: NodeType) -> &'static str {
 // ─── DOM Position Mapping ───────────────────────────────────────
 
 /// Find the DOM node and offset for a model position.
-fn find_dom_position(container: &HtmlElement, target_pos: usize) -> Option<(DomNode, usize)> {
+pub(crate) fn find_dom_position(container: &HtmlElement, target_pos: usize) -> Option<(DomNode, usize)> {
     let mut pos = 0;
     find_in_element(container.as_ref(), &mut pos, target_pos)
 }
@@ -1396,6 +1396,243 @@ mod tests {
         assert!(is_leaf_tag("img"));
         assert!(!is_leaf_tag("p"));
         assert!(!is_leaf_tag("strong"));
+    }
+
+    // ─── Position-mapping invariant tests ────────────────────
+    //
+    // The DOM walker (find_in_element) must consume exactly node_size()
+    // positions for every model node. If these diverge, remote cursor
+    // positions will be wrong. We test this by computing "DOM size"
+    // from the model using the same rules the walker uses:
+    //   - Text node: char_len(text)
+    //   - Mark wrapper: transparent (0 overhead)
+    //   - Leaf element (hr, br, img): 1
+    //   - Block element: 2 + children_dom_size
+    // and checking it equals model node_size().
+
+    use super::super::model::{Fragment, Mark, MarkType, Node, NodeType};
+
+    /// Compute the position-space size of a model node as the DOM walker
+    /// would count it. This mirrors find_in_element's counting rules.
+    fn dom_walker_size(node: &Node) -> usize {
+        match node {
+            Node::Text { text, marks } => {
+                // Mark wrappers are transparent — they don't add boundaries.
+                // The walker just counts the text chars.
+                let _ = marks; // marks don't affect position size
+                super::super::model::char_len(text)
+            }
+            Node::Element { node_type, content, .. } => {
+                let tag = node_type_to_tag(*node_type);
+                if is_leaf_tag(tag) {
+                    // Leaf: hr, br, img → size 1
+                    1
+                } else {
+                    // Block element → open(1) + children + close(1)
+                    let children_size: usize = content.children.iter()
+                        .map(|c| dom_walker_size(c))
+                        .sum();
+                    2 + children_size
+                }
+            }
+        }
+    }
+
+    /// Assert that dom_walker_size matches node_size for a document node
+    /// and all its descendants.
+    fn assert_sizes_match(node: &Node) {
+        let dom_size = dom_walker_size(node);
+        let model_size = node.node_size();
+        assert_eq!(
+            dom_size, model_size,
+            "DOM walker size ({dom_size}) != model node_size ({model_size}) for {node:?}"
+        );
+        // Recurse into children
+        if let Node::Element { content, .. } = node {
+            for child in &content.children {
+                assert_sizes_match(child);
+            }
+        }
+    }
+
+    #[test]
+    fn position_sizes_match_plain_paragraph() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("Hello world")]),
+            )]),
+        );
+        assert_sizes_match(&doc);
+    }
+
+    #[test]
+    fn position_sizes_match_heading() {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("level".to_string(), "2".to_string());
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::Heading,
+                attrs,
+                Fragment::from(vec![Node::text("Title")]),
+            )]),
+        );
+        assert_sizes_match(&doc);
+    }
+
+    #[test]
+    fn position_sizes_match_bold_text() {
+        // Bold text in a paragraph: <p><strong>hello</strong></p>
+        // Marks are transparent, so size = just the text chars
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text_with_marks(
+                    "hello",
+                    vec![Mark::new(MarkType::Bold)],
+                )]),
+            )]),
+        );
+        assert_sizes_match(&doc);
+    }
+
+    #[test]
+    fn position_sizes_match_mixed_marks() {
+        // <p>plain <strong>bold</strong> end</p>
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![
+                    Node::text("plain "),
+                    Node::text_with_marks("bold", vec![Mark::new(MarkType::Bold)]),
+                    Node::text(" end"),
+                ]),
+            )]),
+        );
+        assert_sizes_match(&doc);
+    }
+
+    #[test]
+    fn position_sizes_match_nested_list() {
+        // <ul><li><p>item 1</p></li><li><p>item 2</p></li></ul>
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("item 1")]),
+                        )]),
+                    ),
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("item 2")]),
+                        )]),
+                    ),
+                ]),
+            )]),
+        );
+        assert_sizes_match(&doc);
+    }
+
+    #[test]
+    fn position_sizes_match_heading_then_list() {
+        // The exact structure from the bug: heading followed by bullet list
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Heading,
+                    Fragment::from(vec![Node::text("Conversation Pane")]),
+                ),
+                Node::element_with_content(
+                    NodeType::BulletList,
+                    Fragment::from(vec![
+                        Node::element_with_content(
+                            NodeType::ListItem,
+                            Fragment::from(vec![Node::element_with_content(
+                                NodeType::Paragraph,
+                                Fragment::from(vec![Node::text("Log of every action")]),
+                            )]),
+                        ),
+                        Node::element_with_content(
+                            NodeType::ListItem,
+                            Fragment::from(vec![Node::element_with_content(
+                                NodeType::Paragraph,
+                                Fragment::from(vec![Node::text("Document-level messages")]),
+                            )]),
+                        ),
+                    ]),
+                ),
+            ]),
+        );
+        assert_sizes_match(&doc);
+    }
+
+    #[test]
+    fn position_sizes_match_code_marks_in_list() {
+        // List items with inline code marks: <li><p>Use <code>Ctrl+C</code> to copy</p></li>
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::ListItem,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::Paragraph,
+                        Fragment::from(vec![
+                            Node::text("Use "),
+                            Node::text_with_marks("Ctrl+C", vec![Mark::new(MarkType::Code)]),
+                            Node::text(" to copy"),
+                        ]),
+                    )]),
+                )]),
+            )]),
+        );
+        assert_sizes_match(&doc);
+    }
+
+    #[test]
+    fn position_sizes_match_hr_and_image() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("before")]),
+                ),
+                Node::element(NodeType::HorizontalRule),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("after")]),
+                ),
+            ]),
+        );
+        assert_sizes_match(&doc);
+    }
+
+    #[test]
+    fn position_sizes_match_blockquote() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Blockquote,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("quoted text")]),
+                )]),
+            )]),
+        );
+        assert_sizes_match(&doc);
     }
 
     #[test]

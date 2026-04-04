@@ -24,7 +24,7 @@ pub fn doc_to_ydoc_bytes(doc: &Node) -> Vec<u8> {
 
         if let Node::Element { content, .. } = doc {
             for (i, child) in content.children.iter().enumerate() {
-                write_node_to_fragment(&mut txn, &fragment, i as u32, child);
+                write_node(&mut txn, &fragment, i as u32, child);
             }
         }
     }
@@ -87,15 +87,15 @@ impl std::fmt::Display for BridgeError {
 
 // ─── Write model to yrs ─────────────────────────────────────────
 
-fn write_node_to_fragment(
+fn write_node<C: XmlFragment>(
     txn: &mut yrs::TransactionMut<'_>,
-    fragment: &yrs::XmlFragmentRef,
+    container: &C,
     index: u32,
     node: &Node,
 ) {
     match node {
         Node::Text { text, marks } => {
-            let text_ref = fragment.insert(txn, index, XmlTextPrelim::new(text));
+            let text_ref = container.insert(txn, index, XmlTextPrelim::new(text));
             if !marks.is_empty() {
                 let attrs = marks_to_attrs(marks);
                 text_ref.format(txn, 0, text.len() as u32, attrs);
@@ -108,50 +108,14 @@ fn write_node_to_fragment(
             ..
         } => {
             let tag = node_type_to_tag(*node_type);
-            let el = fragment.insert(txn, index, XmlElementPrelim::empty(tag));
-
-            // Set attributes
-            for (key, value) in attrs {
-                el.insert_attribute(txn, key.as_str(), value.as_str());
-            }
-
-            // Write children
-            for (i, child) in content.children.iter().enumerate() {
-                write_node_to_element(txn, &el, i as u32, child);
-            }
-        }
-    }
-}
-
-fn write_node_to_element(
-    txn: &mut yrs::TransactionMut<'_>,
-    element: &yrs::XmlElementRef,
-    index: u32,
-    node: &Node,
-) {
-    match node {
-        Node::Text { text, marks } => {
-            let text_ref = element.insert(txn, index, XmlTextPrelim::new(text));
-            if !marks.is_empty() {
-                let attrs = marks_to_attrs(marks);
-                text_ref.format(txn, 0, text.len() as u32, attrs);
-            }
-        }
-        Node::Element {
-            node_type,
-            attrs,
-            content,
-            ..
-        } => {
-            let tag = node_type_to_tag(*node_type);
-            let el = element.insert(txn, index, XmlElementPrelim::empty(tag));
+            let el = container.insert(txn, index, XmlElementPrelim::empty(tag));
 
             for (key, value) in attrs {
                 el.insert_attribute(txn, key.as_str(), value.as_str());
             }
 
             for (i, child) in content.children.iter().enumerate() {
-                write_node_to_element(txn, &el, i as u32, child);
+                write_node(txn, &el, i as u32, child);
             }
         }
     }
@@ -171,57 +135,14 @@ pub fn sync_model_to_ydoc(ydoc: &Doc, new_doc: &Node) {
         Node::Text { .. } => return,
     };
 
-    sync_children(&mut txn, SyncContainer::Fragment(&fragment), new_children);
-}
-
-/// Wrapper enum so sync_children can operate on both XmlFragmentRef and XmlElementRef.
-enum SyncContainer<'a> {
-    Fragment(&'a yrs::XmlFragmentRef),
-    Element(&'a yrs::XmlElementRef),
-}
-
-impl<'a> SyncContainer<'a> {
-    fn len<T: ReadTxn>(&self, txn: &T) -> u32 {
-        match self {
-            SyncContainer::Fragment(f) => f.len(txn),
-            SyncContainer::Element(e) => e.len(txn),
-        }
-    }
-
-    fn get<T: ReadTxn>(&self, txn: &T, index: u32) -> Option<XmlOut> {
-        match self {
-            SyncContainer::Fragment(f) => f.get(txn, index),
-            SyncContainer::Element(e) => e.get(txn, index),
-        }
-    }
-
-    fn remove(&self, txn: &mut yrs::TransactionMut<'_>, index: u32) {
-        match self {
-            SyncContainer::Fragment(f) => f.remove(txn, index),
-            SyncContainer::Element(e) => e.remove(txn, index),
-        }
-    }
-
-    fn remove_range(&self, txn: &mut yrs::TransactionMut<'_>, index: u32, len: u32) {
-        match self {
-            SyncContainer::Fragment(f) => f.remove_range(txn, index, len),
-            SyncContainer::Element(e) => e.remove_range(txn, index, len),
-        }
-    }
-
-    fn insert_node(&self, txn: &mut yrs::TransactionMut<'_>, index: u32, node: &Node) {
-        match self {
-            SyncContainer::Fragment(f) => write_node_to_fragment(txn, f, index, node),
-            SyncContainer::Element(e) => write_node_to_element(txn, e, index, node),
-        }
-    }
+    sync_children(&mut txn, &fragment, new_children);
 }
 
 /// Sync a list of model children into a yrs container.
 /// Uses blockId-based matching to minimize yrs operations.
-fn sync_children(
+fn sync_children<C: XmlFragment>(
     txn: &mut yrs::TransactionMut<'_>,
-    container: SyncContainer<'_>,
+    container: &C,
     new_children: &[Node],
 ) {
     // Read current yrs children info for matching
@@ -319,12 +240,12 @@ fn sync_children(
         for (target_idx, action) in target.iter().enumerate() {
             match action {
                 SyncAction::Insert { node } => {
-                    container.insert_node(txn, target_idx as u32, node);
+                    write_node(txn, container, target_idx as u32, node);
                     insert_offset += 1;
                 }
                 SyncAction::Reuse { yrs_idx, node } => {
                     let current_pos = old_to_new_pos[yrs_idx] + insert_offset;
-                    sync_block_content(txn, &container, current_pos, node);
+                    sync_block_content(txn, container, current_pos, node);
                 }
             }
         }
@@ -339,7 +260,7 @@ fn sync_children(
                 SyncAction::Insert { node } => node,
                 SyncAction::Reuse { node, .. } => node,
             };
-            container.insert_node(txn, i as u32, node);
+            write_node(txn, container, i as u32, node);
         }
     }
 }
@@ -372,9 +293,9 @@ impl YrsBlockInfo {
 }
 
 /// Update the content of an existing yrs block to match the model node.
-fn sync_block_content(
+fn sync_block_content<C: XmlFragment>(
     txn: &mut yrs::TransactionMut<'_>,
-    container: &SyncContainer<'_>,
+    container: &C,
     pos: u32,
     model_node: &Node,
 ) {
@@ -390,7 +311,7 @@ fn sync_block_content(
     let model_tag = node_type_to_tag(*model_type);
     if yrs_tag != model_tag {
         container.remove(txn, pos);
-        container.insert_node(txn, pos, model_node);
+        write_node(txn, container, pos, model_node);
         return;
     }
 
@@ -416,7 +337,7 @@ fn sync_block_content(
     );
 
     if is_container {
-        sync_children(txn, SyncContainer::Element(el), &model_content.children);
+        sync_children(txn, el, &model_content.children);
     } else {
         // Leaf block (paragraph, heading, code_block, etc.)
         // Compare text content and marks; rewrite children if different.
@@ -429,7 +350,7 @@ fn sync_block_content(
                 el.remove_range(txn, 0, child_len);
             }
             for (i, child) in model_content.children.iter().enumerate() {
-                write_node_to_element(txn, el, i as u32, child);
+                write_node(txn, el, i as u32, child);
             }
         }
     }
@@ -466,14 +387,11 @@ fn collect_xml_out_text<T: ReadTxn>(txn: &T, out: &XmlOut, buf: &mut String) {
 
 /// Check if the marks of yrs children match the model children.
 fn marks_match<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef, model_children: &[Node]) -> bool {
-    use yrs::types::text::{Diff, YChange};
-
-    let yrs_len = el.len(txn);
+    // Collect yrs formatted chunks
     let mut yrs_chunks: Vec<(String, Vec<Mark>)> = Vec::new();
-    for i in 0..yrs_len {
+    for i in 0..el.len(txn) {
         if let Some(XmlOut::Text(text)) = el.get(txn, i) {
-            let diffs: Vec<Diff<YChange>> = text.diff(txn, YChange::identity);
-            for diff in diffs {
+            for diff in text.diff(txn, YChange::identity) {
                 if let Out::Any(Any::String(s)) = &diff.insert {
                     let text_str: &str = s.as_ref();
                     if text_str.is_empty() { continue; }
@@ -484,43 +402,23 @@ fn marks_match<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef, model_children: &[N
                 }
             }
         } else {
-            yrs_chunks.push(("".to_string(), vec![]));
+            yrs_chunks.push((String::new(), vec![]));
         }
     }
 
-    let mut model_chunks: Vec<(&str, &[Mark])> = Vec::new();
-    for child in model_children {
+    // Collect model chunks and compare in one pass
+    let model_chunks: Vec<(&str, &[Mark])> = model_children.iter().filter_map(|child| {
         match child {
-            Node::Text { text, marks } => {
-                if !text.is_empty() {
-                    model_chunks.push((text.as_str(), marks.as_slice()));
-                }
-            }
-            Node::Element { .. } => {
-                model_chunks.push(("", &[]));
-            }
+            Node::Text { text, marks } if !text.is_empty() => Some((text.as_str(), marks.as_slice())),
+            Node::Element { .. } => Some(("", [].as_slice())),
+            _ => None,
         }
-    }
+    }).collect();
 
-    if yrs_chunks.len() != model_chunks.len() {
-        return false;
-    }
-
-    for (yrs_chunk, model_chunk) in yrs_chunks.iter().zip(model_chunks.iter()) {
-        if yrs_chunk.0 != model_chunk.0 {
-            return false;
-        }
-        if yrs_chunk.1.len() != model_chunk.1.len() {
-            return false;
-        }
-        for (ym, mm) in yrs_chunk.1.iter().zip(model_chunk.1.iter()) {
-            if ym.mark_type != mm.mark_type || ym.attrs != mm.attrs {
-                return false;
-            }
-        }
-    }
-
-    true
+    yrs_chunks.len() == model_chunks.len()
+        && yrs_chunks.iter().zip(model_chunks.iter()).all(|(yrs, model)| {
+            yrs.0 == model.0 && yrs.1 == model.1
+        })
 }
 
 // ─── Read yrs to model ──────────────────────────────────────────
