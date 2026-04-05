@@ -16,16 +16,17 @@ impl RedisPubSub {
     }
 
     /// Store a single-use WebSocket authentication token.
-    /// The token maps to `user_id:doc_id` and expires after `ttl_secs`.
+    /// The token maps to `user_id\0doc_id\0client_version` and expires after `ttl_secs`.
     pub async fn store_ws_token(
         &self,
         token: &str,
         user_id: &str,
         doc_id: &str,
+        client_version: Option<&str>,
         ttl_secs: u64,
     ) -> Result<(), RedisError> {
-        // Use \0 as delimiter to avoid issues with user_id/doc_id containing ":"
-        let value = format!("{user_id}\0{doc_id}");
+        let version = client_version.unwrap_or("");
+        let value = format!("{user_id}\0{doc_id}\0{version}");
         let key = format!("ws_token:{token}");
         self.client
             .set::<(), _, _>(&key, value.as_str(), Some(Expiration::EX(ttl_secs as i64)), None, false)
@@ -34,19 +35,21 @@ impl RedisPubSub {
     }
 
     /// Validate and consume a single-use WebSocket token.
-    /// Returns (user_id, doc_id) if valid, None if expired or already used.
+    /// Returns (user_id, doc_id, client_version) if valid, None if expired or already used.
     pub async fn validate_ws_token(
         &self,
         token: &str,
-    ) -> Result<Option<(String, String)>, RedisError> {
+    ) -> Result<Option<(String, String, Option<String>)>, RedisError> {
         let key = format!("ws_token:{token}");
-        // GET + DEL atomically (single-use)
         let value: Option<String> = self.client.getdel(&key).await?;
         Ok(value.and_then(|v| {
-            let mut parts = v.splitn(2, '\0');
+            let mut parts = v.splitn(3, '\0');
             let user_id = parts.next()?.to_string();
             let doc_id = parts.next()?.to_string();
-            Some((user_id, doc_id))
+            let client_version = parts.next()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            Some((user_id, doc_id, client_version))
         }))
     }
 

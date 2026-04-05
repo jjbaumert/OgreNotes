@@ -322,13 +322,27 @@ fn bold_rule() -> InputRule {
                 return None;
             }
             let inner = &matched[2..matched.len() - 2];
-            let bold_node = Node::text_with_marks(inner, vec![Mark::new(MarkType::Bold)]);
-            let content = Fragment::from(vec![bold_node]);
-            let slice = Slice::new(content, 0, 0);
-            let txn = state.transaction().replace(from, to, slice).ok()?;
-            Some(txn)
+            inline_mark_replace(state, from, to, inner, MarkType::Bold)
         }),
     }
+}
+
+/// Shared handler for inline mark rules: replace matched text with marked text,
+/// place cursor after it, and clear stored marks so subsequent typing is plain.
+fn inline_mark_replace(
+    state: &EditorState,
+    from: usize,
+    to: usize,
+    inner: &str,
+    mark_type: MarkType,
+) -> Option<Transaction> {
+    let node = Node::text_with_marks(inner, vec![Mark::new(mark_type)]);
+    let slice = Slice::new(Fragment::from(vec![node]), 0, 0);
+    let inner_len = super::model::char_len(inner);
+    let mut txn = state.transaction().replace(from, to, slice).ok()?;
+    txn.selection = Selection::cursor(from + inner_len);
+    txn.stored_marks = Some(vec![]); // clear marks so next typed char is plain
+    Some(txn)
 }
 
 fn italic_rule() -> InputRule {
@@ -350,15 +364,8 @@ fn italic_rule() -> InputRule {
             None
         }),
         handler: Box::new(|state, from, to, matched| {
-            if matched.len() < 3 {
-                return None;
-            }
-            let inner = &matched[1..matched.len() - 1];
-            let italic_node = Node::text_with_marks(inner, vec![Mark::new(MarkType::Italic)]);
-            let content = Fragment::from(vec![italic_node]);
-            let slice = Slice::new(content, 0, 0);
-            let txn = state.transaction().replace(from, to, slice).ok()?;
-            Some(txn)
+            if matched.len() < 3 { return None; }
+            inline_mark_replace(state, from, to, &matched[1..matched.len() - 1], MarkType::Italic)
         }),
     }
 }
@@ -380,15 +387,8 @@ fn bold_underscore_rule() -> InputRule {
             None
         }),
         handler: Box::new(|state, from, to, matched| {
-            if matched.len() < 5 {
-                return None;
-            }
-            let inner = &matched[2..matched.len() - 2];
-            let bold_node = Node::text_with_marks(inner, vec![Mark::new(MarkType::Bold)]);
-            let content = Fragment::from(vec![bold_node]);
-            let slice = Slice::new(content, 0, 0);
-            let txn = state.transaction().replace(from, to, slice).ok()?;
-            Some(txn)
+            if matched.len() < 5 { return None; }
+            inline_mark_replace(state, from, to, &matched[2..matched.len() - 2], MarkType::Bold)
         }),
     }
 }
@@ -411,15 +411,8 @@ fn italic_underscore_rule() -> InputRule {
             None
         }),
         handler: Box::new(|state, from, to, matched| {
-            if matched.len() < 3 {
-                return None;
-            }
-            let inner = &matched[1..matched.len() - 1];
-            let italic_node = Node::text_with_marks(inner, vec![Mark::new(MarkType::Italic)]);
-            let content = Fragment::from(vec![italic_node]);
-            let slice = Slice::new(content, 0, 0);
-            let txn = state.transaction().replace(from, to, slice).ok()?;
-            Some(txn)
+            if matched.len() < 3 { return None; }
+            inline_mark_replace(state, from, to, &matched[1..matched.len() - 1], MarkType::Italic)
         }),
     }
 }
@@ -441,15 +434,8 @@ fn code_rule() -> InputRule {
             None
         }),
         handler: Box::new(|state, from, to, matched| {
-            if matched.len() < 3 {
-                return None;
-            }
-            let inner = &matched[1..matched.len() - 1];
-            let code_node = Node::text_with_marks(inner, vec![Mark::new(MarkType::Code)]);
-            let content = Fragment::from(vec![code_node]);
-            let slice = Slice::new(content, 0, 0);
-            let txn = state.transaction().replace(from, to, slice).ok()?;
-            Some(txn)
+            if matched.len() < 3 { return None; }
+            inline_mark_replace(state, from, to, &matched[1..matched.len() - 1], MarkType::Code)
         }),
     }
 }
@@ -718,5 +704,392 @@ mod tests {
         let first = para.child(0).unwrap();
         assert_eq!(first.text_content(), "hello");
         assert!(first.marks().iter().any(|m| m.mark_type == MarkType::Bold));
+    }
+
+    // ── Inline mark content verification ──
+
+    #[test]
+    fn italic_rule_produces_italic_text() {
+        let rules = default_input_rules();
+        let state = make_state("*hello*");
+        let txn = check_input_rules(&rules, &state, "*hello*", 1).unwrap();
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        let first = para.child(0).unwrap();
+        assert_eq!(first.text_content(), "hello");
+        assert!(first.marks().iter().any(|m| m.mark_type == MarkType::Italic));
+    }
+
+    #[test]
+    fn italic_underscore_produces_italic_text() {
+        let rules = default_input_rules();
+        let state = make_state("_hello_");
+        let txn = check_input_rules(&rules, &state, "_hello_", 1).unwrap();
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        let first = para.child(0).unwrap();
+        assert_eq!(first.text_content(), "hello");
+        assert!(first.marks().iter().any(|m| m.mark_type == MarkType::Italic));
+    }
+
+    // ── Inline mark edge cases ──
+
+    #[test]
+    fn bold_empty_content_no_match() {
+        let rules = default_input_rules();
+        let state = make_state("****");
+        assert!(check_input_rules(&rules, &state, "****", 1).is_none());
+    }
+
+    #[test]
+    fn italic_empty_content_no_match() {
+        let rules = default_input_rules();
+        let state = make_state("**");
+        assert!(check_input_rules(&rules, &state, "**", 1).is_none());
+    }
+
+    #[test]
+    fn code_empty_content_no_match() {
+        let rules = default_input_rules();
+        let state = make_state("``");
+        assert!(check_input_rules(&rules, &state, "``", 1).is_none());
+    }
+
+    #[test]
+    fn single_star_no_match() {
+        let rules = default_input_rules();
+        let state = make_state("*");
+        assert!(check_input_rules(&rules, &state, "*", 1).is_none());
+    }
+
+    #[test]
+    fn single_backtick_no_match() {
+        let rules = default_input_rules();
+        let state = make_state("`");
+        assert!(check_input_rules(&rules, &state, "`", 1).is_none());
+    }
+
+    #[test]
+    fn bold_with_preceding_text() {
+        let rules = default_input_rules();
+        let state = make_state("hello **world**");
+        let txn = check_input_rules(&rules, &state, "hello **world**", 1).unwrap();
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        // "hello " should remain as plain text, "world" should be bold
+        assert_eq!(para.text_content(), "hello world");
+        let mut found_bold = false;
+        for i in 0..para.child_count() {
+            let child = para.child(i).unwrap();
+            if child.marks().iter().any(|m| m.mark_type == MarkType::Bold) {
+                assert_eq!(child.text_content(), "world");
+                found_bold = true;
+            }
+        }
+        assert!(found_bold, "should have bold 'world'");
+    }
+
+    #[test]
+    fn italic_with_preceding_text() {
+        let rules = default_input_rules();
+        let state = make_state("hello *world*");
+        let txn = check_input_rules(&rules, &state, "hello *world*", 1).unwrap();
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(para.text_content(), "hello world");
+        let has_italic = (0..para.child_count()).any(|i| {
+            let c = para.child(i).unwrap();
+            c.text_content() == "world" && c.marks().iter().any(|m| m.mark_type == MarkType::Italic)
+        });
+        assert!(has_italic);
+    }
+
+    #[test]
+    fn code_with_preceding_text() {
+        let rules = default_input_rules();
+        let state = make_state("hello `code`");
+        let txn = check_input_rules(&rules, &state, "hello `code`", 1).unwrap();
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(para.text_content(), "hello code");
+        let has_code = (0..para.child_count()).any(|i| {
+            let c = para.child(i).unwrap();
+            c.text_content() == "code" && c.marks().iter().any(|m| m.mark_type == MarkType::Code)
+        });
+        assert!(has_code);
+    }
+
+    // ── Missing block rule variants ──
+
+    #[test]
+    fn bullet_list_plus_creates_list() {
+        let rules = default_input_rules();
+        let state = make_state("+ ");
+        let txn = check_input_rules(&rules, &state, "+ ", 1).unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child(0).unwrap().node_type(), Some(NodeType::BulletList));
+    }
+
+    #[test]
+    fn task_list_checked_creates_checked_item() {
+        let rules = default_input_rules();
+        let state = make_state("[x] ");
+        let txn = check_input_rules(&rules, &state, "[x] ", 1).unwrap();
+        let new_state = state.apply(txn);
+        let list = new_state.doc.child(0).unwrap();
+        assert_eq!(list.node_type(), Some(NodeType::TaskList));
+        let item = list.child(0).unwrap();
+        assert_eq!(item.node_type(), Some(NodeType::TaskItem));
+        assert_eq!(item.attrs().get("checked").unwrap(), "true");
+    }
+
+    // ── Block rules preserve remaining text ──
+
+    #[test]
+    fn bullet_list_preserves_remaining_text() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("* Hello")]),
+            )]),
+        );
+        let state = EditorState {
+            selection: Selection::cursor(3), // after "* "
+            ..EditorState::create_default(doc)
+        };
+        let txn = check_input_rules(&default_input_rules(), &state, "* ", 1).unwrap();
+        let new_state = state.apply(txn);
+        let list = new_state.doc.child(0).unwrap();
+        assert_eq!(list.node_type(), Some(NodeType::BulletList));
+        assert_eq!(list.text_content(), "Hello");
+    }
+
+    #[test]
+    fn blockquote_preserves_remaining_text() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("> Hello")]),
+            )]),
+        );
+        let state = EditorState {
+            selection: Selection::cursor(3), // after "> "
+            ..EditorState::create_default(doc)
+        };
+        let txn = check_input_rules(&default_input_rules(), &state, "> ", 1).unwrap();
+        let new_state = state.apply(txn);
+        let bq = new_state.doc.child(0).unwrap();
+        assert_eq!(bq.node_type(), Some(NodeType::Blockquote));
+        assert_eq!(bq.text_content(), "Hello");
+    }
+
+    // ── Block structure depth ──
+
+    #[test]
+    fn blockquote_contains_paragraph() {
+        let rules = default_input_rules();
+        let state = make_state("> ");
+        let txn = check_input_rules(&rules, &state, "> ", 1).unwrap();
+        let new_state = state.apply(txn);
+        let bq = new_state.doc.child(0).unwrap();
+        assert_eq!(bq.node_type(), Some(NodeType::Blockquote));
+        let inner = bq.child(0).unwrap();
+        assert_eq!(inner.node_type(), Some(NodeType::Paragraph));
+    }
+
+    #[test]
+    fn bullet_list_contains_item_with_paragraph() {
+        let rules = default_input_rules();
+        let state = make_state("* ");
+        let txn = check_input_rules(&rules, &state, "* ", 1).unwrap();
+        let new_state = state.apply(txn);
+        let list = new_state.doc.child(0).unwrap();
+        let item = list.child(0).unwrap();
+        assert_eq!(item.node_type(), Some(NodeType::ListItem));
+        let para = item.child(0).unwrap();
+        assert_eq!(para.node_type(), Some(NodeType::Paragraph));
+    }
+
+    // ── Block rules should NOT match with text before trigger ──
+
+    #[test]
+    fn heading_trigger_not_at_start_no_match() {
+        let rules = default_input_rules();
+        let state = make_state("hello # ");
+        assert!(check_input_rules(&rules, &state, "hello # ", 1).is_none());
+    }
+
+    #[test]
+    fn bullet_trigger_not_at_start_no_match() {
+        let rules = default_input_rules();
+        let state = make_state("hello * ");
+        assert!(check_input_rules(&rules, &state, "hello * ", 1).is_none());
+    }
+
+    // ── get_block_text_before ──
+
+    #[test]
+    fn get_block_text_before_middle() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("Hello world")]),
+            )]),
+        );
+        // Cursor at position 6 → after "Hello" (5 chars from content start at 1)
+        let (text, start) = get_block_text_before(&doc, 6).unwrap();
+        assert_eq!(text, "Hello");
+        assert_eq!(start, 1);
+    }
+
+    #[test]
+    fn get_block_text_before_at_start() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("Hello")]),
+            )]),
+        );
+        let (text, start) = get_block_text_before(&doc, 1).unwrap();
+        assert_eq!(text, "");
+        assert_eq!(start, 1);
+    }
+
+    #[test]
+    fn get_block_text_before_at_end() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("Hello")]),
+            )]),
+        );
+        let (text, start) = get_block_text_before(&doc, 6).unwrap();
+        assert_eq!(text, "Hello");
+        assert_eq!(start, 1);
+    }
+
+    #[test]
+    fn get_block_text_before_second_paragraph() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("First")]),
+                ),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("Second")]),
+                ),
+            ]),
+        );
+        // First para: pos 0(open) 1-5(text) 6(close) = size 7
+        // Second para: pos 7(open) 8-13(text) 14(close)
+        let (text, start) = get_block_text_before(&doc, 11).unwrap();
+        assert_eq!(text, "Sec");
+        assert_eq!(start, 8);
+    }
+
+    #[test]
+    fn get_block_text_before_outside_block_returns_none() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element(NodeType::HorizontalRule)]),
+        );
+        // HR is a leaf — cursor at position 0 is at doc level, not inside a text block
+        assert!(get_block_text_before(&doc, 0).is_none());
+    }
+
+    #[test]
+    fn get_block_text_before_empty_paragraph() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::empty(),
+            )]),
+        );
+        let (text, start) = get_block_text_before(&doc, 1).unwrap();
+        assert_eq!(text, "");
+        assert_eq!(start, 1);
+    }
+
+    // ── Inline mark cursor placement (regression: #selection-after-replace) ──
+
+    #[test]
+    fn bold_rule_cursor_after_text_not_selecting() {
+        let rules = default_input_rules();
+        let state = make_state("hello **world**");
+        let txn = check_input_rules(&rules, &state, "hello **world**", 1).unwrap();
+        let new_state = state.apply(txn);
+        // Cursor must be a cursor (empty selection), not a range over "world"
+        assert!(new_state.selection.empty(),
+            "selection should be a cursor, not a range: from={} to={}",
+            new_state.selection.from(), new_state.selection.to());
+        // Cursor should be right after "world"
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(para.text_content(), "hello world");
+        // Position: 1(para open) + 6("hello ") + 5("world") = 12
+        assert_eq!(new_state.selection.from(), 12);
+    }
+
+    #[test]
+    fn italic_rule_cursor_after_text_not_selecting() {
+        let rules = default_input_rules();
+        let state = make_state("*word*");
+        let txn = check_input_rules(&rules, &state, "*word*", 1).unwrap();
+        let new_state = state.apply(txn);
+        assert!(new_state.selection.empty(),
+            "selection should be a cursor after italic conversion");
+    }
+
+    #[test]
+    fn code_rule_cursor_after_text_not_selecting() {
+        let rules = default_input_rules();
+        let state = make_state("`code`");
+        let txn = check_input_rules(&rules, &state, "`code`", 1).unwrap();
+        let new_state = state.apply(txn);
+        assert!(new_state.selection.empty(),
+            "selection should be a cursor after code conversion");
+    }
+
+    #[test]
+    fn bold_rule_clears_stored_marks() {
+        // Regression: typing "asdf **1234**qwer" made "qwer" bold because
+        // stored marks inherited from the bold text node to the left.
+        let rules = default_input_rules();
+        let state = make_state("asdf **1234**");
+        let txn = check_input_rules(&rules, &state, "asdf **1234**", 1).unwrap();
+        let new_state = state.apply(txn);
+        // stored_marks should be empty (no marks) so next typed char is plain
+        assert_eq!(new_state.stored_marks, Some(vec![]),
+            "stored_marks should be explicitly empty after inline mark rule");
+    }
+
+    #[test]
+    fn code_rule_clears_stored_marks() {
+        let rules = default_input_rules();
+        let state = make_state("`code`");
+        let txn = check_input_rules(&rules, &state, "`code`", 1).unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.stored_marks, Some(vec![]));
+    }
+
+    // ── check_input_rules: first match wins ──
+
+    #[test]
+    fn first_matching_rule_wins() {
+        // "* " matches bullet_list rule before any other rule
+        let rules = default_input_rules();
+        let state = make_state("* ");
+        let txn = check_input_rules(&rules, &state, "* ", 1).unwrap();
+        let new_state = state.apply(txn);
+        // Should be a bullet list, not anything else
+        assert_eq!(new_state.doc.child(0).unwrap().node_type(), Some(NodeType::BulletList));
     }
 }

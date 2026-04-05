@@ -78,165 +78,236 @@ fn walk_dom_children(
 
         match child.node_type() {
             web_sys::Node::TEXT_NODE => {
-                let text = child.text_content().unwrap_or_default();
-                // Skip whitespace-only text nodes (common in web page HTML indentation)
-                // but keep spaces inside inline context (they're meaningful between words)
-                if text.is_empty() || (!inline_context && text.trim().is_empty()) {
-                    continue;
-                }
-                // Collapse runs of whitespace in pasted content
-                let text = if inline_context {
-                    text
-                } else {
-                    text.trim().to_string()
-                };
-                if !text.is_empty() {
-                    if active_marks.is_empty() {
-                        out.push(Node::text(&text));
-                    } else {
-                        out.push(Node::text_with_marks(&text, active_marks.to_vec()));
-                    }
-                }
+                convert_text_node(&child, active_marks, out, inline_context);
             }
             web_sys::Node::ELEMENT_NODE => {
                 let Some(el) = child.dyn_ref::<web_sys::Element>() else { continue };
-                let tag = el.tag_name().to_lowercase();
-
-                // Security: skip dangerous elements entirely
-                if matches!(tag.as_str(), "script" | "style" | "iframe" | "object" | "embed" | "link" | "meta") {
-                    continue;
-                }
-
-                // Check if this is a mark (inline formatting) element
-                if let Some(mark) = tag_to_mark(&tag, el) {
-                    let mut new_marks = active_marks.to_vec();
-                    new_marks.push(mark);
-                    walk_dom_children(&child, &new_marks, out, inline_context);
-                    continue;
-                }
-
-                // Check if this is a known block element
-                if let Some(node_type) = tag_to_block_type(&tag) {
-                    let mut children_nodes = Vec::new();
-
-                    match node_type {
-                        NodeType::Heading => {
-                            let level = match tag.as_str() {
-                                "h1" => "1", "h2" => "2", "h3" => "3",
-                                "h4" => "4", "h5" => "5", "h6" => "6",
-                                _ => "1",
-                            };
-                            walk_dom_children(&child, &[], &mut children_nodes, true);
-                            let mut attrs = std::collections::HashMap::new();
-                            attrs.insert("level".to_string(), level.to_string());
-                            out.push(Node::element_with_attrs(
-                                NodeType::Heading, attrs,
-                                Fragment::from(children_nodes),
-                            ));
-                        }
-                        NodeType::CodeBlock => {
-                            // For <pre>, look for <code> child and extract language
-                            let mut lang = String::new();
-                            let code_el = el.query_selector("code").ok().flatten();
-                            let text_source = code_el.as_ref()
-                                .map(|c| c.dyn_ref::<web_sys::Node>().unwrap())
-                                .unwrap_or(&child);
-                            if let Some(code) = &code_el {
-                                let class = code.class_name();
-                                if let Some(l) = class.strip_prefix("language-") {
-                                    lang = l.to_string();
-                                }
-                            }
-                            let text = text_source.text_content().unwrap_or_default();
-                            let mut attrs = std::collections::HashMap::new();
-                            if !lang.is_empty() {
-                                attrs.insert("language".to_string(), lang);
-                            }
-                            let content = if text.is_empty() {
-                                Fragment::empty()
-                            } else {
-                                Fragment::from(vec![Node::text(&text)])
-                            };
-                            out.push(Node::element_with_attrs(NodeType::CodeBlock, attrs, content));
-                        }
-                        NodeType::HorizontalRule => {
-                            out.push(Node::element(NodeType::HorizontalRule));
-                        }
-                        NodeType::HardBreak => {
-                            out.push(Node::element(NodeType::HardBreak));
-                        }
-                        NodeType::Image => {
-                            let src = el.get_attribute("src").unwrap_or_default();
-                            if super::view::is_safe_url(&src) {
-                                let mut attrs = std::collections::HashMap::new();
-                                attrs.insert("src".to_string(), src);
-                                if let Some(alt) = el.get_attribute("alt") {
-                                    attrs.insert("alt".to_string(), alt);
-                                }
-                                out.push(Node::element_with_attrs(
-                                    NodeType::Image, attrs, Fragment::empty(),
-                                ));
-                            }
-                        }
-                        NodeType::BulletList | NodeType::OrderedList => {
-                            walk_dom_children(&child, &[], &mut children_nodes, false);
-                            out.push(Node::element_with_content(
-                                node_type, Fragment::from(children_nodes),
-                            ));
-                        }
-                        NodeType::ListItem => {
-                            walk_dom_children(&child, &[], &mut children_nodes, false);
-                            // If list item has no block children, wrap inline content in paragraph
-                            let all_inline = children_nodes.iter().all(|n| matches!(n, Node::Text { .. }) || n.is_leaf());
-                            if all_inline {
-                                let para = Node::element_with_content(
-                                    NodeType::Paragraph, Fragment::from(children_nodes),
-                                );
-                                out.push(Node::element_with_content(
-                                    NodeType::ListItem, Fragment::from(vec![para]),
-                                ));
-                            } else {
-                                out.push(Node::element_with_content(
-                                    NodeType::ListItem, Fragment::from(children_nodes),
-                                ));
-                            }
-                        }
-                        _ => {
-                            // Paragraph, Blockquote, etc.
-                            walk_dom_children(&child, &[], &mut children_nodes, true);
-                            out.push(Node::element_with_content(
-                                node_type, Fragment::from(children_nodes),
-                            ));
-                        }
-                    }
-                    continue;
-                }
-
-                // Unknown block-level elements (div, section, article, header, footer, main, nav, aside, figure):
-                // treat as paragraph-like if they contain inline content, transparent if they contain blocks.
-                if is_block_level_tag(&tag) {
-                    let mut children_nodes = Vec::new();
-                    walk_dom_children(&child, &[], &mut children_nodes, false);
-
-                    if children_nodes.is_empty() {
-                        // Empty block — skip
-                    } else if children_nodes.iter().all(|n| matches!(n, Node::Text { .. }) || n.is_leaf()) {
-                        // All inline content — wrap in paragraph
-                        out.push(Node::element_with_content(
-                            NodeType::Paragraph,
-                            Fragment::from(children_nodes),
-                        ));
-                    } else {
-                        // Contains block children — add them directly (transparent)
-                        out.extend(children_nodes);
-                    }
-                } else {
-                    // Unknown inline element (span, font, etc.): transparent, preserve marks
-                    walk_dom_children(&child, active_marks, out, inline_context);
-                }
+                convert_element_node(&child, el, active_marks, out, inline_context);
             }
             _ => {} // Skip comments, processing instructions, etc.
         }
+    }
+}
+
+/// Convert a DOM text node into a model text node with active marks.
+#[cfg(target_arch = "wasm32")]
+fn convert_text_node(
+    child: &web_sys::Node,
+    active_marks: &[Mark],
+    out: &mut Vec<Node>,
+    inline_context: bool,
+) {
+    let text = child.text_content().unwrap_or_default();
+
+    // Skip whitespace-only text nodes (common in web page HTML indentation)
+    // but keep spaces inside inline context (they're meaningful between words)
+    if text.is_empty() || (!inline_context && text.trim().is_empty()) {
+        return;
+    }
+
+    let text = if inline_context { text } else { text.trim().to_string() };
+    if text.is_empty() {
+        return;
+    }
+
+    if active_marks.is_empty() {
+        out.push(Node::text(&text));
+    } else {
+        out.push(Node::text_with_marks(&text, active_marks.to_vec()));
+    }
+}
+
+/// Convert a DOM element node into model nodes, dispatching by tag.
+#[cfg(target_arch = "wasm32")]
+fn convert_element_node(
+    child: &web_sys::Node,
+    el: &web_sys::Element,
+    active_marks: &[Mark],
+    out: &mut Vec<Node>,
+    inline_context: bool,
+) {
+    let tag = el.tag_name().to_lowercase();
+
+    // Security: skip dangerous elements entirely
+    if matches!(tag.as_str(), "script" | "style" | "iframe" | "object" | "embed" | "link" | "meta") {
+        return;
+    }
+
+    // Inline formatting element → push mark and recurse
+    if let Some(mark) = tag_to_mark(&tag, el) {
+        let mut new_marks = active_marks.to_vec();
+        new_marks.push(mark);
+        walk_dom_children(child, &new_marks, out, inline_context);
+        return;
+    }
+
+    // Known block element → convert to model node
+    if let Some(node_type) = tag_to_block_type(&tag) {
+        convert_block_element(child, el, &tag, node_type, out);
+        return;
+    }
+
+    // Unknown block-level element (div, section, article, etc.)
+    if is_block_level_tag(&tag) {
+        convert_unknown_block(child, out);
+        return;
+    }
+
+    // Unknown inline element (span, font, etc.): transparent, preserve marks
+    walk_dom_children(child, active_marks, out, inline_context);
+}
+
+/// Walk a DOM node's children into a fresh Vec of model nodes.
+#[cfg(target_arch = "wasm32")]
+fn walk_block_children(child: &web_sys::Node, inline_context: bool) -> Vec<Node> {
+    let mut nodes = Vec::new();
+    walk_dom_children(child, &[], &mut nodes, inline_context);
+    nodes
+}
+
+/// Convert a known block-type DOM element into the corresponding model node.
+#[cfg(target_arch = "wasm32")]
+fn convert_block_element(
+    child: &web_sys::Node,
+    el: &web_sys::Element,
+    tag: &str,
+    node_type: NodeType,
+    out: &mut Vec<Node>,
+) {
+    match node_type {
+        NodeType::Heading => {
+            let level = match tag {
+                "h1" => "1", "h2" => "2", "h3" => "3",
+                "h4" => "4", "h5" => "5", "h6" => "6",
+                _ => "1",
+            };
+            let mut attrs = std::collections::HashMap::new();
+            attrs.insert("level".to_string(), level.to_string());
+            let children = walk_block_children(child, true);
+            out.push(Node::element_with_attrs(
+                NodeType::Heading, attrs, Fragment::from(children),
+            ));
+        }
+        NodeType::CodeBlock => out.push(convert_code_block(child, el)),
+        NodeType::HorizontalRule => out.push(Node::element(NodeType::HorizontalRule)),
+        NodeType::HardBreak => out.push(Node::element(NodeType::HardBreak)),
+        NodeType::Image => { if let Some(n) = convert_image(el) { out.push(n); } }
+        NodeType::ListItem => {
+            out.push(convert_list_item(walk_block_children(child, false)));
+        }
+        NodeType::BulletList | NodeType::OrderedList => {
+            let children = walk_block_children(child, false);
+            out.push(Node::element_with_content(node_type, Fragment::from(children)));
+        }
+        NodeType::Table => {
+            // Walk children; thead/tbody/tfoot are transparent (handled by is_block_level_tag)
+            let children = walk_block_children(child, false);
+            if !children.is_empty() {
+                out.push(Node::element_with_content(NodeType::Table, Fragment::from(children)));
+            }
+        }
+        NodeType::TableRow => {
+            let children = walk_block_children(child, false);
+            if !children.is_empty() {
+                out.push(Node::element_with_content(NodeType::TableRow, Fragment::from(children)));
+            }
+        }
+        NodeType::TableCell | NodeType::TableHeader => {
+            let children = walk_block_children(child, false);
+            // If all children are inline, wrap in Paragraph (same as list items)
+            let children = if children.iter().all(|n| matches!(n, Node::Text { .. }) || n.is_leaf()) {
+                vec![Node::element_with_content(NodeType::Paragraph, Fragment::from(children))]
+            } else {
+                children
+            };
+            let mut attrs = std::collections::HashMap::new();
+            if let Some(cs) = el.get_attribute("colspan") {
+                attrs.insert("colspan".into(), cs);
+            }
+            if let Some(rs) = el.get_attribute("rowspan") {
+                attrs.insert("rowspan".into(), rs);
+            }
+            out.push(Node::element_with_attrs(node_type, attrs, Fragment::from(children)));
+        }
+        _ => {
+            // Paragraph, Blockquote, etc.
+            let children = walk_block_children(child, true);
+            out.push(Node::element_with_content(node_type, Fragment::from(children)));
+        }
+    }
+}
+
+/// Parse a <pre> element into a CodeBlock node, extracting language from <code> child.
+#[cfg(target_arch = "wasm32")]
+fn convert_code_block(child: &web_sys::Node, el: &web_sys::Element) -> Node {
+    use wasm_bindgen::JsCast;
+
+    let code_el = el.query_selector("code").ok().flatten();
+    let text_source = code_el.as_ref()
+        .map(|c| c.dyn_ref::<web_sys::Node>().unwrap())
+        .unwrap_or(child);
+
+    let mut attrs = std::collections::HashMap::new();
+    if let Some(code) = &code_el {
+        if let Some(lang) = code.class_name().strip_prefix("language-") {
+            attrs.insert("language".to_string(), lang.to_string());
+        }
+    }
+
+    let text = text_source.text_content().unwrap_or_default();
+    let content = if text.is_empty() {
+        Fragment::empty()
+    } else {
+        Fragment::from(vec![Node::text(&text)])
+    };
+    Node::element_with_attrs(NodeType::CodeBlock, attrs, content)
+}
+
+/// Parse an <img> element into an Image node, validating the URL.
+#[cfg(target_arch = "wasm32")]
+fn convert_image(el: &web_sys::Element) -> Option<Node> {
+    let src = el.get_attribute("src").unwrap_or_default();
+    if !super::view::is_safe_url(&src) {
+        return None;
+    }
+    let mut attrs = std::collections::HashMap::new();
+    attrs.insert("src".to_string(), src);
+    if let Some(alt) = el.get_attribute("alt") {
+        attrs.insert("alt".to_string(), alt);
+    }
+    Some(Node::element_with_attrs(NodeType::Image, attrs, Fragment::empty()))
+}
+
+/// Convert a <li> element's children into a ListItem node.
+/// If all children are inline, wraps them in a Paragraph first.
+#[cfg(target_arch = "wasm32")]
+fn convert_list_item(children: Vec<Node>) -> Node {
+    let all_inline = children.iter().all(|n| matches!(n, Node::Text { .. }) || n.is_leaf());
+    if all_inline {
+        let para = Node::element_with_content(NodeType::Paragraph, Fragment::from(children));
+        Node::element_with_content(NodeType::ListItem, Fragment::from(vec![para]))
+    } else {
+        Node::element_with_content(NodeType::ListItem, Fragment::from(children))
+    }
+}
+
+/// Convert an unknown block-level element (div, section, etc.).
+/// Wraps inline-only content in a Paragraph; passes through block children transparently.
+#[cfg(target_arch = "wasm32")]
+fn convert_unknown_block(child: &web_sys::Node, out: &mut Vec<Node>) {
+    let children = walk_block_children(child, false);
+
+    if children.is_empty() {
+        return;
+    }
+
+    let all_inline = children.iter().all(|n| matches!(n, Node::Text { .. }) || n.is_leaf());
+    if all_inline {
+        out.push(Node::element_with_content(
+            NodeType::Paragraph, Fragment::from(children),
+        ));
+    } else {
+        out.extend(children);
     }
 }
 
@@ -259,22 +330,16 @@ fn tag_to_mark(tag: &str, el: &web_sys::Element) -> Option<Mark> {
         }
         "span" => {
             let style = el.get_attribute("style").unwrap_or_default();
-            if let Some(color) = extract_css_color(&style, "color") {
-                if super::view::is_safe_color(&color) {
-                    return Some(Mark::new(MarkType::TextColor).with_attr("color", &color));
-                }
-            }
-            None
+            extract_css_color(&style, "color")
+                .filter(|c| super::view::is_safe_color(c))
+                .map(|c| Mark::new(MarkType::TextColor).with_attr("color", &c))
         }
         "mark" => {
             let style = el.get_attribute("style").unwrap_or_default();
-            if let Some(color) = extract_css_color(&style, "background") {
-                if super::view::is_safe_color(&color) {
-                    return Some(Mark::new(MarkType::Highlight).with_attr("color", &color));
-                }
-            }
-            // Plain <mark> with no inline style — default yellow highlight
-            Some(Mark::new(MarkType::Highlight).with_attr("color", "#FFF176"))
+            let color = extract_css_color(&style, "background")
+                .filter(|c| super::view::is_safe_color(c))
+                .unwrap_or_else(|| "#FFF176".to_string());
+            Some(Mark::new(MarkType::Highlight).with_attr("color", &color))
         }
         _ => None,
     }
@@ -284,18 +349,9 @@ fn tag_to_mark(tag: &str, el: &web_sys::Element) -> Option<Mark> {
 /// e.g. `extract_css_color("color: #E53935; font-size: 14px", "color")` → Some("#E53935")
 fn extract_css_color(style: &str, property: &str) -> Option<String> {
     for part in style.split(';') {
-        let trimmed = part.trim();
-        // Match property name exactly: must be followed by optional whitespace then ':'
-        if let Some(after_prop) = trimmed.strip_prefix(property) {
-            let after_trimmed = after_prop.trim_start();
-            if let Some(value) = after_trimmed.strip_prefix(':') {
-                // Ensure the property was a complete word (not a prefix of a longer property).
-                // E.g., "background" should not match "background-color".
-                let first_char_after = after_prop.chars().next();
-                if first_char_after == Some(':') || first_char_after == Some(' ') || after_prop.is_empty() {
-                    return Some(value.trim().to_string());
-                }
-            }
+        let Some((key, value)) = part.split_once(':') else { continue };
+        if key.trim() == property {
+            return Some(value.trim().to_string());
         }
     }
     None
@@ -309,6 +365,7 @@ fn is_block_level_tag(tag: &str) -> bool {
         "div" | "section" | "article" | "header" | "footer"
             | "main" | "nav" | "aside" | "figure" | "figcaption"
             | "details" | "summary" | "address" | "center"
+            | "thead" | "tbody" | "tfoot"
     )
 }
 
@@ -326,6 +383,10 @@ fn tag_to_block_type(tag: &str) -> Option<NodeType> {
         "hr" => Some(NodeType::HorizontalRule),
         "br" => Some(NodeType::HardBreak),
         "img" => Some(NodeType::Image),
+        "table" => Some(NodeType::Table),
+        "tr" => Some(NodeType::TableRow),
+        "td" => Some(NodeType::TableCell),
+        "th" => Some(NodeType::TableHeader),
         _ => None,
     }
 }
@@ -398,6 +459,12 @@ fn fit_node(node: Node, parent_type: NodeType) -> Vec<Node> {
         }
         Node::Element { node_type, content, .. } => {
             match node_type {
+                // Textblock (Paragraph, Heading, CodeBlock) pasted into a textblock context:
+                // extract inline children directly so they merge into the target block
+                // instead of creating invalid nested paragraphs.
+                _ if node_type.is_textblock() && parent_type.is_textblock() => {
+                    content.children.clone()
+                }
                 // Headings are not valid in list items — downgrade to paragraph
                 NodeType::Heading if !is_valid_child(parent_type, *node_type) => {
                     vec![Node::element_with_content(
@@ -407,7 +474,6 @@ fn fit_node(node: Node, parent_type: NodeType) -> Vec<Node> {
                 }
                 // Other block nodes that aren't valid — extract content as paragraphs
                 nt if !nt.is_leaf() && !is_valid_child(parent_type, *node_type) => {
-                    // Extract inline content into a paragraph
                     let text = node.text_content();
                     if text.is_empty() {
                         vec![]
@@ -438,6 +504,7 @@ fn is_valid_child(parent_type: NodeType, child_type: NodeType) -> bool {
                 | NodeType::CodeBlock
                 | NodeType::HorizontalRule
                 | NodeType::Image
+                | NodeType::Table
         ),
         NodeType::ListItem | NodeType::TaskItem => matches!(
             child_type,
@@ -593,6 +660,30 @@ fn element_tags(
                 .map(|a| format!(" alt=\"{}\"", html_escape_attr(a)))
                 .unwrap_or_default();
             (format!("<img{src}{alt} />"), None)
+        }
+        NodeType::Table => ("<table>".into(), Some("</table>".into())),
+        NodeType::TableRow => ("<tr>".into(), Some("</tr>".into())),
+        NodeType::TableCell => {
+            let mut tag = "<td".to_string();
+            if let Some(cs) = attrs.get("colspan").filter(|v| *v != "1") {
+                tag.push_str(&format!(" colspan=\"{}\"", html_escape_attr(cs)));
+            }
+            if let Some(rs) = attrs.get("rowspan").filter(|v| *v != "1") {
+                tag.push_str(&format!(" rowspan=\"{}\"", html_escape_attr(rs)));
+            }
+            tag.push('>');
+            (tag, Some("</td>".into()))
+        }
+        NodeType::TableHeader => {
+            let mut tag = "<th".to_string();
+            if let Some(cs) = attrs.get("colspan").filter(|v| *v != "1") {
+                tag.push_str(&format!(" colspan=\"{}\"", html_escape_attr(cs)));
+            }
+            if let Some(rs) = attrs.get("rowspan").filter(|v| *v != "1") {
+                tag.push_str(&format!(" rowspan=\"{}\"", html_escape_attr(rs)));
+            }
+            tag.push('>');
+            (tag, Some("</th>".into()))
         }
         NodeType::Doc => ("<div>".into(), Some("</div>".into())),
     }
@@ -920,5 +1011,485 @@ mod tests {
         assert_eq!(slice.content.children.len(), 1);
         // Single line: inline text, no paragraph wrapper
         assert!(matches!(slice.content.children[0], Node::Text { .. }));
+    }
+
+    #[test]
+    fn parse_text_empty_line_creates_empty_paragraph() {
+        let slice = parse_from_text("Hello\n\nWorld");
+        assert_eq!(slice.content.children.len(), 3);
+        assert_eq!(slice.content.children[1].text_content(), "");
+        assert_eq!(slice.content.children[1].node_type(), Some(NodeType::Paragraph));
+    }
+
+    // ── serialize_to_html: all mark types ──
+
+    #[test]
+    fn serialize_underline() {
+        let slice = Slice::new(
+            Fragment::from(vec![Node::text_with_marks("u", vec![Mark::new(MarkType::Underline)])]),
+            0, 0,
+        );
+        assert_eq!(serialize_to_html(&slice), "<u>u</u>");
+    }
+
+    #[test]
+    fn serialize_strike() {
+        let slice = Slice::new(
+            Fragment::from(vec![Node::text_with_marks("del", vec![Mark::new(MarkType::Strike)])]),
+            0, 0,
+        );
+        assert_eq!(serialize_to_html(&slice), "<s>del</s>");
+    }
+
+    #[test]
+    fn serialize_code_mark() {
+        let slice = Slice::new(
+            Fragment::from(vec![Node::text_with_marks("x", vec![Mark::new(MarkType::Code)])]),
+            0, 0,
+        );
+        assert_eq!(serialize_to_html(&slice), "<code>x</code>");
+    }
+
+    #[test]
+    fn serialize_text_color() {
+        let mark = Mark::new(MarkType::TextColor).with_attr("color", "#E53935");
+        let slice = Slice::new(
+            Fragment::from(vec![Node::text_with_marks("red", vec![mark])]),
+            0, 0,
+        );
+        let html = serialize_to_html(&slice);
+        assert!(html.contains("style=\"color: #E53935\""));
+        assert!(html.contains("red"));
+        assert!(html.contains("</span>"));
+    }
+
+    #[test]
+    fn serialize_highlight() {
+        let mark = Mark::new(MarkType::Highlight).with_attr("color", "#FFF176");
+        let slice = Slice::new(
+            Fragment::from(vec![Node::text_with_marks("hi", vec![mark])]),
+            0, 0,
+        );
+        let html = serialize_to_html(&slice);
+        assert!(html.contains("style=\"background: #FFF176\""));
+        assert!(html.contains("</mark>"));
+    }
+
+    #[test]
+    fn serialize_mixed_marks_and_plain() {
+        let slice = Slice::new(
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![
+                    Node::text("plain "),
+                    Node::text_with_marks("bold", vec![Mark::new(MarkType::Bold)]),
+                    Node::text(" end"),
+                ]),
+            )]),
+            0, 0,
+        );
+        assert_eq!(
+            serialize_to_html(&slice),
+            "<p>plain <strong>bold</strong> end</p>"
+        );
+    }
+
+    // ── serialize_to_html: element types ──
+
+    #[test]
+    fn serialize_blockquote() {
+        let slice = Slice::new(
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Blockquote,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("quoted")]),
+                )]),
+            )]),
+            0, 0,
+        );
+        assert_eq!(serialize_to_html(&slice), "<blockquote><p>quoted</p></blockquote>");
+    }
+
+    #[test]
+    fn serialize_task_list() {
+        let mut item_attrs = HashMap::new();
+        item_attrs.insert("checked".to_string(), "true".to_string());
+        let slice = Slice::new(
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::TaskList,
+                Fragment::from(vec![Node::element_with_attrs(
+                    NodeType::TaskItem,
+                    item_attrs,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::Paragraph,
+                        Fragment::from(vec![Node::text("done")]),
+                    )]),
+                )]),
+            )]),
+            0, 0,
+        );
+        let html = serialize_to_html(&slice);
+        assert!(html.contains("data-type=\"taskList\""));
+        assert!(html.contains("data-checked=\"true\""));
+        assert!(html.contains("done"));
+    }
+
+    #[test]
+    fn serialize_image() {
+        let mut attrs = HashMap::new();
+        attrs.insert("src".to_string(), "photo.png".to_string());
+        attrs.insert("alt".to_string(), "A photo".to_string());
+        let slice = Slice::new(
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::Image, attrs, Fragment::empty(),
+            )]),
+            0, 0,
+        );
+        let html = serialize_to_html(&slice);
+        assert!(html.contains("src=\"photo.png\""));
+        assert!(html.contains("alt=\"A photo\""));
+        assert!(html.contains("/>"));
+    }
+
+    #[test]
+    fn serialize_hard_break() {
+        let slice = Slice::new(
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![
+                    Node::text("line1"),
+                    Node::element(NodeType::HardBreak),
+                    Node::text("line2"),
+                ]),
+            )]),
+            0, 0,
+        );
+        let html = serialize_to_html(&slice);
+        assert!(html.contains("line1<br />line2"));
+    }
+
+    #[test]
+    fn serialize_nested_list() {
+        let slice = Slice::new(
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("item 1")]),
+                        )]),
+                    ),
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("item 2")]),
+                        )]),
+                    ),
+                ]),
+            )]),
+            0, 0,
+        );
+        assert_eq!(
+            serialize_to_html(&slice),
+            "<ul><li><p>item 1</p></li><li><p>item 2</p></li></ul>"
+        );
+    }
+
+    #[test]
+    fn serialize_heading_level_3() {
+        let mut attrs = HashMap::new();
+        attrs.insert("level".to_string(), "3".to_string());
+        let slice = Slice::new(
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::Heading, attrs,
+                Fragment::from(vec![Node::text("Small")]),
+            )]),
+            0, 0,
+        );
+        assert_eq!(serialize_to_html(&slice), "<h3>Small</h3>");
+    }
+
+    #[test]
+    fn serialize_empty_paragraph() {
+        let slice = Slice::new(
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph, Fragment::empty(),
+            )]),
+            0, 0,
+        );
+        assert_eq!(serialize_to_html(&slice), "<p></p>");
+    }
+
+    // ── serialize_to_text ──
+
+    #[test]
+    fn to_text_hard_break_is_newline() {
+        let slice = Slice::new(
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![
+                    Node::text("a"),
+                    Node::element(NodeType::HardBreak),
+                    Node::text("b"),
+                ]),
+            )]),
+            0, 0,
+        );
+        let text = serialize_to_text(&slice);
+        assert!(text.contains("a\nb"));
+    }
+
+    #[test]
+    fn to_text_nested_list() {
+        let slice = Slice::new(
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::ListItem,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::Paragraph,
+                        Fragment::from(vec![Node::text("item")]),
+                    )]),
+                )]),
+            )]),
+            0, 0,
+        );
+        let text = serialize_to_text(&slice);
+        assert!(text.contains("item"));
+    }
+
+    #[test]
+    fn to_text_empty_paragraph() {
+        let slice = Slice::new(
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("before")]),
+                ),
+                Node::element_with_content(NodeType::Paragraph, Fragment::empty()),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("after")]),
+                ),
+            ]),
+            0, 0,
+        );
+        let text = serialize_to_text(&slice);
+        assert!(text.contains("before"));
+        assert!(text.contains("after"));
+    }
+
+    // ── extract_css_color ──
+
+    #[test]
+    fn extract_css_color_basic() {
+        let color = extract_css_color("color: #E53935; font-size: 14px", "color");
+        assert_eq!(color, Some("#E53935".to_string()));
+    }
+
+    #[test]
+    fn extract_css_color_background() {
+        let color = extract_css_color("background: yellow", "background");
+        assert_eq!(color, Some("yellow".to_string()));
+    }
+
+    #[test]
+    fn extract_css_color_no_match() {
+        assert_eq!(extract_css_color("font-size: 14px", "color"), None);
+        assert_eq!(extract_css_color("", "color"), None);
+    }
+
+    #[test]
+    fn extract_css_color_prefix_not_confused() {
+        // "background-color" should NOT match when searching for "background"
+        let result = extract_css_color("background-color: red", "background");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn extract_css_color_with_spaces() {
+        let color = extract_css_color("  color :  rgb(255, 0, 0)  ;", "color");
+        assert_eq!(color, Some("rgb(255, 0, 0)".to_string()));
+    }
+
+    // ── Security: html_escape_attr ──
+
+    #[test]
+    fn link_href_with_quotes_escaped() {
+        let link = Mark::new(MarkType::Link).with_attr("href", "x\" onclick=\"alert(1)");
+        let slice = Slice::new(
+            Fragment::from(vec![Node::text_with_marks("click", vec![link])]),
+            0, 0,
+        );
+        let html = serialize_to_html(&slice);
+        assert!(html.contains("&quot;"), "quotes in href must be escaped");
+        // The escaped output should NOT contain a raw onclick= attribute breakout.
+        // The " is escaped so onclick stays inside the href value, not as its own attribute.
+        assert!(!html.contains("\" onclick="), "attribute injection must not break out of quotes");
+    }
+
+    #[test]
+    fn image_src_with_quotes_escaped() {
+        let mut attrs = HashMap::new();
+        attrs.insert("src".to_string(), "x\" onerror=\"alert(1)".to_string());
+        let slice = Slice::new(
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::Image, attrs, Fragment::empty(),
+            )]),
+            0, 0,
+        );
+        let html = serialize_to_html(&slice);
+        assert!(html.contains("&quot;"), "quotes in src must be escaped");
+        assert!(!html.contains("\" onerror="), "attribute injection must not break out of quotes");
+    }
+
+    #[test]
+    fn serialize_link_javascript_url() {
+        // javascript: URLs should be rendered as-is by serialize (the view layer
+        // is responsible for sanitization), but let's document the behavior.
+        let link = Mark::new(MarkType::Link).with_attr("href", "javascript:alert(1)");
+        let slice = Slice::new(
+            Fragment::from(vec![Node::text_with_marks("click", vec![link])]),
+            0, 0,
+        );
+        let html = serialize_to_html(&slice);
+        // The href value is present (serialize doesn't filter URLs)
+        assert!(html.contains("href="));
+    }
+
+    // ── fit_slice_to_context: additional cases ──
+
+    #[test]
+    fn fit_text_in_doc_wraps_in_paragraph() {
+        let slice = Slice::new(Fragment::from(vec![Node::text("loose text")]), 0, 0);
+        let fitted = fit_slice_to_context(slice, NodeType::Doc);
+        assert_eq!(fitted.content.children.len(), 1);
+        assert_eq!(fitted.content.children[0].node_type(), Some(NodeType::Paragraph));
+        assert_eq!(fitted.content.children[0].text_content(), "loose text");
+    }
+
+    #[test]
+    fn fit_empty_slice_returns_empty() {
+        let slice = Slice::empty();
+        let fitted = fit_slice_to_context(slice, NodeType::Doc);
+        assert_eq!(fitted.content.children.len(), 0);
+    }
+
+    #[test]
+    fn fit_mixed_valid_and_invalid_in_list_item() {
+        let para = Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("valid")]),
+        );
+        let mut attrs = HashMap::new();
+        attrs.insert("level".to_string(), "1".to_string());
+        let heading = Node::element_with_attrs(
+            NodeType::Heading, attrs,
+            Fragment::from(vec![Node::text("invalid heading")]),
+        );
+        let slice = Slice::new(Fragment::from(vec![para, heading]), 0, 0);
+        let fitted = fit_slice_to_context(slice, NodeType::ListItem);
+
+        assert_eq!(fitted.content.children.len(), 2);
+        // Paragraph stays as-is
+        assert_eq!(fitted.content.children[0].node_type(), Some(NodeType::Paragraph));
+        // Heading downgraded to paragraph
+        assert_eq!(fitted.content.children[1].node_type(), Some(NodeType::Paragraph));
+        assert_eq!(fitted.content.children[1].text_content(), "invalid heading");
+    }
+
+    #[test]
+    fn fit_list_in_doc_unchanged() {
+        let list = Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::ListItem,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("item")]),
+                )]),
+            )]),
+        );
+        let slice = Slice::new(Fragment::from(vec![list]), 0, 0);
+        let fitted = fit_slice_to_context(slice, NodeType::Doc);
+        assert_eq!(fitted.content.children[0].node_type(), Some(NodeType::BulletList));
+    }
+
+    #[test]
+    fn fit_blockquote_valid_in_list_item() {
+        let bq = Node::element_with_content(
+            NodeType::Blockquote,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("quoted")]),
+            )]),
+        );
+        let slice = Slice::new(Fragment::from(vec![bq]), 0, 0);
+        let fitted = fit_slice_to_context(slice, NodeType::ListItem);
+        assert_eq!(fitted.content.children[0].node_type(), Some(NodeType::Blockquote));
+    }
+
+    // ── fit_slice_to_context: paragraph into paragraph (inline paste) ──
+
+    #[test]
+    fn fit_paragraph_into_paragraph_extracts_inline_content() {
+        // Pasting a Paragraph("23") into a Paragraph context should extract
+        // the inline children ("23" text node), not keep the wrapper Paragraph.
+        // This prevents nested <p> inside <p> which breaks contenteditable.
+        let pasted = Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("23")]),
+        );
+        let slice = Slice::new(Fragment::from(vec![pasted]), 0, 0);
+        let fitted = fit_slice_to_context(slice, NodeType::Paragraph);
+
+        // Should produce a text node, not a paragraph
+        assert_eq!(fitted.content.children.len(), 1);
+        assert!(matches!(fitted.content.children[0], Node::Text { .. }),
+            "should extract inline text, got: {:?}", fitted.content.children[0]);
+        assert_eq!(fitted.content.children[0].text_content(), "23");
+    }
+
+    #[test]
+    fn fit_paragraph_with_marks_into_paragraph_preserves_marks() {
+        // Pasting bold text from another paragraph should preserve the marks.
+        let pasted = Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![
+                Node::text("plain "),
+                Node::text_with_marks("bold", vec![Mark::new(MarkType::Bold)]),
+            ]),
+        );
+        let slice = Slice::new(Fragment::from(vec![pasted]), 0, 0);
+        let fitted = fit_slice_to_context(slice, NodeType::Paragraph);
+
+        // Should have 2 inline nodes (plain text + bold text), not a Paragraph wrapper
+        assert_eq!(fitted.content.children.len(), 2);
+        assert!(matches!(fitted.content.children[0], Node::Text { .. }));
+        assert_eq!(fitted.content.children[0].text_content(), "plain ");
+        assert_eq!(fitted.content.children[1].text_content(), "bold");
+        assert!(fitted.content.children[1].marks().iter().any(|m| m.mark_type == MarkType::Bold));
+    }
+
+    // ── strip_tags edge cases ──
+
+    #[test]
+    fn strip_tags_nested() {
+        assert_eq!(strip_tags("<div><p><b>deep</b></p></div>"), "deep");
+    }
+
+    #[test]
+    fn strip_tags_unclosed() {
+        assert_eq!(strip_tags("<p>unclosed"), "unclosed");
+    }
+
+    #[test]
+    fn strip_tags_self_closing() {
+        assert_eq!(strip_tags("a<br/>b"), "ab");
+        assert_eq!(strip_tags("a<hr />b"), "ab");
     }
 }

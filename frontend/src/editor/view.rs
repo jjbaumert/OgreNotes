@@ -303,10 +303,11 @@ impl EditorView {
                     if let Some(text) = data {
                         if !text.is_empty() {
                             if let Some(sel) = read_dom_selection_from(&container2) {
-                                super::debug::log("input", "insertText", &[
-                                    ("data", &text),
-                                    ("pos", &sel.from().to_string()),
-                                ]);
+                                let model_sel = state.borrow().selection.clone();
+                                super::debug::warn("input", &format!(
+                                    "insertText data='{}' dom_pos={} model_pos={}",
+                                    text, sel.from(), model_sel.from(),
+                                ));
                                 let state_with_sel = EditorState {
                                     selection: sel,
                                     ..current_state
@@ -427,6 +428,8 @@ impl EditorView {
                                     }
                                 }
                             }
+                        } else if super::commands::delete_table_selection(&state_with_sel, Some(&|txn| dispatch(txn))) {
+                            // Table-spanning selection: cleared cell contents
                         } else if let Ok(txn) = state_with_sel.transaction().delete_selection() {
                             dispatch(txn);
                         }
@@ -452,6 +455,8 @@ impl EditorView {
                                     dispatch(txn);
                                 }
                             }
+                        } else if super::commands::delete_table_selection(&state_with_sel, Some(&|txn| dispatch(txn))) {
+                            // Table-spanning selection: cleared cell contents
                         } else if let Ok(txn) = state_with_sel.transaction().delete_selection() {
                             dispatch(txn);
                         }
@@ -470,7 +475,22 @@ impl EditorView {
                         if let Ok(txn) = state_with_sel.transaction().split_block() {
                             dispatch(txn);
                         } else {
-                            super::debug::error("enter", "split_block failed");
+                            let doc = &state_with_sel.doc;
+                            let content_size = doc.content_size();
+                            let child_count = doc.child_count();
+                            let pos = state_with_sel.selection.from();
+                            let block = super::state::find_block_at(doc, pos);
+                            let child0_info = doc.child(0).map(|c| format!(
+                                "type={:?} node_size={} text_len={}",
+                                c.node_type(), c.node_size(), c.text_content().len(),
+                            )).unwrap_or_else(|| "none".to_string());
+                            super::debug::error("enter", &format!(
+                                "split_block failed pos={pos} content_size={content_size} \
+                                 child_count={child_count} block_found={} child0=[{child0_info}] \
+                                 doc_text='{}'",
+                                block.is_some(),
+                                doc.text_content().chars().take(100).collect::<String>(),
+                            ));
                         }
                     }
                 }
@@ -789,10 +809,9 @@ impl EditorView {
                     // Block-level paste: replace at the block level, not inside the paragraph.
                     // Split the current block at the cursor, sandwich pasted blocks between halves.
                     if let Some(block) = super::state::find_block_at(&state_with_sel.doc, pos) {
-                        let before_offset = pos - block.content_start;
-                        let after_offset = pos - block.content_start;
-                        let before_content = block.content.cut(0, before_offset);
-                        let after_content = block.content.cut(after_offset, block.content.size());
+                        let offset = pos.saturating_sub(block.content_start).min(block.content.size());
+                        let before_content = block.content.cut(0, offset);
+                        let after_content = block.content.cut(offset, block.content.size());
 
                         let mut nodes = Vec::new();
 
@@ -842,6 +861,30 @@ impl EditorView {
             }
         }) as Box<dyn Fn(web_sys::Event)>);
         self.add_listener("paste", on_paste);
+
+        // click — open links with Ctrl+click (Cmd+click on Mac) in a new tab.
+        // Regular clicks in contenteditable just position the cursor.
+        let on_click = Closure::wrap(Box::new(move |event: web_sys::Event| {
+            let Some(me) = event.dyn_ref::<web_sys::MouseEvent>() else { return };
+            // Ctrl+click (Windows/Linux) or Meta+click (Mac)
+            if !me.ctrl_key() && !me.meta_key() {
+                return;
+            }
+            // Walk up from the click target to find an <a> element
+            let mut node = event.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok());
+            while let Some(el) = node {
+                if el.tag_name().to_lowercase() == "a" {
+                    if let Some(href) = el.get_attribute("href") {
+                        event.prevent_default();
+                        let _ = web_sys::window()
+                            .and_then(|w| w.open_with_url_and_target(&href, "_blank").ok());
+                    }
+                    return;
+                }
+                node = el.parent_element();
+            }
+        }) as Box<dyn Fn(web_sys::Event)>);
+        self.add_listener("click", on_click);
 
         // selectionchange — sync DOM selection to model so toolbar updates
         // when the user moves the cursor (click, arrow keys).
@@ -1138,6 +1181,10 @@ fn node_type_to_tag(nt: NodeType) -> &'static str {
         NodeType::HorizontalRule => "hr",
         NodeType::HardBreak => "br",
         NodeType::Image => "img", // overridden in render_node
+        NodeType::Table => "table",
+        NodeType::TableRow => "tr",
+        NodeType::TableCell => "td",
+        NodeType::TableHeader => "th",
     }
 }
 

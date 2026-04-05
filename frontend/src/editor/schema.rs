@@ -80,10 +80,10 @@ impl Schema {
             return children.is_empty();
         }
 
-        // Enforce minimum cardinality: list containers require 1+ children
+        // Enforce minimum cardinality: list/table containers require 1+ children
         let requires_children = matches!(
             parent_type,
-            NodeType::BulletList | NodeType::OrderedList | NodeType::TaskList
+            NodeType::BulletList | NodeType::OrderedList | NodeType::TaskList | NodeType::Table
         );
         if requires_children && children.is_empty() {
             return false;
@@ -255,6 +255,7 @@ pub fn default_schema() -> Schema {
                 NodeType::CodeBlock,
                 NodeType::HorizontalRule,
                 NodeType::Image,
+                NodeType::Table,
             ],
             inline_content: false,
             block: false,
@@ -419,6 +420,7 @@ pub fn default_schema() -> Schema {
                 NodeType::CodeBlock,
                 NodeType::HorizontalRule,
                 NodeType::Image,
+                NodeType::Table,
             ],
             inline_content: false,
             block: true,
@@ -498,6 +500,93 @@ pub fn default_schema() -> Schema {
             defining: false,
             isolating: false,
             default_attrs: HashMap::new(),
+            allowed_marks: Some(vec![]),
+        },
+    );
+
+    // Table: contains table rows. Isolating prevents edits from escaping.
+    nodes.insert(
+        NodeType::Table,
+        NodeSpec {
+            valid_children: vec![NodeType::TableRow],
+            inline_content: false,
+            block: true,
+            leaf: false,
+            code: false,
+            atom: false,
+            defining: false,
+            isolating: true,
+            default_attrs: HashMap::new(),
+            allowed_marks: Some(vec![]),
+        },
+    );
+
+    // TableRow: contains cells
+    nodes.insert(
+        NodeType::TableRow,
+        NodeSpec {
+            valid_children: vec![NodeType::TableCell, NodeType::TableHeader],
+            inline_content: false,
+            block: false,
+            leaf: false,
+            code: false,
+            atom: false,
+            defining: false,
+            isolating: false,
+            default_attrs: HashMap::new(),
+            allowed_marks: Some(vec![]),
+        },
+    );
+
+    // TableCell: contains block content (like ListItem)
+    let mut cell_attrs = HashMap::new();
+    cell_attrs.insert("colspan".to_string(), "1".to_string());
+    cell_attrs.insert("rowspan".to_string(), "1".to_string());
+    nodes.insert(
+        NodeType::TableCell,
+        NodeSpec {
+            valid_children: vec![
+                NodeType::Paragraph,
+                NodeType::Heading,
+                NodeType::BulletList,
+                NodeType::OrderedList,
+                NodeType::TaskList,
+                NodeType::Blockquote,
+                NodeType::CodeBlock,
+            ],
+            inline_content: false,
+            block: false,
+            leaf: false,
+            code: false,
+            atom: false,
+            defining: true,
+            isolating: true,
+            default_attrs: cell_attrs.clone(),
+            allowed_marks: Some(vec![]),
+        },
+    );
+
+    // TableHeader: same as TableCell, rendered as <th>
+    nodes.insert(
+        NodeType::TableHeader,
+        NodeSpec {
+            valid_children: vec![
+                NodeType::Paragraph,
+                NodeType::Heading,
+                NodeType::BulletList,
+                NodeType::OrderedList,
+                NodeType::TaskList,
+                NodeType::Blockquote,
+                NodeType::CodeBlock,
+            ],
+            inline_content: false,
+            block: false,
+            leaf: false,
+            code: false,
+            atom: false,
+            defining: true,
+            isolating: true,
+            default_attrs: cell_attrs,
             allowed_marks: Some(vec![]),
         },
     );

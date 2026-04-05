@@ -29,6 +29,8 @@ const HIGHLIGHT_COLORS: &[(&str, &str)] = &[
 pub fn Toolbar(
     editor_state: ReadSignal<Option<EditorState>>,
     on_command: Callback<ToolbarCommand>,
+    #[prop(default = 0.into())]
+    comment_count: Signal<usize>,
 ) -> impl IntoView {
     let mark_active = move |mark_type: MarkType| -> bool {
         editor_state
@@ -279,15 +281,58 @@ pub fn Toolbar(
                 <button class="toolbar-btn" title="Horizontal Rule"
                     on:click=move |_| on_command.run(ToolbarCommand::InsertHorizontalRule)
                 >"\u{2014}"</button>
+                <button class="toolbar-btn" title="Insert Table"
+                    on:click=move |_| on_command.run(ToolbarCommand::InsertTable)
+                >"\u{1F4CB}"</button>
             </div>
 
             <div class="toolbar-separator"></div>
 
-            // ─── Group 5: Comment ───
+            // ─── Group 5: Table operations (shown when cursor is in a table) ───
+            <div class="toolbar-group"
+                style:display=move || {
+                    let in_table = editor_state.get()
+                        .map(|s| commands::is_in_table(&s))
+                        .unwrap_or(false);
+                    if in_table { "flex" } else { "none" }
+                }
+            >
+                <button class="toolbar-btn" title="Select Row"
+                    on:click=move |_| on_command.run(ToolbarCommand::SelectTableRow)
+                >"\u{2194} Row"</button>
+                <button class="toolbar-btn" title="Select Column"
+                    on:click=move |_| on_command.run(ToolbarCommand::SelectTableColumn)
+                >"\u{2195} Col"</button>
+                <button class="toolbar-btn" title="Add Row"
+                    on:click=move |_| on_command.run(ToolbarCommand::AddTableRow)
+                >"+ Row"</button>
+                <button class="toolbar-btn" title="Add Column"
+                    on:click=move |_| on_command.run(ToolbarCommand::AddTableColumn)
+                >"+ Col"</button>
+                <button class="toolbar-btn" title="Delete Row"
+                    on:click=move |_| on_command.run(ToolbarCommand::DeleteTableRow)
+                >"\u{2212} Row"</button>
+                <button class="toolbar-btn" title="Delete Column"
+                    on:click=move |_| on_command.run(ToolbarCommand::DeleteTableColumn)
+                >"\u{2212} Col"</button>
+            </div>
+
+            <div class="toolbar-separator"></div>
+
+            // ─── Group 6: Comment ───
             <div class="toolbar-group">
                 <button class="toolbar-btn toolbar-btn-wide" title="Comment (Ctrl+Alt+C)"
                     on:click=move |_| on_command.run(ToolbarCommand::InsertComment)
-                >"\u{1F4AC} Comment"</button>
+                >
+                    {move || {
+                        let count = comment_count.get();
+                        if count > 0 {
+                            format!("\u{1F4AC} {count}")
+                        } else {
+                            "\u{1F4AC} Comment".to_string()
+                        }
+                    }}
+                </button>
             </div>
         </div>
     }
@@ -311,6 +356,13 @@ pub enum ToolbarCommand {
     ToggleBlockquote,
     SetCodeBlock,
     InsertHorizontalRule,
+    InsertTable,
+    SelectTableRow,
+    SelectTableColumn,
+    AddTableRow,
+    AddTableColumn,
+    DeleteTableRow,
+    DeleteTableColumn,
     ToggleLink(String),
     UploadImage,
     InsertComment,

@@ -198,6 +198,9 @@ impl DocRepo {
         );
         item.insert("user_id".to_string(), AttributeValue::S(update.user_id.clone()));
         item.insert("created_at".to_string(), AttributeValue::N(update.created_at.to_string()));
+        if let Some(ref version) = update.client_version {
+            item.insert("client_version".to_string(), AttributeValue::S(version.clone()));
+        }
 
         self.db
             .put_item_conditional(item, "attribute_not_exists(PK) AND attribute_not_exists(SK)")
@@ -229,12 +232,17 @@ impl DocRepo {
                     .map(|b| b.as_ref().to_vec())
                     .ok_or_else(|| RepoError::MissingField("update_bytes".to_string()))?;
 
+                let client_version = item.get("client_version")
+                    .and_then(|v| v.as_s().ok())
+                    .map(|s| s.to_string());
+
                 Ok(DocUpdate {
                     doc_id: doc_id.to_string(),
                     clock,
                     update_bytes,
                     user_id: get_s(item, "user_id")?,
                     created_at: get_n(item, "created_at")?,
+                    client_version,
                 })
             })
             .collect()

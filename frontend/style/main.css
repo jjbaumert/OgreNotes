@@ -535,6 +535,7 @@ html, body {
   overflow-y: auto;
   display: flex;
   justify-content: center;
+  align-items: flex-start;
   padding: var(--space-xl) var(--space-lg);
   background: var(--color-bg);
 }
@@ -542,7 +543,7 @@ html, body {
 .editor-content {
   width: 100%;
   max-width: var(--content-max-width);
-  min-height: 400px;
+  min-height: 100%;
   background: var(--color-surface);
   padding: var(--space-xl);
   border-radius: var(--radius-lg);
@@ -551,6 +552,7 @@ html, body {
   font-size: 16px;
   line-height: 1.6;
   outline: none;
+  box-sizing: border-box;
 }
 
 .editor-content:empty::before {
@@ -703,6 +705,129 @@ html, body {
 .editor-content li[data-type="taskItem"][data-checked="true"]::before {
   background: var(--color-primary);
   border-color: var(--color-primary);
+}
+
+/* Tables */
+.editor-content table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+  table-layout: fixed;
+}
+
+.editor-content th,
+.editor-content td {
+  border: 1px solid var(--color-border);
+  padding: 8px 12px;
+  vertical-align: top;
+  min-width: 80px;
+}
+
+.editor-content th {
+  background: var(--color-mist);
+  font-weight: 600;
+  text-align: left;
+}
+
+.editor-content td p,
+.editor-content th p {
+  margin: 0;
+}
+
+.editor-content td p + p,
+.editor-content th p + p {
+  margin-top: 4px;
+}
+
+/* Selection toolbar — floating above text selection */
+.selection-toolbar {
+  position: fixed;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--color-surface, #1a1a1a);
+  border-radius: 6px;
+  padding: 4px 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  pointer-events: auto;
+}
+
+.selection-toolbar-btn {
+  background: none;
+  border: none;
+  color: var(--color-surface-text, #e0e0e0);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 4px;
+  line-height: 1;
+}
+
+.selection-toolbar-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+/* Comment highlight — overlays commented text with warm background */
+.comment-highlight {
+  position: fixed;
+  background: rgba(210, 150, 60, 0.25);
+  border-radius: 2px;
+  cursor: pointer;
+  pointer-events: auto;
+  z-index: 5;
+  transition: background 0.15s;
+}
+
+.comment-highlight:hover {
+  background: rgba(210, 150, 60, 0.4);
+}
+
+/* Comment bubble — numbered icon in the left margin */
+.comment-bubble {
+  position: fixed;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  cursor: pointer;
+  font-size: 14px;
+  opacity: 0.6;
+  transition: opacity 0.15s;
+}
+
+.comment-bubble:hover {
+  opacity: 1;
+}
+
+.comment-bubble-icon {
+  font-size: 16px;
+}
+
+.comment-bubble-count {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+/* Comment bubble — appears on hover in the right margin of commentable blocks */
+.editor-content [data-block-id] {
+  position: relative;
+}
+
+.editor-content [data-block-id]:hover::after {
+  content: "\1F4AC";
+  position: absolute;
+  right: -32px;
+  top: 2px;
+  font-size: 14px;
+  opacity: 0.4;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.editor-content [data-block-id]:hover::after:hover {
+  opacity: 1;
 }
 
 /* Horizontal rule */
@@ -954,6 +1079,19 @@ html, body {
   color: var(--color-text-secondary);
 }
 
+/* Editor + side panels row */
+.editor-with-panels {
+  flex: 1;
+  display: flex;
+  flex-direction: row;
+  overflow: hidden;
+}
+
+.editor-with-panels .editor-container {
+  flex: 1;
+  overflow-y: auto;
+}
+
 /* ─── Conversation Pane ─────────────────────────────────────── */
 
 .conversation-pane {
@@ -992,15 +1130,246 @@ html, body {
   color: var(--color-text-tertiary);
 }
 
-.conversation-thread {
-  padding: var(--space-sm) var(--space-md);
+/* Comment popup — positioned to the left of document content */
+.comment-popup-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 99;
+}
+
+.comment-popup {
+  position: fixed;
+  z-index: 100;
+  width: 420px;
+  max-height: 500px;
+  background: var(--color-bg, #fff);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.12);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.comment-popup-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--color-border);
 }
 
-.thread-author {
+.comment-popup-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+.comment-popup-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 18px;
+  color: var(--color-text-secondary);
+  padding: 4px;
+  line-height: 1;
+}
+
+.comment-popup-close:hover {
+  color: var(--color-text);
+}
+
+.comment-popup-body {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 120px;
+  max-height: 320px;
+}
+
+.comment-popup-textarea {
+  width: 100%;
+  min-height: 120px;
+  padding: 12px 16px;
+  border: none;
+  border-bottom: 1px solid var(--color-border);
+  font-size: 14px;
+  font-family: inherit;
+  color: var(--color-text);
+  resize: vertical;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.comment-popup-textarea::placeholder {
+  color: var(--color-text-tertiary);
+}
+
+.comment-popup-messages {
+  padding: 12px 16px;
+}
+
+.comment-popup-msg {
+  margin-bottom: 12px;
+}
+
+.comment-popup-msg-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+
+.comment-popup-author {
   font-size: 12px;
   font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+.comment-popup-time {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
+
+.comment-popup-text {
+  font-size: 14px;
   color: var(--color-text);
+  line-height: 1.4;
+}
+
+.comment-popup-loading {
+  font-size: 13px;
+  color: var(--color-text-tertiary);
+  padding: 16px;
+}
+
+.comment-popup-footer {
+  padding: 10px 16px;
+  border-top: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.comment-popup-reply-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.comment-popup-input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  font-size: 14px;
+  outline: none;
+}
+
+.comment-popup-input:focus {
+  border-color: var(--color-primary);
+}
+
+.comment-popup-send {
+  background: var(--color-primary);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.comment-popup-send:hover {
+  opacity: 0.9;
+}
+
+.conversation-error {
+  padding: var(--space-sm) var(--space-md);
+  margin: var(--space-sm);
+  background: #FFF3E0;
+  border: 1px solid #FFB74D;
+  border-radius: 4px;
+  font-size: 12px;
+  color: #E65100;
+  cursor: pointer;
+}
+
+.conversation-thread {
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+  cursor: pointer;
+}
+
+.conversation-thread:hover {
+  background: var(--color-mist);
+}
+
+.conversation-thread.thread-resolved {
+  opacity: 0.6;
+}
+
+.thread-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: 12px;
+}
+
+.thread-author {
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.thread-status {
+  color: var(--color-text-secondary);
+}
+
+.thread-time {
+  color: var(--color-text-tertiary);
+  margin-left: auto;
+}
+
+.thread-preview {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  margin-top: 2px;
+  line-height: 1.4;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.thread-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.thread-action-btn {
+  background: none;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 11px;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+}
+
+.thread-action-btn:hover {
+  background: var(--color-mist);
+  color: var(--color-text);
+}
+
+.thread-delete-btn:hover {
+  color: var(--color-error, #E53935);
+  border-color: var(--color-error, #E53935);
 }
 
 .thread-content {

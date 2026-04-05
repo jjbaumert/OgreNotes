@@ -48,6 +48,9 @@ pub struct DocUpdate {
     pub update_bytes: Vec<u8>,
     pub user_id: String,
     pub created_at: i64,
+    /// Client version that produced this update (None for pre-versioning updates).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
 }
 
 impl DocUpdate {

@@ -68,6 +68,7 @@ features = [
     "FileList",
     "Blob",
     "MouseEvent",
+    "MouseEventInit",
     "WebSocket",
     "MessageEvent",
     "BinaryType",

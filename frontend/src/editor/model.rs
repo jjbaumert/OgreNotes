@@ -1,24 +1,34 @@
 use std::collections::HashMap;
 
-/// Generate a random block ID (8 alphanumeric chars).
-/// Uses Math.random in WASM, or a simple counter in tests.
+/// Generate a random block ID (10 alphanumeric chars).
 pub fn generate_block_id() -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut id = String::with_capacity(10);
+
     #[cfg(target_arch = "wasm32")]
     {
-        let mut id = String::with_capacity(8);
-        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        for _ in 0..8 {
+        for _ in 0..10 {
             let idx = (js_sys::Math::random() * CHARS.len() as f64) as usize;
             id.push(CHARS[idx % CHARS.len()] as char);
         }
-        id
     }
+
     #[cfg(not(target_arch = "wasm32"))]
     {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
         use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
-        format!("blk{:05}", COUNTER.fetch_add(1, Ordering::Relaxed))
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seed = RandomState::new().build_hasher().finish()
+            .wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed));
+        let mut state = seed;
+        for _ in 0..10 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            id.push(CHARS[(state >> 33) as usize % CHARS.len()] as char);
+        }
     }
+
+    id
 }
 
 /// Mark types for inline formatting.
@@ -117,6 +127,10 @@ pub enum NodeType {
     HorizontalRule,
     HardBreak,
     Image,
+    Table,
+    TableRow,
+    TableCell,
+    TableHeader,
 }
 
 impl NodeType {
@@ -160,12 +174,15 @@ impl NodeType {
                 | NodeType::TaskItem
                 | NodeType::CodeBlock
                 | NodeType::Blockquote
+                | NodeType::Table
+                | NodeType::TableCell
+                | NodeType::TableHeader
         )
     }
 
     /// Whether this node type contains inline content (text).
     /// Paragraph, Heading, and CodeBlock hold text directly.
-    /// Container blocks (lists, blockquote) hold other blocks, not text.
+    /// Container blocks (lists, blockquote, table) hold other blocks, not text.
     pub fn is_textblock(&self) -> bool {
         matches!(
             self,
@@ -189,6 +206,12 @@ impl NodeType {
             NodeType::CodeBlock => {
                 let mut m = HashMap::new();
                 m.insert("language".to_string(), String::new());
+                m
+            }
+            NodeType::TableCell | NodeType::TableHeader => {
+                let mut m = HashMap::new();
+                m.insert("colspan".to_string(), "1".to_string());
+                m.insert("rowspan".to_string(), "1".to_string());
                 m
             }
             _ => HashMap::new(),
@@ -596,6 +619,9 @@ impl Fragment {
 
     /// Cut a sub-fragment by position range (char-indexed).
     pub fn cut(&self, from: usize, to: usize) -> Self {
+        let size = self.size();
+        let from = from.min(size);
+        let to = to.min(size);
         if from >= to {
             return Fragment::empty();
         }
@@ -686,6 +712,127 @@ impl Fragment {
                 }
             }
             i += 1;
+        }
+    }
+}
+
+// ─── Document Normalization ────────────────────────────────────
+
+/// Normalize a document tree to fix common structural violations:
+/// - Empty lists (no children) → removed
+/// - Empty list items → get an empty Paragraph
+/// - Orphaned list items under Doc → unwrapped to their children
+/// - Bare text under Doc → wrapped in Paragraph
+///
+/// Idempotent: calling on an already-valid document returns it unchanged.
+pub fn normalize_doc(doc: &Node) -> Node {
+    let Node::Element { content, .. } = doc else { return doc.clone() };
+    let children: Vec<Node> = content.children.iter()
+        .flat_map(|child| normalize_node(child, NodeType::Doc))
+        .collect();
+    let children = if children.is_empty() {
+        vec![Node::element(NodeType::Paragraph)]
+    } else {
+        children
+    };
+    doc.copy_with_content(Fragment::from(children))
+}
+
+fn normalize_node(node: &Node, parent_type: NodeType) -> Vec<Node> {
+    match node {
+        Node::Text { .. } => {
+            if parent_type == NodeType::Doc {
+                vec![Node::element_with_content(
+                    NodeType::Paragraph, Fragment::from(vec![node.clone()]),
+                )]
+            } else {
+                vec![node.clone()]
+            }
+        }
+        Node::Element { node_type, content, .. } => {
+            // Orphaned structural nodes under Doc → unwrap to their children
+            if matches!(node_type,
+                NodeType::ListItem | NodeType::TaskItem
+                | NodeType::TableRow | NodeType::TableCell | NodeType::TableHeader
+            ) && parent_type == NodeType::Doc
+            {
+                return content.children.iter()
+                    .flat_map(|c| normalize_node(c, NodeType::Doc))
+                    .collect();
+            }
+
+            // Block elements inside textblocks (e.g., Paragraph containing Paragraph)
+            // are invalid HTML and break contenteditable. Split them out as siblings.
+            if node_type.is_textblock() {
+                let has_block_children = content.children.iter().any(|c| {
+                    matches!(c, Node::Element { node_type: nt, .. } if nt.is_block() && !nt.is_inline())
+                });
+                if has_block_children {
+                    let mut result = Vec::new();
+                    let mut inline_buf: Vec<Node> = Vec::new();
+
+                    for child in &content.children {
+                        let is_block_child = matches!(child, Node::Element { node_type: nt, .. } if nt.is_block() && !nt.is_inline());
+                        if is_block_child {
+                            // Flush buffered inline content as a paragraph
+                            if !inline_buf.is_empty() {
+                                result.push(node.copy_with_content(Fragment::from(inline_buf.drain(..).collect::<Vec<_>>())));
+                            }
+                            // Add the block child directly (it becomes a sibling)
+                            result.extend(normalize_node(child, parent_type));
+                        } else {
+                            inline_buf.push(child.clone());
+                        }
+                    }
+                    // Flush remaining inline content
+                    if !inline_buf.is_empty() {
+                        result.push(node.copy_with_content(Fragment::from(inline_buf)));
+                    }
+                    // If nothing produced, add an empty paragraph
+                    if result.is_empty() {
+                        result.push(Node::element(NodeType::Paragraph));
+                    }
+                    return result;
+                }
+            }
+
+            // Recurse into children
+            let children: Vec<Node> = content.children.iter()
+                .flat_map(|c| normalize_node(c, *node_type))
+                .collect();
+
+            match node_type {
+                // Empty lists/tables → remove entirely
+                NodeType::BulletList | NodeType::OrderedList | NodeType::TaskList
+                | NodeType::Table => {
+                    if children.is_empty() {
+                        vec![]
+                    } else {
+                        vec![node.copy_with_content(Fragment::from(children))]
+                    }
+                }
+                // Empty table rows → remove
+                NodeType::TableRow => {
+                    if children.is_empty() {
+                        vec![]
+                    } else {
+                        vec![node.copy_with_content(Fragment::from(children))]
+                    }
+                }
+                // Empty list items / table cells → add an empty Paragraph
+                NodeType::ListItem | NodeType::TaskItem
+                | NodeType::TableCell | NodeType::TableHeader => {
+                    if children.is_empty() {
+                        vec![node.copy_with_content(Fragment::from(vec![
+                            Node::element(NodeType::Paragraph),
+                        ]))]
+                    } else {
+                        vec![node.copy_with_content(Fragment::from(children))]
+                    }
+                }
+                // Everything else → just propagate normalized children
+                _ => vec![node.copy_with_content(Fragment::from(children))],
+            }
         }
     }
 }
@@ -1250,5 +1397,237 @@ mod tests {
         );
         let slice = doc.slice(3, 3);
         assert!(slice.content.children.is_empty());
+    }
+
+    // ── normalize_doc ──
+
+    #[test]
+    fn normalize_preserves_valid_doc() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("Hello")]),
+                ),
+                Node::element_with_content(
+                    NodeType::BulletList,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("item")]),
+                        )]),
+                    )]),
+                ),
+            ]),
+        );
+        let normalized = normalize_doc(&doc);
+        assert_eq!(normalized.text_content(), doc.text_content());
+        assert_eq!(normalized.child_count(), 2);
+    }
+
+    #[test]
+    fn normalize_removes_empty_list() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("before")]),
+                ),
+                Node::Element {
+                    node_type: NodeType::BulletList,
+                    attrs: HashMap::new(),
+                    content: Fragment::empty(),
+                    marks: vec![],
+                },
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("after")]),
+                ),
+            ]),
+        );
+        let normalized = normalize_doc(&doc);
+        assert_eq!(normalized.child_count(), 2);
+        assert_eq!(normalized.child(0).unwrap().text_content(), "before");
+        assert_eq!(normalized.child(1).unwrap().text_content(), "after");
+    }
+
+    #[test]
+    fn normalize_adds_paragraph_to_empty_list_item() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![Node::Element {
+                    node_type: NodeType::ListItem,
+                    attrs: HashMap::new(),
+                    content: Fragment::empty(),
+                    marks: vec![],
+                }]),
+            )]),
+        );
+        let normalized = normalize_doc(&doc);
+        let list = normalized.child(0).unwrap();
+        assert_eq!(list.node_type(), Some(NodeType::BulletList));
+        let item = list.child(0).unwrap();
+        assert_eq!(item.node_type(), Some(NodeType::ListItem));
+        let para = item.child(0).unwrap();
+        assert_eq!(para.node_type(), Some(NodeType::Paragraph));
+    }
+
+    #[test]
+    fn normalize_unwraps_orphaned_list_item() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::ListItem,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("orphan")]),
+                )]),
+            )]),
+        );
+        let normalized = normalize_doc(&doc);
+        let first = normalized.child(0).unwrap();
+        assert_eq!(first.node_type(), Some(NodeType::Paragraph));
+        assert_eq!(first.text_content(), "orphan");
+    }
+
+    #[test]
+    fn normalize_wraps_bare_text_under_doc() {
+        let doc = Node::Element {
+            node_type: NodeType::Doc,
+            attrs: HashMap::new(),
+            content: Fragment::from(vec![Node::text("bare")]),
+            marks: vec![],
+        };
+        let normalized = normalize_doc(&doc);
+        let first = normalized.child(0).unwrap();
+        assert_eq!(first.node_type(), Some(NodeType::Paragraph));
+        assert_eq!(first.text_content(), "bare");
+    }
+
+    #[test]
+    fn normalize_is_idempotent() {
+        // An already-corrupted doc
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::Element {
+                    node_type: NodeType::BulletList,
+                    attrs: HashMap::new(),
+                    content: Fragment::empty(),
+                    marks: vec![],
+                },
+                Node::element_with_content(
+                    NodeType::ListItem,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::Paragraph,
+                        Fragment::from(vec![Node::text("orphan")]),
+                    )]),
+                ),
+            ]),
+        );
+        let first = normalize_doc(&doc);
+        let second = normalize_doc(&first);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn normalize_empty_doc_gets_paragraph() {
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::empty());
+        let normalized = normalize_doc(&doc);
+        assert_eq!(normalized.child_count(), 1);
+        assert_eq!(normalized.child(0).unwrap().node_type(), Some(NodeType::Paragraph));
+    }
+
+    #[test]
+    fn normalize_removes_list_whose_items_are_all_empty_after_normalization() {
+        // A list where the only item contains an empty nested list (which gets removed),
+        // leaving the item empty, which gets a paragraph, so the outer list survives.
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::ListItem,
+                    Fragment::from(vec![Node::Element {
+                        node_type: NodeType::BulletList,
+                        attrs: HashMap::new(),
+                        content: Fragment::empty(),
+                        marks: vec![],
+                    }]),
+                )]),
+            )]),
+        );
+        let normalized = normalize_doc(&doc);
+        // Inner empty list removed → ListItem becomes empty → gets Paragraph
+        let list = normalized.child(0).unwrap();
+        assert_eq!(list.node_type(), Some(NodeType::BulletList));
+        let item = list.child(0).unwrap();
+        assert_eq!(item.child(0).unwrap().node_type(), Some(NodeType::Paragraph));
+    }
+
+    #[test]
+    fn normalize_splits_nested_paragraph_out_of_textblock() {
+        // A paragraph containing text + a nested paragraph (invalid HTML).
+        // Should be split into separate sibling paragraphs.
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::Element {
+                node_type: NodeType::Paragraph,
+                attrs: HashMap::new(),
+                content: Fragment::from(vec![
+                    Node::text("before"),
+                    Node::element_with_content(
+                        NodeType::Paragraph,
+                        Fragment::from(vec![Node::text("nested")]),
+                    ),
+                    Node::text("after"),
+                ]),
+                marks: vec![],
+            }]),
+        );
+        let normalized = normalize_doc(&doc);
+        // Should produce 3 paragraphs: "before", "nested", "after"
+        assert_eq!(normalized.child_count(), 3,
+            "nested paragraph should be split out, got {} children: {:?}",
+            normalized.child_count(), normalized);
+        assert_eq!(normalized.child(0).unwrap().text_content(), "before");
+        assert_eq!(normalized.child(1).unwrap().text_content(), "nested");
+        assert_eq!(normalized.child(2).unwrap().text_content(), "after");
+    }
+
+    #[test]
+    fn normalize_splits_nested_paragraph_with_marks() {
+        // Paragraph with bold text + nested paragraph (the exact bug from the report)
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::Element {
+                node_type: NodeType::Paragraph,
+                attrs: HashMap::new(),
+                content: Fragment::from(vec![
+                    Node::text("a"),
+                    Node::text_with_marks("s", vec![Mark::new(MarkType::Bold)]),
+                    Node::element_with_content(
+                        NodeType::Paragraph,
+                        Fragment::from(vec![Node::text("ss")]),
+                    ),
+                ]),
+                marks: vec![],
+            }]),
+        );
+        let normalized = normalize_doc(&doc);
+        assert_eq!(normalized.child_count(), 2);
+        // First para: "a" + bold "s"
+        let first = normalized.child(0).unwrap();
+        assert_eq!(first.node_type(), Some(NodeType::Paragraph));
+        assert_eq!(first.text_content(), "as");
+        // Second para: "ss"
+        let second = normalized.child(1).unwrap();
+        assert_eq!(second.node_type(), Some(NodeType::Paragraph));
+        assert_eq!(second.text_content(), "ss");
     }
 }

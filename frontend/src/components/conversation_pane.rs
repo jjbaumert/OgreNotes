@@ -16,6 +16,10 @@ pub fn ConversationPane(
     editor_state: ReadSignal<Option<EditorState>>,
     /// Block ID to attach the next comment to (set when user clicks Comment with cursor in a block).
     pending_block_id: ReadSignal<Option<String>>,
+    /// Text selection anchor within the block (offset from block content start).
+    pending_anchor_start: ReadSignal<Option<u32>>,
+    /// Text selection end within the block.
+    pending_anchor_end: ReadSignal<Option<u32>>,
     /// Callback to clear the pending block ID after thread creation.
     on_block_used: Callback<()>,
     /// Callback to report inline threads for highlight rendering.
@@ -26,57 +30,92 @@ pub fn ConversationPane(
     let (threads, set_threads) = signal::<Vec<ThreadEntry>>(Vec::new());
     let (new_message, set_new_message) = signal(String::new());
     let (loading, set_loading) = signal(false);
+    let (error_msg, set_error_msg) = signal::<Option<String>>(None);
     let (selected_thread, set_selected_thread) = signal::<Option<String>>(None);
     let (thread_messages, set_thread_messages) = signal::<Vec<MessageEntry>>(Vec::new());
     let (reply_text, set_reply_text) = signal(String::new());
 
-    // Load threads when pane becomes visible or doc_id changes.
-    Effect::new(move |_| {
-        if !visible.get() {
-            return;
-        }
-        let id = doc_id.get();
-        if id.is_empty() {
-            return;
-        }
+    // Shared thread-loading function (used by initial load + polling).
+    let refresh_threads = {
+        let set_threads = set_threads.clone();
+        let set_loading = set_loading.clone();
+        let on_threads_loaded = on_threads_loaded.clone();
+        std::rc::Rc::new(move |id: String, show_loading: bool| {
+            if id.is_empty() { return; }
+            let set_threads = set_threads.clone();
+            let set_loading = set_loading.clone();
+            let on_threads_loaded = on_threads_loaded.clone();
+            if show_loading { set_loading.set(true); }
+            leptos::task::spawn_local(async move {
+                match comments::list_threads(&id).await {
+                    Ok(resp) => {
+                        let entries: Vec<ThreadEntry> = resp
+                            .threads
+                            .into_iter()
+                            .map(|t| ThreadEntry {
+                                thread_id: t.thread_id,
+                                created_by: t.created_by,
+                                created_by_name: t.created_by_name,
+                                status: t.status,
+                                thread_type: t.thread_type,
+                                block_id: t.block_id,
+                                anchor_start: t.anchor_start,
+                                anchor_end: t.anchor_end,
+                                first_message: t.first_message,
+                                created_at: t.created_at,
+                            })
+                            .collect();
+                        let inline: Vec<InlineThreadInfo> = entries
+                            .iter()
+                            .filter(|t| t.thread_type == "inline" && t.block_id.is_some())
+                            .map(|t| InlineThreadInfo {
+                                thread_id: t.thread_id.clone(),
+                                block_id: t.block_id.clone().unwrap(),
+                                anchor_start: t.anchor_start,
+                                anchor_end: t.anchor_end,
+                            })
+                            .collect();
+                        on_threads_loaded.run(inline);
+                        set_threads.set(entries);
+                    }
+                    Err(e) => {
+                        web_sys::console::warn_1(
+                            &format!("Failed to load threads: {e}").into(),
+                        );
+                    }
+                }
+                set_loading.set(false);
+            });
+        })
+    };
 
-        set_loading.set(true);
-        leptos::task::spawn_local(async move {
-            match comments::list_threads(&id).await {
-                Ok(resp) => {
-                    let entries: Vec<ThreadEntry> = resp
-                        .threads
-                        .into_iter()
-                        .map(|t| ThreadEntry {
-                            thread_id: t.thread_id,
-                            created_by: t.created_by,
-                            status: t.status,
-                            thread_type: t.thread_type,
-                            block_id: t.block_id,
-                            created_at: t.created_at,
-                        })
-                        .collect();
-                    // Emit inline threads for highlight overlay.
-                    let inline: Vec<InlineThreadInfo> = entries
-                        .iter()
-                        .filter(|t| t.thread_type == "inline" && t.block_id.is_some())
-                        .map(|t| InlineThreadInfo {
-                            thread_id: t.thread_id.clone(),
-                            block_id: t.block_id.clone().unwrap(),
-                        })
-                        .collect();
-                    on_threads_loaded.run(inline);
-                    set_threads.set(entries);
-                }
-                Err(e) => {
-                    web_sys::console::warn_1(
-                        &format!("Failed to load threads: {e}").into(),
-                    );
-                }
-            }
-            set_loading.set(false);
+    // Load threads when pane becomes visible or doc_id changes.
+    {
+        let refresh = refresh_threads.clone();
+        Effect::new(move |_| {
+            if !visible.get() { return; }
+            refresh(doc_id.get(), true);
         });
-    });
+    }
+
+    // Poll for new threads every 10 seconds while pane is visible.
+    {
+        let refresh = refresh_threads.clone();
+        let poll_handle: std::rc::Rc<std::cell::RefCell<Option<gloo_timers::callback::Interval>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let poll_ref = poll_handle.clone();
+        Effect::new(move |_| {
+            if visible.get() {
+                let refresh = refresh.clone();
+                let doc = doc_id.get_untracked();
+                *poll_ref.borrow_mut() = Some(gloo_timers::callback::Interval::new(10_000, move || {
+                    refresh(doc.clone(), false);
+                }));
+            } else {
+                *poll_ref.borrow_mut() = None; // stop polling
+            }
+        });
+    }
 
     // Auto-select thread when filter_thread_id changes.
     Effect::new(move |_| {
@@ -99,7 +138,7 @@ pub fn ConversationPane(
                         .messages
                         .into_iter()
                         .map(|m| MessageEntry {
-                            user_id: m.user_id,
+                            user_name: if m.user_name.is_empty() { m.user_id } else { m.user_name },
                             content: m.content,
                             created_at: m.created_at,
                         })
@@ -122,23 +161,37 @@ pub fn ConversationPane(
             return;
         }
         set_new_message.set(String::new());
+        set_error_msg.set(None);
         let id = doc_id_for_create.get_untracked();
         let block_id = pending_block_id.get_untracked();
+        let anchor_start = pending_anchor_start.get_untracked();
+        let anchor_end = pending_anchor_end.get_untracked();
         leptos::task::spawn_local(async move {
-            match comments::create_thread(&id, &msg, block_id.as_deref()).await {
+            match comments::create_thread(&id, &msg, block_id.as_deref(), anchor_start, anchor_end).await {
                 Ok(resp) => {
                     let now = js_sys::Date::now() as i64 * 1000;
-                    let user_id = crate::api::client::get_auth()
-                        .map(|a| a.user_id)
-                        .unwrap_or_default();
+                    let auth = crate::api::client::get_auth();
+                    let user_id = auth.as_ref().map(|a| a.user_id.clone()).unwrap_or_default();
+                    let user_name = auth.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| user_id.clone());
                     let thread_type = if block_id.is_some() { "inline" } else { "document" };
+                    let preview = if msg.len() > 120 {
+                        let mut p = msg[..120].to_string();
+                        p.push_str("...");
+                        Some(p)
+                    } else {
+                        Some(msg.clone())
+                    };
                     set_threads.update(|list| {
                         list.insert(0, ThreadEntry {
                             thread_id: resp.thread_id.clone(),
                             created_by: user_id,
+                            created_by_name: user_name,
                             status: "open".to_string(),
                             thread_type: thread_type.to_string(),
                             block_id: block_id.clone(),
+                            anchor_start,
+                            anchor_end,
+                            first_message: preview,
                             created_at: now,
                         });
                     });
@@ -151,6 +204,8 @@ pub fn ConversationPane(
                             .map(|t| InlineThreadInfo {
                                 thread_id: t.thread_id.clone(),
                                 block_id: t.block_id.clone().unwrap(),
+                                anchor_start: t.anchor_start,
+                                anchor_end: t.anchor_end,
                             })
                             .collect();
                         on_threads_loaded.run(inline);
@@ -158,10 +213,11 @@ pub fn ConversationPane(
                     on_block_used.run(());
                     set_selected_thread.set(Some(resp.thread_id));
                 }
+                Err(crate::api::client::ApiClientError::Http(409, _)) => {
+                    set_error_msg.set(Some("This block already has a comment. Select the existing thread to reply.".to_string()));
+                }
                 Err(e) => {
-                    web_sys::console::warn_1(
-                        &format!("Failed to create thread: {e}").into(),
-                    );
+                    set_error_msg.set(Some(format!("Failed to create thread: {e}")));
                 }
             }
         });
@@ -182,7 +238,7 @@ pub fn ConversationPane(
                             .messages
                             .into_iter()
                             .map(|m| MessageEntry {
-                                user_id: m.user_id,
+                                user_name: if m.user_name.is_empty() { m.user_id } else { m.user_name },
                                 content: m.content,
                                 created_at: m.created_at,
                             })
@@ -229,6 +285,11 @@ pub fn ConversationPane(
                     <Show when=move || loading.get()>
                         <div class="conversation-loading">"Loading..."</div>
                     </Show>
+                    {move || error_msg.get().map(|msg| view! {
+                        <div class="conversation-error"
+                            on:click=move |_| set_error_msg.set(None)
+                        >{msg}" \u{2715}"</div>
+                    })}
 
                     // Thread list view.
                     <Show when=move || selected_thread.get().is_none()>
@@ -245,26 +306,76 @@ pub fn ConversationPane(
                                     <div class="conversation-threads">
                                         {items.into_iter().map(|t| {
                                             let tid = t.thread_id.clone();
-                                            let is_inline = t.thread_type == "inline";
-                                            let block_label = if is_inline {
-                                                t.block_id.as_deref().unwrap_or("").to_string()
-                                            } else {
-                                                String::new()
-                                            };
-                                            let has_block = is_inline && !block_label.is_empty();
+                                            let tid_for_click = tid.clone();
+                                            let tid_for_resolve = tid.clone();
+                                            let tid_for_delete = tid.clone();
+                                            let is_resolved = t.status == "resolved";
+                                            let status_label = if is_resolved { "Resolved" } else { "Open" };
+                                            let preview = t.first_message.clone();
                                             view! {
                                                 <div
-                                                    class="conversation-thread"
-                                                    on:click=move |_| set_selected_thread.set(Some(tid.clone()))
+                                                    class=if is_resolved { "conversation-thread thread-resolved" } else { "conversation-thread" }
+                                                    on:click=move |_| set_selected_thread.set(Some(tid_for_click.clone()))
                                                 >
-                                                    <Show when=move || has_block>
-                                                        <div class="thread-anchor-text">
-                                                            "\u{1F4CE} Block comment"
-                                                        </div>
-                                                    </Show>
-                                                    <div class="thread-author">{t.created_by}</div>
-                                                    <div class="thread-status">{t.status}</div>
-                                                    <div class="thread-time">{format_time(t.created_at)}</div>
+                                                    <div class="thread-meta">
+                                                        <span class="thread-author">{t.created_by_name.clone()}</span>
+                                                        <span class="thread-status">{status_label}</span>
+                                                        <span class="thread-time">{format_time(t.created_at)}</span>
+                                                    </div>
+                                                    {preview.map(|text| view! {
+                                                        <div class="thread-preview">{text}</div>
+                                                    })}
+                                                    <div class="thread-actions">
+                                                        <button
+                                                            class="thread-action-btn"
+                                                            title=if is_resolved { "Reopen" } else { "Resolve" }
+                                                            on:click=move |e: web_sys::MouseEvent| {
+                                                                e.stop_propagation();
+                                                                let tid = tid_for_resolve.clone();
+                                                                let new_status = if is_resolved { "open" } else { "resolved" };
+                                                                let set_threads = set_threads.clone();
+                                                                leptos::task::spawn_local(async move {
+                                                                    if comments::update_thread_status(&tid, new_status).await.is_ok() {
+                                                                        set_threads.update(|list| {
+                                                                            if let Some(t) = list.iter_mut().find(|t| t.thread_id == tid) {
+                                                                                t.status = new_status.to_string();
+                                                                            }
+                                                                        });
+                                                                    }
+                                                                });
+                                                            }
+                                                        >{if is_resolved { "\u{21BB}" } else { "\u{2713}" }}</button>
+                                                        <button
+                                                            class="thread-action-btn thread-delete-btn"
+                                                            title="Delete"
+                                                            on:click=move |e: web_sys::MouseEvent| {
+                                                                e.stop_propagation();
+                                                                let tid = tid_for_delete.clone();
+                                                                let set_threads = set_threads.clone();
+                                                                let on_threads_loaded = on_threads_loaded.clone();
+                                                                leptos::task::spawn_local(async move {
+                                                                    if comments::delete_thread(&tid).await.is_ok() {
+                                                                        set_threads.update(|list| {
+                                                                            list.retain(|t| t.thread_id != tid);
+                                                                        });
+                                                                        // Update highlights
+                                                                        let inline: Vec<InlineThreadInfo> = threads
+                                                                            .get_untracked()
+                                                                            .iter()
+                                                                            .filter(|t| t.thread_type == "inline" && t.block_id.is_some())
+                                                                            .map(|t| InlineThreadInfo {
+                                                                                thread_id: t.thread_id.clone(),
+                                                                                block_id: t.block_id.clone().unwrap(),
+                                                                                anchor_start: t.anchor_start,
+                                                                                anchor_end: t.anchor_end,
+                                                                            })
+                                                                            .collect();
+                                                                        on_threads_loaded.run(inline);
+                                                                    }
+                                                                });
+                                                            }
+                                                        >"\u{1F5D1}"</button>
+                                                    </div>
                                                 </div>
                                             }
                                         }).collect::<Vec<_>>()}
@@ -283,7 +394,7 @@ pub fn ConversationPane(
                                     {msgs.into_iter().map(|m| {
                                         view! {
                                             <div class="thread-message">
-                                                <div class="message-author">{m.user_id}</div>
+                                                <div class="message-author">{m.user_name}</div>
                                                 <div class="message-content">{m.content}</div>
                                                 <div class="message-time">{format_time(m.created_at)}</div>
                                             </div>
@@ -352,15 +463,19 @@ pub fn ConversationPane(
 struct ThreadEntry {
     thread_id: String,
     created_by: String,
+    created_by_name: String,
     status: String,
     thread_type: String,
     block_id: Option<String>,
+    anchor_start: Option<u32>,
+    anchor_end: Option<u32>,
+    first_message: Option<String>,
     created_at: i64,
 }
 
 #[derive(Clone)]
 struct MessageEntry {
-    user_id: String,
+    user_name: String,
     content: String,
     created_at: i64,
 }
@@ -376,7 +491,28 @@ fn format_time(timestamp_usec: i64) -> String {
         format!("{}m ago", diff_secs / 60)
     } else if diff_secs < 86400 {
         format!("{}h ago", diff_secs / 3600)
+    } else if diff_secs < 604800 {
+        // Within the last week — show day name
+        let date = js_sys::Date::new_0();
+        date.set_time(ts_ms as f64);
+        let day = date.get_day(); // 0=Sun, 1=Mon, ...
+        let day_name = match day {
+            0 => "Sun", 1 => "Mon", 2 => "Tue", 3 => "Wed",
+            4 => "Thu", 5 => "Fri", 6 => "Sat", _ => "?",
+        };
+        day_name.to_string()
     } else {
-        format!("{}d ago", diff_secs / 86400)
+        // Older than a week — show Month/Day
+        let date = js_sys::Date::new_0();
+        date.set_time(ts_ms as f64);
+        let month = date.get_month() + 1; // 0-indexed
+        let day = date.get_date();
+        let month_name = match month {
+            1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
+            5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
+            9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
+            _ => "?",
+        };
+        format!("{month_name} {day}")
     }
 }

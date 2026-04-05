@@ -14,5 +14,19 @@ fred = { workspace = true }
 tokio = { workspace = true }
 dashmap = { workspace = true }
 
+# Optional: only needed by the replay binary
+ogrenotes-storage = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+aws-sdk-dynamodb = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+
+[features]
+replay = ["ogrenotes-storage", "aws-config", "aws-sdk-dynamodb", "aws-sdk-s3"]
+
+[[bin]]
+name = "replay"
+path = "src/bin/replay.rs"
+required-features = ["replay"]
+
 [dev-dependencies]
 proptest = { workspace = true }

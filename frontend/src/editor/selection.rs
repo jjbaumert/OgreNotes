@@ -474,4 +474,131 @@ mod tests {
         assert_eq!(rp.depth, 3); // doc > ul > li > paragraph
         assert!(super::is_inline_content_node(rp.node_at(rp.depth, &doc)));
     }
+
+    // ── Mapping: additional cases ──
+
+    #[test]
+    fn range_maps_through_insert_inside() {
+        // Selection spans 2..10, insert 3 chars at position 5 (inside the range)
+        let sel = Selection::text(2, 10);
+        let map = StepMap::new(5, 0, 3);
+        let mapped = sel.map(&map);
+        // anchor (2) is before insert → unchanged
+        assert_eq!(mapped.from(), 2);
+        // head (10) is after insert → shifted by 3
+        assert_eq!(mapped.to(), 13);
+    }
+
+    #[test]
+    fn reversed_range_maps_correctly() {
+        // Reversed selection: anchor=10, head=2
+        let sel = Selection::text(10, 2);
+        let map = StepMap::new(5, 0, 3); // insert 3 at pos 5
+        let mapped = sel.map(&map);
+        // anchor (10) → 13 (shifted), head (2) → 2 (before insert)
+        assert_eq!(mapped.anchor(), 13);
+        assert_eq!(mapped.head(), 2);
+        assert_eq!(mapped.from(), 2);
+        assert_eq!(mapped.to(), 13);
+    }
+
+    #[test]
+    fn all_selection_maps() {
+        let sel = Selection::All(AllSelection { from: 0, to: 14 });
+        let map = StepMap::new(5, 0, 3); // insert 3 at pos 5
+        let mapped = sel.map(&map);
+        assert_eq!(mapped.from(), 0);
+        assert_eq!(mapped.to(), 17);
+    }
+
+    #[test]
+    fn range_maps_through_replacement() {
+        // Replace 2 chars at position 3 with 5 chars (net +3)
+        let sel = Selection::text(1, 10);
+        let map = StepMap::new(3, 2, 5);
+        let mapped = sel.map(&map);
+        assert_eq!(mapped.from(), 1);
+        assert_eq!(mapped.to(), 13);
+    }
+
+    // ── find_from: additional cases ──
+
+    #[test]
+    fn find_from_skips_leaf_nodes() {
+        // doc > paragraph("A") > HR > paragraph("B")
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("A")]),
+                ),
+                Node::element(NodeType::HorizontalRule),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("B")]),
+                ),
+            ]),
+        );
+        // Position 3 = after first paragraph close. Search forward should skip HR
+        // and land inside second paragraph.
+        let sel = Selection::find_from(&doc, 3, 1).unwrap();
+        let rp = resolve(&doc, sel.head()).unwrap();
+        let parent = rp.node_at(rp.depth, &doc);
+        assert!(super::is_inline_content_node(parent));
+        assert!(sel.head() > 4, "should be past the HR");
+    }
+
+    #[test]
+    fn find_from_backward_at_zero_returns_none() {
+        let doc = simple_doc();
+        assert!(Selection::find_from(&doc, 0, -1).is_none());
+    }
+
+    #[test]
+    fn find_from_empty_doc() {
+        // Doc with a single empty paragraph
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::empty(),
+            )]),
+        );
+        // Should find the cursor position inside the empty paragraph
+        let sel = Selection::find_from(&doc, 0, 1).unwrap();
+        assert_eq!(sel.head(), 1); // inside the paragraph
+    }
+
+    #[test]
+    fn find_from_only_leaf_nodes() {
+        // Doc with only an HR — no valid text cursor position
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element(NodeType::HorizontalRule)]),
+        );
+        // Forward from 0: HR is at pos 0, size 1 — no textblock to land in
+        assert!(Selection::find_from(&doc, 0, 1).is_none());
+    }
+
+    // ── NodeSelection: edge case ──
+
+    #[test]
+    fn node_selection_at_doc_end() {
+        let doc = simple_doc();
+        // Position 14 = content_size, past all nodes
+        assert!(Selection::node(&doc, 14).is_none());
+    }
+
+    // ── empty() edge case ──
+
+    #[test]
+    fn all_selection_empty_doc() {
+        // Doc with no children: content_size = 0
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::empty());
+        let sel = Selection::all(&doc);
+        assert_eq!(sel.from(), 0);
+        assert_eq!(sel.to(), 0);
+        assert!(sel.empty());
+    }
 }

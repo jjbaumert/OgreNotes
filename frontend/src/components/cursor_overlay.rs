@@ -7,9 +7,12 @@ use super::dom_position::{dom_position_for_model_pos, range_rect};
 #[component]
 pub fn CursorOverlay(
     cursors: ReadSignal<Vec<RemoteCursor>>,
+    /// Scroll tick — forces re-render when the editor container scrolls.
+    scroll_tick: ReadSignal<u32>,
 ) -> impl IntoView {
     view! {
         {move || {
+            let _tick = scroll_tick.get();
             cursors.get().into_iter().filter_map(|cursor| {
                 let pos = cursor.cursor_pos?;
                 let (left, top, height) = dom_position_for_model_pos(pos)?;

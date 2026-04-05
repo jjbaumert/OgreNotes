@@ -191,4 +191,25 @@ impl DynamoClient {
 
         Ok(())
     }
+
+    /// Scan the table with a filter expression on a single attribute.
+    /// Used as a fallback when a GSI doesn't exist.
+    pub async fn scan_with_filter(
+        &self,
+        attr_name: &str,
+        attr_value: &str,
+    ) -> Result<Vec<HashMap<String, AttributeValue>>, aws_sdk_dynamodb::Error> {
+        let result = self
+            .client
+            .scan()
+            .table_name(&self.table_name)
+            .filter_expression("#attr = :val")
+            .expression_attribute_names("#attr", attr_name)
+            .expression_attribute_values(":val", AttributeValue::S(attr_value.to_string()))
+            .send()
+            .await
+            .map_err(|e| e.into_service_error())?;
+
+        Ok(result.items.unwrap_or_default())
+    }
 }

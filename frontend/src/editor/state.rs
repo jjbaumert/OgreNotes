@@ -75,10 +75,30 @@ impl EditorState {
     }
 
     /// Apply a transaction to produce a new state.
+    /// Does a cheap top-level structural check: if any direct child of Doc is
+    /// a bare Text node (from a corrupted undo), normalizes the document.
+    /// Also ensures the selection is inside a valid textblock after normalization.
     pub fn apply(&self, txn: Transaction) -> Self {
+        let doc = if needs_normalize(&txn.doc) {
+            super::model::normalize_doc(&txn.doc)
+        } else {
+            txn.doc
+        };
+        // If the cursor (empty selection) is outside any textblock (e.g., at
+        // position 0 after Ctrl+A delete + normalize added an empty paragraph),
+        // find the nearest valid cursor position. Only for cursors — range
+        // selections like select_all intentionally span doc boundaries.
+        let selection = if txn.selection.empty()
+            && find_block_at(&doc, txn.selection.from()).is_none()
+        {
+            Selection::find_from(&doc, txn.selection.from(), 1)
+                .unwrap_or(txn.selection)
+        } else {
+            txn.selection
+        };
         Self {
-            doc: txn.doc,
-            selection: txn.selection,
+            doc,
+            selection,
             stored_marks: txn.stored_marks,
             schema: Arc::clone(&self.schema),
         }
@@ -88,6 +108,32 @@ impl EditorState {
     pub fn transaction(&self) -> Transaction {
         Transaction::new(self)
     }
+}
+
+/// Cheap check on Doc's direct children and their immediate children.
+/// Returns true if the document has structural violations that normalize_doc would fix.
+fn needs_normalize(doc: &Node) -> bool {
+    let Node::Element { content, node_type, .. } = doc else { return false };
+    if *node_type != NodeType::Doc { return false; }
+    content.children.iter().any(|child| match child {
+        Node::Text { .. } => true, // bare text under Doc
+        Node::Element { node_type, content: child_content, .. } => {
+            // Orphaned structural nodes under Doc
+            matches!(node_type,
+                NodeType::ListItem | NodeType::TaskItem
+                | NodeType::TableRow | NodeType::TableCell | NodeType::TableHeader
+            )
+            // Empty lists/tables
+            || (matches!(node_type,
+                NodeType::BulletList | NodeType::OrderedList | NodeType::TaskList
+                | NodeType::Table
+            ) && child_content.children.is_empty())
+            // Block elements nested inside textblocks (e.g., <p> inside <p>)
+            || (node_type.is_textblock() && child_content.children.iter().any(|gc| {
+                matches!(gc, Node::Element { node_type: nt, .. } if nt.is_block() && !nt.is_inline())
+            }))
+        }
+    })
 }
 
 /// A transaction describes a state change.
@@ -241,13 +287,27 @@ impl Transaction {
                 let replace_to = tb.offset + tb.node_size;
                 let slice = Slice::new(Fragment::from(vec![merged]), 0, 0);
                 let mut txn = self.replace(replace_from, replace_to, slice)?;
-                txn.selection = Selection::cursor(from);
+                // Cursor at the merge point, but clamped to inside the merged block
+                // (from=0 on a select-all would be before the paragraph open boundary)
+                let cursor = from.max(replace_from + 1);
+                txn.selection = Selection::cursor(cursor);
                 return Ok(txn);
             }
         }
 
-        // Same block or couldn't find blocks: simple delete
-        self.delete(from, to)
+        // Same block or couldn't find blocks: simple delete.
+        // If everything is deleted, ensure the doc has at least one paragraph
+        // and the cursor is inside it (not at the doc boundary).
+        let mut txn = self.delete(from, to)?;
+        if txn.doc.child_count() == 0 || txn.doc.text_content().is_empty() {
+            // Normalize: ensure at least one empty paragraph
+            txn.doc = super::model::normalize_doc(&txn.doc);
+            // Place cursor inside the first paragraph
+            if let Some(valid) = Selection::find_from(&txn.doc, 0, 1) {
+                txn.selection = valid;
+            }
+        }
+        Ok(txn)
     }
 
     /// Insert text at the current cursor position, replacing any selection.
@@ -327,7 +387,9 @@ impl Transaction {
             self
         };
 
-        let pos = txn.selection.from();
+        // Clamp position to valid range (DOM selection can be stale after undo)
+        let max = txn.doc.content_size();
+        let pos = txn.selection.from().min(max);
         let block = find_block_at(&txn.doc, pos)
             .ok_or_else(|| StepError("cursor not in a block".into()))?;
 
@@ -473,6 +535,15 @@ impl Transaction {
         // Only join if cursor is at the very start of the block's content
         if pos != block.content_start {
             return Err(StepError("cursor not at block start".into()));
+        }
+
+        // If we're inside a table cell, don't escape — backspace at the start
+        // of a cell's first paragraph should be a no-op.
+        if let Some(table_info) = find_table_at(&self.doc, pos) {
+            if pos == table_info.cell_content_start + 1 {
+                // Cursor at start of cell's first paragraph — don't join
+                return Err(StepError("at table cell boundary".into()));
+            }
         }
 
         // Find the previous sibling textblock by searching just before this block.
@@ -1049,7 +1120,95 @@ fn is_container_type(nt: NodeType) -> bool {
             | NodeType::OrderedList
             | NodeType::TaskList
             | NodeType::Blockquote
+            | NodeType::Table
     )
+}
+
+/// Info about the table context at a given position.
+pub(crate) struct TableInfo {
+    pub table_offset: usize,
+    pub table_node_size: usize,
+    pub row_offset: usize,
+    pub row_index: usize,
+    pub row_node_size: usize,
+    pub cell_offset: usize,
+    pub cell_index: usize,
+    pub cell_node_size: usize,
+    pub cell_content_start: usize,
+    pub cell_node_type: NodeType,
+    pub num_rows: usize,
+    pub num_cols: usize,
+}
+
+/// Find the table, row, and cell containing the given position.
+pub(crate) fn find_table_at(doc: &Node, pos: usize) -> Option<TableInfo> {
+    let Node::Element { content, .. } = doc else { return None };
+    find_table_in_children(&content.children, pos, 0)
+}
+
+fn find_table_in_children(children: &[Node], pos: usize, mut offset: usize) -> Option<TableInfo> {
+    for child in children {
+        let child_size = child.node_size();
+        let Node::Element { node_type, content: child_content, .. } = child else {
+            offset += child_size;
+            continue;
+        };
+        if node_type.is_leaf() {
+            offset += child_size;
+            continue;
+        }
+        let content_start = offset + 1;
+        let content_end = offset + child_size - 1;
+        if pos < content_start || pos > content_end {
+            offset += child_size;
+            continue;
+        }
+
+        if *node_type == NodeType::Table {
+            let num_rows = child_content.children.len();
+            let mut row_offset = content_start;
+            for (row_idx, row) in child_content.children.iter().enumerate() {
+                let row_size = row.node_size();
+                let row_content_start = row_offset + 1;
+                let row_content_end = row_offset + row_size - 1;
+                if pos >= row_content_start && pos <= row_content_end {
+                    if let Node::Element { content: row_content, .. } = row {
+                        let num_cols = row_content.children.len();
+                        let mut cell_offset = row_content_start;
+                        for (cell_idx, cell) in row_content.children.iter().enumerate() {
+                            let cell_size = cell.node_size();
+                            let cell_cs = cell_offset + 1;
+                            let cell_ce = cell_offset + cell_size - 1;
+                            if pos >= cell_cs && pos <= cell_ce {
+                                let cell_nt = cell.node_type().unwrap_or(NodeType::TableCell);
+                                return Some(TableInfo {
+                                    table_offset: offset,
+                                    table_node_size: child_size,
+                                    row_offset,
+                                    row_index: row_idx,
+                                    row_node_size: row_size,
+                                    cell_offset,
+                                    cell_index: cell_idx,
+                                    cell_node_size: cell_size,
+                                    cell_content_start: cell_cs,
+                                    cell_node_type: cell_nt,
+                                    num_rows,
+                                    num_cols,
+                                });
+                            }
+                            cell_offset += cell_size;
+                        }
+                    }
+                }
+                row_offset += row_size;
+            }
+            return None; // inside table but not inside a cell
+        }
+
+        // Not a table — recurse into container
+        return find_table_in_children(&child_content.children, pos, content_start);
+    }
+    None
 }
 
 // ─── Tests ──────────────────────────────────────────────────────
@@ -1961,5 +2120,155 @@ mod tests {
         let txn = state.transaction().split_block().unwrap();
         let new_state = state.apply(txn);
         assert_eq!(new_state.doc.child_count(), 2);
+    }
+
+    // ── Regression: select + backspace + type puts cursor before inserted text ──
+
+    #[test]
+    fn select_backspace_then_type_cursor_after_inserted_text() {
+        // Reproduce: type "1234", Enter, then select text, backspace, type "a"
+        // The cursor should be AFTER the "a", not before it.
+
+        // Step 1: Start with "1234" in a paragraph
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("1234")]),
+            )]),
+        );
+        let state = EditorState::create_default(doc);
+
+        // Step 2: Split block (Enter) at end of "1234" (position 5)
+        let state = EditorState {
+            selection: Selection::cursor(5),
+            ..state
+        };
+        let txn = state.transaction().split_block().unwrap();
+        let state = state.apply(txn);
+        // Now: Para("1234") + Para("")
+        assert_eq!(state.doc.child_count(), 2);
+        assert_eq!(state.doc.child(0).unwrap().text_content(), "1234");
+
+        // Step 3: Select "1234" (positions 1..5) and delete
+        let state = EditorState {
+            selection: Selection::text(1, 5),
+            ..state
+        };
+        let txn = state.transaction().delete_selection().unwrap();
+        let state = state.apply(txn);
+        // Now: Para("") + Para("") or just one empty Para
+        let cursor_after_delete = state.selection.from();
+
+        // Step 4: Type "a" at the cursor position after deletion
+        let state = EditorState {
+            selection: Selection::cursor(cursor_after_delete),
+            ..state
+        };
+        let txn = state.transaction().insert_text("a").unwrap();
+        let new_state = state.apply(txn);
+
+        // The "a" should be in the document
+        assert!(new_state.doc.text_content().contains("a"),
+            "doc should contain 'a', got: '{}'", new_state.doc.text_content());
+
+        // Cursor should be AFTER "a", not before it
+        let cursor = new_state.selection.from();
+        let cursor_text_before: String = {
+            // Get text content up to cursor position
+            let block = find_block_at(&new_state.doc, cursor);
+            if let Some(b) = block {
+                let offset = cursor - b.content_start;
+                b.content.cut(0, offset).children.iter()
+                    .map(|c| c.text_content()).collect()
+            } else {
+                String::new()
+            }
+        };
+        assert!(cursor_text_before.contains("a"),
+            "cursor at pos={cursor} should be AFTER 'a', but text before cursor is '{}'. \
+             Full doc text: '{}'",
+            cursor_text_before, new_state.doc.text_content());
+    }
+
+    #[test]
+    fn select_all_in_block_backspace_then_type() {
+        // Simpler version: single paragraph "abcde", select all, backspace, type "x"
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("abcde")]),
+            )]),
+        );
+        let state = EditorState::create_default(doc);
+
+        // Select all text in paragraph (1..6)
+        let state = EditorState {
+            selection: Selection::text(1, 6),
+            ..state
+        };
+
+        // Delete selection
+        let txn = state.transaction().delete_selection().unwrap();
+        let state = state.apply(txn);
+        assert_eq!(state.doc.child(0).unwrap().text_content(), "");
+        assert_eq!(state.selection.from(), 1, "cursor should be at para content start after delete");
+
+        // Type "x"
+        let txn = state.transaction().insert_text("x").unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "x");
+        // Cursor should be at position 2 (after "x": para_open=1, "x"=1 char)
+        assert_eq!(new_state.selection.from(), 2,
+            "cursor should be after 'x' at position 2, got {}",
+            new_state.selection.from());
+        assert!(new_state.selection.empty(), "should be a cursor, not a range");
+    }
+
+    #[test]
+    fn type_1234_enter_select_backspace_type_a() {
+        // Exact user scenario: type "1234", Enter, select "1234", backspace, type "a"
+        // Cursor should be AFTER the "a".
+
+        // Start with "1234" paragraph
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("1234")]),
+            )]),
+        );
+        let state = EditorState::create_default(doc);
+
+        // Press Enter at end of "1234" → two paragraphs
+        let state = EditorState { selection: Selection::cursor(5), ..state };
+        let txn = state.transaction().split_block().unwrap();
+        let state = state.apply(txn);
+        assert_eq!(state.doc.child_count(), 2);
+        assert_eq!(state.doc.child(0).unwrap().text_content(), "1234");
+        // Cursor should be in second paragraph
+        let cursor_after_enter = state.selection.from();
+        assert!(cursor_after_enter > 5, "cursor should be in second paragraph, got {cursor_after_enter}");
+
+        // Select "1234" in first paragraph (positions 1..5)
+        let state = EditorState { selection: Selection::text(1, 5), ..state };
+        let txn = state.transaction().delete_selection().unwrap();
+        let state = state.apply(txn);
+        let cursor_after_delete = state.selection.from();
+        assert_eq!(cursor_after_delete, 1,
+            "cursor should be at start of first (now empty) paragraph after delete, got {cursor_after_delete}");
+
+        // Type "a"
+        let state = EditorState { selection: Selection::cursor(cursor_after_delete), ..state };
+        let txn = state.transaction().insert_text("a").unwrap();
+        let new_state = state.apply(txn);
+
+        let cursor_final = new_state.selection.from();
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "a");
+        assert_eq!(cursor_final, 2,
+            "cursor should be at position 2 (after 'a'), got {cursor_final}");
+        assert!(new_state.selection.empty(), "should be a cursor, not a range");
     }
 }

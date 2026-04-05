@@ -122,8 +122,8 @@ pub fn default_keymap() -> Keymap {
         // Text commands
         .bind("Mod-a", Box::new(commands::select_all))
         // List indent / dedent
-        .bind("Tab", Box::new(|s, d| commands::sink_list_item(s, d)))
-        .bind("Shift-Tab", Box::new(|s, d| commands::lift_list_item(s, d)))
+        .bind("Tab", Box::new(|s, d| commands::tab_command(s, d)))
+        .bind("Shift-Tab", Box::new(|s, d| commands::shift_tab_command(s, d)))
         // Consume browser shortcuts to prevent default browser actions
         .bind("Mod-s", Box::new(|_, _| true)) // prevent browser save dialog
         .bind("Mod-p", Box::new(|_, _| true)) // prevent browser print dialog

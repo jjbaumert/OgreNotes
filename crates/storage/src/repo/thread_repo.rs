@@ -84,21 +84,28 @@ impl ThreadRepo {
     }
 
     /// List all threads for a document.
-    /// Uses the doc_id_gsi GSI to query by document ID.
+    /// Tries the GSI5-docid-updated GSI first; falls back to a scan if the GSI
+    /// doesn't exist (common in dev environments without full infra).
     pub async fn list_threads_for_doc(&self, doc_id: &str) -> Result<Vec<Thread>, RepoError> {
-        let items = self
-            .db
-            .query_index(
-                "GSI5-docid-updated",
-                "doc_id_gsi",
-                doc_id,
-                None,  // no SK filter — just sort by updated_at
-                None,
-                false, // newest first
-                None,
-            )
-            .await
-            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        let items = match self.db.query_index(
+            "GSI5-docid-updated",
+            "doc_id_gsi",
+            doc_id,
+            None,
+            None,
+            false,
+            None,
+        ).await {
+            Ok(items) => items,
+            Err(_) => {
+                // GSI doesn't exist — fall back to scan with filter.
+                // This is slower but works without the GSI.
+                self.db.scan_with_filter(
+                    "doc_id",
+                    doc_id,
+                ).await.map_err(|e| RepoError::Dynamo(e.to_string()))?
+            }
+        };
 
         items
             .iter()
@@ -271,6 +278,28 @@ impl ThreadRepo {
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
+    /// Get the first message in a thread (or None if no messages exist).
+    pub async fn get_first_message(&self, thread_id: &str) -> Result<Option<Message>, RepoError> {
+        let pk = format!("THREAD#{thread_id}");
+        let result = self.db.inner()
+            .query()
+            .table_name(self.db.table_name())
+            .key_condition_expression("PK = :pk AND begins_with(SK, :sk)")
+            .expression_attribute_values(":pk", AttributeValue::S(pk))
+            .expression_attribute_values(":sk", AttributeValue::S("MSG#".to_string()))
+            .limit(1)
+            .send()
+            .await
+            .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+
+        let items = result.items.unwrap_or_default();
+        if let Some(item) = items.first() {
+            Ok(Some(message_from_item(item, thread_id)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// List messages in a thread (oldest first).
     pub async fn list_messages(&self, thread_id: &str) -> Result<Vec<Message>, RepoError> {
         let pk = format!("THREAD#{thread_id}");
@@ -297,6 +326,26 @@ impl ThreadRepo {
             .delete_item(&pk, sk)
             .await
             .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Delete a thread and all its messages.
+    pub async fn delete_thread(&self, thread_id: &str) -> Result<(), RepoError> {
+        let pk = format!("THREAD#{thread_id}");
+        // Query all items (metadata + messages) under this PK
+        let items = self.db
+            .query(&pk, None)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+
+        // Delete each item
+        for item in &items {
+            if let Some(sk) = item.get("SK").and_then(|v| v.as_s().ok()) {
+                self.db.delete_item(&pk, sk)
+                    .await
+                    .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+            }
+        }
+        Ok(())
     }
 }
 

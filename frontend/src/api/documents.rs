@@ -73,6 +73,9 @@ pub struct WsTokenResponse {
 }
 
 /// Request a single-use WebSocket authentication token for a document.
+/// Sends the client version so the server can tag each update for triage.
 pub async fn request_ws_token(id: &str) -> Result<WsTokenResponse, ApiClientError> {
-    api_post(&format!("/documents/{id}/ws-token"), &serde_json::json!({})).await
+    api_post(&format!("/documents/{id}/ws-token"), &serde_json::json!({
+        "client_version": env!("CARGO_PKG_VERSION")
+    })).await
 }

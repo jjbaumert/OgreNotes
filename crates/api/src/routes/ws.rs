@@ -33,15 +33,24 @@ struct WsTokenResponse {
     token: String,
 }
 
+#[derive(Deserialize)]
+struct WsTokenRequest {
+    #[serde(default)]
+    client_version: Option<String>,
+}
+
 /// Generate a single-use WebSocket authentication token.
 /// The token is stored in Redis with a 30-second TTL.
 async fn create_ws_token(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
     Path(doc_id): Path<String>,
+    body: Option<axum::Json<WsTokenRequest>>,
 ) -> Result<axum::Json<WsTokenResponse>, ApiError> {
     // Verify user has access to the document
     let _meta = crate::routes::documents::get_verified_doc(&state, &doc_id, &user_id).await?;
+
+    let client_version = body.and_then(|b| b.client_version.clone());
 
     // Generate random token
     let token = nanoid::nanoid!(32);
@@ -49,7 +58,7 @@ async fn create_ws_token(
     // Store in Redis with 30-second TTL
     state
         .redis_pubsub
-        .store_ws_token(&token, &user_id, &doc_id, 30)
+        .store_ws_token(&token, &user_id, &doc_id, client_version.as_deref(), 30)
         .await
         .map_err(|e| ApiError::Internal(format!("Redis error: {e}")))?;
 
@@ -79,7 +88,7 @@ async fn ws_upgrade(
         .await
         .map_err(|e| ApiError::Internal(format!("Redis error: {e}")))?;
 
-    let Some((user_id, token_doc_id)) = auth else {
+    let Some((user_id, token_doc_id, client_version)) = auth else {
         return Err(ApiError::Unauthorized);
     };
 
@@ -122,7 +131,7 @@ async fn ws_upgrade(
     };
 
     // Upgrade to WebSocket
-    Ok(ws.on_upgrade(move |socket| handle_ws(socket, room, user_id, state)))
+    Ok(ws.on_upgrade(move |socket| handle_ws(socket, room, user_id, client_version, state)))
 }
 
 // ─── WebSocket Message Loop ─────────────────────────────────────
@@ -131,6 +140,7 @@ async fn handle_ws(
     socket: WebSocket,
     room: Arc<Room>,
     user_id: String,
+    client_version: Option<String>,
     state: AppState,
 ) {
     use futures_util::{SinkExt, StreamExt};
@@ -167,6 +177,7 @@ async fn handle_ws(
     // Process incoming messages
     let room_for_recv = Arc::clone(&room);
     let doc_id = room.doc_id().to_string();
+    let client_version_for_recv = client_version;
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
@@ -210,6 +221,7 @@ async fn handle_ws(
                                             update_bytes: payload.to_vec(),
                                             user_id: user_id.clone(),
                                             created_at: ts,
+                                            client_version: client_version_for_recv.clone(),
                                         };
                                         let _ = state.doc_repo.append_update(&update).await;
                                     }

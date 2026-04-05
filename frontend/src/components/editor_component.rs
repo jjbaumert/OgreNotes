@@ -278,6 +278,13 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             ToolbarCommand::ToggleBlockquote => { commands::toggle_blockquote(&state, Some(&dispatch_fn)); }
             ToolbarCommand::SetCodeBlock => { commands::set_code_block(&state, Some(&dispatch_fn)); }
             ToolbarCommand::InsertHorizontalRule => { commands::insert_horizontal_rule(&state, Some(&dispatch_fn)); }
+            ToolbarCommand::InsertTable => { commands::insert_table(3, 3, &state, Some(&dispatch_fn)); }
+            ToolbarCommand::SelectTableRow => { commands::select_table_row(&state, Some(&dispatch_fn)); }
+            ToolbarCommand::SelectTableColumn => { commands::select_table_column(&state, Some(&dispatch_fn)); }
+            ToolbarCommand::AddTableRow => { commands::add_row(&state, Some(&dispatch_fn)); }
+            ToolbarCommand::AddTableColumn => { commands::add_column(&state, Some(&dispatch_fn)); }
+            ToolbarCommand::DeleteTableRow => { commands::delete_row(&state, Some(&dispatch_fn)); }
+            ToolbarCommand::DeleteTableColumn => { commands::delete_column(&state, Some(&dispatch_fn)); }
             ToolbarCommand::ToggleLink(ref href) => { commands::toggle_link(href, &state, Some(&dispatch_fn)); }
             ToolbarCommand::ToggleTextColor(ref color) => { commands::toggle_color_mark(MarkType::TextColor, color, &state, Some(&dispatch_fn)); }
             ToolbarCommand::ToggleHighlight(ref color) => { commands::toggle_color_mark(MarkType::Highlight, color, &state, Some(&dispatch_fn)); }

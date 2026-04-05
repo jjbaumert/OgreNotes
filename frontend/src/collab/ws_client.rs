@@ -109,6 +109,115 @@ pub struct RemoteCursor {
 /// Callback for when remote cursors change.
 pub type OnAwarenessUpdate = Box<dyn Fn(Vec<RemoteCursor>)>;
 
+// ─── Message handling helpers ──────────────────────────────────
+
+/// Wrap a closure as a `Closure<dyn Fn(web_sys::Event)>`.
+fn wrap_event(f: impl Fn(web_sys::Event) + 'static) -> Closure<dyn Fn(web_sys::Event)> {
+    Closure::wrap(Box::new(f) as Box<dyn Fn(web_sys::Event)>)
+}
+
+/// Extract binary payload from a WebSocket MessageEvent.
+fn extract_binary_payload(event: &web_sys::Event) -> Option<Vec<u8>> {
+    let me = event.dyn_ref::<MessageEvent>()?;
+    let buf = me.data().dyn_into::<js_sys::ArrayBuffer>().ok()?;
+    Some(js_sys::Uint8Array::new(&buf).to_vec())
+}
+
+/// Send a binary message over the WebSocket (type byte + payload).
+fn ws_send(ws_ref: &Rc<RefCell<Option<WebSocket>>>, msg_type: u8, payload: &[u8]) {
+    if let Some(ws) = ws_ref.borrow().as_ref() {
+        let mut msg = vec![msg_type];
+        msg.extend_from_slice(payload);
+        let _ = ws.send_with_u8_array(&msg);
+    }
+}
+
+/// Handle MSG_SYNC_STEP1: server sent its state vector — respond with our diff + our SV.
+fn handle_sync_step1(
+    payload: &[u8],
+    ydoc: &Rc<RefCell<yrs::Doc>>,
+    ws_ref: &Rc<RefCell<Option<WebSocket>>>,
+) {
+    crate::editor::debug::log("collab", "received SyncStep1", &[]);
+    let ydoc = ydoc.borrow();
+    let txn = ydoc.transact();
+    if let Ok(sv) = yrs::StateVector::decode_v1(payload) {
+        let diff = txn.encode_state_as_update_v1(&sv);
+        ws_send(ws_ref, MSG_SYNC_STEP2, &diff);
+
+        let our_sv = txn.state_vector().encode_v1();
+        ws_send(ws_ref, MSG_SYNC_STEP1, &our_sv);
+    }
+}
+
+/// Apply a remote yrs update with the remote-apply guard (suppresses observer).
+fn apply_remote_update(
+    payload: &[u8],
+    ydoc: &Rc<RefCell<yrs::Doc>>,
+    is_remote: &Rc<Cell<bool>>,
+) {
+    crate::editor::debug::log("collab", "received update", &[
+        ("size", &payload.len().to_string()),
+    ]);
+    let _guard = RemoteApplyGuard::new(is_remote);
+    let ydoc = ydoc.borrow();
+    let mut txn = ydoc.transact_mut();
+    if let Ok(update) = yrs::Update::decode_v1(payload) {
+        let _ = txn.apply_update(update);
+    }
+}
+
+/// Schedule a debounced callback to read the model from yrs and notify the UI.
+/// Uses gloo_timers::Timeout (not spawn_local) to avoid re-entrant task queue polling.
+fn schedule_remote_callback(
+    ydoc: &Rc<RefCell<yrs::Doc>>,
+    on_remote: &Rc<RefCell<Option<OnRemoteUpdate>>>,
+    timer: &Rc<RefCell<Option<gloo_timers::callback::Timeout>>>,
+) {
+    let ydoc_ref = ydoc.clone();
+    let on_remote_ref = on_remote.clone();
+    *timer.borrow_mut() = Some(gloo_timers::callback::Timeout::new(
+        WS_RECV_DEBOUNCE_MS,
+        move || {
+            let doc = {
+                let ydoc = ydoc_ref.borrow();
+                yrs_bridge::read_doc_from_ydoc(&ydoc).ok()
+            };
+            if let Some(doc) = doc {
+                if let Some(callback) = on_remote_ref.borrow().as_ref() {
+                    callback(doc);
+                }
+            }
+        },
+    ));
+}
+
+/// Handle MSG_AWARENESS: update remote cursor state and notify callback.
+fn handle_awareness(
+    payload: &[u8],
+    remote_cursors: &Rc<RefCell<std::collections::HashMap<String, RemoteCursor>>>,
+    on_awareness: &Rc<RefCell<Option<OnAwarenessUpdate>>>,
+) {
+    let Ok(state) = serde_json::from_slice::<AwarenessPayload>(payload) else { return };
+    let color_idx = (state.color as usize) % CURSOR_COLORS.len();
+    let cursor = RemoteCursor {
+        user_id: state.user_id.clone(),
+        name: state.name.clone(),
+        color: CURSOR_COLORS[color_idx].to_string(),
+        cursor_pos: state.cursor_pos,
+        selection_anchor: state.selection_anchor,
+        selection_head: state.selection_head,
+    };
+    remote_cursors.borrow_mut().insert(state.user_id, cursor);
+
+    if let Some(callback) = on_awareness.borrow().as_ref() {
+        let cursors: Vec<RemoteCursor> = remote_cursors.borrow().values().cloned().collect();
+        callback(cursors);
+    }
+}
+
+// ─── CollabClient ──────────────────────────────────────────────
+
 /// WebSocket collaboration client.
 /// Maintains a **persistent** yrs Doc for incremental sync.
 pub struct CollabClient {
@@ -197,7 +306,7 @@ impl CollabClient {
 
     /// Connect to the WebSocket server.
     /// `connected_flag` is set to true when synced, false on disconnect.
-    pub fn connect(&self, ws_url: &str, token: &str, connected_flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    pub fn connect(&self, ws_url: &str, _token: &str, connected_flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         *self.state.borrow_mut() = ConnectionState::Connecting;
 
         let ws = match WebSocket::new(ws_url) {
@@ -208,165 +317,75 @@ impl CollabClient {
                 return;
             }
         };
-
         ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
 
-        let _token = token.to_string();
         let state = Rc::clone(&self.state);
         let ydoc = Rc::clone(&self.ydoc);
         let ws_ref = Rc::clone(&self.ws);
-        let on_remote = Rc::clone(&self.on_remote_update);
         let closures = Rc::clone(&self._closures);
-        let is_applying_remote = Rc::clone(&self.is_applying_remote);
 
-        // onopen: mark connected
+        // ── onopen ──
         let state_for_open = Rc::clone(&state);
-        let on_open = Closure::wrap(Box::new(move |_: web_sys::Event| {
+        let on_open = wrap_event(move |_| {
             *state_for_open.borrow_mut() = ConnectionState::Connected;
             crate::editor::debug::log("collab", "WebSocket connected", &[]);
-        }) as Box<dyn Fn(web_sys::Event)>);
+        });
 
-        // onmessage: handle sync protocol
-        let state_for_msg = Rc::clone(&state);
-        let ydoc_for_msg = Rc::clone(&ydoc);
-        let ws_for_msg = Rc::clone(&ws_ref);
-        let on_remote_for_msg = Rc::clone(&on_remote);
-        let on_awareness_for_msg = Rc::clone(&self.on_awareness_update);
-        let remote_cursors_for_msg = Rc::clone(&self.remote_cursors);
-        let flag_for_msg = std::sync::Arc::clone(&connected_flag);
-        let is_remote_for_msg = Rc::clone(&is_applying_remote);
-        let recv_generation = Rc::new(std::cell::Cell::new(0u64));
-        let on_message = Closure::wrap(Box::new(move |event: web_sys::Event| {
-            let Some(me) = event.dyn_ref::<MessageEvent>() else { return };
-            let Ok(buf) = me.data().dyn_into::<js_sys::ArrayBuffer>() else { return };
-            let array = js_sys::Uint8Array::new(&buf);
-            let data = array.to_vec();
+        // ── onmessage ──
+        let on_message = {
+            let state = Rc::clone(&state);
+            let ydoc = Rc::clone(&ydoc);
+            let ws_ref = Rc::clone(&ws_ref);
+            let is_remote = Rc::clone(&self.is_applying_remote);
+            let on_remote = Rc::clone(&self.on_remote_update);
+            let on_awareness = Rc::clone(&self.on_awareness_update);
+            let remote_cursors = Rc::clone(&self.remote_cursors);
+            let flag = std::sync::Arc::clone(&connected_flag);
+            let pending_recv_timer: Rc<RefCell<Option<gloo_timers::callback::Timeout>>> =
+                Rc::new(RefCell::new(None));
 
-            if data.is_empty() { return; }
-            let msg_type = data[0];
-            let payload = &data[1..];
+            wrap_event(move |event: web_sys::Event| {
+                let Some(data) = extract_binary_payload(&event) else { return };
+                if data.is_empty() { return; }
 
-            match msg_type {
-                MSG_SYNC_STEP1 => {
-                    // Server sent its state vector — respond with our diff
-                    crate::editor::debug::log("collab", "received SyncStep1", &[]);
-                    let ydoc = ydoc_for_msg.borrow();
-                    let txn = ydoc.transact();
-                    if let Ok(sv) = yrs::StateVector::decode_v1(payload) {
-                        let diff = txn.encode_state_as_update_v1(&sv);
-                        // Send SyncStep2 with our diff
-                        if let Some(ws) = ws_for_msg.borrow().as_ref() {
-                            let mut msg = vec![MSG_SYNC_STEP2];
-                            msg.extend_from_slice(&diff);
-                            let _ = ws.send_with_u8_array(&msg);
-                        }
+                let msg_type = data[0];
+                let payload = &data[1..];
 
-                        // Also send our state vector so the server can send us what we're missing
-                        let our_sv = txn.state_vector().encode_v1();
-                        if let Some(ws) = ws_for_msg.borrow().as_ref() {
-                            let mut msg = vec![MSG_SYNC_STEP1];
-                            msg.extend_from_slice(&our_sv);
-                            let _ = ws.send_with_u8_array(&msg);
+                match msg_type {
+                    MSG_SYNC_STEP1 => handle_sync_step1(payload, &ydoc, &ws_ref),
+                    MSG_SYNC_STEP2 => {
+                        apply_remote_update(payload, &ydoc, &is_remote);
+                        *state.borrow_mut() = ConnectionState::Synced;
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    MSG_UPDATE => {
+                        apply_remote_update(payload, &ydoc, &is_remote);
+                        schedule_remote_callback(&ydoc, &on_remote, &pending_recv_timer);
+                    }
+                    MSG_AWARENESS => handle_awareness(payload, &remote_cursors, &on_awareness),
+                    MSG_ERROR => {
+                        if let Ok(error) = std::str::from_utf8(payload) {
+                            web_sys::console::error_1(&format!("WebSocket error: {error}").into());
                         }
                     }
+                    _ => {}
+                }
+            })
+        };
 
-                }
-                MSG_SYNC_STEP2 => {
-                    // Server sent us what we're missing — apply and mark synced
-                    crate::editor::debug::log("collab", "received SyncStep2 (synced)", &[
-                        ("size", &payload.len().to_string()),
-                    ]);
-                    {
-                        let _guard = RemoteApplyGuard::new(&is_remote_for_msg);
-                        let ydoc = ydoc_for_msg.borrow();
-                        let mut txn = ydoc.transact_mut();
-                        if let Ok(update) = yrs::Update::decode_v1(payload) {
-                            let _ = txn.apply_update(update);
-                        }
-                    }
-                    *state_for_msg.borrow_mut() = ConnectionState::Synced;
-                    flag_for_msg.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                MSG_UPDATE => {
-                    // Remote incremental update — apply to persistent Doc
-                    crate::editor::debug::log("collab", "received update", &[
-                        ("size", &payload.len().to_string()),
-                    ]);
-                    {
-                        let _guard = RemoteApplyGuard::new(&is_remote_for_msg);
-                        let ydoc = ydoc_for_msg.borrow();
-                        let mut txn = ydoc.transact_mut();
-                        if let Ok(update) = yrs::Update::decode_v1(payload) {
-                            let _ = txn.apply_update(update);
-                        }
-                    }
-
-                    // Debounce the model read-back + callback
-                    let recv_gen = recv_generation.get() + 1;
-                    recv_generation.set(recv_gen);
-                    let gen_ref = recv_generation.clone();
-                    let on_remote_ref = on_remote_for_msg.clone();
-                    let ydoc_ref = ydoc_for_msg.clone();
-                    wasm_bindgen_futures::spawn_local(async move {
-                        gloo_timers::future::TimeoutFuture::new(WS_RECV_DEBOUNCE_MS).await;
-                        if gen_ref.get() != recv_gen {
-                            return;
-                        }
-                        let ydoc = ydoc_ref.borrow();
-                        if let Ok(doc) = yrs_bridge::read_doc_from_ydoc(&ydoc) {
-                            if let Some(callback) = on_remote_ref.borrow().as_ref() {
-                                callback(doc);
-                            }
-                        }
-                    });
-                }
-                MSG_AWARENESS => {
-                    // Remote user's cursor/selection update.
-                    if let Ok(state) = serde_json::from_slice::<AwarenessPayload>(payload) {
-                        let color_idx = (state.color as usize) % CURSOR_COLORS.len();
-                        let cursor = RemoteCursor {
-                            user_id: state.user_id.clone(),
-                            name: state.name.clone(),
-                            color: CURSOR_COLORS[color_idx].to_string(),
-                            cursor_pos: state.cursor_pos,
-                            selection_anchor: state.selection_anchor,
-                            selection_head: state.selection_head,
-                        };
-                        remote_cursors_for_msg.borrow_mut().insert(state.user_id, cursor);
-
-                        // Notify callback with all remote cursors.
-                        if let Some(callback) = on_awareness_for_msg.borrow().as_ref() {
-                            let cursors: Vec<RemoteCursor> = remote_cursors_for_msg
-                                .borrow()
-                                .values()
-                                .cloned()
-                                .collect();
-                            callback(cursors);
-                        }
-                    }
-                }
-                MSG_ERROR => {
-                    if let Ok(error) = std::str::from_utf8(payload) {
-                        web_sys::console::error_1(&format!("WebSocket error: {error}").into());
-                    }
-                }
-                _ => {}
-            }
-        }) as Box<dyn Fn(web_sys::Event)>);
-
-        // onclose: mark disconnected
+        // ── onclose ──
         let state_for_close = Rc::clone(&state);
         let flag_for_close = std::sync::Arc::clone(&connected_flag);
-        let on_close = Closure::wrap(Box::new(move |_: web_sys::Event| {
+        let on_close = wrap_event(move |_| {
             *state_for_close.borrow_mut() = ConnectionState::Disconnected;
             flag_for_close.store(false, std::sync::atomic::Ordering::Relaxed);
             crate::editor::debug::log("collab", "WebSocket disconnected", &[]);
-        }) as Box<dyn Fn(web_sys::Event)>);
+        });
 
-        // onerror
-        let on_error = Closure::wrap(Box::new(move |_: web_sys::Event| {
+        // ── onerror ──
+        let on_error = wrap_event(move |_| {
             web_sys::console::error_1(&"WebSocket error".into());
-        }) as Box<dyn Fn(web_sys::Event)>);
+        });
 
         ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
         ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
@@ -374,8 +393,6 @@ impl CollabClient {
         ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
 
         *self.ws.borrow_mut() = Some(ws);
-
-        // Store closures to prevent them from being dropped
         let mut cls = closures.borrow_mut();
         cls.push(on_open);
         cls.push(on_message);
@@ -458,5 +475,239 @@ impl CollabClient {
 impl Drop for CollabClient {
     fn drop(&mut self) {
         self.disconnect();
+    }
+}
+
+// ─── Tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::model::{Fragment, Node, NodeType};
+    use crate::editor::yrs_bridge;
+
+    fn simple_doc() -> Node {
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("Hello world")]),
+            )]),
+        )
+    }
+
+    // ── Construction ──
+
+    #[test]
+    fn new_creates_empty_doc() {
+        let client = CollabClient::new("doc1".into(), None);
+        assert!(!client.is_synced());
+        assert_eq!(*client.state.borrow(), ConnectionState::Disconnected);
+        // ydoc has no content fragment yet (empty)
+        let ydoc = client.ydoc.borrow();
+        let txn = ydoc.transact();
+        assert!(txn.get_xml_fragment("content").is_none());
+    }
+
+    #[test]
+    fn new_with_initial_bytes_loads_state() {
+        let doc = simple_doc();
+        let bytes = yrs_bridge::doc_to_ydoc_bytes(&doc);
+        let client = CollabClient::new("doc1".into(), Some(&bytes));
+
+        let ydoc = client.ydoc.borrow();
+        let restored = yrs_bridge::read_doc_from_ydoc(&ydoc).unwrap();
+        assert_eq!(restored.text_content(), "Hello world");
+    }
+
+    // ── send_update ──
+
+    #[test]
+    fn send_update_when_not_synced_is_noop() {
+        let doc = simple_doc();
+        let bytes = yrs_bridge::doc_to_ydoc_bytes(&doc);
+        let client = CollabClient::new("doc1".into(), Some(&bytes));
+        // State is Disconnected, not Synced
+        assert!(!client.is_synced());
+
+        let modified = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("Modified")]),
+            )]),
+        );
+        client.send_update(&modified);
+
+        // No crash, pending_updates should be empty (send_update returned early)
+        // But the observer may have fired during sync_model_to_ydoc... no, send_update
+        // returns before calling sync_model_to_ydoc when not synced.
+        assert!(client.pending_updates.borrow().is_empty());
+    }
+
+    #[test]
+    fn send_update_captures_and_applies_changes() {
+        let doc = simple_doc();
+        let bytes = yrs_bridge::doc_to_ydoc_bytes(&doc);
+        let client = CollabClient::new("doc1".into(), Some(&bytes));
+
+        // Force state to Synced so send_update proceeds
+        *client.state.borrow_mut() = ConnectionState::Synced;
+
+        let modified = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("Modified text")]),
+            )]),
+        );
+        client.send_update(&modified);
+
+        // After send_update, the ydoc should have the new content
+        let ydoc = client.ydoc.borrow();
+        let restored = yrs_bridge::read_doc_from_ydoc(&ydoc).unwrap();
+        assert_eq!(restored.text_content(), "Modified text");
+
+        // pending_updates should be drained (send_update drains them)
+        assert!(client.pending_updates.borrow().is_empty());
+    }
+
+    #[test]
+    fn send_update_no_change_produces_no_updates() {
+        let doc = simple_doc();
+        let bytes = yrs_bridge::doc_to_ydoc_bytes(&doc);
+        let client = CollabClient::new("doc1".into(), Some(&bytes));
+        *client.state.borrow_mut() = ConnectionState::Synced;
+
+        // Send the same doc — no changes
+        client.send_update(&doc);
+
+        // ydoc content unchanged
+        let ydoc = client.ydoc.borrow();
+        let restored = yrs_bridge::read_doc_from_ydoc(&ydoc).unwrap();
+        assert_eq!(restored.text_content(), "Hello world");
+    }
+
+    // ── RemoteApplyGuard ──
+
+    #[test]
+    fn remote_apply_guard_sets_and_resets_flag() {
+        let flag = Rc::new(Cell::new(false));
+        {
+            let _guard = RemoteApplyGuard::new(&flag);
+            assert!(flag.get(), "flag should be true while guard is alive");
+        }
+        assert!(!flag.get(), "flag should be false after guard is dropped");
+    }
+
+    #[test]
+    fn remote_apply_guard_resets_on_panic() {
+        let flag = Rc::new(Cell::new(false));
+        let flag_clone = Rc::clone(&flag);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = RemoteApplyGuard::new(&flag_clone);
+            assert!(flag_clone.get());
+            panic!("simulated panic");
+        }));
+        assert!(result.is_err());
+        assert!(!flag.get(), "flag should be reset even after panic");
+    }
+
+    // ── Observer suppression ──
+
+    #[test]
+    fn observer_suppressed_during_remote_apply() {
+        let doc = simple_doc();
+        let bytes = yrs_bridge::doc_to_ydoc_bytes(&doc);
+        let client = CollabClient::new("doc1".into(), Some(&bytes));
+
+        // Simulate remote apply: set flag, then modify ydoc directly
+        client.is_applying_remote.set(true);
+        {
+            let ydoc = client.ydoc.borrow();
+            let modified = Node::element_with_content(
+                NodeType::Doc,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("Remote change")]),
+                )]),
+            );
+            yrs_bridge::sync_model_to_ydoc(&ydoc, &modified);
+        }
+        client.is_applying_remote.set(false);
+
+        // Observer should NOT have captured the remote change
+        assert!(client.pending_updates.borrow().is_empty(),
+            "observer should be suppressed during remote apply");
+    }
+
+    #[test]
+    fn observer_captures_local_edit() {
+        let doc = simple_doc();
+        let bytes = yrs_bridge::doc_to_ydoc_bytes(&doc);
+        let client = CollabClient::new("doc1".into(), Some(&bytes));
+
+        // is_applying_remote is false (default) — local edit
+        {
+            let ydoc = client.ydoc.borrow();
+            let modified = Node::element_with_content(
+                NodeType::Doc,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("Local change")]),
+                )]),
+            );
+            yrs_bridge::sync_model_to_ydoc(&ydoc, &modified);
+        }
+
+        // Observer SHOULD have captured the local change
+        assert!(!client.pending_updates.borrow().is_empty(),
+            "observer should capture local edits");
+    }
+
+    // ── Disconnect ──
+
+    #[test]
+    fn disconnect_sets_state() {
+        let client = CollabClient::new("doc1".into(), None);
+        *client.state.borrow_mut() = ConnectionState::Connected;
+        client.disconnect();
+        assert_eq!(*client.state.borrow(), ConnectionState::Disconnected);
+        assert!(client.ws.borrow().is_none());
+    }
+
+    // ── AwarenessPayload serialization ──
+
+    #[test]
+    fn awareness_payload_roundtrip() {
+        let payload = AwarenessPayload {
+            user_id: "user1".into(),
+            name: "Alice".into(),
+            color: 3,
+            cursor_pos: Some(42),
+            selection_anchor: Some(10),
+            selection_head: Some(20),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"user_id\":\"user1\""));
+        assert!(json.contains("\"cursor_pos\":42"));
+        let back: AwarenessPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.user_id, "user1");
+        assert_eq!(back.cursor_pos, Some(42));
+    }
+
+    #[test]
+    fn awareness_payload_optional_fields_omitted() {
+        let payload = AwarenessPayload {
+            user_id: "user1".into(),
+            name: "Alice".into(),
+            color: 0,
+            cursor_pos: None,
+            selection_anchor: None,
+            selection_head: None,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains("cursor_pos"), "None fields should be omitted: {json}");
+        assert!(!json.contains("selection_anchor"), "None fields should be omitted: {json}");
     }
 }

@@ -70,10 +70,8 @@ pub fn read_doc_from_ydoc(ydoc: &Doc) -> Result<Node, BridgeError> {
         children.push(Node::element(NodeType::Paragraph));
     }
 
-    Ok(Node::element_with_content(
-        NodeType::Doc,
-        Fragment::from(children),
-    ))
+    let doc = Node::element_with_content(NodeType::Doc, Fragment::from(children));
+    Ok(super::model::normalize_doc(&doc))
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +80,42 @@ pub struct BridgeError(pub String);
 impl std::fmt::Display for BridgeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "bridge error: {}", self.0)
+    }
+}
+
+/// An action to take for each model child during sync.
+#[derive(Debug)]
+enum SyncAction<'a> {
+    /// Reuse an existing yrs block at `yrs_idx`, updating its content.
+    Reuse { yrs_idx: usize, node: &'a Node },
+    /// Insert a new yrs block from this model node.
+    Insert { node: &'a Node },
+}
+
+impl<'a> SyncAction<'a> {
+    fn node(&self) -> &'a Node {
+        match self {
+            SyncAction::Reuse { node, .. } | SyncAction::Insert { node } => node,
+        }
+    }
+}
+
+/// Snapshot of a yrs block's identity for matching purposes.
+#[derive(Debug)]
+struct YrsBlockInfo {
+    tag: Option<String>,
+    block_id: Option<String>,
+}
+
+impl YrsBlockInfo {
+    fn from_xml_out<T: ReadTxn>(txn: &T, out: &XmlOut) -> Self {
+        match out {
+            XmlOut::Element(el) => YrsBlockInfo {
+                tag: Some(el.tag().to_string()),
+                block_id: el.get_attribute(txn, "blockId"),
+            },
+            _ => YrsBlockInfo { tag: None, block_id: None },
+        }
     }
 }
 
@@ -127,10 +161,11 @@ fn write_node<C: XmlFragment>(
 /// This preserves the Doc's client_id and produces minimal incremental updates
 /// via `observe_update_v1`.
 pub fn sync_model_to_ydoc(ydoc: &Doc, new_doc: &Node) {
+    let normalized = super::model::normalize_doc(new_doc);
     let mut txn = ydoc.transact_mut();
     let fragment = txn.get_or_insert_xml_fragment("content");
 
-    let new_children = match new_doc {
+    let new_children = match &normalized {
         Node::Element { content, .. } => &content.children,
         Node::Text { .. } => return,
     };
@@ -145,7 +180,18 @@ fn sync_children<C: XmlFragment>(
     container: &C,
     new_children: &[Node],
 ) {
-    // Read current yrs children info for matching
+    let (actions, matched) = match_children(txn, container, new_children);
+    remove_unmatched(txn, container, &matched);
+    apply_actions(txn, container, &actions, &matched);
+}
+
+/// Match model children to existing yrs blocks by blockId (or tag for leaf atoms).
+/// Returns a list of SyncActions and a bitmask of which yrs blocks were matched.
+fn match_children<'a, C: XmlFragment>(
+    txn: &yrs::TransactionMut<'_>,
+    container: &C,
+    new_children: &'a [Node],
+) -> (Vec<SyncAction<'a>>, Vec<bool>) {
     let yrs_len = container.len(txn);
     let mut yrs_blocks: Vec<YrsBlockInfo> = Vec::with_capacity(yrs_len as usize);
     for i in 0..yrs_len {
@@ -154,7 +200,6 @@ fn sync_children<C: XmlFragment>(
         }
     }
 
-    // Build a map from blockId -> yrs index for fast lookup
     let mut block_id_map: HashMap<String, usize> = HashMap::new();
     for (i, info) in yrs_blocks.iter().enumerate() {
         if let Some(ref bid) = info.block_id {
@@ -162,62 +207,82 @@ fn sync_children<C: XmlFragment>(
         }
     }
 
-    // Track which yrs blocks have been matched (to know which to delete)
     let mut matched = vec![false; yrs_blocks.len()];
-    // Build the target sequence: each entry is either a matched yrs index or a new node to insert
-    let mut target: Vec<SyncAction> = Vec::with_capacity(new_children.len());
+    let mut actions: Vec<SyncAction> = Vec::with_capacity(new_children.len());
 
     for new_child in new_children {
-        let new_bid = new_child.block_id().map(|s| s.to_string());
-        let new_tag = new_child.node_type().map(node_type_to_tag);
-
-        // Try to match by blockId first
-        let matched_idx = if let Some(ref bid) = new_bid {
-            block_id_map.get(bid).copied().filter(|&idx| !matched[idx])
-        } else {
-            None
-        };
-
-        if let Some(idx) = matched_idx {
+        if let Some(idx) = find_match(new_child, &block_id_map, &yrs_blocks, &matched) {
             matched[idx] = true;
-            target.push(SyncAction::Reuse { yrs_idx: idx, node: new_child });
+            actions.push(SyncAction::Reuse { yrs_idx: idx, node: new_child });
         } else {
-            // No blockId match. For atomic leaf nodes (HorizontalRule, HardBreak,
-            // Image) that carry no text content and are structurally unique, try
-            // matching by type. For everything else (paragraphs, headings, lists,
-            // etc.), treat as a new insert to avoid assigning the wrong CRDT
-            // identity when multiple blocks of the same type exist.
-            let is_leaf_node = matches!(
-                new_child.node_type(),
-                Some(NodeType::HorizontalRule | NodeType::HardBreak | NodeType::Image)
-            );
-            let type_match = if new_bid.is_none() && is_leaf_node {
-                yrs_blocks.iter().enumerate().find(|(i, info)| {
-                    !matched[*i]
-                        && info.block_id.is_none()
-                        && info.tag.as_deref() == new_tag
-                }).map(|(i, _)| i)
-            } else {
-                None
-            };
+            actions.push(SyncAction::Insert { node: new_child });
+        }
+    }
 
-            if let Some(idx) = type_match {
-                matched[idx] = true;
-                target.push(SyncAction::Reuse { yrs_idx: idx, node: new_child });
-            } else {
-                target.push(SyncAction::Insert { node: new_child });
+    (actions, matched)
+}
+
+/// Try to find a matching yrs block for a model node.
+/// Matches by blockId first, then falls back to tag-matching for leaf atoms
+/// (HorizontalRule, HardBreak, Image) that have no blockId.
+fn find_match(
+    node: &Node,
+    block_id_map: &HashMap<String, usize>,
+    yrs_blocks: &[YrsBlockInfo],
+    matched: &[bool],
+) -> Option<usize> {
+    let bid = node.block_id().map(|s| s.to_string());
+    let tag = node.node_type().map(node_type_to_tag);
+
+    // Try blockId match first
+    if let Some(ref bid) = bid {
+        if let Some(&idx) = block_id_map.get(bid) {
+            if !matched[idx] {
+                return Some(idx);
             }
         }
     }
 
-    // Delete unmatched blocks (reverse order to keep indices stable)
-    for i in (0..yrs_blocks.len()).rev() {
+    // For atomic leaf nodes without a blockId, try matching by tag.
+    // Non-leaf blocks (paragraphs, headings, lists) are always inserted fresh
+    // to avoid assigning the wrong CRDT identity when multiple blocks share a type.
+    let is_leaf = matches!(
+        node.node_type(),
+        Some(NodeType::HorizontalRule | NodeType::HardBreak | NodeType::Image)
+    );
+    if bid.is_none() && is_leaf {
+        return yrs_blocks.iter().enumerate().find(|(i, info)| {
+            !matched[*i] && info.block_id.is_none() && info.tag.as_deref() == tag
+        }).map(|(i, _)| i);
+    }
+
+    None
+}
+
+/// Remove yrs blocks that weren't matched to any model node.
+/// Iterates in reverse to keep indices stable during removal.
+fn remove_unmatched<C: XmlFragment>(
+    txn: &mut yrs::TransactionMut<'_>,
+    container: &C,
+    matched: &[bool],
+) {
+    for i in (0..matched.len()).rev() {
         if !matched[i] {
             container.remove(txn, i as u32);
         }
     }
+}
 
-    // Compute new positions for matched blocks after deletions.
+/// Write the matched/new actions to the yrs container.
+/// Uses a fast path when matched blocks are already in their target order,
+/// falls back to clearing and rewriting everything when blocks were reordered.
+fn apply_actions<C: XmlFragment>(
+    txn: &mut yrs::TransactionMut<'_>,
+    container: &C,
+    actions: &[SyncAction],
+    matched: &[bool],
+) {
+    // Compute where each matched block ended up after deletions
     let mut old_to_new_pos: HashMap<usize, u32> = HashMap::new();
     let mut pos = 0u32;
     for (i, was_matched) in matched.iter().enumerate() {
@@ -227,17 +292,16 @@ fn sync_children<C: XmlFragment>(
         }
     }
 
-    // Check if matched blocks are already in their target order
-    let matched_in_target_order: Vec<usize> = target.iter().filter_map(|action| {
-        if let SyncAction::Reuse { yrs_idx, .. } = action { Some(*yrs_idx) } else { None }
+    let reused_indices: Vec<usize> = actions.iter().filter_map(|a| {
+        if let SyncAction::Reuse { yrs_idx, .. } = a { Some(*yrs_idx) } else { None }
     }).collect();
 
-    let already_ordered = matched_in_target_order.windows(2).all(|w| w[0] < w[1]);
+    let already_ordered = reused_indices.windows(2).all(|w| w[0] < w[1]);
 
     if already_ordered {
         // Fast path: matched blocks are in order. Insert new blocks and update changed ones.
         let mut insert_offset = 0u32;
-        for (target_idx, action) in target.iter().enumerate() {
+        for (target_idx, action) in actions.iter().enumerate() {
             match action {
                 SyncAction::Insert { node } => {
                     write_node(txn, container, target_idx as u32, node);
@@ -255,39 +319,8 @@ fn sync_children<C: XmlFragment>(
         if remaining > 0 {
             container.remove_range(txn, 0, remaining);
         }
-        for (i, action) in target.iter().enumerate() {
-            let node = match action {
-                SyncAction::Insert { node } => node,
-                SyncAction::Reuse { node, .. } => node,
-            };
-            write_node(txn, container, i as u32, node);
-        }
-    }
-}
-
-#[derive(Debug)]
-enum SyncAction<'a> {
-    Reuse { yrs_idx: usize, node: &'a Node },
-    Insert { node: &'a Node },
-}
-
-/// Info about a yrs block for matching purposes.
-#[derive(Debug)]
-struct YrsBlockInfo {
-    tag: Option<String>,
-    block_id: Option<String>,
-}
-
-impl YrsBlockInfo {
-    fn from_xml_out<T: ReadTxn>(txn: &T, out: &XmlOut) -> Self {
-        match out {
-            XmlOut::Element(el) => {
-                let tag = Some(el.tag().to_string());
-                let block_id = el.get_attribute(txn, "blockId");
-                YrsBlockInfo { tag, block_id }
-            }
-            XmlOut::Text(_) => YrsBlockInfo { tag: None, block_id: None },
-            _ => YrsBlockInfo { tag: None, block_id: None },
+        for (i, action) in actions.iter().enumerate() {
+            write_node(txn, container, i as u32, action.node());
         }
     }
 }
@@ -306,16 +339,34 @@ fn sync_block_content<C: XmlFragment>(
         return;
     };
 
-    // Check if tag changed (e.g. paragraph -> heading). If so, replace entirely.
-    let yrs_tag = el.tag().to_string();
-    let model_tag = node_type_to_tag(*model_type);
-    if yrs_tag != model_tag {
+    // Tag changed (e.g. paragraph -> heading) → replace entirely
+    if el.tag().as_ref() != node_type_to_tag(*model_type) {
         container.remove(txn, pos);
         write_node(txn, container, pos, model_node);
         return;
     }
 
-    // Sync attributes
+    sync_attrs(txn, el, model_attrs);
+
+    // Container blocks recurse into children; leaf blocks compare text + marks
+    let is_container = matches!(model_type,
+        NodeType::BulletList | NodeType::OrderedList | NodeType::TaskList |
+        NodeType::Blockquote | NodeType::ListItem | NodeType::TaskItem
+    );
+
+    if is_container {
+        sync_children(txn, el, &model_content.children);
+    } else if !text_and_marks_match(txn, el, model_node, &model_content.children) {
+        replace_children(txn, el, &model_content.children);
+    }
+}
+
+/// Sync element attributes: add/update those in the model, remove stale ones.
+fn sync_attrs(
+    txn: &mut yrs::TransactionMut<'_>,
+    el: &yrs::XmlElementRef,
+    model_attrs: &HashMap<String, String>,
+) {
     let mut yrs_attrs: HashMap<String, String> = el.attributes(txn)
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
@@ -329,30 +380,31 @@ fn sync_block_content<C: XmlFragment>(
     for key in yrs_attrs.keys() {
         el.remove_attribute(txn, key);
     }
+}
 
-    // Container blocks (list, blockquote, list items): recurse into children
-    let is_container = matches!(model_type,
-        NodeType::BulletList | NodeType::OrderedList | NodeType::TaskList |
-        NodeType::Blockquote | NodeType::ListItem | NodeType::TaskItem
-    );
+/// Check if a leaf block's text content and marks match the model.
+fn text_and_marks_match(
+    txn: &yrs::TransactionMut<'_>,
+    el: &yrs::XmlElementRef,
+    model_node: &Node,
+    model_children: &[Node],
+) -> bool {
+    collect_element_text(txn, el) == model_node.text_content()
+        && marks_match(txn, el, model_children)
+}
 
-    if is_container {
-        sync_children(txn, el, &model_content.children);
-    } else {
-        // Leaf block (paragraph, heading, code_block, etc.)
-        // Compare text content and marks; rewrite children if different.
-        let yrs_text = collect_element_text(txn, el);
-        let model_text = model_node.text_content();
-
-        if yrs_text != model_text || !marks_match(txn, el, &model_content.children) {
-            let child_len = el.len(txn);
-            if child_len > 0 {
-                el.remove_range(txn, 0, child_len);
-            }
-            for (i, child) in model_content.children.iter().enumerate() {
-                write_node(txn, el, i as u32, child);
-            }
-        }
+/// Replace all children of a yrs element with the given model nodes.
+fn replace_children(
+    txn: &mut yrs::TransactionMut<'_>,
+    el: &yrs::XmlElementRef,
+    children: &[Node],
+) {
+    let len = el.len(txn);
+    if len > 0 {
+        el.remove_range(txn, 0, len);
+    }
+    for (i, child) in children.iter().enumerate() {
+        write_node(txn, el, i as u32, child);
     }
 }
 
@@ -425,58 +477,53 @@ fn marks_match<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef, model_children: &[N
 
 fn read_xml_out<T: ReadTxn>(txn: &T, out: &XmlOut) -> Vec<Node> {
     match out {
-        XmlOut::Element(el) => {
-            let Some(node_type) = tag_to_node_type(&el.tag()) else {
-                return vec![];
-            };
-
-            // Read attributes
-            let mut attrs = node_type.default_attrs();
-            for (key, value) in el.attributes(txn) {
-                attrs.insert(key.to_string(), value.to_string());
-            }
-
-            // Read children
-            let mut children = Vec::new();
-            let len = el.len(txn);
-            for i in 0..len {
-                if let Some(child) = el.get(txn, i) {
-                    children.extend(read_xml_out(txn, &child));
-                }
-            }
-
-            vec![Node::element_with_attrs(
-                node_type,
-                attrs,
-                Fragment::from(children),
-            )]
-        }
-        XmlOut::Text(text) => {
-            // Use diff() to get formatted text chunks with their marks
-            let diffs: Vec<Diff<YChange>> = text.diff(txn, YChange::identity);
-            let mut nodes = Vec::new();
-            for diff in diffs {
-                if let Out::Any(Any::String(s)) = &diff.insert {
-                    let text_str: &str = s.as_ref();
-                    if text_str.is_empty() {
-                        continue;
-                    }
-                    let marks = diff
-                        .attributes
-                        .as_ref()
-                        .map(|a| attrs_to_marks(a))
-                        .unwrap_or_default();
-                    if marks.is_empty() {
-                        nodes.push(Node::text(text_str));
-                    } else {
-                        nodes.push(Node::text_with_marks(text_str, marks));
-                    }
-                }
-            }
-            nodes
-        }
+        XmlOut::Element(el) => read_element(txn, el),
+        XmlOut::Text(text) => read_text_diffs(txn, text),
         _ => vec![],
     }
+}
+
+/// Read a yrs XmlElement into an editor Node, recursing into children.
+fn read_element<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef) -> Vec<Node> {
+    let Some(node_type) = tag_to_node_type(&el.tag()) else {
+        return vec![];
+    };
+
+    let mut attrs = node_type.default_attrs();
+    for (key, value) in el.attributes(txn) {
+        attrs.insert(key.to_string(), value.to_string());
+    }
+
+    let mut children = Vec::new();
+    for i in 0..el.len(txn) {
+        if let Some(child) = el.get(txn, i) {
+            children.extend(read_xml_out(txn, &child));
+        }
+    }
+
+    vec![Node::element_with_attrs(node_type, attrs, Fragment::from(children))]
+}
+
+/// Read a yrs XmlText into editor text Nodes, preserving formatting marks.
+fn read_text_diffs<T: ReadTxn>(txn: &T, text: &yrs::XmlTextRef) -> Vec<Node> {
+    let mut nodes = Vec::new();
+    for diff in text.diff(txn, YChange::identity) {
+        if let Out::Any(Any::String(s)) = &diff.insert {
+            let text_str: &str = s.as_ref();
+            if text_str.is_empty() {
+                continue;
+            }
+            let marks = diff.attributes.as_ref()
+                .map(|a| attrs_to_marks(a))
+                .unwrap_or_default();
+            if marks.is_empty() {
+                nodes.push(Node::text(text_str));
+            } else {
+                nodes.push(Node::text_with_marks(text_str, marks));
+            }
+        }
+    }
+    nodes
 }
 
 // ─── Tag mapping ────────────────────────────────────────────────
@@ -496,6 +543,10 @@ fn node_type_to_tag(nt: NodeType) -> &'static str {
         NodeType::HorizontalRule => "horizontal_rule",
         NodeType::HardBreak => "hard_break",
         NodeType::Image => "image",
+        NodeType::Table => "table",
+        NodeType::TableRow => "table_row",
+        NodeType::TableCell => "table_cell",
+        NodeType::TableHeader => "table_header",
     }
 }
 
@@ -514,6 +565,10 @@ fn tag_to_node_type(tag: &str) -> Option<NodeType> {
         "horizontal_rule" => Some(NodeType::HorizontalRule),
         "hard_break" => Some(NodeType::HardBreak),
         "image" => Some(NodeType::Image),
+        "table" => Some(NodeType::Table),
+        "table_row" => Some(NodeType::TableRow),
+        "table_cell" => Some(NodeType::TableCell),
+        "table_header" => Some(NodeType::TableHeader),
         _ => None,
     }
 }
@@ -599,7 +654,9 @@ fn attrs_to_marks(attrs: &Attrs) -> Vec<Mark> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::rc::Rc;
 
     fn simple_doc() -> Node {
         Node::element_with_content(
@@ -1419,6 +1476,920 @@ mod tests {
             "syncing the refreshed doc against its own state should produce no updates");
     }
 
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    // ─── Multi-client simulation helpers ──────────────────────────
+
+    struct ClientPair {
+        doc_a: Doc,
+        doc_b: Doc,
+        updates_a: Rc<RefCell<Vec<Vec<u8>>>>,
+        updates_b: Rc<RefCell<Vec<Vec<u8>>>>,
+        _sub_a: yrs::Subscription,
+        _sub_b: yrs::Subscription,
+    }
+
+    fn make_client_pair(initial: &Node) -> ClientPair {
+        let bytes = doc_to_ydoc_bytes(initial);
+
+        let doc_a = Doc::with_client_id(1);
+        {
+            let mut txn = doc_a.transact_mut();
+            txn.apply_update(Update::decode_v1(&bytes).unwrap()).unwrap();
+        }
+
+        let doc_b = Doc::with_client_id(2);
+        {
+            let mut txn = doc_b.transact_mut();
+            txn.apply_update(Update::decode_v1(&bytes).unwrap()).unwrap();
+        }
+
+        let updates_a = Rc::new(RefCell::new(Vec::new()));
+        let updates_b = Rc::new(RefCell::new(Vec::new()));
+
+        let cap_a = Rc::clone(&updates_a);
+        let _sub_a = doc_a.observe_update_v1(move |_, event| {
+            cap_a.borrow_mut().push(event.update.clone());
+        }).unwrap();
+
+        let cap_b = Rc::clone(&updates_b);
+        let _sub_b = doc_b.observe_update_v1(move |_, event| {
+            cap_b.borrow_mut().push(event.update.clone());
+        }).unwrap();
+
+        ClientPair { doc_a, doc_b, updates_a, updates_b, _sub_a, _sub_b }
+    }
+
+    fn exchange_updates(pair: &ClientPair) {
+        let a_updates: Vec<Vec<u8>> = pair.updates_a.borrow().clone();
+        let b_updates: Vec<Vec<u8>> = pair.updates_b.borrow().clone();
+
+        {
+            let mut txn = pair.doc_b.transact_mut();
+            for u in &a_updates {
+                txn.apply_update(Update::decode_v1(u).unwrap()).unwrap();
+            }
+        }
+        {
+            let mut txn = pair.doc_a.transact_mut();
+            for u in &b_updates {
+                txn.apply_update(Update::decode_v1(u).unwrap()).unwrap();
+            }
+        }
+    }
+
+    fn assert_convergence(pair: &ClientPair) -> (Node, Node) {
+        let a = read_doc_from_ydoc(&pair.doc_a).unwrap();
+        let b = read_doc_from_ydoc(&pair.doc_b).unwrap();
+        assert_eq!(a, b, "CRDT convergence failed: docs differ after update exchange");
+        (a, b)
+    }
+
+    fn make_para(block_id: &str, text: &str) -> Node {
+        Node::element_with_attrs(
+            NodeType::Paragraph,
+            [("blockId".into(), block_id.into())].into(),
+            Fragment::from(vec![Node::text(text)]),
+        )
+    }
+
+    fn make_doc(children: Vec<Node>) -> Node {
+        Node::element_with_content(NodeType::Doc, Fragment::from(children))
+    }
+
+    // ─── Single-user edge case tests ───────────────────────────────
+
+    #[test]
+    fn sync_rapid_sequential_edits() {
+        let ydoc = Doc::new();
+        let initial = make_doc(vec![make_para("b1", "")]);
+        sync_model_to_ydoc(&ydoc, &initial);
+
+        let update_count = Rc::new(RefCell::new(0u32));
+        let count_ref = Rc::clone(&update_count);
+        let _sub = ydoc.observe_update_v1(move |_, _| {
+            *count_ref.borrow_mut() += 1;
+        }).unwrap();
+
+        for i in 1..=10 {
+            let text: String = (b'A'..b'A' + i as u8).map(|c| c as char).collect();
+            let model = make_doc(vec![make_para("b1", &text)]);
+            sync_model_to_ydoc(&ydoc, &model);
+        }
+
+        let result = read_doc_from_ydoc(&ydoc).unwrap();
+        assert_eq!(result.child(0).unwrap().text_content(), "ABCDEFGHIJ");
+        assert_eq!(*update_count.borrow(), 10, "each sync should fire exactly 1 update");
+    }
+
+    #[test]
+    fn sync_block_reorder_slow_path() {
+        let ydoc = Doc::new();
+        let initial = make_doc(vec![
+            make_para("b1", "first"),
+            make_para("b2", "second"),
+            make_para("b3", "third"),
+        ]);
+        sync_model_to_ydoc(&ydoc, &initial);
+
+        // Reorder: [b3, b1, b2]
+        let reordered = make_doc(vec![
+            make_para("b3", "third"),
+            make_para("b1", "first"),
+            make_para("b2", "second"),
+        ]);
+        sync_model_to_ydoc(&ydoc, &reordered);
+
+        let result = read_doc_from_ydoc(&ydoc).unwrap();
+        assert_eq!(result.child_count(), 3);
+        assert_eq!(result.child(0).unwrap().text_content(), "third");
+        assert_eq!(result.child(1).unwrap().text_content(), "first");
+        assert_eq!(result.child(2).unwrap().text_content(), "second");
+    }
+
+    #[test]
+    fn roundtrip_unicode_and_emoji() {
+        let text = "Hello \u{1F30D}\u{1F44B}\u{1F3FD} caf\u{00E9} \u{00FC}\u{00F6}\u{00E4} \u{4F60}\u{597D} \u{0410}\u{043B}\u{0438}\u{0441}\u{0430}";
+        let doc = make_doc(vec![make_para("b1", text)]);
+        let bytes = doc_to_ydoc_bytes(&doc);
+        let restored = ydoc_bytes_to_doc(&bytes).unwrap();
+        assert_eq!(restored.child(0).unwrap().text_content(), text);
+
+        // Also test incremental sync with emoji appended
+        let ydoc = Doc::new();
+        sync_model_to_ydoc(&ydoc, &doc);
+        let updated = make_doc(vec![make_para("b1", &format!("{text}\u{1F680}"))]);
+        sync_model_to_ydoc(&ydoc, &updated);
+        let result = read_doc_from_ydoc(&ydoc).unwrap();
+        assert!(result.child(0).unwrap().text_content().ends_with("\u{1F680}"));
+    }
+
+    #[test]
+    fn roundtrip_deeply_nested_structure() {
+        let doc = make_doc(vec![
+            Node::element_with_content(
+                NodeType::Blockquote,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::BulletList,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::BulletList,
+                            Fragment::from(vec![Node::element_with_content(
+                                NodeType::ListItem,
+                                Fragment::from(vec![Node::element_with_content(
+                                    NodeType::Paragraph,
+                                    Fragment::from(vec![Node::text("deep")]),
+                                )]),
+                            )]),
+                        )]),
+                    )]),
+                )]),
+            ),
+        ]);
+
+        let bytes = doc_to_ydoc_bytes(&doc);
+        let restored = ydoc_bytes_to_doc(&bytes).unwrap();
+        assert_eq!(restored.text_content(), "deep");
+
+        // Modify innermost text via sync
+        let ydoc = Doc::new();
+        sync_model_to_ydoc(&ydoc, &doc);
+        // Rebuild with changed text
+        let updated = make_doc(vec![
+            Node::element_with_content(
+                NodeType::Blockquote,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::BulletList,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::BulletList,
+                            Fragment::from(vec![Node::element_with_content(
+                                NodeType::ListItem,
+                                Fragment::from(vec![Node::element_with_content(
+                                    NodeType::Paragraph,
+                                    Fragment::from(vec![Node::text("deeper")]),
+                                )]),
+                            )]),
+                        )]),
+                    )]),
+                )]),
+            ),
+        ]);
+        sync_model_to_ydoc(&ydoc, &updated);
+        let result = read_doc_from_ydoc(&ydoc).unwrap();
+        assert_eq!(result.text_content(), "deeper");
+    }
+
+    #[test]
+    fn sync_very_long_text() {
+        let long_text = "a".repeat(100_000);
+        let doc = make_doc(vec![make_para("b1", &long_text)]);
+        let bytes = doc_to_ydoc_bytes(&doc);
+        let restored = ydoc_bytes_to_doc(&bytes).unwrap();
+        assert_eq!(restored.child(0).unwrap().text_content().len(), 100_000);
+
+        // Sync with one char changed in the middle
+        let ydoc = Doc::new();
+        sync_model_to_ydoc(&ydoc, &doc);
+        let mut modified = long_text.clone();
+        modified.replace_range(50_000..50_001, "X");
+        let updated = make_doc(vec![make_para("b1", &modified)]);
+        sync_model_to_ydoc(&ydoc, &updated);
+        let result = read_doc_from_ydoc(&ydoc).unwrap();
+        let result_text = result.child(0).unwrap().text_content();
+        assert_eq!(result_text.len(), 100_000);
+        assert_eq!(&result_text[49_999..50_001], "aX");
+    }
+
+    #[test]
+    fn roundtrip_empty_blocks() {
+        let doc = make_doc(vec![
+            Node::element_with_attrs(
+                NodeType::Paragraph,
+                [("blockId".into(), "p1".into())].into(),
+                Fragment::from(vec![]),
+            ),
+            Node::element_with_attrs(
+                NodeType::Heading,
+                [("blockId".into(), "h1".into()), ("level".into(), "1".into())].into(),
+                Fragment::from(vec![]),
+            ),
+            Node::element_with_attrs(
+                NodeType::CodeBlock,
+                [("blockId".into(), "c1".into()), ("language".into(), "".into())].into(),
+                Fragment::from(vec![]),
+            ),
+        ]);
+
+        let bytes = doc_to_ydoc_bytes(&doc);
+        let restored = ydoc_bytes_to_doc(&bytes).unwrap();
+        assert_eq!(restored.child_count(), 3);
+        assert_eq!(restored.child(0).unwrap().node_type(), Some(NodeType::Paragraph));
+        assert_eq!(restored.child(1).unwrap().node_type(), Some(NodeType::Heading));
+        assert_eq!(restored.child(2).unwrap().node_type(), Some(NodeType::CodeBlock));
+        assert_eq!(restored.text_content(), "");
+    }
+
+    #[test]
+    fn roundtrip_many_marks_on_same_text() {
+        let marks = vec![
+            Mark::new(MarkType::Bold),
+            Mark::new(MarkType::Italic),
+            Mark::new(MarkType::Underline),
+            Mark::new(MarkType::Strike),
+            Mark::new(MarkType::TextColor).with_attr("color", "#ff0000"),
+            Mark::new(MarkType::Highlight).with_attr("color", "yellow"),
+        ];
+        let doc = make_doc(vec![Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text_with_marks("styled", marks.clone())]),
+        )]);
+
+        let bytes = doc_to_ydoc_bytes(&doc);
+        let restored = ydoc_bytes_to_doc(&bytes).unwrap();
+        let text_node = restored.child(0).unwrap().child(0).unwrap();
+        let restored_marks = text_node.marks();
+        assert_eq!(restored_marks.len(), 6, "all 6 marks should survive roundtrip");
+        assert!(restored_marks.iter().any(|m| m.mark_type == MarkType::Bold));
+        assert!(restored_marks.iter().any(|m| m.mark_type == MarkType::Italic));
+        assert!(restored_marks.iter().any(|m| m.mark_type == MarkType::Underline));
+        assert!(restored_marks.iter().any(|m| m.mark_type == MarkType::Strike));
+        assert!(restored_marks.iter().any(|m| m.mark_type == MarkType::TextColor
+            && m.attrs.get("color").map(|s| s.as_str()) == Some("#ff0000")));
+        assert!(restored_marks.iter().any(|m| m.mark_type == MarkType::Highlight
+            && m.attrs.get("color").map(|s| s.as_str()) == Some("yellow")));
+    }
+
+    #[test]
+    fn roundtrip_code_mark_exclusion() {
+        let doc = make_doc(vec![Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![
+                Node::text("before "),
+                Node::text_with_marks("code", vec![Mark::new(MarkType::Code)]),
+                Node::text(" after"),
+            ]),
+        )]);
+
+        let bytes = doc_to_ydoc_bytes(&doc);
+        let restored = ydoc_bytes_to_doc(&bytes).unwrap();
+        let para = restored.child(0).unwrap();
+        assert_eq!(para.text_content(), "before code after");
+
+        // Find the code-marked text node
+        let mut found_code = false;
+        for i in 0..para.child_count() {
+            let child = para.child(i).unwrap();
+            if child.text_content().contains("code") && !child.text_content().contains(" ") {
+                assert_eq!(child.marks().len(), 1);
+                assert_eq!(child.marks()[0].mark_type, MarkType::Code);
+                found_code = true;
+            }
+        }
+        assert!(found_code, "should have a code-marked text node");
+    }
+
+    // ─── Two-user concurrent edit tests ────────────────────────────
+
+    #[test]
+    fn concurrent_edit_different_blocks() {
+        let initial = make_doc(vec![
+            make_para("b1", "Hello"),
+            make_para("b2", "World"),
+        ]);
+        let pair = make_client_pair(&initial);
+
+        // A edits b1
+        let model_a = make_doc(vec![
+            make_para("b1", "Hello Alice"),
+            make_para("b2", "World"),
+        ]);
+        sync_model_to_ydoc(&pair.doc_a, &model_a);
+
+        // B edits b2
+        let model_b = make_doc(vec![
+            make_para("b1", "Hello"),
+            make_para("b2", "World Bob"),
+        ]);
+        sync_model_to_ydoc(&pair.doc_b, &model_b);
+
+        exchange_updates(&pair);
+        let (result, _) = assert_convergence(&pair);
+
+        // Both edits should be preserved since they target different blocks
+        assert_eq!(result.child(0).unwrap().text_content(), "Hello Alice");
+        assert_eq!(result.child(1).unwrap().text_content(), "World Bob");
+    }
+
+    #[test]
+    fn concurrent_edit_same_block_text() {
+        // Both clients rewrite the same paragraph's text.
+        // sync_model_to_ydoc does a full children rewrite when text differs,
+        // so this is an XML-level conflict, not char-level merge.
+        let initial = make_doc(vec![make_para("b1", "Hello world")]);
+        let pair = make_client_pair(&initial);
+
+        let model_a = make_doc(vec![make_para("b1", "Hello beautiful world")]);
+        sync_model_to_ydoc(&pair.doc_a, &model_a);
+
+        let model_b = make_doc(vec![make_para("b1", "Hello world!")]);
+        sync_model_to_ydoc(&pair.doc_b, &model_b);
+
+        exchange_updates(&pair);
+        let (result, _) = assert_convergence(&pair);
+
+        // Primary assertion: convergence (A==B). Content depends on yrs conflict resolution.
+        let text = result.child(0).unwrap().text_content();
+        assert!(!text.is_empty(), "merged text should not be empty: got '{text}'");
+    }
+
+    #[test]
+    fn concurrent_insert_same_position() {
+        let initial = make_doc(vec![make_para("b1", "AB")]);
+        let pair = make_client_pair(&initial);
+
+        let model_a = make_doc(vec![make_para("b1", "AXB")]);
+        sync_model_to_ydoc(&pair.doc_a, &model_a);
+
+        let model_b = make_doc(vec![make_para("b1", "AYB")]);
+        sync_model_to_ydoc(&pair.doc_b, &model_b);
+
+        exchange_updates(&pair);
+        let (result, _) = assert_convergence(&pair);
+
+        let text = result.child(0).unwrap().text_content();
+        assert!(!text.is_empty(), "merged text should not be empty: got '{text}'");
+    }
+
+    #[test]
+    fn concurrent_delete_vs_edit() {
+        let initial = make_doc(vec![
+            make_para("b1", "Keep"),
+            make_para("b2", "Delete me"),
+        ]);
+        let pair = make_client_pair(&initial);
+
+        // A removes b2
+        let model_a = make_doc(vec![make_para("b1", "Keep")]);
+        sync_model_to_ydoc(&pair.doc_a, &model_a);
+
+        // B edits b2
+        let model_b = make_doc(vec![
+            make_para("b1", "Keep"),
+            make_para("b2", "Delete me edited"),
+        ]);
+        sync_model_to_ydoc(&pair.doc_b, &model_b);
+
+        exchange_updates(&pair);
+        let (result, _) = assert_convergence(&pair);
+
+        // Convergence is the primary assertion.
+        // The exact outcome depends on yrs conflict resolution for concurrent
+        // remove vs modify of the same XML element.
+        assert!(result.child_count() >= 1, "should have at least the kept block");
+        assert_eq!(result.child(0).unwrap().text_content(), "Keep");
+    }
+
+    #[test]
+    fn concurrent_type_change_vs_text_edit() {
+        let initial = make_doc(vec![make_para("b1", "Hello")]);
+        let pair = make_client_pair(&initial);
+
+        // A converts paragraph -> heading
+        let model_a = make_doc(vec![Node::element_with_attrs(
+            NodeType::Heading,
+            [("blockId".into(), "b1".into()), ("level".into(), "1".into())].into(),
+            Fragment::from(vec![Node::text("Hello")]),
+        )]);
+        sync_model_to_ydoc(&pair.doc_a, &model_a);
+
+        // B edits the text
+        let model_b = make_doc(vec![make_para("b1", "Hello world")]);
+        sync_model_to_ydoc(&pair.doc_b, &model_b);
+
+        exchange_updates(&pair);
+        let (result, _) = assert_convergence(&pair);
+
+        // Convergence is primary. Both a type change (remove+insert) and text edit
+        // happened concurrently on the same block.
+        assert!(result.child_count() >= 1);
+    }
+
+    #[test]
+    fn concurrent_add_blocks_same_position() {
+        let initial = make_doc(vec![make_para("b1", "First")]);
+        let pair = make_client_pair(&initial);
+
+        // A appends a new paragraph
+        let model_a = make_doc(vec![
+            make_para("b1", "First"),
+            make_para("ba", "From A"),
+        ]);
+        sync_model_to_ydoc(&pair.doc_a, &model_a);
+
+        // B appends a new paragraph
+        let model_b = make_doc(vec![
+            make_para("b1", "First"),
+            make_para("bb", "From B"),
+        ]);
+        sync_model_to_ydoc(&pair.doc_b, &model_b);
+
+        exchange_updates(&pair);
+        let (result, _) = assert_convergence(&pair);
+
+        // Both insertions should be preserved
+        assert_eq!(result.child_count(), 3, "should have original + both new blocks");
+        let all_text = result.text_content();
+        assert!(all_text.contains("First"));
+        assert!(all_text.contains("From A"));
+        assert!(all_text.contains("From B"));
+    }
+
+    #[test]
+    fn concurrent_different_marks_same_text() {
+        let initial = make_doc(vec![Node::element_with_attrs(
+            NodeType::Paragraph,
+            [("blockId".into(), "b1".into())].into(),
+            Fragment::from(vec![Node::text("Hello")]),
+        )]);
+        let pair = make_client_pair(&initial);
+
+        // A applies Bold
+        let model_a = make_doc(vec![Node::element_with_attrs(
+            NodeType::Paragraph,
+            [("blockId".into(), "b1".into())].into(),
+            Fragment::from(vec![Node::text_with_marks("Hello", vec![Mark::new(MarkType::Bold)])]),
+        )]);
+        sync_model_to_ydoc(&pair.doc_a, &model_a);
+
+        // B applies Italic
+        let model_b = make_doc(vec![Node::element_with_attrs(
+            NodeType::Paragraph,
+            [("blockId".into(), "b1".into())].into(),
+            Fragment::from(vec![Node::text_with_marks("Hello", vec![Mark::new(MarkType::Italic)])]),
+        )]);
+        sync_model_to_ydoc(&pair.doc_b, &model_b);
+
+        exchange_updates(&pair);
+        let (result, _) = assert_convergence(&pair);
+
+        // Both clients fully rewrite children when marks differ (remove_range +
+        // write_node), so yrs sees two independent insertions → text may be
+        // duplicated. Convergence (A==B) is the key assertion.
+        let text = result.child(0).unwrap().text_content();
+        assert!(text.contains("Hello"), "original text should be present: got '{text}'");
+    }
+
+    #[test]
+    fn concurrent_split_vs_edit() {
+        let initial = make_doc(vec![make_para("b1", "Hello world")]);
+        let pair = make_client_pair(&initial);
+
+        // A splits into two paragraphs (simulating Enter key)
+        let model_a = make_doc(vec![
+            make_para("b1", "Hello"),
+            make_para("b2", "world"),
+        ]);
+        sync_model_to_ydoc(&pair.doc_a, &model_a);
+
+        // B edits the original paragraph
+        let model_b = make_doc(vec![make_para("b1", "Hello world!")]);
+        sync_model_to_ydoc(&pair.doc_b, &model_b);
+
+        exchange_updates(&pair);
+        let (result, _) = assert_convergence(&pair);
+
+        // Complex structural conflict. Convergence is the key assertion.
+        assert!(result.child_count() >= 1);
+    }
+
+    #[test]
+    fn out_of_order_update_delivery() {
+        // Test that updates from different clients arrive at a third client
+        // in different orders but still converge. This is the real-world
+        // scenario: A and B edit concurrently, their updates reach C in
+        // arbitrary order.
+        let initial = make_doc(vec![
+            make_para("b1", "Block 1"),
+            make_para("b2", "Block 2"),
+        ]);
+        let bytes = doc_to_ydoc_bytes(&initial);
+
+        let doc_a = Doc::with_client_id(1);
+        let doc_b = Doc::with_client_id(2);
+        {
+            let mut txn = doc_a.transact_mut();
+            txn.apply_update(Update::decode_v1(&bytes).unwrap()).unwrap();
+        }
+        {
+            let mut txn = doc_b.transact_mut();
+            txn.apply_update(Update::decode_v1(&bytes).unwrap()).unwrap();
+        }
+
+        let updates_a: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let updates_b: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let cap_a = Rc::clone(&updates_a);
+        let cap_b = Rc::clone(&updates_b);
+        let _sub_a = doc_a.observe_update_v1(move |_, e| { cap_a.borrow_mut().push(e.update.clone()); }).unwrap();
+        let _sub_b = doc_b.observe_update_v1(move |_, e| { cap_b.borrow_mut().push(e.update.clone()); }).unwrap();
+
+        // A edits b1, B edits b2 (concurrently)
+        sync_model_to_ydoc(&doc_a, &make_doc(vec![
+            make_para("b1", "Block 1 by A"), make_para("b2", "Block 2"),
+        ]));
+        sync_model_to_ydoc(&doc_b, &make_doc(vec![
+            make_para("b1", "Block 1"), make_para("b2", "Block 2 by B"),
+        ]));
+
+        let ua = updates_a.borrow().clone();
+        let ub = updates_b.borrow().clone();
+
+        // Client C receives A first, then B
+        let doc_c1 = Doc::with_client_id(3);
+        {
+            let mut txn = doc_c1.transact_mut();
+            txn.apply_update(Update::decode_v1(&bytes).unwrap()).unwrap();
+            for u in &ua { txn.apply_update(Update::decode_v1(u).unwrap()).unwrap(); }
+            for u in &ub { txn.apply_update(Update::decode_v1(u).unwrap()).unwrap(); }
+        }
+
+        // Client D receives B first, then A (reversed order)
+        let doc_c2 = Doc::with_client_id(4);
+        {
+            let mut txn = doc_c2.transact_mut();
+            txn.apply_update(Update::decode_v1(&bytes).unwrap()).unwrap();
+            for u in &ub { txn.apply_update(Update::decode_v1(u).unwrap()).unwrap(); }
+            for u in &ua { txn.apply_update(Update::decode_v1(u).unwrap()).unwrap(); }
+        }
+
+        let result_c1 = read_doc_from_ydoc(&doc_c1).unwrap();
+        let result_c2 = read_doc_from_ydoc(&doc_c2).unwrap();
+        assert_eq!(result_c1, result_c2, "different delivery order should still converge");
+    }
+
+    #[test]
+    fn stale_state_editing() {
+        let initial = make_doc(vec![make_para("b1", "Version 0")]);
+        let pair = make_client_pair(&initial);
+
+        // A makes two sequential edits
+        let model_a1 = make_doc(vec![make_para("b1", "Version 1")]);
+        sync_model_to_ydoc(&pair.doc_a, &model_a1);
+        let model_a2 = make_doc(vec![make_para("b1", "Version 2")]);
+        sync_model_to_ydoc(&pair.doc_a, &model_a2);
+
+        // B has NOT received A's updates yet. Edits from stale "Version 0" state.
+        let model_b = make_doc(vec![make_para("b1", "Version 0 plus B")]);
+        sync_model_to_ydoc(&pair.doc_b, &model_b);
+
+        // Now exchange all updates
+        exchange_updates(&pair);
+        let (result, _) = assert_convergence(&pair);
+
+        // Both clients must agree. The content depends on yrs conflict resolution
+        // for concurrent full-text rewrites.
+        assert!(!result.child(0).unwrap().text_content().is_empty());
+    }
+
+    // ─── Three-user test ───────────────────────────────────────────
+
+    #[test]
+    fn three_users_edit_different_blocks() {
+        let initial = make_doc(vec![
+            make_para("b1", "Block 1"),
+            make_para("b2", "Block 2"),
+            make_para("b3", "Block 3"),
+        ]);
+        let bytes = doc_to_ydoc_bytes(&initial);
+
+        let doc_a = Doc::with_client_id(1);
+        let doc_b = Doc::with_client_id(2);
+        let doc_c = Doc::with_client_id(3);
+        {
+            let mut txn = doc_a.transact_mut();
+            txn.apply_update(Update::decode_v1(&bytes).unwrap()).unwrap();
+        }
+        {
+            let mut txn = doc_b.transact_mut();
+            txn.apply_update(Update::decode_v1(&bytes).unwrap()).unwrap();
+        }
+        {
+            let mut txn = doc_c.transact_mut();
+            txn.apply_update(Update::decode_v1(&bytes).unwrap()).unwrap();
+        }
+
+        let updates_a: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let updates_b: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let updates_c: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let cap_a = Rc::clone(&updates_a);
+        let cap_b = Rc::clone(&updates_b);
+        let cap_c = Rc::clone(&updates_c);
+        let _sub_a = doc_a.observe_update_v1(move |_, e| { cap_a.borrow_mut().push(e.update.clone()); }).unwrap();
+        let _sub_b = doc_b.observe_update_v1(move |_, e| { cap_b.borrow_mut().push(e.update.clone()); }).unwrap();
+        let _sub_c = doc_c.observe_update_v1(move |_, e| { cap_c.borrow_mut().push(e.update.clone()); }).unwrap();
+
+        // Each user edits their own block
+        sync_model_to_ydoc(&doc_a, &make_doc(vec![
+            make_para("b1", "Block 1 by A"), make_para("b2", "Block 2"), make_para("b3", "Block 3"),
+        ]));
+        sync_model_to_ydoc(&doc_b, &make_doc(vec![
+            make_para("b1", "Block 1"), make_para("b2", "Block 2 by B"), make_para("b3", "Block 3"),
+        ]));
+        sync_model_to_ydoc(&doc_c, &make_doc(vec![
+            make_para("b1", "Block 1"), make_para("b2", "Block 2"), make_para("b3", "Block 3 by C"),
+        ]));
+
+        // Full mesh exchange
+        let ua = updates_a.borrow().clone();
+        let ub = updates_b.borrow().clone();
+        let uc = updates_c.borrow().clone();
+
+        {
+            let mut txn = doc_a.transact_mut();
+            for u in &ub { txn.apply_update(Update::decode_v1(u).unwrap()).unwrap(); }
+            for u in &uc { txn.apply_update(Update::decode_v1(u).unwrap()).unwrap(); }
+        }
+        {
+            let mut txn = doc_b.transact_mut();
+            for u in &ua { txn.apply_update(Update::decode_v1(u).unwrap()).unwrap(); }
+            for u in &uc { txn.apply_update(Update::decode_v1(u).unwrap()).unwrap(); }
+        }
+        {
+            let mut txn = doc_c.transact_mut();
+            for u in &ua { txn.apply_update(Update::decode_v1(u).unwrap()).unwrap(); }
+            for u in &ub { txn.apply_update(Update::decode_v1(u).unwrap()).unwrap(); }
+        }
+
+        let result_a = read_doc_from_ydoc(&doc_a).unwrap();
+        let result_b = read_doc_from_ydoc(&doc_b).unwrap();
+        let result_c = read_doc_from_ydoc(&doc_c).unwrap();
+        assert_eq!(result_a, result_b, "A and B should converge");
+        assert_eq!(result_b, result_c, "B and C should converge");
+
+        // All three edits should be preserved (different blocks)
+        assert_eq!(result_a.child(0).unwrap().text_content(), "Block 1 by A");
+        assert_eq!(result_a.child(1).unwrap().text_content(), "Block 2 by B");
+        assert_eq!(result_a.child(2).unwrap().text_content(), "Block 3 by C");
+    }
+
+    // ─── Reconnect/refresh tests ───────────────────────────────────
+
+    #[test]
+    fn offline_edit_reconnect_via_state_vector() {
+        let initial = make_doc(vec![
+            make_para("b1", "Shared"),
+            make_para("b2", "Content"),
+        ]);
+        let bytes = doc_to_ydoc_bytes(&initial);
+
+        let doc_a = Doc::with_client_id(1);
+        let doc_b = Doc::with_client_id(2);
+        {
+            let mut txn = doc_a.transact_mut();
+            txn.apply_update(Update::decode_v1(&bytes).unwrap()).unwrap();
+        }
+        {
+            let mut txn = doc_b.transact_mut();
+            txn.apply_update(Update::decode_v1(&bytes).unwrap()).unwrap();
+        }
+
+        // A goes offline, makes 3 edits
+        sync_model_to_ydoc(&doc_a, &make_doc(vec![
+            make_para("b1", "Shared edit1"), make_para("b2", "Content"),
+        ]));
+        sync_model_to_ydoc(&doc_a, &make_doc(vec![
+            make_para("b1", "Shared edit1"), make_para("b2", "Content"),
+            make_para("b3", "New block"),
+        ]));
+        sync_model_to_ydoc(&doc_a, &make_doc(vec![
+            make_para("b1", "Shared edit1 edit2"), make_para("b2", "Content"),
+            make_para("b3", "New block"),
+        ]));
+
+        // B makes 1 edit online
+        sync_model_to_ydoc(&doc_b, &make_doc(vec![
+            make_para("b1", "Shared"), make_para("b2", "Content by B"),
+        ]));
+
+        // Reconnect via state vector exchange
+        let sv_b = { let txn = doc_b.transact(); txn.state_vector() };
+        let sv_a = { let txn = doc_a.transact(); txn.state_vector() };
+        let diff_a_for_b = {
+            let txn = doc_a.transact();
+            txn.encode_state_as_update_v1(&sv_b)
+        };
+        let diff_b_for_a = {
+            let txn = doc_b.transact();
+            txn.encode_state_as_update_v1(&sv_a)
+        };
+
+        {
+            let mut txn = doc_b.transact_mut();
+            txn.apply_update(Update::decode_v1(&diff_a_for_b).unwrap()).unwrap();
+        }
+        {
+            let mut txn = doc_a.transact_mut();
+            txn.apply_update(Update::decode_v1(&diff_b_for_a).unwrap()).unwrap();
+        }
+
+        let result_a = read_doc_from_ydoc(&doc_a).unwrap();
+        let result_b = read_doc_from_ydoc(&doc_b).unwrap();
+        assert_eq!(result_a, result_b, "state vector reconnect should converge");
+
+        // B's edit to b2 should be preserved since it's a different block
+        assert_eq!(result_a.child(1).unwrap().text_content(), "Content by B");
+        // A's new block should appear
+        assert!(result_a.child_count() >= 3);
+    }
+
+    #[test]
+    fn chained_snapshot_refresh_no_duplication() {
+        // Session 1: initial + edits
+        let initial = make_doc(vec![make_para("b1", "Start")]);
+        let snapshot_0 = doc_to_ydoc_bytes(&initial);
+
+        let session1 = Doc::with_client_id(1);
+        {
+            let mut txn = session1.transact_mut();
+            txn.apply_update(Update::decode_v1(&snapshot_0).unwrap()).unwrap();
+        }
+        let cap1: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let c1 = Rc::clone(&cap1);
+        let _s1 = session1.observe_update_v1(move |_, e| { c1.borrow_mut().push(e.update.clone()); }).unwrap();
+
+        sync_model_to_ydoc(&session1, &make_doc(vec![make_para("b1", "Start edit1")]));
+        sync_model_to_ydoc(&session1, &make_doc(vec![make_para("b1", "Start edit1 edit2")]));
+
+        // Server creates snapshot_1 = snapshot_0 + session1 updates
+        let server1 = Doc::new();
+        {
+            let mut txn = server1.transact_mut();
+            txn.apply_update(Update::decode_v1(&snapshot_0).unwrap()).unwrap();
+            for u in cap1.borrow().iter() {
+                txn.apply_update(Update::decode_v1(u).unwrap()).unwrap();
+            }
+        }
+        let snapshot_1 = { let txn = server1.transact(); txn.encode_state_as_update_v1(&yrs::StateVector::default()) };
+
+        // Session 2: load snapshot_1, make more edits
+        let session2 = Doc::with_client_id(2);
+        {
+            let mut txn = session2.transact_mut();
+            txn.apply_update(Update::decode_v1(&snapshot_1).unwrap()).unwrap();
+        }
+        let cap2: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let c2 = Rc::clone(&cap2);
+        let _s2 = session2.observe_update_v1(move |_, e| { c2.borrow_mut().push(e.update.clone()); }).unwrap();
+
+        sync_model_to_ydoc(&session2, &make_doc(vec![
+            make_para("b1", "Start edit1 edit2"),
+            make_para("b2", "New para"),
+        ]));
+
+        // Server creates snapshot_2
+        let server2 = Doc::new();
+        {
+            let mut txn = server2.transact_mut();
+            txn.apply_update(Update::decode_v1(&snapshot_1).unwrap()).unwrap();
+            for u in cap2.borrow().iter() {
+                txn.apply_update(Update::decode_v1(u).unwrap()).unwrap();
+            }
+        }
+        let snapshot_2 = { let txn = server2.transact(); txn.encode_state_as_update_v1(&yrs::StateVector::default()) };
+
+        // Session 3: fresh load from snapshot_2
+        let result = ydoc_bytes_to_doc(&snapshot_2).unwrap();
+        assert_eq!(result.child_count(), 2, "should have exactly 2 paragraphs, no duplication");
+        assert_eq!(result.child(0).unwrap().text_content(), "Start edit1 edit2");
+        assert_eq!(result.child(1).unwrap().text_content(), "New para");
+
+        // Idempotency: syncing against own state produces no updates
+        let session3 = Doc::new();
+        {
+            let mut txn = session3.transact_mut();
+            txn.apply_update(Update::decode_v1(&snapshot_2).unwrap()).unwrap();
+        }
+        let cap3: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let c3 = Rc::clone(&cap3);
+        let _s3 = session3.observe_update_v1(move |_, e| { c3.borrow_mut().push(e.update.clone()); }).unwrap();
+        sync_model_to_ydoc(&session3, &result);
+        assert_eq!(cap3.borrow().len(), 0, "syncing own state should produce no updates");
+    }
+
+    // ─── Structural edge case tests ────────────────────────────────
+
+    #[test]
+    fn sync_replace_all_content_no_blockid_match() {
+        let ydoc = Doc::new();
+        let initial = make_doc(vec![
+            make_para("b1", "old one"),
+            make_para("b2", "old two"),
+            make_para("b3", "old three"),
+        ]);
+        sync_model_to_ydoc(&ydoc, &initial);
+
+        // Completely new content, no blockId overlap
+        let replaced = make_doc(vec![
+            make_para("x1", "new alpha"),
+            make_para("x2", "new beta"),
+        ]);
+        sync_model_to_ydoc(&ydoc, &replaced);
+
+        let result = read_doc_from_ydoc(&ydoc).unwrap();
+        assert_eq!(result.child_count(), 2);
+        assert_eq!(result.child(0).unwrap().text_content(), "new alpha");
+        assert_eq!(result.child(1).unwrap().text_content(), "new beta");
+    }
+
+    #[test]
+    fn sync_mixed_blockid_and_leaf_nodes() {
+        let ydoc = Doc::new();
+        let mut img_attrs: HashMap<String, String> = HashMap::new();
+        img_attrs.insert("src".into(), "img.png".into());
+        let initial = make_doc(vec![
+            make_para("b1", "text"),
+            Node::element(NodeType::HorizontalRule),
+            make_para("b2", "more"),
+            Node::element_with_attrs(NodeType::Image, img_attrs.clone(), Fragment::from(vec![])),
+            make_para("b3", "end"),
+        ]);
+        sync_model_to_ydoc(&ydoc, &initial);
+
+        // Reorder: move HR after b2, remove image, edit text
+        let updated = make_doc(vec![
+            make_para("b1", "text updated"),
+            make_para("b2", "more"),
+            Node::element(NodeType::HorizontalRule),
+            make_para("b3", "end changed"),
+        ]);
+        sync_model_to_ydoc(&ydoc, &updated);
+
+        let result = read_doc_from_ydoc(&ydoc).unwrap();
+        assert_eq!(result.child_count(), 4);
+        assert_eq!(result.child(0).unwrap().text_content(), "text updated");
+        assert_eq!(result.child(1).unwrap().text_content(), "more");
+        assert_eq!(result.child(2).unwrap().node_type(), Some(NodeType::HorizontalRule));
+        assert_eq!(result.child(3).unwrap().text_content(), "end changed");
+    }
+
+    #[test]
+    fn sync_duplicate_blockids_no_panic() {
+        let ydoc = Doc::new();
+        let initial = make_doc(vec![make_para("b1", "Hello")]);
+        sync_model_to_ydoc(&ydoc, &initial);
+
+        // Sync with two paragraphs having the same blockId (shouldn't happen
+        // in practice, but the code should handle it gracefully)
+        let duped = make_doc(vec![
+            make_para("b1", "First"),
+            make_para("b1", "Second"),
+        ]);
+        sync_model_to_ydoc(&ydoc, &duped);
+
+        let result = read_doc_from_ydoc(&ydoc).unwrap();
+        assert_eq!(result.child_count(), 2, "both paragraphs should exist");
+        let all_text = result.text_content();
+        assert!(all_text.contains("First"), "first text should be present");
+        assert!(all_text.contains("Second"), "second text should be present");
+    }
 }

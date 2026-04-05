@@ -1,5 +1,6 @@
 use leptos::prelude::*;
 use leptos_router::hooks::{use_navigate, use_params_map};
+use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::api::client;
@@ -9,7 +10,9 @@ use crate::collab::ws_client::RemoteCursor;
 use crate::components::at_menu::{AtMenu, AtMenuItem, AtMenuItemType};
 use crate::components::block_menu::BlockMenu;
 use crate::components::comment_highlights::{CommentHighlights, InlineThreadInfo};
+use crate::components::comment_popup::CommentPopup;
 use crate::components::conversation_pane::ConversationPane;
+use crate::components::selection_toolbar::{SelectionToolbar, SelectionCommand};
 use crate::components::cursor_overlay::CursorOverlay;
 use crate::components::history_viewer::HistoryViewer;
 use crate::components::menu_bar::{DocAction, MenuBar};
@@ -48,13 +51,26 @@ pub fn DocumentPage() -> impl IntoView {
     let (conversation_visible, set_conversation_visible) = signal(false);
     // Inline comment state
     let (pending_block_id, set_pending_block_id) = signal::<Option<String>>(None);
+    let (pending_anchor_start, set_pending_anchor_start) = signal::<Option<u32>>(None);
+    let (pending_anchor_end, set_pending_anchor_end) = signal::<Option<u32>>(None);
     let (filter_thread_id, set_filter_thread_id) = signal::<Option<String>>(None);
     let (inline_threads, set_inline_threads) = signal::<Vec<InlineThreadInfo>>(Vec::new());
+    let (comment_count, set_comment_count) = signal(0usize);
+    // Comment popup state (for inline comment threads shown near highlighted text)
+    let (popup_thread_id, set_popup_thread_id) = signal::<Option<String>>(None);
+    let (popup_left, set_popup_left) = signal(0.0f64);
+    let (popup_top, set_popup_top) = signal(0.0f64);
+    let (popup_is_new, set_popup_is_new) = signal(false);
+    let (popup_block_id, set_popup_block_id) = signal::<Option<String>>(None);
+    let (popup_anchor_start, set_popup_anchor_start) = signal::<Option<u32>>(None);
+    let (popup_anchor_end, set_popup_anchor_end) = signal::<Option<u32>>(None);
     // Block menu state
     let (block_menu_visible, set_block_menu_visible) = signal(false);
     let (block_menu_top, set_block_menu_top) = signal(0.0f64);
     // Remote cursor presence
     let (remote_cursors, set_remote_cursors) = signal::<Vec<RemoteCursor>>(Vec::new());
+    // Scroll tick — incremented on editor-container scroll to force overlay re-render
+    let (scroll_tick, set_scroll_tick) = signal(0u32);
     // History viewer
     let (history_visible, set_history_visible) = signal(false);
     let (current_doc_text, set_current_doc_text) = signal(String::new());
@@ -224,9 +240,13 @@ pub fn DocumentPage() -> impl IntoView {
 
     // Send incremental yrs updates over WebSocket when connected.
     // Debounced: rapid keystrokes are batched into fewer WS sends.
+    // Uses gloo_timers::callback::Timeout instead of spawn_local + TimeoutFuture
+    // to avoid re-entrant polling of the wasm-bindgen task runner's RefCell
+    // (Leptos Effects use queueMicrotask which shares the same microtask queue).
     let collab_for_send = std::rc::Rc::clone(&collab_client);
     let (prev_doc_hash, set_prev_doc_hash) = signal(0u64);
-    let send_generation = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    let pending_send_timer: std::rc::Rc<std::cell::RefCell<Option<gloo_timers::callback::Timeout>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
     let remote_flag_for_send = std::rc::Rc::clone(&remote_update_flag);
     Effect::new(move |_| {
         let Some(state) = editor_state.get() else { return };
@@ -245,27 +265,21 @@ pub fn DocumentPage() -> impl IntoView {
         }
         set_prev_doc_hash.set(hash);
 
-        // Debounce: increment generation, spawn a delayed send.
-        // If another change arrives before the timeout, the generation
-        // check will skip the stale send.
-        let send_gen = send_generation.get() + 1;
-        send_generation.set(send_gen);
-        let gen_ref = send_generation.clone();
+        // Debounce: set a timer. If another change arrives before the timeout,
+        // the previous timer is dropped (cancelled) and a new one is set.
         let collab = collab_for_send.clone();
         let doc = state.doc.clone();
-        leptos::task::spawn_local(async move {
-            gloo_timers::future::TimeoutFuture::new(
-                crate::collab::ws_client::WS_SEND_DEBOUNCE_MS,
-            ).await;
-            if gen_ref.get() != send_gen {
-                return; // Superseded by a newer change
-            }
-            if let Some(ref client) = *collab.borrow() {
-                if client.is_synced() {
-                    client.send_update(&doc);
+        let timer_ref = pending_send_timer.clone();
+        *timer_ref.borrow_mut() = Some(gloo_timers::callback::Timeout::new(
+            crate::collab::ws_client::WS_SEND_DEBOUNCE_MS,
+            move || {
+                if let Some(ref client) = *collab.borrow() {
+                    if client.is_synced() {
+                        client.send_update(&doc);
+                    }
                 }
-            }
-        });
+            },
+        ));
     });
 
     // Send local cursor/selection position as awareness updates.
@@ -315,8 +329,34 @@ pub fn DocumentPage() -> impl IntoView {
     let save_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let save_doc_id = current_id.clone();
     let ws_connected_for_save = std::sync::Arc::clone(&ws_connected);
+    // Track title changes separately so we can save the title even when WS handles content.
+    let title_save_doc_id = save_doc_id.clone();
+    let (prev_title, set_prev_title) = signal(String::new());
+    let pending_title_timer: std::rc::Rc<std::cell::RefCell<Option<gloo_timers::callback::Timeout>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    Effect::new(move |_| {
+        let current_title = title.get();
+        if current_title == prev_title.get_untracked() || current_title == "Loading..." {
+            return;
+        }
+        set_prev_title.set(current_title.clone());
+        let id = title_save_doc_id.get_untracked();
+        if id.is_empty() {
+            return;
+        }
+        let timer_ref = pending_title_timer.clone();
+        *timer_ref.borrow_mut() = Some(gloo_timers::callback::Timeout::new(1000, move || {
+            leptos::task::spawn_local(async move {
+                if let Err(e) = documents::update_document_title(&id, &current_title).await {
+                    web_sys::console::error_1(&format!("Title save failed: {e}").into());
+                }
+            });
+        }));
+    });
+
     let on_change = Callback::new(move |bytes: Vec<u8>| {
-        // Skip REST save if WebSocket is handling persistence
+        // Skip REST content save if WebSocket is handling persistence.
+        // Title is saved separately via the Effect above.
         if ws_connected_for_save.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
@@ -325,7 +365,6 @@ pub fn DocumentPage() -> impl IntoView {
         if id.is_empty() {
             return;
         }
-        let current_title = title.get_untracked();
         let generation = save_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let gen_ref = std::sync::Arc::clone(&save_generation);
 
@@ -351,12 +390,6 @@ pub fn DocumentPage() -> impl IntoView {
                         break;
                     }
                 }
-            }
-
-            if let Err(e) = documents::update_document_title(&id, &current_title).await {
-                web_sys::console::error_1(
-                    &format!("Title save failed: {e}").into(),
-                );
             }
         });
     });
@@ -417,6 +450,8 @@ pub fn DocumentPage() -> impl IntoView {
             open_comment_pane(
                 &editor_state,
                 &set_pending_block_id,
+                &set_pending_anchor_start,
+                &set_pending_anchor_end,
                 &set_conversation_visible,
                 &conversation_visible,
             );
@@ -495,6 +530,40 @@ pub fn DocumentPage() -> impl IntoView {
         set_at_menu_visible.set(false);
     });
 
+    // Attach scroll listener to .editor-container so fixed-position overlays
+    // (comment highlights, selection toolbar, cursor overlay) re-render on scroll.
+    // Uses requestAnimationFrame to throttle to ~60fps.
+    {
+        let scroll_raf_pending = std::rc::Rc::new(std::cell::Cell::new(false));
+        Effect::new(move |_| {
+            if !content_loaded.get() {
+                return;
+            }
+            let Some(window) = web_sys::window() else { return };
+            let Some(document) = window.document() else { return };
+            let Some(container) = document.query_selector(".editor-container").ok().flatten() else {
+                return;
+            };
+
+            let raf_pending = scroll_raf_pending.clone();
+            let on_scroll = Closure::wrap(Box::new(move |_: web_sys::Event| {
+                if raf_pending.get() {
+                    return;
+                }
+                raf_pending.set(true);
+                let raf_pending_inner = raf_pending.clone();
+                let cb = Closure::once_into_js(move || {
+                    raf_pending_inner.set(false);
+                    set_scroll_tick.set(scroll_tick.get_untracked().wrapping_add(1));
+                });
+                let _ = web_sys::window().map(|w| w.request_animation_frame(cb.as_ref().unchecked_ref()));
+            }) as Box<dyn Fn(web_sys::Event)>);
+
+            let _ = container.add_event_listener_with_callback("scroll", on_scroll.as_ref().unchecked_ref());
+            on_scroll.forget(); // leak — lives as long as the DOM element
+        });
+    }
+
     // Mousemove on editor area: detect block hover for BlockMenu.
     let on_editor_mousemove = move |ev: web_sys::MouseEvent| {
         let x = ev.client_x() as f64;
@@ -538,6 +607,8 @@ pub fn DocumentPage() -> impl IntoView {
             open_comment_pane(
                 &editor_state,
                 &set_pending_block_id,
+                &set_pending_anchor_start,
+                &set_pending_anchor_end,
                 &set_conversation_visible,
                 &conversation_visible,
             );
@@ -549,10 +620,12 @@ pub fn DocumentPage() -> impl IntoView {
     };
 
     // Handle document-level actions from the menu bar.
+    // Capture navigate at definition time (inside Router context).
+    let navigate_for_action = leptos_router::hooks::use_navigate();
     let on_doc_action = Callback::new(move |action: DocAction| {
         match action {
             DocAction::NewDocument => {
-                let navigate = leptos_router::hooks::use_navigate();
+                let navigate = navigate_for_action.clone();
                 leptos::task::spawn_local(async move {
                     match documents::create_document("Untitled", None).await {
                         Ok(doc) => { navigate(&format!("/d/{}", doc.id), Default::default()); }
@@ -672,8 +745,11 @@ pub fn DocumentPage() -> impl IntoView {
                 <Toolbar
                     editor_state=editor_state
                     on_command=on_command
+                    comment_count=Signal::derive(move || comment_count.get())
                 />
 
+                // Editor + side panels in a row
+                <div class="editor-with-panels">
                 {move || {
                     if content_loaded.get() {
                         let content = initial_content.get();
@@ -709,12 +785,20 @@ pub fn DocumentPage() -> impl IntoView {
                     doc_id=current_id
                     editor_state=editor_state
                     pending_block_id=pending_block_id
-                    on_block_used=Callback::new(move |_| set_pending_block_id.set(None))
+                    pending_anchor_start=pending_anchor_start
+                    pending_anchor_end=pending_anchor_end
+                    on_block_used=Callback::new(move |_| {
+                        set_pending_block_id.set(None);
+                        set_pending_anchor_start.set(None);
+                        set_pending_anchor_end.set(None);
+                    })
                     on_threads_loaded=Callback::new(move |threads: Vec<InlineThreadInfo>| {
+                        set_comment_count.set(threads.len());
                         set_inline_threads.set(threads);
                     })
                     filter_thread_id=filter_thread_id
                 />
+                </div> // editor-with-panels
             </div>
 
             <ShareDialog
@@ -723,14 +807,80 @@ pub fn DocumentPage() -> impl IntoView {
                 folder_id=folder_id
             />
 
-            <CursorOverlay cursors=remote_cursors />
+            <CursorOverlay cursors=remote_cursors scroll_tick=scroll_tick />
 
             <CommentHighlights
                 threads=inline_threads
                 editor_state=editor_state
-                on_click=Callback::new(move |thread_id: String| {
-                    set_filter_thread_id.set(Some(thread_id));
-                    set_conversation_visible.set(true);
+                scroll_tick=scroll_tick
+                on_click=Callback::new(move |(thread_id, left, top): (String, f64, f64)| {
+                    set_popup_thread_id.set(Some(thread_id));
+                    set_popup_left.set(left);
+                    set_popup_top.set(top);
+                })
+            />
+
+            <CommentPopup
+                thread_id=popup_thread_id
+                left=popup_left
+                top=popup_top
+                doc_id=current_id
+                block_id=popup_block_id
+                anchor_start=popup_anchor_start
+                anchor_end=popup_anchor_end
+                is_new=popup_is_new
+                on_close=Callback::new(move |_| {
+                    set_popup_thread_id.set(None);
+                    set_popup_is_new.set(false);
+                    set_popup_block_id.set(None);
+                })
+                on_thread_created=Callback::new(move |_tid: String| {
+                    // Refresh thread list in conversation pane
+                })
+            />
+
+            <SelectionToolbar
+                editor_state=editor_state
+                scroll_tick=scroll_tick
+                on_command=Callback::new(move |cmd: SelectionCommand| {
+                    match cmd {
+                        SelectionCommand::Comment => {
+                            // Open the popup for a new comment at the selection
+                            if let Some(state) = editor_state.get_untracked() {
+                                let from = state.selection.from();
+                                let to = state.selection.to();
+                                if let Some(bid) = state.doc.block_id_at(from) {
+                                    let block = crate::editor::state::find_block_at(&state.doc, from);
+                                    let (a_start, a_end) = if from != to {
+                                        if let Some(b) = &block {
+                                            let rel_from = (from.saturating_sub(b.content_start)) as u32;
+                                            let rel_to = (to.saturating_sub(b.content_start)).min(b.content.size()) as u32;
+                                            if rel_from < rel_to { (Some(rel_from), Some(rel_to)) }
+                                            else { (None, None) }
+                                        } else { (None, None) }
+                                    } else { (None, None) };
+
+                                    // Get position from the browser selection
+                                    if let Some(window) = web_sys::window() {
+                                        if let Some(sel) = window.get_selection().ok().flatten() {
+                                            if let Ok(range) = sel.get_range_at(0) {
+                                                let rect = range.get_bounding_client_rect();
+                                                let popup_width = 420.0;
+                                                set_popup_left.set((rect.left() - popup_width - 12.0).max(4.0));
+                                                set_popup_top.set(rect.top());
+                                            }
+                                        }
+                                    }
+
+                                    set_popup_block_id.set(Some(bid));
+                                    set_popup_anchor_start.set(a_start);
+                                    set_popup_anchor_end.set(a_end);
+                                    set_popup_is_new.set(true);
+                                    set_popup_thread_id.set(None);
+                                }
+                            }
+                        }
+                    }
                 })
             />
 
@@ -764,18 +914,42 @@ pub fn DocumentPage() -> impl IntoView {
 fn open_comment_pane(
     editor_state: &ReadSignal<Option<EditorState>>,
     set_pending_block_id: &WriteSignal<Option<String>>,
+    set_pending_anchor_start: &WriteSignal<Option<u32>>,
+    set_pending_anchor_end: &WriteSignal<Option<u32>>,
     set_conversation_visible: &WriteSignal<bool>,
     conversation_visible: &ReadSignal<bool>,
 ) {
     if let Some(state) = editor_state.get_untracked() {
-        let pos = state.selection.from();
-        if let Some(block_id) = state.doc.block_id_at(pos) {
+        let from = state.selection.from();
+        let to = state.selection.to();
+        if let Some(block_id) = state.doc.block_id_at(from) {
+            // Compute selection offsets relative to the block's content start
+            let block = crate::editor::state::find_block_at(&state.doc, from);
+            let (anchor_start, anchor_end) = if from != to {
+                if let Some(b) = &block {
+                    let rel_from = (from.saturating_sub(b.content_start)) as u32;
+                    let rel_to = (to.saturating_sub(b.content_start)).min(b.content.size()) as u32;
+                    if rel_from < rel_to {
+                        (Some(rel_from), Some(rel_to))
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None) // cursor, no text selection
+            };
             set_pending_block_id.set(Some(block_id));
+            set_pending_anchor_start.set(anchor_start);
+            set_pending_anchor_end.set(anchor_end);
             set_conversation_visible.set(true);
             return;
         }
     }
-    // No block found — toggle pane for document-level comments.
+    set_pending_block_id.set(None);
+    set_pending_anchor_start.set(None);
+    set_pending_anchor_end.set(None);
     set_conversation_visible.set(!conversation_visible.get_untracked());
 }
 

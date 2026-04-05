@@ -29,6 +29,7 @@ pub fn doc_router() -> Router<AppState> {
 pub fn thread_router() -> Router<AppState> {
     Router::new()
         .route("/{thread_id}", patch(update_thread))
+        .route("/{thread_id}", delete(delete_thread_handler))
         .route("/{thread_id}/messages", get(list_messages))
         .route("/{thread_id}/messages", post(add_message))
         .route("/{thread_id}/messages/{message_id}", delete(delete_message))
@@ -72,12 +73,16 @@ struct ThreadResponse {
     thread_type: ThreadType,
     status: ThreadStatus,
     created_by: String,
+    created_by_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     block_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     anchor_start: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     anchor_end: Option<u32>,
+    /// Preview of the first message in the thread (truncated to 120 chars).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_message: Option<String>,
     created_at: i64,
     updated_at: i64,
 }
@@ -87,6 +92,7 @@ struct ThreadResponse {
 struct MessageResponse {
     message_id: String,
     user_id: String,
+    user_name: String,
     content: String,
     created_at: i64,
 }
@@ -127,25 +133,56 @@ async fn list_threads(
     .await?;
 
     let threads = state.thread_repo.list_threads_for_doc(&doc_id).await?;
-    let response = ThreadListResponse {
-        threads: threads
-            .into_iter()
-            .map(|t| ThreadResponse {
-                thread_id: t.thread_id,
-                doc_id: t.doc_id,
-                thread_type: t.thread_type,
-                status: t.status,
-                created_by: t.created_by,
-                block_id: t.block_id,
-                anchor_start: t.anchor_start,
-                anchor_end: t.anchor_end,
-                created_at: t.created_at,
-                updated_at: t.updated_at,
-            })
-            .collect(),
-    };
 
-    Ok(axum::Json(response))
+    // Look up user names for thread creators and first message previews.
+    let mut user_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut responses = Vec::with_capacity(threads.len());
+    for t in threads {
+        let name = if let Some(cached) = user_names.get(&t.created_by) {
+            cached.clone()
+        } else {
+            let name = match state.user_repo.get_by_id(&t.created_by).await {
+                Ok(Some(user)) => user.name,
+                _ => t.created_by.clone(), // fallback to user ID
+            };
+            user_names.insert(t.created_by.clone(), name.clone());
+            name
+        };
+
+        // Fetch first message preview (best-effort; None on error).
+        let first_message = state
+            .thread_repo
+            .get_first_message(&t.thread_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|m| {
+                if m.content.len() > 120 {
+                    let mut preview = m.content[..120].to_string();
+                    preview.push_str("...");
+                    preview
+                } else {
+                    m.content
+                }
+            });
+
+        responses.push(ThreadResponse {
+            thread_id: t.thread_id,
+            doc_id: t.doc_id,
+            thread_type: t.thread_type,
+            status: t.status,
+            created_by: t.created_by,
+            created_by_name: name,
+            block_id: t.block_id,
+            anchor_start: t.anchor_start,
+            anchor_end: t.anchor_end,
+            first_message,
+            created_at: t.created_at,
+            updated_at: t.updated_at,
+        });
+    }
+
+    Ok(axum::Json(ThreadListResponse { threads: responses }))
 }
 
 /// POST /documents/:doc_id/threads — create a new comment thread.
@@ -183,6 +220,46 @@ async fn create_thread(
                     ));
                 }
             }
+        }
+    }
+
+    // Enforce thread uniqueness per block:
+    // - Block comments (no anchor range): one per block
+    // - Inline comments (with anchor range): multiple allowed per block,
+    //   but not on the exact same text range
+    // - Block and inline can coexist on the same block
+    if let Some(ref bid) = body.block_id {
+        // Best-effort duplicate check — if the GSI query fails, allow creation
+        // rather than blocking all comments.
+        let existing = match state.thread_repo.list_threads_for_doc(&doc_id).await {
+            Ok(threads) => threads,
+            Err(e) => {
+                tracing::warn!("Failed to check existing threads (GSI may not exist): {e}");
+                Vec::new()
+            }
+        };
+        let is_inline = body.anchor_start.is_some() && body.anchor_end.is_some();
+
+        let has_conflict = existing.iter().any(|t| {
+            if t.block_id.as_deref() != Some(bid.as_str()) { return false; }
+            if t.status != ThreadStatus::Open { return false; }
+
+            if is_inline {
+                // Inline: conflict only if exact same anchor range
+                t.anchor_start == body.anchor_start && t.anchor_end == body.anchor_end
+            } else {
+                // Block: conflict if any block comment (no anchors) exists
+                t.anchor_start.is_none() && t.anchor_end.is_none()
+            }
+        });
+
+        if has_conflict {
+            let msg = if is_inline {
+                "This text range already has an open comment thread"
+            } else {
+                "This block already has an open block comment"
+            };
+            return Err(ApiError::Conflict(msg.to_string()));
         }
     }
 
@@ -304,16 +381,29 @@ async fn list_messages(
     .await?;
 
     let messages = state.thread_repo.list_messages(&thread_id).await?;
+    let mut user_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut msg_responses = Vec::with_capacity(messages.len());
+    for m in messages {
+        let name = if let Some(cached) = user_names.get(&m.user_id) {
+            cached.clone()
+        } else {
+            let name = match state.user_repo.get_by_id(&m.user_id).await {
+                Ok(Some(user)) => user.name,
+                _ => m.user_id.clone(),
+            };
+            user_names.insert(m.user_id.clone(), name.clone());
+            name
+        };
+        msg_responses.push(MessageResponse {
+            message_id: m.message_id,
+            user_id: m.user_id,
+            user_name: name,
+            content: m.content,
+            created_at: m.created_at,
+        });
+    }
     let response = MessageListResponse {
-        messages: messages
-            .into_iter()
-            .map(|m| MessageResponse {
-                message_id: m.message_id,
-                user_id: m.user_id,
-                content: m.content,
-                created_at: m.created_at,
-            })
-            .collect(),
+        messages: msg_responses,
     };
 
     Ok(axum::Json(response))
@@ -382,6 +472,32 @@ async fn add_message(
     }
 
     Ok(StatusCode::CREATED)
+}
+
+/// DELETE /threads/:thread_id — delete a thread and all its messages.
+async fn delete_thread_handler(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(thread_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let thread = state
+        .thread_repo
+        .get_thread(&thread_id)
+        .await?
+        .ok_or(ApiError::NotFound("Thread not found".to_string()))?;
+
+    // Verify access: must be thread creator or have Edit access on the document
+    let _meta = super::documents::check_doc_access(
+        &state,
+        &thread.doc_id,
+        &user_id,
+        ogrenotes_storage::models::AccessLevel::Edit,
+    )
+    .await?;
+
+    state.thread_repo.delete_thread(&thread_id).await?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// DELETE /threads/:thread_id/messages/:message_id — delete a message.

@@ -1,5 +1,5 @@
 use super::state::{EditorState, Transaction};
-use super::transform::Step;
+use super::transform::{Step, StepMap};
 
 /// A plugin that can observe and modify editor state transitions.
 pub trait Plugin {
@@ -67,6 +67,29 @@ impl HistoryPlugin {
         }
     }
 
+    /// Remap all undo/redo entries through step maps from a concurrent change.
+    /// This keeps stored inverted steps' positions aligned with the current
+    /// document state, enabling correct undo after remote edits.
+    pub fn remap_through(&mut self, maps: &[StepMap]) {
+        if maps.is_empty() {
+            return;
+        }
+        for entry in &mut self.undo_stack {
+            for step in &mut entry.steps {
+                for map in maps {
+                    *step = step.map(map);
+                }
+            }
+        }
+        for entry in &mut self.redo_stack {
+            for step in &mut entry.steps {
+                for map in maps {
+                    *step = step.map(map);
+                }
+            }
+        }
+    }
+
     /// Record a transaction's steps for undo.
     pub fn record(&mut self, transaction: &Transaction, old_doc: &super::model::Node) {
         if !transaction.doc_changed {
@@ -79,6 +102,10 @@ impl HistoryPlugin {
         {
             return;
         }
+
+        // Remap existing undo/redo entries through this transaction's maps
+        // so their positions stay valid against the new document state.
+        self.remap_through(&transaction.maps);
 
         // Compute inverted steps
         let mut inverted = Vec::new();
@@ -384,5 +411,82 @@ mod tests {
         history.clear();
         assert!(!history.can_undo());
         assert!(!history.can_redo());
+    }
+
+    // ── Undo after concurrent edit (known bug) ──
+
+    #[test]
+    fn undo_list_wrap_after_concurrent_text_edit() {
+        // Reproduces: User A wraps paragraph in bullet list, User B edits text,
+        // User A undoes. The undo should unwrap the list while preserving B's edit.
+        //
+        // This test documents the expected correct behavior. It will fail until
+        // HistoryPlugin remaps undo step positions through concurrent changes.
+
+        use crate::editor::commands::toggle_list;
+        use std::cell::RefCell;
+
+        let state = EditorState::create_default(simple_doc());
+        let mut history = HistoryPlugin::new();
+
+        // ── User A: wrap paragraph in bullet list ──
+        let wrap_txn: RefCell<Option<Transaction>> = RefCell::new(None);
+        toggle_list(
+            NodeType::BulletList,
+            NodeType::ListItem,
+            &state,
+            Some(&|txn| { *wrap_txn.borrow_mut() = Some(txn); }),
+        );
+        let wrap_txn = wrap_txn.into_inner().expect("toggle_list should dispatch");
+        history.record(&wrap_txn, &state.doc);
+        let after_wrap = state.apply(wrap_txn);
+
+        // Verify: doc is now BulletList > ListItem > Paragraph("Hello world")
+        let list = after_wrap.doc.child(0).unwrap();
+        assert_eq!(list.node_type(), Some(NodeType::BulletList));
+        assert_eq!(list.text_content(), "Hello world");
+
+        // ── User B: concurrent text edit (simulate remote update) ──
+        // Insert " beautiful" after "Hello" inside the nested paragraph.
+        // Structure: Doc(0) > BulletList(1) > ListItem(2) > Paragraph(3) > "Hello world"
+        // "Hello" ends at position 3+5=8, so we insert at position 8.
+        let after_remote = {
+            let insert_pos = 8; // after "Hello" inside the nested para
+            let remote_state = EditorState {
+                selection: Selection::cursor(insert_pos),
+                ..after_wrap.clone()
+            };
+            let remote_txn = remote_state.transaction()
+                .insert_text(" beautiful")
+                .expect("insert should succeed");
+            // Do NOT record in history (remote changes aren't recorded),
+            // but DO remap existing undo entries through the remote change's maps.
+            history.remap_through(&remote_txn.maps);
+            after_wrap.apply(remote_txn)
+        };
+
+        // Verify: text is now "Hello beautiful world"
+        assert_eq!(after_remote.doc.child(0).unwrap().text_content(), "Hello beautiful world");
+
+        // ── User A: undo ──
+        let undo_txn = history.undo(&after_remote);
+
+        // The undo should succeed (not return None)
+        assert!(undo_txn.is_some(),
+            "Undo should succeed even after concurrent edit, but returned None \
+            (stale positions in inverted step)");
+
+        let after_undo = after_remote.apply(undo_txn.unwrap());
+
+        // The paragraph should be unwrapped from the list
+        let first = after_undo.doc.child(0).unwrap();
+        assert_eq!(first.node_type(), Some(NodeType::Paragraph),
+            "Undo should unwrap the list back to a paragraph, \
+            but got {:?}. Doc: {:?}", first.node_type(), after_undo.doc);
+
+        // User B's text edit should be preserved
+        assert!(first.text_content().contains("beautiful"),
+            "User B's concurrent edit should be preserved after undo, \
+            but got: '{}'. Doc: {:?}", first.text_content(), after_undo.doc);
     }
 }

@@ -3,71 +3,98 @@
 //! In debug builds (`cfg(debug_assertions)`), logging calls emit to the browser console
 //! when the global debug flag is enabled. In release builds, all logging compiles to nothing.
 //!
+//! # Levels
+//!
+//! - `window.__ogre_debug = true` — shows important events (enter, paste, collab, errors)
+//! - `window.__ogre_debug = "verbose"` — also shows per-keystroke events (input, keydown, backspace)
+//!
 //! # Usage
 //!
 //! ```rust,ignore
-//! use super::debug;
-//!
-//! debug::enable();  // Turn on logging (e.g., from a dev tools call)
-//! debug::log("input", "insertText fired", &[("data", "X"), ("pos", "5")]);
-//! debug::warn("paste", "empty clipboard data");
+//! debug::log("input", "insertText fired", &[("data", "X")]);  // verbose only
+//! debug::log("enter", "split_block", &[("pos", "5")]);         // always when enabled
+//! debug::warn("paste", "empty clipboard data");                 // always when enabled
 //! ```
-//!
-//! To enable from the browser console: `window.__ogre_debug = true`
 
 #[cfg(debug_assertions)]
 mod inner {
     use std::cell::Cell;
 
+    /// Debug level: 0 = off, 1 = normal, 2 = verbose (per-keystroke)
     thread_local! {
-        static ENABLED: Cell<bool> = const { Cell::new(false) };
-        /// Timestamp of last window.__ogre_debug check (ms since epoch).
-        static LAST_CHECK: Cell<f64> = const { Cell::new(0.0) };
+        static LEVEL: Cell<u8> = const { Cell::new(0) };
     }
 
-    /// Enable debug logging.
+    /// Categories that are verbose (per-keystroke). Only shown at level 2.
+    fn is_verbose_category(category: &str) -> bool {
+        matches!(category, "input" | "keydown" | "backspace" | "selection")
+    }
+
+    /// Enable debug logging at normal level.
     pub fn enable() {
-        ENABLED.with(|e| e.set(true));
+        LEVEL.with(|l| l.set(1));
     }
 
     /// Disable debug logging.
     pub fn disable() {
-        ENABLED.with(|e| e.set(false));
+        LEVEL.with(|l| l.set(0));
     }
 
-    /// Check if debug logging is enabled.
-    /// Checks `window.__ogre_debug` at most once per second to avoid
-    /// expensive WASM-JS boundary crossings on every call.
+    /// Check if debug logging is enabled (at any level).
+    /// Checks `window.__ogre_debug` at most once per second.
     pub fn is_enabled() -> bool {
-        ENABLED.with(|e| {
-            if e.get() {
-                return true;
+        get_level() > 0
+    }
+
+    /// Counter incremented on every call. Only checks `window.__ogre_debug`
+    /// every N calls instead of using `Date::now()` (avoids WASM-JS boundary crossing).
+    thread_local! {
+        static CALL_COUNT: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// How many calls between window.__ogre_debug checks.
+    const CHECK_INTERVAL: u32 = 500;
+
+    fn get_level() -> u8 {
+        LEVEL.with(|l| {
+            let cached = l.get();
+            if cached > 0 {
+                return cached;
             }
-            // Throttled check of window.__ogre_debug (once per second)
-            LAST_CHECK.with(|lc| {
-                let now = js_sys::Date::now();
-                if now - lc.get() > 1000.0 {
-                    lc.set(now);
-                    if let Some(window) = web_sys::window() {
-                        if let Ok(val) = js_sys::Reflect::get(&window, &"__ogre_debug".into()) {
-                            if val.is_truthy() {
-                                e.set(true); // Cache it so subsequent calls are fast
-                                return true;
+            // Only check the JS global every CHECK_INTERVAL calls (no Date::now needed)
+            CALL_COUNT.with(|c| {
+                let count = c.get().wrapping_add(1);
+                c.set(count);
+                if count % CHECK_INTERVAL != 0 {
+                    return 0;
+                }
+                if let Some(window) = web_sys::window() {
+                    if let Ok(val) = js_sys::Reflect::get(&window, &"__ogre_debug".into()) {
+                        if let Some(s) = val.as_string() {
+                            if s == "verbose" {
+                                l.set(2);
+                                return 2;
                             }
+                        }
+                        if val.is_truthy() {
+                            l.set(1);
+                            return 1;
                         }
                     }
                 }
-                false
+                0
             })
         })
     }
 
-    /// Log a debug message to the browser console.
-    /// `category` groups related messages (e.g., "input", "paste", "selection").
-    /// `message` is the main log line.
-    /// `fields` are key-value pairs for structured data.
+    /// Log a debug message. Verbose categories (input, keydown, backspace)
+    /// are only shown when `window.__ogre_debug = "verbose"`.
     pub fn log(category: &str, message: &str, fields: &[(&str, &str)]) {
-        if !is_enabled() {
+        let level = get_level();
+        if level == 0 {
+            return;
+        }
+        if level < 2 && is_verbose_category(category) {
             return;
         }
         let mut out = format!("[editor:{category}] {message}");
@@ -77,20 +104,16 @@ mod inner {
         web_sys::console::log_1(&out.into());
     }
 
-    /// Log a warning to the browser console.
+    /// Log a warning. Always emitted regardless of debug flag — warnings
+    /// indicate problems that shouldn't be silently swallowed.
     pub fn warn(category: &str, message: &str) {
-        if !is_enabled() {
-            return;
-        }
         let out = format!("[editor:{category}] {message}");
         web_sys::console::warn_1(&out.into());
     }
 
-    /// Log an error to the browser console (always emitted when debug is enabled).
+    /// Log an error. Always emitted regardless of debug flag — errors are
+    /// diagnostics that should never be silenced.
     pub fn error(category: &str, message: &str) {
-        if !is_enabled() {
-            return;
-        }
         let out = format!("[editor:{category}] {message}");
         web_sys::console::error_1(&out.into());
     }

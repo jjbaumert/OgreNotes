@@ -3730,3 +3730,239 @@ fn enter_on_empty_list_item_exits_list() {
 
     cleanup(&container);
 }
+
+// ── Regression: cursor position after select + backspace + type ──
+
+#[wasm_bindgen_test]
+fn cursor_after_select_backspace_then_type() {
+    // Reproduce: type "1234", Enter, select "1234", backspace, type "a"
+    // Cursor should be AFTER "a", not before it.
+    let container = create_container();
+    let doc = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::empty(),
+        )]),
+    );
+    let (view, txns) = create_editor(container.clone(), doc);
+
+    // Step 1: Type "1234"
+    set_cursor(&view, 1);
+    dispatch_before_input(view.container(), "insertText", Some("1234"));
+    let state = apply_all(&view, &txns);
+    txns.borrow_mut().clear();
+    view.update_state(state.clone());
+    assert_eq!(state.doc.child(0).unwrap().text_content(), "1234");
+
+    // Step 2: Press Enter at end of "1234"
+    set_cursor(&view, 5);
+    dispatch_before_input(view.container(), "insertParagraph", None);
+    let state = apply_all(&view, &txns);
+    txns.borrow_mut().clear();
+    view.update_state(state.clone());
+    assert_eq!(state.doc.child_count(), 2, "should have two paragraphs after Enter");
+
+    // Step 3: Ctrl+A — select entire document content
+    // Use content boundaries (1 to content_size-1) since position 0 and content_size
+    // are doc-level boundaries that can't be represented in DOM selection.
+    // Real Ctrl+A in the browser selects all text within contenteditable,
+    // which maps to the first textblock start through last textblock end.
+    let first_start = 1; // first paragraph content_start
+    let last_end = state.doc.content_size(); // end of all content
+    set_selection(&view, first_start, last_end);
+
+    // Step 4: Backspace to delete everything
+    dispatch_before_input(view.container(), "deleteContentBackward", None);
+    let state = apply_all(&view, &txns);
+    txns.borrow_mut().clear();
+    view.update_state(state.clone());
+    let cursor_after_delete = state.selection.from();
+    assert_eq!(state.doc.text_content(), "",
+        "doc should be empty after Ctrl+A backspace, got: '{}'", state.doc.text_content());
+
+    // Step 5: Type "123" one character at a time WITHOUT manually setting cursor.
+    // Let the DOM selection flow naturally after each render, just like real typing.
+    let mut state = state;
+    for ch in ["1", "2", "3"] {
+        dispatch_before_input(view.container(), "insertText", Some(ch));
+        state = apply_all(&view, &txns);
+        txns.borrow_mut().clear();
+        view.update_state(state.clone());
+    }
+
+    // Verify: text is "123" in order, not scrambled
+    let para_text = state.doc.child(0).unwrap().text_content();
+    assert_eq!(para_text, "123",
+        "paragraph should be '123', got: '{para_text}'");
+
+    // Verify: cursor is at position 4 (para_open=1 + "123"=3)
+    assert_eq!(state.selection.from(), 4,
+        "model cursor should be at position 4 (after '123'), got {}",
+        state.selection.from());
+    assert!(state.selection.empty(), "should be a cursor, not a range");
+
+    // Verify DOM selection matches the model
+    if let Some(dom_sel) = view.read_dom_selection() {
+        assert_eq!(dom_sel.from(), 4,
+            "DOM cursor should be at position 4, got {}", dom_sel.from());
+    }
+
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn cursor_after_select_all_backspace_then_type_simple() {
+    // Simpler version: single paragraph "abcde", select all, backspace, type "x"
+    let container = create_container();
+    let doc = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("abcde")]),
+        )]),
+    );
+    let (view, txns) = create_editor(container.clone(), doc);
+
+    // Select all text in paragraph (1..6)
+    set_selection(&view, 1, 6);
+
+    // Backspace
+    dispatch_before_input(view.container(), "deleteContentBackward", None);
+    let state = apply_all(&view, &txns);
+    txns.borrow_mut().clear();
+    view.update_state(state.clone());
+    assert_eq!(state.doc.child(0).unwrap().text_content(), "",
+        "paragraph should be empty after deleting all text");
+
+    // Type "x"
+    let cursor_after_delete = state.selection.from();
+    set_cursor(&view, cursor_after_delete);
+    dispatch_before_input(view.container(), "insertText", Some("x"));
+    let state = apply_all(&view, &txns);
+    txns.borrow_mut().clear();
+    view.update_state(state.clone());
+
+    // Verify content
+    assert_eq!(state.doc.child(0).unwrap().text_content(), "x");
+
+    // Verify cursor is AFTER "x" (position 2)
+    assert_eq!(state.selection.from(), 2,
+        "cursor should be at position 2 (after 'x'), got {}",
+        state.selection.from());
+
+    // Verify DOM selection matches
+    if let Some(dom_sel) = view.read_dom_selection() {
+        assert_eq!(dom_sel.from(), 2,
+            "DOM cursor should be at position 2, got {}", dom_sel.from());
+    }
+
+    cleanup(&container);
+}
+
+// ── Link click behavior ──
+
+#[wasm_bindgen_test]
+fn link_renders_with_href_and_target_blank() {
+    // A document with a link mark should render an <a> with href and target="_blank"
+    let container = create_container();
+    let link = Mark::new(MarkType::Link).with_attr("href", "https://example.com");
+    let doc = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![
+                Node::text("before "),
+                Node::text_with_marks("link text", vec![link]),
+                Node::text(" after"),
+            ]),
+        )]),
+    );
+    let (view, _txns) = create_editor(container.clone(), doc);
+
+    let html = inner_html(&view);
+    assert!(html.contains("<a"), "should render an <a> element, got: {html}");
+    assert!(html.contains("href=\"https://example.com\""),
+        "should have href attribute, got: {html}");
+    assert!(html.contains("target=\"_blank\""),
+        "should have target=_blank, got: {html}");
+    assert!(html.contains("link text"),
+        "should contain link text, got: {html}");
+
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn ctrl_click_on_link_prevents_default() {
+    // Ctrl+click on a link should preventDefault (to open in new tab)
+    // Regular click should NOT preventDefault (cursor positioning)
+    let container = create_container();
+    let link = Mark::new(MarkType::Link).with_attr("href", "https://example.com");
+    let doc = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text_with_marks("click me", vec![link])]),
+        )]),
+    );
+    let (view, _txns) = create_editor(container.clone(), doc);
+
+    // Find the <a> element in the rendered DOM
+    let anchor = view.container().query_selector("a").unwrap()
+        .expect("should have an <a> element");
+
+    // Regular click — should NOT prevent default (cursor positioning)
+    {
+        let init = web_sys::MouseEventInit::new();
+        init.set_bubbles(true);
+        init.set_cancelable(true);
+        init.set_ctrl_key(false);
+        init.set_meta_key(false);
+        let event = web_sys::MouseEvent::new_with_mouse_event_init_dict("click", &init).unwrap();
+        anchor.dispatch_event(&event).unwrap();
+        assert!(!event.default_prevented(),
+            "regular click should NOT prevent default");
+    }
+
+    // Ctrl+click — should prevent default (open link)
+    {
+        let init = web_sys::MouseEventInit::new();
+        init.set_bubbles(true);
+        init.set_cancelable(true);
+        init.set_ctrl_key(true);
+        let event = web_sys::MouseEvent::new_with_mouse_event_init_dict("click", &init).unwrap();
+        anchor.dispatch_event(&event).unwrap();
+        assert!(event.default_prevented(),
+            "Ctrl+click on link should prevent default (opens in new tab)");
+    }
+
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn ctrl_click_on_non_link_does_nothing() {
+    // Ctrl+click on regular text (not a link) should not preventDefault
+    let container = create_container();
+    let doc = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("plain text")]),
+        )]),
+    );
+    let (view, _txns) = create_editor(container.clone(), doc);
+
+    let para = view.container().query_selector("p").unwrap()
+        .expect("should have a <p> element");
+
+    let init = web_sys::MouseEventInit::new();
+    init.set_bubbles(true);
+    init.set_cancelable(true);
+    init.set_ctrl_key(true);
+    let event = web_sys::MouseEvent::new_with_mouse_event_init_dict("click", &init).unwrap();
+    para.dispatch_event(&event).unwrap();
+    assert!(!event.default_prevented(),
+        "Ctrl+click on non-link should NOT prevent default");
+
+    cleanup(&container);
+}

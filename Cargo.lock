@@ -2052,9 +2052,13 @@ dependencies = [
 name = "ogrenotes-collab"
 version = "0.1.0"
 dependencies = [
+ "aws-config",
+ "aws-sdk-dynamodb",
+ "aws-sdk-s3",
  "dashmap",
  "fred",
  "ogrenotes-common",
+ "ogrenotes-storage",
  "proptest",
  "serde",
  "serde_json",
