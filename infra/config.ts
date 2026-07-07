@@ -163,15 +163,13 @@ export const environments: Record<string, EnvConfig> = {
     qdrantSpot: true,
     containerInsights: false,
     cpuArch: 'X86_64',
-    // Scale to zero outside dev hours (Eastern, DST-aware). Two UP windows:
-    // Tue 4:30p→Wed 12:30a, and Fri 4:30p→Mon 12:30a (the weekend, continuous).
-    offHours: {
-      timezone: 'America/New_York',
-      windows: [
-        { up: 'cron(30 16 ? * TUE *)', down: 'cron(30 0 ? * WED *)' },
-        { up: 'cron(30 16 ? * FRI *)', down: 'cron(30 0 ? * MON *)' },
-      ],
-    },
+    // offHours (scheduled scale-to-zero) is DISABLED: when down, the ALB
+    // target group is empty and requests get a hard 503 until the next
+    // scheduled `up` — there is no wake-on-use. That fails the "only delay
+    // a page, never deny it" bar, so this stack runs 24/7. Re-enable only
+    // once a request-triggered wake path exists. Windows kept for reference:
+    //   { up: 'cron(30 16 ? * TUE *)', down: 'cron(30 0 ? * WED *)' },
+    //   { up: 'cron(30 16 ? * FRI *)', down: 'cron(30 0 ? * MON *)' },
     aiEnabled: false,
     cloudMapNamespace: 'ogrenote.local',
   },
