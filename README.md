@@ -33,9 +33,18 @@ crates/
 - Document version history with diff and restore
 - Notifications (document opened, comments, sharing)
 - Workspaces with member management
-- Admin user management (list, disable/enable, promote/demote) with `ADMIN_EMAILS` bootstrap
 - Import/export (HTML, Markdown, CSV, XLSX)
 - Blob upload/download with presigned S3 URLs
+- Document templates with placeholder / mail-merge fill (basic placeholder substitution)
+- Third-party embeds (static provider allowlist, sandboxed iframe render)
+- Kanban board and calendar views
+
+### Enterprise
+- MFA / TOTP enrollment and challenge
+- SAML SSO (per-workspace configuration)
+- SCIM user provisioning (token-authenticated)
+- Audit logging — admin-mutation and security-event trails, with a retention worker
+- Admin console: user management (list, disable/enable, promote/demote) with `ADMIN_EMAILS` bootstrap, plus audit-log and metrics views
 
 ### Search (Phase 1 + 2)
 - BM25 keyword search via Tantivy (title 2x boost, body, snippets)
@@ -62,19 +71,19 @@ crates/
 - Document outline (table of contents)
 - File browser with sorting
 - Search dialog (Ctrl+K) with debounced hybrid search
+- AI assistant dialog with streaming (SSE) responses
+- Document relationship panel (add/remove/typeahead)
+- In-document find and replace
+- Template picker
+- Admin console pages (users, audit, metrics)
+- Responsive mobile layout with touch gestures and drawer navigation
 - Share dialog
 - Notification bell
 
 ## What's Not Built Yet
-- Frontend UI for the AI assistant (backend is ready, needs SSE client + dialog)
-- Frontend UI for document relationships (backend CRUD endpoints exist)
-- Contextual chunk enrichment (LLM-generated context headers at embedding time)
-- Backfill script for re-embedding existing documents
-- In-document find and replace
-- Mobile layout
-- Admin console UI (backend API endpoints exist, no frontend yet)
-- Templates
-- Embeds (third-party content)
+- Contextual chunk enrichment (LLM-generated context headers at embedding time) — the chunker currently prepends a static title header only
+- Backfill script for re-embedding existing documents — imported docs aren't indexed into Qdrant until first edited (a v1 limitation)
+- Per-workspace embed domain allowlist — embeds ship with a static provider allowlist; per-workspace configuration is stubbed
 
 ## Local Development
 
