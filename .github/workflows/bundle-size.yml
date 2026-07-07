@@ -1,0 +1,145 @@
+name: WASM bundle size
+
+# Phase 5 M-P9 piece B — bundle-size CI gate.
+#
+# Builds the frontend with `trunk build --release` (so wasm-opt=z
+# runs, matching the deployed artifact), measures the gzipped
+# `*_bg.wasm`, and fails the build if it exceeds the threshold
+# codified in design/performance-budgets.md.
+#
+# Threshold tracks the current measured baseline plus ~7% headroom,
+# not the aspirational 800 KB figure. A separate optimization
+# track tightens it; this gate just stops further regression. See
+# the "Ratchet, not anchor" subsection in performance-budgets.md.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: bundle-size-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Hard threshold in bytes — change this only in lockstep with
+  # `design/performance-budgets.md`'s "CI gate threshold" row. The
+  # gate steps DOWN as bundle-shrinking work lands; bumps UP require
+  # an explicit, doc-noted reason.
+  #
+  # 2026-06-03 re-baseline: the measured bundle reached 2,168,852 B
+  # gzipped (~2.07 MiB) — ~2 weeks of accumulated Phase-5 features off
+  # the stale 1.87 MB / 2026-05-21 baseline (link sharing was the last
+  # ~10–30 KB that crossed the old 2.0 MiB gate).
+  #
+  # 2026-06-04 ratchet DOWN: deploy builds now apply size-optimizing
+  # profile overrides (CARGO_PROFILE_RELEASE_OPT_LEVEL=z, LTO=fat,
+  # CODEGEN_UNITS=1, STRIP, PANIC=abort — see the "Build frontend" step
+  # and Dockerfile Stage 2) plus wasm-opt --all-features. Measured
+  # bundle dropped to ~1,425,747 B gzipped (~1.36 MiB), a ~34% cut.
+  # Gate set to the new measurement + ~9% headroom (absorbs local↔CI
+  # toolchain drift); tighten after the first CI baseline confirms.
+  # See performance-budgets.md → "Bundle size".
+  #
+  # 2026-07-02 rebaseline: #142 Phase 2 mail-merge added the values-fill
+  # form + the placeholder DTO on TemplateItem, pushing the measured
+  # bundle to 1,561,511 B — ~11 KB over the previous 1,550,000 limit.
+  # Bumping to 1,600,000 (~1.52 MiB) with ~40 KB headroom to absorb
+  # Phase 3 (Sample gallery) without a further churn.
+  #
+  # 2026-07-04 rebaseline: #137 Kanban Phase 2 added the card modal,
+  # click observer, and column/card commands; #136 Calendar fixes
+  # added the data-atom-size DOM walk handlers. Measured bundle
+  # 1,616,644 B — ~17 KB over the previous 1,600,000 limit.
+  # Bumping to 1,650,000 (~1.57 MiB) with ~33 KB headroom for
+  # incremental Phase 5 work.
+  WASM_GZ_LIMIT: "1650000"   # ~1.57 MiB
+  # Soft regression budget — a no-op-change PR that adds > 5% to the
+  # bundle (without crossing the hard limit) gets a warning so a
+  # quiet drift can be caught before it eats the headroom.
+  WASM_GZ_SOFT_DELTA_PCT: "5"
+
+jobs:
+  bundle-size:
+    name: WASM bundle size gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + wasm32)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            frontend -> target
+          shared-key: bundle-size
+
+      - name: Install trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      - name: Install wasm-bindgen-cli (matches trunk's invocation)
+        uses: jetli/wasm-bindgen-action@v0.2.0
+        with:
+          version: latest
+
+      - name: Build frontend (release)
+        working-directory: frontend
+        # Size-optimizing profile overrides, applied here (not in
+        # frontend/Cargo.toml [profile.release]) so local dev / e2e builds
+        # stay fast. These MUST match the Dockerfile Stage 2 build so the
+        # gate measures exactly what ships. wasm-opt=z still runs post-link
+        # via index.html's data-wasm-opt directive.
+        env:
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: z
+          CARGO_PROFILE_RELEASE_LTO: fat
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+          CARGO_PROFILE_RELEASE_STRIP: "true"
+          CARGO_PROFILE_RELEASE_PANIC: abort
+        run: trunk build --release
+
+      - name: Measure WASM bundle
+        id: measure
+        working-directory: frontend/dist
+        run: |
+          set -euo pipefail
+          WASM=$(ls *_bg.wasm 2>/dev/null | head -1)
+          if [ -z "$WASM" ]; then
+            echo "::error::No *_bg.wasm produced in frontend/dist/"
+            ls -la
+            exit 1
+          fi
+          RAW=$(stat -c%s "$WASM")
+          GZ=$(gzip -9 -c "$WASM" | wc -c)
+          echo "wasm=$WASM"  | tee -a "$GITHUB_OUTPUT"
+          echo "raw=$RAW"    | tee -a "$GITHUB_OUTPUT"
+          echo "gz=$GZ"      | tee -a "$GITHUB_OUTPUT"
+          {
+            echo "## WASM bundle size"
+            echo ""
+            echo "| metric | bytes | human |"
+            echo "|---|---|---|"
+            printf "| raw | %s | %s |\n"     "$RAW" "$(numfmt --to=iec --suffix=B "$RAW")"
+            printf "| gzip -9 | %s | %s |\n" "$GZ"  "$(numfmt --to=iec --suffix=B "$GZ")"
+            printf "| limit | %s | %s |\n"   "${WASM_GZ_LIMIT}" "$(numfmt --to=iec --suffix=B "${WASM_GZ_LIMIT}")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Gate on threshold
+        env:
+          GZ: ${{ steps.measure.outputs.gz }}
+        run: |
+          set -euo pipefail
+          if [ "$GZ" -gt "$WASM_GZ_LIMIT" ]; then
+            echo "::error::WASM bundle ${GZ} bytes > limit ${WASM_GZ_LIMIT} bytes (gzipped)."
+            echo "See design/performance-budgets.md → 'Bundle size'."
+            exit 1
+          fi
+          echo "::notice::WASM bundle within budget: ${GZ} / ${WASM_GZ_LIMIT} (gz)."

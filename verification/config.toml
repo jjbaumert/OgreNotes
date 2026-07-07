@@ -1,0 +1,36 @@
+# verification/config.toml — per-project knobs for OgreNotes.
+#
+# Schema and rationale: verification/config.toml.example
+# Read by all four sub-agents before they act.
+
+[issue_tracker]
+kind = "github"
+repo = ""   # use the local repo's gh default
+
+[planner]
+default_effort_unit = "minutes"
+ask_clarifying_questions = true
+
+[api_tester]
+base_url = "http://localhost:3000"
+curl_max_time_secs = 30
+production_host_patterns = ["prod.", "production."]
+
+[ticket_writer]
+auto_file = false
+default_labels = ["verification-finding"]
+default_assignee = ""
+duplicate_check = true
+
+[specialists]
+frontend = "frontend-doctor"
+api = "api-tester"
+human = "human-instructor"
+perf = "perf-investigator"
+
+[perf_investigator]
+default_samples = 20
+default_p95_threshold_ms = 500
+default_p99_threshold_ms = 2000
+profilers_available = false
+cargo_bloat_available = false

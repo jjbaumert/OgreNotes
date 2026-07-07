@@ -1,0 +1,173 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ─── Tier 1: unit / lib tests ───────────────────────────────────
+  # Fast path (~1 min warm): backend lib tests + 500+ frontend unit
+  # tests. The collab crate's `redis_pubsub::tests` module needs a
+  # live Redis at localhost:6379 — provided here as a service container
+  # rather than the full docker-compose stack the integration job uses,
+  # so this job stays cheap. DDB Local / MinIO are NOT here; any test
+  # that needs them belongs in the integration job.
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # samael's `xmlsec` feature wraps libxml2 + xmlsec1 for SAML
+      # signature verification. Mirrors the Dockerfile (commit
+      # 45e086e) and playwright.yml (commit 508b1c3) — ci.yml was
+      # missed when the SAML feature went live with 0b8aee1, which
+      # is why unit + integration have been red since 2026-05-14.
+      - name: Install xmlsec1 + clang (samael dependencies)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libssl-dev \
+            libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
+            clang libclang-dev
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            frontend -> target
+
+      - name: Workspace lib tests
+        run: cargo test --workspace --lib --locked
+
+      - name: Frontend lib tests
+        working-directory: frontend
+        run: cargo test --lib --locked
+
+  # ─── Supply-chain audit: cargo-deny ─────────────────────────────
+  # License policy + RUSTSEC advisories + source allow-list, driven by
+  # deny.toml at the repo root. Independent of the test jobs: no infra,
+  # no xmlsec build deps — the action ships a prebuilt cargo-deny binary,
+  # so this stays a sub-minute check. `all-features` in deny.toml means
+  # the optional xlsx/docx/pdf/samael deps are audited too.
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check all
+
+  # ─── Tier 2: integration tests ──────────────────────────────────
+  # Spins up the local compose stack (DynamoDB Local, MinIO, Redis)
+  # and runs the API crate's full test suite. Each test creates its
+  # own isolated DynamoDB table + S3 bucket in-process.
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # The integration test build produces ~24 separate test binaries,
+      # each linking the full dep graph. Without this step the runner
+      # disk fills mid-link and `ld` SIGBUSes (collect2: fatal error: ld
+      # terminated with signal 7 [Bus error]). Removes ~30 GB of preinstalled
+      # tooling we don't use (Android SDK, GHC, .NET, dotnet runtimes).
+      - name: Free disk space on runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # See the unit job's identical step for context — samael's
+      # xmlsec feature needs these at compile time.
+      - name: Install xmlsec1 + clang (samael dependencies)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libssl-dev \
+            libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
+            clang libclang-dev
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          shared-key: integration
+
+      - name: Start infra (DynamoDB / MinIO / Redis)
+        run: docker compose up -d
+
+      - name: Wait for services
+        run: |
+          for port in 8000 9000 6379; do
+            echo "Waiting for port $port..."
+            for i in $(seq 1 30); do
+              if nc -z 127.0.0.1 "$port"; then
+                echo "  port $port ready"
+                break
+              fi
+              sleep 1
+            done
+          done
+
+      # `--no-fail-fast` so all test binaries run even if one fails.
+      # Default cargo test aborts at the first failing binary, which
+      # masked the camelCase detail-JSON bug for 4 days (after the
+      # earlier xmlsec1 outage cleared, the first binary to actually
+      # run alphabetically failed and hid every binary after it). Cost
+      # of running everything is small (~30s); benefit is seeing the
+      # full failure set in one run.
+      # NOTE: the SAML happy-path tests in test_saml_acs_happy.rs
+      # SKIP on this runner. We tried enforcing them with
+      # OGRE_REQUIRE_SAML_HAPPY=1 and the run proved ubuntu-latest's
+      # xmlsec1 is affected by the same samael 0.0.18 in-process
+      # bindings bug as the Fedora dev box (xmlsec aborts at
+      # xmldsig.c:442 — "in-process xmlsec cannot verify a known-good
+      # signature"), so there is no available runner where samael's
+      # verify works in-process. The happy path therefore stays a
+      # manual-runbook check against a real IdP (see the file header
+      # and runbook/saml-config.md); the test self-activates the day a
+      # runner ships a working xmlsec. Do NOT re-add the enforce var
+      # until a probe confirms in-process verify works here.
+      - name: API integration tests
+        run: cargo test -p ogrenotes-api --locked --no-fail-fast
+
+      - name: Compose logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Stop infra
+        if: always()
+        run: docker compose down -v

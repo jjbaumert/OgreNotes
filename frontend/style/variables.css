@@ -1,0 +1,60 @@
+/* Non-color design tokens.
+ *
+ * Color tokens have moved to:
+ *   - `tokens-light.css` — semantic color tokens for light mode
+ *   - `tokens-dark.css`  — dark-mode overrides, scoped to
+ *                          `:root[data-theme="dark"]`
+ *
+ * The split is part of Phase 5 M-P1 (design-token foundation). Keep
+ * spacing, layout, typography, radii, breakpoints, and mobile-chrome
+ * values here — anything that doesn't change between light + dark.
+ */
+
+:root {
+  /* Typography */
+  --font-ui: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'Cascadia Code', monospace;
+  --font-doc-heading: 'Inter', system-ui, sans-serif;
+  --font-doc-body: 'Inter', system-ui, sans-serif;
+
+  /* Spacing */
+  --space-unit: 4px;
+  --space-xs: calc(var(--space-unit) * 1);
+  --space-sm: calc(var(--space-unit) * 2);
+  --space-md: calc(var(--space-unit) * 4);
+  --space-lg: calc(var(--space-unit) * 6);
+  --space-xl: calc(var(--space-unit) * 8);
+
+  /* Layout */
+  /* Editor column width on wide screens. 720px is the classic prose-
+   * readability ceiling (~80 chars), but it leaves wide screens with
+   * substantial empty bands on either side and squeezes tables, code
+   * blocks, and side-by-side content. 1080px (~110 chars) is the
+   * upper end of comfortable prose width while giving meaningful
+   * canvas room for wider content. Tightens automatically on tablet
+   * via `.editor-content` padding rules in responsive.css. */
+  --content-max-width: 1080px;
+  --sidebar-width: 240px;
+  --sidebar-collapsed: 48px;
+  --toolbar-height: 44px;
+  --outline-width: 220px;
+  --conversation-width: 280px;
+
+  /* Breakpoints (used in @media queries via plain values; tokens are for documentation/JS use) */
+  --bp-mobile: 640px;
+  --bp-tablet: 1024px;
+
+  /* Mobile chrome */
+  --mobile-toolbar-height: 44px;
+  --mobile-drawer-width: 88vw;
+  --touch-target-min: 44px;
+  /* Used by mobile overlays (notification dropdown, comment popup) to
+   * sit just below the doc-header. Tracks the header's effective
+   * vertical footprint — keep in sync if `.doc-header` gains rows. */
+  --mobile-header-offset: 56px;
+
+  /* Borders */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+}

@@ -1,0 +1,25 @@
+[package]
+name = "ogrenotes-load"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Out of the main workspace on purpose — goose pulls a different
+# tokio/reqwest stack than the API server and we don't want its
+# dep tree to enter the main `cargo build` graph. Root Cargo.toml's
+# `exclude` lists this directory.
+
+[[bin]]
+name = "load"
+path = "src/main.rs"
+
+[dependencies]
+goose = "0.17"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Goose's get_request_builder returns reqwest::RequestBuilder; the
+# crate is in goose's tree but not re-exported, so we depend on it
+# directly to name the type. Goose 0.17 pins reqwest 0.11 — we have
+# to match exactly or the RequestBuilder types diverge.
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }

@@ -1,0 +1,210 @@
+name: WASM browser tests
+
+# Runs the frontend's wasm-bindgen-test integration suite under headless
+# Firefox against a freshly-booted local stack (DynamoDB Local + MinIO +
+# Redis + axum server). These tests exercise the WebSocket protocol
+# directly from a real browser-like environment — they catch regressions
+# that backend integration tests can't see (wire-format mismatches that
+# only manifest on the WASM side, browser-side message framing, etc).
+#
+# Triggers per push + PR rather than nightly (unlike playwright.yml)
+# because the wasm-pack invocation is the cheap part — the slow part is
+# the docker-compose + axum-build, and we already pay that in the
+# `integration` job of ci.yml. ~5-7 min wall-clock on a cold cache.
+#
+# Currently runs:
+#   - frontend/tests/collab_e2e.rs::test_ws_connects_and_stays_open
+#   - frontend/tests/collab_e2e.rs::test_two_clients_sync_update
+#   - frontend/tests/collab_e2e.rs::test_reply_broadcasts_comment_event_to_peers
+#   - frontend/tests/collab_e2e.rs::test_ws_no_immediate_disconnect
+#
+# To extend: drop new tests into frontend/tests/collab_e2e.rs (or a new
+# *.rs file under frontend/tests/) and add the corresponding `--test`
+# argument to the wasm-pack step below.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: wasm-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # AWS SDK shims so the server + setup_dev binary talk to DynamoDB
+  # Local + MinIO instead of real AWS. Mirrors playwright.yml exactly
+  # so the two workflows can share the same Swatinem/rust-cache key
+  # and warm each other's caches.
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT_URL_DYNAMODB: http://127.0.0.1:8000
+  AWS_ENDPOINT_URL_S3: http://127.0.0.1:9000
+  DYNAMODB_TABLE_PREFIX: "ci-"
+  S3_BUCKET: "ci-ogrenotes"
+  REDIS_URL: "redis://127.0.0.1:6379"
+  DEV_MODE: "true"
+  JWT_SECRET: "ci-jwt-secret-that-is-at-least-32-bytes-long"
+  OAUTH_CLIENT_ID: "ci-not-used"
+  OAUTH_CLIENT_SECRET: "ci-not-used"
+  OAUTH_REDIRECT_URI: "http://localhost:3000/auth/callback"
+  SEARCH_INDEX_PATH: "/tmp/ogrenotes-ci-search"
+  API_PORT: "3000"
+
+jobs:
+  collab-e2e:
+    name: collab_e2e (headless Firefox)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # ─── System libs ──────────────────────────────────────────
+      # samael's `xmlsec` feature (SAML signature verification)
+      # needs libxml2 + xmlsec1 + clang at compile time. The
+      # Dockerfile got these in 45e086e; playwright.yml in 508b1c3;
+      # ci.yml in 402aae0; this workflow was missed all three times.
+      # `cargo run --bin setup_dev` (Provision DDB step) compiles
+      # the full workspace including samael, so the build crashes
+      # here without these packages.
+      - name: Install xmlsec1 + clang (samael dependencies)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libssl-dev \
+            libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
+            clang libclang-dev
+
+      # ─── Toolchain ────────────────────────────────────────────
+      - name: Install Rust (stable + wasm32)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            frontend -> target
+          # Sharing the playwright cache key would conflict — both jobs
+          # write to the same target dirs but with different feature
+          # configurations. Use a dedicated key.
+          shared-key: wasm-tests
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      # geckodriver + Firefox are preinstalled on ubuntu-latest. wasm-pack
+      # uses them transparently when --firefox is passed. If the runner
+      # image ever drops them this step starts to fail with "no driver
+      # found"; fix by adding `sudo apt-get install -y firefox-geckodriver`.
+
+      # ─── Infra ────────────────────────────────────────────────
+      - name: Start infra (DynamoDB / MinIO / Redis)
+        run: docker compose up -d
+
+      - name: Wait for services
+        run: |
+          for port in 8000 9000 6379; do
+            echo "Waiting for port $port..."
+            for i in $(seq 1 30); do
+              if nc -z 127.0.0.1 "$port"; then
+                echo "  port $port ready"
+                break
+              fi
+              sleep 1
+            done
+          done
+
+      # Strip the `pdf` feature here for the same reason as the
+      # axum build below — symmetric to playwright.yml — and apply
+      # it to `setup_dev` too because it lives in the same crate
+      # and inherits the same default feature set. setup_dev is a
+      # pure DDB + S3 provisioner; it doesn't touch the pdf code
+      # paths.
+      - name: Provision DynamoDB table + S3 bucket
+        run: |
+          cargo run --locked --bin setup_dev -p ogrenotes-api \
+            --no-default-features --features "dev-login,xlsx,docx"
+
+      # ─── Start API server ─────────────────────────────────────
+      # collab_e2e expects the server at http://localhost:3000 and uses
+      # the dev-login endpoint to mint JWTs, so DEV_MODE=true is
+      # mandatory (set in env: above).
+      # Strip the `pdf` feature from the axum build — same fix as
+      # playwright.yml (532fe94). The collab_e2e tests exercise WS
+      # connect / sync / comment broadcast paths only; no PDF
+      # import or export is involved. Without this strip, the cold
+      # cargo build of pdf-extract + printpdf + ~70 transitive
+      # crates pushes the wall-clock past the 25-minute job budget
+      # and traps the workflow in a doom loop (cold build → 25m
+      # timeout → no cache save → cold build again). PDF
+      # correctness is covered by ci.yml's default-feature build
+      # via `crates/api/tests/test_import_pdf_e2e.rs`.
+      - name: Build axum server (release)
+        run: |
+          cargo build --release --locked --bin ogrenotes-api \
+            --no-default-features --features "dev-login,xlsx,docx"
+
+      - name: Start axum server
+        run: |
+          mkdir -p /tmp/ci-logs
+          ./target/release/ogrenotes-api \
+            > /tmp/ci-logs/server.log 2>&1 &
+          echo $! > /tmp/ci-logs/server.pid
+
+      - name: Wait for server
+        run: |
+          # 90 iterations × 2s = 3 min. Mirrors playwright.yml.
+          for i in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:3000/api/v1/auth/dev-login \
+                -H 'content-type: application/json' \
+                -d '{"email":"healthcheck@ci"}' >/dev/null; then
+              echo "server ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "server failed to start" >&2
+          tail -n 200 /tmp/ci-logs/server.log
+          exit 1
+
+      # ─── Run wasm-bindgen tests ───────────────────────────────
+      # `--test collab_e2e` selects the integration test target;
+      # everything after the bare `--` is forwarded to cargo by
+      # wasm-pack. Run from `frontend/` because that's the wasm crate.
+      - name: Run collab_e2e under headless Firefox
+        working-directory: frontend
+        run: |
+          wasm-pack test --headless --firefox -- --test collab_e2e
+
+      # ─── Teardown ─────────────────────────────────────────────
+      - name: Stop axum server
+        if: always()
+        run: |
+          if [ -f /tmp/ci-logs/server.pid ]; then
+            kill "$(cat /tmp/ci-logs/server.pid)" || true
+          fi
+
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-tests-server-log
+          path: /tmp/ci-logs/server.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Compose logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Stop infra
+        if: always()
+        run: docker compose down -v

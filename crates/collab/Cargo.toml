@@ -1,0 +1,82 @@
+[package]
+name = "ogrenotes-collab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+publish.workspace = true
+
+[dependencies]
+ogrenotes-common = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+yrs = { workspace = true }
+tracing = { workspace = true }
+fred = { workspace = true }
+tokio = { workspace = true }
+dashmap = { workspace = true }
+rand = { workspace = true }
+calamine = { version = "0.35", optional = true }
+rust_xlsxwriter = { version = "0.80", optional = true }
+# DOCX import — Phase 6 M-6.5 piece A. A .docx is a ZIP of OOXML; we
+# unzip `word/document.xml` (deflate only — no other compression in
+# the spec) and stream it through quick-xml. Reader-only; the docx
+# writer (piece B) is a separate dependency choice.
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+quick-xml = { workspace = true, optional = true }
+# DOCX export — Phase 6 M-6.5 piece B. docx-rs is the writer half (it
+# builds + packs the OOXML container); the reader side stays the
+# hand-rolled zip + quick-xml above.
+docx-rs = { version = "0.4", optional = true }
+# PDF import — Phase 6 M-6.6 piece A. pdf-extract is the pure-Rust
+# text-only extractor; tables/images/marks are dropped (v1), OCR is a
+# v2 carry. Reader-only; the PDF writer (piece B) is a separate choice.
+pdf-extract = { version = "0.12", optional = true }
+# PDF export — Phase 6 M-6.6 piece B. printpdf is the pure-Rust writer;
+# we use its built-in Helvetica (no bundled font) and lay out the
+# plain-text output by hand. Reader stays pdf-extract above.
+printpdf = { version = "0.9", optional = true }
+# Markdown import — Phase 5 M-P5 piece A.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# HTML import — Phase 5 M-P5 piece B. ammonia sanitizes BEFORE
+# html5ever sees the input; html5ever + markup5ever_rcdom build
+# a walkable DOM tree we map to NodeType variants.
+ammonia = "4"
+html5ever = "0.39"
+markup5ever_rcdom = "0.39"
+
+# Optional: only needed by the replay binary
+ogrenotes-storage = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+aws-sdk-dynamodb = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+
+[features]
+replay = ["ogrenotes-storage", "aws-config", "aws-sdk-dynamodb", "aws-sdk-s3"]
+xlsx = ["calamine", "rust_xlsxwriter"]
+docx = ["zip", "quick-xml", "docx-rs"]
+pdf = ["pdf-extract", "printpdf"]
+
+[[bin]]
+name = "replay"
+path = "src/bin/replay.rs"
+required-features = ["replay"]
+
+[dev-dependencies]
+proptest = { workspace = true }
+nanoid = { workspace = true }
+# Phase 5 M-P9 piece D — perf benchmarks. HTML reports are off
+# (`html_reports` feature pulls in plotters + a long compile tail);
+# CI wants the JSON output only.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# Builds minimal text PDFs for the from_pdf tests (M-6.6 piece A).
+# Tracks pdf-extract's lopdf (0.42, patched for RUSTSEC-2026-0187) so
+# the reader path carries no vulnerable lopdf — used only to generate
+# fixtures, with no type sharing across the extract/build boundary.
+lopdf = "0.42"
+
+[[bench]]
+name = "yrs_ops"
+harness = false
+path = "benches/yrs_ops.rs"

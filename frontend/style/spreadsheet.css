@@ -1,0 +1,1596 @@
+/* ─── Spreadsheet View ─────────────────────────────────────── */
+
+/* The spreadsheet grid is rendered LTR regardless of UI locale.
+ * v1 of i18n (M-P2) deliberately scopes RTL out of the grid for
+ * three reasons that compound:
+ *   1. Column-order semantics: A1 → B1 → C1 is universally
+ *      left-to-right in every spreadsheet tool users have used,
+ *      including Arabic/Hebrew localizations of Excel and Numbers.
+ *      Flipping the grid would surprise users far more than not
+ *      flipping it.
+ *   2. The sticky row-header gutter, the resize handles, the
+ *      paste-target overlay, and the cell-selection corner-handle
+ *      were all built against physical edges; an RTL flip would
+ *      need a separate audit pass per primitive.
+ *   3. Formula syntax stays LTR (`=SUM(A1:B2)`) — mixing an RTL
+ *      grid with LTR formulas creates a worse bidi mess than a
+ *      consistent LTR grid embedded in an otherwise-RTL page.
+ *
+ * The `direction: ltr` declaration below pins the wrapper LTR;
+ * everything below this rule can keep using physical `left`/
+ * `right` properties without breaking under `<html dir="rtl">`.
+ * See design/i18n.md §RTL strategy for the v2 carry-forward. */
+.spreadsheet-wrapper {
+  direction: ltr;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--color-bg);
+}
+
+/* Formula bar */
+.spreadsheet-formula-bar {
+  display: flex;
+  align-items: center;
+  height: 32px;
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  padding: 0 8px;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.formula-bar-cell-ref {
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  color: var(--color-text);
+  min-width: 48px;
+  text-align: center;
+  padding: 2px 8px;
+  background: var(--color-mist);
+  border-radius: 3px;
+}
+
+.formula-bar-separator {
+  width: 1px;
+  height: 18px;
+  background: var(--color-border);
+}
+
+.formula-bar-value {
+  flex: 1;
+  font-size: 13px;
+  color: var(--color-text);
+  cursor: text;
+  padding: 2px 4px;
+  min-height: 20px;
+}
+
+.formula-bar-input {
+  flex: 1;
+  font-size: 13px;
+  border: 1px solid var(--color-primary);
+  border-radius: 3px;
+  padding: 2px 6px;
+  outline: none;
+  font-family: var(--font-mono);
+}
+
+/* Tool strip — sits between the formula bar and the grid. Currently
+   hosts only the format-painter button. Mirrors the formula-bar
+   metrics so the strip reads as a continuous header. */
+.spreadsheet-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 8px;
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.ss-tool-btn {
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.ss-tool-btn:hover {
+  background: var(--color-mist);
+}
+
+.ss-tool-btn.active {
+  background: color-mix(in srgb, var(--color-primary) 18%, transparent);
+  border-color: var(--color-primary);
+}
+
+.ss-tool-status {
+  font-size: 12px;
+  color: var(--color-text-secondary, #666);
+  font-style: italic;
+}
+
+/* Cross-document consent prompt. Centered modal over a dimmed
+   backdrop. Sits above every other CF / context-menu layer so the
+   user has to engage with it before continuing. */
+.ss-foreign-consent-backdrop {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 200;
+}
+
+.ss-foreign-consent {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 201;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  padding: 20px;
+  min-width: 360px;
+  max-width: 540px;
+}
+
+.ss-foreign-consent-title {
+  margin: 0 0 12px 0;
+  font-size: 16px;
+}
+
+.ss-foreign-consent-list {
+  margin: 0 0 12px 0;
+  padding-left: 18px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.ss-foreign-consent-item code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-text);
+}
+
+.ss-foreign-consent-hint {
+  font-size: 12px;
+  color: var(--color-text-secondary, #666);
+  margin: 0 0 12px 0;
+}
+
+.ss-foreign-consent-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* When the painter is armed the cells advertise the affordance via
+   cursor: cell. Applied on the grid container so it covers the
+   gutter area without leaking onto the formula bar. */
+.spreadsheet-grid-container.fmt-painter-armed,
+.spreadsheet-grid-container.fmt-painter-armed .spreadsheet-cell {
+  cursor: cell;
+}
+
+/* Grid container */
+.spreadsheet-grid-container {
+  flex: 1;
+  overflow: auto;
+  /* Containing block for `.ss-remote-cell` overlays — they're
+     `position: absolute` and need an offset parent that scrolls
+     with the grid content. The grid container is the natural
+     anchor. */
+  position: relative;
+  /* The 40px row-number column is `position: sticky; left: 0`, so
+     it visually covers the leftmost 40px of the scroll viewport.
+     Without `scroll-padding-left`, both manual horizontal scrolling
+     and `scrollIntoView({inline:"nearest"})` consider that area
+     visible — leaving column A partially clipped behind the sticky
+     overlay and giving the user no clean "scroll back to A" stop.
+     `scroll-padding-left` matches the sticky width and tells the
+     scroll machinery to treat those 40px as reserved. Same applies
+     vertically once the column-header row is taken into account
+     (24px). */
+  scroll-padding-left: 40px;
+  scroll-padding-top: 24px;
+}
+
+.spreadsheet-grid {
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 13px;
+  min-width: 100%;
+  /* Prevent the browser's native text selection from highlighting cell
+     contents while the user is dragging across cells with the mouse —
+     we paint our own grid selection (.spreadsheet-cell.selected) and the
+     two would visually fight (issue #14). The cell editor input still
+     selects normally because it's an <input> outside this rule's reach
+     (user-select on form fields is a UA default that overrides this). */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Corner cell (top-left) */
+.spreadsheet-corner {
+  width: 40px;
+  min-width: 40px;
+  background: var(--color-mist);
+  border: 1px solid var(--color-border);
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 3;
+}
+
+/* Column headers */
+.spreadsheet-col-header {
+  height: 24px;
+  background: var(--color-mist);
+  border: 1px solid var(--color-border);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  text-align: center;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  user-select: none;
+}
+
+.spreadsheet-col-header.active {
+  background: var(--color-primary);
+  color: white;
+}
+
+.col-resize-handle {
+  position: absolute;
+  right: -2px;
+  top: 0;
+  width: 5px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 4;
+}
+
+/* Row resize handle */
+.spreadsheet-row-header {
+  position: relative;
+}
+
+.row-resize-handle {
+  position: absolute;
+  bottom: -2px;
+  left: 0;
+  width: 100%;
+  height: 5px;
+  cursor: row-resize;
+  z-index: 4;
+}
+
+.row-resize-handle:hover {
+  background: var(--color-primary);
+  opacity: 0.4;
+}
+
+.col-resize-handle:hover {
+  background: var(--color-primary);
+  opacity: 0.4;
+}
+
+/* Row headers */
+.spreadsheet-row-header {
+  width: 40px;
+  min-width: 40px;
+  background: var(--color-mist);
+  border: 1px solid var(--color-border);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  text-align: center;
+  position: sticky;
+  left: 0;
+  /* Sit above non-frozen cells during horizontal scroll. The
+     `.spreadsheet-cell.cursor` class also uses z-index: 1 with a
+     `position: relative` (so the cursor outline doesn't get clipped
+     by sibling cells); with equal z-index the later-in-DOM cell
+     would paint over the row-number column when scrolled. z-index 2
+     keeps the row-header on top while staying below the corner
+     (z-3) and frozen-row × frozen-col cells (z-4). */
+  z-index: 2;
+  user-select: none;
+}
+
+.spreadsheet-row-header.active {
+  background: var(--color-primary);
+  color: white;
+}
+
+/* Row-virtualization spacer rows (#72): stand in for the unrendered
+   rows above/below the visible window so the scrollbar geometry stays
+   identical to a fully-rendered table. Border/padding off so the
+   filler doesn't draw a phantom grid line. */
+.ss-virt-spacer td {
+  border: none;
+  padding: 0;
+  background: transparent;
+}
+
+/* Data cells */
+.spreadsheet-cell {
+  height: 24px;
+  border: 1px solid var(--color-border);
+  padding: 2px 6px;
+  background: var(--color-surface);
+  cursor: cell;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.spreadsheet-cell.selected {
+  background: rgba(45, 95, 45, 0.08);
+}
+
+.spreadsheet-cell.cursor {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -1px;
+  z-index: 1;
+  position: relative;
+}
+
+/* Marquee around the source of a pending cut. Static dashed outline —
+ * we don't animate marching ants, but the dashed pattern + accent color
+ * is enough signal that "this range is flagged for move on next paste". */
+.spreadsheet-cell.cut-marquee {
+  outline: 2px dashed var(--color-primary);
+  outline-offset: -1px;
+  position: relative;
+}
+
+/* Highlight for cells whose reference is currently being built into a
+ * formula via mouse or keyboard pick. Blue dashed to distinguish from
+ * the cut marquee and the cursor outline. */
+.spreadsheet-cell.reference-pick {
+  outline: 2px dashed var(--color-focus-outline);
+  outline-offset: -1px;
+  background: rgba(59, 130, 246, 0.08);
+  position: relative;
+}
+
+/* Tap-and-hold anchor cell on touch devices. After a long-press fires, the
+ * anchor cell pulses to signal "now tap a second cell to define the range".
+ * Cleared by the second tap, by Escape, or by entering edit mode. */
+.spreadsheet-cell.tap-anchor {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -1px;
+  position: relative;
+  z-index: 1;
+  animation: spreadsheet-tap-anchor-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes spreadsheet-tap-anchor-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(45, 95, 45, 0.45); }
+  50%      { box-shadow: 0 0 0 6px rgba(45, 95, 45, 0.0); }
+}
+
+/* ─── In-page formula keyboard (mobile only) ─────────────────────────
+ *
+ * Pinned to the bottom of the visible viewport. Shown when a cell editor
+ * holds a value starting with `=` AND `(hover: none)` matches; gated in
+ * Rust (`formula_keyboard_visible` in spreadsheet_view.rs), not CSS.
+ * Renders above the home indicator via env(safe-area-inset-bottom).
+ */
+.formula-keyboard {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 95;
+  background: var(--color-surface);
+  border-top: 1px solid var(--color-border);
+  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.08);
+  padding: 6px 8px calc(6px + env(safe-area-inset-bottom)) 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  user-select: none;
+}
+
+.formula-keyboard-chips {
+  display: flex;
+  overflow-x: auto;
+  gap: 6px;
+  padding: 2px 0;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+
+.formula-keyboard-chips::-webkit-scrollbar {
+  display: none;
+}
+
+.formula-chip {
+  flex-shrink: 0;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  color: var(--color-primary);
+  cursor: pointer;
+  white-space: nowrap;
+  min-height: var(--touch-target-min);
+}
+
+.formula-chip:active {
+  background: var(--color-mist);
+}
+
+.formula-keyboard-row {
+  display: flex;
+  gap: 6px;
+}
+
+.formula-key {
+  flex: 1;
+  min-height: var(--touch-target-min);
+  padding: 8px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-size: 16px;
+  font-family: var(--font-mono);
+  color: var(--color-text);
+  cursor: pointer;
+  text-align: center;
+  /* Disable iOS tap highlight; we have our own :active state. */
+  -webkit-tap-highlight-color: transparent;
+}
+
+.formula-key:active {
+  background: var(--color-mist);
+  transform: scale(0.97);
+}
+
+.formula-key-op {
+  color: var(--color-primary);
+  font-weight: 600;
+}
+
+.formula-key-back {
+  background: var(--color-mist);
+  font-size: 18px;
+}
+
+/* ─── Mode-switcher tab strip (M-P3 piece C) ───────────────────────
+ * Three-way tab control at the top of the on-screen keyboard. Standard
+ * defers to the OS keyboard; Numeric shows a number pad; Formula shows
+ * function chips + operators. Auto-Formula override locks the two
+ * non-Formula tabs while the value starts with `=`. */
+.formula-keyboard-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 2px 0 4px 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.formula-keyboard-tab {
+  flex: 1;
+  min-height: var(--touch-target-min);
+  padding: 6px 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.formula-keyboard-tab.is-active {
+  background: var(--color-bg);
+  border-color: var(--color-border);
+  color: var(--color-primary);
+}
+
+.formula-keyboard-tab.is-locked {
+  /* The user can't switch off Formula until they backspace the `=` */
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.formula-keyboard-tab:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Standard-mode body — just the OS-keyboard hint plus commit/cancel.
+ * The OS soft keyboard handles all character entry; we're just the
+ * commit affordance + mode picker. */
+.formula-keyboard-actions {
+  align-items: center;
+}
+
+.formula-keyboard-hint {
+  flex: 1;
+  text-align: center;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  font-family: var(--font-body, inherit);
+}
+
+.formula-key-cancel {
+  color: var(--color-error);
+  font-weight: 600;
+}
+
+.formula-key-commit {
+  background: var(--color-primary);
+  color: var(--color-surface);
+  border-color: var(--color-primary);
+  font-weight: 700;
+  font-size: 18px;
+}
+
+.formula-key-commit:active {
+  background: var(--color-primary-hover);
+}
+
+.spreadsheet-cell-input {
+  width: 100%;
+  height: 100%;
+  border: none;
+  outline: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  background: transparent;
+  box-sizing: border-box;
+}
+
+.spreadsheet-cell-select {
+  width: 100%;
+  height: 100%;
+  border: none;
+  outline: none;
+  font: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.spreadsheet-checkbox {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: var(--color-primary);
+}
+
+.spreadsheet-cell.formula-cell {
+  color: var(--color-primary);
+}
+
+/* Spill-fill (M-S1a step 4): cells whose value is rendered from a
+   dynamic-array formula anchored elsewhere (SORT / FILTER / UNIQUE /
+   TRANSPOSE / SEQUENCE / MMULT etc.). Distinguished visually so a
+   user knows the cell isn't independently editable — typing into it
+   "breaks" the spill, the engine clears the block, and the anchor
+   reports `#SPILL!`. The italic + faint left-edge tint mirrors
+   Excel's spill UX. */
+.spreadsheet-cell.spill-fill {
+  font-style: italic;
+  box-shadow: inset 2px 0 0 0 color-mix(in srgb, var(--color-primary) 35%, transparent);
+}
+
+/* IconSet conditional-format glyph. Sits as a prefix span before
+   the cell value, separated by a thin gap so it doesn't crowd the
+   text. The cell's text-alignment still applies to `{display}`,
+   so the glyph + text move together. */
+.ss-cf-icon {
+  display: inline-block;
+  margin-right: 4px;
+  font-style: normal;
+}
+
+/* Cell comments. The red top-right corner triangle is the standard
+   Excel comment indicator; the absolute-positioned `<div>` becomes a
+   tooltip on hover. The cell needs `position: relative` so the popup
+   anchors to it, and `overflow: visible` so the popup can spill into
+   neighboring cells. */
+.spreadsheet-cell.has-comment {
+  position: relative;
+  overflow: visible;
+}
+
+/* Clickable comment indicator. Replaces the old `::after` triangle so
+   the corner marker is a real, focusable click target that opens the
+   cell's comment thread. The triangle is drawn with the border trick;
+   the element's border region is what receives the click. */
+.ss-comment-marker {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 0 8px 8px 0;
+  border-color: transparent var(--color-error, #c0392b) transparent transparent;
+  cursor: pointer;
+  z-index: 4;
+}
+
+.ss-comment-marker:hover {
+  border-width: 0 10px 10px 0;
+}
+
+.ss-comment-marker:focus-visible {
+  outline: 2px solid var(--color-focus, #2d7ff9);
+  outline-offset: 1px;
+}
+
+.ss-comment-popup {
+  display: none;
+  position: absolute;
+  top: 0;
+  left: calc(100% + 4px);
+  z-index: 30;
+  padding: 6px 8px;
+  background: var(--color-surface, #fff);
+  border: 1px solid var(--color-border, #ccc);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+  border-radius: 3px;
+  max-width: 240px;
+  font-style: normal;
+  font-weight: normal;
+  white-space: pre-wrap;
+  pointer-events: none;
+}
+
+/* Opening message + reply count inside the thread-aware preview. */
+.ss-comment-popup-msg {
+  color: var(--color-text, #222);
+}
+
+.ss-comment-popup-meta {
+  margin-top: 4px;
+  font-size: 0.85em;
+  color: var(--color-text-muted, #888);
+}
+
+.spreadsheet-cell.has-comment:hover .ss-comment-popup {
+  display: block;
+}
+
+/* Frozen rows */
+.frozen-row td,
+.frozen-row th {
+  position: sticky;
+  top: 24px; /* below column header */
+  z-index: 2;
+  background: var(--color-surface);
+}
+
+.frozen-row .spreadsheet-row-header {
+  z-index: 3;
+}
+
+/* Frozen columns (M-S2). Each cell whose column index is below the
+   `frozen_cols` count gets `class:frozen-col` so it stays pinned to
+   the left edge of the scroll viewport. The cumulative `left` offset
+   is applied inline per-cell from `spreadsheet_view.rs` so multiple
+   frozen columns don't overlap and so column resizing shifts the
+   pinned offsets. */
+.spreadsheet-cell.frozen-col {
+  position: sticky;
+  z-index: 2;
+  background: var(--color-surface);
+}
+
+/* Frozen-row × frozen-col intersection: stack above both axes so a
+   simultaneous horizontal+vertical scroll keeps the corner cells
+   visible. */
+.frozen-row .spreadsheet-cell.frozen-col {
+  z-index: 4;
+}
+
+/* Context menu */
+.ss-ctx-backdrop {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 99;
+}
+
+.ss-ctx-menu {
+  position: fixed;
+  z-index: 100;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 4px 0;
+  min-width: 180px;
+  /* The top level is now a compact ~9-item list (advanced actions
+     live in hover submenus), so it fits in the viewport and does not
+     need its own scroll. Crucially, overflow must stay visible: an
+     `overflow-y: auto` here would force `overflow-x` to auto too and
+     clip the submenu fly-outs that extend past the right edge. The
+     view layer still clamps left/top to keep the box on-screen. */
+  overflow: visible;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+}
+
+.ss-ctx-item {
+  display: block;
+  width: 100%;
+  padding: 4px 14px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--color-text);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.ss-ctx-item:hover {
+  background: var(--color-mist);
+}
+
+.ss-ctx-sep {
+  height: 1px;
+  background: var(--color-border);
+  margin: 4px 8px;
+}
+
+/* ── Submenus ──────────────────────────────────────────────────
+   A parent row carries a trailing ▸ and reveals its fly-out on hover.
+   The fly-out is absolutely positioned to the right of its parent. */
+.ss-ctx-sub {
+  position: relative;
+}
+
+.ss-ctx-parent {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.ss-ctx-arrow {
+  opacity: 0.55;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.ss-ctx-submenu {
+  display: none;
+  position: absolute;
+  left: 100%;
+  top: -5px; /* align the fly-out's first item with its parent row */
+  min-width: 180px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 4px 0;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  /* A single submenu can still be tall (e.g. Format); bound it to the
+     viewport with its own scroll. Sub-submenus open to the right of
+     their own parent row, so this scroll doesn't clip them. */
+  max-height: calc(100vh - 20px);
+  overflow-y: auto;
+}
+
+.ss-ctx-sub:hover > .ss-ctx-submenu {
+  display: block;
+}
+
+/* Near the right edge the view layer flags the menu so submenus open
+   leftward instead of overflowing off-screen. Applies to every nesting
+   level, so a flipped Format ▸ and its Conditional Formatting ▸ both
+   cascade to the left. */
+.ss-ctx-flip-x .ss-ctx-submenu {
+  left: auto;
+  right: 100%;
+}
+
+.ss-ctx-sub:hover > .ss-ctx-parent {
+  background: var(--color-mist);
+}
+
+/* Cell edit wrapper for autocomplete positioning */
+.spreadsheet-cell-edit-wrapper {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+/* Formula autocomplete popup */
+.ss-autocomplete {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 50;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  min-width: 200px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+/* M-P3 piece D — reanchor above the on-screen formula keyboard on
+ * touch viewports. The keyboard mounts `position: fixed; bottom: 0`
+ * at z-index 95 with a height that varies by mode (the Formula
+ * layout is ~6 key rows + tabs + chips). We pin the autocomplete
+ * above that band so a cell at the bottom of the viewport doesn't
+ * lose its function-name picker behind the keyboard.
+ *
+ * `--mobile-kb-height` is a conservative estimate for the Formula
+ * layout (it's the only mode where autocomplete actually fires).
+ * Override at runtime by setting `--mobile-kb-height` on
+ * :root if a future piece measures the real keyboard height. */
+.ss-autocomplete.is-above-keyboard {
+  position: fixed;
+  top: auto;
+  left: 0;
+  right: 0;
+  bottom: calc(env(safe-area-inset-bottom) + var(--mobile-kb-height, 380px));
+  z-index: 96;
+  max-height: 30vh;
+  border-left: none;
+  border-right: none;
+  border-radius: 0;
+}
+
+.ss-autocomplete-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.ss-autocomplete-item:hover,
+.ss-autocomplete-item.active {
+  background: var(--color-primary);
+  color: white;
+}
+
+.ss-ac-name {
+  font-weight: 600;
+  font-family: var(--font-mono);
+}
+
+.ss-ac-desc {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+}
+
+.ss-autocomplete-item.active .ss-ac-desc {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+/* Column filter icon */
+.col-filter-icon {
+  font-size: 9px;
+  opacity: 0.4;
+  cursor: pointer;
+  margin-left: 2px;
+}
+
+.col-filter-icon:hover {
+  opacity: 1;
+}
+
+/* Filter popup */
+.ss-filter-popup {
+  position: fixed;
+  top: 80px;
+  right: 20px;
+  z-index: 100;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 4px 0;
+  min-width: 180px;
+  max-height: 300px;
+  overflow-y: auto;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+}
+
+.ss-filter-header {
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+/* Find/Replace bar */
+.ss-find-bar {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 0 0 0 6px;
+  padding: 6px 10px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+
+.ss-find-input {
+  width: 120px;
+  padding: 3px 6px;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  font-size: 12px;
+  outline: none;
+}
+
+.ss-find-input:focus {
+  border-color: var(--color-primary);
+}
+
+.ss-find-count {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  min-width: 50px;
+}
+
+.ss-find-btn {
+  padding: 3px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.ss-find-btn:hover {
+  background: var(--color-mist);
+}
+
+.ss-find-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--color-text-secondary);
+  padding: 2px;
+}
+
+/* Sheet tab bar */
+/* Remote-user cell cursor (presence). The outline itself is
+   applied inline on the affected `<td>` (see #70), so we no longer
+   need a positioned overlay element — only the floating name
+   badge keeps its own rule. The cell carries `position: relative`
+   when a remote cursor lands on it, which makes the badge's
+   absolute positioning anchor to the cell. */
+.ss-remote-cell-label {
+  position: absolute;
+  top: -16px;
+  left: -2px;
+  font-size: 10px;
+  color: white;
+  padding: 1px 4px;
+  border-radius: 3px 3px 3px 0;
+  white-space: nowrap;
+  line-height: 1.2;
+  font-weight: 600;
+}
+
+.ss-status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 2px 12px;
+  background: var(--color-mist);
+  border-top: 1px solid var(--color-border);
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  flex-shrink: 0;
+  height: 22px;
+}
+
+.ss-status-stat { white-space: nowrap; }
+
+.ss-status-sep { opacity: 0.4; }
+
+.ss-sheet-tabs {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  background: var(--color-mist);
+  border-top: 1px solid var(--color-border);
+  padding: 0 4px;
+  height: 28px;
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+
+.ss-sheet-tab {
+  padding: 4px 12px;
+  border: 1px solid var(--color-border);
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+  background: var(--color-surface);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  color: var(--color-text-secondary);
+}
+
+.ss-sheet-tab.active {
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-weight: 600;
+  border-bottom: 2px solid var(--color-surface);
+  margin-bottom: -1px;
+}
+
+.ss-sheet-tab:hover:not(.active) {
+  background: var(--color-bg);
+}
+
+.ss-sheet-add {
+  font-size: 14px;
+  font-weight: 700;
+  padding: 4px 10px;
+  color: var(--color-text-secondary);
+}
+
+/* Charts area */
+.ss-charts-area {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-bg);
+  flex-shrink: 0;
+}
+
+.ss-chart {
+  position: relative;
+  display: inline-block;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 8px;
+}
+
+.ss-chart-inner svg {
+  display: block;
+}
+
+.ss-chart-remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--color-text-secondary);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.ss-chart:hover .ss-chart-remove {
+  opacity: 1;
+}
+
+.ss-chart-remove:hover {
+  color: var(--color-text);
+}
+
+.spreadsheet-empty {
+  padding: 32px;
+  text-align: center;
+  color: var(--color-text-secondary);
+}
+
+/* ─── Pivot editor sidebar (M-S2 v2) ─────────────────────── */
+
+.ss-pivot-editor {
+  position: fixed;
+  top: 60px;
+  right: 12px;
+  width: 320px;
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+  background: var(--color-bg, #fff);
+  border: 1px solid var(--color-border, #d0d0d0);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  z-index: 80;
+  font-size: 13px;
+}
+
+.ss-pivot-editor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--color-border, #d0d0d0);
+  background: var(--color-bg-subtle, #f7f7f7);
+  border-radius: 6px 6px 0 0;
+}
+
+.ss-pivot-editor-title {
+  font-weight: 600;
+}
+
+.ss-pivot-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--color-text-secondary);
+  padding: 0 4px;
+}
+
+.ss-pivot-close:hover { color: var(--color-text); }
+
+.ss-pivot-editor-body {
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ss-pivot-source-row code {
+  background: var(--color-bg-subtle, #f0f0f0);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+.ss-pivot-toprow {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.ss-pivot-toplabel {
+  display: flex;
+  flex-direction: column;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  gap: 2px;
+}
+
+.ss-pivot-toplabel select {
+  font-size: 12px;
+  padding: 2px 4px;
+}
+
+.ss-pivot-remove {
+  margin-left: auto;
+  background: none;
+  border: 1px solid var(--color-border, #d0d0d0);
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--color-text-error, #c33);
+}
+
+.ss-pivot-remove:hover {
+  background: var(--color-bg-subtle, #f7f7f7);
+}
+
+.ss-pivot-section-title {
+  font-weight: 600;
+  font-size: 12px;
+  margin-top: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-secondary);
+}
+
+.ss-pivot-field-search {
+  width: 100%;
+  padding: 4px 6px;
+  font-size: 12px;
+  border: 1px solid var(--color-border, #d0d0d0);
+  border-radius: 4px;
+  margin-bottom: 4px;
+  box-sizing: border-box;
+}
+
+.ss-pivot-field-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--color-border, #e0e0e0);
+  border-radius: 4px;
+  padding: 4px;
+}
+
+.ss-pivot-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  cursor: grab;
+  user-select: none;
+}
+
+.ss-pivot-field:hover {
+  background: var(--color-bg-subtle, #f0f0f0);
+}
+
+.ss-pivot-field-icon {
+  display: inline-block;
+  width: 18px;
+  text-align: center;
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+
+.ss-pivot-field-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ss-pivot-zone {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-height: 36px;
+  padding: 6px;
+  border: 1px dashed var(--color-border, #d0d0d0);
+  border-radius: 4px;
+  background: var(--color-bg, #fff);
+}
+
+.ss-pivot-zone:empty::before {
+  content: "Drag a field here";
+  color: var(--color-text-secondary);
+  font-style: italic;
+  font-size: 11px;
+  padding: 4px;
+}
+
+.ss-pivot-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--color-bg-subtle, #eef);
+  border: 1px solid var(--color-border, #c0c0d8);
+  border-radius: 12px;
+  padding: 2px 6px 2px 8px;
+  font-size: 12px;
+}
+
+.ss-pivot-chip-label {
+  white-space: nowrap;
+}
+
+.ss-pivot-chip-agg,
+.ss-pivot-chip-kind {
+  font-size: 11px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.ss-pivot-chip-bin {
+  width: 56px;
+  font-size: 11px;
+  padding: 0 4px;
+  border: 1px solid var(--color-border, #d0d0d0);
+  border-radius: 3px;
+  background: var(--color-surface);
+}
+
+.ss-pivot-chip[draggable] {
+  cursor: grab;
+}
+
+.ss-pivot-chip[draggable]:active {
+  cursor: grabbing;
+}
+
+.ss-pivot-chip-x {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  padding: 0 2px;
+}
+
+.ss-pivot-chip-x:hover { color: var(--color-text); }
+
+.ss-pivot-chip-filter-toggle {
+  font-size: 11px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  padding: 0 2px;
+  color: var(--color-text);
+}
+
+.ss-pivot-chip-filter-toggle:hover {
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 3px;
+}
+
+.ss-pivot-filter-popover {
+  margin-top: 4px;
+  border: 1px solid var(--color-border, #d0d0d0);
+  border-radius: 4px;
+  background: var(--color-surface, #fff);
+  padding: 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  font-size: 12px;
+}
+
+.ss-pivot-filter-popover-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.ss-pivot-filter-popover-actions {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+
+.ss-pivot-filter-action {
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid var(--color-border, #d0d0d0);
+  border-radius: 3px;
+  background: var(--color-bg-subtle, #f7f7f7);
+  cursor: pointer;
+}
+
+.ss-pivot-filter-action:hover {
+  background: var(--color-mist, #e8e8e8);
+}
+
+.ss-pivot-filter-popover-list {
+  max-height: 180px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ss-pivot-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.ss-pivot-filter-row:hover {
+  background: var(--color-bg-subtle, #f0f0f0);
+}
+
+.ss-pivot-empty-hint {
+  padding: 12px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  font-style: italic;
+}
+
+/* ─── Sort dialog (M-S2 v2 follow-up) ────────────────────── */
+
+.ss-sort-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.18);
+  z-index: 200;
+}
+
+.ss-sort-dialog {
+  position: fixed;
+  top: 80px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 440px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 100px);
+  overflow-y: auto;
+  background: var(--color-bg, #fff);
+  border: 1px solid var(--color-border, #d0d0d0);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  z-index: 201;
+  font-size: 13px;
+}
+
+.ss-sort-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--color-border, #e0e0e0);
+  background: var(--color-bg-subtle, #f7f7f7);
+  border-radius: 6px 6px 0 0;
+}
+
+.ss-sort-dialog-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.ss-sort-dialog-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--color-text-secondary);
+  padding: 0 4px;
+}
+
+.ss-sort-dialog-close:hover { color: var(--color-text); }
+
+.ss-sort-dialog-body {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ss-sort-dialog-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.ss-sort-dialog-range {
+  flex: 1;
+  padding: 4px 6px;
+  font-family: monospace;
+  font-size: 12px;
+  border: 1px solid var(--color-border, #d0d0d0);
+  border-radius: 4px;
+}
+
+.ss-sort-dialog-headers {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.ss-sort-dialog-keys {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--color-border, #e0e0e0);
+  border-radius: 4px;
+  padding: 8px;
+}
+
+.ss-sort-dialog-key {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ss-sort-dialog-key-label {
+  width: 60px;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+
+.ss-sort-dialog-key-col {
+  flex: 1;
+  font-size: 12px;
+  padding: 3px 6px;
+  border: 1px solid var(--color-border, #d0d0d0);
+  border-radius: 4px;
+  min-width: 100px;
+}
+
+.ss-sort-dialog-key-dir {
+  font-size: 12px;
+  padding: 3px 6px;
+  border: 1px solid var(--color-border, #d0d0d0);
+  border-radius: 4px;
+}
+
+.ss-sort-dialog-key-remove {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  padding: 0 4px;
+}
+
+.ss-sort-dialog-key-remove:hover { color: var(--color-text); }
+
+.ss-sort-dialog-add {
+  align-self: flex-start;
+  background: none;
+  border: 1px dashed var(--color-border, #c0c0c0);
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+}
+
+.ss-sort-dialog-add:hover {
+  border-style: solid;
+  color: var(--color-text);
+}
+
+.ss-sort-dialog-error {
+  padding: 6px 8px;
+  background: var(--color-error-bg);
+  border: 1px solid var(--color-error-border);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--color-error-fg);
+}
+
+.ss-sort-dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--color-border, #e0e0e0);
+}
+
+.ss-sort-dialog-cancel,
+.ss-sort-dialog-apply {
+  padding: 5px 14px;
+  font-size: 13px;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid var(--color-border, #d0d0d0);
+}
+
+.ss-sort-dialog-cancel {
+  background: var(--color-bg-subtle, #f7f7f7);
+}
+
+/* Apply button uses the brand "primary action" token rather than
+ * the action-blue Excel convention — keeps consistent with other
+ * primary buttons in the app and adapts under dark mode. */
+.ss-sort-dialog-apply {
+  background: var(--color-primary);
+  color: var(--color-on-primary);
+  border-color: var(--color-primary);
+}
+
+.ss-sort-dialog-apply:hover {
+  background: var(--color-primary-hover);
+}

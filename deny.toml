@@ -1,0 +1,107 @@
+# cargo-deny configuration for the OgreNotes workspace.
+# Run `cargo deny check` (install with `cargo install cargo-deny`).
+# Schema: cargo-deny >= 0.16 (version = 2 tables).
+
+[graph]
+# Evaluate the full feature surface so optional deps (xlsx/docx/pdf,
+# samael's xmlsec, etc.) are covered by the license/advisory checks.
+all-features = true
+
+[advisories]
+version = 2
+# Fail on crates with an active RUSTSEC advisory or that have been yanked.
+yanked = "deny"
+# Suppressions below are ONLY for advisories with no available upstream fix.
+# Each entry is documented; anything fixable is fixed in Cargo.lock instead.
+# A NEW advisory (not listed here) still fails the check by design — revisit
+# this list whenever the AWS SDK or samael dependency trees move.
+ignore = [
+    # rustls-webpki 0.101.7 (rustls 0.21) is pulled ONLY by
+    # aws-smithy-http-client's legacy hyper-0.14 TLS *acceptor* feature — a
+    # server-side path the AWS SDK client never instantiates. Our actual
+    # client TLS uses rustls 0.23 / rustls-webpki 0.103.13 (patched). The
+    # 0.101.x line has no fixed release; removable only when the AWS SDK
+    # drops the legacy connector. Re-check on each aws-config bump.
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7: unused legacy AWS acceptor path; no 0.101.x fix" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7: unused legacy AWS acceptor path; no 0.101.x fix" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7: unused legacy AWS acceptor path; no 0.101.x fix" },
+
+    # Unmaintained transitive crates with no upgrade path. None are direct
+    # workspace dependencies; all arrive via the AWS SDK or samael (SAML).
+    { id = "RUSTSEC-2023-0019", reason = "kuchiki unmaintained (via samael); no replacement release" },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained (deep transitive); no fix available" },
+    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained (deep transitive); no fix available" },
+    { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained (deep transitive); no fix available" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained (via AWS SDK); no fix available" },
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained (deep transitive); no safe upgrade" },
+
+    # lopdf stack-overflow on deeply-nested PDF parse (load_mem & friends).
+    # The exploitable path is PARSING untrusted uploads — that's pdf-extract
+    # (our PDF reader), now on patched lopdf 0.42 (pdf-extract 0.10 -> 0.12).
+    # The only lopdf still on a vulnerable line (0.39) arrives via printpdf
+    # 0.9.1 (latest; pins lopdf ^0.39, no fixed release), which we use ONLY
+    # to WRITE/generate PDFs — it never calls lopdf's load* parse path on
+    # untrusted input, so the DoS isn't reachable through export. Drop this
+    # when printpdf ships a release on lopdf >= 0.42.
+    { id = "RUSTSEC-2026-0187", reason = "lopdf parse-DoS: reader patched (pdf-extract->lopdf 0.42); residual 0.39 is printpdf write-only, no upstream fix" },
+
+    # ttf-parser 0.25.1 unmaintained (via lopdf 0.39 via printpdf 0.9.1,
+    # and via lopdf 0.42 via pdf-extract 0.12). Same shape as the lopdf
+    # deferrals — printpdf-side is write-only; pdf-extract-side uses
+    # ttf-parser to read font tables from PDFs we already trust to
+    # parse. No safer replacement; drop when upstream printpdf and
+    # pdf-extract move to a maintained font-parser.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser 0.25.1 unmaintained (deep transitive via lopdf); no fix available" },
+
+    # quick-xml 0.36.2 arrives ONLY via docx-rs 0.4.20's write-only
+    # DOCX-generation path — we hand docx-rs a trusted Node model and
+    # it emits XML. The two advisories below are both about PARSING
+    # attacker-controlled XML (quadratic runtime on duplicate attrs,
+    # unbounded namespace allocation) — neither reachable in the
+    # writer flow. Our READER-side XML (spreadsheet import via
+    # calamine) is on quick-xml 0.39.4 (patched). docx-rs has no
+    # release with a newer quick-xml as of 0.4.20; drop this when
+    # docx-rs bumps or when we replace it.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.36.2 parse-DoS: reachable only through docx-rs writer path (not parse); no upstream fix" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.36.2 NsReader alloc-DoS: reachable only through docx-rs writer path (not parse); no upstream fix" },
+]
+
+[licenses]
+version = 2
+# Permissive licenses only — matches the all-MIT/Apache/BSD dependency tree.
+# Adding a copyleft license here is a deliberate policy decision, not a fix
+# for a failing check.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",        # samael (SAML SP)
+    "BSD-3-Clause",
+    "0BSD",                # quoted_printable (via lettre) — BSD Zero Clause
+    "ISC",
+    "BSL-1.0",             # Boost Software License (permissive) — xxhash-rust, via leptos/server_fn (frontend)
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0", # webpki-roots — permissive license for the Mozilla CA bundle
+    "MPL-2.0",             # weak-copyleft, file-scoped; allowed by policy
+]
+confidence-threshold = 0.8
+# Per-crate SPDX clarifications go here if a crate ships an ambiguous or
+# non-SPDX license expression, e.g.:
+# [[licenses.clarify]]
+# crate = "ring"
+# expression = "ISC AND MIT AND OpenSSL"
+# license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+# Duplicate versions and wildcard ("*") version requirements are flagged but
+# not fatal — bump to "deny" once the tree is clean if you want to enforce it.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# Only crates.io is trusted. An unknown registry or git source fails the check.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

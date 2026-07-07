@@ -1,0 +1,22 @@
+# framework/config.toml — per-project knobs for the agent framework.
+#
+# Schema and rationale: framework/config.toml.example
+# Read by both review agents and the supervisor before they act.
+
+[supervisor]
+kind = "human"
+identity = ["unset"]
+
+[branch_protection]
+allow_direct_to_main = false
+
+[agents]
+# Conservative defaults. Flip to true once you've seen the agents
+# handle simpler refactors without scope creep on this project.
+may_propose_breaking_changes = false
+may_add_test_coverage_gap_tests = false
+
+# OgreNotes is a pre-framework codebase that uses raw String IDs
+# throughout. The grandfather clause silences newtype-on-existing-IDs
+# findings; new IDs may newtype if locally beneficial.
+identifier_strategy = "string-grandfathered"

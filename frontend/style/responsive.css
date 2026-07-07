@@ -1,0 +1,423 @@
+/* ─── Responsive overrides ──────────────────────────────────────────────────
+ *
+ * Mobile-first breakpoints layered on top of main.css / spreadsheet.css.
+ * Tokens live in variables.css (--bp-mobile=640px, --bp-tablet=1024px).
+ * @media values are duplicated as plain numbers because CSS @media doesn't
+ * accept var() in the query itself — keep these in sync with variables.css.
+ *
+ * Sections below are skeletons. Drawer machinery, mobile toolbar, touch
+ * interactions, and spreadsheet keyboards land in subsequent phases of
+ * design/mobile.md (see plan: ~/.claude/plans/is-there-an-agent-cozy-wirth.md).
+ */
+
+/* ─── Mobile menu toggle ────────────────────────────────────────────────── */
+/* Hamburger button rendered in doc-header / action-bar. Hidden by default;
+ * shown on mobile via @media below. */
+.mobile-menu-toggle {
+  display: none;
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--color-text);
+  min-width: var(--touch-target-min);
+  min-height: var(--touch-target-min);
+}
+
+/* ─── Drawer backdrop ───────────────────────────────────────────────────── */
+/* Used by sidebar / outline / conversation-pane drawers on mobile.
+ * Hidden on desktop entirely. */
+.drawer-backdrop {
+  display: none;
+}
+
+/* ─── Tablet (≤ 1024px) ─────────────────────────────────────────────────── */
+@media (max-width: 1024px) {
+  /* Sidebar starts collapsed on tablet to reclaim canvas width */
+  .sidebar {
+    width: var(--sidebar-collapsed);
+  }
+
+  /* Conversation pane hides on tablet by default; surfaces via toggle */
+  .conversation-pane {
+    display: none;
+  }
+
+  .conversation-pane.is-open {
+    display: flex;
+  }
+
+  /* Editor padding tightens */
+  .editor-content {
+    padding-inline: var(--space-md);
+  }
+}
+
+/* ─── Mobile (≤ 640px) ──────────────────────────────────────────────────── */
+@media (max-width: 640px) {
+  /* App layout stacks vertically; sidebar becomes an overlay drawer */
+  .app-layout {
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh; /* dynamic viewport height — accounts for mobile chrome */
+  }
+
+  /* Sidebar collapses to off-canvas drawer; toggled with .is-open.
+   * The drawer is anchored to the inline-start edge of the viewport
+   * (left in LTR, right in RTL) and slides off-screen via translateX.
+   * `translateX` is NOT a logical property — it moves in physical
+   * pixels — so we drive its sign from `--drawer-hide-x`, which the
+   * `[dir="rtl"]` rule below flips. The closed state ships at the
+   * inline-start "hidden" position; `.is-open` returns to translate
+   * zero (the same on either side). */
+  .sidebar {
+    position: fixed;
+    inset-block: 0;
+    inset-inline-start: 0;
+    inset-inline-end: auto;
+    width: var(--mobile-drawer-width);
+    max-width: 320px;
+    z-index: 90;
+    --drawer-hide-x: -100%;
+    transform: translateX(var(--drawer-hide-x));
+    transition: transform 0.2s ease;
+    /* iPhone notch / home indicator: pad inner content so it doesn't
+     * disappear under system chrome on edge-to-edge devices. */
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  [dir="rtl"] .sidebar {
+    --drawer-hide-x: 100%;
+  }
+
+  .sidebar.is-open {
+    transform: translateX(0);
+  }
+
+  /* Show drawer backdrop and the hamburger toggle on mobile */
+  .drawer-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    z-index: 89;
+  }
+
+  .mobile-menu-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Conserve doc-header real estate on narrow screens — drop the user
+   * name; the avatar / notification bell + the share icon remain. */
+  .doc-header-actions .user-name {
+    display: none;
+  }
+
+  /* Notification dropdown anchored to the bell can overflow the left
+   * edge of narrow viewports. Pin it to the viewport's top-right with
+   * `position: fixed` so it stays inside the screen regardless of where
+   * the bell sits in the header. */
+  .notification-panel {
+    position: fixed;
+    top: var(--mobile-header-offset);
+    inset-inline: 8px;
+    width: auto;
+    max-width: none;
+  }
+
+  /* Comment popup: same overflow problem — JS sets `left`/`top` based on
+   * the highlighted text's screen position, which on a 375px-wide phone
+   * routinely lands a 420px popup off the left or right edge. Override
+   * the inline positioning and stretch between viewport insets. !important
+   * is required to defeat the inline `style:left` / `style:top`. */
+  .comment-popup {
+    inset-inline: 8px !important;
+    top: var(--mobile-header-offset) !important;
+    width: auto !important;
+    max-height: calc(100vh - var(--mobile-header-offset) - 24px);
+  }
+
+  /* Outline + conversation pane are always-rendered (see main.css comment)
+   * so CSS transitions can fire on `.is-open` toggles. Default state slides
+   * the drawer off the inline-end edge (right in LTR, left in RTL);
+   * `.is-open` brings it back on screen. `translateX` is physical so we
+   * drive its sign from `--drawer-hide-x`, flipped under `[dir="rtl"]`
+   * below. */
+  .document-outline,
+  .conversation-pane {
+    display: flex;
+    flex-direction: column;
+    position: fixed;
+    inset-block: 0;
+    inset-inline-start: auto;
+    inset-inline-end: 0;
+    width: var(--mobile-drawer-width);
+    max-width: 320px;
+    z-index: 90;
+    border-inline-start: 1px solid var(--color-border);
+    background: var(--color-bg);
+    --drawer-hide-x: 100%;
+    transform: translateX(var(--drawer-hide-x));
+    transition: transform 0.2s ease;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  [dir="rtl"] .document-outline,
+  [dir="rtl"] .conversation-pane {
+    --drawer-hide-x: -100%;
+  }
+
+  .document-outline.is-open,
+  .conversation-pane.is-open {
+    transform: translateX(0);
+  }
+
+  /* History pane on phones: takes over the editor area instead of
+   * sliding in as a 320px drawer. The 320px desktop pane is too narrow
+   * to read a diff on a phone, so when it opens we hide the editor and
+   * the formatting toolbar (formatting buttons are useless without an
+   * editor on screen) and let the pane fill the rest of the viewport.
+   * The menu bar stays visible so the user can toggle the pane back off
+   * via the "Document History" menu action. */
+  .history-pane {
+    width: 100%;
+    max-width: none;
+    min-width: 0;
+    border-inline-start: none;
+    flex: 1;
+    position: relative;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .editor-with-panels:has(.history-pane.is-open) .editor-container {
+    display: none;
+  }
+  /* Hide the formatting toolbar while the history pane is open — it
+   * doesn't have an editor to act on, and on a phone every pixel
+   * counts. The history pane lives inside the .editor-with-panels
+   * sibling; the toolbar is a preceding sibling of that wrapper, so
+   * step up to .main-content with `:has` and target the toolbar there. */
+  .main-content:has(.history-pane.is-open) .toolbar {
+    display: none;
+  }
+  /* Diff modal goes full-screen *within* the pane on mobile (not the
+   * whole viewport), keeping the menu bar visible above. Achieved by
+   * absolute-positioning inside the now-relative pane. */
+  .history-pane .history-diff-backdrop {
+    position: absolute;
+    inset: 0;
+  }
+  .history-pane .history-diff-modal {
+    width: auto;
+    max-width: none;
+    height: auto;
+    max-height: none;
+    margin: 8px;
+  }
+
+  /* Editor row no longer competes with side panels for width */
+  .editor-with-panels {
+    flex-direction: column;
+  }
+
+  /* Edge-to-edge content on small screens: drop the outer container
+   * gutter and the document "card" chrome (border radius + drop shadow)
+   * so the editor uses the full viewport width. */
+  .editor-container {
+    padding: 0;
+    background: var(--color-surface);
+  }
+  .editor-content {
+    padding: var(--space-md) var(--space-sm);
+    border-radius: 0;
+    box-shadow: none;
+    max-width: none;
+  }
+
+  /* Allow scrolling in both axes AND pinch-zoom across the document
+   * body. `pan-y` alone would block descendant elements (e.g. wide
+   * tables with `overflow-x: auto`) from initiating horizontal scroll;
+   * `manipulation` is the spec shorthand for `pan-x pan-y pinch-zoom`,
+   * which keeps every pan direction and the two-finger zoom available
+   * while still letting one-finger taps and long-presses dispatch to
+   * our handlers (and suppresses the 300ms double-tap-zoom delay). */
+  .editor-container,
+  .editor-content {
+    touch-action: manipulation;
+  }
+
+  /* Editor pinch gesture: `.editor-with-panels` carries the touch
+   * handlers (in document.rs). `pan-y` is explicit so iOS Safari uses
+   * vertical scroll even when the touch lands on the contenteditable
+   * text — without this, dragging on text after a zoom triggers iOS
+   * text-selection instead of a scroll. Wide tables/images still scroll
+   * horizontally via their own `overflow-x: auto`, independent of this
+   * rule. */
+  .editor-with-panels {
+    touch-action: pan-y;
+  }
+
+  /* Touch targets: ensure interactive elements meet 44px minimum */
+  .toolbar button,
+  .sidebar-item,
+  .outline-item {
+    min-height: var(--touch-target-min);
+  }
+
+  /* Keyboard-aware toolbar: pin flush to the bottom of the visible
+   * viewport. --mobile-toolbar-offset is set inline by toolbar.rs from
+   * window.visualViewport listeners (px occluded by the soft keyboard).
+   * `padding-bottom` keeps the buttons themselves clear of the iPhone
+   * home indicator while the toolbar background fills to the screen
+   * edge — the iOS-standard pattern.
+   *
+   * Width: single row, no wrap; buttons that don't fit go into an
+   * overflow `⋯` menu surfaced via `.toolbar-overflow-trigger`. */
+  .toolbar {
+    position: fixed;
+    inset-inline: 0;
+    bottom: var(--mobile-toolbar-offset, 0px);
+    z-index: 80;
+    background: var(--color-surface);
+    border-top: 1px solid var(--color-border);
+    overflow: visible;
+  }
+
+  /* Mobile-only: the secondary toolbar groups collapse into a floating
+   * panel that drops up from the overflow trigger. */
+  .toolbar-overflow-trigger {
+    display: inline-flex;
+  }
+  .toolbar-overflow-content {
+    display: none;
+    position: absolute;
+    bottom: 100%;
+    inset-inline-end: 4px;
+    margin-bottom: 4px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.1);
+    padding: 6px;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+    min-width: 200px;
+    z-index: 81;
+  }
+  .toolbar-overflow-content.is-open {
+    display: flex;
+    max-height: 60vh;
+    overflow-y: auto;
+  }
+  .toolbar-overflow-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 80;
+  }
+  /* Inside the drop-up panel, flip vertical separator strokes to
+   * horizontal dividers and let groups span the panel width. */
+  .toolbar-overflow-content .toolbar-separator {
+    width: 100%;
+    height: 1px;
+    margin: 4px 0;
+  }
+  .toolbar-overflow-content .toolbar-group {
+    flex-wrap: wrap;
+  }
+
+  /* Reserve space at the bottom of the editor canvas so content isn't
+   * permanently hidden behind the fixed toolbar. */
+  .editor-container,
+  .file-browser {
+    padding-bottom: calc(var(--mobile-toolbar-height) + var(--space-md));
+  }
+
+  /* Tables: allow horizontal scroll instead of overflow. The wrapping
+   * `html, body { overflow-x: hidden }` rule below stops a hard swipe
+   * at the table edge from chaining out and shifting the whole page
+   * sideways — the table can still bounce/scroll internally as the
+   * browser intends. */
+  .editor-content table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Lock the main window's horizontal scroll. The vertical-scroll
+   * container `.editor-container` defaults to `overflow-x: auto` when
+   * `overflow-y: auto` is set (CSS spec coerces unspecified `visible`
+   * to `auto` to match), so any child wider than the viewport (long
+   * code spans, unbroken URLs, etc.) becomes a horizontal pan target.
+   * Force-clip every layer that could host that pan. Tables and images
+   * keep their own `overflow-x: auto` and scroll internally. */
+  html, body {
+    overflow-x: hidden;
+  }
+  .editor-container,
+  .editor-content,
+  .file-browser {
+    overflow-x: hidden;
+  }
+
+  /* Share dialog already uses max-width: 90vw — keep as-is */
+}
+
+/* ─── Outline drawer close button ───────────────────────────────────────── */
+/* Visible only inside the document-outline drawer on mobile. Desktop uses
+ * Ctrl+Shift+O to toggle, so the explicit button is mobile-only. */
+.outline-close {
+  display: none;
+  background: transparent;
+  border: none;
+  font-size: 20px;
+  line-height: 1;
+  padding: 6px 10px;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  margin-inline-start: auto;
+  min-width: var(--touch-target-min);
+  min-height: var(--touch-target-min);
+}
+
+@media (max-width: 640px) {
+  .outline-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Outline header gains a flex layout so the close button can sit on the
+   * trailing edge alongside the "Outline" label. */
+  .outline-header {
+    display: flex;
+    align-items: center;
+  }
+}
+
+/* ─── Phone landscape / small tablet (≤ 768px) ────────────────────────── */
+/* The 640px block above stretches the comment popup edge-to-edge for
+ * portrait phones. Phones in landscape (iPhone-sized devices are
+ * 667–932px wide) miss that breakpoint, so the JS-positioned 420px
+ * popup can still land off the left or right edge. Apply the same
+ * edge-to-edge override at the slightly wider 768px breakpoint —
+ * scoped to just the popup (and notification panel, which has the
+ * same overflow shape) so the rest of the layout stays unaffected. */
+@media (min-width: 641px) and (max-width: 768px) {
+  .comment-popup {
+    inset-inline: 8px !important;
+    width: auto !important;
+    max-width: calc(100vw - 16px);
+  }
+
+  .notification-panel {
+    position: fixed;
+    inset-inline: 8px;
+    width: auto;
+    max-width: none;
+  }
+}

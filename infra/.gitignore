@@ -1,0 +1,14 @@
+# CDK
+cdk.out/
+*.d.ts
+*.js
+!jest.config.js
+
+# deps
+node_modules/
+
+# local context cache (account-specific lookups)
+cdk.context.json
+
+# IDE
+.idea/

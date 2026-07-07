@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+#
+# Advisory pre-push review hook for OgreNotes.
+#
+# Runs the project's review agents over the production Rust changes
+# about to be pushed and prints their findings:
+#   1. rust-author-reviewer   (author-time: layering, idioms, trust
+#                              boundaries, named anti-patterns)
+#   2. rust-refactor-reviewer  (structural: cost-benefit gate, default
+#                              verdict "leave it", considered-and-declined)
+#
+# It is ADVISORY: it never blocks the push. This is the first step
+# toward wiring the review agents into an automatic gate (see
+# OGRENOTES-BRIEF.md, section 5).
+#
+# Install (run once from the repo root):
+#   ln -sf ../../scripts/hooks/pre-push .git/hooks/pre-push
+#   chmod +x scripts/hooks/pre-push
+# A thin .git/hooks/pre-push that `exec`s this file also works (that is
+# what the bundled installer sets up).
+#
+# Knobs (environment variables):
+#   OGRE_SKIP_REVIEW=1      skip both reviews for this one push
+#   OGRE_SKIP_REFACTOR=1    run the author review only, skip refactor
+#   OGRE_REVIEW_BASE=<ref>  override the diff base (default: upstream)
+#
+# Notes:
+# - The reviewer agents are read-only by design (tool set is
+#   Bash/Read/Grep/Glob, no Edit/Write), so this only inspects the diff.
+# - It calls the `claude` CLI in headless mode and allows the reviewers'
+#   read-only tools. If `claude` is not installed, the hook no-ops.
+# - To make it BLOCKING later, have it parse agent output for a severity
+#   marker and `exit 1` on high-severity findings.
+
+set -uo pipefail
+
+if [ "${OGRE_SKIP_REVIEW:-0}" = "1" ]; then
+  echo "[pre-push] OGRE_SKIP_REVIEW=1 set; skipping review."
+  exit 0
+fi
+
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+cd "$root" || exit 0
+
+# Pick a base to diff against: explicit override, else the upstream
+# tracking branch, else origin/master, else the previous commit.
+base="${OGRE_REVIEW_BASE:-}"
+if [ -z "$base" ]; then
+  base="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+fi
+if [ -z "$base" ] && git rev-parse --verify -q origin/master >/dev/null 2>&1; then
+  base="origin/master"
+fi
+if [ -z "$base" ]; then
+  base="HEAD~1"
+fi
+
+range="${base}..HEAD"
+
+# Only review non-test production Rust changes.
+changed="$(git diff --name-only "$range" -- '*.rs' 2>/dev/null | grep -vE '(^|/)tests/|_test\.rs$' || true)"
+if [ -z "$changed" ]; then
+  echo "[pre-push] no non-test Rust changes in ${range}; skipping review."
+  exit 0
+fi
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo "[pre-push] 'claude' CLI not on PATH; skipping review (advisory)."
+  exit 0
+fi
+
+echo "[pre-push] reviewing production Rust changes on ${range}"
+echo "[pre-push] changed production Rust files:"
+echo "${changed}" | sed 's/^/    /'
+echo "[pre-push] advisory only; this will NOT block the push"
+
+# Run one reviewer agent over the range. Advisory: never fails the push.
+run_reviewer() {
+  local agent="$1" label="$2" instructions="$3"
+  echo
+  echo "[pre-push] === ${label} (${agent}) ==="
+  local prompt="You are reviewing code about to be pushed. ${instructions} \
+Work from the git diff range ${range} (start with: git diff ${range} -- \
+'*.rs'). Review only non-test production code. If there are no material \
+findings, say so in one line. Do not edit any files."
+  claude --agent "${agent}" \
+         --permission-mode acceptEdits \
+         --allowedTools "Bash Read Grep Glob" \
+         -p "${prompt}" 2>&1 \
+    || echo "[pre-push] ${label} did not complete cleanly (advisory; not blocking)."
+}
+
+run_reviewer rust-author-reviewer "author review" \
+  "Apply your author-time review discipline: layering compliance, Rust \
+idioms, trust-boundary slippage, and any named anti-patterns from the \
+framework."
+
+if [ "${OGRE_SKIP_REFACTOR:-0}" != "1" ]; then
+  run_reviewer rust-refactor-reviewer "refactor review" \
+    "Apply your structural review discipline with your strict cost-benefit \
+gate (default verdict 'leave it'): layer violations, purpose drift, and \
+missing / premature / leaky abstractions. Label each finding author-time / \
+refactor-worthwhile / refactor-only-if-touching, and include a \
+considered-and-declined section."
+fi
+
+echo
+echo "[pre-push] advisory review done; push proceeding."
+exit 0

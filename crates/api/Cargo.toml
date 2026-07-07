@@ -1,0 +1,99 @@
+[package]
+name = "ogrenotes-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+publish.workspace = true
+default-run = "ogrenotes-api"
+
+[features]
+# `dev-login` compiles in the `/api/v1/auth/dev-login` endpoint. Enabled by
+# default so tests and local dev work unchanged. Production deploys SHOULD
+# build with `--no-default-features` so the handler is not reachable even
+# if `DEV_MODE=true` somehow leaks into the config.
+#
+# `xlsx`, `docx`, `pdf` are re-exposed pass-throughs to the matching
+# `ogrenotes-collab` features. They're on by default so prod and the
+# regular CI test suite get the full all-format import/export surface,
+# but the playwright nightly job can opt out of `pdf` to skip the
+# ~70-crate compile cost of `pdf-extract` + `printpdf` — playwright
+# doesn't exercise the PDF paths (those have e2e coverage in
+# `crates/api/tests/test_import_pdf_e2e.rs` and unit coverage in
+# `crates/collab/src/{import_pdf,export}.rs`).
+default = ["dev-login", "xlsx", "docx", "pdf"]
+dev-login = []
+xlsx = ["ogrenotes-collab/xlsx"]
+docx = ["ogrenotes-collab/docx"]
+pdf = ["ogrenotes-collab/pdf"]
+
+[dependencies]
+ogrenotes-common = { workspace = true }
+ogrenotes-storage = { workspace = true }
+ogrenotes-auth = { workspace = true }
+ogrenotes-collab = { workspace = true }
+ogrenotes-search = { workspace = true }
+ogrenotes-embeddings = { workspace = true }
+ogrenotes-notify = { workspace = true }
+ogrenotes-worker = { workspace = true }
+aws-sdk-bedrockruntime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+rand = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-dynamodb = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+
+dashmap = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio-stream = "0.1"
+urlencoding = "2"
+fred = { workspace = true }
+nanoid = { workspace = true }
+futures-util = "0.3"
+base64 = { workspace = true }
+sha2 = { workspace = true }
+samael = { workspace = true }
+bcrypt = { workspace = true }
+quick-xml = { workspace = true }
+flate2 = { workspace = true }
+# In-memory zip writer for POST /documents/bulk/export
+# (Phase 5 M-P5 piece C). `default-features = false` drops the
+# bzip2 / aes / deflate64 implementations we don't need; the
+# deflate-flate2 feature keeps DEFLATE compression on but routes
+# it through the same flate2 we already depend on.
+zip = { version = "2", default-features = false, features = ["deflate-flate2"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tower = { workspace = true }
+http-body-util = "0.1"
+hyper = "1"
+fred = { workspace = true }
+nanoid = { workspace = true }
+serde_json = { workspace = true }
+yrs = { workspace = true }
+ogrenotes-storage = { workspace = true }
+# Real TCP WebSocket client for the end-to-end read-only-enforcement test
+# (#111). Version matches the tokio-tungstenite axum 0.8 already locks, so
+# this adds no new transitive resolution.
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
+# SAML happy-path test (test_saml_acs_happy.rs) mints a SHA-256-signed
+# SAMLResponse by shelling out to the `xmlsec1` CLI (the same xmlsec
+# engine the server verifies with), then POSTs it to the ACS route.
+# chrono mints the live assertion timestamps the issue-delay/condition
+# windows need. samael is used only by the test's capability probe, to
+# detect hosts where its in-process xmlsec bindings can't verify (so
+# the test skips rather than false-fails there — see the file header).
+chrono = { workspace = true }
+samael = { workspace = true }

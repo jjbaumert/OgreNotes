@@ -1,0 +1,149 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/common",
+    "crates/storage",
+    "crates/auth",
+    "crates/collab",
+    "crates/search",
+    "crates/embeddings",
+    "crates/notify",
+    "crates/worker",
+    "crates/api",
+]
+exclude = [
+    "frontend",
+    "tests/load",
+    "tests/rag-eval",
+]
+
+[workspace.package]
+version = "0.1.2"
+edition = "2024"
+license = "MIT"
+description = "Clean-room collaborative document, spreadsheet, and chat platform written in Rust."
+# Not published to crates.io — these crates are internal to the OgreNotes
+# application. Inherited by every member via `publish.workspace = true`.
+publish = false
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# IDs
+nanoid = "0.4"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# AWS
+aws-config = "1"
+aws-sdk-dynamodb = "1"
+aws-sdk-s3 = "1"
+aws-sdk-bedrockruntime = "1"
+serde_dynamo = { version = "4.3", features = ["aws-sdk-dynamodb+1"] }
+
+# CRDT
+yrs = "0.21"
+
+# Redis
+# `subscriber-client` enables the long-lived SubscriberClient with
+# automatic re-subscribe-on-reconnect — used for cross-instance pub/sub
+# fanout of document updates.
+fred = { version = "9", features = ["subscriber-client"] }
+
+# Concurrency
+dashmap = "6"
+
+# Web framework
+axum = { version = "0.8", features = ["ws", "multipart"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs", "set-header"] }
+
+# Auth
+jsonwebtoken = "9"
+oauth2 = "4"
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+rand = "0.9"
+urlencoding = "2"
+# MFA (Phase 4 M-E3): TOTP for 6-digit codes, AES-GCM to encrypt the
+# stored secret at rest, bcrypt to hash single-use recovery codes.
+totp-rs = { version = "5", features = ["qr", "gen_secret"] }
+aes-gcm = "0.10"
+bcrypt = "0.15"
+# SAML 2.0 SP role (Phase 4 M-E4). samael is BSD-2-Clause pure-Rust
+# SAML SP/IdP scaffolding. The `xmlsec` feature wraps libxml2 +
+# xmlsec1 (both C libraries) to provide XML Signature verification
+# — required by piece D for assertion signature checks. Piece C
+# (metadata + login redirect) does not need xmlsec; the feature
+# flip happens in piece D's commit along with the ACS handler.
+# The Dockerfile already installs the C deps so the deploy is ready
+# whenever piece D lands.
+samael = { version = "0.0.18", default-features = false, features = ["xmlsec"] }
+quick-xml = "0.37"
+flate2 = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Testing
+proptest = "1"
+test-strategy = "0.4"
+
+# Search
+tantivy = "0.22"
+qdrant-client = "1"
+uuid = { version = "1", features = ["v5"] }
+
+# Email (M4)
+# `lettre` with SMTP transport speaks the SES SMTP relay in prod and
+# MailHog locally — one code path, no need for aws-sdk-ses/v2.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder"] }
+async-trait = "0.1"
+minijinja = "2"
+
+# Workspace crates
+ogrenotes-common = { path = "crates/common" }
+ogrenotes-storage = { path = "crates/storage" }
+ogrenotes-auth = { path = "crates/auth" }
+ogrenotes-collab = { path = "crates/collab" }
+ogrenotes-search = { path = "crates/search" }
+ogrenotes-embeddings = { path = "crates/embeddings" }
+ogrenotes-notify = { path = "crates/notify" }
+ogrenotes-worker = { path = "crates/worker" }
+
+# Faster-compiling release profile used only by the AWS test-stack Docker
+# build. Trades ~10% runtime perf (no LTO, more codegen units) for ~30–50%
+# faster compilation. Prod releases should still use `--release`.
+# `incremental = false` is intentional: incremental artifacts bloat the
+# Docker cache mount and produce non-deterministic output.
+[profile.release-fast]
+inherits = "release"
+codegen-units = 256
+lto = false
+incremental = false
+# Strip symbols from the deployed server binary: smaller image layer and
+# faster ECS image pull, at zero runtime cost. Kept here (not opt-level=z /
+# panic=abort) on purpose — the server wants opt-level 3 for throughput, and
+# axum relies on per-request unwind, so panic=abort would turn a handler
+# panic into a whole-process kill.
+strip = true
+
+# Test profile — line-tables-only debug info. Each integration test
+# (`tests/test_*.rs`) becomes its own ~200 MB binary at debug=2; with
+# 24+ tests × the full dep graph that overflows GitHub Actions' 14 GB
+# free disk and the linker dies with SIGBUS. Line tables are enough
+# for stack traces and panic locations on assertion failures, and cut
+# binary size by 50–70%. Local debugging in IDEs that need full debug
+# info can override with `cargo test --profile=test-debug`.
+[profile.test]
+debug = 1

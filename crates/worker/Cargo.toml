@@ -1,0 +1,26 @@
+[package]
+name = "ogrenotes-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+publish.workspace = true
+
+[dependencies]
+ogrenotes-common = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+nanoid = { workspace = true }
+
+# Streams + ack on the same Redis client family the rest of the
+# stack already uses. We don't need subscriber-client here; XADD /
+# XREADGROUP / XACK / XCLAIM all flow through the regular RedisClient.
+fred = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

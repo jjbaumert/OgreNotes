@@ -1,0 +1,15 @@
+{
+  "name": "ogrenote-frontend-doctor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Headless-browser diagnostic harness for the OgreNotes deployed frontend. Driven by the .claude/agents/frontend-doctor.md subagent.",
+  "type": "module",
+  "scripts": {
+    "doctor": "node doctor.js"
+  },
+  "dependencies": {
+    "@axe-core/playwright": "4.10.1",
+    "otplib": "12.0.1",
+    "playwright": "1.49.0"
+  }
+}

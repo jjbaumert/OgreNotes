@@ -1,0 +1,48 @@
+name: Bug report
+description: Report something that isn't working as intended
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a report. Triage is best-effort —
+        see the governance note in the README. Please do **not** report
+        security vulnerabilities here; use the process in SECURITY.md.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+      placeholder: When I ..., I expected ..., but instead ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Go to ...
+        2. Click ...
+        3. See error
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, browser (for frontend issues), Rust version, commit SHA.
+      placeholder: |
+        - OS:
+        - Browser:
+        - Rust:
+        - Commit:
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / screenshots
+      description: Relevant logs or screenshots. Redact any tokens or personal data.
+      render: shell
+    validations:
+      required: false

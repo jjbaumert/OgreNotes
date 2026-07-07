@@ -1,0 +1,119 @@
+/* Light-mode color tokens (Phase 5 M-P1).
+ *
+ * Source palette: `design/branding.md` §Color Palette (lines 53-78).
+ * The token names below are the public API every other CSS file
+ * consumes — when adding a new color, ADD A TOKEN, don't hardcode
+ * a hex. The hardcoded-color lint in pre-commit flags raw `#xxxxxx`
+ * outside this file and `tokens-dark.css`.
+ *
+ * Naming convention: existing `--color-*` names are preserved from
+ * the pre-M-P1 `variables.css` to avoid a mass-rename of every
+ * consumer in one commit. A follow-up "semantic vocabulary"
+ * cleanup can introduce role-named aliases (`--bg-canvas`,
+ * `--text-primary`, etc.) once the dark mode flips are in.
+ *
+ * Dark-mode overrides live in `tokens-dark.css` under the
+ * `:root[data-theme="dark"]` selector. Both files MUST export the
+ * same set of variables — a missing override would let a light
+ * value bleed into the dark theme.
+ */
+
+:root {
+  /* Tells the browser the page is in light mode, so the UA
+   * stylesheet picks light-mode defaults for native form
+   * controls, scrollbars, and any `system-ui`-derived colors.
+   * The dark-mode counterpart lives in tokens-dark.css. */
+  color-scheme: light;
+
+  /* Primary brand */
+  --color-primary: #2D5F2D;        /* Swamp Green */
+  --color-primary-hover: #245024;
+  --color-secondary: #5C3D2E;      /* Ogre Brown */
+
+  /* Surface + structural */
+  --color-bg: #F5F0E8;             /* Parchment — page canvas */
+  --color-surface: #FFFFFF;        /* Bone — cards, modals, docs */
+  --color-border: #E8E4DC;
+  --color-mist: #E8E4DC;           /* Subtle backgrounds, hover states */
+  /* Recessed surface — chips, hover-states, header bars inside
+   * panels. Sits between --color-surface and --color-bg in tone.
+   * Lots of consumers in spreadsheet.css use this with an inline
+   * fallback hex (`var(--color-bg-subtle, #f7f7f7)`); the fallback
+   * only fires when this token is unset — which used to be every
+   * page load. Defining it here AND in tokens-dark.css makes the
+   * variable resolve correctly in both themes; the fallbacks
+   * become defensive dead code (still useful for FOUC). */
+  --color-bg-subtle: #F5F0E8;
+  --color-bg-hover: #EBE6DD;       /* slightly darker than canvas */
+  --color-text-error: #C0392B;     /* Rust — same family as --color-error */
+
+  /* Text */
+  --color-text: #1A1A1A;           /* Ink — body */
+  --color-text-secondary: #6B6B6B; /* Stone — secondary */
+
+  /* Status — base accent colors */
+  --color-success: #4A7C4A;        /* Moss */
+  --color-warning: #D4920B;        /* Amber */
+  --color-error: #C0392B;          /* Rust */
+  /* M-P8 piece C: darkened from #2980B9 (4.30:1 on white — fell
+   * short of WCAG AA 4.5:1 for body text) to #1A6FB0 (5.32:1). */
+  --color-link: #1A6FB0;           /* River */
+  --color-collab: #7B5EA7;         /* Violet — collaboration cursors */
+
+  /* Status — surface trios (bg + border + fg) for inline messages,
+   * error banners, success toasts, warning notifications. Hand-tuned
+   * to keep the fg AA-contrast against bg in both modes; the M-P8
+   * a11y pass will re-validate with axe-core. */
+  --color-error-bg: #FEEEEE;
+  --color-error-border: #F0B0B0;
+  --color-error-fg: #8C2020;
+  --color-error-hover: #A93226;    /* darker Rust for button hover */
+  --color-success-bg: #E8F5E8;
+  --color-success-border: #B0CCB0;
+  --color-success-fg: #1E5A1E;
+  --color-warning-bg: #FFF8DC;
+  --color-warning-border: #E0C870;
+  --color-warning-fg: #6B4500;
+
+  /* Text tier 3 — placeholders, timestamps, byline metadata.
+   * Lighter than text-secondary so the visual hierarchy reads as
+   * primary → secondary → tertiary.
+   * M-P8 piece C: darkened from #999999 (2.85:1 on white — failed
+   * WCAG AA for both body and large text) to #767676 (4.54:1).
+   * Lifts every timestamp / byline / metadata caption to AA. */
+  --color-text-tertiary: #767676;
+
+  /* Code blocks — inverted (dark bg + light fg) in light mode for
+   * syntax-highlighting visual feel. Dark mode keeps the inversion
+   * direction but pushes bg darker than canvas for inset look. */
+  --color-code-bg: #1A1A1A;
+  --color-code-fg: #E0E0E0;
+
+  /* "On-X" text colors — what to draw on top of a colored
+   * surface. Primary button text needs to flip with the primary
+   * accent color: light-on-dark-green in light mode, dark-on-pale-
+   * green in dark mode. Danger button text stays white in both
+   * because both error variants are dark enough. */
+  --color-on-primary: #FFFFFF;
+  --color-on-danger: #FFFFFF;
+
+  /* Focus outline for spreadsheet cells, paste-target indicators,
+   * etc. Brighter blue for clear "selected" semantics. */
+  --color-focus-outline: #3B82F6;
+
+  /* Brand-anchor surface — same color in BOTH light and dark
+   * mode. Used by elements that signal brand identity rather than
+   * theme-aware UI (the sidebar is the canonical example). Keeping
+   * the value identical in tokens-dark.css is deliberate — see
+   * design/branding.md and the M-P1 follow-up commit that
+   * formalized this pattern. */
+  --color-brand-anchor: #5C3D2E;        /* Ogre Brown */
+  --color-on-brand-anchor: #FFFFFF;     /* light text reads against the dark brown */
+  /* Muted variant for section titles, placeholder items, keyboard
+   * shortcut hints — sits inside the brand-anchor stripe but reads
+   * as secondary. rgba(255,255,255,0.7) over #5C3D2E gives 5.72:1
+   * which passes WCAG AA for body text (4.5:1). The pre-Phase-6
+   * values (0.4 / 0.5) were 2.98:1 / 3.76:1 — both AA-fails for
+   * small text. Phase 6 M-6.x a11y-audit follow-up. */
+  --color-on-brand-anchor-muted: rgba(255, 255, 255, 0.7);
+}

@@ -1,0 +1,147 @@
+/* Dark-mode color tokens (Phase 5 M-P1).
+ *
+ * Source palette: `design/branding.md` §Color Palette §Dark Mode
+ * (lines 80-87) plus derived values where the spec leaves a token
+ * unspecified — see the comments inline.
+ *
+ * Selector specificity: `:root[data-theme="dark"]` is (0,2,0), one
+ * more than the plain `:root` (0,1,0) used in `tokens-light.css`.
+ * That extra attribute-selector point is what makes the dark
+ * overrides win when the runtime flips `data-theme` on `<html>`.
+ *
+ * MUST export the same variable set as `tokens-light.css`. Missing
+ * a key here would let the light value bleed through under dark
+ * mode. The follow-up frontend wiring in Piece C will flip the
+ * attribute; the follow-up audit pass in Piece D guarantees every
+ * downstream stylesheet uses these tokens (no hardcoded hex).
+ */
+
+:root[data-theme="dark"] {
+  /* Opt the UA stylesheet into dark mode. Without this, native
+   * form controls (`<input>`, `<textarea>`, `<select>`) keep
+   * their light-mode defaults — most visibly white-on-white
+   * text in any input whose CSS sets `color` but not
+   * `background` (the comment-popup textarea is the regression
+   * that surfaced this in the first dark-mode pass). Also
+   * applies to scrollbars, default ::selection, and any
+   * `system-ui`-derived colors. */
+  color-scheme: dark;
+
+  /* Primary brand — dark mode uses Pale Green per branding.md:87
+   * for primary accents because Swamp Green hits a contrast wall
+   * on the Deep Bog background. Hover is slightly desaturated. */
+  --color-primary: #7DC87D;        /* Pale Green */
+  --color-primary-hover: #8FD68F;
+  --color-secondary: #C9A88A;      /* desaturated Ogre Brown */
+
+  /* Surface + structural */
+  --color-bg: #1A1F1A;             /* Deep Bog — page canvas */
+  --color-surface: #2A2A2A;        /* Charcoal — cards, modals, docs */
+  --color-border: #3A3A3A;         /* derived: Charcoal +~10% lightness */
+  --color-mist: #2F352F;           /* derived: a hair lighter than canvas */
+  /* Recessed surface — sits a hair lighter than the canvas so chips
+   * and panel header bars read as inset against the surrounding
+   * Charcoal modal. Without this, the consumers in spreadsheet.css
+   * (every var(--color-bg-subtle, #f7f7f7) reference) fell back to
+   * the inline light hex — pivot chips became light-on-light in
+   * dark mode. Mirrors the same key in tokens-light.css. */
+  --color-bg-subtle: #232823;
+  --color-bg-hover: #3A3A3A;       /* matches --color-border for hover bg */
+  --color-text-error: #E87060;     /* matches --color-error in dark */
+
+  /* Text */
+  --color-text: #E8E8E8;           /* derived: high-contrast on Deep Bog */
+  --color-text-secondary: #B0B0B0; /* Ash — secondary */
+
+  /* Status — re-tuned for legibility on dark surfaces. Hex values
+   * derived to keep WCAG AA contrast against --color-surface
+   * (#2A2A2A) at 4.5:1 body / 3:1 large.
+   * M-P8 piece C confirmed the values with a hand audit; one
+   * tweak: --color-error lifted from #E0594B (3.90:1) to #E87060
+   * (4.73:1) so error text passes 4.5:1 body. */
+  --color-success: #6FC46F;
+  --color-warning: #F0B33C;
+  --color-error: #E87060;
+  --color-link: #5BA3D9;
+  --color-collab: #A48BD9;         /* Violet lightened for dark canvas */
+
+  /* Status surface trios. Backgrounds are tinted dark variants of
+   * the status color so they blend with the Charcoal surface but
+   * remain distinguishable; foregrounds are pastel variants for
+   * legibility against the dark bg. */
+  --color-error-bg: #3A1A1A;
+  --color-error-border: #6A3838;
+  --color-error-fg: #F5B5B5;
+  --color-error-hover: #B83A2E;
+  --color-success-bg: #1A3A1A;
+  --color-success-border: #3A6A3A;
+  --color-success-fg: #B5E5B5;
+  --color-warning-bg: #3A2F1A;
+  --color-warning-border: #6A5A2A;
+  --color-warning-fg: #F0D080;
+
+  /* M-P8 piece C: lifted from #888888 (4.05:1 on #2A2A2A — AA-large
+   * only) to #959595 (4.79:1) so tertiary text passes body-grade
+   * AA on the standard card surface with headroom over the 4.5
+   * threshold (vs #909090, which computes 4.496 — just below). */
+  --color-text-tertiary: #959595;
+
+  /* Code: keep dark bg (was already inverted in light mode), make
+   * it slightly DARKER than --color-bg (Deep Bog #1A1F1A) so the
+   * code-block still reads as a recessed surface. */
+  --color-code-bg: #0F1110;
+  --color-code-fg: #E0E0E0;
+
+  /* `on-primary` flips: in dark mode primary = Pale Green (light),
+   * so a dark text color is required. `on-danger` stays white —
+   * both dark and light error tokens have enough contrast for it. */
+  --color-on-primary: #1A1F1A;
+  --color-on-danger: #FFFFFF;
+
+  /* Same blue works in dark mode (it's already saturated enough). */
+  --color-focus-outline: #5B9BF0;
+
+  /* Brand-anchor surface — IDENTICAL to the light-mode value by
+   * design. The sidebar uses this for its background; the dark
+   * Ogre Brown sits well against both Parchment and Deep Bog
+   * canvases, so we treat it as a brand stripe rather than a
+   * theme-aware surface. If we ever decide the sidebar should
+   * pick a darker brown in dark mode, that's a one-line token
+   * change here. */
+  --color-brand-anchor: #5C3D2E;        /* same Ogre Brown as light mode */
+  --color-on-brand-anchor: #FFFFFF;
+  /* Same value as light mode because brand-anchor is the same. */
+  --color-on-brand-anchor-muted: rgba(255, 255, 255, 0.7);
+}
+
+/* Form controls — explicit bg/color under dark mode. `color-scheme:
+ * dark` above gets us most of the way (native browser defaults
+ * become dark), but textareas with an explicit `color: var(--color-text)`
+ * + no `background` still rendered white-on-white. These rules
+ * align every text input with the surrounding surface tokens so
+ * what the user sees matches the popup/dialog/page they're inside
+ * of. Light-mode behavior is unchanged — these only apply when
+ * `data-theme="dark"` is set. */
+:root[data-theme="dark"] input[type="text"],
+:root[data-theme="dark"] input[type="email"],
+:root[data-theme="dark"] input[type="password"],
+:root[data-theme="dark"] input[type="search"],
+:root[data-theme="dark"] input[type="url"],
+:root[data-theme="dark"] input:not([type]),
+:root[data-theme="dark"] textarea,
+:root[data-theme="dark"] select {
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
+/* Text-selection highlight. The light-mode default
+ * (`rgba(45, 95, 45, 0.2)` Swamp Green @ 20%) bleeds into a dark
+ * canvas — the green is already close to Deep Bog (#1A1F1A), so
+ * the highlight is barely visible AND the slight tint over light
+ * text drops legibility. Override with a brighter Pale Green at
+ * higher alpha so the selection is unambiguous in dark mode. */
+:root[data-theme="dark"] .editor-content ::selection,
+:root[data-theme="dark"] ::selection {
+  background: rgba(125, 200, 125, 0.35); /* Pale Green @ 35% */
+  color: var(--color-text);
+}

@@ -1,0 +1,11 @@
+target/
+frontend/target/
+frontend/dist/
+dist/
+.git/
+*.md
+design/
+scripts/
+infra/
+.env
+.aws-test-config.env

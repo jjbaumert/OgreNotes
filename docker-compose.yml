@@ -1,0 +1,36 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --save 60 1 --loglevel warning
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    ports:
+      - "127.0.0.1:8000:8000"
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+
+  # MailHog — local SMTP catcher for M4 email notifications. The notify
+  # crate speaks SMTP; set SMTP_HOST=localhost SMTP_PORT=1025 and browse
+  # captured mail at http://localhost:8025.
+  mailhog:
+    image: mailhog/mailhog:latest
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+
+volumes:
+  redis-data:

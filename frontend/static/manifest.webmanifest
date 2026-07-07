@@ -1,0 +1,28 @@
+{
+  "name": "OgreNotes",
+  "short_name": "OgreNotes",
+  "description": "Collaborative documents, spreadsheets, and messaging.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#F5F0E8",
+  "theme_color": "#2D5F2D",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-maskable.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ],
+  "categories": ["productivity", "business"],
+  "lang": "en-US",
+  "dir": "ltr"
+}

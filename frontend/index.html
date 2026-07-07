@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes" />
+    <title>OgreNotes</title>
+    <!-- #152: stamp data-theme (+ a11y attrs) from the cached pref, or the
+         OS fallback, SYNCHRONOUSLY — before the stylesheet paints and long
+         before the WASM loads. Without this, every full load (including the
+         Home button, which does a window.location reload) shows a light
+         frame until main() runs and sets data-theme. The localStorage keys
+         mirror theme.rs's cache, which the running app keeps populated.
+         CSP-allowed via the backend's inline-script hashing (api/main.rs). -->
+    <script>
+      (function () {
+        try {
+          var d = document.documentElement;
+          var t = localStorage.getItem('ogrenotes.theme');
+          if (t === 'light' || t === 'dark') {
+            d.setAttribute('data-theme', t);
+          } else {
+            d.setAttribute(
+              'data-theme',
+              window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+            );
+          }
+          if (localStorage.getItem('ogrenotes.dyslexic_font') === 'true')
+            d.setAttribute('data-dyslexic', 'true');
+          if (localStorage.getItem('ogrenotes.reduce_motion') === 'true')
+            d.setAttribute('data-reduce-motion', 'true');
+          // #152: size the boot skeleton (below) to match a collapsed
+          // sidebar if that's the user's saved choice, so the placeholder
+          // bar matches the real sidebar width once WASM mounts.
+          if (localStorage.getItem('ogrenotes.sidebar-collapsed') === '1')
+            d.setAttribute('data-sidebar-collapsed', '1');
+        } catch (e) {}
+      })();
+    </script>
+    <!-- Tokens load in cascade order: non-color → light palette →
+         dark overrides. Order matters because `:root[data-theme=
+         "dark"]` (specificity 0,2,0) beats `:root` (0,1,0), and
+         the source order also has to put dark AFTER light for
+         tied-specificity rules. main.css and below consume the
+         tokens. -->
+    <link data-trunk rel="css" href="style/variables.css" />
+    <link data-trunk rel="css" href="style/tokens-light.css" />
+    <link data-trunk rel="css" href="style/tokens-dark.css" />
+    <link data-trunk rel="css" href="style/main.css" />
+    <link data-trunk rel="css" href="style/spreadsheet.css" />
+    <link data-trunk rel="css" href="style/responsive.css" />
+    <!-- data-wasm-opt-params="--all-features" is REQUIRED for the
+         size-optimized deploy build: under lto=fat (set via
+         CARGO_PROFILE_RELEASE_* in the Dockerfile / bundle-size.yml)
+         LLVM emits bulk-memory ops (memory.copy/fill), and wasm-bindgen
+         strips the target_features section, so wasm-opt would otherwise
+         validate against MVP and reject them. Harmless for the plain
+         (lto=false) release build. Do not remove. -->
+    <link data-trunk rel="rust" data-wasm-opt="z" data-wasm-opt-params="--all-features" />
+
+    <!-- PWA shell (Phase 5 M-P3 piece A). Trunk copies each file
+         from `static/` to the dist root; the served URLs below
+         match those copy destinations. Theme-color values match
+         the M-P1 light/dark token surfaces (Parchment / Deep Bog). -->
+    <link data-trunk rel="copy-file" href="static/manifest.webmanifest" />
+    <link data-trunk rel="copy-file" href="static/service-worker.js" />
+    <link data-trunk rel="copy-file" href="static/icon.svg" />
+    <link data-trunk rel="copy-file" href="static/icon-maskable.svg" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
+    <meta name="theme-color" content="#F5F0E8" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#1A1F1A" media="(prefers-color-scheme: dark)" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="OgreNotes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <script>
+      // Service-worker registration. Feature-detected. Skipped on
+      // localhost/127.0.0.1 dev hosts because the cached shell
+      // collides with `trunk serve`'s live-reload.
+      if (
+        'serviceWorker' in navigator &&
+        location.hostname !== 'localhost' &&
+        location.hostname !== '127.0.0.1' &&
+        location.protocol === 'https:'
+      ) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/service-worker.js').catch(() => {});
+        });
+        // When an updated worker (it calls skipWaiting + clients.claim)
+        // takes control of this already-open page, reload once so a
+        // client stranded on a previous build's shell picks up the fresh
+        // index.html + current asset URLs. Guarded two ways: only armed
+        // when a controller already exists (so a first-ever install
+        // doesn't reload), and a flag prevents a reload loop.
+        if (navigator.serviceWorker.controller) {
+          let reloading = false;
+          navigator.serviceWorker.addEventListener('controllerchange', () => {
+            if (reloading) return;
+            reloading = true;
+            window.location.reload();
+          });
+        }
+      }
+    </script>
+</head>
+<body>
+    <!-- #152: static sidebar skeleton. Painted by CSS immediately on a full
+         page load so the brand-colored sidebar column is filled during the
+         WASM download/compile/mount gap — otherwise the empty themed
+         background shows for a beat and the sidebar "flashes" in. `main.rs`
+         removes this once the real sidebar is in the DOM. Hidden on mobile
+         (where the sidebar is an off-canvas drawer). -->
+    <div id="boot-skeleton" aria-hidden="true"></div>
+</body>
+</html>

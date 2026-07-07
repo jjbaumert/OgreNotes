@@ -1,0 +1,30 @@
+name: Feature request
+description: Suggest an idea or enhancement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Note that OgreNotes has no roadmap or support
+        guarantee — direction is set solely by the maintainer, and requests
+        may be declined. Discussion here is still welcome.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      placeholder: I'm frustrated when ... / It would help to ...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      placeholder: Describe what you'd like to see.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false

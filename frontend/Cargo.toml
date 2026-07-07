@@ -1,0 +1,161 @@
+[package]
+name = "ogrenotes-frontend"
+version = "0.1.2"
+edition = "2024"
+license = "MIT"
+
+[lib]
+name = "ogrenotes_frontend"
+path = "src/lib.rs"
+
+[dependencies]
+leptos = { version = "0.7", features = ["csr"] }
+leptos_router = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+# Wrap non-Send wasm handles (Closure / EventTarget) so they can ride in
+# Leptos's `Send + Sync` `on_cleanup` for listener teardown (#6). Safe
+# because the wasm runtime is single-threaded; already in the tree
+# transitively via leptos.
+send_wrapper = "0.6"
+gloo-net = { version = "0.6", features = ["http"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+console_error_panic_hook = "0.1"
+urlencoding = "2"
+yrs = "0.21"
+pulldown-cmark = { version = "0.12", default-features = false }
+# `libm` provides pure-Rust implementations of `erf`, `lgamma`, etc.
+# that aren't on stable f64. Used by the spreadsheet's statistical
+# distribution library (M-S1c). ~20 KB compiled to wasm with no
+# transitive deps; preferred over `statrs` because that pulls in
+# `nalgebra` and bloats the bundle by orders of magnitude for what
+# is essentially a handful of formulas we hand-roll on top.
+libm = "0.2"
+# Phase 4 M-E3 piece E: render the TOTP provisioning URI as an SVG
+# QR code on the enrollment page. `default-features = false` keeps
+# the `image` PNG renderer out — we only need the SVG path.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Phase 5 M-P2 piece 1 — i18n harness. fluent-bundle is the message
+# resolver (parse FTL files, lookup keys, format with args). unic-
+# langid carries the BCP-47 locale identifier we hand to the bundle.
+# Pure Rust, wasm-compatible. See design/i18n.md for the full
+# library-choice rationale.
+fluent-bundle = "0.15"
+unic-langid = { version = "0.9", features = ["macros"] }
+
+# Sublime-style fuzzy ranking for the command palette (Phase 5
+# M-P4 piece B). Pulled in here rather than at the workspace level
+# because no backend crate needs it.
+fuzzy-matcher = "0.3"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "Window",
+    "Document",
+    "Element",
+    "Node",
+    "Text",
+    "NodeList",
+    "HtmlElement",
+    "HtmlDivElement",
+    "HtmlDocument",
+    "HtmlInputElement",
+    "HtmlTextAreaElement",
+    "HtmlBrElement",
+    "HtmlImageElement",
+    "HtmlAnchorElement",
+    "HtmlPreElement",
+    "HtmlSelectElement",
+    "HtmlHrElement",
+    "Location",
+    "Storage",
+    "console",
+    "Event",
+    "EventTarget",
+    "KeyboardEvent",
+    "InputEvent",
+    "CompositionEvent",
+    "Clipboard",
+    "ClipboardEvent",
+    "ClipboardEventInit",
+    "DataTransfer",
+    "DragEvent",
+    "DomParser",
+    "SupportedType",
+    "FocusEvent",
+    "Selection",
+    "Range",
+    "StaticRange",
+    "MutationObserver",
+    "MutationObserverInit",
+    "MutationRecord",
+    "DomTokenList",
+    "CssStyleDeclaration",
+    "Performance",
+    "InputEventInit",
+    "KeyboardEventInit",
+    "History",
+    "File",
+    "FileList",
+    "Blob",
+    "Url",
+    "FormData",
+    "MouseEvent",
+    "MouseEventInit",
+    "WebSocket",
+    "MessageEvent",
+    "BinaryType",
+    "CloseEvent",
+    "DomRect",
+    "DomRectList",
+    "Navigator",
+    "TouchEvent",
+    "TouchList",
+    "Touch",
+    "VisualViewport",
+    "MediaQueryList",
+    "ScrollIntoViewOptions",
+    "ScrollBehavior",
+    "ScrollLogicalPosition",
+    # Phase 6 M-6.2 piece A: fetch + ReadableStream for SSE
+    # streaming on /api/v1/ask. EventSource won't work because
+    # /ask is POST with a JSON body; we have to drop down to
+    # raw fetch + reader.
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "Headers",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "TextDecoder",
+    "TextDecoderOptions",
+    "TextDecodeOptions",
+]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+futures-channel = "0.3"
+futures-util = "0.3"
+# Property tests for the remote-swap StepMap diff (step_map_for_doc_swap) —
+# NATIVE ONLY. proptest drags in deps that don't build for
+# wasm32-unknown-unknown (rusty-fork via the `fork` feature; getrandom 0.3
+# via rand), and `wasm-pack test` compiles the lib's #[cfg(test)] modules.
+# These property tests run under `cargo test` natively, not in the browser,
+# so scope proptest to non-wasm targets and gate the prop module with
+# cfg(not(target_arch = "wasm32")). default-features off also drops the
+# unused fork/timeout machinery on native.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
+
+# Tuned for build speed on the test-stack Docker image. Trunk has no
+# --profile flag, so we override release directly here. Frontend is
+# excluded from the workspace (see root Cargo.toml `exclude = ["frontend"]`),
+# so the workspace `release-fast` profile doesn't reach this crate.
+[profile.release]
+codegen-units = 256
+lto = false

@@ -1,0 +1,117 @@
+# framework/config.toml — per-project knobs for the agent framework.
+#
+# Both agents (authoring, refactoring) and the supervisor read this
+# file before acting. A missing knob falls back to the most-restrictive
+# default and emits an `open-question` finding asking the owner to set
+# it explicitly. Silent fallback to permissive defaults is a config bug.
+#
+# Copy this file to `framework/config.toml` in your project root, then
+# fill in values. Comments below explain trade-offs for each knob.
+
+
+# ─── Supervisor ────────────────────────────────────────────────
+
+[supervisor]
+
+# Who applies the supervisor-review checklist.
+#   "human" — a person reads agent output and decides each disposition.
+#             This is the safe default. Choose this when you're new to
+#             the framework or when the project handles material with
+#             security or correctness sensitivity above what mechanical
+#             rules can fully cover.
+#   "agent" — a supervising agent applies the checklist mechanically
+#             to the structured agent output. Faster, but a project
+#             should only opt in once the human-supervised version of
+#             the framework has been running for some time without
+#             surprises.
+kind = "human"
+
+# Free-text identifier of the supervisor. For human-kind, list real
+# names (`["alice", "bob"]`); for agent-kind, the agent's role name.
+# Used in audit logs, not in dispatch logic.
+identity = ["unset"]
+
+
+# ─── Branch protection ─────────────────────────────────────────
+
+[branch_protection]
+
+# Whether the agent may push directly to the project's main branch.
+# The default is `false` — the agent ships changes through PRs and
+# the supervisor reviews them. Flipping this to `true` is reasonable
+# only on a single-developer project where the supervisor is the
+# committer in any case.
+allow_direct_to_main = false
+
+
+# ─── Agent capabilities ────────────────────────────────────────
+
+[agents]
+
+# Whether the agents may propose `breaking-api-deprecation-shim`
+# patches: a public-API change that adds the new signature alongside
+# the old one, marks the old one `#[deprecated(since=…, note=…)]`,
+# and proposes a removal date. The supervisor still has to land the
+# patch.
+#
+# When false, public-API change findings flag-and-stop (no patch).
+# Flip to true once you've seen the agent handle simpler refactors
+# without scope creep.
+may_propose_breaking_changes = false
+
+# Whether the refactoring agent may add new tests under the
+# `test-coverage-gap` finding kind for currently-untested behavior.
+# Even when true, the agent is restricted to property-based tests
+# (round-trip, idempotence, monotonicity, no-crash-on-input) — not
+# specific-output tests, which would freeze incidental behavior.
+#
+# When false, coverage gaps are surfaced as `consider`-severity
+# findings without a patch, and a human writes the test.
+may_add_test_coverage_gap_tests = false
+
+
+# ─── Identifier strategy ───────────────────────────────────────
+
+# How the project encodes resource identifiers in code. The agents
+# read this to decide whether to generate newtype-on-existing-IDs
+# findings.
+#
+#   "newtype"               — every resource has a newtype
+#                             (DocId, UserId, …). The default for
+#                             new projects. Agents flag any new code
+#                             that uses raw String for an ID.
+#
+#   "string-grandfathered"  — existing IDs are raw String by legacy
+#                             choice. Agents do not flag existing
+#                             usage. New IDs introduced after this
+#                             setting was recorded MAY newtype if
+#                             the local benefit clears the cost-
+#                             benefit gate, but the agents do not
+#                             require it.
+#
+#   "mixed"                 — case by case. Agents fall back to
+#                             default-suspicion (newtype preferred)
+#                             but include a stronger explanation
+#                             for each finding. Use sparingly; this
+#                             is a sign the project's strategy
+#                             isn't yet decided.
+identifier_strategy = "newtype"
+
+
+# ─── This-project-overrides slot (for OgreNotes) ───────────────
+#
+# Uncomment and copy into your real `framework/config.toml` to mirror
+# this project's actual configuration:
+#
+# [supervisor]
+# kind = "human"
+# identity = ["jbaumert"]
+#
+# [branch_protection]
+# allow_direct_to_main = false
+#
+# [agents]
+# may_propose_breaking_changes = false
+# may_add_test_coverage_gap_tests = false
+#
+# identifier_strategy = "string-grandfathered"

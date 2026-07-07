@@ -1,0 +1,167 @@
+# verification/config.toml — per-project knobs for the verification framework.
+#
+# Read by all four sub-agents (test-planner, api-tester,
+# human-instructor, ticket-writer) before they act. A missing knob
+# falls back to the most-restrictive default. Comments below explain
+# trade-offs for each knob.
+#
+# Copy this file to `verification/config.toml` and fill in values.
+
+
+# ─── Issue tracker ─────────────────────────────────────────────
+
+[issue_tracker]
+
+# Which issue tracker the ticket-writer files into.
+#   "github" — uses `gh issue create`. Requires the `gh` CLI to be
+#              authenticated on the host running the agent.
+# Future values may include "linear", "jira"; only "github" is
+# supported today.
+kind = "github"
+
+# Repository to file issues against. Leave empty to use whatever
+# `gh` picks up from the local git remote (typical). Set to
+# "owner/name" when you want issues filed in a different repo
+# than the one this project lives in (e.g., a separate
+# bug-tracking repo).
+repo = ""
+
+
+# ─── Test planner ──────────────────────────────────────────────
+
+[planner]
+
+# Effort estimates the planner emits on each plan entry. The
+# user uses these to scope the plan down before approving.
+#   "minutes" — best for on-demand runs where each test is
+#               typically 1-30 min.
+#   "hours"   — best for pre-release sweeps with bigger entries.
+default_effort_unit = "minutes"
+
+# Whether the planner asks the user clarifying questions before
+# emitting a plan when the input is ambiguous in a shape-changing
+# way. See `agents/test-planner.md §When to ask clarifying
+# questions`. Setting to false makes the planner emit its best
+# guess and let the user revise via Gate 1.
+ask_clarifying_questions = true
+
+
+# ─── API tester ────────────────────────────────────────────────
+
+[api_tester]
+
+# Base URL for the running deployed system. The api-tester sends
+# its curls here.
+#   Local dev:       "http://localhost:3000"
+#   AWS test stack:  "https://<test-stack-host>"
+# Leave empty to force the api-tester to ask the parent agent
+# rather than guess.
+base_url = ""
+
+# Default max-time for curl, in seconds. Hung servers shouldn't
+# hang the agent. 30s is generous; the api-tester may override
+# per-test if it knows a slow endpoint is involved.
+curl_max_time_secs = 30
+
+# Whether the api-tester refuses to run if base_url points at
+# what appears to be a production host. The check is a substring
+# match against this list — keep it loud and obvious.
+production_host_patterns = ["prod.", "production."]
+
+
+# ─── Ticket writer ─────────────────────────────────────────────
+
+[ticket_writer]
+
+# MUST be false. The ticket-writer never auto-files; every draft
+# requires Gate 2 approval. This knob exists so the supervisor
+# checklist (T-rules in `supervisor-review.md`) can read a value
+# and assert; flipping to true is not supported.
+auto_file = false
+
+# Default labels applied to every filed issue. Common values:
+#   ["bug"]
+#   ["verification-finding"]
+#   ["bug", "from-verification-run"]
+default_labels = []
+
+# Default assignee. Empty means no assignee; GitHub will leave
+# the issue unassigned for triage.
+default_assignee = ""
+
+# Whether to run a duplicate-check `gh issue list --search ...`
+# before filing each draft. Should always be true in production
+# use; the option exists for first-run debugging.
+duplicate_check = true
+
+
+# ─── Specialists registry ──────────────────────────────────────
+
+[specialists]
+
+# Informational: tells the planner which specialists exist in
+# this project. The planner picks from these by name when
+# assigning each plan entry. The actual specialist prompts live
+# in `verification/agents/` (this framework) and `.claude/agents/`
+# (Claude Code wiring); this registry just records what's
+# available.
+#
+# `frontend-doctor` is reused from the pre-existing `.claude/
+# agents/` (the project had it before this framework). The other
+# four are introduced by this framework.
+frontend = "frontend-doctor"
+api = "api-tester"
+human = "human-instructor"
+perf = "perf-investigator"
+
+
+# ─── Performance investigator ──────────────────────────────────
+
+[perf_investigator]
+
+# Default number of samples for latency measurements. Single
+# samples are noise; 20 is the minimum credible distribution.
+# Bump for high-variance endpoints (network-bound, cold-cache).
+default_samples = 20
+
+# Latency thresholds the perf-investigator uses when the plan
+# entry doesn't name one. If a plan entry says "is this fast
+# enough?" with no number, the investigator falls back to these
+# and characterizes the distribution against them.
+default_p95_threshold_ms = 500
+default_p99_threshold_ms = 2000
+
+# Whether profilers (cargo flamegraph, samply, perf, etc.) are
+# set up on this stack. When false, the perf-investigator
+# returns `inconclusive` with a `gap_reason` for any test that
+# would need profiling rather than guessing.
+profilers_available = false
+
+# Whether `cargo bloat` is wired up for the frontend. When false,
+# bundle-size investigations return `inconclusive` rather than
+# pasting unreliable size estimates.
+cargo_bloat_available = false
+
+
+# ─── Project-overrides slot (example for OgreNotes) ────────────
+#
+# Uncomment and copy into your real `verification/config.toml`
+# to mirror this project's actual configuration:
+#
+# [issue_tracker]
+# kind = "github"
+# repo = ""              # use gh default (this repo)
+#
+# [planner]
+# default_effort_unit = "minutes"
+# ask_clarifying_questions = true
+#
+# [api_tester]
+# base_url = "http://localhost:3000"
+# curl_max_time_secs = 30
+#
+# [ticket_writer]
+# auto_file = false
+# default_labels = ["verification-finding"]
+# default_assignee = ""
+# duplicate_check = true

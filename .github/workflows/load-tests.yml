@@ -1,0 +1,165 @@
+name: Load tests (nightly)
+
+# Phase 5 M-P9 piece E — nightly load test against a fresh local
+# stack (DynamoDB Local + MinIO + Redis + axum server). Goose driver
+# is in tests/load/ and is excluded from the main workspace so its
+# reqwest 0.11 pin doesn't enter the production build graph.
+#
+# The job uploads the goose HTML report + per-run scalar metrics as
+# artifacts. A failing run blocks no merges (nightly only, not on
+# PR push) — the alarms in `runbook/sla-alarms.md` (M-P9 piece F)
+# are the merge-gating signal; this workflow gives engineers an
+# observable trend before alarms fire.
+
+on:
+  schedule:
+    # 04:30 UTC — after the audit-retention and trash-cleanup
+    # workers (03 / 04 UTC respectively), before the digest
+    # scheduler (15 UTC).
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+    inputs:
+      users:
+        description: "Concurrent users (defaults to 50 for the smoke run)"
+        required: false
+        default: "50"
+      run_time:
+        description: "Total duration (e.g. 60s, 5m)"
+        required: false
+        default: "60s"
+
+concurrency:
+  group: load-tests-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT_URL_DYNAMODB: http://127.0.0.1:8000
+  AWS_ENDPOINT_URL_S3: http://127.0.0.1:9000
+  DYNAMODB_TABLE_PREFIX: "load-"
+  S3_BUCKET: "load-ogrenotes"
+  REDIS_URL: "redis://127.0.0.1:6379"
+  DEV_MODE: "true"
+  JWT_SECRET: "load-test-jwt-secret-that-is-at-least-32-bytes-long"
+  OAUTH_CLIENT_ID: "load-not-used"
+  OAUTH_CLIENT_SECRET: "load-not-used"
+  OAUTH_REDIRECT_URI: "http://localhost:3000/auth/callback"
+  SEARCH_INDEX_PATH: "/tmp/ogrenotes-load-search"
+  API_PORT: "3000"
+  # Bump the dev-login rate-limit ceiling — the load test mints
+  # one user per goose worker, and 50 logins in a 5-second hatch
+  # window would trip the default 100/min cap on a re-run.
+  RATE_LIMIT_DEV_LOGIN_PER_MIN: "10000"
+
+jobs:
+  load-test:
+    name: read_heavy (${{ github.event.inputs.users || '50' }} users)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xmlsec1 + clang (samael dependencies)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libssl-dev \
+            libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
+            clang libclang-dev
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            tests/load -> target
+          shared-key: load-tests
+
+      - name: Start infra (DynamoDB / MinIO / Redis)
+        run: docker compose up -d
+
+      - name: Wait for services
+        run: |
+          for port in 8000 9000 6379; do
+            for i in $(seq 1 30); do
+              nc -z 127.0.0.1 "$port" && break
+              sleep 1
+            done
+          done
+
+      - name: Provision DynamoDB table + S3 bucket
+        run: cargo run --release --locked --bin setup_dev -p ogrenotes-api
+
+      - name: Build axum server (release, with dev-login)
+        run: cargo build --release --locked --bin ogrenotes-api --features dev-login
+
+      - name: Start axum server
+        run: |
+          mkdir -p /tmp/load-logs
+          ./target/release/ogrenotes-api > /tmp/load-logs/server.log 2>&1 &
+          echo $! > /tmp/load-logs/server.pid
+
+      - name: Wait for server
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:3000/health >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          tail -n 200 /tmp/load-logs/server.log
+          exit 1
+
+      - name: Build goose driver
+        working-directory: tests/load
+        run: cargo build --release --locked
+
+      - name: Run read_heavy scenario
+        working-directory: tests/load
+        env:
+          USERS: ${{ github.event.inputs.users || '50' }}
+          RUN_TIME: ${{ github.event.inputs.run_time || '60s' }}
+        run: |
+          mkdir -p ../../artifacts/load
+          ./target/release/load \
+            --host http://127.0.0.1:3000 \
+            --scenarios readheavy \
+            --users "$USERS" \
+            --hatch-rate 5 \
+            --run-time "$RUN_TIME" \
+            --report-file ../../artifacts/load/goose-report.html \
+            --report-file ../../artifacts/load/goose-report.json \
+            --no-reset-metrics
+
+      - name: Stop axum server
+        if: always()
+        run: |
+          if [ -f /tmp/load-logs/server.pid ]; then
+            kill "$(cat /tmp/load-logs/server.pid)" || true
+          fi
+
+      - name: Upload load-test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-artifacts
+          path: |
+            artifacts/load/**
+            /tmp/load-logs/server.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Compose logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Stop infra
+        if: always()
+        run: docker compose down -v

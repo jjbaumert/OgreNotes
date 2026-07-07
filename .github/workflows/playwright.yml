@@ -1,0 +1,667 @@
+name: Playwright (frontend-doctor scenarios)
+
+# Heavier tier-3 scenarios: spins up the full local stack (DynamoDB Local
+# + MinIO + Redis + axum server + frontend WASM build) and drives each
+# scripted scenario through a headless Chromium. Scenarios share the
+# provisioned stack, so adding another one is ~30s of additional
+# wall-clock rather than another 8-10 min of setup.
+#
+# Scheduled nightly rather than per-push because the wasm toolchain +
+# trunk build + Playwright install pushes total wall-clock to ~8–10 min
+# on a cold cache. Run on-demand via the "Run workflow" button when
+# touching the document or spreadsheet flows.
+#
+# Current scenarios:
+#   - trash-flow            — delete → Trash → restore → purge loop.
+#   - spreadsheet-paste     — copy/paste ref translation + no clipboard
+#                             permission prompt.
+#   - spreadsheet-features  — M-S2 editor-UI smoke (toolbar, sheet
+#                             tabs, formula bar, header-click sort,
+#                             freeze rows via context menu).
+#   - pivot-editor          — M-S2 v2 pivot-table sidebar smoke
+#                             (insert via ctx menu, field-list
+#                             checkbox routing, delete clears).
+#   - comment-live-sync     — peer's REST-driven reply lands in another
+#                             tab's open CommentPopup without manual
+#                             reload.
+
+on:
+  schedule:
+    # 06:00 UTC daily (≈23:00 PT). Matches the "nightly" expectation.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: playwright-frontend-doctor
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # AWS SDK credential/endpoint shims so the server and setup_dev binary
+  # talk to DynamoDB Local + MinIO instead of real AWS.
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT_URL_DYNAMODB: http://127.0.0.1:8000
+  AWS_ENDPOINT_URL_S3: http://127.0.0.1:9000
+  # Server config
+  DYNAMODB_TABLE_PREFIX: "ci-"
+  S3_BUCKET: "ci-ogrenotes"
+  REDIS_URL: "redis://127.0.0.1:6379"
+  DEV_MODE: "true"
+  JWT_SECRET: "ci-jwt-secret-that-is-at-least-32-bytes-long"
+  OAUTH_CLIENT_ID: "ci-not-used"
+  OAUTH_CLIENT_SECRET: "ci-not-used"
+  OAUTH_REDIRECT_URI: "http://localhost:3000/auth/callback"
+  SEARCH_INDEX_PATH: "/tmp/ogrenotes-ci-search"
+  API_PORT: "3000"
+  # Bump the per-IP rate-limit ceiling well above defaults. In CI
+  # axum receives connections without X-Forwarded-For, so every
+  # scenario shares the "unknown" bucket; the production 10/min
+  # default for auth_refresh trips before the suite finishes.
+  RATE_LIMIT_AUTH_REFRESH_PER_MIN: "60"
+  RATE_LIMIT_AUTH_LOGIN_PER_MIN: "60"
+  # Same shared-"unknown"-bucket reason: a disconnected WS during fast
+  # typing storms the reconnect trigger on every keydown, so the default
+  # 30/min WS-upgrade cap trips mid-scenario (the document-details flaky).
+  RATE_LIMIT_WS_UPGRADE_PER_MIN: "60"
+  # Phase 6 M-6.2 piece E: passed through to the API task so the
+  # /api/v1/ask endpoint can stream against the real Claude API.
+  # `secrets.ANTHROPIC_API_KEY` resolves to empty string on PRs
+  # from forks (GitHub doesn't expose secrets to fork builds); the
+  # ask-flow scenario step below skips when the env var is empty.
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+jobs:
+  frontend-doctor:
+    name: Playwright frontend-doctor
+    runs-on: ubuntu-latest
+    # 30 was too tight on a cold-cache day: the release build alone swings from
+    # ~3 min (warm) to ~16.5 min (cold), and a cold run measured 30.6 min — so
+    # it tripped the cap and was *cancelled*, which skips the rust-cache save
+    # post-step, leaving the next run cold too (a self-perpetuating loop). 45
+    # gives a cold run room to finish and repopulate the cache. The scenarios
+    # themselves are ~2.5 min total and are not the bottleneck.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # ─── System libs ──────────────────────────────────────────
+      # samael's `xmlsec` feature wraps libxml2 + xmlsec1 for SAML
+      # signature verification. The Dockerfile got these in commit
+      # 45e086e; the playwright workflow was missed in that pass,
+      # so every run since 2026-05-15 (when the feature went live)
+      # has crashed the `cargo run --bin setup_dev` step before any
+      # scenario could execute. Mirror the Dockerfile package set:
+      # -dev headers + libclang for bindgen at compile time; the
+      # `libxmlsec1-openssl` shim is what the runtime binary
+      # dlopens for the actual crypto backend.
+      - name: Install xmlsec1 + clang (samael dependencies)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libssl-dev \
+            libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
+            clang libclang-dev
+
+      # ─── Toolchain ────────────────────────────────────────────
+      - name: Install Rust (stable + wasm32)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            frontend -> target
+          shared-key: playwright
+          # Save the cache even when the job fails, so one bad run doesn't
+          # leave the next one cold. (A *cancelled* run still skips the save —
+          # the raised timeout above is what keeps us out of cancellation.)
+          cache-on-failure: true
+
+      # trunk auto-downloads wasm-bindgen when the build needs it, so the
+      # action here gives us a single prebuilt trunk binary and nothing else.
+      - name: Install trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # ─── Infra ────────────────────────────────────────────────
+      - name: Start infra (DynamoDB / MinIO / Redis)
+        run: docker compose up -d
+
+      - name: Wait for services
+        run: |
+          for port in 8000 9000 6379; do
+            echo "Waiting for port $port..."
+            for i in $(seq 1 30); do
+              if nc -z 127.0.0.1 "$port"; then
+                echo "  port $port ready"
+                break
+              fi
+              sleep 1
+            done
+          done
+
+      - name: Provision DynamoDB table + S3 bucket
+        run: cargo run --locked --bin setup_dev -p ogrenotes-api
+
+      # ─── Frontend build ───────────────────────────────────────
+      # main.rs serves static assets from /app/frontend/dist. We symlink
+      # the workspace's build output there so the single axum process
+      # serves both the API and the SPA over port 3000 (matching the
+      # Playwright scenario's same-origin assumption).
+      - name: Build frontend (trunk)
+        working-directory: frontend
+        run: trunk build
+
+      - name: Expose frontend dist at /app/frontend/dist
+        run: |
+          sudo mkdir -p /app/frontend
+          sudo ln -sfn "$(pwd)/frontend/dist" /app/frontend/dist
+
+      # ─── Start API server ─────────────────────────────────────
+      # Build and run are split so a slow cold compile doesn't eat into
+      # the readiness-poll window. `cargo build` blocks until the binary
+      # exists; `Start axum server` then just execs the already-compiled
+      # artifact and backgrounds it.
+      # Strip the `pdf` feature from the playwright build — no scenario
+      # in doctor.js exercises PDF import/export, and `pdf-extract` +
+      # `printpdf` together pull in ~70 transitive crates (allsorts,
+      # azul-*, ouroboros) that pushed the cold cargo build past the
+      # 30-minute job budget and trapped the workflow in a doom loop
+      # (cold build → 30m timeout → no cache save → cold build again).
+      # PDF correctness is verified by `crates/api/tests/test_import_pdf_e2e.rs`
+      # under the regular CI workflow, which runs with the api crate's
+      # default feature set (pdf on).
+      - name: Build axum server (release)
+        run: |
+          cargo build --release --locked --bin ogrenotes-api \
+            --no-default-features --features "dev-login,xlsx,docx"
+
+      - name: Start axum server
+        run: |
+          mkdir -p /tmp/ci-logs
+          ./target/release/ogrenotes-api \
+            > /tmp/ci-logs/server.log 2>&1 &
+          echo $! > /tmp/ci-logs/server.pid
+
+      - name: Wait for server
+        run: |
+          # 90 iterations × 2s = 3 min. Startup is normally <5s; the
+          # headroom covers AWS-SDK / Redis / search-index warm-up on a
+          # slow runner without masking a genuinely broken server.
+          for i in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:3000/api/v1/auth/dev-login \
+                -H 'content-type: application/json' \
+                -d '{"email":"healthcheck@ci"}' >/dev/null; then
+              echo "server ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "server failed to start" >&2
+          tail -n 200 /tmp/ci-logs/server.log
+          exit 1
+
+      # ─── Playwright ───────────────────────────────────────────
+      - name: Install doctor deps
+        working-directory: scripts/frontend-doctor
+        run: npm install
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          # `-cf` = chromium+firefox. Bumped when Firefox was added for the
+          # #90 history-pane guard: the old chromium-only cache would
+          # otherwise hit and skip the binary-download step, leaving Firefox
+          # missing (install-deps installs system libs, not the binary).
+          key: playwright-${{ runner.os }}-1.49.0-cf
+
+      # Firefox in addition to Chromium: the #90 history-pane panic is
+      # Gecko-specific (reproduces in Firefox, clean in Chromium), so the
+      # regression guard for it must run in Firefox.
+      - name: Install Chromium + Firefox
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        working-directory: scripts/frontend-doctor
+        run: npx playwright install --with-deps chromium firefox
+
+      - name: Install browser system deps (cache hit)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        working-directory: scripts/frontend-doctor
+        run: npx playwright install-deps chromium firefox
+
+      - name: Run trash-flow scenario
+        id: trash-flow
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario trash-flow \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/trash-flow
+
+      # `if: always()` so a trash-flow failure doesn't hide a separate
+      # spreadsheet-paste failure. Both scenarios exit non-zero
+      # independently and the job as a whole fails if either fails.
+      # But: if trash-flow was *skipped* (because an earlier setup step
+      # like `Wait for server` or `Install doctor deps` failed), running
+      # this scenario just produces a confusing secondary error — so
+      # only run when trash-flow actually got to execute.
+      - name: Run spreadsheet-paste scenario
+        id: spreadsheet-paste
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario spreadsheet-paste \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/spreadsheet-paste
+
+      # M-S2 editor-UI smoke: toolbar (format painter), sheet-tab
+      # bar, formula bar, header-click sort, freeze rows via
+      # context menu. Catches DOM regressions on the M-S2 features
+      # without needing a full per-feature scenario.
+      - name: Run spreadsheet-features scenario
+        id: spreadsheet-features
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario spreadsheet-features \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/spreadsheet-features
+
+      # #76: spreadsheet mount/unmount reclaim. Repeatedly navigate
+      # between two spreadsheet docs (each navigation unmounts the
+      # previous grid and runs its on_cleanup), then copy/paste on the
+      # surviving doc — a second spawn_local that must find the engine
+      # still live. Asserts no panic / no use-after-free, not heap
+      # numbers (usedJSHeapSize is too noisy to gate on).
+      - name: Run spreadsheet-lifecycle scenario
+        id: spreadsheet-lifecycle
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario spreadsheet-lifecycle \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/spreadsheet-lifecycle
+
+      # #134: focus/expand toggle round-trip. Enter + exit focus mode via
+      # both the single header button (which must flip ⤢ ↔ ✕) and
+      # Ctrl+Shift+F, asserting the chrome hides/shows and — importantly —
+      # nothing panics on teardown (the focus-exit closure-drop class).
+      - name: Run focus-mode scenario
+        id: focus-mode
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario focus-mode \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/focus-mode
+
+      # Regression for the menu-bar backdrop-intercept bug: with a menu open,
+      # clicking another menu name must switch to it in one click (the
+      # full-screen backdrop used to swallow the click and only close).
+      - name: Run menu-switch scenario
+        id: menu-switch
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario menu-switch \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/menu-switch
+
+      # #146: Document-menu Rename + Duplicate. On a spreadsheet (explicit,
+      # assertable title): rename via the prompt updates the title; duplicate
+      # navigates to a new doc with a "<title> copy" name and copied cell.
+      - name: Run doc-actions scenario
+        id: doc-actions
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario doc-actions \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/doc-actions
+
+      # #144: favorites — star the doc, assert the header toggle goes active
+      # and the doc shows up in the sidebar Favorites list (live), then unstar.
+      - name: Run favorites scenario
+        id: favorites
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario favorites \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/favorites
+
+      # #147: in-app Find & Replace — type repeated text, open the bar (Edit
+      # menu + Ctrl+F), assert the live match count, navigate, Replace All,
+      # and verify the editor model actually changed.
+      - name: Run find-replace scenario
+        id: find-replace
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario find-replace \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/find-replace
+
+      # #139: Show Line Numbers — number each visual line (more numbers than
+      # blocks once a paragraph wraps) in one uniform font; Show Page Breaks
+      # no longer paints a full-width rule through the text.
+      - name: Run line-numbers scenario
+        id: line-numbers
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario line-numbers \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/line-numbers
+
+      # #141: Document Details panel — opens from the Document menu and shows
+      # metadata rows incl. a live word/character count of the typed text.
+      - name: Run document-details scenario
+        id: document-details
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario document-details \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/document-details
+
+      # #145: Expand — the header ↗ hides the doc header and shows a floating
+      # collapse button (.expanded on app-layout); the FAB exits.
+      - name: Run expand scenario
+        id: expand
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario expand \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/expand
+
+      # #143: subscript/superscript toolbar toggles render <sub>/<sup> in the
+      # editor and are mutually exclusive.
+      - name: Run subscript scenario
+        id: subscript
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario subscript \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/subscript
+
+      # M-S2 v2 pivot-table sidebar smoke: insert a pivot via ctx
+      # menu, field-list checkbox default-routes by type, delete
+      # clears the editor. Skips drag-drop (HTML5 dnd in headless
+      # Chromium is fragile) — checkbox-driven path is reliable.
+      - name: Run pivot-editor scenario
+        id: pivot-editor
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario pivot-editor \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/pivot-editor
+
+      # Same skip-on-setup-failure rule as spreadsheet-paste: the
+      # scenario only makes sense if the server actually came up. We
+      # gate on trash-flow having reached a real outcome (success or
+      # failure) — that's our proxy for "stack is provisioned and
+      # serving HTTP."
+      - name: Run comment-live-sync scenario
+        id: comment-live-sync
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario comment-live-sync \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/comment-live-sync
+
+      # ─── May 2026 UI batch — six new spreadsheet scenarios ────
+      # Each targets one or more specific issues fixed in the
+      # recent batch that previously only had engine-level
+      # coverage. See `scripts/frontend-doctor/doctor.js` for
+      # scenario bodies and gates.
+
+      - name: Run spreadsheet-keyboard scenario (#60 Ctrl+Y)
+        id: spreadsheet-keyboard
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario spreadsheet-keyboard \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/spreadsheet-keyboard
+
+      - name: Run spreadsheet-headers scenario (#58 status bar, #59 col-click)
+        id: spreadsheet-headers
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario spreadsheet-headers \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/spreadsheet-headers
+
+      - name: Run spreadsheet-toolbar scenario (#56 format dropdown, #64 bold)
+        id: spreadsheet-toolbar
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario spreadsheet-toolbar \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/spreadsheet-toolbar
+
+      - name: Run spreadsheet-freeze scenario (#61 off-by-one)
+        id: spreadsheet-freeze
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario spreadsheet-freeze \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/spreadsheet-freeze
+
+      - name: Run spreadsheet-sheet-tabs scenario (#65 right-click delete)
+        id: spreadsheet-sheet-tabs
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario spreadsheet-sheet-tabs \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/spreadsheet-sheet-tabs
+
+      - name: Run spreadsheet-remote-cursor scenario (#63 presence)
+        id: spreadsheet-remote-cursor
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario spreadsheet-remote-cursor \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/spreadsheet-remote-cursor
+
+      - name: Run mobile-spreadsheet-keyboards scenario (M-P3 piece E)
+        id: mobile-spreadsheet-keyboards
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario mobile-spreadsheet-keyboards \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/mobile-spreadsheet-keyboards
+
+      - name: Run command-palette-actions scenario (M-P4 piece D)
+        id: command-palette-actions
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario command-palette-actions \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/command-palette-actions
+
+      - name: Run embed-youtube scenario (M-P6 piece D)
+        id: embed-youtube
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario embed-youtube \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/embed-youtube
+
+      - name: Run bulk-delete scenario (M-P7 piece D)
+        id: bulk-delete
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario bulk-delete \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/bulk-delete
+
+      # M-P8 piece D: axe-core conformance gate. Walks home, editor,
+      # and command-palette-open surfaces with the WCAG 2.1 A + AA
+      # rule set. Threshold is zero serious + zero critical
+      # violations per surface; minor/moderate findings land in the
+      # uploaded axe-results.json artifact but don't fail the gate
+      # (the team takes those as a follow-up backlog).
+      - name: Run a11y-audit scenario (M-P8 piece D)
+        id: a11y-audit
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario a11y-audit \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/a11y-audit
+
+      # M-6.2 piece E: end-to-end agentic Ask flow. Real Claude API
+      # call (paid). Gated on ANTHROPIC_API_KEY being set so PRs
+      # from forks (which can't access repo secrets) don't fail —
+      # the env var resolves to empty for fork builds, the `if`
+      # below skips, and the scenario doesn't run at all.
+      - name: Run ask-flow scenario (M-6.2 piece E)
+        id: ask-flow
+        if: always() && env.ANTHROPIC_API_KEY != '' && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario ask-flow \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/ask-flow
+
+      # Persist-on-refresh regression guard for the d92dac4 / 108d4fc
+      # fix arc — see scenarioSustainedTypeReload in doctor.js for the
+      # rationale.
+      - name: Run sustained-type-reload scenario
+        id: sustained-type-reload
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario sustained-type-reload \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/sustained-type-reload
+
+      # Firefox-only: the #90 history-pane close panic is Gecko-specific
+      # (clean in Chromium). Guards against regression of the deferred
+      # modal-close teardown in history_viewer.rs.
+      - name: Run history-pane scenario (Firefox, #90)
+        id: history-pane
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        env:
+          DOCTOR_BROWSER: firefox
+        run: |
+          node doctor.js \
+            --scenario history-pane \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/history-pane
+
+      # Firefox-only: the delete-from-menu confirm-dialog close panic is
+      # the same Gecko-specific class as #90. Guards the deferred
+      # ConfirmDialog close path.
+      - name: Run delete-document scenario (Firefox)
+        id: delete-document
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        env:
+          DOCTOR_BROWSER: firefox
+        run: |
+          node doctor.js \
+            --scenario delete-document \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/delete-document
+
+      # Firefox-only: ConfirmDialog/dialog close panic class. The share
+      # dialog guards the same `a11y::defer_close` click-close path the
+      # CommentPopup uses, so it covers the comment-popup fix too. The
+      # dedicated comment-popup scenario (driven via the spreadsheet
+      # cell-comment submenu + create_thread round-trip) is flaky on the CI
+      # runner — kept in doctor.js for manual runs, not gated here.
+      - name: Run share-dialog scenario (Firefox)
+        id: share-dialog
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        env:
+          DOCTOR_BROWSER: firefox
+        run: |
+          node doctor.js \
+            --scenario share-dialog \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/share-dialog
+
+      # ─── Teardown / artifacts ─────────────────────────────────
+      - name: Stop axum server
+        if: always()
+        run: |
+          if [ -f /tmp/ci-logs/server.pid ]; then
+            kill "$(cat /tmp/ci-logs/server.pid)" || true
+          fi
+
+      - name: Upload doctor artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-doctor-artifacts
+          path: |
+            artifacts/doctor/**
+            /tmp/ci-logs/server.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Compose logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Stop infra
+        if: always()
+        run: docker compose down -v

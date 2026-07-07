@@ -1,0 +1,5862 @@
+/* Reset */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  color: var(--color-text);
+  background: var(--color-bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Layout */
+.app-layout {
+  display: flex;
+  height: 100vh;
+}
+
+/* #152: boot skeleton — a brand-colored placeholder bar occupying the
+   sidebar column on a full page load, before WASM mounts the real sidebar.
+   Without it the empty themed background shows for a beat and the sidebar
+   flashes in. `main.rs` removes the element once the real sidebar exists.
+   Width tracks the real sidebar across breakpoints: collapsed pref (stamped
+   on <html> by the head boot script), tablet (forced-collapsed), and mobile
+   (hidden — the sidebar is an off-canvas drawer there). */
+#boot-skeleton {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: var(--sidebar-width);
+  background: var(--color-brand-anchor);
+  z-index: 90;
+}
+:root[data-sidebar-collapsed="1"] #boot-skeleton {
+  width: var(--sidebar-collapsed);
+}
+@media (max-width: 1024px) {
+  #boot-skeleton {
+    width: var(--sidebar-collapsed);
+  }
+}
+@media (max-width: 640px) {
+  #boot-skeleton {
+    display: none;
+  }
+}
+
+/* #100: focus mode — hide the sidebar + menu bar so the editor gets the
+   full width/height. Toggled from View / Ctrl+Shift+F; the floating
+   .focus-exit-btn provides a visible exit. */
+.app-layout.focus-mode .sidebar,
+.app-layout.focus-mode .menu-bar {
+  display: none;
+}
+
+.focus-exit-btn {
+  position: fixed;
+  top: 8px;
+  inset-inline-end: 12px;
+  z-index: 200;
+  padding: 4px 10px;
+  font-size: 12px;
+  background: var(--color-surface);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  cursor: pointer;
+  /* Subtle so it isn't itself a distraction; full on hover. */
+  opacity: 0.5;
+  transition: opacity 0.12s ease;
+}
+
+.focus-exit-btn:hover {
+  opacity: 1;
+}
+
+/* #141: Document Details panel — a two-column definition list of metadata. */
+.doc-details-list {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 8px 20px;
+  margin: 0;
+  align-items: baseline;
+}
+.doc-details-list dt {
+  color: var(--color-text-secondary);
+  font-size: 13px;
+}
+.doc-details-list dd {
+  margin: 0;
+  color: var(--color-text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  word-break: break-word;
+}
+
+/* #145: Expand — a superset of focus mode. On top of hiding the sidebar +
+   menu bar, drop the doc header entirely so only the editor remains, and let
+   the editor breathe full-bleed. Pairs with the browser Fullscreen API. */
+.app-layout.expanded .sidebar,
+.app-layout.expanded .menu-bar,
+.app-layout.expanded .doc-header {
+  display: none;
+}
+.app-layout.expanded .editor-container {
+  padding-block: var(--space-xl);
+}
+/* The only chrome in Expand: a subtle floating collapse button. */
+.expand-collapse-fab {
+  position: fixed;
+  top: 10px;
+  inset-inline-end: 12px;
+  z-index: 200;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  background: var(--color-surface);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: 50%;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  cursor: pointer;
+  opacity: 0.4;
+  transition: opacity 0.12s ease;
+}
+.expand-collapse-fab:hover {
+  opacity: 1;
+}
+/* Header expand toggle — same look as the focus toggle, minus the auto
+   margin (the focus toggle already pushed the group to the right). */
+.expand-toggle-btn {
+  background: transparent;
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+.expand-toggle-btn:hover {
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+.expand-toggle-btn.active {
+  background: var(--color-primary);
+  color: white;
+  border-color: var(--color-primary);
+}
+
+/* Sidebar. Background uses the brand-anchor token (same Ogre
+ * Brown in light + dark mode) rather than a theme-flipping surface
+ * — the sidebar reads as a brand stripe regardless of canvas color.
+ * Text color is similarly anchored to white so it reads against the
+ * dark brown in both modes. */
+.sidebar {
+  width: var(--sidebar-width);
+  background: var(--color-brand-anchor);
+  color: var(--color-on-brand-anchor);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  overflow-y: auto;
+  transition: width 0.2s ease;
+}
+
+.sidebar.collapsed {
+  width: var(--sidebar-collapsed);
+}
+
+.sidebar-header {
+  padding: var(--space-md);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.sidebar-logo {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+}
+
+.sidebar-section {
+  padding: var(--space-sm) var(--space-md);
+}
+
+.sidebar-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  /* Was rgba(255,255,255,0.5) = 3.76:1 on brand-anchor — AA-large only,
+   * fails for small uppercase text. Token defined in tokens-{light,dark}.css
+   * resolves to rgba(255,255,255,0.7) = 5.72:1. Phase 6 a11y-audit fix. */
+  color: var(--color-on-brand-anchor-muted);
+  margin-bottom: var(--space-sm);
+}
+
+.sidebar-item {
+  display: flex;
+  align-items: center;
+  padding: var(--space-sm) var(--space-sm);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.8);
+  text-decoration: none;
+}
+
+/* Muted variant used by placeholder rows ("no recent docs", "no pinned
+ * docs") and the keyboard-shortcut chip. Same contrast token as
+ * .sidebar-section-title so 5.72:1 is preserved. Italic stays because
+ * it's a visual hint that the row isn't actionable. */
+.sidebar-item-muted {
+  color: var(--color-on-brand-anchor-muted);
+  font-style: italic;
+}
+
+.sidebar-item-shortcut {
+  margin-inline-start: auto;
+  font-size: 11px;
+  color: var(--color-on-brand-anchor-muted);
+}
+
+.sidebar-item:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--color-surface);
+}
+
+.sidebar-item.active {
+  background: rgba(255, 255, 255, 0.15);
+  color: var(--color-surface);
+}
+
+/* Collapsed-state icon strip — replaces the empty bar with a
+ * vertical column of navigation icons. Only displayed when
+ * `.sidebar.collapsed` is set (the inline `style:display=flex`
+ * the component writes when collapsed swaps this on). */
+.sidebar-icons {
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: var(--space-sm) 0;
+}
+
+.sidebar-icon-btn {
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 18px;
+  padding: 0;
+  line-height: 1;
+}
+
+.sidebar-icon-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--color-surface);
+}
+
+.sidebar-icon-btn:focus-visible {
+  outline: 2px solid var(--color-surface);
+  outline-offset: 1px;
+}
+
+/* Main content */
+.main-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* #152: the document page's root inside the persistent shell's `.app-layout`.
+   It is the editor's flex-sibling slot next to the sidebar (replacing the
+   role the per-page `.app-layout` wrapper used to play) and hosts the
+   editor-area event handlers. `min-width: 0` keeps wide editor content from
+   pushing past the sidebar. */
+.doc-shell {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 100%;
+}
+
+/* Toolbar */
+/* Menu bar (Document | Edit | View | Insert | Format) */
+.menu-bar {
+  /* Positioned + z-indexed so scrolling comment highlights (z-index 5),
+     comment bubbles (10), and remote cursors (5-6) slide UNDER the
+     chrome instead of painting over it. z-index needs a positioned
+     element to take effect.
+     Must outrank .toolbar (z-index 20) so the dropdown menus that
+     overflow this bar paint OVER the toolbar — otherwise the toolbar
+     covers the first item and makes it unclickable (issue #19). */
+  position: relative;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  padding: 0 var(--space-md);
+  height: 28px;
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  gap: 0;
+  flex-shrink: 0;
+}
+.menu-bar-item-wrapper {
+  position: relative;
+}
+.menu-bar-item {
+  /* Stack the menu-name buttons ABOVE an open menu's full-screen
+     `.menu-bar-backdrop` (z-index 99) and dropdown (100). Without this the
+     backdrop covers the other menu names, so clicking one only closes the
+     current menu (hits the backdrop) instead of switching to it — you'd
+     have to click twice. With the buttons on top, a single click reaches
+     the button and `toggle_menu` switches menus in one step (and hover-
+     switch works too). */
+  position: relative;
+  z-index: 101;
+  padding: 2px 10px;
+  border: none;
+  background: transparent;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+.menu-bar-item:hover,
+.menu-bar-item.open {
+  background: var(--color-mist);
+  color: var(--color-text);
+}
+.menu-bar-backdrop {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 99;
+}
+.menu-bar-dropdown {
+  position: absolute;
+  top: 100%;
+  inset-inline-start: 0;
+  z-index: 100;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 4px 0;
+  min-width: 200px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.18);
+}
+.menu-bar-action {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 5px 12px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--color-text);
+  text-align: start;
+}
+.menu-bar-action:hover {
+  background: var(--color-mist);
+}
+.menu-bar-action-label {
+  flex: 1;
+}
+.menu-bar-action-shortcut {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+  margin-inline-start: 16px;
+}
+.menu-bar-action-icon {
+  width: 22px;
+  text-align: center;
+  font-weight: 700;
+  color: var(--color-text-secondary);
+  flex-shrink: 0;
+  font-size: 13px;
+}
+.menu-bar-action-arrow {
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  margin-inline-start: auto;
+}
+.menu-bar-action-disabled {
+  opacity: 0.4;
+  cursor: default;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 5px 12px;
+  border: none;
+  background: transparent;
+  font-size: 13px;
+  color: var(--color-text);
+  text-align: start;
+}
+.menu-bar-action-check {
+  width: 18px;
+  text-align: center;
+  color: var(--color-primary);
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.menu-bar-action-label-toggle {
+  color: var(--color-primary);
+}
+.menu-bar-sep {
+  height: 1px;
+  background: var(--color-border);
+  margin: 4px 8px;
+}
+
+.toolbar {
+  /* See .menu-bar — same stacking-context fix. */
+  position: relative;
+  z-index: 20;
+  height: var(--toolbar-height);
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  padding: 0 var(--space-md);
+  gap: var(--space-xs);
+  flex-shrink: 0;
+}
+
+/* Overflow-menu trigger and content. On desktop the trigger is hidden and
+ * the overflow content renders inline (display: contents lets the wrapper
+ * disappear for layout). Mobile overrides in responsive.css collapse the
+ * content into a floating panel surfaced via the trigger. */
+.toolbar-overflow-trigger {
+  display: none;
+}
+
+.toolbar-overflow-content {
+  display: contents;
+}
+
+.toolbar-spacer {
+  flex: 1;
+}
+
+.toolbar-group {
+  display: flex;
+  gap: 2px;
+}
+
+.toolbar-separator {
+  width: 1px;
+  height: 24px;
+  background: var(--color-border);
+  margin: 0 var(--space-sm);
+}
+
+.toolbar-btn {
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+.toolbar-btn:hover {
+  background: var(--color-mist);
+  color: var(--color-text);
+}
+
+.toolbar-btn.active {
+  background: var(--color-primary);
+  color: var(--color-surface);
+}
+
+.toolbar-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.toolbar-btn-wide {
+  width: auto;
+  padding: 0 12px;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.toolbar-block-dropdown-wrapper {
+  position: relative;
+}
+
+.toolbar-block-dropdown-btn {
+  height: 28px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.toolbar-block-dropdown-btn:hover {
+  border-color: var(--color-text-secondary);
+}
+.toolbar-block-icon {
+  font-weight: 700;
+  min-width: 20px;
+  text-align: center;
+}
+.toolbar-block-arrow {
+  font-size: 10px;
+  color: var(--color-text-secondary);
+}
+
+.toolbar-block-menu {
+  position: absolute;
+  top: 100%;
+  inset-inline-start: 0;
+  z-index: 100;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 4px 0;
+  min-width: 240px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.18);
+}
+.toolbar-block-menu-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 6px 12px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--color-text);
+  gap: 10px;
+  text-align: start;
+}
+.toolbar-block-menu-item:hover {
+  background: var(--color-mist);
+}
+.toolbar-block-menu-icon {
+  font-weight: 700;
+  min-width: 24px;
+  text-align: center;
+  color: var(--color-text-secondary);
+}
+.toolbar-block-menu-label {
+  flex: 1;
+}
+.toolbar-block-menu-shortcut {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+}
+.toolbar-block-menu-sep {
+  height: 1px;
+  background: var(--color-border);
+  margin: 4px 8px;
+}
+
+.toolbar-label {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  font-weight: 600;
+  padding: 0 4px;
+  align-self: center;
+  white-space: nowrap;
+}
+
+.toolbar-color-wrapper {
+  position: relative;
+  display: inline-flex;
+}
+
+.toolbar-color-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 99;
+}
+
+.toolbar-color-picker {
+  position: absolute;
+  top: 100%;
+  inset-inline-start: 0;
+  z-index: 100;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 6px;
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  width: 160px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+}
+
+.toolbar-color-swatch {
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  cursor: pointer;
+  padding: 0;
+}
+.toolbar-color-swatch:hover {
+  transform: scale(1.15);
+}
+
+.toolbar-color-remove {
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  cursor: pointer;
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.toolbar-color-remove:hover {
+  background: var(--color-mist);
+}
+
+/* File browser */
+.file-browser {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-lg);
+}
+
+.breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  margin-bottom: var(--space-md);
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+
+.breadcrumb-link {
+  color: var(--color-link);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.breadcrumb-link:hover {
+  text-decoration: underline;
+}
+
+.breadcrumb-separator {
+  color: var(--color-text-secondary);
+}
+
+.breadcrumb-sep {
+  color: var(--color-text-secondary);
+  user-select: none;
+}
+
+.breadcrumb-current {
+  color: var(--color-text);
+  font-weight: 500;
+}
+
+.file-list {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.file-list th {
+  text-align: start;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--color-text-secondary);
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+  cursor: pointer;
+  user-select: none;
+}
+
+.file-list td {
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+  font-size: 13px;
+}
+
+.file-list tr:hover td {
+  background: var(--color-mist);
+}
+
+.file-list .file-name {
+  cursor: pointer;
+  color: var(--color-text);
+  font-weight: 500;
+}
+
+.file-list .file-name:hover {
+  color: var(--color-link);
+}
+
+.file-list .file-icon {
+  width: 20px;
+  display: inline-block;
+  margin-inline-end: var(--space-sm);
+}
+
+.file-list .file-date {
+  color: var(--color-text-secondary);
+}
+
+/* Action bar */
+.action-bar {
+  display: flex;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-md);
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  border: none;
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.btn-primary {
+  background: var(--color-primary);
+  color: var(--color-surface);
+}
+
+.btn-primary:hover {
+  background: var(--color-primary-hover);
+}
+
+.btn-secondary {
+  background: var(--color-surface);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+}
+
+.btn-secondary:hover {
+  background: var(--color-mist);
+}
+
+.btn-danger {
+  background: var(--color-error);
+  color: var(--color-on-danger);
+}
+
+.btn-danger:hover {
+  background: var(--color-error-hover);
+}
+
+.btn:disabled,
+.btn[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Editor area */
+.editor-container {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: var(--space-xl) var(--space-lg);
+  background: var(--color-bg);
+}
+
+.editor-content {
+  width: 100%;
+  max-width: var(--content-max-width);
+  min-height: 100%;
+  background: var(--color-surface);
+  padding: var(--space-xl);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+  font-family: var(--font-doc-body);
+  /* Base font-size scales with `--editor-zoom` (default 1), set inline by
+   * the pinch-zoom handler in document.rs. Headings/lists below use `em`
+   * so they scale proportionally with this base. */
+  font-size: calc(16px * var(--editor-zoom, 1));
+  line-height: 1.6;
+  outline: none;
+  box-sizing: border-box;
+  /* Preserve runs of spaces the user types — without this, HTML default
+     `white-space: normal` collapses `  ` to ` ` even though the model
+     stores both bytes. `pre-wrap` keeps spaces and still wraps long lines.
+     Newlines aren't a concern — the editor stores them as separate block
+     nodes or HardBreak, never as `\n` inside a text node. */
+  white-space: pre-wrap;
+}
+
+.editor-content:empty::before {
+  content: "Start typing...";
+  color: var(--color-text-secondary);
+  pointer-events: none;
+}
+
+/* #139: Show Line Numbers. Numbers are measured per *visual* line and drawn
+   by `EditorGutterOverlay` (a fixed overlay), not by a CSS counter — so they
+   number wrapped lines, give a table one number, and render in one uniform
+   font/size regardless of the block's font. Here we only reserve the left
+   gutter space so text doesn't sit under the numbers. */
+.show-line-numbers .editor-content {
+  padding-inline-start: 3.5em;
+}
+.editor-line-number {
+  position: fixed;
+  z-index: 5;
+  text-align: end;
+  /* Fixed size + UI font: uniform across headings, body, tables. Does NOT
+     scale with --editor-zoom (numbers are chrome, not content). */
+  font-family: var(--font-ui);
+  font-size: 12px;
+  line-height: 1;
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+  opacity: 0.6;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: none;
+}
+
+/* #139: Show Page Breaks — an unobtrusive right-margin marker (dashed tick +
+   "Page N") at roughly each printable-page boundary, drawn by the overlay.
+   Deliberately NOT a full-width rule through the text. Approximate, opt-in. */
+.editor-page-break {
+  position: fixed;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.editor-page-break-line {
+  flex: 1;
+  border-top: 1px dashed var(--color-border);
+  height: 0;
+}
+.editor-page-break-label {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+.editor-content h1 {
+  font-family: var(--font-doc-heading);
+  font-size: 1.75em; /* 28px at default zoom; scales with --editor-zoom */
+  font-weight: 700;
+  margin: 24px 0 8px;
+  line-height: 1.3;
+}
+
+.editor-content h2 {
+  font-family: var(--font-doc-heading);
+  font-size: 1.375em; /* 22px at default zoom */
+  font-weight: 600;
+  margin: 20px 0 8px;
+  line-height: 1.3;
+}
+
+.editor-content h3 {
+  font-family: var(--font-doc-heading);
+  font-size: 1.125em; /* 18px at default zoom */
+  font-weight: 600;
+  margin: 16px 0 8px;
+  line-height: 1.3;
+}
+
+.editor-content > :first-child {
+  margin-top: 0;
+}
+
+.editor-content p {
+  margin: 0 0 8px;
+}
+
+.editor-content ul, .editor-content ol {
+  margin: 0 0 8px;
+  padding-inline-start: 24px;
+}
+
+.editor-content li {
+  margin: 2px 0;
+}
+
+.editor-content blockquote {
+  border-inline-start: 3px solid var(--color-primary);
+  padding-inline-start: var(--space-md);
+  margin: 8px 0;
+  color: var(--color-text-secondary);
+}
+
+.editor-content pre {
+  background: var(--color-code-bg);
+  color: var(--color-code-fg);
+  padding: var(--space-md);
+  border-radius: var(--radius-md);
+  margin: 8px 0;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  overflow-x: auto;
+}
+
+.editor-content code {
+  background: var(--color-mist);
+  padding: 2px 4px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+.editor-content pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.editor-content hr {
+  border: none;
+  border-top: 2px solid var(--color-border);
+  margin: 16px 0;
+}
+
+.editor-content img {
+  max-width: 100%;
+  border-radius: var(--radius-md);
+}
+
+/* Selection and cursor */
+.editor-content ::selection {
+  background: rgba(45, 95, 45, 0.2);
+}
+
+.editor-content:focus {
+  outline: none;
+}
+
+/* Inline formatting */
+.editor-content strong {
+  font-weight: 700;
+}
+
+.editor-content em {
+  font-style: italic;
+}
+
+.editor-content u {
+  text-decoration: underline;
+}
+
+.editor-content s {
+  text-decoration: line-through;
+}
+
+/* #143: sub/superscript. line-height:0 keeps them from inflating the line. */
+.editor-content sub,
+.editor-content sup {
+  font-size: 0.75em;
+  line-height: 0;
+}
+.editor-content sub {
+  vertical-align: sub;
+}
+.editor-content sup {
+  vertical-align: super;
+}
+
+.editor-content a {
+  color: var(--color-link);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.editor-content a:hover {
+  text-decoration: none;
+}
+
+/* Task list */
+.editor-content ul[data-type="taskList"] {
+  list-style: none;
+  padding-inline-start: 4px;
+}
+
+.editor-content li[data-type="taskItem"] {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-sm);
+}
+
+.editor-content li[data-type="taskItem"]::before {
+  content: "";
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--color-text-secondary);
+  border-radius: 3px;
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+
+.editor-content li[data-type="taskItem"][data-checked="true"]::before {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+}
+
+/* Tables */
+.editor-content table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+  table-layout: fixed;
+}
+
+.editor-content th,
+.editor-content td {
+  border: 1px solid var(--color-border);
+  padding: 8px 12px;
+  vertical-align: top;
+  min-width: 80px;
+}
+
+.editor-content th {
+  background: var(--color-mist);
+  font-weight: 600;
+  text-align: start;
+}
+
+.editor-content td p,
+.editor-content th p {
+  margin: 0;
+}
+
+.editor-content td p + p,
+.editor-content th p + p {
+  margin-top: 4px;
+}
+
+/* Selection toolbar — floating above text selection */
+.selection-toolbar {
+  position: fixed;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--color-surface, #1a1a1a);
+  border-radius: 6px;
+  padding: 4px 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  pointer-events: auto;
+}
+
+.selection-toolbar-btn {
+  background: none;
+  border: none;
+  color: var(--color-surface-text, #e0e0e0);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 4px;
+  line-height: 1;
+}
+
+.selection-toolbar-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+/* Editor right-click context menu. Mirrors the spreadsheet's
+ * `.ss-ctx-menu` chrome so the two surfaces feel consistent. */
+.editor-ctx-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 99;
+  /* Transparent — purpose is to catch the dismiss-click, not to dim
+     the page behind the menu. */
+  background: transparent;
+}
+
+.editor-ctx-menu {
+  position: fixed;
+  z-index: 100;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 4px 0;
+  min-width: 220px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  color: var(--color-text);
+  /* `overflow: visible` (the default) is REQUIRED so the
+   * `.editor-ctx-submenu` panel (positioned at `left: 100%` of the
+   * parent row) renders outside the menu's right edge. Setting
+   * `overflow-y: auto` here would force CSS to also clip the
+   * x-axis — the submenu would still mount, but it would be
+   * cropped to zero width and the user would see only the parent
+   * row's hover background brightening. The menu is short enough
+   * that omitting a scroll container is the right tradeoff. */
+}
+
+.editor-ctx-item {
+  display: flex;
+  width: 100%;
+  padding: 6px 12px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--color-text);
+  text-align: left;
+  align-items: center;
+  gap: 12px;
+}
+
+.editor-ctx-item:hover:not(:disabled) {
+  background: var(--color-mist);
+}
+
+.editor-ctx-item:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.editor-ctx-label {
+  flex: 1;
+}
+
+.editor-ctx-shortcut {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.editor-ctx-sep {
+  height: 1px;
+  background: var(--color-border);
+  margin: 4px 8px;
+}
+
+/* Submenu — opens to the right on hover of the parent item. The
+ * wrapper provides the positioning context; the submenu itself
+ * mirrors `.editor-ctx-menu` chrome so the two levels feel
+ * indistinguishable. */
+.editor-ctx-submenu-wrap {
+  position: relative;
+}
+
+.editor-ctx-item-has-submenu {
+  cursor: default;
+}
+
+.editor-ctx-submenu-arrow {
+  color: var(--color-text-secondary);
+  font-size: 10px;
+}
+
+.editor-ctx-submenu {
+  position: absolute;
+  left: 100%;
+  top: -5px;
+  display: none;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 4px 0;
+  min-width: 180px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  color: var(--color-text);
+  z-index: 101;
+}
+
+.editor-ctx-submenu-wrap:hover > .editor-ctx-submenu,
+.editor-ctx-submenu-wrap:focus-within > .editor-ctx-submenu {
+  display: block;
+}
+
+/* Highlight the parent row while the submenu is visible so the
+ * connection between row and panel reads at a glance. */
+.editor-ctx-submenu-wrap:hover > .editor-ctx-item-has-submenu,
+.editor-ctx-submenu-wrap:focus-within > .editor-ctx-item-has-submenu {
+  background: var(--color-mist);
+}
+
+/* Comment highlight — overlays commented text with warm background */
+.comment-highlight {
+  position: fixed;
+  background: rgba(210, 150, 60, 0.25);
+  border-radius: 2px;
+  cursor: pointer;
+  pointer-events: auto;
+  z-index: 5;
+  transition: background 0.15s;
+}
+
+.comment-highlight:hover {
+  background: rgba(210, 150, 60, 0.4);
+}
+
+/* Comment bubble — numbered icon in the left margin */
+.comment-bubble {
+  position: fixed;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  cursor: pointer;
+  font-size: 14px;
+  opacity: 0.6;
+  transition: opacity 0.15s;
+}
+
+.comment-bubble:hover {
+  opacity: 1;
+}
+
+.comment-bubble-icon {
+  font-size: 16px;
+}
+
+.comment-bubble-count {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+/* Add-comment affordance — same placement as the existing-comment bubble
+   (left margin of the block) and the same speech-bubble glyph, but with a
+   small "+" overlaid so the empty/add state is visually distinct from a
+   thread that already has comments. Dimmer when idle so it doesn't
+   compete visually with real comments. */
+.comment-bubble-add {
+  /* `position: fixed` is set by .comment-bubble; that establishes the
+     containing block for the absolute "+" badge below. */
+  opacity: 0.35;
+}
+
+.comment-bubble-add:hover {
+  opacity: 1;
+}
+
+.comment-bubble-add .comment-bubble-icon {
+  font-size: 18px;
+  line-height: 1;
+}
+
+.comment-bubble-add-plus {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Visual center of the speech-bubble glyph sits a hair above its
+     geometric center because of the tail at bottom-left. */
+  margin-bottom: 3px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--color-text-primary, #111);
+  pointer-events: none;
+}
+
+/* Block-level commentable elements need positioning context for inline
+   children that use position:absolute. The "add comment" bubble itself is
+   rendered as a real DOM element by AddCommentBubble (see
+   frontend/src/components/comment_highlights.rs) — not via ::after — so
+   that it can hold a click handler and stay visible while hovered. */
+.editor-content [data-block-id] {
+  position: relative;
+}
+
+/* Horizontal rule */
+.editor-content hr {
+  border: none;
+  border-top: 2px solid var(--color-border);
+  margin: 16px 0;
+  cursor: pointer;
+}
+
+.editor-content hr:focus,
+.editor-content hr.selected {
+  border-color: var(--color-primary);
+}
+
+/* Login page */
+.login-page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  background: var(--color-bg);
+}
+
+.login-card {
+  background: var(--color-surface);
+  padding: var(--space-xl);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  text-align: center;
+  max-width: 360px;
+  width: 100%;
+}
+
+.login-title {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--color-primary);
+  margin-bottom: var(--space-sm);
+}
+
+.login-subtitle {
+  font-size: 14px;
+  color: var(--color-text-secondary);
+  margin-bottom: var(--space-xl);
+}
+
+.login-btn {
+  width: 100%;
+  padding: var(--space-md);
+  background: var(--color-text);
+  color: var(--color-surface);
+  border: none;
+  border-radius: var(--radius-md);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.login-btn:hover {
+  opacity: 0.9;
+}
+
+/* OAuth brand buttons pin both bg and text color so they stay
+ * high-contrast in dark mode — the default .login-btn uses
+ * var(--color-surface) for text, which collapses to dark-on-dark
+ * when only the background is overridden (e.g. GitHub's #24292e). */
+.login-btn-github {
+  background: #24292e;
+  color: #fff;
+}
+.login-btn-google {
+  background: #4285f4;
+  color: #fff;
+}
+
+/* Document page header */
+.doc-header {
+  /* Stacking context must outrank .menu-bar (z-index 30) so the
+   * notification dropdown anchored to the bell here can paint OVER the
+   * menu bar that sits just below this header. Menu-bar dropdowns drop
+   * downward and never overlap this region, so raising this above 30 is
+   * safe. */
+  position: relative;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
+/* #149/#142: folder-membership chips. Originally rendered as their own strip
+ * under the header (.doc-folders-bar) — now inline in the doc-header so they
+ * share horizontal space with the title / actions cluster instead of stacking
+ * another row. Takes the slack between the title and the header-actions block
+ * (which pushes right via margin-inline-start: auto). `min-width: 0` is what
+ * lets it actually shrink; without it flex children default to `auto` and
+ * would push siblings off-screen when chips accumulate. Overflow scrolls
+ * horizontally rather than wrapping — keeping the header a single row. */
+.doc-folders-inline {
+  display: flex;
+  align-items: center;
+  flex: 1 1 0;
+  min-width: 0;
+  gap: var(--space-xs);
+  padding-inline: var(--space-md);
+  overflow-x: auto;
+  font-size: 12px;
+}
+.doc-folders-inline::-webkit-scrollbar {
+  height: 4px;
+}
+.doc-folders-inline::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 2px;
+}
+/* Distraction-free / focus mode: keep only the editor + top-right controls.
+ * The chips carry navigation context that doesn't belong in that view. */
+.app-layout.focus-mode .doc-folders-inline {
+  display: none;
+}
+.doc-folder-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  color: var(--color-text);
+  max-width: 220px;
+}
+.doc-folder-chip.primary {
+  /* The home folder — visually distinct and non-removable. */
+  border-style: dashed;
+  opacity: 0.85;
+}
+.doc-folder-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.doc-folder-chip-remove {
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted, inherit);
+  cursor: pointer;
+  line-height: 1;
+  padding: 0 2px;
+  font-size: 11px;
+}
+.doc-folder-chip-remove:hover {
+  color: var(--color-error);
+}
+.doc-folder-add-btn {
+  border: 1px dashed var(--color-border);
+  background: transparent;
+  color: var(--color-text-muted, inherit);
+  cursor: pointer;
+  border-radius: 12px;
+  padding: 2px 10px;
+  font-size: 12px;
+}
+.doc-folder-add-btn:hover {
+  border-color: var(--color-brand-anchor);
+  color: var(--color-text);
+}
+
+.doc-title {
+  font-size: 16px;
+  font-weight: 600;
+  border: none;
+  background: transparent;
+  outline: none;
+  flex: 1;
+  min-width: 0; /* allows the flex item to actually shrink and overflow */
+  padding: var(--space-xs);
+  /* Long titles truncate with an ellipsis; the full title is exposed via
+   * the `title` attribute on hover (and to screen readers). */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.doc-title:focus {
+  background: var(--color-mist);
+  border-radius: var(--radius-sm);
+}
+
+.doc-title-editable {
+  cursor: text;
+  /* `<input>` has a UA intrinsic min-width (~20ch) that ignores
+   * `min-width: 0` on the flex item alone; explicitly anchor the input
+   * to its flex allocation so it actually shrinks on narrow viewports. */
+  width: 100%;
+  min-width: 0;
+}
+
+.doc-title-editable:hover {
+  background: var(--color-mist);
+  border-radius: var(--radius-sm);
+}
+
+/* Empty state */
+.empty-state {
+  text-align: center;
+  padding: var(--space-xl);
+  color: var(--color-text-secondary);
+}
+
+.empty-state-text {
+  font-size: 14px;
+  margin-bottom: var(--space-md);
+}
+
+/* ─── Document Outline ──────────────────────────────────────── */
+
+.document-outline {
+  width: 220px;
+  min-width: 180px;
+  border-inline-start: 1px solid var(--color-border);
+  padding: var(--space-md);
+  overflow-y: auto;
+  flex-shrink: 0;
+  /* Always-rendered (so CSS transitions can fire); hidden until `.is-open`. */
+  display: none;
+}
+
+.document-outline.is-open {
+  display: block;
+}
+
+.outline-header {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-secondary);
+  margin-bottom: var(--space-sm);
+}
+
+.outline-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.outline-item {
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.outline-item:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text);
+}
+
+.outline-h1 { padding-inline-start: 8px; font-weight: 600; }
+.outline-h2 { padding-inline-start: 20px; }
+.outline-h3 { padding-inline-start: 32px; font-size: 12px; }
+
+.outline-empty {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  padding: var(--space-sm);
+}
+
+/* ─── Share Button & Dialog ─────────────────────────────────── */
+
+.share-button {
+  background: var(--color-primary);
+  color: white;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 6px 12px;
+  font-size: 16px; /* sized for the share glyph */
+  line-height: 1;
+  font-weight: 600;
+  cursor: pointer;
+  margin-inline-start: auto;
+}
+
+.share-button:hover {
+  opacity: 0.9;
+}
+
+/* #142: Use Template — sibling of .share-button, secondary-looking so it
+ * doesn't compete with Share. Only rendered when the doc is a template. */
+.use-template-button {
+  background: transparent;
+  color: var(--color-primary);
+  border: 1px solid var(--color-primary);
+  border-radius: var(--radius-sm);
+  padding: 6px 12px;
+  font-size: 0.9rem;
+  line-height: 1;
+  font-weight: 600;
+  cursor: pointer;
+  margin-inline-start: auto;
+}
+
+.use-template-button:hover {
+  background: var(--color-primary);
+  color: white;
+}
+
+/* When both buttons render, only Share should push right; drop the auto
+ * margin on Share so they sit next to each other on the far right. */
+.use-template-button + .share-button {
+  margin-inline-start: var(--space-sm);
+}
+
+/* #147: in-app Find & Replace bar. */
+.find-replace-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  flex-wrap: wrap;
+}
+
+/* #147: find-match highlighting via the CSS Custom Highlight API. The editor
+   registers `ogre-find` over every match and `ogre-find-active` over the
+   current one (find_highlight.rs). Only paint properties are honored here. */
+::highlight(ogre-find) {
+  background-color: rgba(245, 179, 1, 0.32);
+}
+::highlight(ogre-find-active) {
+  background-color: #f5b301;
+  color: #1a1a1a;
+}
+.find-replace-bar .find-input {
+  padding: 4px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-size: 13px;
+  min-width: 140px;
+}
+.find-replace-bar .find-count {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  min-width: 44px;
+  text-align: center;
+}
+.find-replace-bar .find-btn {
+  padding: 4px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  font-size: 13px;
+}
+.find-replace-bar .find-btn:hover {
+  background: var(--color-mist);
+  color: var(--color-text);
+}
+.find-replace-bar .find-close {
+  margin-inline-start: auto;
+  border: none;
+}
+
+/* #144: header favorite (star) toggle. */
+.favorite-toggle-btn {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 6px;
+  color: var(--color-text-secondary);
+}
+.favorite-toggle-btn:hover {
+  color: var(--color-text);
+}
+.favorite-toggle-btn.active {
+  color: #f5b301; /* star gold */
+}
+
+/* #144: favorite star dropdown (Added to Favorites / Collections / Remove). */
+.favorite-menu-wrapper {
+  position: relative;
+  display: inline-block;
+}
+.favorite-menu-backdrop {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 99;
+}
+.favorite-menu-dropdown {
+  position: absolute;
+  top: 100%;
+  inset-inline-end: 0;
+  z-index: 100;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 4px 0;
+  min-width: 220px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.18);
+}
+.favorite-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 14px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--color-text);
+  text-align: start;
+}
+.favorite-menu-item:hover {
+  background: var(--color-mist);
+}
+.favorite-menu-check,
+.favorite-menu-star {
+  display: inline-block;
+  width: 16px;
+  text-align: center;
+  flex: none;
+  color: var(--color-text-secondary);
+}
+.favorite-menu-star {
+  color: #f5b301;
+}
+.favorite-menu-sep {
+  height: 1px;
+  background: var(--color-border);
+  margin: 4px 0;
+}
+.favorite-menu-section-title {
+  padding: 4px 14px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-secondary);
+}
+
+/* #144: Favorites items in the sidebar. */
+.sidebar-favorite-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-decoration: none;
+  color: inherit;
+}
+.sidebar-favorite-star {
+  color: #f5b301;
+  flex-shrink: 0;
+}
+.sidebar-favorite-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* #134: header focus/expand toggle. Takes the auto right-margin so it and
+   the Share button group at the right edge; flips icon (⤢ enter ↔ ✕ exit)
+   and shows an active state in focus mode. */
+.focus-toggle-btn {
+  margin-inline-start: auto;
+  background: transparent;
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+.focus-toggle-btn:hover {
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+.focus-toggle-btn.active {
+  background: var(--color-primary);
+  color: white;
+  border-color: var(--color-primary);
+}
+
+.share-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.share-dialog {
+  background: var(--color-bg);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  width: 480px;
+  max-width: 90vw;
+}
+
+.share-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-md) var(--space-lg);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.share-header h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.share-close {
+  background: none;
+  border: none;
+  font-size: 18px;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  padding: 4px;
+}
+
+.share-body {
+  padding: var(--space-lg);
+}
+
+.share-input-row {
+  display: flex;
+  gap: var(--space-sm);
+}
+
+.share-email-input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+}
+
+.share-level-select {
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  background: var(--color-bg);
+}
+
+.share-btn {
+  padding: 8px 16px;
+  background: var(--color-primary);
+  color: white;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.share-status {
+  margin-top: var(--space-md);
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+
+/* Editor + side panels row */
+.editor-with-panels {
+  flex: 1;
+  display: flex;
+  flex-direction: row;
+  overflow: hidden;
+}
+
+.editor-with-panels .editor-container {
+  flex: 1;
+  overflow-y: auto;
+}
+
+
+/* ─── Conversation Pane ─────────────────────────────────────── */
+
+.conversation-pane {
+  width: 280px;
+  min-width: 240px;
+  border-inline-start: 1px solid var(--color-border);
+  flex-direction: column;
+  flex-shrink: 0;
+  background: var(--color-bg);
+  /* Always-rendered (so CSS transitions can fire); hidden until `.is-open`. */
+  display: none;
+}
+
+.conversation-pane.is-open {
+  display: flex;
+}
+
+.conversation-header {
+  padding: var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.conversation-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.comment-nav-btn {
+  background: none;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 10px;
+  color: var(--color-text-secondary);
+  padding: 0;
+}
+
+.comment-nav-btn:hover {
+  background: var(--color-mist);
+  color: var(--color-text);
+}
+
+.conversation-title {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-secondary);
+}
+
+.conversation-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-sm);
+}
+
+.conversation-empty {
+  padding: var(--space-lg);
+  text-align: center;
+  font-size: 13px;
+  color: var(--color-text-tertiary);
+}
+
+/* Comment popup — positioned to the left of document content */
+.comment-popup-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 99;
+}
+
+.comment-popup {
+  position: fixed;
+  z-index: 100;
+  width: 420px;
+  max-width: calc(100vw - 16px);
+  max-height: 500px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.12);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.comment-popup-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.comment-popup-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.comment-popup-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+.comment-popup-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 18px;
+  color: var(--color-text-secondary);
+  padding: 4px;
+  line-height: 1;
+}
+
+.comment-popup-close:hover {
+  color: var(--color-text);
+}
+
+.comment-popup-body {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 120px;
+  max-height: 320px;
+}
+
+.comment-popup-textarea {
+  width: 100%;
+  min-height: 120px;
+  padding: 12px 16px;
+  border: none;
+  border-bottom: 1px solid var(--color-border);
+  font-size: 14px;
+  font-family: inherit;
+  color: var(--color-text);
+  resize: vertical;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.comment-popup-textarea::placeholder {
+  color: var(--color-text-tertiary);
+}
+
+.comment-popup-messages {
+  padding: 12px 16px;
+}
+
+.comment-popup-msg {
+  margin-bottom: 12px;
+}
+
+.comment-popup-msg-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+
+.comment-popup-author {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+.comment-popup-time {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
+
+.comment-popup-text {
+  font-size: 14px;
+  color: var(--color-text);
+  line-height: 1.4;
+}
+
+.comment-popup-loading {
+  font-size: 13px;
+  color: var(--color-text-tertiary);
+  padding: 16px;
+}
+
+.comment-popup-footer {
+  padding: 10px 16px;
+  border-top: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.comment-popup-reply-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.comment-popup-input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  font-size: 14px;
+  outline: none;
+}
+
+.comment-popup-input:focus {
+  border-color: var(--color-primary);
+}
+
+.comment-popup-send {
+  background: var(--color-primary);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.comment-popup-send:hover {
+  opacity: 0.9;
+}
+
+.conversation-error {
+  padding: var(--space-sm) var(--space-md);
+  margin: var(--space-sm);
+  background: var(--color-warning-bg);
+  border: 1px solid var(--color-warning-border);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--color-warning-fg);
+  cursor: pointer;
+}
+
+.conversation-thread {
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+  cursor: pointer;
+}
+
+.conversation-thread:hover {
+  background: var(--color-mist);
+}
+
+.conversation-thread.thread-resolved {
+  opacity: 0.6;
+}
+
+.thread-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: 12px;
+}
+
+.thread-author {
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.thread-status {
+  color: var(--color-text-secondary);
+}
+
+.thread-time {
+  color: var(--color-text-tertiary);
+  margin-inline-start: auto;
+}
+
+.thread-preview {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  margin-top: 2px;
+  line-height: 1.4;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.thread-typing-indicator {
+  font-size: 12px;
+  font-style: italic;
+  color: var(--color-text-tertiary);
+  padding: 4px 8px;
+  margin-top: 4px;
+}
+
+.thread-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.thread-action-btn {
+  background: none;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 11px;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+}
+
+.thread-action-btn:hover {
+  background: var(--color-mist);
+  color: var(--color-text);
+}
+
+.thread-delete-btn:hover {
+  color: var(--color-error, #E53935);
+  border-color: var(--color-error, #E53935);
+}
+
+.thread-content {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  margin-top: 2px;
+}
+
+.thread-time {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  margin-top: 2px;
+}
+
+.conversation-input {
+  padding: var(--space-sm);
+  border-top: 1px solid var(--color-border);
+}
+
+.conversation-message-input {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  box-sizing: border-box;
+}
+
+/* ─── Chat Panel (Sidebar) ──────────────────────────────────── */
+
+.sidebar-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  padding: 6px 12px;
+}
+
+.sidebar-section-toggle {
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+.sidebar-section-body {
+  padding: 0 12px 8px;
+}
+
+.sidebar-empty {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.4);
+  font-style: italic;
+  padding: 4px 0;
+}
+
+.chat-list {
+  margin-bottom: 8px;
+}
+
+.chat-item {
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.chat-item:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.chat-title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sidebar-action-btn {
+  background: none;
+  border: 1px dashed rgba(255, 255, 255, 0.3);
+  color: rgba(255, 255, 255, 0.6);
+  padding: 4px 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 12px;
+  width: 100%;
+  text-align: center;
+}
+
+.sidebar-action-btn:hover {
+  border-color: rgba(255, 255, 255, 0.5);
+  color: rgba(255, 255, 255, 0.8);
+}
+
+/* ─── Notification Bell ─────────────────────────────────────── */
+
+.doc-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-inline-start: auto;
+}
+
+.user-name {
+  font-size: 14px;
+  color: var(--text-secondary, #666);
+  white-space: nowrap;
+}
+
+.notification-bell-wrapper {
+  position: relative;
+}
+
+.notification-bell {
+  background: none;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  position: relative;
+  padding: 4px 8px;
+}
+
+.notification-badge {
+  position: absolute;
+  top: 0;
+  inset-inline-end: 0;
+  background: var(--color-error, #e74c3c);
+  color: white;
+  font-size: 10px;
+  font-weight: 700;
+  min-width: 16px;
+  height: 16px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+}
+
+.notification-panel {
+  position: absolute;
+  top: 100%;
+  inset-inline-end: 0;
+  width: 320px;
+  max-width: calc(100vw - 16px);
+  max-height: 400px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  z-index: 100;
+  overflow: hidden;
+}
+
+.notification-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.notification-mark-all {
+  background: none;
+  border: none;
+  color: var(--color-primary);
+  font-size: 12px;
+  cursor: pointer;
+  /* Push this and the Clear-all button that follows to the right of the
+     header (title stays left); they sit together with a small gap. */
+  margin-inline-start: auto;
+}
+
+/* #120: "Clear all" dismisses (deletes) notifications — muted next to
+   the primary "Mark all read" so the destructive action reads as
+   secondary. */
+.notification-clear-all {
+  background: none;
+  border: none;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  margin-inline-start: var(--space-sm);
+}
+
+.notification-clear-all:hover {
+  color: var(--color-text);
+}
+
+.notification-panel-body {
+  overflow-y: auto;
+  max-height: 350px;
+}
+
+.notification-empty {
+  padding: var(--space-lg);
+  text-align: center;
+  font-size: 13px;
+  color: var(--color-text-tertiary);
+}
+
+.notification-item {
+  position: relative;
+  /* Reserve room on the trailing edge for the dismiss X so it doesn't
+     overlap long messages. */
+  padding: var(--space-sm) var(--space-lg) var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+  font-size: 13px;
+}
+
+/* #120: per-notification dismiss (delete) affordance, top-trailing
+   corner. Muted by default (visible on touch), full-strength on hover. */
+.notification-dismiss {
+  position: absolute;
+  top: 2px;
+  inset-inline-end: 4px;
+  background: none;
+  border: none;
+  color: var(--color-text-tertiary);
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 5px;
+  cursor: pointer;
+  opacity: 0.45;
+}
+
+.notification-item:hover .notification-dismiss,
+.notification-dismiss:hover {
+  opacity: 1;
+}
+
+.notification-dismiss:hover {
+  color: var(--color-text);
+}
+
+.notification-item.unread {
+  background: rgba(41, 128, 185, 0.05);
+  border-inline-start: 3px solid var(--color-primary);
+}
+
+.notification-item.clickable {
+  cursor: pointer;
+}
+
+.notification-item.clickable:hover {
+  background: var(--color-mist, rgba(0, 0, 0, 0.04));
+}
+
+.notification-message {
+  color: var(--color-text-secondary);
+}
+
+.notification-actor {
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.notification-doc {
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+/* Truncated comment/reply preview under the action line. */
+.notification-preview {
+  margin-top: 2px;
+  color: var(--color-text-secondary);
+  font-style: italic;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ─── Block Menu ────────────────────────────────────────────── */
+
+.block-menu {
+  position: absolute;
+  inset-inline-start: -40px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 50;
+}
+
+.block-menu-item {
+  background: none;
+  border: none;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-secondary);
+  text-align: center;
+  min-width: 28px;
+}
+
+.block-menu-item:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text);
+}
+
+.block-menu-divider {
+  height: 1px;
+  background: var(--color-border);
+  margin: 2px 0;
+}
+
+/* ─── @ Menu ────────────────────────────────────────────────── */
+
+.at-menu {
+  position: fixed;
+  width: 280px;
+  max-height: 300px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  z-index: 100;
+  overflow: hidden;
+}
+
+.at-menu-header {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--color-border);
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+
+.at-menu-query {
+  font-weight: 600;
+  color: var(--color-primary);
+}
+
+.at-menu-body {
+  overflow-y: auto;
+  max-height: 250px;
+}
+
+.at-menu-empty {
+  padding: 16px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--color-text-tertiary);
+}
+
+.at-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.at-menu-item:hover,
+.at-menu-item--highlighted {
+  /* Both hover (mouse) and highlighted (keyboard) share the same
+     visual so users can freely switch between the two. */
+  background: var(--color-bg-hover);
+}
+
+.at-menu-icon {
+  font-size: 16px;
+  width: 20px;
+  text-align: center;
+}
+
+.at-menu-label {
+  flex: 1;
+}
+
+/* #148 section headers group People / Documents / Insert / AI
+   entries. Small, uppercase, colored muted so they read as
+   labels not results. */
+.at-menu-section-header {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--color-fg-muted);
+  padding: 6px 12px 2px;
+}
+
+.at-menu-section + .at-menu-section {
+  border-top: 1px solid var(--color-border-subtle);
+  margin-top: 2px;
+  padding-top: 2px;
+}
+
+/* #148 user @-mention chip. Small pill-shape with a subtle
+   background so it reads as a distinct atom, but stays inline
+   with prose (no line-break). */
+.mention {
+  display: inline;
+  background: var(--color-mention-bg, rgba(59, 130, 246, 0.12));
+  color: var(--color-mention-fg, #1d4ed8);
+  padding: 0 4px;
+  border-radius: 4px;
+  font-weight: 500;
+}
+
+/* #148 @-ask "Insert into document" action row inside AskDialog.
+   Sits below the answer + citations; only visible when the
+   parent supplied an on_insert callback. */
+.ask-insert-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 0 4px;
+  margin-top: 12px;
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+/* Remote cursor overlay (collaboration presence) */
+.remote-cursor-selection {
+  position: fixed;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.remote-cursor-caret {
+  position: fixed;
+  pointer-events: none;
+  z-index: 6;
+  width: 2px;
+  border-left: 2px solid;
+}
+
+.remote-cursor-label {
+  position: absolute;
+  bottom: 100%;
+  left: -1px;
+  padding: 1px 4px;
+  font-size: 11px;
+  line-height: 14px;
+  /* Hardcoded white because the background here is set inline via
+   * the cursor's per-user color (always a dark, saturated swatch).
+   * Both light and dark mode assume white reads against it. */
+  color: #fff;
+  border-radius: 3px 3px 3px 0;
+  white-space: nowrap;
+  pointer-events: none;
+  /* #99: the name tag sits above the line and can obscure the text on
+   * the line above. Render it semi-transparent so that text stays
+   * legible through it; the caret bar stays fully opaque so presence is
+   * still obvious. A full opt-out lives at View → Show Cursors. */
+  opacity: 0.6;
+}
+
+/* ─── Search Dialog ─────────────────────────────────────────── */
+
+.search-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 15vh;
+  z-index: 1000;
+}
+
+.search-dialog {
+  background: var(--color-bg);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
+  width: 560px;
+  max-width: 90vw;
+  max-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.search-input-wrapper {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-md) var(--space-lg);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.search-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+.search-input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  font-size: 16px;
+  font-family: var(--font-ui);
+  color: var(--color-text);
+  outline: none;
+}
+
+.search-input::placeholder {
+  color: var(--color-text-secondary);
+}
+
+.search-shortcut {
+  font-size: 11px;
+  /* Was --color-text-secondary (#6B6B6B) on --color-mist
+   * (#E8E4DC) = 4.20:1 — just below the 4.5 AA threshold.
+   * Lift to primary text (#1A1A1A light, #E8E8E8 dark) which
+   * lands at 13.73:1 / 11.5:1 — comfortable AA pass in both
+   * modes. The visual weight bump on a small Esc chip is
+   * minor; high contrast is the goal. */
+  color: var(--color-text);
+  background: var(--color-mist);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
+}
+
+.search-results {
+  overflow-y: auto;
+  flex: 1;
+}
+
+.search-loading,
+.search-empty {
+  padding: var(--space-lg);
+  text-align: center;
+  color: var(--color-text-secondary);
+  font-size: 14px;
+}
+
+.search-result-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-lg);
+  cursor: pointer;
+  border-bottom: 1px solid var(--color-border);
+  user-select: none;
+}
+
+/* ─── Command palette (Phase 5 M-P4 piece A) ───────────────────
+ * Activated via `>` prefix in the search dialog. Reuses the
+ * search-results container, with its own row class so the visual
+ * distinction (mono label, scope chip, shortcut hint on the
+ * right) reads as "I'm in action mode now, not search". */
+.command-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-lg);
+  cursor: pointer;
+  border-bottom: 1px solid var(--color-border);
+  user-select: none;
+}
+.command-item:last-child {
+  border-bottom: none;
+}
+.command-item:hover {
+  background: var(--color-mist);
+}
+.command-item-icon {
+  font-size: 16px;
+  color: var(--color-primary);
+  flex-shrink: 0;
+  width: 16px;
+  text-align: center;
+}
+.command-item-content {
+  flex: 1;
+  min-width: 0;
+}
+.command-item-label {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.command-item-shortcut {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  /* --color-text-tertiary on --color-bg-subtle is 4.0:1 in light
+     mode — under the 4.5:1 WCAG AA threshold for small text. The
+     secondary token darkens enough (~4.8:1) to pass without
+     widening blast radius across every tertiary-text site. */
+  color: var(--color-text-secondary);
+  padding: 2px 6px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-bg-subtle);
+  flex-shrink: 0;
+}
+
+.search-result-item:last-child {
+  border-bottom: none;
+}
+
+.search-result-item:hover {
+  background: var(--color-mist);
+}
+
+.search-result-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+  padding-top: 2px;
+}
+
+.search-result-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.search-result-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.search-result-snippet {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  margin-top: 2px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.search-result-snippet b {
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+.search-result-time {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  flex-shrink: 0;
+  white-space: nowrap;
+  padding-top: 2px;
+}
+
+/* Confirm + folder-picker dialogs (share the same backdrop). */
+.confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.confirm-dialog {
+  background: var(--color-bg);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  width: 420px;
+  max-width: 90vw;
+}
+
+.folder-picker-dialog {
+  background: var(--color-bg);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  width: 480px;
+  max-width: 90vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.confirm-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-md) var(--space-lg);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.confirm-header h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.confirm-body {
+  padding: var(--space-lg);
+}
+
+.confirm-body p {
+  margin: 0;
+  color: var(--color-text);
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-sm);
+  padding: var(--space-md) var(--space-lg);
+  border-top: 1px solid var(--color-border);
+}
+
+.folder-picker-body {
+  padding: var(--space-sm) 0;
+  overflow-y: auto;
+  flex: 1;
+}
+
+/* #146: Duplicate dialog — name field, destination label, share warning. */
+.duplicate-name-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 var(--space-md) var(--space-sm);
+}
+.duplicate-dest-label {
+  padding: 0 var(--space-md) var(--space-xs);
+  font-size: 0.9rem;
+  color: var(--color-text-secondary);
+}
+.duplicate-share-warning {
+  margin: var(--space-sm) var(--space-md) 0;
+  padding: 8px 12px;
+  background: var(--color-warning-bg);
+  border: 1px solid var(--color-warning-border);
+  color: var(--color-warning-fg);
+  border-radius: var(--radius-sm);
+  font-size: 0.9rem;
+}
+
+/* #142: template picker modal — reuses .confirm-backdrop + .folder-picker-dialog
+ * for the shell. Adds row layout so title and the Use / Copying… action end up
+ * on opposite sides (title left, action right) with hover feedback. */
+.template-picker-dialog {
+  width: 480px;
+}
+.template-picker-body {
+  padding: var(--space-xs) 0;
+  overflow-y: auto;
+  max-height: 60vh;
+}
+.template-picker-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  width: 100%;
+  padding: var(--space-sm) var(--space-md);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+}
+.template-picker-row:hover:not(:disabled) {
+  background: var(--color-mist);
+}
+.template-picker-row:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.template-picker-row-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.template-picker-row-action {
+  font-size: 0.9rem;
+  color: var(--color-primary);
+  white-space: nowrap;
+}
+.template-picker-empty,
+.template-picker-error {
+  padding: var(--space-md);
+  color: var(--color-text-secondary);
+  text-align: center;
+}
+.template-picker-error {
+  color: var(--color-error, #b91c1c);
+}
+
+/* #142 Phase 2 — values-fill form. One row per placeholder key. */
+.template-picker-fill {
+  padding: var(--space-sm) var(--space-md) var(--space-md);
+}
+.template-picker-fill-hint {
+  margin: 0 0 var(--space-sm);
+  color: var(--color-text-secondary);
+  font-size: 0.9rem;
+}
+.template-picker-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: var(--space-sm);
+}
+.template-picker-field-key {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.85rem;
+  color: var(--color-text-secondary);
+}
+.template-picker-field-input {
+  padding: 6px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+  color: var(--color-text);
+  font: inherit;
+}
+.template-picker-field-input:focus {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -1px;
+}
+.template-picker-back {
+  margin-inline-end: var(--space-xs);
+}
+
+/* #142 Phase 3 — group headers inside the picker body. Subtle divider
+ * label; the row list continues below it. Muted color and small size
+ * so it doesn't compete with the row titles. */
+.template-picker-section-title {
+  padding: var(--space-sm) var(--space-md) 4px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-secondary);
+}
+.template-picker-section-title:not(:first-child) {
+  margin-top: var(--space-xs);
+  border-top: 1px solid var(--color-border);
+}
+
+.folder-picker-tree {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.folder-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 14px;
+}
+
+.folder-picker-row:hover:not(.disabled) {
+  background: var(--color-mist);
+}
+
+.folder-picker-row.selected {
+  background: var(--color-primary);
+  color: var(--color-surface);
+}
+
+.folder-picker-row.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.folder-picker-chevron {
+  display: inline-block;
+  width: 14px;
+  text-align: center;
+  color: var(--color-text-secondary);
+}
+
+.folder-picker-icon {
+  font-size: 14px;
+}
+
+.folder-picker-empty {
+  padding: var(--space-md) var(--space-lg);
+  color: var(--color-text-secondary);
+}
+
+.folder-picker-error {
+  color: var(--color-error, #c0392b);
+  padding: var(--space-sm) var(--space-lg);
+  margin: 0;
+  font-size: 13px;
+}
+
+.editor-content-readonly {
+  cursor: default;
+  user-select: text;
+  caret-color: transparent;
+}
+
+/* Trashed-document banner shown at the top of the document view. */
+.trash-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: 10px 16px;
+  background: var(--color-warning-bg);
+  border-bottom: 1px solid var(--color-warning-border);
+  color: var(--color-warning-fg);
+  font-size: 14px;
+}
+
+.trash-banner-message {
+  flex: 1;
+}
+
+.trash-banner .btn {
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
+/* #140: doc-wide edit-lock banner. Mirrors .trash-banner (a warning-toned
+   status strip) since a locked doc is likewise non-editable. */
+.lock-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: 10px 16px;
+  background: var(--color-warning-bg);
+  border-bottom: 1px solid var(--color-warning-border);
+  color: var(--color-warning-fg);
+  font-size: 14px;
+}
+
+.lock-banner-message {
+  flex: 1;
+}
+
+.lock-banner .btn {
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
+/* #110: informational bar offering a view-link viewer a way to ask the
+   owner for edit access. Informational (not a warning) — surface bg with a
+   primary accent rule. */
+.link-viewer-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: 10px 16px;
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  border-inline-start: 3px solid var(--color-primary);
+  color: var(--color-text-secondary);
+  font-size: 14px;
+}
+
+.link-viewer-banner-message {
+  flex: 1;
+}
+
+.link-viewer-banner .btn {
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
+/* Row actions column in the Trash file browser. */
+.file-row-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.file-row-actions .btn {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+/* #150: inline folder Rename/Delete actions in the file name cell. Revealed
+   on row hover/focus to keep the listing calm, but always shown on
+   coarse-pointer (touch) devices that have no hover. */
+.folder-row-actions {
+  display: inline-flex;
+  gap: var(--space-xs);
+  margin-inline-start: var(--space-sm);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+tr:hover .folder-row-actions,
+.folder-row-actions:focus-within {
+  opacity: 1;
+}
+@media (hover: none) {
+  .folder-row-actions {
+    opacity: 1;
+  }
+}
+.folder-row-actions .btn-sm {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+/* Build stamp above the Sign-out row. Low-contrast on the dark sidebar —
+   present for ops/debug glance ("is the fix live?") without competing
+   visually with primary navigation. Version on the left, git hash on
+   the right. */
+.sidebar-version {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 11px;
+  /* Was rgba(255,255,255,0.3) = 2.98:1 on brand-anchor — failed
+   * AA for body text. Token resolves to rgba(...,0.7) = 5.72:1
+   * (defined in tokens-{light,dark}.css). Phase 6 a11y-audit
+   * round-2 fix. */
+  color: var(--color-on-brand-anchor-muted);
+  padding: 0 0 6px;
+  font-family: var(--font-mono, monospace);
+  letter-spacing: 0.02em;
+}
+.sidebar-version-hash {
+  /* Same token as the parent rule. The previous rgba(...,0.22)
+   * computed 2.45:1 — well below AA. Visual "dimmer than
+   * version number" hierarchy is lost; the version + hash now
+   * share contrast. If we need to recover the qualifier vs
+   * label distinction, do it with font-weight or italic
+   * instead of opacity. */
+  color: var(--color-on-brand-anchor-muted);
+}
+
+/* Phase 5 M-P1 piece D — theme selector at the sidebar footer.
+ * Three button row (System / Light / Dark) using emoji glyphs.
+ * The sidebar bg is the Ogre Brown brand stripe (same in light
+ * and dark) so the buttons need their own contrast scheme rather
+ * than consuming --color-surface (which is theme-aware). Pressed
+ * state uses --color-primary so the selected glyph reads
+ * unambiguously against the brand stripe. */
+.theme-selector {
+  /* Segmented theme picker on the Settings → Appearance surface.
+   * Three equal-width options (emoji over a short label); token-based
+   * so it tracks data-theme. (Moved off the Ogre-Brown sidebar in the
+   * account-menu step 2.) */
+  display: flex;
+  gap: var(--space-sm);
+  padding: 0;
+  max-width: 360px;
+}
+.theme-selector-btn {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  background: var(--color-mist);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 12px 8px;
+  font-size: 0.85rem;
+  cursor: pointer;
+  color: var(--color-text);
+}
+.theme-selector-emoji {
+  font-size: 20px;
+  line-height: 1;
+}
+.theme-selector-btn:hover {
+  border-color: var(--color-primary);
+}
+.theme-selector-btn.selected {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: var(--color-on-primary);
+}
+
+/* M-P2 piece 3 locale selector — native <select> for keyboard
+ * a11y and zero custom-dropdown plumbing. Token-based since the
+ * selector moved onto the light/dark settings surface (account-menu
+ * step 2); the tokens track data-theme for correct contrast in both
+ * themes. */
+.locale-selector {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+}
+.locale-selector-label {
+  font-size: 14px;
+  /* The globe emoji + the select line up baseline-wise more
+   * naturally with a small horizontal nudge — the select has
+   * native padding the label doesn't. */
+  padding-inline-start: 2px;
+  color: var(--color-text);
+}
+.locale-selector-select {
+  flex: 0 1 auto;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 4px 6px;
+  font-size: 13px;
+  color: var(--color-text);
+  cursor: pointer;
+}
+.locale-selector-select:hover {
+  background: var(--color-mist);
+}
+.locale-selector-select:focus {
+  outline: 1px solid var(--color-focus-outline);
+  outline-offset: 1px;
+}
+
+/* History pane: right-side panel listing every snapshot of the
+   document, with an attributed diff for the selected version below.
+   Always rendered so transitions can fire; hidden until `.is-open`. */
+.history-pane {
+  width: 320px;
+  min-width: 280px;
+  border-inline-start: 1px solid var(--color-border);
+  flex-direction: column;
+  flex-shrink: 0;
+  background: var(--color-bg);
+  font-size: 13px;
+  display: none;
+  overflow: hidden;
+}
+.history-pane.is-open {
+  display: flex;
+}
+.history-header {
+  padding: var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+  font-weight: 600;
+}
+.history-versions {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-sm);
+}
+.history-loading,
+.history-empty {
+  padding: var(--space-md);
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+}
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.history-version-item {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 10px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.history-version-item:hover {
+  background: var(--color-bg-secondary);
+}
+.history-version-item.selected {
+  background: var(--color-accent-soft, rgba(10, 132, 255, 0.12));
+}
+.history-version-num {
+  font-weight: 600;
+}
+.history-version-time {
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+}
+/* Diff popup: opens centered when a version is clicked. */
+.history-diff-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.history-diff-modal {
+  background: var(--color-bg);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  width: 720px;
+  max-width: 92vw;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+}
+.history-diff-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--space-md) var(--space-lg);
+  border-bottom: 1px solid var(--color-border);
+}
+.history-diff-version {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.history-diff-label {
+  font-weight: 600;
+  font-size: 14px;
+}
+.history-diff-attribution {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
+.history-modal-close {
+  background: none;
+  border: none;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  padding: 4px 8px;
+}
+.history-modal-close:hover {
+  color: var(--color-text);
+}
+.history-diff-modal-body {
+  padding: var(--space-md) var(--space-lg);
+  overflow-y: auto;
+  flex: 1;
+}
+.history-diff-empty {
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  padding: var(--space-md) 0;
+}
+.history-diff-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-sm);
+  padding: var(--space-md) var(--space-lg);
+  border-top: 1px solid var(--color-border);
+}
+.history-restore-error {
+  color: var(--color-danger, #c33);
+  font-size: 12px;
+  padding: var(--space-sm) 0 0;
+}
+/* Diff cards: one per DiffEntry inside the diff modal body. Left gutter
+   color signals add/remove/modify/deleted. Header carries the node-type
+   label and the jump-to-block button; body holds the rendered RichBlocks. */
+.diff-card {
+  border: 1px solid var(--color-border);
+  border-inline-start-width: 4px;
+  border-radius: 4px;
+  padding: 8px var(--space-md);
+  margin-bottom: var(--space-md);
+  background: var(--color-bg);
+}
+.diff-card--added {
+  border-inline-start-color: var(--color-success);
+  background: rgba(46, 139, 61, 0.04);
+}
+.diff-card--removed {
+  border-inline-start-color: var(--color-error);
+  background: rgba(195, 65, 65, 0.04);
+}
+.diff-card--modified {
+  border-inline-start-color: var(--color-warning);
+  background: rgba(212, 155, 26, 0.04);
+}
+.diff-card--deleted {
+  border-inline-start-color: var(--color-text-tertiary, #888);
+  background: rgba(120, 120, 120, 0.05);
+  opacity: 0.85;
+}
+.diff-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+.diff-card-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.diff-card-jump {
+  font-size: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  background: var(--color-bg-secondary);
+  cursor: pointer;
+  color: var(--color-text-secondary);
+}
+.diff-card-jump:hover {
+  background: var(--color-mist, var(--color-bg-secondary));
+  color: var(--color-text);
+}
+.diff-card-deleted {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  font-style: italic;
+}
+.diff-card-body {
+  font-size: 13px;
+  color: var(--color-text);
+}
+
+/* Modified entries stack old above new with a faint strikethrough on
+   the old block; the gutter classes nest inside .diff-card--modified. */
+.diff-block--old {
+  text-decoration: line-through;
+  text-decoration-color: rgba(195, 65, 65, 0.6);
+  opacity: 0.75;
+  margin-bottom: 4px;
+}
+.diff-block--new {
+  /* No extra styling — the parent card already carries the modified
+     amber gutter; the new block is the canonical "current" content. */
+}
+
+/* Per-block rendering inside a card. Reset the editor's heavy default
+   spacing so the modal feels compact, but keep semantic emphasis. */
+.diff-block {
+  margin: 0 0 4px 0;
+  line-height: 1.4;
+}
+.diff-block:last-child {
+  margin-bottom: 0;
+}
+.diff-block-item {
+  margin: 0 0 2px 0;
+}
+.diff-task-mark {
+  font-family: var(--font-mono, monospace);
+  margin-inline-end: 4px;
+  color: var(--color-text-tertiary);
+}
+.diff-block-code {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  /* Wrap long lines but allow horizontal scroll inside the parent
+     <pre> when a no-break run (e.g. a long URL) overflows. */
+  white-space: pre-wrap;
+}
+.diff-block-code,
+.diff-block:has(> .diff-block-code) {
+  overflow-x: auto;
+  max-width: 100%;
+}
+.diff-block.diff-table {
+  /* `display: block` on the table lets `overflow-x` work — without it
+     the table establishes its own block formatting context and won't
+     scroll. The inner <tbody>/<tr>/<td> retain native table layout. */
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+  border-collapse: collapse;
+}
+.diff-block-cell,
+.diff-block-cell-header {
+  border: 1px solid var(--color-border);
+  padding: 2px 6px;
+}
+.diff-block-cell-header {
+  background: var(--color-bg-secondary);
+  font-weight: 600;
+}
+.diff-image-placeholder {
+  display: inline-block;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  background: var(--color-bg-secondary);
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-style: italic;
+}
+
+/* Inline link mark: rendered as plain underlined text, no href. */
+.diff-link {
+  text-decoration: underline;
+  color: inherit;
+}
+
+/* ─── Admin console (Phase 4 M-E2) ───────────────────────────── */
+/* Functional table-based UI. Three pages share the same shell + nav. */
+
+.admin-shell {
+  padding: 24px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+.admin-nav {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  padding-bottom: 12px;
+  margin-bottom: 24px;
+  border-bottom: 1px solid var(--color-border);
+  font-size: 14px;
+}
+
+.admin-nav a {
+  text-decoration: none;
+  color: var(--color-text);
+}
+
+.admin-nav a:hover {
+  text-decoration: underline;
+}
+
+.admin-nav-sep {
+  color: var(--color-text-secondary);
+}
+
+.admin-loading {
+  padding: 48px;
+  text-align: center;
+  color: var(--color-text-secondary);
+}
+
+.admin-error {
+  background: var(--color-error-bg);
+  border: 1px solid var(--color-error-border);
+  color: var(--color-error-fg);
+  padding: 8px 12px;
+  border-radius: 4px;
+  margin: 12px 0;
+}
+
+.admin-search {
+  width: 320px;
+  padding: 6px 10px;
+  margin-bottom: 16px;
+  font-size: 14px;
+}
+
+.admin-users-table,
+.admin-metrics-table,
+.admin-audit-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.admin-users-table th,
+.admin-metrics-table th,
+.admin-audit-table th {
+  text-align: start;
+  padding: 8px;
+  background: var(--color-mist);
+  color: var(--color-text);
+  border-bottom: 2px solid var(--color-border);
+}
+
+.admin-users-table td,
+.admin-metrics-table td,
+.admin-audit-table td {
+  padding: 8px;
+  border-bottom: 1px solid var(--color-border);
+  vertical-align: top;
+}
+
+.admin-row-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.admin-row-actions button {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+
+.admin-pagination {
+  margin-top: 16px;
+  display: flex;
+  gap: 8px;
+}
+
+.admin-audit-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 16px;
+}
+
+.admin-audit-filters label {
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.admin-audit-filters input {
+  padding: 6px 8px;
+  font-size: 14px;
+  min-width: 180px;
+}
+
+/* Per-source row tint so the operator can distinguish admin actions
+ * from security events at a glance without inspecting the kind. */
+.admin-audit-admin td {
+  background: rgba(80, 120, 200, 0.04);
+}
+
+.admin-audit-security td {
+  background: rgba(200, 120, 80, 0.04);
+}
+
+.admin-audit-table code {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ─── MFA pages (Phase 4 M-E3 piece E) ───────────────────────── */
+/* Shared by /auth/mfa-enroll and /auth/mfa-challenge. Centered card
+ * with consistent typography; QR fills the upper half of the
+ * enroll card. */
+
+.mfa-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--color-bg);
+}
+
+.mfa-card {
+  width: 100%;
+  max-width: 420px;
+  padding: 32px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  box-shadow: 0 2px 16px rgba(0, 0, 0, 0.04);
+}
+
+.mfa-title {
+  font-size: 22px;
+  margin: 0 0 4px;
+}
+
+.mfa-subtitle {
+  font-size: 14px;
+  color: var(--color-text-secondary);
+  margin: 0 0 24px;
+}
+
+.mfa-error {
+  background: var(--color-error-bg);
+  border: 1px solid var(--color-error-border);
+  color: var(--color-error-fg);
+  padding: 8px 12px;
+  border-radius: 4px;
+  margin: 12px 0;
+  font-size: 13px;
+}
+
+.mfa-success {
+  background: var(--color-success-bg);
+  border: 1px solid var(--color-success-border);
+  color: var(--color-success-fg);
+  padding: 8px 12px;
+  border-radius: 4px;
+  margin: 12px 0;
+  font-size: 13px;
+}
+
+/* QR code is rendered as inline SVG — `inner_html=svg` on a div.
+ * The SVG carries its own viewBox so we constrain via the container. */
+.mfa-qr {
+  margin: 16px auto;
+  width: 240px;
+  height: 240px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mfa-qr svg {
+  width: 100%;
+  height: 100%;
+}
+
+.mfa-secret {
+  margin: 16px 0;
+  padding: 12px;
+  background: var(--color-mist);
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.mfa-secret-label {
+  color: var(--color-text-secondary);
+  margin-bottom: 4px;
+}
+
+.mfa-secret-value {
+  font-family: var(--font-mono, monospace);
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.mfa-recovery {
+  margin: 16px 0;
+  padding: 12px;
+  background: var(--color-warning-bg);
+  border: 1px solid var(--color-warning-border);
+  border-radius: 4px;
+}
+
+.mfa-recovery summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.mfa-recovery-warning {
+  font-size: 12px;
+  color: var(--color-warning-fg);
+  margin: 8px 0;
+}
+
+.mfa-recovery-list {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.mfa-recovery-list code {
+  font-family: var(--font-mono, monospace);
+  font-size: 13px;
+  background: var(--color-surface);
+  padding: 4px 8px;
+  border-radius: 3px;
+}
+
+.mfa-verify {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 24px;
+}
+
+.mfa-verify label {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+
+.mfa-verify input {
+  font-size: 18px;
+  padding: 10px;
+  text-align: center;
+  letter-spacing: 0.2em;
+  font-family: var(--font-mono, monospace);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+}
+
+.mfa-verify-btn {
+  padding: 10px 16px;
+  background: var(--color-primary);
+  color: var(--color-on-primary);
+  border: none;
+  border-radius: 4px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.mfa-verify-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.mfa-fallback-link {
+  background: none;
+  border: none;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+  margin-top: 16px;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 0;
+}
+
+/* ─── Workspace SAML config (Phase 4 M-E4 piece E) ───────────── */
+
+.workspace-saml-page {
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  padding: 32px;
+  background: var(--color-bg);
+}
+
+.workspace-saml-card {
+  width: 100%;
+  max-width: 720px;
+  padding: 24px 32px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+}
+
+.workspace-saml-card h1 {
+  font-size: 22px;
+  margin: 0 0 4px;
+}
+
+.workspace-saml-subtitle {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  margin: 0 0 20px;
+}
+
+.workspace-saml-subtitle code {
+  font-family: var(--font-mono, monospace);
+  background: var(--color-mist);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+.workspace-saml-error {
+  background: var(--color-error-bg);
+  border: 1px solid var(--color-error-border);
+  color: var(--color-error-fg);
+  padding: 8px 12px;
+  border-radius: 4px;
+  margin: 12px 0;
+  font-size: 13px;
+}
+
+.workspace-saml-status {
+  background: var(--color-success-bg);
+  border: 1px solid var(--color-success-border);
+  color: var(--color-success-fg);
+  padding: 8px 12px;
+  border-radius: 4px;
+  margin: 12px 0;
+  font-size: 13px;
+}
+
+.workspace-saml-section {
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-border);
+}
+
+.workspace-saml-section h2 {
+  font-size: 15px;
+  margin: 0 0 4px;
+}
+
+.workspace-saml-help {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  margin: 0 0 12px;
+}
+
+.workspace-saml-url-row {
+  display: flex;
+  gap: 8px;
+}
+
+.workspace-saml-sp-url {
+  flex: 1;
+  padding: 8px;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-mist);
+}
+
+.workspace-saml-section label {
+  display: block;
+  margin-top: 12px;
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.workspace-saml-section input[type="text"] {
+  width: 100%;
+  padding: 8px;
+  font-size: 13px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  box-sizing: border-box;
+}
+
+.workspace-saml-section textarea {
+  width: 100%;
+  padding: 8px;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  box-sizing: border-box;
+  resize: vertical;
+}
+
+.workspace-saml-attrs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  column-gap: 12px;
+}
+
+.workspace-saml-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.workspace-saml-save {
+  padding: 8px 14px;
+  background: var(--color-primary);
+  color: var(--color-on-primary);
+  border: none;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.workspace-saml-delete {
+  padding: 8px 14px;
+  background: var(--color-error-bg);
+  color: var(--color-error-fg);
+  border: 1px solid var(--color-error-border);
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.workspace-saml-save:disabled,
+.workspace-saml-delete:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.workspace-saml-meta {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+/* ─── SCIM Tokens page (Phase 4 M-E5 piece F) ──────────── */
+
+.workspace-scim-page {
+  padding: 24px;
+  max-width: 980px;
+  margin: 0 auto;
+}
+
+.workspace-scim-card {
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border, #ddd);
+  border-radius: 8px;
+  padding: 24px;
+}
+
+.workspace-scim-card h1 {
+  margin: 0 0 8px;
+}
+
+.workspace-scim-subtitle {
+  color: var(--color-text-secondary);
+  margin: 0 0 24px;
+}
+
+.workspace-scim-section {
+  margin: 24px 0;
+}
+
+.workspace-scim-section h2 {
+  font-size: 1.1em;
+  margin: 0 0 8px;
+}
+
+.workspace-scim-section h2 + p,
+.workspace-scim-help {
+  color: var(--color-text-secondary);
+  margin: 0 0 12px;
+  font-size: 0.92em;
+}
+
+.workspace-scim-base-url,
+.workspace-scim-fresh-input {
+  width: 100%;
+  padding: 8px 10px;
+  font-family: monospace;
+  font-size: 0.92em;
+  border: 1px solid var(--border, #ccc);
+  border-radius: 4px;
+  background: var(--bg-elev-0, #f7f7f7);
+}
+
+.workspace-scim-fresh {
+  background: var(--color-warning-bg);
+  border: 1px solid var(--color-warning-border);
+  border-radius: 6px;
+  padding: 16px;
+  margin: 16px 0;
+}
+
+.workspace-scim-fresh h3 {
+  margin: 0 0 4px;
+  color: var(--color-warning-fg);
+}
+
+.workspace-scim-fresh-warning {
+  color: var(--color-warning-fg);
+  font-weight: 600;
+  margin: 0 0 12px;
+}
+
+.workspace-scim-fresh-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.workspace-scim-fresh-row .workspace-scim-fresh-input {
+  flex: 1;
+  background: var(--color-surface);
+}
+
+.workspace-scim-create-row {
+  display: flex;
+  gap: 8px;
+}
+
+.workspace-scim-create-row input[type="text"] {
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid var(--border, #ccc);
+  border-radius: 4px;
+}
+
+.workspace-scim-create {
+  padding: 8px 16px;
+}
+
+.workspace-scim-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92em;
+}
+
+.workspace-scim-table th,
+.workspace-scim-table td {
+  border-bottom: 1px solid var(--border, #eee);
+  padding: 8px 10px;
+  text-align: start;
+}
+
+.workspace-scim-table tr.workspace-scim-revoked {
+  color: var(--color-text-secondary);
+}
+
+.workspace-scim-revoke {
+  font-size: 0.85em;
+  padding: 4px 10px;
+}
+
+.workspace-scim-empty {
+  color: var(--color-text-secondary);
+  font-style: italic;
+}
+
+.workspace-scim-error {
+  background: var(--color-error-bg);
+  border: 1px solid var(--color-error-border);
+  color: var(--color-error-fg);
+  padding: 8px 12px;
+  border-radius: 4px;
+  margin-bottom: 16px;
+}
+
+/* ─── Sync indicator (Phase 5 M-P3 piece B) ─────────────────────
+ * Document-header pill flipping between Saved / Saving / Offline.
+ * Colors source from the M-P1 status-trio tokens so dark mode
+ * Just Works via tokens-dark.css. Reduced-motion users get the
+ * static dot — no pulsing. */
+.sync-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 12px;
+  font-size: 12px;
+  line-height: 1.4;
+  user-select: none;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.sync-indicator-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+.sync-indicator.is-saved {
+  color: var(--color-success-fg);
+  background: var(--color-success-bg);
+  border-color: var(--color-success-border);
+}
+.sync-indicator.is-saved .sync-indicator-dot {
+  background: var(--color-success);
+}
+.sync-indicator.is-saving {
+  color: var(--color-warning-fg);
+  background: var(--color-warning-bg);
+  border-color: var(--color-warning-border);
+}
+.sync-indicator.is-saving .sync-indicator-dot {
+  background: var(--color-warning);
+  animation: sync-indicator-pulse 1.2s ease-in-out infinite;
+}
+.sync-indicator.is-offline {
+  color: var(--color-error-fg);
+  background: var(--color-error-bg);
+  border-color: var(--color-error-border);
+}
+.sync-indicator.is-offline .sync-indicator-dot {
+  background: var(--color-error);
+}
+@keyframes sync-indicator-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sync-indicator.is-saving .sync-indicator-dot {
+    animation: none;
+  }
+}
+
+/* ─── Home-page drop overlay (Phase 5 M-P5 piece D) ─────────────
+ * Full-page semi-opaque sheet that mounts while the user drags an
+ * importable file over the window. Pointer-events: none on the
+ * outer layer so child clicks would pass through, but the doc-
+ * level drop listener catches `drop` before any underlying element
+ * gets it. Centered card uses brand-primary as the "you're about
+ * to do something" cue. */
+.home-drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(45, 95, 45, 0.18);
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.home-drop-overlay-body {
+  background: var(--color-surface);
+  border: 2px dashed var(--color-primary);
+  border-radius: 12px;
+  padding: 36px 56px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.15);
+  text-align: center;
+  max-width: 480px;
+}
+.home-drop-overlay-icon {
+  font-size: 48px;
+  margin-bottom: 12px;
+}
+.home-drop-overlay-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--color-text);
+  margin-bottom: 6px;
+}
+.home-drop-overlay-hint {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+
+/* ─── Bulk selection bar (Phase 5 M-P7 piece C) ────────────────
+ * Fixed-position bar at the top of the home page viewport, shown
+ * only when the user has docs checked. The count + Cancel + Delete
+ * buttons sit centred. z-index sits below the search dialog (10000)
+ * but above the file browser. */
+.bulk-selection-bar {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  gap: var(--space-md, 12px);
+  padding: 8px 16px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 24px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14);
+}
+.bulk-selection-count {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+  padding-right: var(--space-sm, 8px);
+}
+
+.file-row-select {
+  width: 32px;
+  text-align: center;
+}
+.file-row-select input[type="checkbox"] {
+  cursor: pointer;
+}
+.file-list tr.is-selected {
+  background: var(--color-mist);
+}
+
+/* ─── Embed block (Phase 5 M-P6 piece B) ───────────────────────
+ * Sandboxed iframe wrapper inside the editor. The wrapper is
+ * contenteditable=false so the editor treats it as a single atom
+ * (selection lands on the wrapper, not the iframe content). The
+ * iframe itself rides with sandbox + lazy loading + no-referrer
+ * (see render_node in editor/view.rs). */
+.embed-block {
+  display: block;
+  margin: var(--space-md, 12px) 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md, 6px);
+  overflow: hidden;
+  background: var(--color-bg-subtle, transparent);
+}
+.embed-block iframe {
+  display: block;
+  border: none;
+  width: 100%;
+}
+
+/* ─── Calendar block (#136) — see design/live-app-blocks.md ────
+ * Native inline calendar. Non-editable wrapper (atom) so cursor
+ * navigation treats the whole block as one unit — same posture as
+ * `.embed-block`. Colour tokens reuse the app palette so dark/light
+ * theming just works. The six event colours use the existing
+ * text-color mark palette (--color-red / --color-blue etc.) so a
+ * new theme doesn't have to redefine them. */
+.calendar-block {
+  display: block;
+  margin: var(--space-md, 12px) 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md, 6px);
+  background: var(--color-bg-subtle, transparent);
+  font-size: 13px;
+}
+.calendar-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--color-border);
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.calendar-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+.calendar-view-toggles,
+.calendar-nav {
+  display: inline-flex;
+  gap: 4px;
+}
+.calendar-view-toggle,
+.calendar-nav-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--color-border);
+  background: transparent;
+  border-radius: var(--radius-sm, 4px);
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  text-transform: capitalize;
+}
+.calendar-view-toggle--active {
+  background: var(--color-accent, #2563eb);
+  color: var(--color-accent-fg, white);
+  border-color: var(--color-accent, #2563eb);
+}
+.calendar-banner {
+  padding: 6px 12px;
+  background: var(--color-warning-bg, #fef3c7);
+  color: var(--color-warning-fg, #92400e);
+  border-bottom: 1px solid var(--color-border);
+  font-size: 12px;
+}
+.calendar-body {
+  padding: 8px;
+}
+.calendar-month-grid {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.calendar-month-grid th {
+  padding: 6px 4px;
+  font-weight: 500;
+  text-align: center;
+  color: var(--color-fg-muted, #6b7280);
+  font-size: 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+.calendar-day {
+  vertical-align: top;
+  height: 88px;
+  padding: 4px;
+  border: 1px solid var(--color-border);
+  cursor: pointer;
+  position: relative;
+}
+.calendar-day:hover {
+  background: var(--color-hover, rgba(0, 0, 0, 0.04));
+}
+.calendar-day--other-month {
+  color: var(--color-fg-muted, #9ca3af);
+  background: var(--color-bg-subtle-2, rgba(0, 0, 0, 0.02));
+}
+.calendar-day--today .calendar-day-num {
+  background: var(--color-accent, #2563eb);
+  color: var(--color-accent-fg, white);
+  border-radius: 50%;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.calendar-day-num {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 500;
+  margin-bottom: 2px;
+}
+.calendar-event {
+  display: block;
+  padding: 2px 6px;
+  margin: 2px 0;
+  border-radius: 3px;
+  font-size: 11px;
+  color: white;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.calendar-event--red    { background: var(--color-red, #dc2626); }
+.calendar-event--orange { background: var(--color-orange, #ea580c); }
+.calendar-event--yellow { background: var(--color-yellow, #ca8a04); color: #1f2937; }
+.calendar-event--green  { background: var(--color-green, #16a34a); }
+.calendar-event--blue   { background: var(--color-blue, #2563eb); }
+.calendar-event--violet { background: var(--color-violet, #7c3aed); }
+
+/* ─── Calendar week / day time-grid views (#136) ────────────────
+ * Both views share the same time-axis + hour-cell shape; only the
+ * column count differs (7 for week, 1 for day). Layout:
+ *   - Header row: empty corner + day headers
+ *   - All-day band: label + one cell per day
+ *   - Body: time axis + one absolutely-positioned day column per day
+ *
+ * The day column uses `position: relative` so timed events (which
+ * have `position: absolute` + inline top/height) float on top of
+ * the click-target hour cells. Hour cells stay hit-testable
+ * because the event blocks are inset horizontally with margins. */
+.calendar-time-grid {
+  display: flex;
+  flex-direction: column;
+  --calendar-axis-width: 56px;
+}
+.calendar-time-grid--day {
+  --calendar-week-columns: 1;
+}
+.calendar-time-grid--week {
+  --calendar-week-columns: 7;
+}
+.calendar-week-headers,
+.calendar-week-allday,
+.calendar-week-body {
+  display: grid;
+  grid-template-columns: var(--calendar-axis-width) repeat(var(--calendar-week-columns), 1fr);
+}
+.calendar-week-headers {
+  border-bottom: 1px solid var(--color-border);
+}
+.calendar-week-day-header {
+  padding: 8px 6px;
+  text-align: center;
+  border-left: 1px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+}
+.calendar-week-day-header .day-name {
+  color: var(--color-fg-muted, #6b7280);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.calendar-week-day-header .day-num {
+  font-size: 18px;
+  font-weight: 600;
+}
+.calendar-week-day-header--today .day-num {
+  color: var(--color-accent, #2563eb);
+}
+.calendar-time-axis-corner {
+  /* Empty corner sitting over the time-axis column. */
+}
+.calendar-time-axis-header {
+  padding: 4px 6px;
+  font-size: 11px;
+  color: var(--color-fg-muted, #6b7280);
+  text-align: right;
+  border-right: 1px solid var(--color-border);
+}
+.calendar-week-allday {
+  border-bottom: 1px solid var(--color-border);
+  min-height: 32px;
+}
+.calendar-week-allday-cell {
+  border-left: 1px solid var(--color-border);
+  padding: 2px 4px;
+  cursor: pointer;
+  min-height: 32px;
+}
+.calendar-week-allday-cell:hover {
+  background: var(--color-hover, rgba(0, 0, 0, 0.04));
+}
+.calendar-week-body {
+  max-height: 640px;
+  overflow-y: auto;
+}
+.calendar-time-axis {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--color-border);
+}
+.calendar-time-label {
+  height: 40px;
+  padding: 2px 6px 0 0;
+  font-size: 10px;
+  color: var(--color-fg-muted, #6b7280);
+  text-align: right;
+  box-sizing: border-box;
+}
+.calendar-week-day-column {
+  position: relative;
+  border-left: 1px solid var(--color-border);
+}
+.calendar-hour-cell {
+  height: 40px;
+  box-sizing: border-box;
+  border-bottom: 1px solid var(--color-border);
+  cursor: pointer;
+}
+.calendar-hour-cell:hover {
+  background: var(--color-hover, rgba(0, 0, 0, 0.04));
+}
+.calendar-event--timed {
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  /* Intentionally no `color:` here — the base `.calendar-event`
+   * declares `color: white` and the per-color modifier (e.g.
+   * `.calendar-event--yellow` uses dark text) overrides. If we
+   * set `color: white` here, its equal-specificity/later-order
+   * would win against `--yellow` and yellow timed events would
+   * be white-on-yellow. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: grab;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+
+/* ─── Calendar drag interactions (#136) ─────────────────────────
+ * Resize handles are inset zones at the trailing edge of the
+ * draggable — right edge for all-day spans, bottom edge for
+ * timed blocks. They inherit pointer events (unlike the event
+ * body's `cursor: grab`) with cursors indicating the axis. */
+.calendar-event-resize {
+  position: absolute;
+  background: transparent;
+}
+.calendar-event-resize--x {
+  top: 0;
+  right: -2px;
+  width: 6px;
+  height: 100%;
+  cursor: ew-resize;
+}
+.calendar-event-resize--y {
+  left: 0;
+  right: 0;
+  bottom: -3px;
+  height: 6px;
+  cursor: ns-resize;
+}
+.calendar-event {
+  position: relative;
+}
+.calendar-event[data-calendar-draggable] {
+  cursor: grab;
+}
+.calendar-event--dragging {
+  opacity: 0.7;
+  cursor: grabbing !important;
+  z-index: 10;
+}
+.calendar-event--hidden-hit {
+  /* Temporarily removed from hit testing during pointerup so
+   * `document.elementFromPoint` returns the underlying day cell
+   * instead of the dragged element itself. */
+  pointer-events: none;
+}
+.calendar-event-label {
+  display: inline-block;
+  vertical-align: top;
+}
+
+/* Calendar event add/edit modal (#136). Reuses `.confirm-backdrop`
+ * for the overlay so backdrop click + Escape behavior match the
+ * rest of the app's dialogs. */
+.calendar-modal {
+  min-width: 380px;
+  max-width: 92vw;
+  background: var(--color-bg, white);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md, 8px);
+  padding: 0;
+  color: inherit;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.16);
+}
+.calendar-modal-body {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.calendar-modal-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+.calendar-modal-field > span,
+.calendar-modal-field > legend {
+  color: var(--color-fg-muted, #6b7280);
+  font-size: 12px;
+  font-weight: 500;
+}
+.calendar-modal-field input[type="text"],
+.calendar-modal-field input[type="date"],
+.calendar-modal-field input[type="time"] {
+  padding: 6px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 4px);
+  font: inherit;
+  color: inherit;
+  background: var(--color-bg, white);
+}
+.calendar-modal-allday {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.calendar-modal-color-field {
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+.calendar-modal-color-chips {
+  display: inline-flex;
+  gap: 6px;
+}
+.calendar-modal-color {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  padding: 0;
+}
+.calendar-modal-color--active {
+  border-color: var(--color-fg, black);
+  box-shadow: 0 0 0 2px var(--color-bg, white) inset;
+}
+.calendar-modal-datetime {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.calendar-modal-datetime > label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.calendar-modal-datetime > label > span {
+  min-width: 60px;
+  color: var(--color-fg-muted, #6b7280);
+}
+.calendar-modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--color-border);
+}
+.calendar-modal-spacer {
+  flex: 1;
+}
+
+/* ─── Kanban board (#137) — see design/live-app-blocks.md ──────
+ * Horizontal column strip; each column is a vertical card list.
+ * The block wrapper is contenteditable=false so the whole board
+ * behaves as an atom for cursor navigation. Cards inherit the
+ * six-hue palette Calendar established. */
+.kanban-block {
+  display: block;
+  margin: var(--space-md, 12px) 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md, 6px);
+  background: var(--color-bg-subtle, transparent);
+  padding: 8px;
+}
+.kanban-strip {
+  display: flex;
+  flex-direction: row;
+  gap: 12px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+  align-items: flex-start;
+}
+.kanban-column {
+  flex: 0 0 260px;
+  min-width: 240px;
+  max-width: 320px;
+  background: var(--color-bg, white);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 4px);
+  display: flex;
+  flex-direction: column;
+  max-height: 560px;
+  overflow: hidden;
+}
+.kanban-column-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-subtle-2, rgba(0, 0, 0, 0.02));
+}
+.kanban-column-title {
+  flex: 1;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: text;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.kanban-column-count {
+  font-size: 11px;
+  color: var(--color-fg-muted, #6b7280);
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: var(--color-hover, rgba(0, 0, 0, 0.06));
+}
+.kanban-column-count--full {
+  color: var(--color-warning-fg, #92400e);
+  background: var(--color-warning-bg, #fef3c7);
+}
+.kanban-column-menu {
+  padding: 0 4px;
+  background: transparent;
+  border: none;
+  color: var(--color-fg-muted, #9ca3af);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  border-radius: 3px;
+}
+.kanban-column-menu:hover {
+  color: var(--color-fg, black);
+  background: var(--color-hover, rgba(0, 0, 0, 0.06));
+}
+.kanban-card-list {
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 40px;
+}
+.kanban-card {
+  border-left: 3px solid var(--color-border);
+  border-radius: 3px;
+  background: var(--color-bg-subtle-2, rgba(0, 0, 0, 0.02));
+  padding: 6px 8px;
+  cursor: pointer;
+  font-size: 12px;
+  box-shadow: 0 1px 1px rgba(0, 0, 0, 0.05);
+  /* Positioning context for the top-right assignee chip. */
+  position: relative;
+  /* Reserve inline space at the top-right so long titles wrap
+     around the assignee circle instead of overlapping it. */
+  padding-right: 30px;
+}
+.kanban-card:hover {
+  background: var(--color-hover, rgba(0, 0, 0, 0.04));
+}
+.kanban-card-title {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.kanban-card-body {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--color-fg-muted, #6b7280);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.kanban-card--red    { border-left-color: var(--color-red, #dc2626); }
+.kanban-card--orange { border-left-color: var(--color-orange, #ea580c); }
+.kanban-card--yellow { border-left-color: var(--color-yellow, #ca8a04); }
+.kanban-card--green  { border-left-color: var(--color-green, #16a34a); }
+.kanban-card--blue   { border-left-color: var(--color-blue, #2563eb); }
+.kanban-card--violet { border-left-color: var(--color-violet, #7c3aed); }
+
+/* Phase 3 drag states. `--dragging` rides during the pointer
+   move; `--hidden-hit` is toggled around the elementFromPoint
+   call in the drop handler so the dragged card doesn't hit-test
+   over itself. Kept minimal on purpose — a fancier drop-slot
+   indicator is a follow-up. */
+.kanban-card--dragging {
+  opacity: 0.7;
+  cursor: grabbing;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+.kanban-card--hidden-hit {
+  pointer-events: none;
+}
+/* Ghost placeholder inserted at the source card's slot while a
+   drag is active. Holds the layout height so the source column
+   doesn't reflow when the card switches to position: fixed.
+   Renders as a subtle dashed outline so users can see where the
+   card came from. */
+.kanban-card-placeholder {
+  border: 1px dashed var(--color-border, #d1d5db);
+  border-radius: 3px;
+  background: var(--color-hover, rgba(0, 0, 0, 0.02));
+  box-sizing: border-box;
+}
+
+/* Column drag states (Phase 4a). Column becomes semi-transparent
+   while dragging. Placeholder mirrors card placeholder styling
+   at column proportions. Drag handle cursor lives on the header. */
+.kanban-column-header {
+  cursor: grab;
+}
+.kanban-column--dragging {
+  opacity: 0.7;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+.kanban-column-placeholder {
+  border: 1px dashed var(--color-border, #d1d5db);
+  border-radius: 4px;
+  background: var(--color-hover, rgba(0, 0, 0, 0.02));
+  flex: 0 0 260px;
+  min-width: 240px;
+  max-width: 320px;
+  box-sizing: border-box;
+}
+
+/* Drop indicator: distinguishes the LIVE drop-preview from the
+   source ghost. Same shape, brighter accent so the eye follows
+   it as it moves with the pointer. Absence of this element on
+   pointerup means the pointer wasn't over any valid target ->
+   drag cancels rather than committing at the last hover slot. */
+.kanban-drop-indicator {
+  border-color: var(--color-accent, #2563eb);
+  background: rgba(37, 99, 235, 0.08);
+}
+
+/* Phase 4b — labels row (chips at top of the card). */
+.kanban-card-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+.kanban-card-label {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--color-hover, rgba(0, 0, 0, 0.06));
+  color: var(--color-fg-muted, #4b5563);
+}
+.kanban-card-label--red    { background: rgba(220, 38, 38, 0.15); color: #991b1b; }
+.kanban-card-label--orange { background: rgba(234, 88, 12, 0.15); color: #9a3412; }
+.kanban-card-label--yellow { background: rgba(202, 138, 4, 0.15); color: #854d0e; }
+.kanban-card-label--green  { background: rgba(22, 163, 74, 0.15); color: #166534; }
+.kanban-card-label--blue   { background: rgba(37, 99, 235, 0.15); color: #1e40af; }
+.kanban-card-label--violet { background: rgba(124, 58, 237, 0.15); color: #5b21b6; }
+
+/* Phase 4b/4c — footer: due-date pill + assignee chip. */
+.kanban-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-top: 6px;
+}
+.kanban-card-due {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--color-hover, rgba(0, 0, 0, 0.05));
+  color: var(--color-fg-muted, #6b7280);
+}
+.kanban-card-due--overdue {
+  background: rgba(220, 38, 38, 0.15);
+  color: #991b1b;
+  font-weight: 600;
+}
+/* Assignee picker dropdown (Phase 4c). Renders below the input
+   when the search returns matches. Click a row → id + name are
+   filled in from that user; typing a fresh query clears any
+   previously-picked id so free-form text stays unresolved. */
+.kanban-modal-assignee-field {
+  position: relative;
+}
+.kanban-modal-user-picker {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg, white);
+  border-radius: 3px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  max-height: 200px;
+  overflow-y: auto;
+}
+.kanban-modal-user-picker-item {
+  display: block;
+  width: 100%;
+  padding: 6px 10px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  font-size: 12px;
+}
+.kanban-modal-user-picker-item:hover {
+  background: var(--color-hover, rgba(0, 0, 0, 0.05));
+}
+.kanban-modal-user-picker-name {
+  display: block;
+  font-weight: 500;
+}
+.kanban-modal-user-picker-email {
+  display: block;
+  color: var(--color-fg-muted, #6b7280);
+  font-size: 11px;
+}
+
+.kanban-card-assignee {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  font-size: 9px;
+  font-weight: 600;
+  background: var(--color-accent, #2563eb);
+  color: #fff;
+  /* Anchor to the card's top-right corner, matching the
+     avatar-badge idiom users expect from Jira / Trello etc. */
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  /* Above the card's cursor: pointer target but doesn't
+     eat the card click — parent's `edit-card` action is what
+     the click observer resolves. */
+  pointer-events: none;
+}
+/* Cards are leaf atoms in the model — the browser can't put a
+   caret inside them and the edit-card modal owns text mutation,
+   so native text selection during a drag is pure UX noise. Ban
+   it everywhere in the card subtree. The pointer-events wrapper
+   above only handles hit-testing; this handles selection.
+   Calendar events get the same treatment for the same reason
+   (the event modal owns mutation, drag shifts dates). */
+.kanban-card,
+.kanban-card *,
+.calendar-event,
+.calendar-event * {
+  user-select: none;
+  -webkit-user-select: none;
+}
+.kanban-add-card,
+.kanban-add-column {
+  padding: 6px 10px;
+  border: 1px dashed var(--color-border);
+  background: transparent;
+  border-radius: 3px;
+  font-size: 12px;
+  color: var(--color-fg-muted, #6b7280);
+  cursor: pointer;
+  margin: 6px;
+}
+.kanban-add-column {
+  flex: 0 0 220px;
+  align-self: stretch;
+  min-height: 40px;
+}
+.kanban-add-card:hover,
+.kanban-add-column:hover {
+  color: var(--color-fg, black);
+  border-color: var(--color-fg-muted, #6b7280);
+  background: var(--color-hover, rgba(0, 0, 0, 0.03));
+}
+
+/* Phase 2a Option A — LiveApp attribute-rejection toast.
+ * Fires when the server-side pre-apply gate refuses an update
+ * (an oversized attr, an unknown key, a malformed value). The
+ * user's local yrs still has the (invalid) write; this toast is
+ * the only in-session signal that the change didn't reach the
+ * server. Same visual shape as .home-import-error but scoped
+ * to the document page. */
+.collab-liveapp-toast {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: 99;
+  max-width: 360px;
+  padding: 10px 14px;
+  background: var(--color-error-bg);
+  border: 1px solid var(--color-error-border);
+  color: var(--color-error-fg);
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+/* Import error toast — pinned bottom-right of the viewport,
+ * clickable to dismiss. Sits on top of normal page chrome but
+ * below the search dialog (z-index: 10000) so a Ctrl+K still
+ * works while one is showing. */
+.home-import-error {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: 99;
+  max-width: 360px;
+  padding: 10px 14px;
+  background: var(--color-error-bg);
+  border: 1px solid var(--color-error-border);
+  color: var(--color-error-fg);
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+/* ─── Phase 5 M-P8 piece B: accessibility primitives ─────────────
+ * `.visually-hidden` is the standard SR-only utility — taken out
+ * of the visual flow but reachable by assistive tech. Don't use
+ * `display: none` for content meant to be read.
+ * `.skip-to-content` is the keyboard-only anchor at the very top
+ * of the App. Invisible until focused; revealing on focus is the
+ * WCAG-recommended pattern. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip-to-content {
+  position: absolute;
+  top: -40px;
+  left: 8px;
+  z-index: 100000;
+  padding: 8px 16px;
+  background: var(--color-bg);
+  color: var(--color-text);
+  border: 2px solid var(--color-accent);
+  border-radius: 4px;
+  text-decoration: none;
+  font-weight: 600;
+  transition: top 0.15s ease;
+}
+.skip-to-content:focus {
+  top: 8px;
+  outline: 3px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* ─── Phase 5 M-P8 piece E: prefers-reduced-motion ───────────────
+ * WCAG 2.3.3 (Animation from Interactions, AAA) and the more
+ * widely-honored SC 2.2.2 (Pause, Stop, Hide) ask that motion be
+ * suppressible. Browsers expose user intent via the
+ * `prefers-reduced-motion: reduce` media query. When set, we cut
+ * animations to a single short tick (not 0ms — that breaks
+ * transitionend handlers that rely on firing) and short-circuit
+ * any infinite-loop keyframes (sync-indicator pulse, etc.).
+ *
+ * Scope is global on purpose: every transition in the codebase
+ * should respect the user's choice. If a future component needs
+ * to override (e.g. a "click here to reveal" reveal that has no
+ * meaning without motion), it can re-introduce the transition
+ * inside the same media query — but that should be the rare
+ * exception, not the norm. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ─── Ask dialog (Phase 6 M-6.2 piece B) ─────────────────────────
+ * Reuses .search-backdrop and the .search-dialog/.search-input
+ * shape from the command palette for visual continuity; the
+ * .ask-* classes add the answer body, status row, source list,
+ * and the AI badge. */
+.ask-dialog {
+  /* Slightly taller than the palette since the answer can run
+   * for a few paragraphs. */
+  max-height: 70vh;
+}
+.ask-header {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: var(--space-sm) var(--space-lg) 0;
+}
+.ask-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--color-on-primary);
+  background: var(--color-primary);
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.ask-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-md) var(--space-lg) var(--space-lg);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+.ask-status {
+  font-size: 13px;
+  font-style: italic;
+  color: var(--color-text-secondary);
+  padding: var(--space-sm) var(--space-md);
+  background: var(--color-mist);
+  border-radius: var(--radius-sm);
+}
+.ask-error {
+  font-size: 14px;
+  color: var(--color-error-fg);
+  background: var(--color-error-bg);
+  border: 1px solid var(--color-error-border);
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-sm);
+}
+.ask-answer {
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--color-text);
+  white-space: pre-wrap;
+}
+.ask-sources {
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--space-md);
+}
+.ask-sources-heading {
+  margin: 0 0 var(--space-sm);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--color-text-secondary);
+}
+/* Piece C: numbered list, provider icon, citation index. The
+ * `list-style: none` strips the default ol marker because the
+ * `.ask-source-index` span renders the [1] / [2] prefix in a
+ * monospace style that's easier to align with the icon. */
+.ask-sources-list {
+  margin: 0;
+  padding-inline-start: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+.ask-source-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-xs);
+  font-size: 14px;
+}
+.ask-source-index {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  flex-shrink: 0;
+  min-width: 28px;
+}
+.ask-source-icon {
+  flex-shrink: 0;
+}
+.ask-source-link {
+  color: var(--color-link);
+  text-decoration: none;
+}
+.ask-source-link:hover {
+  text-decoration: underline;
+}
+.ask-hint {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  text-align: center;
+  padding: var(--space-lg);
+  line-height: 1.5;
+}
+.ask-spinner {
+  font-size: 18px;
+  color: var(--color-text-secondary);
+  animation: ask-spin 1.4s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes ask-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ─── Relationship panel (Phase 6 M-6.2 piece D) ────────────────
+ * Renders below the heading list inside the .document-outline
+ * drawer. Visual hierarchy intentionally lower than the heading
+ * list (smaller text, recessed bg) so the table of contents
+ * remains the primary scan target. */
+.relationship-panel {
+  border-top: 1px solid var(--color-border);
+  padding: var(--space-md) var(--space-md) 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+.relationship-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--color-text-secondary);
+}
+.relationship-add-btn {
+  background: transparent;
+  border: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+  border-radius: var(--radius-sm);
+  width: 22px;
+  height: 22px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+.relationship-add-btn:hover {
+  background: var(--color-mist);
+  color: var(--color-text);
+}
+.relationship-empty {
+  font-size: 13px;
+  color: var(--color-text-tertiary);
+  font-style: italic;
+}
+.relationship-error {
+  font-size: 12px;
+  color: var(--color-error-fg);
+  background: var(--color-error-bg);
+  border: 1px solid var(--color-error-border);
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+}
+.relationship-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+.relationship-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-xs);
+  font-size: 13px;
+}
+.relationship-type {
+  color: var(--color-text-secondary);
+  font-weight: 500;
+  flex-shrink: 0;
+}
+.relationship-arrow {
+  color: var(--color-text-tertiary);
+  flex-shrink: 0;
+}
+.relationship-link {
+  color: var(--color-link);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+.relationship-link:hover {
+  text-decoration: underline;
+}
+.relationship-remove-btn {
+  background: transparent;
+  border: none;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 4px;
+  flex-shrink: 0;
+}
+.relationship-remove-btn:hover {
+  color: var(--color-error-fg);
+}
+
+/* Inline picker: type dropdown + typeahead input + result list +
+ * action row. Sits in-place below the list to keep the
+ * interaction local to the panel — no second modal layer. */
+.relationship-picker {
+  background: var(--color-mist);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-sm);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+.relationship-picker-row {
+  display: flex;
+  gap: var(--space-xs);
+}
+.relationship-type-select,
+.relationship-picker-input {
+  width: 100%;
+  font-size: 13px;
+  padding: 6px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+.relationship-picker-results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 160px;
+  overflow-y: auto;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+.relationship-picker-result {
+  padding: 6px 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.relationship-picker-result:hover {
+  background: var(--color-mist);
+}
+.relationship-picker-result.is-selected {
+  background: var(--color-primary);
+  color: var(--color-on-primary);
+}
+.relationship-picker-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-xs);
+  margin-top: var(--space-xs);
+}
+
+/* ─── Account settings page (design/account-menu.md, step 1) ─────
+ * Tabbed shell: a vertical section list beside a content panel.
+ * Tabs collapse above the panel on narrow viewports. Uses the
+ * shared design tokens so it tracks light/dark automatically. */
+.settings-page {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: var(--space-lg) var(--space-md);
+}
+.settings-title {
+  font-size: 1.5rem;
+  margin: 0 0 var(--space-lg);
+  color: var(--color-text);
+}
+.settings-body {
+  display: flex;
+  gap: var(--space-lg);
+  align-items: flex-start;
+}
+.settings-tabs {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  flex: 0 0 200px;
+}
+.settings-tab {
+  text-align: start;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  padding: var(--space-sm) var(--space-md);
+  font-size: 0.95rem;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+}
+.settings-tab:hover {
+  background: var(--color-mist);
+  color: var(--color-text);
+}
+.settings-tab.selected {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: var(--color-on-primary);
+}
+.settings-panel {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-lg);
+}
+.settings-panel-title {
+  margin: 0 0 var(--space-md);
+  font-size: 1.15rem;
+  color: var(--color-text);
+}
+.settings-panel-muted {
+  color: var(--color-text-secondary);
+  margin: 0;
+}
+
+@media (max-width: 640px) {
+  .settings-body {
+    flex-direction: column;
+  }
+  .settings-tabs {
+    flex: 1 1 auto;
+    flex-direction: row;
+    flex-wrap: wrap;
+    width: 100%;
+  }
+}
+
+/* ─── Account settings — fields & toggles (account-menu step 2) ──
+ * Layout for the controls hosted inside .settings-panel: the
+ * Appearance theme/locale rows and the Accessibility checkboxes. */
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  margin-bottom: var(--space-lg);
+}
+.settings-field-label {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--color-text);
+}
+.settings-toggle-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+.settings-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-sm);
+  cursor: pointer;
+}
+.settings-toggle input[type="checkbox"] {
+  margin-top: 3px;
+  flex: 0 0 auto;
+}
+.settings-toggle-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.settings-toggle-label {
+  color: var(--color-text);
+}
+.settings-toggle-hint {
+  font-size: 0.85rem;
+  color: var(--color-text-secondary);
+}
+
+/* ─── Accessibility prefs applied as <html> attributes ──────────
+ * The settings UI writes data-reduce-motion / data-dyslexic on the
+ * document root (theme::apply_a11y_prefs). These rules give those
+ * attributes effect app-wide, independent of the OS-level
+ * prefers-reduced-motion media query (which still applies on its
+ * own, above). */
+[data-reduce-motion="true"] *,
+[data-reduce-motion="true"] *::before,
+[data-reduce-motion="true"] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
+
+/* Dyslexia-friendly typography. OpenDyslexic isn't bundled yet, so
+ * the stack degrades to widely-installed rounded faces that are
+ * recognized as more legible for dyslexic readers; dropping the
+ * OpenDyslexic web-font is a follow-up that needs no code change —
+ * it's first in the stack already. */
+[data-dyslexic="true"] {
+  --font-doc-body: "OpenDyslexic", "Comic Neue", "Comic Sans MS", sans-serif;
+}
+
+/* ─── Account menu (account-menu step 3) ────────────────────────
+ * Avatar-anchored hub in the sidebar footer. The trigger sits on
+ * the Ogre-Brown sidebar (on-brand-anchor text); the dropdown is a
+ * popover on the light/dark surface, anchored ABOVE the trigger
+ * (bottom: 100%) since the footer hugs the bottom of the viewport. */
+.account-menu {
+  position: relative;
+}
+.account-menu-trigger {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  width: 100%;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: var(--space-sm);
+  border-radius: var(--radius-md);
+  color: var(--color-on-brand-anchor);
+}
+.account-menu-trigger:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+.account-avatar {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.18);
+}
+.account-avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.account-avatar-initials {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-on-brand-anchor);
+}
+.account-menu-id {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+.account-menu-name {
+  max-width: 100%;
+  text-align: start;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+}
+.account-menu-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  font-size: 11px;
+  color: var(--color-on-brand-anchor-muted);
+}
+.account-menu-status-emoji {
+  flex: 0 0 auto;
+}
+.account-menu-status-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-menu-chevron {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--color-on-brand-anchor-muted);
+}
+.account-menu-dropdown {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+}
+.account-menu-identity {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-sm);
+  border-bottom: 1px solid var(--color-border);
+  margin-bottom: 2px;
+}
+.account-menu-identity-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-menu-identity-email {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-menu-item {
+  display: block;
+  width: 100%;
+  text-align: start;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: var(--space-sm);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  color: var(--color-text);
+}
+.account-menu-item:hover {
+  background: var(--color-mist);
+}
+.account-menu-item-danger {
+  color: var(--color-text-error);
+}
+
+/* ─── Settings — profile form (account-menu step 4) ─────────────
+ * Text inputs + the read-only email row + the save action row.
+ * Reuses the .settings-field column layout from step 2. */
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  max-width: 420px;
+}
+.settings-input {
+  padding: var(--space-sm);
+  font-size: 0.95rem;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+.settings-input:focus {
+  outline: 2px solid var(--color-focus-outline);
+  outline-offset: 1px;
+}
+.settings-readonly {
+  padding: var(--space-sm);
+  font-size: 0.95rem;
+  color: var(--color-text-secondary);
+  background: var(--color-mist);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.settings-form-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+}
+.settings-saved {
+  color: var(--color-success, #2E7D32);
+  font-size: 0.9rem;
+}
+.settings-error {
+  color: var(--color-text-error);
+  font-size: 0.9rem;
+}
+
+/* #29 BYOK key status row in the Profile tab. */
+.settings-byok-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  margin: 6px 0;
+}
+.settings-byok-active {
+  color: var(--color-success, #2E7D32);
+  font-size: 0.9rem;
+}
+
+/* ─── Status editor (account-menu step 5) ───────────────────────
+ * Emoji + text row in the Profile tab; reuses .settings-input. */
+.status-editor-row {
+  display: flex;
+  gap: var(--space-sm);
+}
+.status-emoji-input {
+  flex: 0 0 56px;
+  text-align: center;
+}
+.status-text-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* ─── Notification settings (account-menu step 6) ───────────────*/
+.settings-radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+.settings-radio {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  cursor: pointer;
+  color: var(--color-text);
+  font-size: 0.95rem;
+}
+
+/* ─── Help & Support (account-menu step 6) ──────────────────────*/
+.settings-subheading {
+  margin: var(--space-md) 0 var(--space-sm);
+  font-size: 1rem;
+  color: var(--color-text);
+}
+.settings-subheading:first-child {
+  margin-top: 0;
+}
+.settings-shortcuts {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+.settings-shortcut-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-md);
+}
+.settings-shortcut-row dt {
+  flex: 0 0 120px;
+  margin: 0;
+}
+.settings-shortcut-row dd {
+  margin: 0;
+  color: var(--color-text-secondary);
+}
+.settings-shortcuts kbd {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.85rem;
+  padding: 2px 6px;
+  background: var(--color-mist);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+}

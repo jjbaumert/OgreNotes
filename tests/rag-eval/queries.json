@@ -1,0 +1,185 @@
+{
+  "_comment": "Phase 6 M-6.3 piece A — 50-query eval set. Schema in src/lib.rs::EvalCatalog. Corpus is a fictional product-design knowledge base ('Lighthouse', a fake project-tracking product) chosen to be domain-recognizable without referencing real OgreNotes code. The 50 queries split 10 keyword / 15 semantic / 15 multi-hop / 10 gap-analysis per RAG plan §4.1.",
+  "corpus": [
+    {
+      "id": "auth-design",
+      "title": "Lighthouse Authentication Design",
+      "content": "# Authentication Design\n\nLighthouse uses OAuth 2.0 with PKCE for browser logins plus a short-lived JWT access token paired with an HttpOnly refresh-token cookie. The access token TTL is 15 minutes; refresh tokens rotate on every use and carry a 30-day idle window. MFA via TOTP is required for admin accounts; optional for everyone else."
+    },
+    {
+      "id": "session-mgmt",
+      "title": "Session Management",
+      "content": "# Session Management\n\nRefresh-token rotation happens on every /auth/refresh call. The server writes a new RefreshToken row tied to the previous one's family id; a stolen-then-replayed token mismatches the family and revokes the whole chain. Session expiry is silent — the SPA detects a 401 and bounces to login."
+    },
+    {
+      "id": "oauth-providers",
+      "title": "OAuth Provider Integration",
+      "content": "# OAuth Provider Integration\n\nLighthouse ships with Google and GitHub providers in v1. Each provider gets a separate client-id / client-secret pair stored in SSM Parameter Store; the OAuth callback handler resolves the provider by URL prefix. Token exchange is performed server-side with the access token never crossing the browser boundary."
+    },
+    {
+      "id": "mfa-totp",
+      "title": "MFA: TOTP Implementation",
+      "content": "# MFA: TOTP Implementation\n\nUsers enable TOTP via /auth/mfa/enroll, which returns a QR-code provisioning URI plus 10 recovery codes. The TOTP secret is stored encrypted at rest. Subsequent logins require both password and a 6-digit code; recovery codes are single-use and rate-limited at 5/minute."
+    },
+    {
+      "id": "user-model",
+      "title": "User Data Model",
+      "content": "# User Data Model\n\nUsers carry a stable user_id (UUID v4), email (unique within a workspace), display name, role enum (User / Admin), MFA enrolment state, and a home_folder_id. UI prefs (theme, locale, dyslexic_font flag) live in a separate UI_PREFS row. SCIM-provisioned users carry an external_id for the IdP round-trip."
+    },
+    {
+      "id": "permission-model",
+      "title": "Permission Model",
+      "content": "# Permission Model\n\nFour access levels: Own, Edit, Comment, View. Own is non-transferable in bulk (separate ownership-transfer endpoint required). Permissions are stored as Member rows pointing at folders; document-level access is computed from the folder chain plus per-doc share rows. Link-sharing produces a special 'public link' member row with a configurable expiry."
+    },
+    {
+      "id": "sharing-spec",
+      "title": "Document Sharing Specification",
+      "content": "# Document Sharing Specification\n\nDocuments can be shared by adding a Member row to the folder or directly to the doc. External link-sharing produces a short, signed URL that grants the configured access level without an account. Bulk-share supports up to 100 docs per call; rejects self-shares and Own-grants."
+    },
+    {
+      "id": "folder-model",
+      "title": "Folder & Hierarchy Model",
+      "content": "# Folder & Hierarchy Model\n\nEvery user gets a Home folder + a Trash folder at signup. Folders form a tree; a doc lives in exactly one folder. Breadcrumbs are computed by walking parent_id pointers. Bulk-move is supported up to 100 docs per call, atomic per id."
+    },
+    {
+      "id": "import-export",
+      "title": "Import / Export Formats",
+      "content": "# Import / Export Formats\n\nv1 supports synchronous import for Markdown, HTML, XLSX, and CSV; export for all four plus Markdown round-trips. HTML import runs through ammonia + html5ever sanitization. DOCX and PDF are deferred to v2 because both need the async-worker subsystem to handle the larger conversion latency budget."
+    },
+    {
+      "id": "embed-allowlist",
+      "title": "Embed URL Allowlist",
+      "content": "# Embed URL Allowlist\n\nFour providers in v1: YouTube, Vimeo, Loom, CodeSandbox. The allowlist matcher converts the user-visible URL to the canonical iframe URL (e.g. youtube.com/watch?v=X → youtube.com/embed/X). Per-workspace allowlist additions are a v2 carry-forward — today's allowlist is global."
+    },
+    {
+      "id": "spreadsheet-engine",
+      "title": "Spreadsheet Formula Engine",
+      "content": "# Spreadsheet Formula Engine\n\nThe engine ships with 400+ functions across nine categories: arithmetic, statistical, text, logical, date/time, lookup, financial, engineering, and information. Formula evaluation is iterative with a topological sort over the cell dependency graph; circular references resolve to the standard #REF! error."
+    },
+    {
+      "id": "pivot-tables",
+      "title": "Pivot Table Implementation",
+      "content": "# Pivot Table Implementation\n\nPivots support arbitrary row + column dimension nesting plus multi-aggregation values. The compute path operates on a snapshot of the source range; rebuilding the pivot is a single deterministic pass. Subtotals and grand totals render inline with the dimension hierarchy."
+    },
+    {
+      "id": "comments-model",
+      "title": "Comments & Threads",
+      "content": "# Comments & Threads\n\nComments anchor to block_ids (and cell ids in spreadsheets). Each thread is a list of messages with timestamps + author. Threads can resolve and reopen. Real-time fanout uses the same WebSocket channel the editor's CRDT updates flow through."
+    },
+    {
+      "id": "realtime-collab",
+      "title": "Real-time Collaboration",
+      "content": "# Real-time Collaboration\n\nDocuments use the yrs Rust port of Yjs as the CRDT backbone. Updates flow via WebSocket with a binary update protocol. Conflict resolution is automatic per CRDT semantics (last-writer-wins on attributes, structural merge on text). Snapshots persist every N updates to bound recovery time."
+    },
+    {
+      "id": "presence",
+      "title": "User Presence",
+      "content": "# User Presence\n\nEach connected user broadcasts a presence packet (cursor position, selection range, color) on every CRDT awareness update. The color palette is a fixed 16-entry list assigned deterministically by hash(user_id). Stale presence (no packet for 30 s) is gc'd from the awareness map."
+    },
+    {
+      "id": "notifications",
+      "title": "Notifications System",
+      "content": "# Notifications System\n\nActivity events (Edit, Comment, Share, Open, Restore, ResolveComment, Delete, Move) emit Notification rows to subscribed users. Three delivery channels: in-app feed (always), browser push (per-user pref), email digest (daily roll-up). Bulk operations should emit aggregate notifications rather than per-id rows — currently a known gap."
+    },
+    {
+      "id": "search-architecture",
+      "title": "Search Architecture",
+      "content": "# Search Architecture\n\nFull-text search uses Tantivy with a two-field schema (title 2x boost, body 1x). Indexing is fire-and-forget on every document mutation. The /search endpoint is permission-filtered with over-fetch — request 20 results, hide rows the user can't view, return up to the originally requested count."
+    },
+    {
+      "id": "rag-architecture",
+      "title": "RAG Architecture",
+      "content": "# RAG Architecture\n\nFour-layer system: Tantivy BM25 for keyword, Qdrant vectors for semantic, DynamoDB adjacency list for the knowledge graph, and a Claude tool-calling loop for the agent. Hybrid retrieval uses Reciprocal Rank Fusion (RRF) with default k=60. The agent picks tools based on a system prompt describing each tool's strengths."
+    },
+    {
+      "id": "mobile-design",
+      "title": "Mobile UX Design",
+      "content": "# Mobile UX Design\n\nv1 is responsive web + PWA install + offline indicator. Native iOS / Android are deferred to a future phase. Mobile-specific affordances: 44 px tap targets, drawer-style sidebar on narrow viewports, on-screen formula keyboard for spreadsheet cell editing, and a PWA app shell cached by the service worker (no API caching)."
+    },
+    {
+      "id": "perf-budgets",
+      "title": "Performance Budgets",
+      "content": "# Performance Budgets\n\nPer-route p95 SLAs codified in CloudWatch alarms. Auth: < 200 ms. Document list: < 300 ms. Search: < 500 ms. WebSocket handshake: < 400 ms. Front-end RUM samples 10% of sessions and POSTs vitals once at 1.5 s post-load. WASM bundle CI gate is set at 2 MiB gzipped (was aspirationally 850 KB; lifted to the as-shipped baseline)."
+    },
+    {
+      "id": "accessibility",
+      "title": "Accessibility Standards",
+      "content": "# Accessibility Standards\n\nThe product targets WCAG 2.1 Level AA. Focus traps + role=\"dialog\" + aria-modal on every modal. Live regions (status / alert) for transient state messages. Color contrast verified per design token pair; the contrast audit runs in CI via axe-core. prefers-reduced-motion respected globally via a single CSS media query."
+    },
+    {
+      "id": "i18n-arch",
+      "title": "Internationalization Architecture",
+      "content": "# Internationalization Architecture\n\nFluent (fluent-rs) is the translation harness. Catalogs live in frontend/locales/<locale>/main.ftl. Locale resolution chain: URL ?locale= → user's stored pref → navigator.language → en-US. RTL languages flip layout via logical CSS properties; Arabic ships as the v1 RTL pilot."
+    },
+    {
+      "id": "command-palette",
+      "title": "Command Palette Design",
+      "content": "# Command Palette Design\n\nCtrl+K opens the palette in Search mode; Ctrl+Shift+P opens it in Action mode. The action registry is a flat thread_local list. Ranking combines fuzzy match (SkimMatcherV2), scope bonus (+50 for matching the host page's scope), and MRU bonus (+100 decaying −5 per slot, persisted to localStorage)."
+    },
+    {
+      "id": "bulk-ops",
+      "title": "Bulk Operations Design",
+      "content": "# Bulk Operations Design\n\nFive endpoints: bulk delete / restore / move / share / export. Cap at 100 ids per call. Per-id authorization, no shortcuts. HTTP 207 Multi-Status on partial success; HTTP 200 on all-success. Same JSON body shape both ways so the client doesn't branch on status code to parse."
+    },
+    {
+      "id": "knowledge-graph",
+      "title": "Knowledge Graph Schema",
+      "content": "# Knowledge Graph Schema\n\nDocument relationships live in DynamoDB as adjacency-list rows: REL#<type>#<target_id> for the forward direction, RREL#<type>#<source_id> for the reverse. Five relation types: implements, derived-from, depends-on, references, supersedes. The agent's get_related tool queries this table; today's UI exposes outbound rels only."
+    }
+  ],
+  "queries": [
+    { "id": "kw-01", "category": "keyword", "text": "OAuth provider configuration", "expectedDocIds": ["oauth-providers"] },
+    { "id": "kw-02", "category": "keyword", "text": "TOTP MFA enrolment", "expectedDocIds": ["mfa-totp"] },
+    { "id": "kw-03", "category": "keyword", "text": "pivot table dimensions", "expectedDocIds": ["pivot-tables"] },
+    { "id": "kw-04", "category": "keyword", "text": "WCAG 2.1 conformance", "expectedDocIds": ["accessibility"] },
+    { "id": "kw-05", "category": "keyword", "text": "Fluent translation harness", "expectedDocIds": ["i18n-arch"] },
+    { "id": "kw-06", "category": "keyword", "text": "Tantivy BM25", "expectedDocIds": ["search-architecture"] },
+    { "id": "kw-07", "category": "keyword", "text": "yrs CRDT collaboration", "expectedDocIds": ["realtime-collab"] },
+    { "id": "kw-08", "category": "keyword", "text": "Qdrant vector store", "expectedDocIds": ["rag-architecture"] },
+    { "id": "kw-09", "category": "keyword", "text": "Reciprocal Rank Fusion", "expectedDocIds": ["rag-architecture"] },
+    { "id": "kw-10", "category": "keyword", "text": "WASM bundle size budget", "expectedDocIds": ["perf-budgets"] },
+
+    { "id": "sem-01", "category": "semantic", "text": "How does the app remember who is logged in across browser restarts?", "expectedDocIds": ["session-mgmt", "auth-design"] },
+    { "id": "sem-02", "category": "semantic", "text": "What controls collaborative editing conflicts when two people type in the same paragraph?", "expectedDocIds": ["realtime-collab"] },
+    { "id": "sem-03", "category": "semantic", "text": "How are full-text searches across many documents organized internally?", "expectedDocIds": ["search-architecture"] },
+    { "id": "sem-04", "category": "semantic", "text": "How do I see which other people are currently looking at a document?", "expectedDocIds": ["presence"] },
+    { "id": "sem-05", "category": "semantic", "text": "What languages can the editor be displayed in?", "expectedDocIds": ["i18n-arch"] },
+    { "id": "sem-06", "category": "semantic", "text": "How are alerts about activity surfaced to users?", "expectedDocIds": ["notifications"] },
+    { "id": "sem-07", "category": "semantic", "text": "Can someone view a document without having an account first?", "expectedDocIds": ["sharing-spec"] },
+    { "id": "sem-08", "category": "semantic", "text": "What latency budgets are documented for the system?", "expectedDocIds": ["perf-budgets"] },
+    { "id": "sem-09", "category": "semantic", "text": "How does the system answer natural-language questions about my notes?", "expectedDocIds": ["rag-architecture"] },
+    { "id": "sem-10", "category": "semantic", "text": "What's the keystroke for finding a document quickly?", "expectedDocIds": ["command-palette"] },
+    { "id": "sem-11", "category": "semantic", "text": "Can I delete many documents in one operation?", "expectedDocIds": ["bulk-ops"] },
+    { "id": "sem-12", "category": "semantic", "text": "Is there a phone version of the app?", "expectedDocIds": ["mobile-design"] },
+    { "id": "sem-13", "category": "semantic", "text": "Where can I learn about the file formats supported for upload?", "expectedDocIds": ["import-export"] },
+    { "id": "sem-14", "category": "semantic", "text": "How do user-color cursor indicators get their colors?", "expectedDocIds": ["presence"] },
+    { "id": "sem-15", "category": "semantic", "text": "What does the comments feature anchor itself to?", "expectedDocIds": ["comments-model"] },
+
+    { "id": "mh-01", "category": "multi-hop", "text": "What three documents would I read to understand the OAuth flow end-to-end?", "expectedDocIds": ["oauth-providers", "auth-design", "session-mgmt"] },
+    { "id": "mh-02", "category": "multi-hop", "text": "Show me everything related to folder hierarchy and sharing together", "expectedDocIds": ["folder-model", "sharing-spec"] },
+    { "id": "mh-03", "category": "multi-hop", "text": "Which docs cover both real-time collaboration and presence?", "expectedDocIds": ["realtime-collab", "presence"] },
+    { "id": "mh-04", "category": "multi-hop", "text": "What's the connection between spreadsheets and pivot tables?", "expectedDocIds": ["spreadsheet-engine", "pivot-tables"] },
+    { "id": "mh-05", "category": "multi-hop", "text": "What's needed to import a markdown file that contains embedded YouTube videos?", "expectedDocIds": ["import-export", "embed-allowlist"] },
+    { "id": "mh-06", "category": "multi-hop", "text": "Why might search results depend on the user's language preference?", "expectedDocIds": ["search-architecture", "i18n-arch"] },
+    { "id": "mh-07", "category": "multi-hop", "text": "What does the comments system need from the collaborative editing layer?", "expectedDocIds": ["comments-model", "realtime-collab"] },
+    { "id": "mh-08", "category": "multi-hop", "text": "Which design touches both mobile UX and the on-screen keyboard?", "expectedDocIds": ["mobile-design"] },
+    { "id": "mh-09", "category": "multi-hop", "text": "What docs define how the shared-with-me view works?", "expectedDocIds": ["folder-model", "sharing-spec"] },
+    { "id": "mh-10", "category": "multi-hop", "text": "How does the activity feed know about bulk operations?", "expectedDocIds": ["notifications", "bulk-ops"] },
+    { "id": "mh-11", "category": "multi-hop", "text": "Trace the full path from a user signing up to having edit access to documents", "expectedDocIds": ["auth-design", "oauth-providers", "user-model", "permission-model"] },
+    { "id": "mh-12", "category": "multi-hop", "text": "What's the relationship between the knowledge graph and the RAG agent's tools?", "expectedDocIds": ["knowledge-graph", "rag-architecture"] },
+    { "id": "mh-13", "category": "multi-hop", "text": "Which documents discuss CRDT-related conflict resolution?", "expectedDocIds": ["realtime-collab"] },
+    { "id": "mh-14", "category": "multi-hop", "text": "What docs together describe the full permission story for a single document?", "expectedDocIds": ["permission-model", "sharing-spec", "folder-model"] },
+    { "id": "mh-15", "category": "multi-hop", "text": "How does the accessibility design intersect with the i18n architecture?", "expectedDocIds": ["accessibility", "i18n-arch"] },
+
+    { "id": "gap-01", "category": "gap-analysis", "text": "What does the corpus say about Slack integration?", "expectedDocIds": [] },
+    { "id": "gap-02", "category": "gap-analysis", "text": "Which document covers iOS native app development?", "expectedDocIds": [] },
+    { "id": "gap-03", "category": "gap-analysis", "text": "Where is the DOCX import/export specification?", "expectedDocIds": [] },
+    { "id": "gap-04", "category": "gap-analysis", "text": "How is video calling handled in the product?", "expectedDocIds": [] },
+    { "id": "gap-05", "category": "gap-analysis", "text": "What's the LDAP / Active Directory auth bridge design?", "expectedDocIds": [] },
+    { "id": "gap-06", "category": "gap-analysis", "text": "Which doc covers the marketplace for embedded apps?", "expectedDocIds": [] },
+    { "id": "gap-07", "category": "gap-analysis", "text": "How is offline editing supported on desktop?", "expectedDocIds": [] },
+    { "id": "gap-08", "category": "gap-analysis", "text": "What's the LightRAG framework integration design?", "expectedDocIds": [] },
+    { "id": "gap-09", "category": "gap-analysis", "text": "Where is the PDF export pipeline documented?", "expectedDocIds": [] },
+    { "id": "gap-10", "category": "gap-analysis", "text": "How does the system handle E2E encryption of document content at rest?", "expectedDocIds": [] }
+  ]
+}
