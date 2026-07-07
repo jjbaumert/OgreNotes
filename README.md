@@ -13,6 +13,8 @@ crates/
   embeddings/      Vector embedding pipeline (Bedrock Titan + Qdrant)
   storage/         DynamoDB + S3 repositories, data models
   auth/            OAuth2, JWT, session management
+  notify/          Email notification delivery (preferences, templates, background send)
+  worker/          Async job queue (Redis streams) — background imports & long-running jobs
   common/          Shared config, ID generation, time utilities
 ```
 

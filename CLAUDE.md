@@ -2,7 +2,7 @@
 
 OgreNotes is a clean-room collaborative document/spreadsheet/chat
 platform written in Rust. The repository is a Cargo workspace of
-eight backend crates plus a separate Leptos/WASM frontend.
+nine backend crates plus a separate Leptos/WASM frontend.
 
 ## Where the canonical specs live
 
