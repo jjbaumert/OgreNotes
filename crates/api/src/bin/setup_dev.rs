@@ -29,7 +29,15 @@ async fn main() {
         .await;
 
     let dynamo = aws_sdk_dynamodb::Client::new(&aws_config);
-    let s3 = aws_sdk_s3::Client::new(&aws_config);
+    // Path-style for a custom endpoint (MinIO); real AWS S3 keeps
+    // virtual-host. Mirrors the gate in api/src/main.rs.
+    let s3 = {
+        let mut b = aws_sdk_s3::config::Builder::from(&aws_config);
+        if std::env::var("AWS_ENDPOINT_URL_S3").is_ok() {
+            b = b.force_path_style(true);
+        }
+        aws_sdk_s3::Client::from_conf(b.build())
+    };
 
     // Create DynamoDB table
     match dynamo

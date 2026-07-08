@@ -69,7 +69,18 @@ async fn main() {
         .await;
 
     let dynamo_client = aws_sdk_dynamodb::Client::new(&aws_config);
-    let s3_client = aws_sdk_s3::Client::new(&aws_config);
+    // Path-style addressing is required for local S3-compatible stores
+    // (MinIO) reached via a custom endpoint; they don't support the
+    // virtual-host `<bucket>.host` form. Gate on AWS_ENDPOINT_URL_S3 so
+    // production (real AWS S3, no custom endpoint) keeps the default
+    // virtual-host addressing untouched.
+    let s3_client = {
+        let mut b = aws_sdk_s3::config::Builder::from(&aws_config);
+        if std::env::var("AWS_ENDPOINT_URL_S3").is_ok() {
+            b = b.force_path_style(true);
+        }
+        aws_sdk_s3::Client::from_conf(b.build())
+    };
 
     let dynamo = DynamoClient::new(dynamo_client, config.table_name());
     let s3 = S3Client::new(s3_client, config.s3_bucket.clone());
