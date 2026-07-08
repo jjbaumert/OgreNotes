@@ -283,6 +283,7 @@ impl TestApp {
             anthropic_model: "claude-sonnet-4-6".into(),
             admin_emails,
             dev_mode: true,
+            embed_youtube_nocookie: true,
             deploy_env: "test".into(),
             email_enabled: false,
             email_from_address: String::new(),

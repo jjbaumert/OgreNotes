@@ -2164,11 +2164,18 @@ async fn resolve_embed(
     // setting we'll thread the per-workspace allowlist in here.
     let allowed: std::collections::HashSet<String> = std::collections::HashSet::new();
     match crate::embed_allowlist::validate_url(&req.url, &allowed) {
-        Ok((provider, src)) => Ok(Json(ResolveEmbedResponse {
-            height: provider.default_height(),
-            provider: provider.to_attr(),
-            src,
-        })),
+        Ok((provider, src)) => {
+            let src = crate::embed_allowlist::apply_privacy(
+                &provider,
+                src,
+                state.config.embed_youtube_nocookie,
+            );
+            Ok(Json(ResolveEmbedResponse {
+                height: provider.default_height(),
+                provider: provider.to_attr(),
+                src,
+            }))
+        }
         Err(crate::embed_allowlist::EmbedRejection::NotHttps) => Err(ApiError::BadRequest(
             "embed URL must use https://".to_string(),
         )),

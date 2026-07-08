@@ -1271,7 +1271,10 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                     // third-party content, not the editor's selection.
                     // The wrapper carries `contenteditable="false"`;
                     // the iframe itself rides with sandbox + lazy
-                    // loading + no-referrer. Height is clamped at
+                    // loading + `strict-origin-when-cross-origin`
+                    // (sends only our origin, not the document path —
+                    // `no-referrer` broke YouTube, which validates the
+                    // embedding origin: Error 153). Height is clamped at
                     // render-time (200..1200 px); missing attributes
                     // fall through to provider-agnostic defaults.
                     let wrapper = doc.create_element("div").ok()?;
@@ -1289,7 +1292,9 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                     iframe
                         .set_attribute("sandbox", "allow-scripts allow-same-origin")
                         .ok()?;
-                    iframe.set_attribute("referrerpolicy", "no-referrer").ok()?;
+                    iframe
+                        .set_attribute("referrerpolicy", "strict-origin-when-cross-origin")
+                        .ok()?;
                     iframe.set_attribute("loading", "lazy").ok()?;
                     iframe.set_attribute("frameborder", "0").ok()?;
                     iframe.set_attribute("width", "100%").ok()?;

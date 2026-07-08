@@ -154,6 +154,29 @@ pub fn validate_url(
     Err(EmbedRejection::UnknownProvider)
 }
 
+/// Apply privacy-preserving host rewrites to an already-validated
+/// embed `src`. Currently: when `youtube_nocookie` is set, a YouTube
+/// embed is moved to `youtube-nocookie.com` (YouTube's privacy-enhanced
+/// mode — no cookies set until the viewer plays). No-op for other
+/// providers or when disabled. Kept separate from `validate_url` so the
+/// security-critical allowlist logic (and its tests) stay untouched;
+/// the config-gated policy lives at the route edge.
+///
+/// Note: `www.youtube-nocookie.com` must also be in the CSP `frame-src`
+/// allowlist (`crates/api/src/routes/mod.rs`) for the rewritten iframe
+/// to load.
+pub fn apply_privacy(provider: &EmbedProvider, src: String, youtube_nocookie: bool) -> String {
+    if youtube_nocookie && *provider == EmbedProvider::YouTube {
+        src.replacen(
+            "https://www.youtube.com/embed/",
+            "https://www.youtube-nocookie.com/embed/",
+            1,
+        )
+    } else {
+        src
+    }
+}
+
 // ─── Per-provider matchers ──────────────────────────────────────
 
 fn try_youtube(url: &str) -> Option<String> {
@@ -480,6 +503,36 @@ mod tests {
     #[test]
     fn generic_attr_with_empty_domain_rejects() {
         assert_eq!(EmbedProvider::from_attr("generic:"), None);
+    }
+
+    #[test]
+    fn apply_privacy_rewrites_youtube_to_nocookie_when_enabled() {
+        let src = apply_privacy(
+            &EmbedProvider::YouTube,
+            "https://www.youtube.com/embed/dQw4w9WgXcQ".to_string(),
+            true,
+        );
+        assert_eq!(src, "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ");
+    }
+
+    #[test]
+    fn apply_privacy_noop_when_disabled() {
+        let src = apply_privacy(
+            &EmbedProvider::YouTube,
+            "https://www.youtube.com/embed/dQw4w9WgXcQ".to_string(),
+            false,
+        );
+        assert_eq!(src, "https://www.youtube.com/embed/dQw4w9WgXcQ");
+    }
+
+    #[test]
+    fn apply_privacy_leaves_non_youtube_untouched() {
+        let src = apply_privacy(
+            &EmbedProvider::Vimeo,
+            "https://player.vimeo.com/video/76979871".to_string(),
+            true,
+        );
+        assert_eq!(src, "https://player.vimeo.com/video/76979871");
     }
 
     #[test]

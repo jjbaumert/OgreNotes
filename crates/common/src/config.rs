@@ -47,6 +47,12 @@ pub struct AppConfig {
     /// Enable dev-only features (dev-login endpoint). MUST be false in production.
     pub dev_mode: bool,
 
+    /// Rewrite YouTube embeds to `youtube-nocookie.com` (privacy-enhanced
+    /// mode — no cookies set until the viewer actually plays). Default on;
+    /// set `EMBED_YOUTUBE_NOCOOKIE=false` to use the standard `youtube.com`
+    /// host instead.
+    pub embed_youtube_nocookie: bool,
+
     /// Deployment environment name (e.g. "dev", "staging", "prod"). Used as
     /// the `Environment` dimension on all emitted CloudWatch metrics.
     pub deploy_env: String,
@@ -395,6 +401,7 @@ impl AppConfig {
         validate_jwt_secret(&jwt_secret);
 
         let dev_mode = env_or("DEV_MODE", "false") == "true";
+        let embed_youtube_nocookie = env_or("EMBED_YOUTUBE_NOCOOKIE", "true") == "true";
         let frontend_origin = env_or("FRONTEND_ORIGIN", "http://localhost:8080");
         validate_frontend_origin(&frontend_origin, dev_mode);
 
@@ -443,6 +450,7 @@ impl AppConfig {
                 .filter(|s| !s.is_empty())
                 .collect(),
             dev_mode,
+            embed_youtube_nocookie,
             deploy_env: env_or("DEPLOY_ENV", "dev"),
             email_enabled,
             email_from_address: env_or("EMAIL_FROM_ADDRESS", ""),
@@ -716,6 +724,7 @@ mod tests {
             anthropic_model: "claude-sonnet-4-6".into(),
             admin_emails: Vec::new(),
             dev_mode: false,
+            embed_youtube_nocookie: true,
             deploy_env: "test".into(),
             email_enabled: false,
             email_from_address: String::new(),
