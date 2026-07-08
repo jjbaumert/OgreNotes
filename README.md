@@ -97,60 +97,49 @@ crates/
 
 ### Start Local Services
 
+`docker-compose.yml` provides the full local backend — DynamoDB Local
+(`:8000`), MinIO (`:9000`, S3-compatible), Redis (`:6379`), and MailHog
+(`:1025` SMTP / `:8025` web UI):
+
 ```bash
-# DynamoDB Local
-docker run -d --name dynamodb -p 8000:8000 amazon/dynamodb-local
+docker compose up -d
+```
 
-# MinIO (S3-compatible)
-docker run -d --name minio -p 9000:9000 \
-  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-  minio/minio server /data
+For vector/semantic search, also run Qdrant (optional):
 
-# Redis
-docker run -d --name redis -p 6379:6379 redis
-
-# Qdrant (optional — for vector/semantic search)
+```bash
 docker run -d --name qdrant -p 6333:6333 -p 6334:6334 qdrant/qdrant
 ```
 
-### Initialize Database and Bucket
+### Configure Environment
+
+All local env vars live in `scripts/local-dev.env`. Source it with `set -a`
+so the values are **exported** to the child process — a plain `source`
+leaves them unexported and the server silently falls back to real AWS and
+placeholder OAuth:
 
 ```bash
-export DYNAMODB_TABLE_PREFIX=dev-
-export S3_BUCKET=dev-ogrenotes
-export AWS_REGION=us-east-1
-export AWS_ACCESS_KEY_ID=fakekey
-export AWS_SECRET_ACCESS_KEY=fakesecret
-
-cargo run --bin setup_dev
+set -a && source scripts/local-dev.env && set +a
 ```
 
-### Start the API Server
+What that file bakes in (and why it matters):
+
+- **AWS creds are `minioadmin/minioadmin`.** MinIO validates credentials and
+  rejects anything else (`InvalidAccessKeyId`); DynamoDB Local ignores them,
+  so the same pair works for both.
+- **`AWS_ENDPOINT_URL_DYNAMODB` / `AWS_ENDPOINT_URL_S3`** point the AWS SDK at
+  the local containers. Without them every call goes to real AWS.
+- **`DEV_MODE=true`** enables the `/auth/dev-login` shortcut — log in locally
+  with any email, no real OAuth needed.
+
+Edit the file to enable optional Google OAuth, Qdrant, or the AI assistant
+(Anthropic) — see its inline comments.
+
+### Initialize and Run
 
 ```bash
-export DYNAMODB_TABLE_PREFIX=dev-
-export S3_BUCKET=dev-ogrenotes
-export REDIS_URL=redis://localhost:6379
-export OAUTH_CLIENT_ID=your-github-client-id
-export OAUTH_CLIENT_SECRET=your-github-client-secret
-export OAUTH_REDIRECT_URI=http://localhost:3000/api/v1/auth/callback
-export JWT_SECRET=your-secret-at-least-32-bytes-long
-export DEV_MODE=true
-
-# Optional: Google OAuth (create at https://console.cloud.google.com/apis/credentials)
-export GOOGLE_CLIENT_ID=your-id.apps.googleusercontent.com
-export GOOGLE_CLIENT_SECRET=your-secret
-
-# Optional: enable vector search
-export QDRANT_URL=http://localhost:6334
-
-# Optional: enable AI assistant
-export ANTHROPIC_API_KEY=sk-ant-...
-
-# Optional: auto-promote these emails to admin on login
-export ADMIN_EMAILS=you@example.com
-
-cargo run
+cargo run --bin setup_dev   # first run (and after `docker compose down`) — creates the table + bucket
+cargo run                   # starts the API on :3000
 ```
 
 ### Start the Frontend
