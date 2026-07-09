@@ -3,6 +3,7 @@
 
 pub(crate) mod measure;
 pub(crate) mod parse;
+pub(crate) mod shapes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShapeKind {
