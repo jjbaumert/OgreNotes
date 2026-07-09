@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    # `main` is the default branch of the public repo (the pre-OSS
+    # private repo used `master`; the 2026-07-07 re-publish switched).
+    # With the stale name, pushes to the default branch ran NO CI at
+    # all — ddc03be landed with a broken integration test unseen.
+    branches: [main]
   pull_request:
 
 concurrency:
