@@ -957,6 +957,8 @@ insert-mermaid-label = Mermaid diagram
 insert-mermaid-description = Insert a diagram rendered from Mermaid text
 kanban-column-delete-confirm = Delete this column and all its cards?
 kanban-column-wip-limit-prompt = WIP limit (empty to clear)
+mermaid-modal-title = Edit Diagram
+mermaid-modal-save = Save
 
 # ─── File-browser bulk selection (Phase 5 M-P7 piece C) ─────────
 

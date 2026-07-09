@@ -139,7 +139,7 @@ fn render_modal(
                 }
             >
                 <div class="confirm-header">
-                    <h3>"Edit Diagram"</h3>
+                    <h3>{crate::t!("mermaid-modal-title")}</h3>
                 </div>
                 <div class="calendar-modal-body mermaid-modal-body">
                     <textarea
@@ -156,13 +156,13 @@ fn render_modal(
                         class="btn btn-secondary"
                         on:click=move |_| a11y::defer_close(close_cb)
                     >
-                        "Cancel"
+                        {crate::t!("common-cancel")}
                     </button>
                     <button
                         class="btn btn-primary"
                         on:click=move |_| a11y::defer_close(save_cb)
                     >
-                        "Save"
+                        {crate::t!("mermaid-modal-save")}
                     </button>
                 </div>
             </div>
