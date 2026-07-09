@@ -7,6 +7,7 @@
 
 mod pie;
 mod layout;
+pub(crate) mod flowchart;
 
 /// Max diagram source length (chars). Shared cap: the single source of
 /// truth for both the `crates/collab` write-gate validator
@@ -38,6 +39,15 @@ impl DiagramKind {
             DiagramKind::Unknown => "unknown",
         }
     }
+}
+
+/// XML-escape a user-supplied string before interpolating into SVG.
+/// Order matters: `&` first so earlier escapes aren't double-escaped.
+pub(crate) fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

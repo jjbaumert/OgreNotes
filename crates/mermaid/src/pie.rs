@@ -1,6 +1,6 @@
 //! Mermaid `pie` diagram: parser + SVG renderer.
 
-use crate::ParseError;
+use crate::{escape_xml, ParseError};
 
 #[derive(Debug)]
 pub(crate) struct Pie {
@@ -91,14 +91,6 @@ pub(crate) fn parse(source: &str) -> Result<Pie, ParseError> {
         });
     }
     Ok(Pie { title, show_data, slices })
-}
-
-/// XML-escape a user-supplied string before interpolating into SVG.
-pub(crate) fn escape_xml(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 const PALETTE: &[&str] = &[
