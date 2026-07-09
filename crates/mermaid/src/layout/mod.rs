@@ -8,6 +8,7 @@
 //! coordinate transform). See the slice-2 design spec.
 
 pub(crate) mod acyclic;
+pub(crate) mod rank;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Direction {
