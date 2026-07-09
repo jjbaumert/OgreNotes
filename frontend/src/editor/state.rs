@@ -2271,6 +2271,54 @@ mod tests {
     }
 
     #[test]
+    fn forward_delete_at_block_end_over_embed_deletes_only_the_embed() {
+        // doc > [para("Hi"), embed, para("Lo")]; caret at end of "Hi" (pos 3).
+        // Forward-delete over a following atom (the YouTube embed) must remove
+        // just the embed and leave both paragraphs intact — not merge them and
+        // not leave the embed floating. `join_forward` can't reach the atom (an
+        // embed is not a textblock) and delete(pos, pos+1) hits the block-close
+        // boundary, so `atom_after_cursor_block` supplies the atom's range.
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("Hi")]),
+                ),
+                Node::element(NodeType::Embed),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("Lo")]),
+                ),
+            ]),
+        );
+        let state = EditorState {
+            selection: Selection::cursor(3),
+            ..EditorState::create_default(doc)
+        };
+        // join_forward must fail here (the next sibling is an atom, not a
+        // textblock) — that's why the atom-after special case is needed.
+        assert!(state.transaction().join_forward().is_err());
+        let (from, to) = crate::editor::selection::atom_after_cursor_block(
+            &state.doc, &state.selection,
+        )
+        .unwrap();
+        let txn = state.transaction().delete(from, to).unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 2);
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "Hi");
+        assert_eq!(new_state.doc.child(1).unwrap().text_content(), "Lo");
+        assert_eq!(
+            new_state.doc.child(0).unwrap().node_type(),
+            Some(NodeType::Paragraph)
+        );
+        assert_eq!(
+            new_state.doc.child(1).unwrap().node_type(),
+            Some(NodeType::Paragraph)
+        );
+    }
+
+    #[test]
     fn join_backward_after_exit_blockquote_preserves_container() {
         // Reproduces the bug where pressing Enter twice at the end of a
         // blockquote (which exits the blockquote) and then backspace
