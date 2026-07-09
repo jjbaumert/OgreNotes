@@ -2,7 +2,7 @@
 name = "ogrenotes-mermaid"
 version = "0.1.0"
 edition = "2021"
-license = "LicenseRef-Proprietary"
+license.workspace = true
 publish = false
 
 [dependencies]
