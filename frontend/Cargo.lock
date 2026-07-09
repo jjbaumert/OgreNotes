@@ -1128,6 +1128,7 @@ dependencies = [
  "leptos",
  "leptos_router",
  "libm",
+ "ogrenotes-highlight",
  "ogrenotes-mermaid",
  "proptest",
  "pulldown-cmark",
@@ -1143,6 +1144,10 @@ dependencies = [
  "web-sys",
  "yrs",
 ]
+
+[[package]]
+name = "ogrenotes-highlight"
+version = "0.1.0"
 
 [[package]]
 name = "ogrenotes-mermaid"

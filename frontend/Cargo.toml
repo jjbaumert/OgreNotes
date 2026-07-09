@@ -4,6 +4,17 @@ version = "0.1.2"
 edition = "2024"
 license = "MIT"
 
+# Declares this crate as its own (empty) workspace so Cargo's ancestor
+# search stops here. Without this, invoking cargo from a git worktree
+# nested under the main repo (e.g. .claude/worktrees/<name>/frontend)
+# walks *past* this directory's own exclusion and lands on the outer
+# checkout's root Cargo.toml, whose `exclude = ["frontend"]` entry is
+# relative to *that* root and doesn't match the worktree-nested path —
+# cargo then errors with "current package believes it's in a workspace
+# when it's not". Frontend is already built as a standalone crate (own
+# Cargo.lock, own profile); this makes that explicit and worktree-safe.
+[workspace]
+
 [lib]
 name = "ogrenotes_frontend"
 path = "src/lib.rs"
@@ -55,6 +66,11 @@ fuzzy-matcher = "0.3"
 # crates/mermaid — shared with the backend for future server-side
 # rendering; frontend uses it directly for the live-app block view.
 ogrenotes-mermaid = { path = "../crates/mermaid" }
+
+# Pure-Rust syntax tokenizer, zero deps, wasm-clean. Shared with the
+# backend (crates/highlight) — server HTML export uses the same
+# tokenizer + palette, so editor and export always agree.
+ogrenotes-highlight = { path = "../crates/highlight" }
 
 [dependencies.web-sys]
 version = "0.3"

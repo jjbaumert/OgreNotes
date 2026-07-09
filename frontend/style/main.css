@@ -961,6 +961,36 @@ html, body {
   padding: 0;
 }
 
+/* ── Code block syntax highlighting ─────────────────────────────
+   Token colors mirror crates/highlight/src/lib.rs::color_for —
+   that crate is the single source of truth (HTML export inlines
+   the same values). Update both together. */
+:root {
+  --tok-keyword: #cf222e;
+  --tok-type: #953800;
+  --tok-string: #0a3069;
+  --tok-comment: #6e7781;
+  --tok-number: #0550ae;
+  --tok-function: #8250df;
+  --tok-meta: #116329;
+}
+:root[data-theme="dark"] {
+  --tok-keyword: #ff7b72;
+  --tok-type: #ffa657;
+  --tok-string: #a5d6ff;
+  --tok-comment: #8b949e;
+  --tok-number: #79c0ff;
+  --tok-function: #d2a8ff;
+  --tok-meta: #7ee787;
+}
+.tok-keyword { color: var(--tok-keyword); }
+.tok-type { color: var(--tok-type); }
+.tok-string { color: var(--tok-string); }
+.tok-comment { color: var(--tok-comment); font-style: italic; }
+.tok-number { color: var(--tok-number); }
+.tok-function { color: var(--tok-function); }
+.tok-meta { color: var(--tok-meta); }
+
 .editor-content hr {
   border: none;
   border-top: 2px solid var(--color-border);
