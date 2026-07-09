@@ -487,7 +487,7 @@ fn safe_required_text(
 ) -> String {
     match attrs.get(key).map(|s| s.trim()) {
         Some(v) if !v.is_empty() => clamp_chars(v, max),
-        _ => placeholder.to_string(),
+        _ => clamp_chars(placeholder, max),
     }
 }
 
@@ -697,6 +697,16 @@ mod tests {
                 .count(),
             MAX_CARD_TITLE_LEN
         );
+    }
+
+    #[test]
+    fn safe_required_text_clamps_placeholder_to_max() {
+        // Regression: issue #5 — the fallback path returned the
+        // placeholder unclamped, violating the length-cap contract.
+        let absent = HashMap::new();
+        assert_eq!(safe_required_text(&absent, "title", 1, "(x)"), "(");
+        let blank = attrs_with("title", "   ".to_string());
+        assert_eq!(safe_required_text(&blank, "title", 1, "(x)"), "(");
     }
 
     #[test]
