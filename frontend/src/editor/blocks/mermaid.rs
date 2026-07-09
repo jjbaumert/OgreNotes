@@ -40,6 +40,10 @@ impl LiveAppBlockView for MermaidView {
         }
         // Edit hook consumed by the delegated click listener (Task 8).
         wrapper.set_attribute("data-mermaid-action", "edit").ok()?;
+        // Current source, so the click listener can seed the edit
+        // modal without a separate model lookup. `set_attribute`
+        // escapes the value automatically.
+        wrapper.set_attribute("data-source", source).ok()?;
 
         let out = ogrenotes_mermaid::render(source);
         match out.svg {

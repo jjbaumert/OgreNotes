@@ -23,6 +23,7 @@ use super::editor_context_menu::{EditorContextCommand, EditorContextMenu};
 use super::kanban_card_modal::{
     KanbanCardModal, KanbanCardModalMode, KanbanCardModalState, KanbanCardOutcome,
 };
+use super::mermaid_modal::{MermaidModal, MermaidModalOutcome, MermaidModalState};
 use super::toolbar::ToolbarCommand;
 
 /// Props for the editor component.
@@ -1291,6 +1292,25 @@ fn calendar_click_outcome(
     }
 }
 
+/// Parse a click on the editor container for a Mermaid
+/// click-to-edit hit. Returns the modal state to open, or `None`
+/// for clicks that don't hit `[data-mermaid-action="edit"]` (so the
+/// click falls through to normal editor handling).
+///
+/// The block's current `source` is read off the `data-source`
+/// attribute `MermaidView::render` stamps on the `.mermaid-block`
+/// wrapper (see `editor/blocks/mermaid.rs`) — there's no separate
+/// model lookup here, mirroring how `calendar_click_outcome` reads
+/// event fields straight off the DOM.
+fn mermaid_click_outcome(ev: &web_sys::MouseEvent) -> Option<MermaidModalState> {
+    let target = ev.target()?.dyn_into::<web_sys::Element>().ok()?;
+    let action_el = target.closest("[data-mermaid-action]").ok()??;
+    let block_el = action_el.closest(".mermaid-block").ok()??;
+    let block_id = block_el.get_attribute("data-block-id")?;
+    let source = block_el.get_attribute("data-source").unwrap_or_default();
+    Some(MermaidModalState { block_id, source })
+}
+
 /// If the user is switching from month → day/week (or vice
 /// versa), the cursor's shape needs to match. Month expects
 /// `YYYY-MM`; day/week expect `YYYY-MM-DD`. Best-effort — falls
@@ -1690,6 +1710,12 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     // dispatches Add/Edit/Delete commands.
     let calendar_modal_state: RwSignal<Option<CalendarModalState>> = RwSignal::new(None);
 
+    // Task 8 — Mermaid edit modal state. `None` = hidden. A
+    // delegated click listener on `.editor-content` populates this
+    // on clicks inside `.mermaid-block`; the modal callback
+    // dispatches `commands::update_mermaid_source`.
+    let mermaid_modal_state: RwSignal<Option<MermaidModalState>> = RwSignal::new(None);
+
     // Initialize the editor after the DOM element is mounted
     let view_ref_init = Rc::clone(&view_ref);
     let history_ref_init = Rc::clone(&history_ref);
@@ -1911,6 +1937,48 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
         });
     });
 
+    // Task 8 — delegated click listener for `.mermaid-block`
+    // click-to-edit. Sits alongside the Calendar/Kanban observers
+    // above, so a single click passes through all three
+    // `data-*-action` guards and only fires the branch that
+    // matches. Opens `mermaid_modal_state`; the modal's Save
+    // outcome is picked up by `on_mermaid_outcome` below.
+    let mermaid_modal_click = mermaid_modal_state;
+    Effect::new(move |_| {
+        let Some(container) = container_ref.get() else { return };
+        let already: web_sys::HtmlElement = container.clone().into();
+        if already.get_attribute("data-mermaid-observer").is_some() {
+            return;
+        }
+        let el: web_sys::HtmlElement = container.into();
+        let _ = el.set_attribute("data-mermaid-observer", "attached");
+        let listener = Closure::wrap(Box::new(move |ev: web_sys::MouseEvent| {
+            let Some(modal_state) = mermaid_click_outcome(&ev) else {
+                return;
+            };
+            // Mermaid owns the click — stop it before the editor's
+            // selection handler collapses onto the leaf atom.
+            ev.stop_propagation();
+            ev.prevent_default();
+            mermaid_modal_click.set(Some(modal_state));
+        }) as Box<dyn Fn(web_sys::MouseEvent)>);
+        let _ = el.add_event_listener_with_callback(
+            "click",
+            listener.as_ref().unchecked_ref(),
+        );
+        let cleanup_el = send_wrapper::SendWrapper::new(el);
+        let cleanup_listener = send_wrapper::SendWrapper::new(listener);
+        on_cleanup(move || {
+            let el = cleanup_el.take();
+            let listener = cleanup_listener.take();
+            let _ = el.remove_event_listener_with_callback(
+                "click",
+                listener.as_ref().unchecked_ref(),
+            );
+            drop(listener);
+        });
+    });
+
     // #137 — Column-op dispatcher. Rename/Remove use
     // `window.prompt` / `window.confirm` for v1 — good enough for
     // the "type a column name" and "are you sure" moments, and it
@@ -2074,6 +2142,49 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                         );
                     }
                 }
+            }
+        }
+    });
+
+    // Task 8 — Mermaid modal outcome dispatcher. Save writes the
+    // block's `source` attribute; Cancel is a noop. Same
+    // SendWrapper-around-Rc pattern as the Calendar/Kanban
+    // callbacks above — Leptos requires `Send + Sync` and
+    // wasm-bindgen is single-threaded.
+    let view_ref_mermaid_modal =
+        send_wrapper::SendWrapper::new(Rc::clone(&view_ref));
+    let history_ref_mermaid_modal =
+        send_wrapper::SendWrapper::new(Rc::clone(&history_ref));
+    let on_change_mermaid_modal = props.on_change.clone();
+    let on_state_change_mermaid_modal = props.on_state_change.clone();
+    let on_mapping_mermaid_modal = props.on_mapping.clone();
+    let on_mermaid_outcome = Callback::new(move |outcome: MermaidModalOutcome| {
+        let view = view_ref_mermaid_modal.borrow();
+        let Some(view) = view.as_ref() else { return };
+        let state = view.state();
+        let history_ref_dispatch = Rc::clone(&*history_ref_mermaid_modal);
+        let on_change_dispatch = on_change_mermaid_modal.clone();
+        let on_state_change_dispatch = on_state_change_mermaid_modal.clone();
+        let on_mapping_dispatch = on_mapping_mermaid_modal.clone();
+        let dispatch_fn = move |txn: Transaction| {
+            apply_and_notify(
+                view,
+                txn,
+                Some(&history_ref_dispatch),
+                &on_change_dispatch,
+                &on_state_change_dispatch,
+                on_mapping_dispatch.as_ref(),
+            );
+        };
+        match outcome {
+            MermaidModalOutcome::Cancel => {}
+            MermaidModalOutcome::Save { block_id, source } => {
+                commands::update_mermaid_source(
+                    &block_id,
+                    source,
+                    &state,
+                    Some(&dispatch_fn),
+                );
             }
         }
     });
@@ -2834,6 +2945,10 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             <KanbanCardModal
                 state=kanban_card_modal_state
                 on_outcome=on_kanban_outcome
+            />
+            <MermaidModal
+                state=mermaid_modal_state
+                on_outcome=on_mermaid_outcome
             />
         </div>
     }
