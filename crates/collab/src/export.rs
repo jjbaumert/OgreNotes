@@ -1090,6 +1090,7 @@ fn node_type_to_html_tag(nt: NodeType) -> &'static str {
         // `render_html_attrs`, and the inner display text
         // comes from the node's `display` attr.
         NodeType::Mention => "span",
+        NodeType::Mermaid => "div",
     }
 }
 
