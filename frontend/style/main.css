@@ -806,6 +806,11 @@ html, body {
   align-items: flex-start;
   padding: var(--space-xl) var(--space-lg);
   background: var(--color-bg);
+  /* Positioning context for `.code-lang-chip` (and any future
+   * overlay mounted as a sibling of `.editor-content`). Absolutely
+   * positioned children still scroll with this container's content
+   * (overflow-y: auto above), so no scroll-driven recompute needed. */
+  position: relative;
 }
 
 .editor-content {
@@ -990,6 +995,29 @@ html, body {
 .tok-number { color: var(--tok-number); }
 .tok-function { color: var(--tok-function); }
 .tok-meta { color: var(--tok-meta); }
+
+/* Task 7 — language-selector chip overlay for code blocks. Mounted
+ * as a sibling of `.editor-content` inside the positioned
+ * `.editor-container` wrapper (see `position: relative` above), so
+ * its `top`/`right` are relative to that wrapper's rect. */
+.code-lang-chip {
+  position: absolute;
+  z-index: 20;
+}
+.code-lang-chip select {
+  font-size: 12px;
+  padding: 1px 4px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-mist);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  opacity: 0.55;
+}
+.code-lang-chip select:hover,
+.code-lang-chip select:focus {
+  opacity: 1;
+}
 
 .editor-content hr {
   border: none;
