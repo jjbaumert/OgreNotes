@@ -306,7 +306,9 @@ fn classify_word(word: &str, spec: &LexerSpec, next_is_paren: bool) -> TokenKind
 
 #[cfg(test)]
 mod tests {
-    use crate::{highlight, Language, TokenKind};
+    use crate::{highlight, Language, Token, TokenKind};
+    use super::{tokenize, LexerSpec};
+    use proptest::prelude::*;
 
     fn kinds_of(src: &str, lang: Language) -> Vec<(String, TokenKind)> {
         highlight(src, lang)
@@ -386,5 +388,125 @@ mod tests {
     #[test]
     fn multibyte_input_is_sliced_on_char_boundaries() {
         assert_partition("let s = \"héllo → 世界\"; // ünïcode 🎉", Language::Rust);
+    }
+
+    // Coverage for five engine features untested by partition.rs property test:
+    // triple_quoted, multiline_delims, at_meta, dollar_meta, ci_keywords
+
+    fn all_features_spec() -> LexerSpec {
+        LexerSpec {
+            line_comments: &["//", "#"],
+            block_comment: Some(("/*", "*/")),
+            string_delims: &['"', '\'', '`'],
+            multiline_delims: &['`'],
+            triple_quoted: true,
+            rust_raw_strings: true,
+            keywords: &["kw", "SELECT"],
+            types: &["Ty"],
+            caps_types: true,
+            fn_calls: true,
+            ci_keywords: true,
+            hash_meta: false, // '#' is a line comment in this spec; mutually exclusive
+            at_meta: true,
+            dollar_meta: true,
+        }
+    }
+
+    fn all_features_with_hash_spec() -> LexerSpec {
+        LexerSpec {
+            line_comments: &["//"],
+            block_comment: Some(("/*", "*/")),
+            string_delims: &['"', '\'', '`'],
+            multiline_delims: &['`'],
+            triple_quoted: true,
+            rust_raw_strings: true,
+            keywords: &["kw", "SELECT"],
+            types: &["Ty"],
+            caps_types: true,
+            fn_calls: true,
+            ci_keywords: true,
+            hash_meta: true,
+            at_meta: true,
+            dollar_meta: true,
+        }
+    }
+
+    #[test]
+    fn all_features_triple_quoted_double() {
+        let src = r#""""x""""#;
+        let toks = tokenize(src, &all_features_spec());
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].kind, TokenKind::String);
+        assert_eq!(toks[0].text, src);
+    }
+
+    #[test]
+    fn all_features_triple_quoted_single() {
+        let src = "'''x'''";
+        let toks = tokenize(src, &all_features_spec());
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].kind, TokenKind::String);
+        assert_eq!(toks[0].text, src);
+    }
+
+    #[test]
+    fn all_features_multiline_delim() {
+        let src = "`a\nb`";
+        let toks = tokenize(src, &all_features_spec());
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].kind, TokenKind::String);
+        assert_eq!(toks[0].text, src);
+    }
+
+    #[test]
+    fn all_features_at_meta() {
+        let toks = tokenize("@name", &all_features_spec());
+        assert!(toks.contains(&Token { text: "@name", kind: TokenKind::Meta }));
+    }
+
+    #[test]
+    fn all_features_dollar_meta_simple() {
+        let toks = tokenize("$var", &all_features_spec());
+        assert!(toks.contains(&Token { text: "$var", kind: TokenKind::Meta }));
+    }
+
+    #[test]
+    fn all_features_dollar_meta_braces() {
+        let toks = tokenize("${x}", &all_features_spec());
+        assert!(toks.contains(&Token { text: "${x}", kind: TokenKind::Meta }));
+    }
+
+    #[test]
+    fn all_features_ci_keywords_lowercase() {
+        let toks = tokenize("select", &all_features_spec());
+        assert!(toks.contains(&Token { text: "select", kind: TokenKind::Keyword }));
+    }
+
+    #[test]
+    fn all_features_ci_keywords_uppercase() {
+        let toks = tokenize("SELECT", &all_features_spec());
+        assert!(toks.contains(&Token { text: "SELECT", kind: TokenKind::Keyword }));
+    }
+
+    #[test]
+    fn all_features_ci_keywords_mixed() {
+        let toks = tokenize("SeLeCt", &all_features_spec());
+        assert!(toks.contains(&Token { text: "SeLeCt", kind: TokenKind::Keyword }));
+    }
+
+    proptest! {
+        #[test]
+        fn all_features_partition_roundtrip(src in r"[\PC]*") {
+            let toks = tokenize(&src, &all_features_spec());
+            let joined: String = toks.iter().map(|t| t.text).collect();
+            prop_assert_eq!(joined, src, "partition violated");
+        }
+
+        #[test]
+        fn all_features_with_hash_partition_roundtrip(src in r"[\PC]*") {
+            let toks = tokenize(&src, &all_features_with_hash_spec());
+            let joined: String = toks.iter().map(|t| t.text).collect();
+            prop_assert_eq!(joined, src, "partition violated");
+        }
     }
 }
