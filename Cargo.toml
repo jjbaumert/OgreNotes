@@ -5,6 +5,7 @@ members = [
     "crates/storage",
     "crates/auth",
     "crates/collab",
+    "crates/mermaid",
     "crates/search",
     "crates/embeddings",
     "crates/notify",
