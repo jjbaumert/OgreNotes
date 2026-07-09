@@ -382,11 +382,15 @@ impl Parser {
     /// comma-separated list of already-defined node ids.
     fn parse_class_assign(&mut self, stmt: &str) -> Result<(), ParseError> {
         let rest = stmt.strip_prefix("class").unwrap().trim();
-        let Some(last_space) = rest.rfind(char::is_whitespace) else {
+        // rsplit_once is char-boundary safe. (A manual `rfind + 1` slice
+        // panics on multi-byte Unicode whitespace such as U+2003 em space:
+        // rfind returns the START byte of the char, so `+ 1` lands inside
+        // it.)
+        let Some((node_list, class_name)) = rest.rsplit_once(char::is_whitespace) else {
             return Err(self.err("class needs a node list and a class name"));
         };
-        let node_list = rest[..last_space].trim();
-        let class_name = rest[last_space + 1..].trim();
+        let node_list = node_list.trim();
+        let class_name = class_name.trim();
         if node_list.is_empty() || class_name.is_empty() {
             return Err(self.err("class needs a node list and a class name"));
         }
@@ -645,5 +649,23 @@ mod tests {
     fn direction_inside_subgraph_errors() {
         let e = parse("graph TD\nsubgraph s\ndirection LR\nend").unwrap_err();
         assert_eq!(e.line, Some(3));
+    }
+
+    #[test]
+    fn class_assign_multibyte_whitespace_no_panic() {
+        // Multi-byte Unicode whitespace between node list and class name
+        // must not panic (rfind returns the START byte of the char; naive
+        // `+ 1` slicing lands mid-char). Ok or a clean line error are both
+        // acceptable — panicking on untrusted input is not.
+        for ws in ['\u{2003}' /* em space */, '\u{a0}' /* nbsp */] {
+            let src = format!("graph TD\nA\nclass A{ws}hot");
+            match parse(&src) {
+                Ok(g) => {
+                    let a = g.nodes.iter().find(|n| n.id == "A").unwrap();
+                    assert_eq!(a.classes, vec!["hot"], "for {ws:?}");
+                }
+                Err(e) => assert!(e.line.is_some(), "clean error for {ws:?}"),
+            }
+        }
     }
 }
