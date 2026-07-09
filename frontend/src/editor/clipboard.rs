@@ -945,6 +945,16 @@ fn element_tags(
             );
             (open, None)
         }
+        // Mermaid: leaf block atom, mirrors Embed's minimal-shape
+        // clipboard emission (no dedicated render pipeline on the
+        // clipboard path yet). Source is in the `source` attribute.
+        NodeType::Mermaid => {
+            let source = attrs.get("source").map(String::as_str).unwrap_or("");
+            (
+                format!("<div class=\"mermaid\">{}</div>", html_escape_attr(source)),
+                None,
+            )
+        }
     }
 }
 

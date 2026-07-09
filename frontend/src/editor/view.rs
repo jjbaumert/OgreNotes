@@ -1522,6 +1522,7 @@ fn node_type_to_tag(nt: NodeType) -> &'static str {
         // pre-existing text+MarkType::Mention DOM output for
         // paste round-trip stability.
         NodeType::Mention => "span",
+        NodeType::Mermaid => "div",
     }
 }
 
