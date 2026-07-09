@@ -3675,6 +3675,7 @@ dependencies = [
  "markup5ever_rcdom",
  "nanoid",
  "ogrenotes-common",
+ "ogrenotes-mermaid",
  "ogrenotes-storage",
  "pdf-extract",
  "printpdf",
