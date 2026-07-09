@@ -34,7 +34,11 @@ jobs:
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
+          # Either credential works; the public repo (post 2026-07-07
+          # re-publish) has ANTHROPIC_API_KEY set. Keep both inputs so
+          # whichever secret exists is picked up.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
 
           # This is an optional setting that allows Claude to read CI results on PRs
           additional_permissions: |
