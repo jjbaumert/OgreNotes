@@ -1128,6 +1128,7 @@ dependencies = [
  "leptos",
  "leptos_router",
  "libm",
+ "ogrenotes-mermaid",
  "proptest",
  "pulldown-cmark",
  "qrcode",
@@ -1142,6 +1143,10 @@ dependencies = [
  "web-sys",
  "yrs",
 ]
+
+[[package]]
+name = "ogrenotes-mermaid"
+version = "0.1.0"
 
 [[package]]
 name = "once_cell"
