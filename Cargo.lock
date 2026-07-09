@@ -3727,6 +3727,9 @@ dependencies = [
 [[package]]
 name = "ogrenotes-mermaid"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+]
 
 [[package]]
 name = "ogrenotes-notify"

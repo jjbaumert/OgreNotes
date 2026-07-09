@@ -214,6 +214,33 @@ pub(crate) fn run_flat(input: &LayoutInput) -> Result<Layout, String> {
 /// and the top-level assembly, so that `apply_direction` runs exactly once
 /// on the fully-assembled whole.
 pub(crate) fn layout_tb(input: &LayoutInput) -> Result<Layout, String> {
+    // Every stage below reasons in TB-internal axes: the rank axis (uses
+    // node HEIGHT for spacing) becomes the final y-axis for TB/BT, but
+    // becomes the final x-axis for LR/RL once `apply_direction` swaps
+    // coordinates — and vice versa for the order axis (uses node WIDTH).
+    // So for LR/RL we feed transposed node extents through these stages:
+    // the axis that will end up as x gets true WIDTH-based clearance, the
+    // axis that will end up as y gets true HEIGHT-based clearance, once
+    // swapped back by `apply_direction`. Without this, separation is
+    // computed against the wrong dimension and nodes can overlap in the
+    // final coordinate space (caught by the `flat_no_node_overlaps`
+    // property test).
+    let transposed;
+    let input = if matches!(input.direction, Direction::LR | Direction::RL) {
+        transposed = LayoutInput {
+            nodes: input
+                .nodes
+                .iter()
+                .map(|n| LNode { width: n.height, height: n.width, cluster: n.cluster })
+                .collect(),
+            edges: input.edges.clone(),
+            clusters: input.clusters.clone(),
+            direction: input.direction,
+        };
+        &transposed
+    } else {
+        input
+    };
     let ac = acyclic::make_acyclic(input.nodes.len(), &input.edges);
     let ranks = rank::assign_ranks(input.nodes.len(), &ac.edges);
     // Order-graph nodes are the ORIGINAL nodes; edges are the surviving
@@ -242,6 +269,9 @@ pub(crate) fn layout_tb(input: &LayoutInput) -> Result<Layout, String> {
     };
     Ok(layout)
 }
+
+#[cfg(test)]
+mod props;
 
 #[cfg(test)]
 mod tests {
