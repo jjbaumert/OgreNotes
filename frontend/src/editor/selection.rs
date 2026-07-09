@@ -269,6 +269,37 @@ pub fn atom_before_cursor_block(doc: &Node, sel: &Selection) -> Option<(usize, u
     Some((from, before))
 }
 
+/// Forward-delete mirror of [`atom_before_cursor_block`]: when the caret
+/// is at the very end of an inline-content block whose immediately-next
+/// sibling is an atom (horizontal rule, image, embed), return that atom's
+/// `[from, to)` position range so Delete can remove just the atom.
+/// `join_forward` can't target it (an atom is not a textblock, so
+/// `find_block_at` past it returns None and the join fails) and a raw
+/// `delete(pos, pos + 1)` deletes the block's close boundary instead,
+/// leaving the atom undeletable from the block before it. Returns None
+/// unless the caret is a collapsed cursor exactly at the block's content
+/// end with an atom directly after it.
+pub fn atom_after_cursor_block(doc: &Node, sel: &Selection) -> Option<(usize, usize)> {
+    if !sel.empty() {
+        return None;
+    }
+    let pos = sel.head();
+    let rp = resolve(doc, pos)?;
+    if !is_inline_content_node(rp.node_at(rp.depth, doc)) {
+        return None;
+    }
+    if pos != rp.end(rp.depth, doc) {
+        return None; // only at the block's content end
+    }
+    let after = pos + 1; // step over the block's close boundary
+    let arp = resolve(doc, after)?;
+    let next = arp.node_after(doc)?;
+    if !next.node_type().map(|t| t.is_atom()).unwrap_or(false) {
+        return None;
+    }
+    Some((after, after + next.node_size()))
+}
+
 /// Check if a node is a container for inline content (text).
 /// This includes Paragraph, Heading, and CodeBlock.
 /// ListItem and TaskItem do NOT directly hold inline content --
@@ -897,6 +928,68 @@ mod tests {
             atom_before_cursor_block(&doc, &Selection::cursor(6)),
             Some((4, 5))
         );
+    }
+
+    // ── atom_after_cursor_block: forward-delete over an atom ──
+
+    fn doc_with_embed() -> Node {
+        // doc > [para("Hi"), embed, para("Lo")] — same position layout
+        // as doc_with_hr; the embed (YouTube/Vimeo) is a size-1 leaf atom.
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("Hi")]),
+                ),
+                Node::element(NodeType::Embed),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("Lo")]),
+                ),
+            ]),
+        )
+    }
+
+    #[test]
+    fn atom_after_cursor_block_at_block_end_returns_embed_range() {
+        let doc = doc_with_embed();
+        // Caret at end of "Hi" (pos 3); the embed occupies [4, 5).
+        assert_eq!(
+            atom_after_cursor_block(&doc, &Selection::cursor(3)),
+            Some((4, 5))
+        );
+    }
+
+    #[test]
+    fn atom_after_cursor_block_returns_hr_range() {
+        let doc = doc_with_hr();
+        // Caret at end of "Hi" (pos 3); the HR occupies [4, 5).
+        assert_eq!(
+            atom_after_cursor_block(&doc, &Selection::cursor(3)),
+            Some((4, 5))
+        );
+    }
+
+    #[test]
+    fn atom_after_cursor_block_mid_block_is_none() {
+        let doc = doc_with_embed();
+        // Mid-"Hi" (pos 2) — Delete removes a char, not the embed.
+        assert!(atom_after_cursor_block(&doc, &Selection::cursor(2)).is_none());
+    }
+
+    #[test]
+    fn atom_after_cursor_block_without_atom_is_none() {
+        // Two adjacent paragraphs, no atom between — let join_forward run.
+        let doc = simple_doc();
+        // End of "Hello" (pos 6); next sibling is a paragraph.
+        assert!(atom_after_cursor_block(&doc, &Selection::cursor(6)).is_none());
+    }
+
+    #[test]
+    fn atom_after_cursor_block_ignores_range() {
+        let doc = doc_with_embed();
+        assert!(atom_after_cursor_block(&doc, &Selection::text(1, 3)).is_none());
     }
 
     // ── NodeSelection: edge case ──

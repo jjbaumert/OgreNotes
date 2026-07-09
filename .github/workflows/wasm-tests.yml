@@ -12,19 +12,25 @@ name: WASM browser tests
 # the docker-compose + axum-build, and we already pay that in the
 # `integration` job of ci.yml. ~5-7 min wall-clock on a cold cache.
 #
-# Currently runs:
-#   - frontend/tests/collab_e2e.rs::test_ws_connects_and_stays_open
-#   - frontend/tests/collab_e2e.rs::test_two_clients_sync_update
-#   - frontend/tests/collab_e2e.rs::test_reply_broadcasts_comment_event_to_peers
-#   - frontend/tests/collab_e2e.rs::test_ws_no_immediate_disconnect
+# Two jobs:
+#   collab-e2e — frontend/tests/collab_e2e.rs (integration target) against
+#     a live axum stack: WS connect / sync / comment broadcast.
+#   lib-wasm — the frontend lib's inline `#[wasm_bindgen_test]` tests
+#     (render_node output, DOM↔model position walkers, focus traps). Pure
+#     browser-DOM, no backend. `--test collab_e2e` excludes the `--lib`
+#     target, so these need their own job or they never run in CI.
 #
-# To extend: drop new tests into frontend/tests/collab_e2e.rs (or a new
-# *.rs file under frontend/tests/) and add the corresponding `--test`
-# argument to the wasm-pack step below.
+# To extend collab-e2e: drop new tests into frontend/tests/collab_e2e.rs
+# (or a new *.rs under frontend/tests/) and add the `--test` argument to
+# the wasm-pack step. To extend lib-wasm: add `#[wasm_bindgen_test]` fns
+# in any `#[cfg(all(test, target_arch = "wasm32"))]` module under
+# frontend/src/ — `--lib` picks them up automatically.
 
 on:
   push:
-    branches: [master]
+    # `main` is the default branch of the public repo (the pre-OSS
+    # private repo used `master`; the 2026-07-07 re-publish switched).
+    branches: [main]
   pull_request:
 
 concurrency:
@@ -208,3 +214,50 @@ jobs:
       - name: Stop infra
         if: always()
         run: docker compose down -v
+
+  # ── Lib wasm-bindgen tests (no backend) ─────────────────────────
+  # The inline `#[cfg(all(test, target_arch = "wasm32"))]` tests in the
+  # frontend lib exercise pure browser-DOM behavior — render_node output,
+  # the DOM↔model position walkers, focus traps. They need a real
+  # `web_sys::Document` (hence headless Firefox) but NOT the axum stack,
+  # so they run in their own fast job without docker-compose. The
+  # collab-e2e job above runs only `--test collab_e2e`, which excludes
+  # the `--lib` target — without this job these tests never run in CI.
+  lib-wasm:
+    name: lib wasm tests (headless Firefox)
+    runs-on: ubuntu-latest
+    # 25 min to match the sibling jobs' headroom for a cold-cache Leptos
+    # wasm build (dev profile, so typically well under this).
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + wasm32)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            frontend -> target
+          # Dedicated key: this job only builds the frontend lib for the
+          # wasm test target, a different feature/target set than the
+          # collab-e2e job's `wasm-tests` cache.
+          shared-key: wasm-tests-lib
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      # geckodriver + Firefox are preinstalled on ubuntu-latest; wasm-pack
+      # uses them transparently when --firefox is passed.
+      # `--lib` goes AFTER the `--` separator (a cargo passthrough arg, same
+      # as collab-e2e's `-- --test collab_e2e`): the wasm-pack-action pins
+      # `version: latest`, so don't rely on wasm-pack forwarding an unknown
+      # `--lib` from before the separator.
+      - name: Run frontend lib wasm-bindgen tests
+        working-directory: frontend
+        run: wasm-pack test --headless --firefox -- --lib

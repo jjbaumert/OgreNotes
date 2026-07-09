@@ -100,8 +100,12 @@ fn embed_frame_src() -> &'static str {
     // 'self' permits embeds we host directly (none today, but
     // keeps the iframe-from-our-origin case safe if a future
     // embed UX ever needs it).
+    // Both youtube.com (existing embeds) and youtube-nocookie.com (the
+    // privacy-enhanced rewrite, EMBED_YOUTUBE_NOCOOKIE) are listed so
+    // iframes load regardless of when the embed was created.
     "'self' \
      https://www.youtube.com \
+     https://www.youtube-nocookie.com \
      https://player.vimeo.com \
      https://www.figma.com \
      https://www.loom.com \
@@ -279,6 +283,7 @@ mod tests {
         assert!(csp.contains("frame-src"), "csp missing frame-src: {csp}");
         for origin in [
             "https://www.youtube.com",
+            "https://www.youtube-nocookie.com",
             "https://player.vimeo.com",
             "https://www.figma.com",
             "https://www.loom.com",

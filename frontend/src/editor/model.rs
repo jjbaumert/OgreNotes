@@ -1079,12 +1079,27 @@ fn normalize_node(node: &Node, parent_type: NodeType) -> Vec<Node> {
                 .collect();
 
             match node_type {
-                // Empty lists → remove entirely
+                // Lists: children must all be list items (schema allows
+                // only BulletList/OrderedList => ListItem, TaskList =>
+                // TaskItem). A raw paste can drop a bare block straight
+                // into a list; wrap any such stray child in an item so it
+                // stays a reachable, deletable entry rather than an
+                // orphaned marker that no backspace path can act on.
+                // Empty lists → remove entirely.
                 NodeType::BulletList | NodeType::OrderedList | NodeType::TaskList => {
-                    if children.is_empty() {
+                    let item_type = if *node_type == NodeType::TaskList {
+                        NodeType::TaskItem
+                    } else {
+                        NodeType::ListItem
+                    };
+                    let items: Vec<Node> = children
+                        .into_iter()
+                        .map(|child| ensure_list_item(child, item_type))
+                        .collect();
+                    if items.is_empty() {
                         vec![]
                     } else {
-                        vec![node.copy_with_content(Fragment::from(children))]
+                        vec![node.copy_with_content(Fragment::from(items))]
                     }
                 }
                 // Empty tables → remove, EXCEPT a spreadsheet table: a
@@ -1122,6 +1137,56 @@ fn normalize_node(node: &Node, parent_type: NodeType) -> Vec<Node> {
                 // Everything else → just propagate normalized children
                 _ => vec![node.copy_with_content(Fragment::from(children))],
             }
+        }
+    }
+}
+
+/// Coerce a node into a valid child of a list — the contract a list's
+/// children must satisfy (schema: `BulletList`/`OrderedList` => `ListItem`,
+/// `TaskList` => `TaskItem`; `ListItem`/`TaskItem` may hold paragraphs,
+/// nested lists, blockquotes, etc.).
+///
+/// A raw paste can drop non-item content straight into a list — a bare
+/// text run, a stray paragraph, or a nested list with no item wrapper.
+/// Such content has no enclosing item, so no backspace/delete path can act
+/// on it and it renders as an orphaned, undeletable entry. This wraps it:
+///
+/// - An existing list item (either kind) is kept as-is; an empty one gets
+///   an empty paragraph so it has a cursor target.
+/// - Bare text or an inline node is wrapped in a paragraph inside a fresh
+///   item (text may not be a direct item child).
+/// - Any other block (paragraph, heading, nested list, blockquote) is
+///   wrapped directly in a fresh item.
+///
+/// Idempotent. Used by `normalize_doc` (the read/write-back self-heal);
+/// the paste path enforces the same invariant separately via
+/// `clipboard::fit_pasted_list_items`, which additionally schema-fits
+/// each item's content.
+pub(crate) fn ensure_list_item(node: Node, item_type: NodeType) -> Node {
+    match node {
+        // Already a list item: keep it; an empty item gets a cursor target.
+        Node::Element { node_type, attrs, content, marks }
+            if matches!(node_type, NodeType::ListItem | NodeType::TaskItem) =>
+        {
+            let content = if content.children.is_empty() {
+                Fragment::from(vec![Node::element(NodeType::Paragraph)])
+            } else {
+                content
+            };
+            Node::Element { node_type, attrs, content, marks }
+        }
+        // A block that slipped directly into a list → wrap it as an item.
+        Node::Element { node_type, .. } if !node_type.is_inline() => {
+            Node::element_with_content(item_type, Fragment::from(vec![node]))
+        }
+        // Bare text or an inline node → wrap in a paragraph inside an item,
+        // so the text isn't left as an invalid direct child of the item.
+        other => {
+            let para = Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![other]),
+            );
+            Node::element_with_content(item_type, Fragment::from(vec![para]))
         }
     }
 }
@@ -1911,6 +1976,156 @@ mod tests {
         assert_eq!(item.node_type(), Some(NodeType::ListItem));
         let para = item.child(0).unwrap();
         assert_eq!(para.node_type(), Some(NodeType::Paragraph));
+    }
+
+    #[test]
+    fn ensure_list_item_wraps_bare_text_in_a_paragraph() {
+        // The real "e." corruption: a bare text run sits directly inside a
+        // list with no enclosing item. It has no cursor position and can't
+        // be deleted. ensure_list_item must wrap it as item[paragraph[text]]
+        // — text may not be a direct child of a list item.
+        let fixed = ensure_list_item(Node::text("e."), NodeType::ListItem);
+        assert_eq!(fixed.node_type(), Some(NodeType::ListItem));
+        let para = fixed.child(0).unwrap();
+        assert_eq!(para.node_type(), Some(NodeType::Paragraph));
+        assert_eq!(para.text_content(), "e.");
+    }
+
+    #[test]
+    fn ensure_list_item_wraps_bare_block() {
+        // A stray paragraph handed to a list becomes a proper list item.
+        let para = Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("stray")]),
+        );
+        let fixed = ensure_list_item(para, NodeType::ListItem);
+        assert_eq!(fixed.node_type(), Some(NodeType::ListItem));
+        assert_eq!(fixed.child(0).unwrap().node_type(), Some(NodeType::Paragraph));
+        assert_eq!(fixed.text_content(), "stray");
+    }
+
+    #[test]
+    fn ensure_list_item_leaves_valid_item_untouched() {
+        let item = Node::element_with_content(
+            NodeType::ListItem,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("ok")]),
+            )]),
+        );
+        let fixed = ensure_list_item(item.clone(), NodeType::ListItem);
+        assert_eq!(fixed, item);
+    }
+
+    #[test]
+    fn normalize_wraps_bare_text_under_list() {
+        // The actual corruption behind the undeletable "e.": a bare text
+        // run sits directly inside a BulletList, between real items, with
+        // no enclosing item. find_block_at finds no textblock for it, so no
+        // backspace path can remove it. Normalize must wrap it as a proper
+        // item so every child of the list is an item.
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("real")]),
+                        )]),
+                    ),
+                    // Orphaned bare text directly inside the list.
+                    Node::text("e."),
+                ]),
+            )]),
+        );
+        let normalized = normalize_doc(&doc);
+        let list = normalized.child(0).unwrap();
+        assert_eq!(list.child_count(), 2);
+        for i in 0..2 {
+            assert_eq!(
+                list.child(i).unwrap().node_type(),
+                Some(NodeType::ListItem),
+                "every direct child of a list must be a ListItem",
+            );
+        }
+        // The "e." text is preserved, now inside a paragraph in its item.
+        let wrapped = list.child(1).unwrap();
+        assert_eq!(wrapped.child(0).unwrap().node_type(), Some(NodeType::Paragraph));
+        assert_eq!(normalized.text_content(), "reale.");
+    }
+
+    #[test]
+    fn normalize_preserves_nested_list_first_item() {
+        // Regression guard: a ListItem whose first child is a nested list
+        // (no leading paragraph) is schema-VALID — ListItem.valid_children
+        // includes BulletList (schema.rs). Normalize must NOT rewrite it
+        // (e.g. by injecting an empty paragraph), or merely opening a doc
+        // would mutate valid content and churn CRDT state to collaborators.
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::ListItem,
+                    // First (only) child is a nested list — no paragraph.
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::BulletList,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::ListItem,
+                            Fragment::from(vec![Node::element_with_content(
+                                NodeType::Paragraph,
+                                Fragment::from(vec![Node::text("child")]),
+                            )]),
+                        )]),
+                    )]),
+                )]),
+            )]),
+        );
+        let normalized = normalize_doc(&doc);
+        assert_eq!(normalized, doc, "valid nested-list-first item must be left unchanged");
+    }
+
+    #[test]
+    fn normalize_wraps_stray_block_under_list() {
+        // Bug: a raw paste can drop a bare Paragraph directly inside a
+        // list (schema allows only list items as list children). The
+        // paragraph is found by find_block_at but not by find_item_at, so
+        // backspace at its start hits "no action available" and the block
+        // resists deletion. Normalize must wrap it in a list item.
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![
+                    Node::element_with_content(
+                        NodeType::Paragraph,
+                        Fragment::from(vec![Node::text("stray")]),
+                    ),
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("real")]),
+                        )]),
+                    ),
+                ]),
+            )]),
+        );
+        let normalized = normalize_doc(&doc);
+        let list = normalized.child(0).unwrap();
+        assert_eq!(list.node_type(), Some(NodeType::BulletList));
+        assert_eq!(list.child_count(), 2);
+        for i in 0..2 {
+            assert_eq!(
+                list.child(i).unwrap().node_type(),
+                Some(NodeType::ListItem),
+                "every direct child of a list must be a ListItem",
+            );
+        }
+        assert_eq!(normalized.text_content(), "strayreal");
     }
 
     #[test]

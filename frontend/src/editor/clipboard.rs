@@ -560,6 +560,123 @@ pub fn fit_slice_to_context(slice: Slice, parent_type: NodeType) -> Slice {
     Slice::new(Fragment::from(fitted), slice.open_start, slice.open_end)
 }
 
+/// Turn pasted content into valid list items of `item_type`, for the
+/// in-list paste path (pasting list content while the cursor is already in
+/// a list). Items from pasted lists are extracted so they land as siblings
+/// in the current list; every item is coerced to `item_type` (keeping the
+/// target list homogeneous) and its content is run through
+/// [`fit_slice_to_context`] against the list-item context — the same
+/// schema-fitting the non-list paste branch applies — so pasted headings,
+/// bare text, or otherwise-invalid content become valid list-item content
+/// instead of orphaned, undeletable nodes directly inside the list. Stray
+/// non-list content pasted alongside is fitted and wrapped in its own item.
+///
+/// Every returned node is a valid `item_type` with a cursor-addressable
+/// first block.
+pub fn fit_pasted_list_items(slice: &Slice, item_type: NodeType) -> Vec<Node> {
+    let mut items = Vec::new();
+    for node in &slice.content.children {
+        collect_as_list_items(node, item_type, &mut items);
+    }
+    items
+}
+
+fn collect_as_list_items(node: &Node, item_type: NodeType, out: &mut Vec<Node>) {
+    match node.node_type() {
+        // A pasted list: extract its children so they become siblings in
+        // the target list rather than a nested sub-list.
+        Some(NodeType::BulletList | NodeType::OrderedList | NodeType::TaskList) => {
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i) {
+                    collect_as_list_items(child, item_type, out);
+                }
+            }
+        }
+        // An existing list item: coerce to the target type and fit its
+        // content to the list-item context. Nested lists inside the item
+        // keep their nesting but get their own children sanitized
+        // recursively — the same orphan corruption is otherwise possible
+        // one level down, where needs_normalize (Doc-direct-children only)
+        // won't self-heal it in-session.
+        Some(NodeType::ListItem | NodeType::TaskItem) => {
+            if let Node::Element { attrs, content, .. } = node {
+                let fitted =
+                    fit_slice_to_context(Slice::new(content.clone(), 0, 0), item_type);
+                let children: Vec<Node> = fitted
+                    .content
+                    .children
+                    .into_iter()
+                    .filter_map(|child| match child.node_type() {
+                        Some(
+                            NodeType::BulletList
+                            | NodeType::OrderedList
+                            | NodeType::TaskList,
+                        ) => sanitize_nested_list(&child),
+                        _ => Some(child),
+                    })
+                    .collect();
+                let children = if children.is_empty() {
+                    Fragment::from(vec![Node::element(NodeType::Paragraph)])
+                } else {
+                    Fragment::from(children)
+                };
+                // `element_with_attrs` merges the target type's default
+                // attrs (a coerced TaskItem gets `checked=false`, matching
+                // the convert command) with the source attrs (task→task
+                // keeps its checked state) and clears marks (items allow
+                // none). Crossing task→list, drop the now-meaningless
+                // `checked` rather than carry it as a stale attr.
+                let mut attrs = attrs.clone();
+                if item_type != NodeType::TaskItem {
+                    attrs.remove("checked");
+                }
+                out.push(Node::element_with_attrs(item_type, attrs, children));
+            }
+        }
+        // Stray block or bare text pasted alongside the list: fit it to the
+        // list-item context (text/heading/invalid block -> valid content)
+        // and wrap the result in a fresh item. Whitespace-only or
+        // fits-to-nothing content is dropped (parity with the pre-fitter
+        // paste loop) instead of becoming an empty-looking bullet.
+        _ => {
+            if node.text_content().trim().is_empty() {
+                return;
+            }
+            let fitted = fit_slice_to_context(
+                Slice::new(Fragment::from(vec![node.clone()]), 0, 0),
+                item_type,
+            );
+            if !fitted.content.children.is_empty() {
+                out.push(Node::element_with_content(item_type, fitted.content));
+            }
+        }
+    }
+}
+
+/// Rebuild a nested list so every child is a valid item of the list's own
+/// item type (TaskList => TaskItem, else ListItem), recursing through
+/// deeper nesting via [`collect_as_list_items`]. Returns `None` when
+/// nothing valid remains — a list must hold at least one item, so an
+/// emptied nested list is dropped rather than kept schema-invalid.
+fn sanitize_nested_list(list: &Node) -> Option<Node> {
+    let item_type = if list.node_type() == Some(NodeType::TaskList) {
+        NodeType::TaskItem
+    } else {
+        NodeType::ListItem
+    };
+    let mut items = Vec::new();
+    for i in 0..list.child_count() {
+        if let Some(child) = list.child(i) {
+            collect_as_list_items(child, item_type, &mut items);
+        }
+    }
+    if items.is_empty() {
+        None
+    } else {
+        Some(list.copy_with_content(Fragment::from(items)))
+    }
+}
+
 /// Fit a single node into the target parent context.
 fn fit_node(node: Node, parent_type: NodeType) -> Vec<Node> {
     match &node {
@@ -1949,6 +2066,237 @@ mod tests {
         assert_eq!(fitted.content.children[0].text_content(), "plain ");
         assert_eq!(fitted.content.children[1].text_content(), "bold");
         assert!(fitted.content.children[1].marks().iter().any(|m| m.mark_type == MarkType::Bold));
+    }
+
+    // ── fit_pasted_list_items (in-list paste path) ──
+
+    fn bullet_item(text: &str) -> Node {
+        Node::element_with_content(
+            NodeType::ListItem,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text(text)]),
+            )]),
+        )
+    }
+
+    #[test]
+    fn fit_pasted_list_items_extracts_items_from_pasted_list() {
+        let list = Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![bullet_item("a"), bullet_item("b")]),
+        );
+        let slice = Slice::new(Fragment::from(vec![list]), 0, 0);
+        let items = fit_pasted_list_items(&slice, NodeType::ListItem);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|n| n.node_type() == Some(NodeType::ListItem)));
+        assert_eq!(items[0].text_content(), "a");
+        assert_eq!(items[1].text_content(), "b");
+    }
+
+    #[test]
+    fn fit_pasted_list_items_wraps_bare_text_in_list_into_item() {
+        // The "e." corruption at its source: a bare text run sits directly
+        // inside the pasted list. It must become a proper item, not slip in
+        // as an orphaned, undeletable list child.
+        let list = Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![bullet_item("real"), Node::text("e.")]),
+        );
+        let slice = Slice::new(Fragment::from(vec![list]), 0, 0);
+        let items = fit_pasted_list_items(&slice, NodeType::ListItem);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|n| n.node_type() == Some(NodeType::ListItem)));
+        // The "e." text is wrapped in a paragraph inside its item.
+        let wrapped = &items[1];
+        assert_eq!(wrapped.child(0).unwrap().node_type(), Some(NodeType::Paragraph));
+        assert_eq!(wrapped.text_content(), "e.");
+    }
+
+    #[test]
+    fn fit_pasted_list_items_downgrades_heading_in_item() {
+        // A pasted list item whose content is a Heading (invalid in a list
+        // item) is fitted to a paragraph, preserving the text.
+        let item = Node::element_with_content(
+            NodeType::ListItem,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Heading,
+                Fragment::from(vec![Node::text("H")]),
+            )]),
+        );
+        let list = Node::element_with_content(NodeType::BulletList, Fragment::from(vec![item]));
+        let slice = Slice::new(Fragment::from(vec![list]), 0, 0);
+        let items = fit_pasted_list_items(&slice, NodeType::ListItem);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].child(0).unwrap().node_type(), Some(NodeType::Paragraph));
+        assert_eq!(items[0].text_content(), "H");
+    }
+
+    #[test]
+    fn fit_pasted_list_items_coerces_items_to_target_type() {
+        // Pasting a bullet list into a task list yields TaskItems, not a
+        // schema-invalid mix.
+        let list = Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![bullet_item("a")]),
+        );
+        let slice = Slice::new(Fragment::from(vec![list]), 0, 0);
+        let items = fit_pasted_list_items(&slice, NodeType::TaskItem);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].node_type(), Some(NodeType::TaskItem));
+        assert_eq!(items[0].text_content(), "a");
+    }
+
+    #[test]
+    fn fit_pasted_list_items_wraps_stray_block_alongside_list() {
+        // A stray paragraph captured alongside the pasted list becomes its
+        // own item rather than being dropped or inserted raw.
+        let stray = Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("stray")]),
+        );
+        let list = Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![bullet_item("a")]),
+        );
+        let slice = Slice::new(Fragment::from(vec![stray, list]), 0, 0);
+        let items = fit_pasted_list_items(&slice, NodeType::ListItem);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|n| n.node_type() == Some(NodeType::ListItem)));
+        assert_eq!(items[0].text_content(), "stray");
+        assert_eq!(items[1].text_content(), "a");
+    }
+
+    #[test]
+    fn fit_pasted_list_items_sanitizes_nested_lists() {
+        // The orphan corruption one level down: a pasted item contains a
+        // nested list holding a bare text run and a heading-only item.
+        // The nested list's children must be sanitized recursively, not
+        // copied verbatim — otherwise the "e." corruption survives at
+        // depth 1 and needs_normalize (Doc-direct-children only) won't
+        // self-heal it in-session.
+        let nested = Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![
+                Node::text("e."),
+                Node::element_with_content(
+                    NodeType::ListItem,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::Heading,
+                        Fragment::from(vec![Node::text("H")]),
+                    )]),
+                ),
+            ]),
+        );
+        let item = Node::element_with_content(
+            NodeType::ListItem,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("outer")]),
+                ),
+                nested,
+            ]),
+        );
+        let list = Node::element_with_content(NodeType::BulletList, Fragment::from(vec![item]));
+        let slice = Slice::new(Fragment::from(vec![list]), 0, 0);
+        let items = fit_pasted_list_items(&slice, NodeType::ListItem);
+        assert_eq!(items.len(), 1);
+        let outer = &items[0];
+        // The nested list survives as the item's second child…
+        let inner = outer.child(1).unwrap();
+        assert_eq!(inner.node_type(), Some(NodeType::BulletList));
+        // …and every one of its children is a proper ListItem.
+        assert!(inner.child_count() >= 2);
+        for i in 0..inner.child_count() {
+            assert_eq!(
+                inner.child(i).unwrap().node_type(),
+                Some(NodeType::ListItem),
+                "nested list child {i} must be a ListItem",
+            );
+        }
+        // Bare text was wrapped in a paragraph; the heading was downgraded.
+        assert_eq!(inner.child(0).unwrap().text_content(), "e.");
+        assert_eq!(
+            inner.child(0).unwrap().child(0).unwrap().node_type(),
+            Some(NodeType::Paragraph),
+        );
+        assert_eq!(
+            inner.child(1).unwrap().child(0).unwrap().node_type(),
+            Some(NodeType::Paragraph),
+        );
+    }
+
+    #[test]
+    fn fit_pasted_list_items_task_coercion_gets_checked_default() {
+        // Coercing a bullet item into a task list must produce a
+        // schema-complete TaskItem with the default checked=false —
+        // matching the convert command — not a TaskItem missing the attr.
+        let list = Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![bullet_item("a")]),
+        );
+        let slice = Slice::new(Fragment::from(vec![list]), 0, 0);
+        let items = fit_pasted_list_items(&slice, NodeType::TaskItem);
+        assert_eq!(items[0].attrs().get("checked").map(String::as_str), Some("false"));
+    }
+
+    #[test]
+    fn fit_pasted_list_items_preserves_checked_state_between_task_lists() {
+        // Task→task paste keeps the source item's checked=true.
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("checked".to_string(), "true".to_string());
+        let task = Node::element_with_attrs(
+            NodeType::TaskItem,
+            attrs,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("done")]),
+            )]),
+        );
+        let list = Node::element_with_content(NodeType::TaskList, Fragment::from(vec![task]));
+        let slice = Slice::new(Fragment::from(vec![list]), 0, 0);
+        let items = fit_pasted_list_items(&slice, NodeType::TaskItem);
+        assert_eq!(items[0].attrs().get("checked").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn fit_pasted_list_items_drops_stale_checked_on_list_item() {
+        // Task→bullet coercion must not leave a stale checked attr on the
+        // resulting ListItem.
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("checked".to_string(), "true".to_string());
+        let task = Node::element_with_attrs(
+            NodeType::TaskItem,
+            attrs,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("was done")]),
+            )]),
+        );
+        let list = Node::element_with_content(NodeType::TaskList, Fragment::from(vec![task]));
+        let slice = Slice::new(Fragment::from(vec![list]), 0, 0);
+        let items = fit_pasted_list_items(&slice, NodeType::ListItem);
+        assert_eq!(items[0].node_type(), Some(NodeType::ListItem));
+        assert!(items[0].attrs().get("checked").is_none());
+    }
+
+    #[test]
+    fn fit_pasted_list_items_drops_whitespace_only_stray_content() {
+        // Parity with the old paste loop: whitespace-only stray content is
+        // dropped, not turned into an empty-looking bullet.
+        let blank = Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("   ")]),
+        );
+        let list = Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![bullet_item("a")]),
+        );
+        let slice = Slice::new(Fragment::from(vec![blank, list]), 0, 0);
+        let items = fit_pasted_list_items(&slice, NodeType::ListItem);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text_content(), "a");
     }
 
     // ── strip_tags edge cases ──
