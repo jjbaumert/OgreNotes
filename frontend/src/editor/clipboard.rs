@@ -560,6 +560,72 @@ pub fn fit_slice_to_context(slice: Slice, parent_type: NodeType) -> Slice {
     Slice::new(Fragment::from(fitted), slice.open_start, slice.open_end)
 }
 
+/// Turn pasted content into valid list items of `item_type`, for the
+/// in-list paste path (pasting list content while the cursor is already in
+/// a list). Items from pasted lists are extracted so they land as siblings
+/// in the current list; every item is coerced to `item_type` (keeping the
+/// target list homogeneous) and its content is run through
+/// [`fit_slice_to_context`] against the list-item context — the same
+/// schema-fitting the non-list paste branch applies — so pasted headings,
+/// bare text, or otherwise-invalid content become valid list-item content
+/// instead of orphaned, undeletable nodes directly inside the list. Stray
+/// non-list content pasted alongside is fitted and wrapped in its own item.
+///
+/// Every returned node is a valid `item_type` with a cursor-addressable
+/// first block.
+pub fn fit_pasted_list_items(slice: &Slice, item_type: NodeType) -> Vec<Node> {
+    let mut items = Vec::new();
+    for node in &slice.content.children {
+        collect_as_list_items(node, item_type, &mut items);
+    }
+    items
+}
+
+fn collect_as_list_items(node: &Node, item_type: NodeType, out: &mut Vec<Node>) {
+    match node.node_type() {
+        // A pasted list: extract its children so they become siblings in
+        // the target list rather than a nested sub-list.
+        Some(NodeType::BulletList | NodeType::OrderedList | NodeType::TaskList) => {
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i) {
+                    collect_as_list_items(child, item_type, out);
+                }
+            }
+        }
+        // An existing list item: coerce to the target type (preserving
+        // attrs/marks) and fit its content to the list-item context.
+        Some(NodeType::ListItem | NodeType::TaskItem) => {
+            if let Node::Element { attrs, content, marks, .. } = node {
+                let fitted =
+                    fit_slice_to_context(Slice::new(content.clone(), 0, 0), item_type);
+                let children = if fitted.content.children.is_empty() {
+                    Fragment::from(vec![Node::element(NodeType::Paragraph)])
+                } else {
+                    fitted.content
+                };
+                out.push(Node::Element {
+                    node_type: item_type,
+                    attrs: attrs.clone(),
+                    content: children,
+                    marks: marks.clone(),
+                });
+            }
+        }
+        // Stray block or bare text pasted alongside the list: fit it to the
+        // list-item context (text/heading/invalid block -> valid content)
+        // and wrap the result in a fresh item. Drop if it fits to nothing.
+        _ => {
+            let fitted = fit_slice_to_context(
+                Slice::new(Fragment::from(vec![node.clone()]), 0, 0),
+                item_type,
+            );
+            if !fitted.content.children.is_empty() {
+                out.push(Node::element_with_content(item_type, fitted.content));
+            }
+        }
+    }
+}
+
 /// Fit a single node into the target parent context.
 fn fit_node(node: Node, parent_type: NodeType) -> Vec<Node> {
     match &node {
@@ -1939,6 +2005,105 @@ mod tests {
         assert_eq!(fitted.content.children[0].text_content(), "plain ");
         assert_eq!(fitted.content.children[1].text_content(), "bold");
         assert!(fitted.content.children[1].marks().iter().any(|m| m.mark_type == MarkType::Bold));
+    }
+
+    // ── fit_pasted_list_items (in-list paste path) ──
+
+    fn bullet_item(text: &str) -> Node {
+        Node::element_with_content(
+            NodeType::ListItem,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text(text)]),
+            )]),
+        )
+    }
+
+    #[test]
+    fn fit_pasted_list_items_extracts_items_from_pasted_list() {
+        let list = Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![bullet_item("a"), bullet_item("b")]),
+        );
+        let slice = Slice::new(Fragment::from(vec![list]), 0, 0);
+        let items = fit_pasted_list_items(&slice, NodeType::ListItem);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|n| n.node_type() == Some(NodeType::ListItem)));
+        assert_eq!(items[0].text_content(), "a");
+        assert_eq!(items[1].text_content(), "b");
+    }
+
+    #[test]
+    fn fit_pasted_list_items_wraps_bare_text_in_list_into_item() {
+        // The "e." corruption at its source: a bare text run sits directly
+        // inside the pasted list. It must become a proper item, not slip in
+        // as an orphaned, undeletable list child.
+        let list = Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![bullet_item("real"), Node::text("e.")]),
+        );
+        let slice = Slice::new(Fragment::from(vec![list]), 0, 0);
+        let items = fit_pasted_list_items(&slice, NodeType::ListItem);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|n| n.node_type() == Some(NodeType::ListItem)));
+        // The "e." text is wrapped in a paragraph inside its item.
+        let wrapped = &items[1];
+        assert_eq!(wrapped.child(0).unwrap().node_type(), Some(NodeType::Paragraph));
+        assert_eq!(wrapped.text_content(), "e.");
+    }
+
+    #[test]
+    fn fit_pasted_list_items_downgrades_heading_in_item() {
+        // A pasted list item whose content is a Heading (invalid in a list
+        // item) is fitted to a paragraph, preserving the text.
+        let item = Node::element_with_content(
+            NodeType::ListItem,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Heading,
+                Fragment::from(vec![Node::text("H")]),
+            )]),
+        );
+        let list = Node::element_with_content(NodeType::BulletList, Fragment::from(vec![item]));
+        let slice = Slice::new(Fragment::from(vec![list]), 0, 0);
+        let items = fit_pasted_list_items(&slice, NodeType::ListItem);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].child(0).unwrap().node_type(), Some(NodeType::Paragraph));
+        assert_eq!(items[0].text_content(), "H");
+    }
+
+    #[test]
+    fn fit_pasted_list_items_coerces_items_to_target_type() {
+        // Pasting a bullet list into a task list yields TaskItems, not a
+        // schema-invalid mix.
+        let list = Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![bullet_item("a")]),
+        );
+        let slice = Slice::new(Fragment::from(vec![list]), 0, 0);
+        let items = fit_pasted_list_items(&slice, NodeType::TaskItem);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].node_type(), Some(NodeType::TaskItem));
+        assert_eq!(items[0].text_content(), "a");
+    }
+
+    #[test]
+    fn fit_pasted_list_items_wraps_stray_block_alongside_list() {
+        // A stray paragraph captured alongside the pasted list becomes its
+        // own item rather than being dropped or inserted raw.
+        let stray = Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("stray")]),
+        );
+        let list = Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![bullet_item("a")]),
+        );
+        let slice = Slice::new(Fragment::from(vec![stray, list]), 0, 0);
+        let items = fit_pasted_list_items(&slice, NodeType::ListItem);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|n| n.node_type() == Some(NodeType::ListItem)));
+        assert_eq!(items[0].text_content(), "stray");
+        assert_eq!(items[1].text_content(), "a");
     }
 
     // ── strip_tags edge cases ──
