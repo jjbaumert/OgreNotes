@@ -121,13 +121,18 @@ fn build_level(
     // whose endpoints resolve to the same entity for any other reason
     // belong to a deeper level and were already consumed there; edges with
     // an endpoint outside `target`'s subtree belong to a shallower level.
+    // The `Entity::Node` gate on the self-loop branch matters: at ancestor
+    // levels a self-loop's endpoints both resolve to the same CLUSTER
+    // placeholder (`rf == rt` there too), and without the gate the loop
+    // would be emitted again at every ancestor level. A self-loop belongs
+    // only to the one level where its node is a direct member.
     let mut local_edges = Vec::new();
     let mut local_edge_orig = Vec::new();
     for (ei, edge) in input.edges.iter().enumerate() {
         let rf = representative_of(input, edge.from, target);
         let rt = representative_of(input, edge.to, target);
         if let (Some(rf), Some(rt)) = (rf, rt) {
-            if rf != rt || edge.from == edge.to {
+            if rf != rt || (edge.from == edge.to && matches!(rf, Entity::Node(_))) {
                 local_edges.push(LEdge {
                     from: entity_index[&rf],
                     to: entity_index[&rt],
@@ -397,5 +402,44 @@ mod tests {
         // Rect exists (title-sized minimum), no panic.
         assert_eq!(l.cluster_rects.len(), 1);
         assert!(l.cluster_rects[0].w > 0.0);
+    }
+
+    #[test]
+    fn self_loop_in_cluster_emitted_exactly_once() {
+        // 0 top-level -> 1 (in cluster); 1 -> 1 self-loop.
+        let input = LayoutInput {
+            nodes: vec![node_in(None), node_in(Some(0))],
+            edges: vec![e(0, 1), e(1, 1)],
+            clusters: vec![LCluster { parent: None, title: (50.0, 16.0) }],
+            direction: Direction::TB,
+        };
+        let l = run_clustered(&input).unwrap();
+        assert_eq!(l.edge_paths.len(), input.edges.len());
+        let loops: Vec<_> = l.edge_paths.iter().filter(|p| p.edge == 1).collect();
+        assert_eq!(loops.len(), 1, "self-loop must be emitted exactly once");
+        for p in &loops[0].points {
+            assert!(p.0.is_finite() && p.1.is_finite());
+        }
+    }
+
+    #[test]
+    fn self_loop_in_nested_cluster_emitted_exactly_once() {
+        // 0 top-level -> 1 (in inner cluster, two levels deep); 1 -> 1.
+        let input = LayoutInput {
+            nodes: vec![node_in(None), node_in(Some(1))],
+            edges: vec![e(0, 1), e(1, 1)],
+            clusters: vec![
+                LCluster { parent: None, title: (50.0, 16.0) },
+                LCluster { parent: Some(0), title: (50.0, 16.0) },
+            ],
+            direction: Direction::TB,
+        };
+        let l = run_clustered(&input).unwrap();
+        assert_eq!(l.edge_paths.len(), input.edges.len());
+        let loops: Vec<_> = l.edge_paths.iter().filter(|p| p.edge == 1).collect();
+        assert_eq!(loops.len(), 1, "self-loop must be emitted exactly once");
+        for p in &loops[0].points {
+            assert!(p.0.is_finite() && p.1.is_finite());
+        }
     }
 }
