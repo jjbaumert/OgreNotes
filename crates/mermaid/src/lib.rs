@@ -5,6 +5,8 @@
 //! and no SVG, so callers can fall back to raw source. See
 //! docs/superpowers/specs/2026-07-08-mermaid-support-design.md.
 
+mod pie;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagramKind {
     Pie,
@@ -71,17 +73,10 @@ pub fn detect_kind(source: &str) -> DiagramKind {
 pub fn render(source: &str) -> RenderOutput {
     let kind = detect_kind(source);
     match kind {
-        DiagramKind::Pie => {
-            // Filled in by Task 2. Until then, a structured error.
-            RenderOutput {
-                kind,
-                svg: None,
-                error: Some(ParseError {
-                    message: "pie rendering not yet implemented".to_string(),
-                    line: None,
-                }),
-            }
-        }
+        DiagramKind::Pie => match pie::parse(source) {
+            Ok(p) => RenderOutput { kind, svg: Some(pie::render_svg(&p)), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
         DiagramKind::Unknown => RenderOutput {
             kind,
             svg: None,
@@ -136,6 +131,23 @@ mod tests {
     fn unknown_kind_returns_error() {
         let out = render("total gibberish");
         assert_eq!(out.kind, DiagramKind::Unknown);
+        assert!(out.svg.is_none());
+        assert!(out.error.is_some());
+    }
+
+    #[test]
+    fn pie_renders_svg_via_public_render() {
+        let out = render("pie title T\n\"A\" : 1\n\"B\" : 1");
+        assert_eq!(out.kind, DiagramKind::Pie);
+        assert!(out.error.is_none());
+        let svg = out.svg.expect("pie should render");
+        assert!(svg.starts_with("<svg"));
+    }
+
+    #[test]
+    fn pie_parse_error_flows_through_render() {
+        let out = render("pie\n\"A\" : notanumber");
+        assert_eq!(out.kind, DiagramKind::Pie);
         assert!(out.svg.is_none());
         assert!(out.error.is_some());
     }
