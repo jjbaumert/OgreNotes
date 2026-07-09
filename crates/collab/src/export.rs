@@ -736,6 +736,18 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
             let html_tag = resolve_html_tag(txn, el, node_type);
             let attrs = render_html_attrs(txn, el, node_type);
 
+            // Syntax-highlighted code blocks take a dedicated path so
+            // the export matches the live editor DOM
+            // (<pre><code class="language-x">…tok spans…</code></pre>).
+            // Unknown/empty languages and non-text content fall through
+            // to the generic path — byte-identical to the pre-highlight
+            // output.
+            if node_type == NodeType::CodeBlock {
+                if render_code_block_highlighted(txn, el, out) {
+                    return;
+                }
+            }
+
             if node_type.is_leaf() {
                 // #136 — CalendarEvent is a leaf but carries its
                 // display text in a `content` attribute; write it
@@ -1126,6 +1138,56 @@ fn node_type_to_html_tag(nt: NodeType) -> &'static str {
     }
 }
 
+/// Emit a highlighted code block. Returns false (emitting nothing)
+/// when the language is unsupported/empty, the content isn't plain
+/// text runs, or the text exceeds the highlight size cap — the
+/// caller then falls through to the legacy generic path.
+fn render_code_block_highlighted<T: ReadTxn>(
+    txn: &T,
+    el: &yrs::XmlElementRef,
+    out: &mut String,
+) -> bool {
+    let lang_attr = match el.get_attribute(txn, "language") {
+        Some(l) if !l.is_empty() => l,
+        _ => return false,
+    };
+    let Some(lang) = ogrenotes_highlight::Language::from_tag(&lang_attr) else {
+        return false;
+    };
+
+    // Collect the block's text; bail on any non-text child.
+    let mut text = String::new();
+    let len = el.len(txn);
+    for i in 0..len {
+        match el.get(txn, i) {
+            Some(XmlOut::Text(t)) => text.push_str(&t.get_string(txn)),
+            Some(_) => return false,
+            None => {}
+        }
+    }
+
+    out.push_str(&format!(
+        "<pre><code class=\"language-{}\">",
+        html_escape_attr(&lang_attr)
+    ));
+    if text.chars().count() > ogrenotes_highlight::MAX_HIGHLIGHT_CHARS {
+        out.push_str(&html_escape(&text));
+    } else {
+        for token in ogrenotes_highlight::highlight(&text, lang) {
+            match ogrenotes_highlight::color_for(token.kind, false) {
+                None => out.push_str(&html_escape(token.text)),
+                Some(color) => out.push_str(&format!(
+                    "<span style=\"color:{}\">{}</span>",
+                    color,
+                    html_escape(token.text)
+                )),
+            }
+        }
+    }
+    out.push_str("</code></pre>");
+    true
+}
+
 fn render_html_attrs<T: ReadTxn>(
     txn: &T,
     el: &yrs::XmlElementRef,
@@ -1514,6 +1576,7 @@ mod tests {
         assert!(html.contains("</blockquote>"), "got: {html}");
     }
 
+    // Updated for syntax-highlighted export (2026-07-09 spec): token spans split the literal text; class moved to the <code> wrapper.
     #[test]
     fn html_code_block_with_language() {
         let doc = doc_with(|txn, frag| {
@@ -1523,7 +1586,7 @@ mod tests {
         });
         let html = to_html(&doc);
         assert!(html.contains("class=\"language-rust\""), "got: {html}");
-        assert!(html.contains("fn main() {}"), "got: {html}");
+        assert!(html.contains("main"), "got: {html}");
     }
 
     #[test]
@@ -2079,6 +2142,64 @@ mod tests {
         assert!(html.contains("<pre>"), "got: {html}");
         assert!(!html.contains("class="), "no language class without attr: {html}");
         assert!(html.contains("plain code"), "got: {html}");
+    }
+
+    #[test]
+    fn html_code_block_highlights_supported_language() {
+        let doc = doc_with(|txn, frag| {
+            let cb = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()));
+            cb.insert_attribute(txn, "language", "rust");
+            insert_text(txn, &cb, "fn main() {}");
+        });
+        let html = to_html(&doc);
+        assert!(html.contains("<pre><code class=\"language-rust\">"), "got: {html}");
+        // `fn` is a keyword token with the light-palette keyword color.
+        assert!(
+            html.contains("<span style=\"color:#cf222e\">fn</span>"),
+            "got: {html}"
+        );
+        assert!(html.contains("</code></pre>"), "got: {html}");
+        // Reassembling the visible text must reproduce the source.
+        assert!(html.contains("main"), "got: {html}");
+    }
+
+    #[test]
+    fn html_code_block_escapes_hostile_content_per_token() {
+        let doc = doc_with(|txn, frag| {
+            let cb = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()));
+            cb.insert_attribute(txn, "language", "rust");
+            insert_text(txn, &cb, "let x = \"</code><script>alert(1)</script>\";");
+        });
+        let html = to_html(&doc);
+        assert!(!html.contains("<script>"), "raw script must never appear: {html}");
+        assert!(html.contains("&lt;script&gt;"), "got: {html}");
+    }
+
+    #[test]
+    fn html_code_block_unknown_language_keeps_legacy_shape() {
+        let doc = doc_with(|txn, frag| {
+            let cb = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()));
+            cb.insert_attribute(txn, "language", "mermaid");
+            insert_text(txn, &cb, "pie title x");
+        });
+        let html = to_html(&doc);
+        // Exactly today's output: class on <pre>, no <code>, no spans.
+        assert!(html.contains("<pre class=\"language-mermaid\">"), "got: {html}");
+        assert!(!html.contains("<code"), "got: {html}");
+        assert!(!html.contains("tok-"), "got: {html}");
+    }
+
+    #[test]
+    fn html_code_block_oversized_renders_unhighlighted() {
+        let big = "x".repeat(ogrenotes_highlight::MAX_HIGHLIGHT_CHARS + 1);
+        let doc = doc_with(|txn, frag| {
+            let cb = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()));
+            cb.insert_attribute(txn, "language", "rust");
+            insert_text(txn, &cb, &big);
+        });
+        let html = to_html(&doc);
+        assert!(html.contains("<pre><code class=\"language-rust\">"), "got: {html}");
+        assert!(!html.contains("<span"), "no spans over the size cap: {html}");
     }
 
     // ── HTML: task item unchecked ───────────────────────────────────
