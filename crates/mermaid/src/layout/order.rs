@@ -249,7 +249,7 @@ fn windows_by_rank(g: &OrderGraph) -> Vec<Vec<(SlotKind, SlotKind)>> {
 }
 
 /// Positions of each slot's chain-neighbors on the adjacent rank.
-fn neighbor_positions(
+pub(crate) fn neighbor_positions(
     g: &OrderGraph,
     rank: usize,
     upstream: bool,

@@ -9,6 +9,7 @@
 
 pub(crate) mod acyclic;
 pub(crate) mod order;
+pub(crate) mod position;
 pub(crate) mod rank;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
