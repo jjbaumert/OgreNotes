@@ -9,7 +9,7 @@ use super::{EdgePath, LayoutInput};
 
 /// Clip point `toward` -> `center` at the bounding box of a node with
 /// the given half-extents, returning the border intersection.
-fn clip_to_box(center: (f64, f64), half: (f64, f64), toward: (f64, f64)) -> (f64, f64) {
+pub(crate) fn clip_to_box(center: (f64, f64), half: (f64, f64), toward: (f64, f64)) -> (f64, f64) {
     let (dx, dy) = (toward.0 - center.0, toward.1 - center.1);
     if dx.abs() < 1e-9 && dy.abs() < 1e-9 {
         return center;

@@ -8,6 +8,7 @@
 //! coordinate transform). See the slice-2 design spec.
 
 pub(crate) mod acyclic;
+pub(crate) mod cluster;
 pub(crate) mod order;
 pub(crate) mod position;
 pub(crate) mod rank;
@@ -191,17 +192,28 @@ pub(crate) fn apply_direction(layout: &mut Layout, dir: Direction) {
     }
 }
 
-/// Full pipeline for FLAT graphs. Cluster inputs are dispatched to the
-/// collapse-expand driver (Task 7); until then they error.
+/// Full pipeline: flat graphs go straight through `run_flat`; graphs with
+/// clusters are dispatched to the recursive collapse-expand driver.
 pub(crate) fn run(input: &LayoutInput) -> Result<Layout, String> {
     validate(input)?;
-    if !input.clusters.is_empty() {
-        return Err("clusters not yet supported".to_string()); // Task 7 replaces
+    if input.clusters.is_empty() {
+        run_flat(input)
+    } else {
+        cluster::run_clustered(input)
     }
-    run_flat(input)
 }
 
 pub(crate) fn run_flat(input: &LayoutInput) -> Result<Layout, String> {
+    let mut layout = layout_tb(input)?;
+    apply_direction(&mut layout, input.direction);
+    Ok(layout)
+}
+
+/// Lays a flat graph out top-to-bottom without applying `direction`. Used
+/// directly by `run_flat`, and by the cluster driver for both sub-layouts
+/// and the top-level assembly, so that `apply_direction` runs exactly once
+/// on the fully-assembled whole.
+pub(crate) fn layout_tb(input: &LayoutInput) -> Result<Layout, String> {
     let ac = acyclic::make_acyclic(input.nodes.len(), &input.edges);
     let ranks = rank::assign_ranks(input.nodes.len(), &ac.edges);
     // Order-graph nodes are the ORIGINAL nodes; edges are the surviving
@@ -222,13 +234,12 @@ pub(crate) fn run_flat(input: &LayoutInput) -> Result<Layout, String> {
         }
     }
     let edge_paths = route::route_edges(input, &ac, &g, &coords);
-    let mut layout = Layout {
+    let layout = Layout {
         node_centers,
         edge_paths,
         cluster_rects: vec![],
         size: coords.size,
     };
-    apply_direction(&mut layout, input.direction);
     Ok(layout)
 }
 
