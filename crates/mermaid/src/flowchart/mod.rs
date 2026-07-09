@@ -4,6 +4,7 @@
 pub(crate) mod measure;
 pub(crate) mod parse;
 pub(crate) mod shapes;
+pub(crate) mod svg;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShapeKind {
@@ -69,4 +70,46 @@ pub(crate) struct FlowGraph {
     pub edges: Vec<FlowEdge>,
     pub subgraphs: Vec<FlowSubgraph>,
     pub class_defs: Vec<ClassDef>,
+}
+
+/// Full flowchart pipeline: parse -> measure -> layout -> SVG. Never
+/// panics; a layout failure (diagram too large, malformed cluster tree)
+/// surfaces as a `ParseError` with no source line.
+pub(crate) fn render_flowchart(source: &str) -> Result<String, crate::ParseError> {
+    let g = parse::parse(source)?;
+    let mut nodes = Vec::with_capacity(g.nodes.len());
+    for n in &g.nodes {
+        let (tw, th) = measure::text_size(&n.label);
+        let (w, h) = shapes::size_for(n.shape, tw, th);
+        nodes.push(crate::layout::LNode { width: w, height: h, cluster: n.subgraph });
+    }
+    let edges = g
+        .edges
+        .iter()
+        .map(|e| crate::layout::LEdge {
+            from: e.from,
+            to: e.to,
+            label: e.label.as_deref().map(|l| {
+                let (w, h) = measure::text_size(l);
+                (w + 8.0, h + 4.0)
+            }),
+        })
+        .collect();
+    let clusters = g
+        .subgraphs
+        .iter()
+        .map(|s| crate::layout::LCluster {
+            parent: s.parent,
+            title: measure::text_size(&s.title),
+        })
+        .collect();
+    let input = crate::layout::LayoutInput {
+        nodes,
+        edges,
+        clusters,
+        direction: g.direction,
+    };
+    let layout = crate::layout::run(&input)
+        .map_err(|message| crate::ParseError { message, line: None })?;
+    Ok(svg::emit(&g, &layout))
 }
