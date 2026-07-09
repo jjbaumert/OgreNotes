@@ -37,6 +37,34 @@ pub enum MermaidModalOutcome {
     Cancel,
 }
 
+/// Why Save is blocked for a given draft, mirroring the server-side gate
+/// in `crates/collab/src/blocks/mermaid.rs::validate_attrs` so the modal
+/// never dispatches a WS update the server is guaranteed to reject (which
+/// would otherwise silently diverge client/server state and lose the
+/// user's edit on refresh). `None` means the draft is save-able.
+///
+/// Pure and DOM-free so it can be unit-tested natively (no wasm target
+/// needed) — see the `save_blocked` tests below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveBlockedReason {
+    Empty,
+    TooLong,
+}
+
+/// Mirrors `crates/collab/src/blocks/mermaid.rs::validate_attrs`: empty
+/// (or whitespace-only) source, or source over
+/// `ogrenotes_mermaid::MAX_SOURCE_LEN` chars, both hard-fail the server's
+/// write gate.
+pub fn save_blocked(source: &str) -> Option<SaveBlockedReason> {
+    if source.trim().is_empty() {
+        Some(SaveBlockedReason::Empty)
+    } else if source.chars().count() > ogrenotes_mermaid::MAX_SOURCE_LEN {
+        Some(SaveBlockedReason::TooLong)
+    } else {
+        None
+    }
+}
+
 #[component]
 pub fn MermaidModal(
     /// `Some` → open; `None` → hidden. Parent writes; modal reads.
@@ -88,6 +116,13 @@ fn render_modal(
         let block_id = block_id_for_save.clone();
         move |()| {
             let src = source.get();
+            // Second guard behind the disabled Save button: mirror the
+            // server's hard gate (empty / over MAX_SOURCE_LEN) so a
+            // dispatched Save can never be rejected by the write gate —
+            // that divergence would lose the user's edit on refresh.
+            if save_blocked(&src).is_some() {
+                return;
+            }
             state.set(None);
             on_outcome.run(MermaidModalOutcome::Save {
                 block_id: block_id.clone(),
@@ -95,6 +130,7 @@ fn render_modal(
             });
         }
     });
+    let blocked_reason = Signal::derive(move || save_blocked(&source.get()));
 
     // Live preview: rendered on each keystroke through the same
     // `ogrenotes_mermaid::render` pipeline the block view uses.
@@ -151,6 +187,18 @@ fn render_modal(
                     <div class="mermaid-preview">{preview}</div>
                 </div>
                 <div class="calendar-modal-actions">
+                    {move || {
+                        blocked_reason.get().map(|reason| {
+                            let msg = match reason {
+                                SaveBlockedReason::Empty => crate::t!("mermaid-modal-error-empty"),
+                                SaveBlockedReason::TooLong => crate::t!(
+                                    "mermaid-modal-error-too-long",
+                                    max = ogrenotes_mermaid::MAX_SOURCE_LEN as i64
+                                ),
+                            };
+                            view! { <span class="mermaid-modal-error" role="alert">{msg}</span> }.into_any()
+                        })
+                    }}
                     <span class="calendar-modal-spacer"></span>
                     <button
                         class="btn btn-secondary"
@@ -160,6 +208,7 @@ fn render_modal(
                     </button>
                     <button
                         class="btn btn-primary"
+                        prop:disabled=move || blocked_reason.get().is_some()
                         on:click=move |_| a11y::defer_close(save_cb)
                     >
                         {crate::t!("mermaid-modal-save")}
@@ -176,4 +225,40 @@ fn event_target_value(e: &web_sys::Event) -> String {
         .and_then(|t| t.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
         .map(|el| el.value())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pure, DOM-free: mirrors `crates/collab/src/blocks/mermaid.rs`'s
+    // `validate_attrs` gate so Save never dispatches a WS update the
+    // server is guaranteed to reject.
+
+    #[test]
+    fn save_blocked_none_for_valid_source() {
+        assert_eq!(save_blocked("pie\n\"A\" : 1"), None);
+    }
+
+    #[test]
+    fn save_blocked_empty_for_blank_source() {
+        assert_eq!(save_blocked(""), Some(SaveBlockedReason::Empty));
+    }
+
+    #[test]
+    fn save_blocked_empty_for_whitespace_only_source() {
+        assert_eq!(save_blocked("   \n\t  "), Some(SaveBlockedReason::Empty));
+    }
+
+    #[test]
+    fn save_blocked_none_at_exactly_max_len() {
+        let src = "x".repeat(ogrenotes_mermaid::MAX_SOURCE_LEN);
+        assert_eq!(save_blocked(&src), None);
+    }
+
+    #[test]
+    fn save_blocked_too_long_over_max_len() {
+        let src = "x".repeat(ogrenotes_mermaid::MAX_SOURCE_LEN + 1);
+        assert_eq!(save_blocked(&src), Some(SaveBlockedReason::TooLong));
+    }
 }
