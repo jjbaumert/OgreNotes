@@ -106,6 +106,44 @@ mod tests {
             .collect();
         assert_eq!(ka, kb);
     }
+
+    #[test]
+    fn large_graph_minimize_crossings_completes_and_is_deterministic() {
+        // Smoke bound at roughly engine-cap shape: a long chain plus a
+        // batch of long-span edges, each of which fans out into dozens of
+        // dummy slots. This exercises the bucketed neighbor/crossing
+        // lookups against hundreds of chain windows per rank instead of
+        // just a handful, without asserting on wall-clock time.
+        let node_count = 120;
+        let nodes: Vec<LNode> = (0..node_count).map(|_| n()).collect();
+        let mut edges: Vec<LEdge> = (0..node_count - 1).map(|i| e(i, i + 1)).collect();
+        for k in 0..60 {
+            let from = k;
+            let to = (k + 40).min(node_count - 1);
+            if to > from {
+                edges.push(e(from, to));
+            }
+        }
+        let ranks: Vec<usize> = (0..node_count).collect();
+
+        let mut a = build_order_graph(&nodes, &edges, &ranks);
+        let mut b = build_order_graph(&nodes, &edges, &ranks);
+        minimize_crossings(&mut a, &edges);
+        minimize_crossings(&mut b, &edges);
+
+        assert_eq!(a.ranks.len(), node_count);
+        let ka: Vec<Vec<String>> = a
+            .ranks
+            .iter()
+            .map(|r| r.iter().map(|s| format!("{:?}", s.kind)).collect())
+            .collect();
+        let kb: Vec<Vec<String>> = b
+            .ranks
+            .iter()
+            .map(|r| r.iter().map(|s| format!("{:?}", s.kind)).collect())
+            .collect();
+        assert_eq!(ka, kb);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -181,6 +219,35 @@ pub(crate) fn build_order_graph(
     OrderGraph { ranks: rows, chains }
 }
 
+/// Buckets every chain window `(a, b)` by the rank its upper element `a`
+/// lives on. Because a chain's slots descend consecutive ranks, `a`'s rank
+/// is also `b`'s rank minus one, so bucket `r` holds exactly the windows
+/// bridging rank `r` and rank `r + 1`. Built in one pass over `g.chains`
+/// (a second pass over `g.ranks` supplies the slot→rank lookup), so the
+/// whole structure costs O(total_windows) regardless of how many ranks or
+/// slots-per-rank the graph has. Windows are pushed in chain-index order
+/// (chains outer, window-within-chain inner) so consumers that want a
+/// deterministic per-slot neighbor order can rely on bucket order.
+fn windows_by_rank(g: &OrderGraph) -> Vec<Vec<(SlotKind, SlotKind)>> {
+    let mut slot_rank: std::collections::HashMap<SlotKind, usize> =
+        std::collections::HashMap::new();
+    for (r, row) in g.ranks.iter().enumerate() {
+        for s in row {
+            slot_rank.insert(s.kind, r);
+        }
+    }
+    let mut buckets: Vec<Vec<(SlotKind, SlotKind)>> = vec![Vec::new(); g.ranks.len()];
+    for chain in &g.chains {
+        for w in chain.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if let Some(&r) = slot_rank.get(&a) {
+                buckets[r].push((a, b));
+            }
+        }
+    }
+    buckets
+}
+
 /// Positions of each slot's chain-neighbors on the adjacent rank.
 fn neighbor_positions(
     g: &OrderGraph,
@@ -189,7 +256,12 @@ fn neighbor_positions(
 ) -> Vec<Vec<usize>> {
     // For each slot on `rank`, collect current index positions of the
     // slots adjacent to it (previous rank if upstream, next if not)
-    // along every edge chain that passes through it.
+    // along every edge chain that passes through it. Only the one bucket
+    // that actually borders `rank` is walked (O(bucket) instead of
+    // scanning every chain window in the graph); building the bucket
+    // index itself is O(total_windows), so a call here costs
+    // O(total_windows + slots_on_rank) rather than the previous
+    // O(slots_on_rank * total_windows).
     let adj_rank = if upstream { rank.wrapping_sub(1) } else { rank + 1 };
     let mut pos_of: std::collections::HashMap<SlotKind, usize> =
         std::collections::HashMap::new();
@@ -198,29 +270,38 @@ fn neighbor_positions(
             pos_of.insert(s.kind, i);
         }
     }
-    g.ranks[rank]
-        .iter()
-        .map(|slot| {
-            let mut out = Vec::new();
-            for chain in &g.chains {
-                for w in chain.windows(2) {
-                    let (a, b) = (w[0], w[1]);
-                    let (here, there) = if upstream { (b, a) } else { (a, b) };
-                    if here == slot.kind {
-                        if let Some(&p) = pos_of.get(&there) {
-                            out.push(p);
-                        }
-                    }
-                }
+    let mut here_pos: std::collections::HashMap<SlotKind, usize> =
+        std::collections::HashMap::new();
+    for (i, s) in g.ranks[rank].iter().enumerate() {
+        here_pos.insert(s.kind, i);
+    }
+    let mut out: Vec<Vec<usize>> = vec![Vec::new(); g.ranks[rank].len()];
+    let buckets = windows_by_rank(g);
+    // Upstream neighbors of `rank` live in the bucket keyed by rank - 1
+    // (windows whose upper element `a` is on rank - 1, lower `b` on
+    // `rank`); downstream neighbors live in the bucket keyed by `rank`
+    // itself (windows whose upper element is on `rank`).
+    let bucket_idx = if upstream { rank.wrapping_sub(1) } else { rank };
+    if bucket_idx < buckets.len() {
+        for &(a, b) in &buckets[bucket_idx] {
+            let (here, there) = if upstream { (b, a) } else { (a, b) };
+            if let (Some(&hi), Some(&p)) = (here_pos.get(&here), pos_of.get(&there)) {
+                out[hi].push(p);
             }
-            out
-        })
-        .collect()
+        }
+    }
+    out
 }
 
 pub(crate) fn count_crossings(g: &OrderGraph, _edges: &[LEdge]) -> usize {
     // For each adjacent rank pair, count inversions among edge segment
-    // endpoint pairs — O(k^2) per pair, fine at our caps.
+    // endpoint pairs. Windows are pre-bucketed by rank once via
+    // `windows_by_rank` (O(total_windows)), so each rank pair only scans
+    // the segments that actually bridge it instead of rescanning every
+    // chain in the graph; the inversion count itself stays O(k^2) in the
+    // number of segments crossing that one rank pair, which is fine at
+    // our caps.
+    let buckets = windows_by_rank(g);
     let mut total = 0;
     for r in 0..g.ranks.len().saturating_sub(1) {
         let pos_hi: std::collections::HashMap<SlotKind, usize> = g.ranks[r]
@@ -234,11 +315,9 @@ pub(crate) fn count_crossings(g: &OrderGraph, _edges: &[LEdge]) -> usize {
             .map(|(i, s)| (s.kind, i))
             .collect();
         let mut segs: Vec<(usize, usize)> = Vec::new();
-        for chain in &g.chains {
-            for w in chain.windows(2) {
-                if let (Some(&a), Some(&b)) = (pos_hi.get(&w[0]), pos_lo.get(&w[1])) {
-                    segs.push((a, b));
-                }
+        for &(a, b) in &buckets[r] {
+            if let (Some(&ai), Some(&bi)) = (pos_hi.get(&a), pos_lo.get(&b)) {
+                segs.push((ai, bi));
             }
         }
         for i in 0..segs.len() {
