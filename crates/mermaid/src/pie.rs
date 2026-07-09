@@ -23,8 +23,12 @@ pub(crate) fn parse(source: &str) -> Result<Pie, ParseError> {
             continue;
         }
         if !seen_header {
-            // Header line: `pie` optionally followed by `showData` or an
-            // inline `title <text>`.
+            // Header line: `pie` optionally followed by `showData` and/or
+            // an inline `title <text>`, in either order:
+            //   pie
+            //   pie showData
+            //   pie title Pets
+            //   pie showData title Pets
             let mut toks = line.splitn(2, char::is_whitespace);
             if toks.next() != Some("pie") {
                 return Err(ParseError {
@@ -32,11 +36,18 @@ pub(crate) fn parse(source: &str) -> Result<Pie, ParseError> {
                     line: Some(line_no),
                 });
             }
-            let rest = toks.next().unwrap_or("").trim();
+            let mut rest = toks.next().unwrap_or("").trim();
             if rest == "showData" {
                 show_data = true;
-            } else if let Some(t) = rest.strip_prefix("title ") {
+                rest = "";
+            } else if let Some(after) = rest.strip_prefix("showData ") {
+                show_data = true;
+                rest = after.trim();
+            }
+            if let Some(t) = rest.strip_prefix("title ") {
                 title = Some(t.trim().to_string());
+            } else if rest == "title" {
+                title = Some(String::new());
             }
             seen_header = true;
             continue;
@@ -116,21 +127,37 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
         ));
     }
 
-    // Zero-total: draw an empty outlined circle, still emit one <path> per
-    // slice (as zero-length arcs) so callers/tests see slice count.
+    // Zero-total: draw an empty outlined circle (no slice has any share of
+    // a 0.0 total, so every `frac` below is 0 and no wedge would be
+    // visible otherwise).
+    if total == 0.0 {
+        svg.push_str(&format!(
+            r#"<circle cx="{CX}" cy="{CY}" r="{R}" fill="none" stroke="currentColor" stroke-width="1"/>"#
+        ));
+    }
+
     let mut angle = -std::f64::consts::FRAC_PI_2; // start at 12 o'clock
     for (i, (label, value)) in pie.slices.iter().enumerate() {
         let frac = if total > 0.0 { value / total } else { 0.0 };
-        let sweep = frac * std::f64::consts::TAU;
-        let (x0, y0) = (CX + R * angle.cos(), CY + R * angle.sin());
-        let end = angle + sweep;
-        let (x1, y1) = (CX + R * end.cos(), CY + R * end.sin());
-        let large_arc = if sweep > std::f64::consts::PI { 1 } else { 0 };
         let fill = PALETTE[i % PALETTE.len()];
-        svg.push_str(&format!(
-            r#"<path d="M {CX} {CY} L {x0:.2} {y0:.2} A {R} {R} 0 {large_arc} 1 {x1:.2} {y1:.2} Z" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1"/>"#
-        ));
-        angle = end;
+        if frac >= 1.0 {
+            // A full-sweep arc's start/end points coincide (especially
+            // after `{:.2}` rounding), so the `A` command degenerates to
+            // an invisible zero-length path. Emit a full disc instead.
+            svg.push_str(&format!(
+                r#"<circle cx="{CX}" cy="{CY}" r="{R}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1"/>"#
+            ));
+        } else if frac > 0.0 {
+            let sweep = frac * std::f64::consts::TAU;
+            let (x0, y0) = (CX + R * angle.cos(), CY + R * angle.sin());
+            let end = angle + sweep;
+            let (x1, y1) = (CX + R * end.cos(), CY + R * end.sin());
+            let large_arc = if sweep > std::f64::consts::PI { 1 } else { 0 };
+            svg.push_str(&format!(
+                r#"<path d="M {CX} {CY} L {x0:.2} {y0:.2} A {R} {R} 0 {large_arc} 1 {x1:.2} {y1:.2} Z" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1"/>"#
+            ));
+            angle = end;
+        }
 
         // Legend row.
         let ly = 60.0 + i as f64 * 22.0;
@@ -238,5 +265,39 @@ mod tests {
         let p = parse("pie showData\n\"A\" : 7").unwrap();
         let svg = render_svg(&p);
         assert!(svg.contains('7'));
+    }
+
+    #[test]
+    fn parses_show_data_and_inline_title() {
+        let p = parse("pie showData title Pets\n\"A\" : 1").unwrap();
+        assert!(p.show_data);
+        assert_eq!(p.title.as_deref(), Some("Pets"));
+    }
+
+    #[test]
+    fn single_slice_pie_renders_full_disc() {
+        let p = parse("pie\n\"A\" : 5").unwrap();
+        let svg = render_svg(&p);
+        // A single 100% slice must render as a visible full disc, not a
+        // degenerate zero-length arc.
+        assert!(svg.contains("<circle"), "expected a full-disc <circle>, got: {svg}");
+    }
+
+    #[test]
+    fn full_slice_among_zeros_renders_disc() {
+        let p = parse("pie\n\"A\" : 5\n\"B\" : 0\n\"C\" : 0").unwrap();
+        let svg = render_svg(&p);
+        assert!(svg.contains("<circle"), "expected a full-disc <circle>, got: {svg}");
+        // Legend still lists all three slices even though only one has a
+        // visible wedge.
+        assert_eq!(svg.matches("<text x=\"320\"").count(), 3);
+    }
+
+    #[test]
+    fn all_zero_pie_renders_outlined_circle() {
+        let p = parse("pie\n\"A\" : 0\n\"B\" : 0").unwrap();
+        let svg = render_svg(&p);
+        assert!(svg.contains("<circle"), "expected an outlined empty circle, got: {svg}");
+        assert!(svg.contains("fill=\"none\""), "zero-total circle must be unfilled, got: {svg}");
     }
 }

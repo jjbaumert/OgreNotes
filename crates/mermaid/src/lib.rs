@@ -7,6 +7,12 @@
 
 mod pie;
 
+/// Max diagram source length (chars). Shared cap: the single source of
+/// truth for both the `crates/collab` write-gate validator
+/// (`blocks::mermaid::MAX_SOURCE_LEN` re-exports this) and the frontend
+/// modal's client-side guard, so the two can never drift apart.
+pub const MAX_SOURCE_LEN: usize = 20_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagramKind {
     Pie,

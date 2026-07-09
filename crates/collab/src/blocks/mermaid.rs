@@ -16,7 +16,11 @@ pub static MERMAID: MermaidBlock = MermaidBlock;
 /// Max diagram source length (chars). Over-cap is hard-rejected so an
 /// interactive write is not silently clamped (which the write gate
 /// would flag as a canonicalization violation).
-pub const MAX_SOURCE_LEN: usize = 20_000;
+///
+/// Re-exported from `ogrenotes_mermaid` — that crate is the single
+/// source of truth, shared with the frontend modal's client-side guard,
+/// so this path stays stable for existing callers.
+pub use ogrenotes_mermaid::MAX_SOURCE_LEN;
 
 /// Single source of truth for the attribute names the export path
 /// iterates. Mirrors `CALENDAR_ATTR_NAMES` / `CARD_ATTR_NAMES`.
@@ -90,6 +94,19 @@ mod tests {
     fn oversized_source_rejected() {
         let big = "x".repeat(MAX_SOURCE_LEN + 1);
         assert!(MERMAID.validate_attrs(NodeType::Mermaid, &attrs(&[("source", &big)])).is_err());
+    }
+
+    /// `MAX_SOURCE_LEN` is now a re-export of `ogrenotes_mermaid::MAX_SOURCE_LEN`
+    /// (single source of truth shared with the frontend modal's guard).
+    /// Pin the value and the boundary so the relocation stays transparent
+    /// to callers of this path.
+    #[test]
+    fn max_source_len_reexport_matches_shared_constant() {
+        assert_eq!(MAX_SOURCE_LEN, 20_000);
+        assert_eq!(MAX_SOURCE_LEN, ogrenotes_mermaid::MAX_SOURCE_LEN);
+        // Exactly at the cap is still accepted.
+        let at_cap = "x".repeat(MAX_SOURCE_LEN);
+        assert!(MERMAID.validate_attrs(NodeType::Mermaid, &attrs(&[("source", &at_cap)])).is_ok());
     }
 
     #[test]
