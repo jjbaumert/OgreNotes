@@ -3725,6 +3725,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ogrenotes-highlight"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "ogrenotes-mermaid"
 version = "0.1.0"
 
