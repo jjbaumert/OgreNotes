@@ -484,8 +484,8 @@ mod tests {
 
     #[test]
     fn all_features_ci_keywords_uppercase() {
-        let toks = tokenize("SELECT", &all_features_spec());
-        assert!(toks.contains(&Token { text: "SELECT", kind: TokenKind::Keyword }));
+        let toks = tokenize("KW", &all_features_spec());
+        assert!(toks.contains(&Token { text: "KW", kind: TokenKind::Keyword }));
     }
 
     #[test]
@@ -496,14 +496,14 @@ mod tests {
 
     proptest! {
         #[test]
-        fn all_features_partition_roundtrip(src in r"[\PC]*") {
+        fn all_features_partition_roundtrip(src in prop_oneof![r"[\PC]*", r#"[ -~\n\t"'`#@$/*\\{}\[\]<>]{0,300}"#]) {
             let toks = tokenize(&src, &all_features_spec());
             let joined: String = toks.iter().map(|t| t.text).collect();
             prop_assert_eq!(joined, src, "partition violated");
         }
 
         #[test]
-        fn all_features_with_hash_partition_roundtrip(src in r"[\PC]*") {
+        fn all_features_with_hash_partition_roundtrip(src in prop_oneof![r"[\PC]*", r#"[ -~\n\t"'`#@$/*\\{}\[\]<>]{0,300}"#]) {
             let toks = tokenize(&src, &all_features_with_hash_spec());
             let joined: String = toks.iter().map(|t| t.text).collect();
             prop_assert_eq!(joined, src, "partition violated");
