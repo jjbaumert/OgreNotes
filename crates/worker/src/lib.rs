@@ -670,4 +670,297 @@ mod tests {
         let parsed: Job = serde_json::from_str(&json).unwrap();
         assert_eq!(job, parsed);
     }
+
+    /// Pre-#85 envelopes were written without the `owner` field.
+    /// `#[serde(default)]` must keep them deserializable as
+    /// ownerless — a redeploy mid-flight must not strand queued
+    /// entries with a parse error.
+    #[test]
+    fn envelope_without_owner_field_deserializes_as_ownerless() {
+        let json = r#"{"jobId":"j-1","enqueuedAtMs":1000,"attempt":2,"payload":{"type":"noop","label":"old"}}"#;
+        let env: JobEnvelope = serde_json::from_str(json).unwrap();
+        assert_eq!(env.owner, None);
+        assert_eq!(env.job_id, "j-1");
+        assert_eq!(env.enqueued_at_ms, 1000);
+        assert_eq!(env.attempt, 2);
+        assert_eq!(env.payload, Job::Noop { label: "old".to_string() });
+    }
+
+    /// Ownerless envelopes must omit the `owner` key entirely (not
+    /// write `"owner":null`) so pre-#85 consumers keep parsing the
+    /// wire form, and the envelope struct's keys stay camelCase —
+    /// they're a Redis wire contract, not an internal detail.
+    #[test]
+    fn ownerless_envelope_omits_owner_key_and_uses_camel_case() {
+        let env = JobEnvelope {
+            job_id: "j-2".to_string(),
+            enqueued_at_ms: 7,
+            attempt: 0,
+            owner: None,
+            payload: Job::Noop { label: "x".to_string() },
+        };
+        let value = serde_json::to_value(&env).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(!obj.contains_key("owner"), "None owner must be omitted");
+        for key in ["jobId", "enqueuedAtMs", "attempt", "payload"] {
+            assert!(obj.contains_key(key), "missing envelope key {key}");
+        }
+    }
+
+    /// The `type` tag is the dead-letter triage discriminator; the
+    /// existing test pins `importDocx`, this pins the other two so
+    /// a variant rename can't slip through unnoticed.
+    #[test]
+    fn import_pdf_and_noop_type_tags_are_pinned() {
+        let pdf = Job::ImportPdf {
+            s3_key: "k".to_string(),
+            title: "t".to_string(),
+            folder_id: None,
+            owner_id: "u".to_string(),
+        };
+        let value = serde_json::to_value(&pdf).unwrap();
+        assert_eq!(value.get("type").and_then(|t| t.as_str()), Some("importPdf"));
+
+        let noop = Job::Noop { label: "n".to_string() };
+        let value = serde_json::to_value(&noop).unwrap();
+        assert_eq!(value.get("type").and_then(|t| t.as_str()), Some("noop"));
+    }
+
+    /// The `state` tags are what the frontend poll loop matches on
+    /// (`pending` / `running` / `succeeded` / `failed`); `running`
+    /// is pinned by an existing test, this pins the rest, and the
+    /// field-free Pending form is pinned exactly.
+    #[test]
+    fn terminal_status_state_tags_and_roundtrips() {
+        assert_eq!(
+            serde_json::to_string(&JobStatus::Pending).unwrap(),
+            r#"{"state":"pending"}"#,
+        );
+
+        let succeeded = JobStatus::Succeeded {
+            finished_at_ms: 42,
+            result_json: Some(r#"{"docId":"d1"}"#.to_string()),
+        };
+        let json = serde_json::to_string(&succeeded).unwrap();
+        assert!(json.contains(r#""state":"succeeded""#));
+        let parsed: JobStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(succeeded, parsed);
+
+        let failed = JobStatus::Failed {
+            finished_at_ms: 43,
+            error: "boom".to_string(),
+        };
+        let json = serde_json::to_string(&failed).unwrap();
+        assert!(json.contains(r#""state":"failed""#));
+        let parsed: JobStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(failed, parsed);
+    }
+
+    /// A Succeeded status written without a result body omits the
+    /// key on the wire (pinned by an existing test); reading it back
+    /// must land on `result_json: None` via `#[serde(default)]`, not
+    /// a missing-field error — that's the shape a poll sees for jobs
+    /// whose worker had no result to report.
+    #[test]
+    fn succeeded_status_roundtrips_when_result_json_omitted() {
+        let status = JobStatus::Succeeded {
+            finished_at_ms: 9,
+            result_json: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: JobStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(status, parsed);
+    }
+
+    /// Owner derivation is the input to the #85 poll-time ownership
+    /// gate: both import variants must yield their `owner_id`, and
+    /// Noop must stay ownerless (bearer-capability polling).
+    #[test]
+    fn owner_derivation_matches_payload_kind() {
+        let docx = Job::ImportDocx {
+            s3_key: "k".to_string(),
+            title: "t".to_string(),
+            folder_id: Some("f".to_string()),
+            owner_id: "user-docx".to_string(),
+        };
+        assert_eq!(owner_of(&docx), Some("user-docx"));
+
+        let pdf = Job::ImportPdf {
+            s3_key: "k".to_string(),
+            title: "t".to_string(),
+            folder_id: None,
+            owner_id: "user-pdf".to_string(),
+        };
+        assert_eq!(owner_of(&pdf), Some("user-pdf"));
+
+        let noop = Job::Noop { label: "l".to_string() };
+        assert_eq!(owner_of(&noop), None);
+    }
+
+    /// The side-channel key encoding is shared with operator
+    /// tooling and the 24h-TTL records already in Redis; a silent
+    /// prefix change would orphan every live status hash.
+    #[test]
+    fn status_key_is_job_prefixed() {
+        assert_eq!(status_key("abc123"), "job:abc123");
+    }
+
+    /// JobError's Display strings surface in HTTP 500 bodies via the
+    /// jobs route's `map_job_error`, and the From<RedisError> impl
+    /// must preserve the underlying detail for triage.
+    #[test]
+    fn job_error_display_and_redis_conversion() {
+        let redis_err =
+            fred::error::RedisError::new(fred::error::RedisErrorKind::Unknown, "boom");
+        let err: JobError = redis_err.into();
+        assert!(
+            matches!(&err, JobError::Redis(msg) if msg.contains("boom")),
+            "expected Redis variant carrying the detail, got {err:?}",
+        );
+        assert!(err.to_string().starts_with("redis: "));
+        assert_eq!(
+            JobError::NotFound("j1".to_string()).to_string(),
+            "not found: j1",
+        );
+        assert_eq!(
+            JobError::Serialize("bad".to_string()).to_string(),
+            "serialize: bad",
+        );
+    }
+
+    /// In-memory no-Redis fake — the substitution the JobProducer
+    /// trait exists for. Implements only the required methods so the
+    /// tests below exercise the trait's *default* `poll`.
+    struct FakeProducer {
+        statuses: std::sync::Mutex<std::collections::HashMap<JobId, JobStatus>>,
+    }
+
+    impl FakeProducer {
+        fn new() -> Self {
+            Self {
+                statuses: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl JobProducer for FakeProducer {
+        async fn enqueue(&self, _payload: Job) -> Result<JobId, JobError> {
+            let id = nanoid::nanoid!();
+            self.statuses
+                .lock()
+                .unwrap()
+                .insert(id.clone(), JobStatus::Pending);
+            Ok(id)
+        }
+        async fn status(&self, job_id: &str) -> Result<JobStatus, JobError> {
+            self.statuses
+                .lock()
+                .unwrap()
+                .get(job_id)
+                .cloned()
+                .ok_or_else(|| JobError::NotFound(job_id.to_string()))
+        }
+    }
+
+    /// Pins the documented #85 footgun: the default `poll` returns
+    /// `(status, None)` even for a payload that carries an owner,
+    /// meaning the route's ownership gate is bypassed unless an impl
+    /// overrides `poll`. If this default ever changes, the trait doc
+    /// and every fake need revisiting together.
+    #[tokio::test]
+    async fn job_producer_default_poll_returns_no_owner_even_for_owned_payloads() {
+        let fake = FakeProducer::new();
+        let job_id = fake
+            .enqueue(Job::ImportDocx {
+                s3_key: "k".to_string(),
+                title: "t".to_string(),
+                folder_id: None,
+                owner_id: "user-1".to_string(),
+            })
+            .await
+            .unwrap();
+        let (status, owner) = fake.poll(&job_id).await.unwrap();
+        assert_eq!(status, JobStatus::Pending);
+        assert_eq!(owner, None, "default poll must report no owner");
+    }
+
+    /// The default `poll` must propagate `NotFound` from `status`
+    /// untouched — the jobs route maps it to a 404.
+    #[tokio::test]
+    async fn job_producer_default_poll_propagates_not_found() {
+        let fake = FakeProducer::new();
+        let err = fake.poll("missing-id").await.unwrap_err();
+        assert!(
+            matches!(&err, JobError::NotFound(id) if id == "missing-id"),
+            "expected NotFound, got {err:?}",
+        );
+    }
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Envelope JSON must round-trip regardless of content —
+            /// labels/ids are caller-controlled and may carry quotes,
+            /// unicode, or control characters.
+            #[test]
+            fn prop_envelope_roundtrips_arbitrary_content(
+                job_id in any::<String>(),
+                enqueued_at_ms in any::<u64>(),
+                attempt in any::<u32>(),
+                owner in proptest::option::of(any::<String>()),
+                label in any::<String>(),
+            ) {
+                let env = JobEnvelope {
+                    job_id,
+                    enqueued_at_ms,
+                    attempt,
+                    owner,
+                    payload: Job::Noop { label },
+                };
+                let json = serde_json::to_string(&env).unwrap();
+                let parsed: JobEnvelope = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(env, parsed);
+            }
+
+            /// For any import payload: owner derivation returns the
+            /// owner_id verbatim, the top-level `type` tag matches the
+            /// variant, and the payload round-trips through JSON.
+            #[test]
+            fn prop_import_jobs_expose_owner_and_type_tag(
+                s3_key in any::<String>(),
+                title in any::<String>(),
+                folder_id in proptest::option::of(any::<String>()),
+                owner_id in any::<String>(),
+                is_pdf in any::<bool>(),
+            ) {
+                let payload = if is_pdf {
+                    Job::ImportPdf {
+                        s3_key,
+                        title,
+                        folder_id,
+                        owner_id: owner_id.clone(),
+                    }
+                } else {
+                    Job::ImportDocx {
+                        s3_key,
+                        title,
+                        folder_id,
+                        owner_id: owner_id.clone(),
+                    }
+                };
+                prop_assert_eq!(owner_of(&payload), Some(owner_id.as_str()));
+                let value = serde_json::to_value(&payload).unwrap();
+                let expected_tag = if is_pdf { "importPdf" } else { "importDocx" };
+                prop_assert_eq!(
+                    value.get("type").and_then(|t| t.as_str()),
+                    Some(expected_tag),
+                );
+                let parsed: Job = serde_json::from_value(value).unwrap();
+                prop_assert_eq!(payload, parsed);
+            }
+        }
+    }
 }

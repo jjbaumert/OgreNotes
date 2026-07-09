@@ -178,4 +178,27 @@ mod tests {
             "expected InvalidAddress(to …), got {res:?}"
         );
     }
+
+    #[test]
+    fn send_error_display_distinguishes_variants() {
+        // The variant prefixes are an oncall contract: `Cap` exists
+        // specifically so a DynamoDB cap-store failure isn't chased
+        // as an SMTP problem. Pin each Display rendering.
+        assert_eq!(
+            SendError::Cap("dynamo down".into()).to_string(),
+            "cap store error: dynamo down"
+        );
+        assert_eq!(
+            SendError::Transport("refused".into()).to_string(),
+            "transport error: refused"
+        );
+        assert_eq!(
+            SendError::InvalidAddress("from x: bad".into()).to_string(),
+            "invalid email address: from x: bad"
+        );
+        assert_eq!(
+            SendError::Build("missing header".into()).to_string(),
+            "build error: missing header"
+        );
+    }
 }

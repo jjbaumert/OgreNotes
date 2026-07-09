@@ -427,3 +427,192 @@ fn notif_from_item(
         created_at: get_n(item, "created_at")?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> Notification {
+        Notification {
+            notif_id: "n1".to_string(),
+            user_id: "u1".to_string(),
+            notif_type: NotifType::Mentioned,
+            doc_id: Some("doc1".to_string()),
+            thread_id: Some("t1".to_string()),
+            actor_id: "u2".to_string(),
+            message: "mentioned you".to_string(),
+            preview: Some("hey @u1 …".to_string()),
+            block_id: Some("blk-1".to_string()),
+            read: false,
+            created_at: 1_700_000_000_000_000,
+        }
+    }
+
+    /// Mimic `create`'s column construction (no live table),
+    /// including its conditional writes and the `read` →
+    /// `is_read` column rename.
+    fn item_for(notif: &Notification) -> HashMap<String, AttributeValue> {
+        let mut item = HashMap::new();
+        item.insert("PK".to_string(), AttributeValue::S(notif.pk()));
+        item.insert("SK".to_string(), AttributeValue::S(notif.sk()));
+        item.insert("notif_id".to_string(), AttributeValue::S(notif.notif_id.clone()));
+        item.insert("user_id".to_string(), AttributeValue::S(notif.user_id.clone()));
+        item.insert(
+            "notif_type".to_string(),
+            AttributeValue::S(
+                serde_json::to_string(&notif.notif_type).unwrap().trim_matches('"').to_string(),
+            ),
+        );
+        if let Some(ref doc_id) = notif.doc_id {
+            item.insert("doc_id".to_string(), AttributeValue::S(doc_id.clone()));
+        }
+        if let Some(ref thread_id) = notif.thread_id {
+            item.insert("thread_id".to_string(), AttributeValue::S(thread_id.clone()));
+        }
+        item.insert("actor_id".to_string(), AttributeValue::S(notif.actor_id.clone()));
+        item.insert("message".to_string(), AttributeValue::S(notif.message.clone()));
+        if let Some(ref preview) = notif.preview {
+            item.insert("preview".to_string(), AttributeValue::S(preview.clone()));
+        }
+        if let Some(ref block_id) = notif.block_id {
+            item.insert("block_id".to_string(), AttributeValue::S(block_id.clone()));
+        }
+        item.insert("is_read".to_string(), AttributeValue::Bool(notif.read));
+        item.insert("created_at".to_string(), AttributeValue::N(notif.created_at.to_string()));
+        item
+    }
+
+    #[test]
+    fn notif_round_trips_with_all_optional_fields() {
+        let notif = fixture();
+        let back = notif_from_item(&item_for(&notif), "u1").expect("from_item");
+        assert_eq!(back.notif_id, notif.notif_id);
+        assert_eq!(back.notif_type, notif.notif_type);
+        assert_eq!(back.doc_id, notif.doc_id);
+        assert_eq!(back.thread_id, notif.thread_id);
+        assert_eq!(back.actor_id, notif.actor_id);
+        assert_eq!(back.message, notif.message);
+        assert_eq!(back.preview, notif.preview);
+        assert_eq!(back.block_id, notif.block_id);
+        assert_eq!(back.read, notif.read);
+        assert_eq!(back.created_at, notif.created_at);
+    }
+
+    #[test]
+    fn notif_round_trips_read_flag_via_is_read_column() {
+        // The model field is `read` but the storage column is
+        // `is_read` (avoids clashing with any future reserved word).
+        // Both polarities must survive the rename.
+        let mut notif = fixture();
+        notif.read = true;
+        let item = item_for(&notif);
+        assert!(item.contains_key("is_read"), "column must be is_read");
+        assert!(!item.contains_key("read"), "model field name must not leak");
+        let back = notif_from_item(&item, "u1").expect("from_item");
+        assert!(back.read);
+    }
+
+    #[test]
+    fn notif_minimal_row_decodes_optionals_as_absent() {
+        let mut notif = fixture();
+        notif.doc_id = None;
+        notif.thread_id = None;
+        notif.preview = None;
+        notif.block_id = None;
+        let back = notif_from_item(&item_for(&notif), "u1").expect("from_item");
+        assert_eq!(back.doc_id, None);
+        assert_eq!(back.thread_id, None);
+        assert_eq!(back.preview, None);
+        assert_eq!(back.block_id, None);
+    }
+
+    #[test]
+    fn notif_missing_is_read_defaults_to_unread() {
+        // A row predating the read-tracking column must surface as
+        // unread (the safe direction — the user sees it once more)
+        // rather than failing decode.
+        let mut item = item_for(&fixture());
+        item.remove("is_read");
+        let back = notif_from_item(&item, "u1").expect("from_item");
+        assert!(!back.read);
+    }
+
+    #[test]
+    fn notif_type_round_trips_for_every_variant() {
+        for nt in [
+            NotifType::Shared,
+            NotifType::Mentioned,
+            NotifType::Commented,
+            NotifType::ChatMessage,
+            NotifType::DocumentEdited,
+            NotifType::DocumentOpened,
+            NotifType::RequestAccess,
+        ] {
+            let mut notif = fixture();
+            notif.notif_type = nt.clone();
+            let back = notif_from_item(&item_for(&notif), "u1")
+                .unwrap_or_else(|e| panic!("roundtrip failed for {nt:?}: {e}"));
+            assert_eq!(back.notif_type, nt);
+        }
+    }
+
+    #[test]
+    fn notif_unknown_type_errors() {
+        let mut item = item_for(&fixture());
+        item.insert("notif_type".to_string(), AttributeValue::S("telegram".to_string()));
+        match notif_from_item(&item, "u1") {
+            Err(RepoError::MissingField(msg)) => {
+                assert!(msg.contains("notif_type"), "must name the field: {msg}")
+            }
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    // ── SK-prefix guards on mark_read / delete_one ────────────────
+    // Both bail on a malformed SK *before* any network call, so they
+    // are testable with an offline client. The guard is what stops a
+    // crafted SK (e.g. "NOTIF_PREF#t1" or "PROFILE") from updating or
+    // deleting a non-notification row under the same USER# partition.
+
+    fn offline_repo() -> NotificationRepo {
+        let conf = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .build();
+        let client = aws_sdk_dynamodb::Client::from_conf(conf);
+        NotificationRepo::new(DynamoClient::new(client, "test-table".to_string()))
+    }
+
+    #[tokio::test]
+    async fn mark_read_rejects_non_notif_sk_before_any_io() {
+        let repo = offline_repo();
+        for bad_sk in ["PROFILE", "NOTIF_PREF#t1", "SESSION#s1", ""] {
+            let err = repo
+                .mark_read("u1", bad_sk)
+                .await
+                .expect_err("non-NOTIF# SK must be rejected");
+            match err {
+                RepoError::MissingField(msg) => {
+                    assert!(msg.contains("invalid notification SK"), "got: {msg}")
+                }
+                other => panic!("expected MissingField for {bad_sk:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_one_rejects_non_notif_sk_before_any_io() {
+        let repo = offline_repo();
+        // NOTIF_PREF# rows share the USER# partition; deleting one via
+        // delete_one would silently reset a user's mute preference.
+        let err = repo
+            .delete_one("u1", "NOTIF_PREF#t1")
+            .await
+            .expect_err("NOTIF_PREF# SK must be rejected");
+        match err {
+            RepoError::MissingField(msg) => {
+                assert!(msg.contains("invalid notification SK"), "got: {msg}")
+            }
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+}

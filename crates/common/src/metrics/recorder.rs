@@ -303,4 +303,88 @@ mod tests {
             snap.counters.keys().collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn snapshot_serializes_to_stable_json_shape() {
+        // MetricsSnapshot is the admin /metrics response body — its JSON
+        // field names are a wire contract consumed by dashboards and
+        // integration tests. Pin the exact shape, including the manual
+        // Serialize impl for HistogramSummary (count/sum/min/max).
+        let r = Recorder::default();
+        r.counter_add(MetricKey::new("req_total", &[]), 2);
+        r.gauge_set(MetricKey::new("conns", &[]), 7);
+        r.histogram_record(MetricKey::new("lat_ms", &[]), 4.0);
+        r.histogram_record(MetricKey::new("lat_ms", &[]), 6.0);
+
+        let json = serde_json::to_value(r.snapshot()).expect("snapshot serializes");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "counters": { "req_total": 2 },
+                "gauges": { "conns": 7 },
+                "histograms": {
+                    "lat_ms": { "count": 2, "sum": 10.0, "min": 4.0, "max": 6.0 }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn histogram_single_value_sets_min_and_max() {
+        // First recorded value must seed min and max (not leave the
+        // Default 0.0 as a phantom min for all-positive samples).
+        let r = Recorder::default();
+        let k = MetricKey::new("lat", &[]);
+        r.histogram_record(k.clone(), 42.5);
+        let snap = r.snapshot();
+        let h = &snap.histograms["lat"];
+        assert_eq!(h.count, 1);
+        assert_eq!(h.min, 42.5);
+        assert_eq!(h.max, 42.5);
+    }
+
+    #[test]
+    fn histogram_handles_negative_values() {
+        // Gauge-style deltas can be negative; min must track below zero
+        // rather than being floored by the zero-initialized default.
+        let r = Recorder::default();
+        let k = MetricKey::new("drift", &[]);
+        r.histogram_record(k.clone(), -3.0);
+        r.histogram_record(k.clone(), 1.0);
+        let snap = r.snapshot();
+        let h = &snap.histograms["drift"];
+        assert_eq!(h.min, -3.0);
+        assert_eq!(h.max, 1.0);
+        assert_eq!(h.sum, -2.0);
+    }
+
+    #[test]
+    fn drain_preserves_other_keys_and_allows_reuse() {
+        // Draining resets the summary in place but keeps the key alive —
+        // a metric recorded again after a flush must accumulate fresh
+        // stats rather than resurrect pre-drain min/max.
+        let r = Recorder::default();
+        let k = MetricKey::new("lat", &[]);
+        r.histogram_record(k.clone(), 100.0);
+        let _ = r.drain_histograms();
+        r.histogram_record(k.clone(), 5.0);
+        let snap = r.snapshot();
+        let h = &snap.histograms["lat"];
+        assert_eq!(h.count, 1);
+        assert_eq!(h.min, 5.0, "pre-drain min must not leak into the new window");
+        assert_eq!(h.max, 5.0);
+    }
+
+    #[test]
+    fn snapshot_does_not_reset_histograms() {
+        // Documented contract: snapshot() is a read-only view (the admin
+        // endpoint may poll freely); only drain_histograms() resets.
+        let r = Recorder::default();
+        let k = MetricKey::new("lat", &[]);
+        r.histogram_record(k.clone(), 1.0);
+        let first = r.snapshot();
+        let second = r.snapshot();
+        assert_eq!(first.histograms["lat"].count, 1);
+        assert_eq!(second.histograms["lat"].count, 1);
+    }
 }

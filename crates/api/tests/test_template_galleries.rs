@@ -382,3 +382,105 @@ async fn test_empty_docids_patch_requires_explicit_flag() {
 
     app.cleanup().await;
 }
+
+/// Gallery mutations are admin curation of workspace-visible shared state
+/// and each write path emits a SecurityAudit row (create → Created,
+/// PATCH → Updated, DELETE → Deleted), all self-events keyed on the acting
+/// admin. None of the three writers had coverage — the CRUD roundtrip
+/// never looks at the audit table.
+#[tokio::test]
+async fn gallery_mutations_write_security_audit_rows() {
+    use ogrenotes_storage::models::security_audit::SecurityAuditAction;
+
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let (alice_id, token, ws_id) = make_admin(&app, "gallery-audit@test.com").await;
+    let doc_a = app.create_doc(&token, "Audited Doc", None).await;
+
+    // Poll for a matching row — the writer fires via tokio::spawn, so the
+    // HTTP response can race the DDB write (same 10×20ms bound as the
+    // audit-writer suite).
+    async fn wait_for_audit(
+        app: &common::TestApp,
+        user_id: &str,
+        matcher: impl Fn(&SecurityAuditAction) -> bool,
+    ) -> ogrenotes_storage::models::security_audit::SecurityAudit {
+        for _ in 0..10 {
+            let rows = app
+                .state
+                .security_audit_repo
+                .list_for_user(user_id, 20)
+                .await
+                .unwrap();
+            if let Some(row) = rows.into_iter().find(|r| matcher(&r.action)) {
+                return row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("expected gallery SecurityAudit row for user {user_id} within 200ms");
+    }
+
+    // Create → TemplateGalleryCreated.
+    let (status, body) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/admin/workspaces/{ws_id}/template-galleries"),
+            Some(&token),
+            Some(serde_json::json!({ "name": "Audited", "docIds": [doc_a] })),
+        )
+        .await;
+    assert_eq!(status, 201, "body: {body}");
+    let gallery_id = body["id"].as_str().unwrap().to_string();
+
+    let row = wait_for_audit(&app, &alice_id, |a| {
+        matches!(
+            a,
+            SecurityAuditAction::TemplateGalleryCreated { workspace_id: w, gallery_id: g }
+                if w == &ws_id && g == &gallery_id
+        )
+    })
+    .await;
+    assert_eq!(row.actor_id, alice_id, "self-event: actor is the curating admin");
+
+    // PATCH → TemplateGalleryUpdated.
+    let (status, _) = app
+        .json_request(
+            Method::PATCH,
+            &format!("/api/v1/admin/workspaces/{ws_id}/template-galleries/{gallery_id}"),
+            Some(&token),
+            Some(serde_json::json!({ "name": "Audited v2" })),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    wait_for_audit(&app, &alice_id, |a| {
+        matches!(
+            a,
+            SecurityAuditAction::TemplateGalleryUpdated { workspace_id: w, gallery_id: g }
+                if w == &ws_id && g == &gallery_id
+        )
+    })
+    .await;
+
+    // DELETE → TemplateGalleryDeleted.
+    let (status, _) = app
+        .json_request(
+            Method::DELETE,
+            &format!("/api/v1/admin/workspaces/{ws_id}/template-galleries/{gallery_id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    wait_for_audit(&app, &alice_id, |a| {
+        matches!(
+            a,
+            SecurityAuditAction::TemplateGalleryDeleted { workspace_id: w, gallery_id: g }
+                if w == &ws_id && g == &gallery_id
+        )
+    })
+    .await;
+
+    app.cleanup().await;
+}

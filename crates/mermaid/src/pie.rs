@@ -300,4 +300,109 @@ mod tests {
         assert!(svg.contains("<circle"), "expected an outlined empty circle, got: {svg}");
         assert!(svg.contains("fill=\"none\""), "zero-total circle must be unfilled, got: {svg}");
     }
+
+    #[test]
+    fn parses_standalone_title_line_after_header() {
+        let p = parse("pie\ntitle Pets\n\"A\" : 1").unwrap();
+        assert_eq!(p.title.as_deref(), Some("Pets"));
+        assert_eq!(p.slices.len(), 1);
+    }
+
+    #[test]
+    fn label_containing_colon_splits_on_last_colon() {
+        let p = parse("pie\n\"10:30 standup\" : 2").unwrap();
+        assert_eq!(p.slices, vec![("10:30 standup".to_string(), 2.0)]);
+    }
+
+    #[test]
+    fn duplicate_labels_are_kept_as_separate_slices() {
+        let p = parse("pie\n\"A\" : 1\n\"A\" : 2").unwrap();
+        assert_eq!(
+            p.slices,
+            vec![("A".to_string(), 1.0), ("A".to_string(), 2.0)]
+        );
+        let svg = render_svg(&p);
+        assert_eq!(svg.matches("<text x=\"320\"").count(), 2, "both duplicates get a legend row");
+    }
+
+    #[test]
+    fn unicode_and_emoji_labels_survive_to_svg() {
+        let p = parse("pie title Tiere 🐾\n\"🐶 Hünde\" : 3\n\"猫\" : 1").unwrap();
+        assert_eq!(p.slices[0].0, "🐶 Hünde");
+        let svg = render_svg(&p);
+        assert!(svg.contains("🐶 Hünde"), "unicode label must pass through unmangled");
+        assert!(svg.contains("猫"));
+        assert!(svg.contains("Tiere 🐾"));
+    }
+
+    #[test]
+    fn infinite_and_nan_values_are_errors() {
+        // `"inf".parse::<f64>()` succeeds, so the finiteness guard is the
+        // only thing standing between these and the renderer.
+        for src in ["pie\n\"A\" : inf", "pie\n\"A\" : -inf", "pie\n\"A\" : NaN"] {
+            let err = parse(src).unwrap_err();
+            assert_eq!(err.line, Some(2), "source: {src:?}");
+        }
+    }
+
+    #[test]
+    fn error_line_numbers_count_skipped_blank_and_comment_lines() {
+        let err = parse("pie\n\n%% a comment\n\"A\" : notanumber").unwrap_err();
+        assert_eq!(err.line, Some(4), "line numbers must be physical, not logical");
+    }
+
+    #[test]
+    fn missing_value_after_colon_is_error_with_line() {
+        let err = parse("pie\n\"A\" :").unwrap_err();
+        assert_eq!(err.line, Some(2));
+    }
+
+    #[test]
+    fn svg_escapes_title_markup() {
+        let p = parse("pie title <img src=x onerror=alert(1)>\n\"A\" : 1").unwrap();
+        let svg = render_svg(&p);
+        assert!(!svg.contains("<img"), "raw title markup must not reach the SVG: {svg}");
+        assert!(svg.contains("&lt;img"));
+    }
+
+    #[test]
+    fn escape_xml_escapes_all_specials_without_double_escaping() {
+        // `&` must be replaced first; otherwise the `&` produced by the
+        // other replacements would itself get re-escaped.
+        assert_eq!(escape_xml(r#"<&>""#), "&lt;&amp;&gt;&quot;");
+        assert_eq!(escape_xml("a&lt;b"), "a&amp;lt;b");
+        assert_eq!(escape_xml("plain"), "plain");
+    }
+
+    #[test]
+    fn trim_num_formats_whole_and_fractional_values() {
+        assert_eq!(trim_num(7.0), "7");
+        assert_eq!(trim_num(0.0), "0");
+        assert_eq!(trim_num(1.5), "1.5");
+    }
+
+    #[test]
+    fn show_data_legend_shows_label_with_value() {
+        let p = parse("pie showData\n\"A\" : 1.5\n\"B\" : 2").unwrap();
+        let svg = render_svg(&p);
+        assert!(svg.contains("A (1.5)"), "fractional value kept as-is: {svg}");
+        assert!(svg.contains("B (2)"), "whole value loses trailing .0: {svg}");
+    }
+
+    #[test]
+    fn more_slices_than_palette_entries_render_with_cycled_fills() {
+        let src = std::iter::once("pie".to_string())
+            .chain((0..10).map(|i| format!("\"S{i}\" : 1")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let p = parse(&src).unwrap();
+        let svg = render_svg(&p);
+        assert_eq!(svg.matches("<text x=\"320\"").count(), 10, "one legend row per slice");
+        // Slice 8 wraps around to the first palette color.
+        assert_eq!(
+            svg.matches(PALETTE[0]).count(),
+            4,
+            "slices 0 and 8 each use palette[0] for wedge fill + legend swatch"
+        );
+    }
 }

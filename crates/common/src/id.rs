@@ -49,4 +49,15 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn alphabet_has_64_unique_symbols() {
+        // The documented 126-bit entropy claim (21 chars x 6 bits) requires
+        // exactly 64 distinct symbols. A duplicated or dropped character in
+        // the const would silently weaken share-link enumeration resistance
+        // without failing any other test.
+        assert_eq!(ALPHABET.len(), 64, "6 bits per char requires 64 symbols");
+        let unique: HashSet<char> = ALPHABET.iter().copied().collect();
+        assert_eq!(unique.len(), 64, "alphabet must not contain duplicates");
+    }
 }

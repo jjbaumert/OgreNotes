@@ -265,3 +265,20 @@ mod tests {
         assert_eq!(std::str::from_utf8(payload).unwrap(), error);
     }
 }
+
+// ─── Coverage-gap tests ─────────────────────────────────────────
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    /// The doc comment on `decode_foreign_doc_update` promises `None`
+    /// when the id isn't valid UTF-8 — pinned here (the truncation
+    /// and empty cases are covered by the sibling module).
+    #[test]
+    fn foreign_doc_update_non_utf8_id_returns_none() {
+        // id_len = 2, id bytes = invalid UTF-8 continuation bytes.
+        let payload = [2u8, 0xFF, 0xFE, 0x01, 0x02];
+        assert!(decode_foreign_doc_update(&payload).is_none());
+    }
+}

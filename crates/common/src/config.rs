@@ -860,4 +860,137 @@ mod tests {
     fn smtp_password_without_username_panics() {
         validate_smtp_credentials(true, &None, &Some("p".into()));
     }
+
+    #[test]
+    fn table_name_for_prefix_appends_canonical_suffix() {
+        // DynamoDB key contract shared with the setup_dev binary: the
+        // canonical table name is exactly `<prefix>ogrenote` (no separator
+        // added, no pluralization). Changing this orphans every deployed
+        // table.
+        assert_eq!(table_name_for_prefix("test1-"), "test1-ogrenote");
+        assert_eq!(table_name_for_prefix(""), "ogrenote");
+    }
+
+    #[test]
+    #[should_panic(expected = "no trailing slash or path")]
+    fn frontend_origin_empty_host_panics() {
+        // "https://" alone parses the scheme but leaves an empty host —
+        // must be rejected, not accepted as a degenerate origin.
+        validate_frontend_origin("https://", false);
+    }
+
+    #[test]
+    #[should_panic(expected = "no trailing slash or path")]
+    fn frontend_origin_with_space_panics() {
+        validate_frontend_origin("https://exa mple.com", false);
+    }
+
+    #[test]
+    fn frontend_origin_accepts_https_in_dev_mode() {
+        // dev_mode relaxes the https requirement; it must not *forbid*
+        // https (e.g. a dev stack behind TLS).
+        validate_frontend_origin("https://dev.example.com", true);
+    }
+
+    #[test]
+    fn jwt_secret_multibyte_length_counts_bytes_not_chars() {
+        // The HS256 minimum is a byte count. 16 two-byte characters is 32
+        // bytes and must pass even though it is only 16 chars — pins that
+        // the check uses len() (bytes), matching what the HMAC actually
+        // keys on.
+        validate_jwt_secret(&"é".repeat(16)); // 16 chars × 2 bytes = 32 bytes
+    }
+
+    #[test]
+    #[should_panic(expected = "JWT_SECRET must be at least 32 bytes")]
+    fn jwt_secret_31_bytes_panics() {
+        // One byte under the minimum — pins the exact boundary.
+        validate_jwt_secret(&"a".repeat(31));
+    }
+
+    #[test]
+    fn debug_redacts_optional_secrets_when_present() {
+        // The existing redaction test leaves google_client_secret and
+        // anthropic_api_key as None, so their redaction lines were never
+        // exercised with real values. A regression that printed either
+        // would leak credentials into every log that formats the config.
+        let config = AppConfig {
+            aws_region: "us-east-1".into(),
+            dynamodb_table_prefix: "test-".into(),
+            s3_bucket: "test-bucket".into(),
+            redis_url: "redis://localhost:6379".into(),
+            oauth_client_id: "client-id".into(),
+            oauth_client_secret: "oauth-secret".into(),
+            oauth_redirect_uri: "http://localhost/callback".into(),
+            jwt_secret: "jwt-secret".into(),
+            google_client_id: Some("google-client-id".into()),
+            google_client_secret: Some("google-secret-value".into()),
+            api_port: 3000,
+            frontend_origin: "http://localhost:8080".into(),
+            search_index_path: "/tmp/ogrenotes-search-index".into(),
+            qdrant_url: None,
+            embedding_model_id: "amazon.titan-embed-text-v2:0".into(),
+            embedding_dimensions: 1024,
+            anthropic_api_key: Some("sk-ant-secret-key-value".into()),
+            anthropic_model: "claude-sonnet-4-6".into(),
+            admin_emails: Vec::new(),
+            dev_mode: false,
+            embed_youtube_nocookie: true,
+            deploy_env: "test".into(),
+            email_enabled: false,
+            email_from_address: String::new(),
+            smtp_host: "localhost".into(),
+            smtp_port: 1025,
+            smtp_username: None,
+            smtp_password: None,
+            smtp_starttls: false,
+            email_daily_cap: 25,
+            email_digest_enabled: false,
+            email_digest_hour_utc: 15,
+            security_audit_retention_enabled: false,
+            security_audit_retention_days: 90,
+            security_audit_retention_hour_utc: 4,
+            max_members_per_doc: 200,
+            max_members_per_folder: 200,
+            max_ws_connections_per_doc: 100,
+            max_ws_connections_per_user_per_doc: 5,
+            rate_limit_auth_login_per_min: 20,
+            rate_limit_auth_refresh_per_min: 60,
+            rate_limit_search_per_min: 60,
+            rate_limit_sharing_per_min: 30,
+            rate_limit_admin_mut_per_min: 30,
+            rate_limit_saml_acs_per_min: 10,
+            max_pending_updates_bytes: 32 * 1024 * 1024,
+            mfa_challenge_max_failures: 5,
+            scim_request_rate_limit_per_minute: 100,
+            rate_limit_comments_per_min: 30,
+            rate_limit_content_write_per_min: 60,
+            rate_limit_user_search_per_min: 60,
+            rate_limit_ws_upgrade_per_min: 30,
+            rate_limit_client_telemetry_per_min: 12,
+            rate_limit_rum_per_min: 60,
+            rate_limit_import_per_min: 10,
+            rate_limit_bulk_export_per_min: 5,
+            rate_limit_bulk_op_per_min: 20,
+            rate_limit_dev_login_per_min: 100,
+            trash_cleanup_enabled: false,
+            trash_retention_days: 30,
+            trash_cleanup_hour_utc: 3,
+            trash_cleanup_dry_run: false,
+            job_stream_name: "ogrenotes-jobs".into(),
+            worker_concurrency: 4,
+            liveapp_strict_validation: "reject".into(),
+            liveapp_gate_exempt_doc_ids: std::collections::HashSet::new(),
+            liveapp_gate_walk_scope: "canary".into(),
+        };
+        let debug_output = format!("{config:?}");
+        assert!(!debug_output.contains("google-secret-value"));
+        assert!(!debug_output.contains("sk-ant-secret-key-value"));
+        // The non-secret google_client_id remains visible.
+        assert!(debug_output.contains("google-client-id"));
+        // table_name() delegates to the shared free function; pin the
+        // delegation here since we already have a constructed config.
+        assert_eq!(config.table_name(), "test-ogrenote");
+    }
+
 }

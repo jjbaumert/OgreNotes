@@ -250,3 +250,76 @@ fn payload_int(
         })
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn point_id_namespace_is_pinned() {
+        // The namespace UUID determines every point ID ever written to
+        // Qdrant (Uuid::new_v5(&OGRE_NS, "{doc_id}:{chunk}")). Changing
+        // it silently orphans all existing vectors, so pin both the raw
+        // bytes ("ogrenotes-embeds") and a golden v5 derivation.
+        assert_eq!(OGRE_NS.as_bytes(), b"ogrenotes-embeds");
+        assert_eq!(
+            OGRE_NS.to_string(),
+            "6f677265-6e6f-7465-732d-656d62656473"
+        );
+        assert_eq!(
+            Uuid::new_v5(&OGRE_NS, b"doc-123:0").to_string(),
+            "7d8863c3-341a-5e3b-a3ed-154fd04d555a"
+        );
+    }
+
+    #[test]
+    fn qdrant_value_str_wraps_string_kind() {
+        match qdrant_value_str("abc").kind {
+            Some(Kind::StringValue(s)) => assert_eq!(s, "abc"),
+            other => panic!("expected StringValue, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qdrant_value_int_wraps_integer_kind() {
+        match qdrant_value_int(-42).kind {
+            Some(Kind::IntegerValue(n)) => assert_eq!(n, -42),
+            other => panic!("expected IntegerValue, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn payload_str_extracts_string_values() {
+        let mut payload = HashMap::new();
+        payload.insert("title".to_string(), qdrant_value_str("My Doc"));
+        assert_eq!(payload_str(&payload, "title"), "My Doc");
+    }
+
+    #[test]
+    fn payload_str_missing_key_defaults_to_empty() {
+        let payload = HashMap::new();
+        assert_eq!(payload_str(&payload, "title"), "");
+    }
+
+    #[test]
+    fn payload_str_wrong_kind_defaults_to_empty() {
+        let mut payload = HashMap::new();
+        payload.insert("title".to_string(), qdrant_value_int(7));
+        assert_eq!(payload_str(&payload, "title"), "");
+    }
+
+    #[test]
+    fn payload_int_extracts_integer_values() {
+        let mut payload = HashMap::new();
+        payload.insert("updated_at".to_string(), qdrant_value_int(1_720_000_000));
+        assert_eq!(payload_int(&payload, "updated_at"), 1_720_000_000);
+    }
+
+    #[test]
+    fn payload_int_missing_or_wrong_kind_defaults_to_zero() {
+        let mut payload = HashMap::new();
+        payload.insert("updated_at".to_string(), qdrant_value_str("not a number"));
+        assert_eq!(payload_int(&payload, "updated_at"), 0);
+        assert_eq!(payload_int(&payload, "absent"), 0);
+    }
+}

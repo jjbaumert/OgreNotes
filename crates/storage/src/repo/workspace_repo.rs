@@ -293,3 +293,100 @@ fn member_from_item(
         joined_at: get_n(item, "joined_at")?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ws_fixture(mfa_required: bool) -> Workspace {
+        Workspace {
+            workspace_id: "ws-1".to_string(),
+            name: "Acme".to_string(),
+            owner_id: "u-1".to_string(),
+            mfa_required,
+            created_at: 100,
+            updated_at: 200,
+        }
+    }
+
+    #[test]
+    fn workspace_round_trips_through_item() {
+        let ws = ws_fixture(true);
+        let back = workspace_from_item(&workspace_to_item(&ws)).expect("from_item");
+        assert_eq!(back.workspace_id, ws.workspace_id);
+        assert_eq!(back.name, ws.name);
+        assert_eq!(back.owner_id, ws.owner_id);
+        assert!(back.mfa_required);
+        assert_eq!(back.created_at, ws.created_at);
+        assert_eq!(back.updated_at, ws.updated_at);
+    }
+
+    #[test]
+    fn mfa_required_false_is_sparse_and_decodes_false() {
+        // M-E3 sparse invariant: `false` writes no attribute (matching
+        // the shape every pre-M-E3 row has), and absence decodes to
+        // false. If a `Bool(false)` ever got written, set_mfa_required's
+        // REMOVE-on-disable branch would leave inconsistent rows.
+        let item = workspace_to_item(&ws_fixture(false));
+        assert!(
+            !item.contains_key("mfa_required"),
+            "mfa_required=false must not write an attribute"
+        );
+        let back = workspace_from_item(&item).expect("from_item");
+        assert!(!back.mfa_required);
+    }
+
+    /// Mimic `add_member`'s column construction (no live table).
+    fn member_item(role: &WorkspaceRole) -> HashMap<String, AttributeValue> {
+        let member = WorkspaceMember {
+            workspace_id: "ws-1".to_string(),
+            user_id: "u-2".to_string(),
+            role: role.clone(),
+            joined_at: 42,
+        };
+        let mut item = HashMap::new();
+        item.insert("PK".to_string(), AttributeValue::S(member.pk()));
+        item.insert("SK".to_string(), AttributeValue::S(member.sk()));
+        item.insert(
+            "role".to_string(),
+            AttributeValue::S(
+                serde_json::to_string(&member.role)
+                    .unwrap()
+                    .trim_matches('"')
+                    .to_string(),
+            ),
+        );
+        item.insert("joined_at".to_string(), AttributeValue::N(member.joined_at.to_string()));
+        item.insert("user_id".to_string(), AttributeValue::S(member.user_id.clone()));
+        item
+    }
+
+    #[test]
+    fn member_role_round_trips_for_every_role() {
+        // add_member serializes the role via serde's lowercase tag;
+        // member_from_item parses it back the same way. All three
+        // tiers must survive — losing Owner/Admin on read would
+        // silently demote a workspace's administration.
+        for role in [WorkspaceRole::Owner, WorkspaceRole::Admin, WorkspaceRole::Member] {
+            let back = member_from_item(&member_item(&role), "ws-1")
+                .unwrap_or_else(|e| panic!("roundtrip failed for {role:?}: {e}"));
+            assert_eq!(back.role, role);
+            assert_eq!(back.user_id, "u-2");
+            assert_eq!(back.workspace_id, "ws-1");
+            assert_eq!(back.joined_at, 42);
+        }
+    }
+
+    #[test]
+    fn member_unknown_role_string_errors() {
+        let mut item = member_item(&WorkspaceRole::Member);
+        item.insert("role".to_string(), AttributeValue::S("superowner".to_string()));
+        let err = member_from_item(&item, "ws-1").expect_err("unknown role must error");
+        match err {
+            RepoError::MissingField(msg) => {
+                assert!(msg.contains("role"), "error must name the field: {msg}")
+            }
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+}

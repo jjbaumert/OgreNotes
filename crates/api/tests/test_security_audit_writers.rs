@@ -677,3 +677,87 @@ async fn folder_share_revoke_writes_audit_row() {
 
     app.cleanup().await;
 }
+
+/// #140 edit-lock — toggling a document's lock via `PUT .../lock` writes
+/// `SecurityAudit::DocLockToggled` with the resulting state. A locked doc
+/// is a doc-wide write-authority change (read-only for everyone including
+/// editors), so both transitions must leave a forensic trail; the no-op
+/// path (same state re-asserted) must NOT write a redundant row. This
+/// writer had no coverage — the functional lock tests in
+/// `test_documents.rs` never look at the audit table.
+#[tokio::test]
+async fn doc_lock_toggle_writes_audit_row() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let (user_id, token) = app.create_user("audit-lock@test.com").await;
+    let doc_id = app.create_doc(&token, "Lockable", None).await;
+
+    // Lock — the event under test.
+    let (status, _) = app
+        .json_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{doc_id}/lock"),
+            Some(&token),
+            Some(serde_json::json!({ "locked": true })),
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let row = wait_for_audit_row(&app, &user_id, |a| {
+        matches!(
+            a,
+            SecurityAuditAction::DocLockToggled { doc_id: d, locked: true } if d == &doc_id
+        )
+    })
+    .await;
+    assert_eq!(row.user_id, user_id, "subject is the doc owner");
+    assert_eq!(row.actor_id, user_id, "self-event: owner-only toggle");
+
+    // Unlock — the reverse transition is audited too (restoring write
+    // authority is as forensically interesting as removing it).
+    let (status, _) = app
+        .json_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{doc_id}/lock"),
+            Some(&token),
+            Some(serde_json::json!({ "locked": false })),
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    wait_for_audit_row(&app, &user_id, |a| {
+        matches!(
+            a,
+            SecurityAuditAction::DocLockToggled { doc_id: d, locked: false } if d == &doc_id
+        )
+    })
+    .await;
+
+    // No-op toggle (already unlocked): the handler returns 204 without
+    // writing or auditing. Both real transitions have already been
+    // polled to completion above, so a fixed grace period then an exact
+    // row count is race-free — there is no third writer in flight.
+    let (status, _) = app
+        .json_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{doc_id}/lock"),
+            Some(&token),
+            Some(serde_json::json!({ "locked": false })),
+        )
+        .await;
+    assert_eq!(status, 204, "no-op toggle still succeeds");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let rows = app
+        .state
+        .security_audit_repo
+        .list_for_user(&user_id, 20)
+        .await
+        .unwrap();
+    let lock_rows = rows
+        .iter()
+        .filter(|r| matches!(&r.action, SecurityAuditAction::DocLockToggled { .. }))
+        .count();
+    assert_eq!(lock_rows, 2, "no-op toggle must not write a redundant audit row");
+
+    app.cleanup().await;
+}

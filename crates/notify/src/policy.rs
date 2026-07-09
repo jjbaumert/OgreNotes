@@ -148,4 +148,30 @@ mod tests {
         assert!(!is_recently_active(now - ACTIVE_WINDOW_USEC, now));
         assert!(!is_recently_active(now - ACTIVE_WINDOW_USEC - 1, now));
     }
+
+    #[test]
+    fn request_access_pref_matrix() {
+        // RequestAccess postdates the loops above and is absent from
+        // them. Pin its full pref matrix: it is NOT special-cased by
+        // MentionsOnly (unlike Mentioned/Shared), so delivery under
+        // the default pref relies on the call site passing
+        // is_direct=true — which the route does, because an edit-
+        // access request is always aimed at the document owner.
+        let t = NotifType::RequestAccess;
+        for is_direct in [true, false] {
+            assert!(!should_email_for_prefs(NotifEmailPref::Disabled, &t, is_direct));
+            assert!(should_email_for_prefs(NotifEmailPref::All, &t, is_direct));
+        }
+        assert!(should_email_for_prefs(NotifEmailPref::MentionsOnly, &t, true));
+        assert!(!should_email_for_prefs(NotifEmailPref::MentionsOnly, &t, false));
+    }
+
+    #[test]
+    fn negative_last_active_is_not_active() {
+        // Corrupt / sentinel negative timestamps must read as
+        // never-active, same as the 0 sentinel — the guard is
+        // `last_active_at > 0`, not merely "recent".
+        assert!(!is_recently_active(-1, 1_000_000_000));
+        assert!(!is_recently_active(i64::MIN, 1_000_000_000));
+    }
 }

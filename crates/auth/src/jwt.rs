@@ -297,6 +297,159 @@ mod tests {
         let result = validate_token(&token, TEST_SECRET);
         assert!(result.is_err());
     }
+
+    // ─── Hardening: alg pinning, malformed tokens, boundaries ────────
+    // validate_token pins HS256 via Validation::new(Algorithm::HS256);
+    // the tests below pin the rejection of downgrade/confusion inputs
+    // and malformed strings that arrive straight off the wire.
+
+    /// Fresh well-formed claims with a comfortable expiry, for tests
+    /// where "the only thing wrong is X".
+    fn valid_claims() -> Claims {
+        let now = jsonwebtoken::get_current_timestamp();
+        Claims {
+            sub: "user123".to_string(),
+            email: "test@example.com".to_string(),
+            iss: EXPECTED_ISSUER.to_string(),
+            aud: EXPECTED_AUDIENCE.to_string(),
+            jti: "jti-x".to_string(),
+            iat: now,
+            exp: now + 900,
+        }
+    }
+
+    #[test]
+    fn alg_none_token_rejected() {
+        // The classic `"alg": "none"` downgrade: well-formed header,
+        // fully valid claims, empty signature. Algorithm pinning must
+        // refuse it as TokenInvalid.
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let claims = format!(
+            r#"{{"sub":"user123","email":"e@e","iss":"{EXPECTED_ISSUER}","aud":"{EXPECTED_AUDIENCE}","jti":"j1","iat":1700000000,"exp":4000000000}}"#
+        );
+        let payload = URL_SAFE_NO_PAD.encode(claims);
+        let token = format!("{header}.{payload}.");
+        assert!(matches!(
+            validate_token(&token, TEST_SECRET),
+            Err(AuthError::TokenInvalid)
+        ));
+    }
+
+    #[test]
+    fn hs384_signed_token_rejected() {
+        // Same secret, same claims, but signed HS384. The signature is
+        // cryptographically valid — algorithm pinning alone must refuse
+        // it so a future config mistake can't widen the accepted set.
+        let token = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS384),
+            &valid_claims(),
+            &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_token(&token, TEST_SECRET),
+            Err(AuthError::TokenInvalid)
+        ));
+    }
+
+    #[test]
+    fn malformed_token_strings_rejected() {
+        // Raw garbage straight off the Authorization header must map to
+        // an error — never panic, never Ok.
+        for garbage in ["", "not-a-jwt", "a.b", "a.b.c.d", "..", "  ", "🦀.🦀.🦀"] {
+            assert!(
+                validate_token(garbage, TEST_SECRET).is_err(),
+                "garbage token {garbage:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_signature_rejected() {
+        // Valid header + payload lifted from a real token, signature
+        // stripped. Must not validate.
+        let token = create_access_token("user123", "test@example.com", TEST_SECRET).unwrap();
+        let mut parts = token.split('.');
+        let (h, p) = (parts.next().unwrap(), parts.next().unwrap());
+        let unsigned = format!("{h}.{p}.");
+        assert!(validate_token(&unsigned, TEST_SECRET).is_err());
+    }
+
+    #[test]
+    fn missing_exp_claim_rejected() {
+        // exp is in the required-spec-claims set; a signed token without
+        // it must not validate even though everything else checks out.
+        #[derive(Serialize)]
+        struct NoExp {
+            sub: String,
+            email: String,
+            iss: String,
+            aud: String,
+            jti: String,
+            iat: u64,
+        }
+        let claims = NoExp {
+            sub: "user123".to_string(),
+            email: "test@example.com".to_string(),
+            iss: EXPECTED_ISSUER.to_string(),
+            aud: EXPECTED_AUDIENCE.to_string(),
+            jti: "jti".to_string(),
+            iat: jsonwebtoken::get_current_timestamp(),
+        };
+        let token = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+        )
+        .unwrap();
+        assert!(validate_token(&token, TEST_SECRET).is_err());
+    }
+
+    #[test]
+    fn secret_length_boundary_is_32_bytes() {
+        // 31 bytes → refused at mint time; exactly 32 → accepted and the
+        // minted token round-trips. Pins the MIN_SECRET_LEN boundary.
+        let short = "a".repeat(31);
+        assert!(matches!(
+            create_access_token("u", "e@e", &short),
+            Err(AuthError::TokenCreation(_))
+        ));
+
+        let exact = "b".repeat(32);
+        let token = create_access_token("u", "e@e", &exact).unwrap();
+        assert_eq!(validate_token(&token, &exact).unwrap().sub, "u");
+    }
+
+    #[test]
+    fn expiry_leeway_is_60_seconds() {
+        // Characterization: validate_token leaves jsonwebtoken's default
+        // 60-second exp leeway in place, so a token expired <60s ago
+        // still validates, while one expired beyond the leeway maps to
+        // TokenExpired. If the leeway is ever tightened to zero the
+        // first assertion flips — that is a deliberate behavior change,
+        // not a refactor.
+        let mint = |exp_offset: i64| {
+            let now = jsonwebtoken::get_current_timestamp();
+            let mut claims = valid_claims();
+            claims.exp = (now as i64 + exp_offset) as u64;
+            jsonwebtoken::encode(
+                &Header::new(Algorithm::HS256),
+                &claims,
+                &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+            )
+            .unwrap()
+        };
+
+        // Expired 5s ago: inside the 60s leeway → currently accepted.
+        assert!(validate_token(&mint(-5), TEST_SECRET).is_ok());
+        // Expired 120s ago: beyond the leeway → TokenExpired.
+        assert!(matches!(
+            validate_token(&mint(-120), TEST_SECRET),
+            Err(AuthError::TokenExpired)
+        ));
+    }
 }
 
 #[cfg(test)]

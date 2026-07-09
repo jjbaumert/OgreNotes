@@ -1187,3 +1187,113 @@ async fn disarm_writes_mfa_disarm_audit_row() {
 
     app.cleanup().await;
 }
+
+/// Redeeming a valid recovery code writes `SecurityAudit::MfaRecoveryUsed`.
+/// A consumed recovery code is a second-factor bypass event — the design
+/// keeps it distinct from `MfaVerify { ok: true }` so forensics can see
+/// which logins skipped TOTP. This writer had no coverage; the functional
+/// redemption test never looks at the audit table.
+#[tokio::test]
+async fn recovery_success_writes_recovery_used_audit_row() {
+    common::require_infra!();
+    std::sync::LazyLock::force(&common::MFA_KEY_INIT);
+    let app = common::TestApp::new().await;
+
+    let email = "mfa-recovery-audit-used@test.com";
+    let (user_id, token) = app.create_user(email).await;
+    let (_, enroll) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/auth/mfa/enroll",
+            Some(&token),
+            None,
+        )
+        .await;
+    let secret = enroll["secret"].as_str().unwrap().to_string();
+    let recovery_code = enroll["recoveryCodes"][0].as_str().unwrap().to_string();
+    let code = current_code(&secret, email);
+    let (status, _) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/auth/mfa/verify",
+            Some(&token),
+            Some(serde_json::json!({ "code": code })),
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let (_, json) = dev_login(&app, email).await;
+    let handle = json["handle"].as_str().unwrap().to_string();
+
+    let (status, body) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/auth/mfa/recovery",
+            None,
+            Some(serde_json::json!({ "handle": handle, "code": recovery_code })),
+        )
+        .await;
+    assert_eq!(status, 200, "recovery body: {body}");
+
+    wait_for_mfa_audit(&app, &user_id, |a| {
+        matches!(a, SecurityAuditAction::MfaRecoveryUsed)
+    })
+    .await;
+
+    app.cleanup().await;
+}
+
+/// A recovery attempt with a non-matching code writes
+/// `SecurityAudit::MfaRecoveryFailed`. The design keeps this distinct from
+/// `MfaVerify { ok: false }` because the bypass-attempt rate-limit alert
+/// needs to tell 50-bit recovery-code brute-force apart from 6-digit TOTP
+/// brute-force. This writer had no coverage.
+#[tokio::test]
+async fn recovery_wrong_code_writes_recovery_failed_audit_row() {
+    common::require_infra!();
+    std::sync::LazyLock::force(&common::MFA_KEY_INIT);
+    let app = common::TestApp::new().await;
+
+    let email = "mfa-recovery-audit-failed@test.com";
+    let (user_id, token) = app.create_user(email).await;
+    let (_, enroll) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/auth/mfa/enroll",
+            Some(&token),
+            None,
+        )
+        .await;
+    let secret = enroll["secret"].as_str().unwrap().to_string();
+    let code = current_code(&secret, email);
+    let (status, _) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/auth/mfa/verify",
+            Some(&token),
+            Some(serde_json::json!({ "code": code })),
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let (_, json) = dev_login(&app, email).await;
+    let handle = json["handle"].as_str().unwrap().to_string();
+
+    // One wrong attempt — inside the failure budget (3), so a plain 401.
+    let (status, _) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/auth/mfa/recovery",
+            None,
+            Some(serde_json::json!({ "handle": handle, "code": "NOPE!-NOPE!" })),
+        )
+        .await;
+    assert_eq!(status, 401);
+
+    wait_for_mfa_audit(&app, &user_id, |a| {
+        matches!(a, SecurityAuditAction::MfaRecoveryFailed)
+    })
+    .await;
+
+    app.cleanup().await;
+}
