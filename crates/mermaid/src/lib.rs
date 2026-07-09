@@ -91,6 +91,23 @@ pub fn detect_kind(source: &str) -> DiagramKind {
 /// Render mermaid `source` to an SVG string. Never panics.
 pub fn render(source: &str) -> RenderOutput {
     let kind = detect_kind(source);
+    // Self-contained gate: `crates/collab`'s write-gate validator already
+    // rejects over-cap sources before they're ever stored, but `render()`
+    // is a public crate entry point other callers can reach directly
+    // (tests, future callers, anything that bypasses the write gate), so
+    // it must not rely on an upstream caller to have checked this. Kept
+    // AFTER `detect_kind` (which is only ever O(first line), cheap even
+    // on a huge string) so the returned `kind` is still meaningful.
+    if source.chars().count() > MAX_SOURCE_LEN {
+        return RenderOutput {
+            kind,
+            svg: None,
+            error: Some(ParseError {
+                message: format!("diagram source too large (max {MAX_SOURCE_LEN} chars)"),
+                line: None,
+            }),
+        };
+    }
     match kind {
         DiagramKind::Pie => match pie::parse(source) {
             Ok(p) => RenderOutput { kind, svg: Some(pie::render_svg(&p)), error: None },
@@ -194,6 +211,23 @@ mod tests {
     }
 
     #[test]
+    fn render_gates_oversized_source_without_parsing() {
+        // Self-contained cap: render() must reject an over-`MAX_SOURCE_LEN`
+        // source itself, not rely on an upstream write-gate having already
+        // checked it. Uses a source that's cheap to detect_kind() on
+        // (short first line) but long overall, and asserts the error and
+        // the XOR invariant rather than any timing.
+        let big = format!("graph TD\n{}", "A --> B\n".repeat(MAX_SOURCE_LEN));
+        assert!(big.chars().count() > MAX_SOURCE_LEN);
+        let out = render(&big);
+        assert_eq!(out.kind, DiagramKind::Flowchart);
+        assert!(out.svg.is_none());
+        let err = out.error.expect("oversized source must error");
+        assert!(err.message.contains("too large"), "got: {}", err.message);
+        assert!(err.line.is_none());
+    }
+
+    #[test]
     fn flowchart_with_subgraph_and_classes_renders() {
         let src = "flowchart LR\nclassDef hot fill:#f00\nsubgraph s[Sub]\nA:::hot --> B\nend\nB --> C";
         let out = render(src);
@@ -224,6 +258,7 @@ mod tests {
             &format!("graph LR\n{}", (0..300).map(|i| format!("n{i} --> n{} \n", (i * 7) % 300)).collect::<String>()),
             "graph TD\nA --> A --> A",
             "graph TD\nA[🥧<br/>🥧] -->|🥧| B",
+            &format!("graph TD\n{}", "A --> B\n".repeat(3000)), // over MAX_SOURCE_LEN
         ];
         for inp in inputs {
             let out = render(inp); // must return, not panic

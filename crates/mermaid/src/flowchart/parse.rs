@@ -37,8 +37,23 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
             continue;
         }
         if !seen_header {
-            p.parse_header(line)?;
+            // Mermaid's own docs use the `graph TD;` form (trailing `;`,
+            // sometimes with statements chained after it on the same
+            // line). Split the header line on `;` the same way a
+            // statement line is split below: the first segment is the
+            // header, any remaining non-empty segments are ordinary
+            // statements on the same line.
+            let mut segs = line.split(';');
+            let header = segs.next().unwrap_or("").trim();
+            p.parse_header(header)?;
             seen_header = true;
+            for stmt in segs {
+                let stmt = stmt.trim();
+                if stmt.is_empty() {
+                    continue;
+                }
+                p.parse_statement(stmt)?;
+            }
             continue;
         }
         for stmt in line.split(';') {
@@ -157,6 +172,21 @@ impl Parser {
             for &f in &lhs {
                 for &t in &rhs {
                     self.g.edges.push(FlowEdge { from: f, to: t, kind, label: label.clone() });
+                    // Bail INSIDE the fan-out loop, not after it: an
+                    // `a&a&...&a --> a&...&a` chain with N ids on each
+                    // side pushes N*N edges before this loop would
+                    // otherwise return, so at N=5000 (well under what a
+                    // 20k-char source can spell) that's 25M `FlowEdge`
+                    // allocations (~2.1GB RSS, measured) long before
+                    // layout's `MAX_EDGES` validator ever runs. Checking
+                    // after every push caps the work at MAX_EDGES + 1
+                    // pushes regardless of how large the fan-out is.
+                    if self.g.edges.len() > crate::layout::MAX_EDGES {
+                        return Err(self.err(format!(
+                            "diagram too large: too many edges (max {})",
+                            crate::layout::MAX_EDGES
+                        )));
+                    }
                 }
             }
             lhs = rhs;
@@ -180,6 +210,8 @@ impl Parser {
 
     fn parse_node_ref(&mut self, rest: &mut &str) -> Result<usize, ParseError> {
         let r = rest.trim_start();
+        // char count == byte length ONLY because the predicate is
+        // ASCII-only; do not relax without a byte-position scan.
         let id_len = r.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
         if id_len == 0 {
             return Err(self.err(format!("expected a node id, found {r:?}")));
@@ -432,6 +464,28 @@ mod tests {
     }
 
     #[test]
+    fn semicolon_terminated_header_alone() {
+        let g = p("graph TD;");
+        assert_eq!(g.direction, Direction::TB);
+        assert!(g.nodes.is_empty());
+    }
+
+    #[test]
+    fn semicolon_terminated_header_with_trailing_statement() {
+        let g = p("graph LR; A-->B");
+        assert_eq!(g.direction, Direction::LR);
+        assert_eq!(g.edges.len(), 1);
+        assert_eq!((g.edges[0].from, g.edges[0].to), (0, 1));
+    }
+
+    #[test]
+    fn unknown_direction_still_errors_with_and_without_semicolon() {
+        assert!(parse("graph XX").unwrap_err().message.contains("unknown direction"));
+        let e = parse("graph XX;").unwrap_err();
+        assert!(e.message.contains("unknown direction"), "got: {}", e.message);
+    }
+
+    #[test]
     fn all_shapes_parse() {
         let cases = [
             ("A[text]", ShapeKind::Rect),
@@ -504,6 +558,20 @@ mod tests {
         assert_eq!(g.edges.len(), 3);
         assert_eq!(g.nodes.len(), 4);
         assert_eq!((g.edges[1].from, g.edges[1].to), (1, 2));
+    }
+
+    #[test]
+    fn fanout_exceeding_edge_cap_errs_quickly() {
+        // 200 ids on each side of `&` fan-out -> up to 200*200 = 40,000
+        // candidate edge pushes if unchecked, but the in-loop cap check
+        // must bail once `MAX_EDGES` (1000) is crossed, well before the
+        // full cross product is built. The test proves "no blowup" simply
+        // by completing in normal test time rather than by timing.
+        let side: String = std::iter::repeat_n("a", 200).collect::<Vec<_>>().join("&");
+        let src = format!("graph TD\n{side} --> {side}");
+        let e = parse(&src).unwrap_err();
+        assert!(e.message.contains("too many edges"), "got: {}", e.message);
+        assert_eq!(e.line, Some(2));
     }
 
     #[test]
