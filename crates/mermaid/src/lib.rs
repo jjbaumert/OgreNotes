@@ -6,6 +6,7 @@
 //! docs/superpowers/specs/2026-07-08-mermaid-support-design.md.
 
 mod pie;
+mod layout;
 
 /// Max diagram source length (chars). Shared cap: the single source of
 /// truth for both the `crates/collab` write-gate validator
