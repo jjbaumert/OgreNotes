@@ -248,6 +248,27 @@ pub(crate) fn layout_tb(input: &LayoutInput) -> Result<Layout, String> {
         .zip(&ac.orig)
         .map(|(e, &o)| LEdge { from: e.from, to: e.to, label: input.edges[o].label })
         .collect();
+    // Cap total dummy (waypoint) slots BEFORE `build_order_graph` runs.
+    // Each surviving edge spanning ranks `rf..rt` gets `rt - rf - 1` dummy
+    // slots (mirrors the loop inside `build_order_graph` exactly, so the
+    // count here is the true count that function would materialize).
+    // Computed from `ranks` alone (already known at this point) so a
+    // pathological validator-passing graph (few hundred nodes, long-span
+    // edges) can be rejected without ever allocating the dummy slots that
+    // make ordering/positioning's per-rank sweeps expensive.
+    let dummy_slots: usize = surviving
+        .iter()
+        .map(|e| {
+            let (rf, rt) = (ranks[e.from], ranks[e.to]);
+            rt.saturating_sub(rf + 1)
+        })
+        .sum();
+    if dummy_slots > order::MAX_DUMMY_SLOTS {
+        return Err(format!(
+            "diagram too large: {dummy_slots} edge waypoints (max {})",
+            order::MAX_DUMMY_SLOTS
+        ));
+    }
     let mut g = order::build_order_graph(&input.nodes, &surviving, &ranks);
     order::minimize_crossings(&mut g, &surviving);
     let coords = position::assign_coords(&g);
@@ -455,6 +476,98 @@ mod tests {
             direction: Direction::TB,
         };
         assert!(run(&input).unwrap_err().contains("too large"));
+    }
+
+    /// Reduced-but-representative version of the reviewer's repro shape
+    /// (400-node chain + 601 long edges -> ~240k dummy slots, 76s wall
+    /// before the fix): a chain plus a batch of edges each spanning most
+    /// of the chain. Stays well inside `MAX_NODES`/`MAX_EDGES` (validator
+    /// would accept it), but the dummy-slot volume is deliberately over
+    /// `order::MAX_DUMMY_SLOTS`, so `layout_tb` must reject it up front
+    /// (via the cap in Fix 1b) instead of materializing the dummy slots
+    /// and grinding through 8+3 sweeps over them (Fix 1a's hoist alone
+    /// would make that fast; the cap makes it instant and bounds memory
+    /// too). Test proves this completes immediately by construction: if
+    /// the cap check were missing or broken, this test would hang/burn
+    /// CPU rather than assert quickly.
+    #[test]
+    fn layout_tb_rejects_dummy_heavy_graph_reviewer_shape() {
+        let node_count = 200;
+        let nodes: Vec<LNode> = (0..node_count).map(|_| node(20.0, 10.0)).collect();
+        let mut edges: Vec<LEdge> = (0..node_count - 1)
+            .map(|i| LEdge { from: i, to: i + 1, label: None })
+            .collect();
+        // 300 edges each spanning nearly the whole chain: ~300 * 198 =
+        // 59,400 dummy slots, comfortably over the 20,000 cap.
+        for k in 0..300 {
+            edges.push(LEdge { from: k % 2, to: node_count - 1, label: None });
+        }
+        let input = LayoutInput {
+            nodes,
+            edges,
+            clusters: vec![],
+            direction: Direction::TB,
+        };
+        let err = run(&input).unwrap_err();
+        assert!(err.contains("too large"), "got: {err}");
+        assert!(err.contains("waypoints"), "got: {err}");
+    }
+
+    /// A validator-passing, dummy-heavy graph deliberately built to trip
+    /// `order::MAX_DUMMY_SLOTS` by a wide margin via many parallel
+    /// full-span edges, independent of the chain shape above — the cap
+    /// check must fire regardless of WHICH edges contribute the volume.
+    #[test]
+    fn layout_tb_rejects_when_dummy_cap_exceeded() {
+        let node_count = 50;
+        let nodes: Vec<LNode> = (0..node_count).map(|_| node(20.0, 10.0)).collect();
+        let mut edges: Vec<LEdge> = (0..node_count - 1)
+            .map(|i| LEdge { from: i, to: i + 1, label: None })
+            .collect();
+        // 500 parallel edges from node 0 to the far end: each spans 48
+        // ranks -> 48 dummy slots; 500 * 48 = 24,000 > 20,000 cap.
+        for _ in 0..500 {
+            edges.push(LEdge { from: 0, to: node_count - 1, label: None });
+        }
+        let input = LayoutInput {
+            nodes,
+            edges,
+            clusters: vec![],
+            direction: Direction::TB,
+        };
+        let err = run(&input).unwrap_err();
+        assert!(err.contains("too large"), "got: {err}");
+    }
+
+    /// Completes-fast smoke: a chain plus a batch of medium-span edges
+    /// whose total dummy volume stays UNDER the cap, so this exercises the
+    /// real (Fix 1a-hoisted) ordering/positioning sweeps end to end rather
+    /// than short-circuiting on the cap. No timing assertion — the point
+    /// is that it completes at all in normal test time.
+    #[test]
+    fn layout_tb_completes_fast_under_dummy_cap() {
+        let node_count = 200;
+        let nodes: Vec<LNode> = (0..node_count).map(|_| node(20.0, 10.0)).collect();
+        let mut edges: Vec<LEdge> = (0..node_count - 1)
+            .map(|i| LEdge { from: i, to: i + 1, label: None })
+            .collect();
+        // 100 edges each spanning ~20 ranks: 100 * 19 = 1,900 dummy slots,
+        // well under the 20,000 cap.
+        for k in 0..100 {
+            let from = k;
+            let to = (k + 20).min(node_count - 1);
+            if to > from {
+                edges.push(LEdge { from, to, label: None });
+            }
+        }
+        let input = LayoutInput {
+            nodes,
+            edges,
+            clusters: vec![],
+            direction: Direction::TB,
+        };
+        let l = run(&input).expect("under-cap graph must lay out, not error");
+        assert_eq!(l.node_centers.len(), node_count);
     }
 
     #[test]

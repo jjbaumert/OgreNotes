@@ -159,6 +159,48 @@ pub(crate) struct Slot {
     pub size: (f64, f64),
 }
 
+/// Buckets every chain window `(a, b)` by the rank its upper element `a`
+/// lives on. Because a chain's slots descend consecutive ranks, `a`'s rank
+/// is also `b`'s rank minus one, so bucket `r` holds exactly the windows
+/// bridging rank `r` and rank `r + 1`. Windows are pushed in chain-index
+/// order (chains outer, window-within-chain inner) so consumers that want
+/// a deterministic per-slot neighbor order can rely on bucket order.
+///
+/// Built ONCE by `build_order_graph` and cached on `OrderGraph` (see
+/// `OrderGraph::index`): the chain set and each slot's rank membership are
+/// invariant after construction — only the within-rank ORDER of slots
+/// changes as `minimize_crossings` sweeps — so rebuilding this index on
+/// every `neighbor_positions`/`count_crossings` call (the pre-fix
+/// behavior) redid identical O(total_windows) work on every one of the
+/// 8 (ordering) + 3 (positioning) sweep passes, per rank, per call. On a
+/// dummy-heavy graph (hundreds of thousands of slots) that rebuild
+/// dominated wall time; caching it once amortizes the cost across the
+/// whole layout.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OrderIndex {
+    buckets: Vec<Vec<(SlotKind, SlotKind)>>,
+}
+
+fn build_window_index(ranks: &[Vec<Slot>], chains: &[Vec<SlotKind>]) -> OrderIndex {
+    let mut slot_rank: std::collections::HashMap<SlotKind, usize> =
+        std::collections::HashMap::new();
+    for (r, row) in ranks.iter().enumerate() {
+        for s in row {
+            slot_rank.insert(s.kind, r);
+        }
+    }
+    let mut buckets: Vec<Vec<(SlotKind, SlotKind)>> = vec![Vec::new(); ranks.len()];
+    for chain in chains {
+        for w in chain.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if let Some(&r) = slot_rank.get(&a) {
+                buckets[r].push((a, b));
+            }
+        }
+    }
+    OrderIndex { buckets }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct OrderGraph {
     /// ranks[r] = ordered slots on rank r.
@@ -166,10 +208,20 @@ pub(crate) struct OrderGraph {
     /// chains[edge] = slot identities the edge passes through, in order
     /// from source to target (both endpoints included).
     pub chains: Vec<Vec<SlotKind>>,
+    /// Chain-window-by-rank index, built once at construction time. See
+    /// `OrderIndex` doc comment for why this is safe to cache.
+    index: OrderIndex,
 }
 
 /// Default footprint a dummy occupies so parallel long edges don't fuse.
 const DUMMY_SIZE: (f64, f64) = (8.0, 8.0);
+
+/// Hard cap on total dummy (waypoint) slots a layout will construct.
+/// Enforced by the caller (`layout_tb`) BEFORE this function runs, by
+/// summing the same `(span - 1)` quantity this function would otherwise
+/// materialize into slots — see the cap check there for why it can't live
+/// here (this function is infallible by construction).
+pub(crate) const MAX_DUMMY_SLOTS: usize = 20_000;
 
 pub(crate) fn build_order_graph(
     nodes: &[LNode],
@@ -205,36 +257,8 @@ pub(crate) fn build_order_graph(
         chain.push(SlotKind::Real(e.to));
         chains.push(chain);
     }
-    OrderGraph { ranks: rows, chains }
-}
-
-/// Buckets every chain window `(a, b)` by the rank its upper element `a`
-/// lives on. Because a chain's slots descend consecutive ranks, `a`'s rank
-/// is also `b`'s rank minus one, so bucket `r` holds exactly the windows
-/// bridging rank `r` and rank `r + 1`. Built in one pass over `g.chains`
-/// (a second pass over `g.ranks` supplies the slot→rank lookup), so the
-/// whole structure costs O(total_windows) regardless of how many ranks or
-/// slots-per-rank the graph has. Windows are pushed in chain-index order
-/// (chains outer, window-within-chain inner) so consumers that want a
-/// deterministic per-slot neighbor order can rely on bucket order.
-fn windows_by_rank(g: &OrderGraph) -> Vec<Vec<(SlotKind, SlotKind)>> {
-    let mut slot_rank: std::collections::HashMap<SlotKind, usize> =
-        std::collections::HashMap::new();
-    for (r, row) in g.ranks.iter().enumerate() {
-        for s in row {
-            slot_rank.insert(s.kind, r);
-        }
-    }
-    let mut buckets: Vec<Vec<(SlotKind, SlotKind)>> = vec![Vec::new(); g.ranks.len()];
-    for chain in &g.chains {
-        for w in chain.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            if let Some(&r) = slot_rank.get(&a) {
-                buckets[r].push((a, b));
-            }
-        }
-    }
-    buckets
+    let index = build_window_index(&rows, &chains);
+    OrderGraph { ranks: rows, chains, index }
 }
 
 /// Positions of each slot's chain-neighbors on the adjacent rank.
@@ -247,10 +271,10 @@ pub(crate) fn neighbor_positions(
     // slots adjacent to it (previous rank if upstream, next if not)
     // along every edge chain that passes through it. Only the one bucket
     // that actually borders `rank` is walked (O(bucket) instead of
-    // scanning every chain window in the graph); building the bucket
-    // index itself is O(total_windows), so a call here costs
-    // O(total_windows + slots_on_rank) rather than the previous
-    // O(slots_on_rank * total_windows).
+    // scanning every chain window in the graph); the bucket index itself
+    // is built once by `build_order_graph` and cached on `g.index` (see
+    // `OrderIndex`), so a call here costs O(bucket + slots_on_rank)
+    // rather than O(total_windows + slots_on_rank) per call.
     let adj_rank = if upstream { rank.wrapping_sub(1) } else { rank + 1 };
     let mut pos_of: std::collections::HashMap<SlotKind, usize> =
         std::collections::HashMap::new();
@@ -265,7 +289,7 @@ pub(crate) fn neighbor_positions(
         here_pos.insert(s.kind, i);
     }
     let mut out: Vec<Vec<usize>> = vec![Vec::new(); g.ranks[rank].len()];
-    let buckets = windows_by_rank(g);
+    let buckets = &g.index.buckets;
     // Upstream neighbors of `rank` live in the bucket keyed by rank - 1
     // (windows whose upper element `a` is on rank - 1, lower `b` on
     // `rank`); downstream neighbors live in the bucket keyed by `rank`
@@ -284,13 +308,14 @@ pub(crate) fn neighbor_positions(
 
 pub(crate) fn count_crossings(g: &OrderGraph, _edges: &[LEdge]) -> usize {
     // For each adjacent rank pair, count inversions among edge segment
-    // endpoint pairs. Windows are pre-bucketed by rank once via
-    // `windows_by_rank` (O(total_windows)), so each rank pair only scans
-    // the segments that actually bridge it instead of rescanning every
-    // chain in the graph; the inversion count itself stays O(k^2) in the
-    // number of segments crossing that one rank pair, which is fine at
+    // endpoint pairs. Windows are pre-bucketed by rank once by
+    // `build_order_graph` and cached on `g.index` (O(total_windows), paid
+    // once per layout instead of once per call), so each rank pair only
+    // scans the segments that actually bridge it instead of rescanning
+    // every chain in the graph; the inversion count itself stays O(k^2) in
+    // the number of segments crossing that one rank pair, which is fine at
     // our caps.
-    let buckets = windows_by_rank(g);
+    let buckets = &g.index.buckets;
     let mut total = 0;
     for r in 0..g.ranks.len().saturating_sub(1) {
         let pos_hi: std::collections::HashMap<SlotKind, usize> = g.ranks[r]
