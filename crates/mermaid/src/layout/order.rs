@@ -168,17 +168,6 @@ pub(crate) struct OrderGraph {
     pub chains: Vec<Vec<SlotKind>>,
 }
 
-pub(crate) fn find(ranks: &[Vec<Slot>], kind: SlotKind) -> Option<(usize, usize)> {
-    for (r, row) in ranks.iter().enumerate() {
-        for (i, s) in row.iter().enumerate() {
-            if s.kind == kind {
-                return Some((r, i));
-            }
-        }
-    }
-    None
-}
-
 /// Default footprint a dummy occupies so parallel long edges don't fuse.
 const DUMMY_SIZE: (f64, f64) = (8.0, 8.0);
 

@@ -1,6 +1,3 @@
-#![allow(dead_code)]
-// TODO(slice2): remove once flowchart consumes layout (Task 14 removes this)
-
 //! Mermaid-agnostic layered (Sugiyama-style) layout engine.
 //! Input: abstract digraph with sized nodes, optional cluster tree, direction.
 //! Output: node centers, edge polylines, cluster rects. Deterministic,

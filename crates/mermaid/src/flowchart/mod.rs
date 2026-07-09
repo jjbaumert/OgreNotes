@@ -1,6 +1,3 @@
-#![allow(dead_code)]
-// TODO(slice2): removed in Task 14
-
 pub(crate) mod measure;
 pub(crate) mod parse;
 pub(crate) mod shapes;
@@ -33,6 +30,12 @@ pub(crate) enum EdgeKind {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FlowNode {
+    /// Mermaid source identifier. Not read by the render pipeline
+    /// (downstream stages address nodes by index); kept because parser
+    /// tests assert on it to verify id-extraction is correct (bare ids,
+    /// subgraph-membership lookup, class-assignment lookup). See
+    /// task-14-report.md for why this isn't deleted outright.
+    #[allow(dead_code)]
     pub id: String,
     pub label: String,          // raw; escaped only at SVG emission
     pub shape: ShapeKind,

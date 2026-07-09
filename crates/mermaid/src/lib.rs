@@ -2,7 +2,9 @@
 
 //! Pure-Rust Mermaid → SVG renderer. `render()` never panics; every
 //! failure or not-yet-supported diagram kind returns a structured error
-//! and no SVG, so callers can fall back to raw source. See
+//! and no SVG, so callers can fall back to raw source. Supports pie
+//! charts and flowcharts (graph/flowchart); other diagram kinds are
+//! detected but not yet rendered. See
 //! docs/superpowers/specs/2026-07-08-mermaid-support-design.md.
 
 mod pie;
@@ -94,6 +96,10 @@ pub fn render(source: &str) -> RenderOutput {
             Ok(p) => RenderOutput { kind, svg: Some(pie::render_svg(&p)), error: None },
             Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
         },
+        DiagramKind::Flowchart => match flowchart::render_flowchart(source) {
+            Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
         DiagramKind::Unknown => RenderOutput {
             kind,
             svg: None,
@@ -170,6 +176,31 @@ mod tests {
     }
 
     #[test]
+    fn flowchart_renders_svg_via_public_render() {
+        let out = render("graph TD\nA[Start] --> B{Go?} -->|yes| C(Done)");
+        assert_eq!(out.kind, DiagramKind::Flowchart);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
+        let svg = out.svg.expect("flowchart should render");
+        assert!(svg.starts_with("<svg"));
+    }
+
+    #[test]
+    fn flowchart_parse_error_flows_through_render() {
+        let out = render("graph TD\nA[unclosed");
+        assert_eq!(out.kind, DiagramKind::Flowchart);
+        assert!(out.svg.is_none());
+        let e = out.error.expect("error");
+        assert_eq!(e.line, Some(2));
+    }
+
+    #[test]
+    fn flowchart_with_subgraph_and_classes_renders() {
+        let src = "flowchart LR\nclassDef hot fill:#f00\nsubgraph s[Sub]\nA:::hot --> B\nend\nB --> C";
+        let out = render(src);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
+    }
+
+    #[test]
     fn render_never_panics_on_adversarial_input() {
         let inputs = [
             "",
@@ -183,6 +214,16 @@ mod tests {
             &"pie\n".repeat(100_000),
             &"\"a\": 1\n".repeat(100_000),
             "🥧 pie 🥧",
+            "graph TD",
+            "graph XX",
+            "flowchart LR\nA --> ",
+            "graph TD\nA[",
+            "graph TD\nsubgraph s\nsubgraph t\nA",
+            "graph TD\nend\nend",
+            &format!("graph TD\n{}", "A --> B\n".repeat(2000)),
+            &format!("graph LR\n{}", (0..300).map(|i| format!("n{i} --> n{} \n", (i * 7) % 300)).collect::<String>()),
+            "graph TD\nA --> A --> A",
+            "graph TD\nA[🥧<br/>🥧] -->|🥧| B",
         ];
         for inp in inputs {
             let out = render(inp); // must return, not panic
