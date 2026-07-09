@@ -11,6 +11,24 @@ use http_body_util::BodyExt;
 use hyper::Method;
 use tower::ServiceExt;
 
+/// Pure math behind `common::align_rate_limit_window` (issue #6):
+/// given the epoch seconds, how long must a test wait so its burst
+/// starts with at least `margin` seconds left in the fixed window?
+#[test]
+fn alignment_wait_math() {
+    // Plenty of headroom → no wait.
+    assert_eq!(common::rate_limit_alignment_wait(0, 60, 10), 0);
+    assert_eq!(common::rate_limit_alignment_wait(30, 60, 10), 0);
+    // Exactly `margin` remaining still qualifies → no wait.
+    assert_eq!(common::rate_limit_alignment_wait(50, 60, 10), 0);
+    // Inside the margin → wait until the next window boundary.
+    assert_eq!(common::rate_limit_alignment_wait(51, 60, 10), 9);
+    assert_eq!(common::rate_limit_alignment_wait(59, 60, 10), 1);
+    // Boundary itself is a fresh window → no wait.
+    assert_eq!(common::rate_limit_alignment_wait(60, 60, 10), 0);
+    assert_eq!(common::rate_limit_alignment_wait(3661, 60, 10), 0);
+}
+
 async fn dispatch_full(
     app: &common::TestApp,
     req: hyper::Request<axum::body::Body>,
@@ -29,6 +47,7 @@ async fn auth_login_rate_limit_returns_429_with_retry_after() {
 
     // Cap is 3/min, keyed by X-Forwarded-For. A single client gets 3
     // through and the 4th 429s.
+    common::align_rate_limit_window().await;
     for i in 0..3 {
         let req = hyper::Request::builder()
             .method(Method::GET)
@@ -99,6 +118,7 @@ async fn auth_refresh_rate_limit_fires_on_repeated_attempts() {
     // empty body + no cookie → the handler reaches the rate-limit
     // check (which runs first) and returns 429 once the cap fires.
     // Below the cap the handler returns 401 (no credentials).
+    common::align_rate_limit_window().await;
     for _ in 0..3 {
         let req = hyper::Request::builder()
             .method(Method::POST)
@@ -133,6 +153,7 @@ async fn search_rate_limit_fires_per_user() {
     let app = common::TestApp::new().await;
     let token = app.create_user_token("ratelimit-search@test.com").await;
 
+    common::align_rate_limit_window().await;
     for i in 0..3 {
         let (status, _) = app
             .json_request(
@@ -173,6 +194,7 @@ async fn user_search_rate_limit_fires_per_user() {
     let app = common::TestApp::new().await;
     let token = app.create_user_token("ratelimit-user-search@test.com").await;
 
+    common::align_rate_limit_window().await;
     for i in 0..3 {
         let (status, _) = app
             .json_request(
@@ -220,6 +242,7 @@ async fn sharing_rate_limit_fires_on_mutation_loop() {
 
     // 1 add (uses 1 of 10 budget) + 9 PATCHes (fills out to 10) = the
     // last PATCH succeeds. The 11th call (next PATCH) must 429.
+    common::align_rate_limit_window().await;
     let add_body = serde_json::json!({ "userId": target_id, "accessLevel": "EDIT" });
     let (status, _) = app
         .json_request(
@@ -284,6 +307,7 @@ async fn admin_mut_rate_limit_fires_on_repeated_promotes() {
     let (_, admin_token) = app.create_user("ratelimit-admin@test.com").await;
     let (target_id, _) = app.create_user("ratelimit-target@test.com").await;
 
+    common::align_rate_limit_window().await;
     for i in 0..10 {
         let (status, _) = app
             .json_request(
@@ -339,6 +363,7 @@ async fn comments_rate_limit_fires_across_thread_and_messages() {
     let doc_id = app.create_doc(&token, "Comments doc", None).await;
 
     // Burns 1 of 5.
+    common::align_rate_limit_window().await;
     let (status, thread) = app
         .json_request(
             Method::POST,
@@ -402,6 +427,7 @@ async fn content_write_rate_limit_fires_on_repeated_puts() {
     let doc_id = app.create_doc(&token, "Content rate-limit doc", None).await;
     let state_bytes = ogrenotes_collab::document::OgreDoc::new().to_state_bytes();
 
+    common::align_rate_limit_window().await;
     for i in 0..5 {
         let (status, _) = app
             .bytes_request(
@@ -477,6 +503,7 @@ async fn ws_upgrade_rate_limit_fires_on_repeated_handshakes() {
         app.raw_request(req).await.0
     }
 
+    common::align_rate_limit_window().await;
     for i in 0..5 {
         let status = upgrade_once(&app, &token, &doc_id).await;
         assert_ne!(
@@ -516,6 +543,7 @@ async fn saml_acs_rate_limit_returns_429_per_source_ip() {
             .unwrap()
     };
 
+    common::align_rate_limit_window().await;
     for i in 0..3 {
         let (status, _) = dispatch_full(&app, mk_req()).await;
         assert_ne!(

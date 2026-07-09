@@ -131,6 +131,45 @@ macro_rules! require_infra {
 }
 pub(crate) use require_infra;
 
+// ─── Rate-limit window alignment (#6) ───────────────────────────
+
+/// Seconds a burst test must wait so it starts with at least
+/// `margin_secs` of headroom in the current fixed rate-limit window.
+///
+/// The limiter buckets on `epoch_secs / window_secs`, so a burst
+/// that straddles a wall-clock window boundary legitimately gets a
+/// fresh budget mid-loop and the "(N+1)th request must 429" assert
+/// flakes. Returns 0 when `margin_secs` or more remain; otherwise
+/// the seconds until the next boundary.
+pub fn rate_limit_alignment_wait(now_secs: u64, window_secs: u64, margin_secs: u64) -> u64 {
+    let remaining = window_secs - (now_secs % window_secs);
+    if remaining >= margin_secs {
+        0
+    } else {
+        remaining
+    }
+}
+
+/// Sleep (if needed) so the caller's rate-limit burst starts with at
+/// least 10s left in the current 60s window. Call immediately before
+/// the first rate-limited request of a burst — after `TestApp` setup,
+/// which can itself take wall-clock time. 10s covers the longest
+/// burst in this suite (11 in-process requests) with a wide slack
+/// factor even under CI-runner scheduling jitter; the extra 250ms
+/// clears the boundary despite whole-second truncation of `now`.
+pub async fn align_rate_limit_window() {
+    const WINDOW_SECS: u64 = 60;
+    const MARGIN_SECS: u64 = 10;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let wait = rate_limit_alignment_wait(now, WINDOW_SECS, MARGIN_SECS);
+    if wait > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(wait) + std::time::Duration::from_millis(250)).await;
+    }
+}
+
 // ─── SAML test fixtures ─────────────────────────────────────────
 
 /// Self-signed RSA-2048 X509 cert (DER base64) generated once for
