@@ -14,7 +14,11 @@ name: WASM bundle size
 
 on:
   push:
-    branches: [master]
+    # `main` is the default branch of the public repo (the pre-OSS
+    # private repo used `master`). With the stale name this gate never
+    # ran on default-branch pushes, so the bundle drifted ~5.4 KB past
+    # the limit unseen — see the 2026-07-08 rebaseline below.
+    branches: [main]
   pull_request:
 
 concurrency:
@@ -54,7 +58,16 @@ env:
   # 1,616,644 B — ~17 KB over the previous 1,600,000 limit.
   # Bumping to 1,650,000 (~1.57 MiB) with ~33 KB headroom for
   # incremental Phase 5 work.
-  WASM_GZ_LIMIT: "1650000"   # ~1.57 MiB
+  #
+  # 2026-07-08 rebaseline: the `push` trigger above was still `master`
+  # after the 2026-07-07 re-publish switched the default branch to
+  # `main`, so the gate never ran on default-branch pushes and the
+  # 33 KB headroom eroded unseen. Two unrelated PRs off the same
+  # merge-base (9b2ae1f) measured 1,655,497 B and 1,655,687 B — 190 B
+  # apart, proving the drift is on main, not in either diff. Bumping
+  # to 1,700,000 (~1.62 MiB) ≈ measurement + ~2.7% headroom; ratchet
+  # down after the first green main run establishes a fresh baseline.
+  WASM_GZ_LIMIT: "1700000"   # ~1.62 MiB
   # Soft regression budget — a no-op-change PR that adds > 5% to the
   # bundle (without crossing the hard limit) gets a warning so a
   # quiet drift can be caught before it eats the headroom.

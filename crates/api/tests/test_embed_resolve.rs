@@ -48,9 +48,15 @@ async fn test_embed_resolve_youtube_rewrites_watch_to_embed() {
         .await;
     assert_eq!(status, 200);
     assert_eq!(json["provider"].as_str().unwrap(), "youtube");
+    // ddc03be added the privacy-enhanced rewrite (apply_privacy) and the
+    // harness runs with embed_youtube_nocookie: true — matching the
+    // production default (EMBED_YOUTUBE_NOCOOKIE defaults to "true") —
+    // so the resolved src is the youtube-nocookie.com host. Both
+    // apply_privacy branches (enabled / disabled / non-YouTube) are
+    // covered by unit tests in embed_allowlist.rs.
     assert_eq!(
         json["src"].as_str().unwrap(),
-        "https://www.youtube.com/embed/dQw4w9WgXcQ",
+        "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ",
     );
     assert_eq!(json["height"].as_u64().unwrap(), 315);
 

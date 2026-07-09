@@ -24,7 +24,9 @@ name: WASM browser tests
 
 on:
   push:
-    branches: [master]
+    # `main` is the default branch of the public repo (the pre-OSS
+    # private repo used `master`; the 2026-07-07 re-publish switched).
+    branches: [main]
   pull_request:
 
 concurrency:
