@@ -1150,8 +1150,10 @@ fn normalize_node(node: &Node, parent_type: NodeType) -> Vec<Node> {
 /// - Any other block (paragraph, heading, nested list, blockquote) is
 ///   wrapped directly in a fresh item.
 ///
-/// Idempotent. Shared by `normalize_doc` (the read/write-back self-heal)
-/// and the list-paste path so both enforce the same invariant.
+/// Idempotent. Used by `normalize_doc` (the read/write-back self-heal);
+/// the paste path enforces the same invariant separately via
+/// `clipboard::fit_pasted_list_items`, which additionally schema-fits
+/// each item's content.
 pub(crate) fn ensure_list_item(node: Node, item_type: NodeType) -> Node {
     match node {
         // Already a list item: keep it; an empty item gets a cursor target.
