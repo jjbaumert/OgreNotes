@@ -899,84 +899,41 @@ impl EditorView {
             ));
 
             if in_list && pasting_list {
-                // Pasting list items into a list: extract items from the pasted list
-                // and insert them as siblings in the current list.
-                // Non-list content (e.g., a stray Heading captured by the selection)
-                // is converted to list items to avoid inserting invalid children.
-                let mut items = Vec::new();
-                for node in &slice.content.children {
-                    if let Some(nt) = node.node_type() {
-                        if matches!(nt,
-                            super::model::NodeType::BulletList
-                            | super::model::NodeType::OrderedList
-                            | super::model::NodeType::TaskList
-                        ) {
-                            // Extract list items from the pasted list
-                            for j in 0..node.child_count() {
-                                if let Some(item) = node.child(j) {
-                                    items.push(item.clone());
-                                }
-                            }
-                        } else if matches!(nt,
-                            super::model::NodeType::ListItem
-                            | super::model::NodeType::TaskItem
-                        ) {
-                            // Already a list item — use as-is
-                            items.push(node.clone());
-                        } else {
-                            // Non-list content (Heading, Paragraph, etc.):
-                            // wrap in a ListItem if it has text, otherwise skip
-                            let text = node.text_content();
-                            if !text.trim().is_empty() {
-                                let para = super::model::Node::element_with_content(
-                                    super::model::NodeType::Paragraph,
-                                    super::model::Fragment::from(vec![
-                                        super::model::Node::text(&text),
-                                    ]),
-                                );
-                                items.push(super::model::Node::element_with_content(
-                                    super::model::NodeType::ListItem,
-                                    super::model::Fragment::from(vec![para]),
-                                ));
-                            }
-                            // Empty non-list nodes (like the stray empty Heading) are dropped
-                        }
-                    }
-                }
-                let item_info = super::state::find_item_at(&state_with_sel.doc, pos);
-                if let Some(item) = item_info {
-                    // Wrap every inserted node into a valid, cursor-
-                    // addressable list item — pasted content can include a
-                    // bare text run or a stray block that would otherwise
-                    // land directly inside the list as an orphaned,
-                    // undeletable entry. (Existing items keep their own
-                    // kind; this does not convert ListItem<->TaskItem.)
-                    let item_type = item.node_type;
-                    let items: Vec<super::model::Node> = items
-                        .into_iter()
-                        .map(|n| super::model::ensure_list_item(n, item_type))
-                        .collect();
-                    let item_text = item.content.children.iter()
-                        .map(|c| c.text_content())
-                        .collect::<String>();
-                    let item_is_empty = item_text.trim().is_empty();
-
-                    let item_slice = super::model::Slice::new(
-                        super::model::Fragment::from(items), 0, 0,
+                // Pasting list content while the cursor is in a list: extract
+                // the items so they land as siblings in the current list,
+                // coerce them to the current list's item type, and fit each
+                // item's content to the list-item context via the shared
+                // clipboard fitter. This keeps every inserted node a valid,
+                // cursor-addressable item — pasted headings, bare text, or
+                // stray blocks can't slip in as orphaned, undeletable list
+                // children.
+                if let Some(item) = super::state::find_item_at(&state_with_sel.doc, pos) {
+                    let items = super::clipboard::fit_pasted_list_items(
+                        &slice, item.node_type,
                     );
+                    if !items.is_empty() {
+                        let item_text = item.content.children.iter()
+                            .map(|c| c.text_content())
+                            .collect::<String>();
+                        let item_is_empty = item_text.trim().is_empty();
 
-                    if item_is_empty {
-                        // Empty bullet: replace it with the pasted items
-                        let from = item.offset;
-                        let to = item.offset + item.node_size;
-                        if let Ok(txn) = state_with_sel.transaction().replace(from, to, item_slice) {
-                            dispatch_paste(txn);
-                        }
-                    } else {
-                        // Non-empty bullet: insert pasted items before the current item
-                        let insert_pos = item.offset;
-                        if let Ok(txn) = state_with_sel.transaction().replace(insert_pos, insert_pos, item_slice) {
-                            dispatch_paste(txn);
+                        let item_slice = super::model::Slice::new(
+                            super::model::Fragment::from(items), 0, 0,
+                        );
+
+                        if item_is_empty {
+                            // Empty bullet: replace it with the pasted items
+                            let from = item.offset;
+                            let to = item.offset + item.node_size;
+                            if let Ok(txn) = state_with_sel.transaction().replace(from, to, item_slice) {
+                                dispatch_paste(txn);
+                            }
+                        } else {
+                            // Non-empty bullet: insert pasted items before the current item
+                            let insert_pos = item.offset;
+                            if let Ok(txn) = state_with_sel.transaction().replace(insert_pos, insert_pos, item_slice) {
+                                dispatch_paste(txn);
+                            }
                         }
                     }
                 }
