@@ -11,6 +11,9 @@ struct Parser {
     g: FlowGraph,
     ids: HashMap<String, usize>,
     line: usize, // 1-based, for errors
+    /// Open subgraphs: (subgraph index, opening line). Top of stack is
+    /// the innermost currently-open subgraph.
+    stack: Vec<(usize, usize)>,
 }
 
 pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
@@ -24,6 +27,7 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
         },
         ids: HashMap::new(),
         line: 0,
+        stack: Vec::new(),
     };
     let mut seen_header = false;
     for (idx, raw) in source.lines().enumerate() {
@@ -51,6 +55,12 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
             line: Some(1),
         });
     }
+    if let Some(&(idx, opening_line)) = p.stack.last() {
+        return Err(ParseError {
+            message: format!("unclosed subgraph `{}`", p.g.subgraphs[idx].id),
+            line: Some(opening_line),
+        });
+    }
     Ok(p.g)
 }
 
@@ -76,9 +86,60 @@ impl Parser {
     }
 
     fn parse_statement(&mut self, stmt: &str) -> Result<(), ParseError> {
-        // Task 11 adds keyword statements here (subgraph/end/classDef/
-        // class + explicit out-of-scope errors). Task 10: chains only.
+        let first = stmt.split_whitespace().next().unwrap_or("");
+        match first {
+            "subgraph" => return self.parse_subgraph_open(stmt),
+            "end" if stmt == "end" => return self.parse_subgraph_end(),
+            "classDef" => return self.parse_class_def(stmt),
+            "class" => return self.parse_class_assign(stmt),
+            "click" | "linkStyle" | "style" | "direction" => {
+                return Err(self.err(format!("`{first}` statements are not supported")));
+            }
+            _ if stmt.starts_with("accTitle") || stmt.starts_with("accDescr") => {
+                let kw = if stmt.starts_with("accTitle") { "accTitle" } else { "accDescr" };
+                return Err(self.err(format!("`{kw}` statements are not supported")));
+            }
+            _ => {}
+        }
         self.parse_chain(stmt)
+    }
+
+    fn parse_subgraph_open(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("subgraph").unwrap().trim();
+        let (id, title) = if let Some(bracket_pos) = rest.find('[') {
+            let id = rest[..bracket_pos].trim().to_string();
+            let after = rest[bracket_pos + 1..].trim_end();
+            let Some(body) = after.strip_suffix(']') else {
+                return Err(self.err("unclosed `[` in subgraph title"));
+            };
+            let title = body.trim();
+            let title = title
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(title);
+            (id, title.to_string())
+        } else {
+            let whole = rest.trim().to_string();
+            if whole.is_empty() {
+                return Err(self.err("subgraph needs an id or title"));
+            }
+            (whole.clone(), whole)
+        };
+        if id.is_empty() {
+            return Err(self.err("subgraph needs an id or title"));
+        }
+        let parent = self.stack.last().map(|&(i, _)| i);
+        let idx = self.g.subgraphs.len();
+        self.g.subgraphs.push(crate::flowchart::FlowSubgraph { id, title, parent });
+        self.stack.push((idx, self.line));
+        Ok(())
+    }
+
+    fn parse_subgraph_end(&mut self) -> Result<(), ParseError> {
+        if self.stack.pop().is_none() {
+            return Err(self.err("found `end` outside a subgraph"));
+        }
+        Ok(())
     }
 
     /// `noderef (edgeop noderef)*` where noderef = group ('&' group)*.
@@ -126,7 +187,21 @@ impl Parser {
         let id: String = r[..id_len].to_string();
         let mut after = &r[id_len..];
         let shape_label = self.try_parse_bracket(&mut after)?;
-        *rest = after;
+
+        // Optional :::className suffix (after any bracket).
+        let r2 = after.trim_start();
+        let mut classes = Vec::new();
+        let mut after2 = after;
+        if let Some(rest_c) = r2.strip_prefix(":::") {
+            let n = rest_c.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+            if n == 0 {
+                return Err(self.err("expected a class name after `:::`"));
+            }
+            classes.push(rest_c[..n].to_string());
+            after2 = &rest_c[n..];
+        }
+        *rest = after2;
+
         let idx = match self.ids.get(&id) {
             Some(&i) => i,
             None => {
@@ -136,7 +211,7 @@ impl Parser {
                     label: id.clone(),
                     shape: ShapeKind::Rect,
                     classes: vec![],
-                    subgraph: None, // Task 11 sets from subgraph stack
+                    subgraph: self.stack.last().map(|&(i, _)| i),
                 });
                 self.ids.insert(id, i);
                 i
@@ -146,6 +221,7 @@ impl Parser {
             self.g.nodes[idx].shape = shape;
             self.g.nodes[idx].label = label;
         }
+        self.g.nodes[idx].classes.extend(classes);
         Ok(idx)
     }
 
@@ -267,6 +343,61 @@ impl Parser {
             }
         }
         Err(self.err(format!("expected an edge (e.g. `-->`), found {r:?}")))
+    }
+
+    /// The style allowlist is the CSS-injection boundary: only these
+    /// properties, and only benign value characters, survive into the
+    /// emitted `style` attribute. Everything else is dropped silently —
+    /// styling is cosmetic and mermaid's style vocabulary is huge, so
+    /// erroring here would be hostile to real-world diagrams.
+    const STYLE_PROPS: &[&str] = &[
+        "fill", "stroke", "stroke-width", "stroke-dasharray",
+        "color", "font-weight", "font-style", "opacity",
+    ];
+
+    fn parse_class_def(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("classDef").unwrap().trim();
+        let Some((name, styles)) = rest.split_once(char::is_whitespace) else {
+            return Err(self.err("classDef needs a name and styles"));
+        };
+        let mut kept = Vec::new();
+        for pair in styles.split(',') {
+            let Some((prop, value)) = pair.split_once(':') else { continue };
+            let (prop, value) = (prop.trim(), value.trim());
+            let value_ok = value.chars().all(|c| {
+                c.is_ascii_alphanumeric() || " #.,%-".contains(c)
+            });
+            if Self::STYLE_PROPS.contains(&prop) && value_ok && !value.is_empty() {
+                kept.push(format!("{prop}:{value}"));
+            }
+        }
+        self.g.class_defs.push(crate::flowchart::ClassDef {
+            name: name.to_string(),
+            style: kept.join(";"),
+        });
+        Ok(())
+    }
+
+    /// `class n1,n2 name` — assigns an existing class name to a
+    /// comma-separated list of already-defined node ids.
+    fn parse_class_assign(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("class").unwrap().trim();
+        let Some(last_space) = rest.rfind(char::is_whitespace) else {
+            return Err(self.err("class needs a node list and a class name"));
+        };
+        let node_list = rest[..last_space].trim();
+        let class_name = rest[last_space + 1..].trim();
+        if node_list.is_empty() || class_name.is_empty() {
+            return Err(self.err("class needs a node list and a class name"));
+        }
+        for id in node_list.split(',') {
+            let id = id.trim();
+            let Some(&idx) = self.ids.get(id) else {
+                return Err(self.err(format!("class refers to unknown node `{id}`")));
+            };
+            self.g.nodes[idx].classes.push(class_name.to_string());
+        }
+        Ok(())
     }
 }
 
@@ -415,5 +546,104 @@ mod tests {
     fn garbage_after_node_is_line_error() {
         let e = parse("graph TD\nA[ok] ???").unwrap_err();
         assert_eq!(e.line, Some(2));
+    }
+
+    #[test]
+    fn subgraph_membership_and_title() {
+        let g = p("graph TD\nsubgraph one[Group One]\nA --> B\nend\nC --> A");
+        assert_eq!(g.subgraphs.len(), 1);
+        assert_eq!(g.subgraphs[0].title, "Group One");
+        assert_eq!(g.nodes[0].subgraph, Some(0)); // A created inside
+        assert_eq!(g.nodes[1].subgraph, Some(0)); // B created inside
+        let c = g.nodes.iter().find(|n| n.id == "C").unwrap();
+        assert_eq!(c.subgraph, None);
+    }
+
+    #[test]
+    fn subgraph_without_bracket_title() {
+        let g = p("graph TD\nsubgraph My Group\nA\nend");
+        assert_eq!(g.subgraphs[0].title, "My Group");
+        assert_eq!(g.subgraphs[0].id, "My Group");
+    }
+
+    #[test]
+    fn nested_subgraphs() {
+        let g = p("graph TD\nsubgraph outer\nsubgraph inner\nA\nend\nB\nend");
+        assert_eq!(g.subgraphs.len(), 2);
+        assert_eq!(g.subgraphs[1].parent, Some(0));
+        assert_eq!(g.nodes[0].subgraph, Some(1)); // A in inner
+        assert_eq!(g.nodes[1].subgraph, Some(0)); // B in outer
+    }
+
+    #[test]
+    fn existing_node_does_not_move_into_subgraph() {
+        let g = p("graph TD\nA\nsubgraph s\nA --> B\nend");
+        assert_eq!(g.nodes[0].subgraph, None);
+        assert_eq!(g.nodes[1].subgraph, Some(0));
+    }
+
+    #[test]
+    fn end_without_subgraph_errors() {
+        let e = parse("graph TD\nend").unwrap_err();
+        assert_eq!(e.line, Some(2));
+    }
+
+    #[test]
+    fn unclosed_subgraph_errors_at_opening_line() {
+        let e = parse("graph TD\nA\nsubgraph s\nB").unwrap_err();
+        assert_eq!(e.line, Some(3));
+        assert!(e.message.contains("unclosed subgraph"));
+    }
+
+    #[test]
+    fn class_def_and_assignment() {
+        let g = p("graph TD\nA\nB\nclassDef hot fill:#f00,stroke-width:2px\nclass A,B hot");
+        assert_eq!(g.class_defs.len(), 1);
+        assert!(g.class_defs[0].style.contains("fill:#f00"));
+        assert!(g.class_defs[0].style.contains("stroke-width:2px"));
+        assert_eq!(g.nodes[0].classes, vec!["hot"]);
+        assert_eq!(g.nodes[1].classes, vec!["hot"]);
+    }
+
+    #[test]
+    fn inline_class_suffix() {
+        let g = p("graph TD\nclassDef hot fill:#f00\nA[Hi]:::hot --> B");
+        assert_eq!(g.nodes[0].classes, vec!["hot"]);
+        assert!(g.nodes[1].classes.is_empty());
+    }
+
+    #[test]
+    fn class_def_sanitizes_disallowed_properties() {
+        let g = p("graph TD\nA\nclassDef bad background-image:url(x),fill:#0f0");
+        // Disallowed property dropped; allowlisted one kept.
+        assert!(!g.class_defs[0].style.contains("url"));
+        assert!(g.class_defs[0].style.contains("fill:#0f0"));
+    }
+
+    #[test]
+    fn class_def_rejects_hostile_value_chars() {
+        let g = p("graph TD\nA\nclassDef x fill:#0f0;evil");
+        // `;` splits statements, so `evil` becomes a separate (bare-node)
+        // statement — fill survives, no injection into the style string.
+        assert!(g.class_defs[0].style.contains("fill:#0f0"));
+        assert!(!g.class_defs[0].style.contains("evil"));
+    }
+
+    #[test]
+    fn out_of_scope_statements_error_with_line() {
+        for stmt in ["click A callback", "linkStyle 0 stroke:red", "style A fill:#f00",
+                     "accTitle: x", "accDescr: y", "direction LR"] {
+            let src = format!("graph TD\nA\n{stmt}");
+            let e = parse(&src).unwrap_err();
+            assert_eq!(e.line, Some(3), "for {stmt}");
+            let kw = stmt.split([' ', ':']).next().unwrap();
+            assert!(e.message.contains(kw), "message names the keyword: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn direction_inside_subgraph_errors() {
+        let e = parse("graph TD\nsubgraph s\ndirection LR\nend").unwrap_err();
+        assert_eq!(e.line, Some(3));
     }
 }
