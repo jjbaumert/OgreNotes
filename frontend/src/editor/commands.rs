@@ -435,6 +435,47 @@ pub fn is_in_code_block(state: &EditorState) -> bool {
     resolve_parent_type(state).map_or(false, |(nt, _)| nt == NodeType::CodeBlock)
 }
 
+/// Language attribute of the code block containing the cursor.
+/// `None` = not in a code block; `Some("")` = code block, no language.
+pub fn code_block_language(state: &EditorState) -> Option<String> {
+    let (nt, _) = resolve_parent_type(state)?;
+    if nt != NodeType::CodeBlock {
+        return None;
+    }
+    let rp = resolve(&state.doc, state.selection.from())?;
+    Some(
+        rp.node_at(rp.depth, &state.doc)
+            .attrs()
+            .get("language")
+            .cloned()
+            .unwrap_or_default(),
+    )
+}
+
+/// Set (or clear, with `""`) the `language` attribute of the code
+/// block containing the cursor. Same targeted `Step::SetAttr` shape
+/// as `update_mermaid_source` — node identity and content untouched.
+/// Returns `false` when the cursor is not in a code block.
+pub fn set_code_block_language(
+    lang: &str,
+    state: &EditorState,
+    dispatch: Option<&dyn Fn(Transaction)>,
+) -> bool {
+    let Some((NodeType::CodeBlock, abs_pos)) = resolve_parent_type(state) else {
+        return false;
+    };
+    if let Some(dispatch) = dispatch {
+        if let Ok(txn) = state.transaction().step(Step::SetAttr {
+            pos: abs_pos,
+            attr: "language".to_string(),
+            value: lang.to_string(),
+        }) {
+            dispatch(txn);
+        }
+    }
+    true
+}
+
 /// Check if the cursor is inside a blockquote.
 /// Searches all ancestor containers, not just the innermost one.
 pub fn is_in_blockquote(state: &EditorState) -> bool {
@@ -4485,6 +4526,61 @@ mod tests {
     fn is_in_code_block_false() {
         let state = EditorState::create_default(simple_doc());
         assert!(!is_in_code_block(&state));
+    }
+
+    // ── code_block_language / set_code_block_language ──
+
+    fn code_block_doc_lang(language: Option<&str>) -> Node {
+        let mut attrs = std::collections::HashMap::new();
+        if let Some(lang) = language {
+            attrs.insert("language".to_string(), lang.to_string());
+        }
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::CodeBlock,
+                attrs,
+                Fragment::from(vec![Node::text("fn main() {}")]),
+            )]),
+        )
+    }
+
+    #[test]
+    fn code_block_language_reads_attr() {
+        let state = EditorState::create_default(code_block_doc_lang(Some("rust")));
+        // cursor into the code block's text (pos 1 = before 'f')
+        let state = EditorState { selection: Selection::cursor(1), ..state };
+        assert_eq!(code_block_language(&state).as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn code_block_language_empty_when_unset_none_when_outside() {
+        let state = EditorState::create_default(code_block_doc_lang(None));
+        let inside = EditorState { selection: Selection::cursor(1), ..state };
+        assert_eq!(code_block_language(&inside).as_deref(), Some(""));
+
+        let para = EditorState::create_default(simple_doc());
+        let outside = EditorState { selection: Selection::cursor(1), ..para };
+        assert_eq!(code_block_language(&outside), None);
+    }
+
+    #[test]
+    fn set_code_block_language_dispatches_set_attr() {
+        let state = EditorState::create_default(code_block_doc_lang(None));
+        let state = EditorState { selection: Selection::cursor(1), ..state };
+        let txn = run_command(&state, |s, d| set_code_block_language("python", s, d)).unwrap();
+        let new_state = state.apply(txn);
+        let updated = EditorState { selection: Selection::cursor(1), ..new_state };
+        assert_eq!(code_block_language(&updated).as_deref(), Some("python"));
+    }
+
+    #[test]
+    fn set_code_block_language_refuses_outside_code_block() {
+        let state = EditorState::create_default(simple_doc());
+        let state = EditorState { selection: Selection::cursor(1), ..state };
+        assert!(!set_code_block_language("python", &state, None));
+        let txn = run_command(&state, |s, d| set_code_block_language("python", s, d));
+        assert!(txn.is_none());
     }
 
     // ── set_paragraph (additional cases) ──
