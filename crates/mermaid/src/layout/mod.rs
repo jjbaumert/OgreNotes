@@ -7,6 +7,8 @@
 //! never panics, all stages operate in TB space (direction is a final
 //! coordinate transform). See the slice-2 design spec.
 
+pub(crate) mod acyclic;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Direction {
     TB,
