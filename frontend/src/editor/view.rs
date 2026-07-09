@@ -549,8 +549,23 @@ impl EditorView {
                             let pos = state_with_sel.selection.from();
                             let max = state_with_sel.doc.content_size();
                             if pos < max {
-                                // Try joining with next block first (delete at block end)
-                                if let Ok(txn) = state_with_sel.transaction().join_forward() {
+                                // Mirror of the backspace atom-before case: Delete
+                                // at a block's end over a following atom (rule,
+                                // image, embed) removes just the atom. join_forward
+                                // can't target it (an atom is not a textblock) and a
+                                // raw delete(pos, pos + 1) hits the block-close
+                                // boundary instead, leaving the atom undeletable.
+                                let atom_after = super::selection::atom_after_cursor_block(
+                                    &state_with_sel.doc, &state_with_sel.selection,
+                                );
+                                if let Some((from, to)) = atom_after {
+                                    if let Ok(mut txn) = state_with_sel.transaction().delete(from, to) {
+                                        // Deletion is after the caret, so it stays put.
+                                        txn.selection = Selection::cursor(pos);
+                                        dispatch(txn);
+                                    }
+                                } else if let Ok(txn) = state_with_sel.transaction().join_forward() {
+                                    // Try joining with next block (delete at block end)
                                     dispatch(txn);
                                 } else if let Ok(txn) =
                                     state_with_sel.transaction().delete(pos, pos + 1)
@@ -1254,6 +1269,16 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                     let el = doc.create_element("span").ok()?;
                     el.set_attribute("class", "mention").ok()?;
                     el.set_attribute("contenteditable", "false").ok()?;
+                    // Mention is a leaf atom, but it renders its display name
+                    // as child text on a `span` (a mark tag) for styling and
+                    // paste round-trip. Without this, the DOM↔model walkers
+                    // treat the span as a transparent mark wrapper and count
+                    // the display text's length instead of the model size —
+                    // drifting every caret position after the chip. The
+                    // `&& read_atom_size().is_none()` guard on the walkers'
+                    // mark-tag branch makes this win. Value is the model's own
+                    // `node_size()`, not a hardcoded constant.
+                    el.set_attribute("data-atom-size", &node.node_size().to_string()).ok()?;
                     if let Some(uid) = attrs.get("user_id") {
                         el.set_attribute("data-user-id", uid).ok()?;
                     }
@@ -1280,6 +1305,17 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                     let wrapper = doc.create_element("div").ok()?;
                     wrapper.set_attribute("class", "embed-block").ok()?;
                     wrapper.set_attribute("contenteditable", "false").ok()?;
+                    // Tell the DOM↔model walkers to treat this wrapper as a
+                    // single atom of the model's `node_size()` (Embed is a
+                    // leaf ⇒ 1). Without it the walkers recurse into the
+                    // div+iframe and count 4 positions, so every caret past
+                    // the embed is off by 3 — the caret "before"/"after" the
+                    // video never lands on the paragraph boundary adjacent to
+                    // the atom, and Backspace's `atom_before_cursor_block`
+                    // (and the forward `atom_after_cursor_block`) can't see
+                    // it. Mirrors the same contract used by Calendar/Kanban
+                    // (see blocks/calendar.rs).
+                    wrapper.set_attribute("data-atom-size", &node.node_size().to_string()).ok()?;
                     let iframe = doc.create_element("iframe").ok()?;
                     if let Some(url) = attrs.get("url") {
                         if is_safe_url(url) {
@@ -1600,13 +1636,17 @@ fn find_in_element(
         } else if child.node_type() == DomNode::ELEMENT_NODE {
             let el = child.dyn_ref::<Element>()?;
             let tag = el.tag_name().to_lowercase();
+            let atom_size = read_atom_size(el);
 
-            if is_mark_tag(&tag) {
-                // Mark wrappers are transparent
+            if is_mark_tag(&tag) && atom_size.is_none() {
+                // Mark wrappers are transparent — but an inline atom that
+                // reuses a mark tag for styling/paste (the `<span
+                // class="mention">` chip) carries `data-atom-size` and must
+                // take the opaque-atom branch below, not be descended into.
                 if let Some(result) = find_in_element(el, pos, target) {
                     return Some(result);
                 }
-            } else if let Some(atom_size) = read_atom_size(el) {
+            } else if let Some(atom_size) = atom_size {
                 // Wrapper for a model-side atom (Calendar, Kanban, …).
                 // Mirror of dom_to_model_walk's atom handling: the
                 // subtree is opaque, so target == atom's start goes
@@ -1710,12 +1750,16 @@ fn dom_to_model_walk(
         } else if child.node_type() == DomNode::ELEMENT_NODE {
             let el = child.dyn_ref::<Element>()?;
             let tag = el.tag_name().to_lowercase();
+            let atom_size = read_atom_size(el);
 
-            if is_mark_tag(&tag) {
+            if is_mark_tag(&tag) && atom_size.is_none() {
+                // Transparent mark wrapper — but an inline atom that reuses a
+                // mark tag (the `<span class="mention">` chip) carries
+                // `data-atom-size` and is handled as an opaque atom below.
                 if let Some(result) = dom_to_model_walk(el, target_node, target_offset, pos) {
                     return Some(result);
                 }
-            } else if let Some(atom_size) = read_atom_size(el) {
+            } else if let Some(atom_size) = atom_size {
                 // Wrapper for a model-side atom (Calendar, Kanban,
                 // etc.). The DOM subtree can be arbitrarily large,
                 // but the model treats it as a single opaque unit
@@ -1758,7 +1802,11 @@ fn dom_node_model_size(node: &DomNode) -> usize {
     } else if node.node_type() == DomNode::ELEMENT_NODE {
         if let Some(el) = node.dyn_ref::<Element>() {
             let tag = el.tag_name().to_lowercase();
-            if is_mark_tag(&tag) {
+            let atom_size = read_atom_size(el);
+            if is_mark_tag(&tag) && atom_size.is_none() {
+                // Transparent mark wrapper. An inline atom on a mark tag (the
+                // mention chip) carries `data-atom-size` and is sized by the
+                // next branch as one opaque unit, not by its display text.
                 let children = el.child_nodes();
                 let mut size = 0;
                 for i in 0..children.length() {
@@ -1767,7 +1815,7 @@ fn dom_node_model_size(node: &DomNode) -> usize {
                     }
                 }
                 size
-            } else if let Some(atom_size) = read_atom_size(el) {
+            } else if let Some(atom_size) = atom_size {
                 atom_size
             } else if is_leaf_tag(&tag) {
                 if is_sentinel(el) { 0 } else { 1 }
@@ -2145,5 +2193,70 @@ mod tests {
         assert!(!is_safe_url("JAVASCRIPT:alert(1)"));
         assert!(!is_safe_url("data:text/html,<script>alert(1)</script>"));
         assert!(!is_safe_url("vbscript:alert(1)"));
+    }
+}
+
+// Browser-only tests: rendering needs a real `web_sys::Document`, so these
+// run under `wasm-pack test` / the wasm32 harness, not native `cargo test`.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod embed_render_tests {
+    use super::*;
+    use super::super::model::{Fragment, Node, NodeType};
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// Regression: the YouTube/Vimeo embed wrapper must advertise
+    /// `data-atom-size="1"` so the DOM↔model walkers treat the div+iframe
+    /// subtree as a single size-1 leaf atom (Embed::node_size() == 1).
+    /// Without it the walkers counted 4 positions (div 2 + iframe 2) and
+    /// every caret past the embed was off by 3 — the caret adjacent to the
+    /// video never landed on the paragraph boundary next to the atom, so
+    /// neither Backspace (`atom_before_cursor_block`) nor Delete
+    /// (`atom_after_cursor_block`) could ever target the embed.
+    #[wasm_bindgen_test]
+    fn embed_wrapper_declares_atom_size_matching_model() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert(
+            "url".to_string(),
+            "https://www.youtube.com/embed/x".to_string(),
+        );
+        let embed = Node::element_with_attrs(NodeType::Embed, attrs, Fragment::empty());
+
+        let rendered = render_node(&document, &embed).expect("embed renders");
+        let el = rendered.dyn_ref::<Element>().expect("wrapper is an element");
+
+        // The wrapper's advertised atom size must equal the model node_size.
+        assert_eq!(read_atom_size(el), Some(embed.node_size()));
+        assert_eq!(read_atom_size(el), Some(1));
+        // …so the DOM walker consumes exactly node_size() positions for it.
+        assert_eq!(dom_node_model_size(&rendered), embed.node_size());
+    }
+
+    /// Regression: the @-mention chip is a size-1 leaf atom rendered as a
+    /// `<span class="mention">Display Name</span>`. Because `span` is a mark
+    /// tag, the walkers would otherwise treat it as transparent and count
+    /// the display name's length (e.g. 5 for "Alice") instead of 1, drifting
+    /// every caret position after the chip. `data-atom-size="1"` plus the
+    /// mark-tag branch's `read_atom_size().is_none()` guard fixes it.
+    #[wasm_bindgen_test]
+    fn mention_chip_counts_as_one_position_not_its_display_text() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("user_id".to_string(), "u-42".to_string());
+        attrs.insert("display".to_string(), "Alice".to_string());
+        let mention = Node::element_with_attrs(NodeType::Mention, attrs, Fragment::empty());
+
+        let rendered = render_node(&document, &mention).expect("mention renders");
+        let el = rendered.dyn_ref::<Element>().expect("chip is an element");
+
+        // Sanity: the display text really is in the DOM (5 chars) …
+        assert_eq!(el.text_content().as_deref(), Some("Alice"));
+        // … yet the walker must size the chip as the model does: one position.
+        assert_eq!(mention.node_size(), 1);
+        assert_eq!(read_atom_size(el), Some(1));
+        assert_eq!(dom_node_model_size(&rendered), 1);
     }
 }
