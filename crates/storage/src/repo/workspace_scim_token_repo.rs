@@ -206,4 +206,45 @@ mod tests {
         let back = from_item(&item).unwrap();
         assert_eq!(back, token);
     }
+
+    #[test]
+    fn from_item_missing_secret_hash_errors() {
+        // A token row without its hash could never verify; it must
+        // fail decode rather than come back with an empty hash.
+        let mut item = HashMap::new();
+        item.insert("workspace_id".to_string(), AttributeValue::S("ws-1".to_string()));
+        item.insert("token_id".to_string(), AttributeValue::S("tok-1".to_string()));
+        item.insert("name".to_string(), AttributeValue::S("n".to_string()));
+        item.insert("created_at".to_string(), AttributeValue::N("1".to_string()));
+        item.insert("last_used_at".to_string(), AttributeValue::N("0".to_string()));
+        item.insert("disabled_at".to_string(), AttributeValue::N("0".to_string()));
+        match from_item(&item) {
+            Err(RepoError::MissingField(f)) => assert_eq!(f, "secret_hash"),
+            other => panic!("expected MissingField(secret_hash), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_disabled_at_rejects_zero_before_any_io() {
+        // `0` is the "active" sentinel: letting it through would
+        // silently re-enable a revoked token. The guard fires before
+        // any network call, so an offline client suffices.
+        let conf = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .build();
+        let repo = WorkspaceScimTokenRepo::new(crate::dynamo::DynamoClient::new(
+            aws_sdk_dynamodb::Client::from_conf(conf),
+            "test-table".to_string(),
+        ));
+        let err = repo
+            .set_disabled_at("ws-1", "tok-1", 0)
+            .await
+            .expect_err("at=0 must be rejected");
+        match err {
+            RepoError::InvalidArgument(msg) => {
+                assert!(msg.contains("non-zero"), "got: {msg}")
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
 }

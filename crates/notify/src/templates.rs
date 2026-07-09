@@ -525,4 +525,196 @@ mod tests {
         assert!(!verify_notif_param("!!!.123", "u", "d", TEST_SECRET, 0));
         assert!(!verify_notif_param("", "u", "d", TEST_SECRET, 0));
     }
+
+    // ─── Escaping: actor name + full character set ───────────────
+
+    #[test]
+    fn render_escapes_actor_name_in_html() {
+        // The actor's display name is user-controlled (profile field);
+        // it must be escaped in the HTML body just like the message.
+        // The existing `html_is_escaped` test only pins the message.
+        let n = sample_notif(NotifType::Commented, Some("d"));
+        let r = render(
+            &n,
+            r#"<img src=x onerror=alert(1)>Mallory"#,
+            "https://app.test",
+            TEST_SECRET,
+            TEST_EXP,
+        );
+        assert!(
+            !r.html.contains("<img"),
+            "raw tag from actor name must not reach html: {}",
+            r.html
+        );
+        assert!(
+            r.html.contains("&lt;img src=x onerror=alert(1)&gt;Mallory"),
+            "escaped actor name missing: {}",
+            r.html
+        );
+    }
+
+    #[test]
+    fn render_escapes_ampersand_and_both_quote_kinds() {
+        // `<`/`>` are pinned elsewhere; `&`, `"`, `'` matter for
+        // attribute contexts (the link is spliced into an href) and
+        // must each map to their entity exactly once (no double
+        // escaping of the `&` inside an emitted entity).
+        let mut n = sample_notif(NotifType::Commented, Some("d"));
+        n.message = r#"Tom & Jerry said "hi" — it's fine"#.into();
+        let r = render(&n, "Alice", "https://app.test", TEST_SECRET, TEST_EXP);
+        assert!(
+            r.html
+                .contains(r#"Tom &amp; Jerry said &quot;hi&quot; — it&#39;s fine"#),
+            "html: {}",
+            r.html
+        );
+        assert!(
+            !r.html.contains("&amp;amp;"),
+            "ampersand must not be double-escaped: {}",
+            r.html
+        );
+    }
+
+    #[test]
+    fn render_preserves_unicode_untouched() {
+        // The escaper walks chars — multibyte content (CJK, emoji,
+        // combining marks) must survive verbatim in subject, html,
+        // and text.
+        let mut n = sample_notif(NotifType::Mentioned, Some("d"));
+        n.message = "日本語のコメント 🦀 café".into();
+        let r = render(&n, "Ünïcødé Üser", "https://app.test", TEST_SECRET, TEST_EXP);
+        assert!(r.subject.contains("Ünïcødé Üser"), "subject: {}", r.subject);
+        assert!(r.html.contains("日本語のコメント 🦀 café"), "html: {}", r.html);
+        assert!(r.text.contains("日本語のコメント 🦀 café"), "text: {}", r.text);
+    }
+
+    #[test]
+    fn render_text_body_stays_plain_not_entity_encoded() {
+        // The text/plain alternative must carry the raw message —
+        // HTML entities leaking into the plain-text part would show
+        // up literally in text-mode mail clients.
+        let mut n = sample_notif(NotifType::Commented, Some("d"));
+        n.message = r#"a < b && c > "d""#.into();
+        let r = render(&n, "Alice", "https://app.test", TEST_SECRET, TEST_EXP);
+        assert!(r.text.contains(r#"a < b && c > "d""#), "text: {}", r.text);
+        assert!(!r.text.contains("&lt;"), "entities leaked into text: {}", r.text);
+        assert!(!r.text.contains("&amp;"), "entities leaked into text: {}", r.text);
+    }
+
+    // ─── Link target selection ───────────────────────────────────
+
+    #[test]
+    fn doc_link_takes_precedence_over_thread_link() {
+        // When a notification carries both a doc_id and a thread_id
+        // (e.g. a comment in a doc-attached thread), the deep link
+        // must point at the document.
+        let mut n = sample_notif(NotifType::Commented, Some("doc-A"));
+        n.thread_id = Some("thread-B".into());
+        let r = render(&n, "Alice", "https://app.test", TEST_SECRET, TEST_EXP);
+        assert!(r.html.contains("/d/doc-A"), "html: {}", r.html);
+        assert!(!r.html.contains("/c/thread-B"), "html: {}", r.html);
+        assert!(!r.text.contains("/c/thread-B"), "text: {}", r.text);
+    }
+
+    #[test]
+    fn request_access_subject_names_the_event() {
+        // RequestAccess is the owner-facing "someone wants edit
+        // access" mail; the subject must say so.
+        let n = sample_notif(NotifType::RequestAccess, Some("d"));
+        let r = render(&n, "Alice", "https://app.test", TEST_SECRET, TEST_EXP);
+        assert!(
+            r.subject.contains("requested edit access"),
+            "subject: {}",
+            r.subject
+        );
+    }
+
+    // ─── Digest: signed links + multi-actor resolution ───────────
+
+    #[test]
+    fn digest_links_carry_signed_notif_param() {
+        // Digest deep links go through the same signed-token path as
+        // per-event mails (#40); only the per-event side was pinned.
+        let mut actors = std::collections::HashMap::new();
+        actors.insert("actor".to_string(), "Alice".to_string());
+        let notifs = vec![sample_notif(NotifType::Shared, Some("d1"))];
+        let r = render_digest(&notifs, &actors, "https://app.test", TEST_SECRET, TEST_EXP).unwrap();
+        assert!(
+            r.html.contains("https://app.test/d/d1?notif="),
+            "digest link missing signed param: {}",
+            r.html
+        );
+        assert!(
+            r.html.contains(&format!(".{TEST_EXP}")),
+            "digest link missing exp suffix: {}",
+            r.html
+        );
+    }
+
+    #[test]
+    fn digest_resolves_each_distinct_actor_name() {
+        // Two notifications from two different actors: each display
+        // name must be looked up independently, not smeared from the
+        // first entry.
+        let mut actors = std::collections::HashMap::new();
+        actors.insert("actor".to_string(), "Alice".to_string());
+        actors.insert("actor-2".to_string(), "Bob".to_string());
+        let first = sample_notif(NotifType::Shared, Some("d1"));
+        let mut second = sample_notif(NotifType::Commented, Some("d2"));
+        second.actor_id = "actor-2".into();
+        let r = render_digest(
+            &[first, second],
+            &actors,
+            "https://app.test",
+            TEST_SECRET,
+            TEST_EXP,
+        )
+        .unwrap();
+        assert!(r.html.contains("Alice"), "html: {}", r.html);
+        assert!(r.html.contains("Bob"), "html: {}", r.html);
+        assert!(r.text.contains("Alice"), "text: {}", r.text);
+        assert!(r.text.contains("Bob"), "text: {}", r.text);
+    }
+
+    // ─── #40 token: additional verify edges ──────────────────────
+
+    #[test]
+    fn build_notif_param_is_deterministic() {
+        // Same (user, target, exp, secret) must produce the same
+        // token — resends and retries yield identical URLs.
+        let a = build_notif_param("alice", "doc-1", TEST_EXP, TEST_SECRET);
+        let b = build_notif_param("alice", "doc-1", TEST_EXP, TEST_SECRET);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn verify_rejects_token_at_exact_expiry_instant() {
+        // Expiry is strict: `exp > now`. A token checked at exactly
+        // its expiry second is already dead.
+        let param = build_notif_param("alice", "doc-1", TEST_EXP, TEST_SECRET);
+        let raw = param.strip_prefix("notif=").unwrap();
+        assert!(!verify_notif_param(raw, "alice", "doc-1", TEST_SECRET, TEST_EXP));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_secret() {
+        // A token minted under one workspace secret must not verify
+        // under another — key rotation invalidates old links.
+        let param = build_notif_param("alice", "doc-1", TEST_EXP, TEST_SECRET);
+        let raw = param.strip_prefix("notif=").unwrap();
+        let now = TEST_EXP - 1;
+        assert!(!verify_notif_param(raw, "alice", "doc-1", b"rotated-secret", now));
+    }
+
+    #[test]
+    fn verify_rejects_param_with_extra_dot_segment() {
+        // `split_once('.')` binds at the first dot, so a trailing
+        // ".999" corrupts the exp segment ("<exp>.999" fails to
+        // parse) rather than being silently ignored.
+        let param = build_notif_param("alice", "doc-1", TEST_EXP, TEST_SECRET);
+        let raw = param.strip_prefix("notif=").unwrap();
+        let extended = format!("{raw}.999");
+        let now = TEST_EXP - 1;
+        assert!(!verify_notif_param(&extended, "alice", "doc-1", TEST_SECRET, now));
+    }
 }

@@ -1435,3 +1435,120 @@ mod proptests {
         }
     }
 }
+
+// ─── Coverage-gap tests: repair removes-path, index/deletion edges ──
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+    use crate::document::OgreDoc;
+    use yrs::types::xml::XmlElementPrelim;
+
+    /// Same shape as the sibling test module's builder (private to
+    /// that module): one Kanban board → one column → one valid card.
+    fn kanban_doc() -> OgreDoc {
+        let doc = OgreDoc::new();
+        {
+            let mut txn = doc.inner().transact_mut();
+            let frag = txn.get_or_insert_xml_fragment("content");
+            let n = frag.len(&txn);
+            if n > 0 {
+                frag.remove_range(&mut txn, 0, n);
+            }
+            let board = frag.insert(
+                &mut txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Kanban.tag_name()),
+            );
+            let col = board.insert(
+                &mut txn,
+                0,
+                XmlElementPrelim::empty(NodeType::KanbanColumn.tag_name()),
+            );
+            col.insert_attribute(&mut txn, "title", "To Do");
+            let card = col.insert(
+                &mut txn,
+                0,
+                XmlElementPrelim::empty(NodeType::KanbanCard.tag_name()),
+            );
+            card.insert_attribute(&mut txn, "title", "Fix login");
+            card.insert_attribute(&mut txn, "color", "red");
+        }
+        doc
+    }
+
+    /// Navigate board → column → card and return the card element.
+    fn card_of<T: ReadTxn>(txn: &T) -> yrs::XmlElementRef {
+        let frag = txn.get_xml_fragment("content").unwrap();
+        let XmlOut::Element(board) = frag.get(txn, 0).unwrap() else {
+            unreachable!()
+        };
+        let XmlOut::Element(col) = board.get(txn, 0).unwrap() else {
+            unreachable!()
+        };
+        let XmlOut::Element(card) = col.get(txn, 0).unwrap() else {
+            unreachable!()
+        };
+        card
+    }
+
+    /// The repair `removes` path: an unknown attribute the block
+    /// validator canonically drops must be physically removed from
+    /// the node, and the post-repair doc must walk clean. The
+    /// existing repair test only covers value canonicalization.
+    #[test]
+    fn repair_removes_unknown_attribute() {
+        let doc = kanban_doc();
+        {
+            let mut txn = doc.inner().transact_mut();
+            let card = card_of(&txn);
+            card.insert_attribute(&mut txn, "smuggledPayload", "arbitrary");
+        }
+        // Sanity: the unknown attr is a violation before repair.
+        assert!(
+            walk_doc(doc.inner())
+                .iter()
+                .any(|v| v.field == "smuggledPayload"),
+            "precondition: smuggled attr must surface as a violation"
+        );
+
+        let report = repair_liveapp_attrs(doc.inner());
+        assert!(
+            report.nodes_touched >= 1,
+            "repair must report the card as touched, got {report:?}"
+        );
+
+        let txn = doc.inner().transact();
+        let card = card_of(&txn);
+        let attrs = collect_attrs(&txn, &card);
+        assert!(
+            !attrs.contains_key("smuggledPayload"),
+            "unknown attribute must be removed, still present in {attrs:?}"
+        );
+        drop(txn);
+        let post = walk_doc(doc.inner());
+        assert!(post.is_empty(), "post-repair walk must be clean, got {post:?}");
+    }
+
+    /// Additions never masquerade as deletions: a post index that is
+    /// a strict superset of pre produces no LiveAppDeletion entries.
+    #[test]
+    fn diff_liveapp_deletions_ignores_additions() {
+        let pre = vec![(NodeType::KanbanCard, "card-a".to_string())];
+        let post = vec![
+            (NodeType::KanbanCard, "card-a".to_string()),
+            (NodeType::KanbanCard, "card-b".to_string()),
+            (NodeType::CalendarEvent, "ev-1".to_string()),
+        ];
+        assert!(diff_liveapp_deletions(&pre, &post).is_empty());
+    }
+
+    /// A doc with no LiveApp nodes at all (the default paragraph doc)
+    /// indexes to empty — the WS handler's pre/post snapshot on plain
+    /// text documents must be a cheap no-op pair.
+    #[test]
+    fn collect_liveapp_index_empty_for_non_liveapp_doc() {
+        let doc = OgreDoc::new();
+        assert!(collect_liveapp_index(doc.inner()).is_empty());
+    }
+}

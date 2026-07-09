@@ -85,3 +85,103 @@ fn activity_from_item(item: &HashMap<String, AttributeValue>) -> Result<Activity
         created_at: get_n(item, "created_at")?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(event_type: ActivityEventType) -> Activity {
+        Activity {
+            activity_id: "act1".to_string(),
+            doc_id: "doc1".to_string(),
+            event_type,
+            actor_id: "u1".to_string(),
+            detail: "{}".to_string(),
+            created_at: 1_700_000_000_000_000,
+        }
+    }
+
+    /// Mimic `create`'s column construction (no live table): the
+    /// event type is stored as the bare serde tag string.
+    fn item_for(activity: &Activity) -> HashMap<String, AttributeValue> {
+        let mut item = HashMap::new();
+        item.insert("PK".to_string(), AttributeValue::S(activity.pk()));
+        item.insert("SK".to_string(), AttributeValue::S(activity.sk()));
+        item.insert("activity_id".to_string(), AttributeValue::S(activity.activity_id.clone()));
+        item.insert("doc_id".to_string(), AttributeValue::S(activity.doc_id.clone()));
+        item.insert(
+            "event_type".to_string(),
+            AttributeValue::S(
+                serde_json::to_string(&activity.event_type)
+                    .unwrap()
+                    .trim_matches('"')
+                    .to_string(),
+            ),
+        );
+        item.insert("actor_id".to_string(), AttributeValue::S(activity.actor_id.clone()));
+        item.insert("detail".to_string(), AttributeValue::S(activity.detail.clone()));
+        item.insert("created_at".to_string(), AttributeValue::N(activity.created_at.to_string()));
+        item
+    }
+
+    #[test]
+    fn round_trip_covers_every_event_type() {
+        // The write path serializes via serde and the read path
+        // deserializes via serde, so a drift can only come from a
+        // variant added to the enum but not re-parseable (e.g. an
+        // alias-only rename). Pin all current variants.
+        let cases = [
+            ActivityEventType::Edit,
+            ActivityEventType::Comment,
+            ActivityEventType::Share,
+            ActivityEventType::Open,
+            ActivityEventType::Restore,
+            ActivityEventType::ResolveComment,
+            ActivityEventType::Delete,
+            ActivityEventType::Move,
+        ];
+        for et in cases {
+            let original = fixture(et.clone());
+            let back = activity_from_item(&item_for(&original))
+                .unwrap_or_else(|e| panic!("roundtrip failed for {et:?}: {e}"));
+            assert_eq!(back.event_type, et, "roundtrip mismatch on {et:?}");
+            assert_eq!(back.activity_id, original.activity_id);
+            assert_eq!(back.doc_id, original.doc_id);
+        }
+    }
+
+    #[test]
+    fn legacy_lowercase_resolve_comment_still_parses() {
+        // The serde alias on ResolveComment keeps pre-camelCase rows
+        // readable.
+        let mut item = item_for(&fixture(ActivityEventType::ResolveComment));
+        item.insert(
+            "event_type".to_string(),
+            AttributeValue::S("resolveComment".to_string()),
+        );
+        assert_eq!(
+            activity_from_item(&item).unwrap().event_type,
+            ActivityEventType::ResolveComment
+        );
+    }
+
+    #[test]
+    fn unknown_event_type_errors_naming_the_field() {
+        let mut item = item_for(&fixture(ActivityEventType::Edit));
+        item.insert("event_type".to_string(), AttributeValue::S("explode".to_string()));
+        match activity_from_item(&item) {
+            Err(RepoError::MissingField(msg)) => {
+                assert!(msg.contains("event_type"), "must name the field: {msg}")
+            }
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_detail_defaults_to_empty_string() {
+        let mut item = item_for(&fixture(ActivityEventType::Open));
+        item.remove("detail");
+        let back = activity_from_item(&item).expect("missing detail is tolerated");
+        assert_eq!(back.detail, "");
+    }
+}

@@ -427,4 +427,62 @@ mod tests {
         assert!(!verify_recovery_code("ABCDE-FGHIJ", "not-a-bcrypt-hash"));
         assert!(!verify_recovery_code("ABCDE-FGHIJ", ""));
     }
+
+    // ─── Additional negative-path coverage ────────────────────────
+
+    #[test]
+    fn decrypt_rejects_truncated_ciphertext() {
+        // Ciphertext shorter than the 16-byte GCM tag can't possibly
+        // authenticate. Must surface Decrypt (not panic) — the blob's
+        // base64 is valid, so the BadCiphertext pre-checks all pass.
+        let key = fixed_key();
+        let mut blob = encrypt(&key, b"secret").unwrap();
+        blob.ct = URL_SAFE_NO_PAD.encode([0u8; 8]); // shorter than the tag
+        assert!(matches!(decrypt(&key, &blob), Err(MfaError::Decrypt)));
+        blob.ct = String::new(); // decodes to zero bytes
+        assert!(matches!(decrypt(&key, &blob), Err(MfaError::Decrypt)));
+    }
+
+    #[test]
+    fn verify_totp_rejects_malformed_code_shapes() {
+        // Codes that aren't exactly 6 digits must fail closed — false,
+        // never a panic: empty, too short, too long, non-numeric,
+        // embedded whitespace.
+        let secret = new_totp_secret();
+        for bad in ["", "12345", "1234567", "abcdef", "12 456"] {
+            assert!(
+                !verify_totp(&secret, bad, "OgreNotes", "alice@example.com"),
+                "malformed code {bad:?} must not verify"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_code_verification_is_case_sensitive() {
+        // Codes are minted uppercase; bcrypt compares exact bytes, so a
+        // lowercase transcription is rejected. Pins current behavior —
+        // making redemption case-insensitive would require normalizing
+        // before hashing AND before verifying.
+        let hash = hash_recovery_code("ABCDE-FGHIJ").unwrap();
+        assert!(verify_recovery_code("ABCDE-FGHIJ", &hash));
+        assert!(!verify_recovery_code("abcde-fghij", &hash));
+    }
+
+    #[test]
+    fn generated_recovery_codes_are_all_well_formed() {
+        // Every one of the minted codes — not just one sample — must
+        // match the xxxxx-xxxxx base32 (A-Z, 2-7) shape users are told
+        // to type when they redeem.
+        for code in generate_recovery_codes() {
+            let (left, right) = code.split_once('-').expect("code must contain a dash");
+            assert_eq!(left.len(), 5, "bad code {code:?}");
+            assert_eq!(right.len(), 5, "bad code {code:?}");
+            assert!(
+                left.bytes()
+                    .chain(right.bytes())
+                    .all(|c| c.is_ascii_uppercase() || (b'2'..=b'7').contains(&c)),
+                "character outside base32 alphabet in {code:?}"
+            );
+        }
+    }
 }

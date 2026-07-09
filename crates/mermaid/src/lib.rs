@@ -270,4 +270,114 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn detection_requires_exact_keyword_match() {
+        // Keywords must match whole-token: prefixes, suffixes, and case
+        // variants are not diagram headers.
+        assert_eq!(detect_kind("piechart\n\"A\": 1"), DiagramKind::Unknown);
+        assert_eq!(detect_kind("PIE\n\"A\": 1"), DiagramKind::Unknown);
+        assert_eq!(detect_kind("graphs TD"), DiagramKind::Unknown);
+        assert_eq!(detect_kind("stateDiagram-v3"), DiagramKind::Unknown);
+    }
+
+    #[test]
+    fn comment_or_blank_only_source_is_unknown() {
+        assert_eq!(detect_kind(""), DiagramKind::Unknown);
+        assert_eq!(detect_kind("%% just a comment\n\n  %% another"), DiagramKind::Unknown);
+    }
+
+    #[test]
+    fn each_unsupported_kind_error_names_its_label() {
+        // "flowchart LR" left this list when slice 2 made flowcharts
+        // render (see flowchart_renders_svg_via_public_render); the
+        // remaining kinds are slice-4 territory.
+        let cases = [
+            ("stateDiagram-v2", "state"),
+            ("classDiagram", "class"),
+            ("erDiagram", "entity-relationship"),
+        ];
+        for (src, label) in cases {
+            let out = render(src);
+            assert!(out.svg.is_none());
+            let err = out.error.expect("unsupported kind must carry an error");
+            assert!(
+                err.message.contains(label),
+                "error for {src:?} should mention {label:?}, got: {}",
+                err.message
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            .. ProptestConfig::default()
+        })]
+
+        /// `render` must never panic on arbitrary unicode input and must
+        /// always produce exactly one of svg/error.
+        #[test]
+        fn render_never_panics_on_arbitrary_input(src in "\\PC*") {
+            let out = render(&src);
+            prop_assert!(
+                out.svg.is_some() != out.error.is_some(),
+                "exactly one of svg/error must be set, got {out:?}"
+            );
+        }
+
+        /// Same invariant with a `pie` header forced on, so the pie parser
+        /// and renderer (not just kind detection) see arbitrary bodies.
+        /// Any produced SVG must be a complete element.
+        #[test]
+        fn pie_bodies_never_panic_and_svg_is_complete(body in "\\PC*") {
+            let out = render(&format!("pie\n{body}"));
+            prop_assert!(out.svg.is_some() != out.error.is_some());
+            if let Some(svg) = &out.svg {
+                prop_assert!(svg.starts_with("<svg"));
+                prop_assert!(svg.ends_with("</svg>"));
+            }
+        }
+
+        /// Well-formed pies always render: one legend entry per slice, and
+        /// no raw `<` from a label survives into the SVG.
+        #[test]
+        fn well_formed_pies_always_render(
+            slices in proptest::collection::vec(
+                ("[A-Za-z0-9<&>][A-Za-z0-9 <&>]{0,11}", 0.0f64..1e6),
+                1..10,
+            )
+        ) {
+            let src = std::iter::once("pie".to_string())
+                .chain(slices.iter().map(|(l, v)| format!("\"{l}\" : {v}")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let out = render(&src);
+            prop_assert!(out.error.is_none(), "unexpected error: {:?}", out.error);
+            let svg = out.svg.expect("well-formed pie must render");
+            prop_assert_eq!(
+                svg.matches("<text x=\"320\"").count(),
+                slices.len(),
+                "one legend row per slice"
+            );
+            // Every `<` in the output must open a tag the renderer itself
+            // emits; any other `<` is an unescaped label character.
+            let renderer_tags =
+                ["<svg", "</svg>", "<text", "</text>", "<rect", "<path", "<circle"];
+            let tag_lt: usize =
+                renderer_tags.iter().map(|t| svg.matches(t).count()).sum();
+            prop_assert_eq!(
+                svg.matches('<').count(),
+                tag_lt,
+                "unescaped `<` leaked into the SVG: {}",
+                svg
+            );
+        }
+    }
 }

@@ -1874,4 +1874,209 @@ mod tests {
         let back = doc_meta_from_item(&item).expect("from_item");
         assert!(!back.is_template);
     }
+
+    #[test]
+    fn doc_meta_round_trips_with_every_optional_field_set() {
+        // The existing tests pin individual sparse fields; this pins
+        // the fully-populated shape in one pass so a regression in
+        // any encode/decode pair is caught even if its focused test
+        // is ever bypassed.
+        let meta = DocumentMeta {
+            doc_id: "doc1".to_string(),
+            title: "T".to_string(),
+            owner_id: "u1".to_string(),
+            folder_id: Some("f1".to_string()),
+            additional_folder_ids: vec!["f2".to_string()],
+            workspace_id: Some("ws1".to_string()),
+            doc_type: DocType::Spreadsheet,
+            snapshot_version: 7,
+            snapshot_s3_key: Some("docs/doc1/snapshots/7.bin".to_string()),
+            is_deleted: true,
+            deleted_at: Some(1_700_000_000_000_000),
+            link_sharing_mode: Some(crate::models::LinkSharingMode::View),
+            link_view_options: ViewOptions {
+                allow_comments: true,
+                ..Default::default()
+            },
+            locked: true,
+            is_template: true,
+            created_at: 1,
+            updated_at: 2,
+        };
+        let back = doc_meta_from_item(&doc_meta_to_item(&meta)).expect("from_item");
+        assert_eq!(back, meta);
+    }
+
+    #[test]
+    fn doc_meta_link_sharing_mode_round_trips_every_mode() {
+        // Stored as the lowercase serde tag ("edit"/"view"/"none");
+        // None (feature disabled) writes no attribute and decodes
+        // back to None. Note the deliberate asymmetry: LinkSharingMode::None
+        // is a *stored* mode distinct from an absent attribute.
+        for mode in [
+            Some(crate::models::LinkSharingMode::Edit),
+            Some(crate::models::LinkSharingMode::View),
+            Some(crate::models::LinkSharingMode::None),
+            None,
+        ] {
+            let mut meta = sample_meta();
+            meta.link_sharing_mode = mode.clone();
+            let item = doc_meta_to_item(&meta);
+            if mode.is_none() {
+                assert!(!item.contains_key("link_sharing_mode"));
+            }
+            let back = doc_meta_from_item(&item).expect("from_item");
+            assert_eq!(back.link_sharing_mode, mode, "mismatch for {mode:?}");
+        }
+    }
+
+    #[test]
+    fn doc_member_round_trips_every_access_level() {
+        // Permission-bearing row: the level is stored as the
+        // UPPERCASE serde tag and must survive to_item → from_item
+        // for all four levels.
+        for level in [
+            AccessLevel::Own,
+            AccessLevel::Edit,
+            AccessLevel::Comment,
+            AccessLevel::View,
+        ] {
+            let member = DocMember {
+                doc_id: "doc1".to_string(),
+                user_id: "u2".to_string(),
+                access_level: level.clone(),
+                added_at: 42,
+            };
+            let item = doc_member_to_item(&member);
+            assert_eq!(
+                item.get("PK").and_then(|v| v.as_s().ok()).map(String::as_str),
+                Some("DOC#doc1")
+            );
+            assert_eq!(
+                item.get("SK").and_then(|v| v.as_s().ok()).map(String::as_str),
+                Some("MEMBER#u2")
+            );
+            let back = doc_member_from_item(&item, "doc1")
+                .unwrap_or_else(|e| panic!("roundtrip failed for {level:?}: {e}"));
+            assert_eq!(back, member);
+        }
+    }
+
+    #[test]
+    fn doc_member_unknown_access_level_errors() {
+        let member = DocMember {
+            doc_id: "doc1".to_string(),
+            user_id: "u2".to_string(),
+            access_level: AccessLevel::View,
+            added_at: 42,
+        };
+        let mut item = doc_member_to_item(&member);
+        item.insert("access_level".to_string(), AttributeValue::S("SUDO".to_string()));
+        match doc_member_from_item(&item, "doc1") {
+            Err(RepoError::MissingField(msg)) => {
+                assert!(msg.contains("access_level"), "must name the field: {msg}")
+            }
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    fn rel_item(relation_type: &str) -> HashMap<String, AttributeValue> {
+        // Shape written by create_relationship's `attrs` closure.
+        HashMap::from([
+            ("source_doc_id".to_string(), AttributeValue::S("src".to_string())),
+            ("target_doc_id".to_string(), AttributeValue::S("dst".to_string())),
+            ("relation_type".to_string(), AttributeValue::S(relation_type.to_string())),
+            ("created_by".to_string(), AttributeValue::S("u1".to_string())),
+            ("created_at".to_string(), AttributeValue::N("42".to_string())),
+        ])
+    }
+
+    #[test]
+    fn doc_rel_from_item_round_trips_every_relation_type() {
+        for rt in [
+            RelationType::Implements,
+            RelationType::DerivedFrom,
+            RelationType::DependsOn,
+            RelationType::References,
+            RelationType::Supersedes,
+        ] {
+            let rel = doc_rel_from_item(&rel_item(rt.as_str()))
+                .unwrap_or_else(|| panic!("decode failed for {rt:?}"));
+            assert_eq!(rel.relation_type, rt);
+            assert_eq!(rel.source_doc_id, "src");
+            assert_eq!(rel.target_doc_id, "dst");
+            assert_eq!(rel.created_by, "u1");
+            assert_eq!(rel.created_at, 42);
+        }
+    }
+
+    #[test]
+    fn doc_rel_from_item_drops_unknown_relation_type() {
+        // Documented posture: list_relationships filter_maps this
+        // decoder, so a row with an unrecognized relation type is
+        // silently skipped rather than failing the whole listing.
+        assert!(doc_rel_from_item(&rel_item("blames")).is_none());
+    }
+
+    // ── append_update input guard (offline — bails before any IO) ──
+
+    fn offline_repo() -> DocRepo {
+        let ddb_conf = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .build();
+        let s3_conf = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .build();
+        DocRepo::new(
+            crate::dynamo::DynamoClient::new(
+                aws_sdk_dynamodb::Client::from_conf(ddb_conf),
+                "test-table".to_string(),
+            ),
+            crate::s3::S3Client::new(
+                aws_sdk_s3::Client::from_conf(s3_conf),
+                "test-bucket".to_string(),
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn append_update_rejects_path_unsafe_doc_id_and_clock() {
+        // L2 trust-boundary check: doc_id and clock are interpolated
+        // into the S3 key path, so '/' and '..' must be rejected as a
+        // typed error before any storage call — a slash in doc_id
+        // would otherwise write under another tenant's key prefix.
+        let repo = offline_repo();
+        let base = crate::models::document::DocUpdate {
+            doc_id: "doc1".to_string(),
+            clock: "clk1".to_string(),
+            update_bytes: vec![1, 2, 3],
+            user_id: "u1".to_string(),
+            created_at: 42,
+            client_version: None,
+        };
+
+        for (doc_id, clock) in [
+            ("doc/../other", "clk1"),
+            ("docs/evil", "clk1"),
+            ("doc1", "1/2"),
+            ("doc1", ".."),
+        ] {
+            let mut update = base.clone();
+            update.doc_id = doc_id.to_string();
+            update.clock = clock.to_string();
+            let err = repo
+                .append_update(&update)
+                .await
+                .expect_err("path-unsafe id must be rejected");
+            match err {
+                RepoError::InvalidArgument(msg) => {
+                    assert!(
+                        msg.contains("path-unsafe"),
+                        "expected path-unsafe message for ({doc_id}, {clock}), got: {msg}"
+                    );
+                }
+                other => panic!("expected InvalidArgument, got {other:?}"),
+            }
+        }
+    }
 }

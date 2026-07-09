@@ -8,4 +8,4 @@ publish = false
 [dependencies]
 
 [dev-dependencies]
-proptest = "1"
+proptest = { workspace = true }

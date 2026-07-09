@@ -365,5 +365,21 @@ mod tests {
             .expect("empty-digest gate should never error");
         assert_eq!(outcome, SendOutcome::SkippedPrefs);
     }
+
+    #[tokio::test]
+    async fn user_lookup_failure_degrades_to_skipped_no_address() {
+        // One step past the pure gates: with the service enabled, the
+        // recipient lookup actually dials the unreachable endpoint
+        // (127.0.0.1:1 → immediate connection refused, still hermetic)
+        // and errors. The `_` arm in try_send must swallow that repo
+        // error into SkippedNoAddress — a DynamoDB outage degrades to
+        // "no email" rather than bubbling an Err out of the pipeline.
+        let svc = build_service(true);
+        let outcome = svc
+            .try_send(&sample_notif(), true)
+            .await
+            .expect("repo failure must not surface as SendError");
+        assert_eq!(outcome, SendOutcome::SkippedNoAddress);
+    }
 }
 

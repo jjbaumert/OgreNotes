@@ -416,3 +416,71 @@ async fn acs_rejects_replayed_valid_assertion() {
 
     app.cleanup().await;
 }
+
+/// An accepted assertion writes `SecurityAudit::SamlAssertionAccepted`
+/// with the workspace and IdP NameID — emitted BEFORE session mint so the
+/// row survives even if a downstream failure aborts the login. This writer
+/// had no coverage; the happy-path test above only checks the session.
+/// Runs under the same capability probe as the other happy-path tests
+/// (skips where in-process xmlsec verification is broken, enforced in CI
+/// via OGRE_REQUIRE_SAML_HAPPY).
+#[tokio::test]
+async fn acs_success_writes_saml_assertion_accepted_audit_row() {
+    use ogrenotes_storage::models::security_audit::SecurityAuditAction;
+
+    common::require_infra!();
+    require_inprocess_saml_verify!();
+    let app = common::TestApp::new().await;
+    let ws_id = setup_workspace(&app, "saml-audit-owner@test.com").await;
+
+    let request_id = format!("_req_{}", nanoid::nanoid!(24));
+    let stored = app
+        .state
+        .redis_session
+        .try_store_saml_authn_request(&request_id, &ws_id, 300)
+        .await
+        .unwrap();
+    assert!(stored, "AuthnRequest must store");
+
+    let name_id = "saml-audit-user@idp.example.test";
+    let signed = build_signed_saml_response(&request_id, name_id, name_id);
+    let b64 = B64.encode(signed.as_bytes());
+
+    let (status, _, body) = post_acs(&app, &b64, &ws_id).await;
+    assert_eq!(
+        status,
+        200,
+        "valid signed assertion must be accepted; body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let user_id = json["user_id"].as_str().unwrap().to_string();
+
+    // The writer fires via tokio::spawn — poll with the same 10×20ms
+    // bound the audit-writer suite uses.
+    let mut found = None;
+    for _ in 0..10 {
+        let rows = app
+            .state
+            .security_audit_repo
+            .list_for_user(&user_id, 20)
+            .await
+            .unwrap();
+        if let Some(row) = rows.into_iter().find(|r| {
+            matches!(
+                &r.action,
+                SecurityAuditAction::SamlAssertionAccepted { workspace_id: w, name_id: n }
+                    if w == &ws_id && n == name_id
+            )
+        }) {
+            found = Some(row);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let row = found.expect("expected SamlAssertionAccepted audit row within 200ms");
+    assert_eq!(row.user_id, user_id, "subject is the JIT-provisioned SAML user");
+    assert_eq!(row.actor_id, user_id, "self-event: actor == subject");
+
+    app.cleanup().await;
+}
