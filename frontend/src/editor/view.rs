@@ -945,6 +945,17 @@ impl EditorView {
                 }
                 let item_info = super::state::find_item_at(&state_with_sel.doc, pos);
                 if let Some(item) = item_info {
+                    // Wrap every inserted node into a valid, cursor-
+                    // addressable list item — pasted content can include a
+                    // bare text run or a stray block that would otherwise
+                    // land directly inside the list as an orphaned,
+                    // undeletable entry. (Existing items keep their own
+                    // kind; this does not convert ListItem<->TaskItem.)
+                    let item_type = item.node_type;
+                    let items: Vec<super::model::Node> = items
+                        .into_iter()
+                        .map(|n| super::model::ensure_list_item(n, item_type))
+                        .collect();
                     let item_text = item.content.children.iter()
                         .map(|c| c.text_content())
                         .collect::<String>();
