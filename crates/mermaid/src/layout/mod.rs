@@ -11,6 +11,7 @@ pub(crate) mod acyclic;
 pub(crate) mod order;
 pub(crate) mod position;
 pub(crate) mod rank;
+pub(crate) mod route;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Direction {
@@ -190,6 +191,47 @@ pub(crate) fn apply_direction(layout: &mut Layout, dir: Direction) {
     }
 }
 
+/// Full pipeline for FLAT graphs. Cluster inputs are dispatched to the
+/// collapse-expand driver (Task 7); until then they error.
+pub(crate) fn run(input: &LayoutInput) -> Result<Layout, String> {
+    validate(input)?;
+    if !input.clusters.is_empty() {
+        return Err("clusters not yet supported".to_string()); // Task 7 replaces
+    }
+    run_flat(input)
+}
+
+pub(crate) fn run_flat(input: &LayoutInput) -> Result<Layout, String> {
+    let ac = acyclic::make_acyclic(input.nodes.len(), &input.edges);
+    let ranks = rank::assign_ranks(input.nodes.len(), &ac.edges);
+    // Order-graph nodes are the ORIGINAL nodes; edges are the surviving
+    // acyclic edges (labels travel with them).
+    let surviving: Vec<LEdge> = ac
+        .edges
+        .iter()
+        .zip(&ac.orig)
+        .map(|(e, &o)| LEdge { from: e.from, to: e.to, label: input.edges[o].label })
+        .collect();
+    let mut g = order::build_order_graph(&input.nodes, &surviving, &ranks);
+    order::minimize_crossings(&mut g, &surviving);
+    let coords = position::assign_coords(&g);
+    let mut node_centers = vec![(0.0, 0.0); input.nodes.len()];
+    for (kind, c) in &coords.centers {
+        if let order::SlotKind::Real(i) = kind {
+            node_centers[*i] = *c;
+        }
+    }
+    let edge_paths = route::route_edges(input, &ac, &g, &coords);
+    let mut layout = Layout {
+        node_centers,
+        edge_paths,
+        cluster_rects: vec![],
+        size: coords.size,
+    };
+    apply_direction(&mut layout, input.direction);
+    Ok(layout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +332,103 @@ mod tests {
         // after swap: (20,10) in 200x100; flip x: 200-20 = 180
         assert_eq!(l.node_centers[0], (180.0, 10.0));
         assert_eq!(l.size, (200.0, 100.0));
+    }
+
+    fn simple_input(dir: Direction) -> LayoutInput {
+        LayoutInput {
+            nodes: vec![node(60.0, 24.0), node(60.0, 24.0), node(60.0, 24.0)],
+            edges: vec![
+                LEdge { from: 0, to: 1, label: None },
+                LEdge { from: 1, to: 2, label: Some((30.0, 12.0)) },
+            ],
+            clusters: vec![],
+            direction: dir,
+        }
+    }
+
+    #[test]
+    fn run_lays_out_a_chain() {
+        let l = run(&simple_input(Direction::TB)).unwrap();
+        assert_eq!(l.node_centers.len(), 3);
+        assert_eq!(l.edge_paths.len(), 2);
+        // Chain stacks downward in TB.
+        assert!(l.node_centers[1].1 > l.node_centers[0].1);
+        assert!(l.node_centers[2].1 > l.node_centers[1].1);
+        // Edge endpoints clip at node boxes, not centers.
+        let p0 = &l.edge_paths[0].points;
+        assert!(p0.first().unwrap().1 > l.node_centers[0].1);
+        assert!(p0.last().unwrap().1 < l.node_centers[1].1);
+        // Labeled single-span edge gets a midpoint label anchor.
+        assert!(l.edge_paths[1].label_at.is_some());
+    }
+
+    #[test]
+    fn run_lr_flows_rightward() {
+        let l = run(&simple_input(Direction::LR)).unwrap();
+        assert!(l.node_centers[1].0 > l.node_centers[0].0);
+        assert!(l.node_centers[2].0 > l.node_centers[1].0);
+    }
+
+    #[test]
+    fn run_handles_cycle_with_true_direction_points() {
+        let input = LayoutInput {
+            nodes: vec![node(40.0, 20.0), node(40.0, 20.0)],
+            edges: vec![
+                LEdge { from: 0, to: 1, label: None },
+                LEdge { from: 1, to: 0, label: None },
+            ],
+            clusters: vec![],
+            direction: Direction::TB,
+        };
+        let l = run(&input).unwrap();
+        let back = l.edge_paths.iter().find(|p| p.reversed).expect("one reversed");
+        // True direction: starts near node 1, ends near node 0.
+        let start = back.points.first().unwrap();
+        let end = back.points.last().unwrap();
+        let d_start_1 = (start.1 - l.node_centers[1].1).abs();
+        let d_end_0 = (end.1 - l.node_centers[0].1).abs();
+        assert!(d_start_1 < d_end_0.max(60.0));
+        assert!(end.1 < start.1, "back edge should flow upward in TB");
+    }
+
+    #[test]
+    fn run_self_loop_has_points() {
+        let input = LayoutInput {
+            nodes: vec![node(40.0, 20.0)],
+            edges: vec![LEdge { from: 0, to: 0, label: None }],
+            clusters: vec![],
+            direction: Direction::TB,
+        };
+        let l = run(&input).unwrap();
+        assert!(l.edge_paths[0].points.len() >= 4);
+        for p in &l.edge_paths[0].points {
+            assert!(p.0.is_finite() && p.1.is_finite());
+        }
+    }
+
+    #[test]
+    fn run_rejects_over_cap() {
+        let input = LayoutInput {
+            nodes: (0..=MAX_NODES)
+                .map(|_| node(1.0, 1.0))
+                .collect(),
+            edges: vec![],
+            clusters: vec![],
+            direction: Direction::TB,
+        };
+        assert!(run(&input).unwrap_err().contains("too large"));
+    }
+
+    #[test]
+    fn run_empty_graph_ok() {
+        let input = LayoutInput {
+            nodes: vec![],
+            edges: vec![],
+            clusters: vec![],
+            direction: Direction::TB,
+        };
+        let l = run(&input).unwrap();
+        assert!(l.node_centers.is_empty());
+        assert!(l.size.0 > 0.0 && l.size.1 > 0.0);
     }
 }
