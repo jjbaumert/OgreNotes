@@ -101,4 +101,28 @@ proptest! {
             }
         }
     }
+
+    #[test]
+    fn clustered_no_node_overlaps(input in arb_input()) {
+        // Like `flat_no_node_overlaps`, but KEEPING clusters: containment
+        // is a looser guarantee (cross-cluster spacing includes title/pad
+        // strips), so only real-node pairwise non-overlap is asserted
+        // here, not cluster-rect containment or cross-cluster clearance.
+        if let Ok(l) = run(&input) {
+            for i in 0..input.nodes.len() {
+                for j in i + 1..input.nodes.len() {
+                    let (ci, cj) = (l.node_centers[i], l.node_centers[j]);
+                    let (ni, nj) = (&input.nodes[i], &input.nodes[j]);
+                    let x_sep = (ci.0 - cj.0).abs()
+                        >= (ni.width + nj.width) / 2.0 - 1e-6;
+                    let y_sep = (ci.1 - cj.1).abs()
+                        >= (ni.height + nj.height) / 2.0 - 1e-6;
+                    prop_assert!(
+                        x_sep || y_sep,
+                        "nodes {i} and {j} overlap: {ci:?} {cj:?}"
+                    );
+                }
+            }
+        }
+    }
 }

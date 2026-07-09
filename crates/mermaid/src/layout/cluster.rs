@@ -143,11 +143,45 @@ fn build_level(
         }
     }
 
+    // `local_input.direction` below is ALWAYS `TB` (see comment on it), so
+    // `layout_tb` never does its own internal transpose for this level.
+    // But every level's local-x/local-y are the SAME shared axes: levels
+    // nest by pure translation in `expand_level` (no per-level rotation),
+    // and the terminal `apply_direction` runs exactly once, on the whole
+    // assembled layout. So the same "transpose-in, single swap-out" trick
+    // `layout_tb` applies at the top of a flat graph (see its comment) has
+    // to be applied here too, at the one place true node extents enter the
+    // hierarchy: real member nodes, as they're copied into `local_nodes`.
+    // Gate on the ORIGINAL (outer) `input.direction`, not `target`'s
+    // depth — it's a single global convention, not a per-level one.
+    let transpose = matches!(input.direction, Direction::LR | Direction::RL);
     let mut local_nodes: Vec<LNode> = Vec::with_capacity(entities.len());
     for e in &entities {
         match *e {
-            Entity::Node(v) => local_nodes.push(input.nodes[v].clone()),
+            Entity::Node(v) => {
+                let n = &input.nodes[v];
+                if transpose {
+                    local_nodes.push(LNode {
+                        width: n.height,
+                        height: n.width,
+                        cluster: n.cluster,
+                    });
+                } else {
+                    local_nodes.push(n.clone());
+                }
+            }
             Entity::Cluster(c) => {
+                // NOT transposed again here: `placeholder_size` comes from
+                // `sub_builds[c].layout.size`, which was already produced
+                // by THIS SAME function one level down, where that level's
+                // own real members went through the `Entity::Node` branch
+                // above and were transposed there. Because nesting is pure
+                // translation, a child's local-x/local-y extents are
+                // already expressed in the same shared axes this level's
+                // `layout_tb` call expects. Swapping again here would
+                // double-transpose every cluster one level deeper than its
+                // parent (a 2-level chain would swap-swap back to
+                // untransposed, a 3-level chain would swap once more, etc).
                 let (w, h) = sub_builds[c]
                     .as_ref()
                     .expect("child clusters are built before their parent")
@@ -441,5 +475,52 @@ mod tests {
         for p in &loops[0].points {
             assert!(p.0.is_finite() && p.1.is_finite());
         }
+    }
+
+    #[test]
+    fn lr_clustered_wide_short_nodes_no_overlap() {
+        // Two wide-short members (120x20) inside a cluster, plus one
+        // top-level node, direction LR. Before the fix, `build_level`
+        // hardcoded TB on every per-level input (no transpose-in), while
+        // the single terminal `apply_direction` swapped the untransposed
+        // geometry — wide/short nodes' clearances landed on the wrong
+        // final axis and overlapped.
+        let input = LayoutInput {
+            nodes: vec![
+                LNode { width: 60.0, height: 24.0, cluster: None },
+                LNode { width: 120.0, height: 20.0, cluster: Some(0) },
+                LNode { width: 120.0, height: 20.0, cluster: Some(0) },
+            ],
+            edges: vec![e(0, 1), e(1, 2)],
+            clusters: vec![LCluster { parent: None, title: (50.0, 16.0) }],
+            direction: Direction::LR,
+        };
+        let l = run_clustered(&input).unwrap();
+
+        // Pairwise non-overlap using true node dimensions: same
+        // x_sep-or-y_sep check as `flat_no_node_overlaps` in props.rs.
+        for i in 0..input.nodes.len() {
+            for j in i + 1..input.nodes.len() {
+                let (ci, cj) = (l.node_centers[i], l.node_centers[j]);
+                let (ni, nj) = (&input.nodes[i], &input.nodes[j]);
+                let x_sep = (ci.0 - cj.0).abs() >= (ni.width + nj.width) / 2.0 - 1e-6;
+                let y_sep = (ci.1 - cj.1).abs() >= (ni.height + nj.height) / 2.0 - 1e-6;
+                assert!(x_sep || y_sep, "nodes {i} and {j} overlap: {ci:?} {cj:?}");
+            }
+        }
+
+        // Members land inside their cluster rect; the top-level node does not.
+        let r = &l.cluster_rects[0];
+        assert!(
+            inside(l.node_centers[1], r),
+            "node 1 center {:?} outside cluster rect {r:?}",
+            l.node_centers[1]
+        );
+        assert!(
+            inside(l.node_centers[2], r),
+            "node 2 center {:?} outside cluster rect {r:?}",
+            l.node_centers[2]
+        );
+        assert!(!inside(l.node_centers[0], r));
     }
 }

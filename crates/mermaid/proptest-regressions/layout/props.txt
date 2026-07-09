@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1386218223b2693d0f0ce0443c24549dd3a4f128b4b988680bef6a43f1aa114b # shrinks to input = LayoutInput { nodes: [LNode { width: 64.49219066978553, height: 10.0, cluster: Some(1) }, LNode { width: 111.70746362329389, height: 10.0, cluster: Some(1) }], edges: [LEdge { from: 0, to: 1, label: None }], clusters: [LCluster { parent: None, title: (30.0, 14.0) }, LCluster { parent: None, title: (30.0, 14.0) }], direction: LR }
