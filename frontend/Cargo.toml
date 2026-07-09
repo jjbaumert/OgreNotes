@@ -51,6 +51,11 @@ unic-langid = { version = "0.9", features = ["macros"] }
 # because no backend crate needs it.
 fuzzy-matcher = "0.3"
 
+# Pure-Rust Mermaid -> SVG renderer, zero deps, wasm-clean. See
+# crates/mermaid — shared with the backend for future server-side
+# rendering; frontend uses it directly for the live-app block view.
+ogrenotes-mermaid = { path = "../crates/mermaid" }
+
 [dependencies.web-sys]
 version = "0.3"
 features = [

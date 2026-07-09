@@ -71,6 +71,12 @@ pub enum NodeType {
     /// dual-read of documents written before this slice; new
     /// inserts always produce `NodeType::Mention` nodes.
     Mention,
+    /// Mermaid diagram block. Leaf atom; source stored in the
+    /// `source` attribute. Rendered to SVG by `ogrenotes-mermaid`
+    /// on both the client (live view) and server (HTML export).
+    /// Mirrors the same-named variant in
+    /// `frontend/src/editor/model.rs`.
+    Mermaid,
 }
 
 impl NodeType {
@@ -101,6 +107,7 @@ impl NodeType {
             NodeType::KanbanColumn => "kanban_column",
             NodeType::KanbanCard => "kanban_card",
             NodeType::Mention => "mention",
+            NodeType::Mermaid => "mermaid",
         }
     }
 
@@ -131,6 +138,7 @@ impl NodeType {
             "kanban_column" => Some(NodeType::KanbanColumn),
             "kanban_card" => Some(NodeType::KanbanCard),
             "mention" => Some(NodeType::Mention),
+            "mermaid" => Some(NodeType::Mermaid),
             _ => None,
         }
     }
@@ -160,6 +168,7 @@ impl NodeType {
                 | NodeType::Kanban
                 | NodeType::KanbanColumn
                 | NodeType::KanbanCard
+                | NodeType::Mermaid
         )
     }
 
@@ -179,6 +188,7 @@ impl NodeType {
                 | NodeType::CalendarEvent
                 | NodeType::KanbanCard
                 | NodeType::Mention
+                | NodeType::Mermaid
         )
     }
 
@@ -204,6 +214,7 @@ impl NodeType {
                 NodeType::Embed,
                 NodeType::Calendar,
                 NodeType::Kanban,
+                NodeType::Mermaid,
             ],
             NodeType::BulletList => &[NodeType::ListItem],
             NodeType::OrderedList => &[NodeType::ListItem],
@@ -259,7 +270,8 @@ impl NodeType {
             | NodeType::Embed
             | NodeType::CalendarEvent
             | NodeType::KanbanCard
-            | NodeType::Mention => &[],
+            | NodeType::Mention
+            | NodeType::Mermaid => &[],
         }
     }
 }
@@ -353,6 +365,7 @@ mod tests {
             NodeType::KanbanColumn,
             NodeType::KanbanCard,
             NodeType::Mention,
+            NodeType::Mermaid,
         ];
 
         for nt in &types {
@@ -477,6 +490,7 @@ mod tests {
         NodeType::KanbanColumn,
         NodeType::KanbanCard,
         NodeType::Mention,
+        NodeType::Mermaid,
     ];
 
     /// The schema-validated mark types. Must match the marks registered in
@@ -510,7 +524,7 @@ mod tests {
         // If this fails, a node type was added to or removed from the collab
         // schema without updating the expected set. Update ALL_NODE_TYPES and
         // the corresponding frontend/src/editor/model.rs NodeType enum.
-        assert_eq!(ALL_NODE_TYPES.len(), 24, "expected 24 node types");
+        assert_eq!(ALL_NODE_TYPES.len(), 25, "expected 25 node types");
     }
 
     #[test]
@@ -571,6 +585,7 @@ mod tests {
             ("kanban_column", NodeType::KanbanColumn),
             ("kanban_card", NodeType::KanbanCard),
             ("mention", NodeType::Mention),
+            ("mermaid", NodeType::Mermaid),
         ];
         for (tag, nt) in expected {
             assert_eq!(nt.tag_name(), *tag, "tag mismatch for {nt:?}");
@@ -616,6 +631,7 @@ mod tests {
             NodeType::CalendarEvent,
             NodeType::KanbanCard,
             NodeType::Mention,
+            NodeType::Mermaid,
         ];
         for nt in ALL_NODE_TYPES {
             let is_leaf = expected_leaves.contains(nt);
@@ -645,7 +661,7 @@ mod tests {
                 NodeType::OrderedList, NodeType::TaskList, NodeType::Blockquote,
                 NodeType::CodeBlock, NodeType::HorizontalRule, NodeType::Image,
                 NodeType::Table, NodeType::Embed, NodeType::Calendar,
-                NodeType::Kanban,
+                NodeType::Kanban, NodeType::Mermaid,
             ]
         );
         // List containers:

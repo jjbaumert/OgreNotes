@@ -184,6 +184,10 @@ pub enum NodeType {
     /// atom; deletes as one keystroke. Mirrors the same-named
     /// variant in `crates/collab/src/schema.rs`.
     Mention,
+    /// Mermaid diagram block. Block-level leaf atom; source stored in
+    /// the `source` attribute; rendered to SVG by `ogrenotes-mermaid`.
+    /// Mirrors the same-named variant in `crates/collab/src/schema.rs`.
+    Mermaid,
 }
 
 impl NodeType {
@@ -198,6 +202,7 @@ impl NodeType {
                 | NodeType::CalendarEvent
                 | NodeType::KanbanCard
                 | NodeType::Mention
+                | NodeType::Mermaid
         )
     }
 
@@ -230,6 +235,7 @@ impl NodeType {
                 | NodeType::Kanban
                 | NodeType::KanbanCard
                 | NodeType::Mention
+                | NodeType::Mermaid
         )
     }
 
@@ -269,7 +275,8 @@ impl NodeType {
             | NodeType::Embed
             | NodeType::CalendarEvent
             | NodeType::KanbanColumn
-            | NodeType::Mention => false,
+            | NodeType::Mention
+            | NodeType::Mermaid => false,
         }
     }
 
@@ -316,7 +323,8 @@ impl NodeType {
             | NodeType::Kanban
             | NodeType::KanbanColumn
             | NodeType::KanbanCard
-            | NodeType::Mention => true,
+            | NodeType::Mention
+            | NodeType::Mermaid => true,
         }
     }
 

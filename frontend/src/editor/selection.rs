@@ -895,6 +895,41 @@ mod tests {
         assert!(atom_before_cursor_block(&doc, &Selection::text(6, 8)).is_none());
     }
 
+    // ── atom_before_cursor_block: Mermaid is generic over is_atom() (#78) ──
+    // Spec §G regression coverage: the atom backspace mechanism must not
+    // be HR-specific. Mirrors `doc_with_hr` / the HR backspace test above
+    // with a `NodeType::Mermaid` node standing in for the rule.
+
+    fn doc_with_mermaid() -> Node {
+        // doc > [para("Hi"), mermaid, para("Lo")]
+        // Same layout/positions as doc_with_hr: 1..3 "Hi", 3 end-Hi,
+        // 4 after-para1, 5 after-mermaid, 6 start-Lo, 8 end-Lo.
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("Hi")]),
+                ),
+                Node::element(NodeType::Mermaid),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("Lo")]),
+                ),
+            ]),
+        )
+    }
+
+    #[test]
+    fn atom_before_cursor_block_at_block_start_returns_mermaid_range() {
+        let doc = doc_with_mermaid();
+        // Caret at start of "Lo" (pos 6); the Mermaid node occupies [4, 5).
+        assert_eq!(
+            atom_before_cursor_block(&doc, &Selection::cursor(6)),
+            Some((4, 5))
+        );
+    }
+
     // ── atom_after_cursor_block: forward-delete over an atom ──
 
     fn doc_with_embed() -> Node {
@@ -920,6 +955,18 @@ mod tests {
     fn atom_after_cursor_block_at_block_end_returns_embed_range() {
         let doc = doc_with_embed();
         // Caret at end of "Hi" (pos 3); the embed occupies [4, 5).
+        assert_eq!(
+            atom_after_cursor_block(&doc, &Selection::cursor(3)),
+            Some((4, 5))
+        );
+    }
+
+    #[test]
+    fn atom_after_cursor_block_at_block_end_returns_mermaid_range() {
+        // Spec §G forward-delete counterpart to the Mermaid backspace
+        // test above — the atom mechanism is generic over is_atom().
+        let doc = doc_with_mermaid();
+        // Caret at end of "Hi" (pos 3); the Mermaid node occupies [4, 5).
         assert_eq!(
             atom_after_cursor_block(&doc, &Selection::cursor(3)),
             Some((4, 5))

@@ -1383,6 +1383,46 @@ fn find_calendar_child(
     None
 }
 
+// ─── Mermaid mutations ──────────────────────────────────────────
+//
+// Mermaid is a leaf atom (like Calendar/Kanban) whose only mutable
+// state is its `source` attribute, edited via `MermaidModal` in
+// `components/mermaid_modal.rs`. The delegated click listener in
+// `components/editor_component.rs` reads the block-id off the DOM
+// wrapper (`data-block-id`) and the modal's Save outcome calls this
+// command to commit the new `source`.
+
+/// Write a Mermaid block's `source` attribute by block id. Emits a
+/// single `Step::SetAttr`, preserving the node's identity/position.
+/// Returns `false` if no Mermaid element with `block_id` exists.
+pub fn update_mermaid_source(
+    block_id: &str,
+    source: String,
+    state: &EditorState,
+    dispatch: Option<&dyn Fn(Transaction)>,
+) -> bool {
+    let Some((offset, node)) = find_element_by_block_id(&state.doc, block_id) else {
+        return false;
+    };
+    if !matches!(&node, Node::Element { node_type: NodeType::Mermaid, .. }) {
+        return false;
+    }
+
+    if let Some(dispatch) = dispatch {
+        let mut txn = state.transaction();
+        match txn.step(Step::SetAttr {
+            pos: offset,
+            attr: "source".to_string(),
+            value: source,
+        }) {
+            Ok(next) => txn = next,
+            Err(_) => return true,
+        }
+        dispatch(txn);
+    }
+    true
+}
+
 // ─── #137 Kanban mutations ──────────────────────────────────────
 //
 // The eight commands below all operate on a Kanban tree
@@ -5027,6 +5067,53 @@ mod tests {
         assert_eq!(attrs.get("startDate").map(|s| s.as_str()), Some("2026-07-04"));
         // Content still preserved.
         assert_eq!(attrs.get("content").map(|s| s.as_str()), Some("Meeting"));
+    }
+
+    // ── Mermaid mutations ──
+
+    fn state_with_mermaid(block_id: &str, source: &str) -> EditorState {
+        let mut attrs: HashMap<String, String> = HashMap::new();
+        attrs.insert("blockId".into(), block_id.into());
+        attrs.insert("source".into(), source.into());
+        let mermaid = Node::element_with_attrs(NodeType::Mermaid, attrs, Fragment::empty());
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![mermaid]));
+        EditorState::create_default(doc)
+    }
+
+    #[test]
+    fn update_mermaid_source_sets_attr() {
+        let state = state_with_mermaid("m1", "pie\n\"A\": 1");
+        let txn = run_command(&state, |s, d| {
+            update_mermaid_source("m1", "pie\n\"B\": 2".into(), s, d)
+        })
+        .unwrap();
+        let new_state = state.apply(txn);
+        let mermaid = new_state.doc.child(0).unwrap();
+        let Node::Element { attrs, .. } = mermaid else { panic!() };
+        assert_eq!(
+            attrs.get("source").map(|s| s.as_str()),
+            Some("pie\n\"B\": 2"),
+        );
+    }
+
+    #[test]
+    fn update_mermaid_source_unknown_block_id_returns_false() {
+        let state = state_with_mermaid("m1", "pie\n\"A\": 1");
+        let dispatched = run_command(&state, |s, d| {
+            update_mermaid_source("missing", "pie\n\"B\": 2".into(), s, d)
+        });
+        assert!(dispatched.is_none(), "unknown block_id must not dispatch");
+    }
+
+    /// Regression: `run_command` treats a `false` return as "no
+    /// dispatch" regardless of whether the closure invoked the
+    /// callback, so this also proves the early-return path itself
+    /// returns `false` (checked directly, bypassing the harness).
+    #[test]
+    fn update_mermaid_source_unknown_block_id_returns_false_direct() {
+        let state = state_with_mermaid("m1", "pie\n\"A\": 1");
+        let ok = update_mermaid_source("missing", "pie\n\"B\": 2".into(), &state, None);
+        assert!(!ok);
     }
 
     /// Regression: same-column drop with `to_index = None` (tail)

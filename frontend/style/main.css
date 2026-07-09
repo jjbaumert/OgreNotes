@@ -5860,3 +5860,53 @@ tr:hover .folder-row-actions,
   border-radius: var(--radius-sm);
   color: var(--color-text);
 }
+
+/* ─── Mermaid diagram block (Task 8) — see design/live-app-blocks.md
+ * for the render/validate/edit pipeline. Block styling here; the
+ * edit modal reuses `.confirm-backdrop` / `.calendar-modal` /
+ * `.calendar-modal-actions` (see calendar_modal.rs) for overlay +
+ * chrome consistency with the rest of the app's dialogs. */
+.mermaid-block {
+  display: block;
+  margin: var(--space-md) 0;
+  cursor: pointer;
+}
+.mermaid-svg svg {
+  max-width: 100%;
+  height: auto;
+}
+.mermaid-error {
+  color: var(--color-danger, #c33);
+  margin: 0 0 var(--space-sm);
+}
+.mermaid-block pre {
+  white-space: pre-wrap;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.85rem;
+  color: var(--color-text-secondary);
+  margin: 0;
+}
+.mermaid-modal-body {
+  min-width: 480px;
+  max-width: 92vw;
+}
+.mermaid-modal .mermaid-source {
+  min-height: 200px;
+  width: 100%;
+  resize: vertical;
+  white-space: pre-wrap;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.85rem;
+  padding: 6px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 4px);
+  color: inherit;
+  background: var(--color-bg, white);
+}
+.mermaid-modal .mermaid-preview {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 4px);
+  padding: var(--space-sm);
+  overflow: auto;
+  max-height: 320px;
+}
