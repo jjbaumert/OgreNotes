@@ -174,7 +174,11 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
 
 /// Format a value without a trailing `.0` for whole numbers.
 fn trim_num(v: f64) -> String {
-    if v.fract() == 0.0 {
+    // Take the integer path only inside i64's exactly-representable
+    // range: beyond it the `as` cast saturates and would display
+    // i64::MAX instead of the real value (issue #12). f64's Display
+    // renders huge whole values correctly on its own.
+    if v.fract() == 0.0 && v >= i64::MIN as f64 && v < i64::MAX as f64 {
         format!("{}", v as i64)
     } else {
         format!("{v}")
@@ -371,6 +375,19 @@ mod tests {
         assert_eq!(trim_num(7.0), "7");
         assert_eq!(trim_num(0.0), "0");
         assert_eq!(trim_num(1.5), "1.5");
+    }
+
+    /// Regression: issue #12 — whole values at or beyond 2^63 used to
+    /// saturate through the `as i64` cast and display i64::MAX instead
+    /// of the actual value.
+    #[test]
+    fn trim_num_huge_whole_values_do_not_saturate() {
+        // 2^63 and 10^19, both exactly representable in f64, both
+        // outside i64's range. f64 Display prints the shortest string
+        // that round-trips (so 2^63 shows as ...6000, the same f64) —
+        // the contract is "the real magnitude, not i64::MAX".
+        assert_eq!(trim_num(9223372036854775808.0), "9223372036854776000");
+        assert_eq!(trim_num(1e19), "10000000000000000000");
     }
 
     #[test]
