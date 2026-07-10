@@ -86,7 +86,9 @@ async fn search(
     let owner_id = params.from.filter(|s| !s.is_empty());
     let folder_id = params.folder_id.filter(|s| !s.is_empty());
 
-    let count = params.count.unwrap_or(20).min(50);
+    // Clamp to [1, 50]: tantivy's TopDocs collector asserts limit >= 1,
+    // so an unclamped count=0 would panic the handler (issue #7).
+    let count = params.count.unwrap_or(20).clamp(1, 50);
 
     // Determine effective search mode (fall back to keyword if embeddings unavailable)
     let has_embeddings = state.embedding_pipeline.is_some();

@@ -283,6 +283,11 @@ impl SearchIndex {
 
         let combined = BooleanQuery::new(clauses);
         let total_needed = query.offset + query.limit;
+        // TopDocs::with_limit asserts limit >= 1; a zero fetch budget can
+        // only ever produce an empty page, so answer it without collecting.
+        if total_needed == 0 {
+            return Ok(vec![]);
+        }
         let top_docs = searcher.search(&combined, &TopDocs::with_limit(total_needed))?;
 
         let mut hits = Vec::with_capacity(query.limit);
@@ -1203,5 +1208,19 @@ mod tests {
             .unwrap();
         assert_eq!(idx.search(&q("nested")).unwrap().len(), 1);
         assert!(nested.join("meta.json").exists());
+    }
+
+    /// Regression: issue #7 — a zero fetch limit must return an empty
+    /// result set, not trip tantivy's `TopDocs::with_limit >= 1` assert
+    /// and panic the caller.
+    #[test]
+    fn test_zero_limit_returns_empty_instead_of_panicking() {
+        let idx = SearchIndex::open_in_memory().unwrap();
+        idx.index_document(&sample_doc("d1", "Hello World", "some body"))
+            .unwrap();
+
+        let mut query = q("hello");
+        query.limit = 0;
+        assert!(idx.search(&query).unwrap().is_empty());
     }
 }
