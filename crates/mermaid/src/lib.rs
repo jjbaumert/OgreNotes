@@ -9,6 +9,7 @@
 
 mod pie;
 mod layout;
+pub(crate) mod measure;
 pub(crate) mod flowchart;
 
 /// Max diagram source length (chars). Shared cap: the single source of

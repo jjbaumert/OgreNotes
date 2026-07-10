@@ -1,4 +1,3 @@
-pub(crate) mod measure;
 pub(crate) mod parse;
 pub(crate) mod shapes;
 pub(crate) mod svg;
@@ -82,7 +81,7 @@ pub(crate) fn render_flowchart(source: &str) -> Result<String, crate::ParseError
     let g = parse::parse(source)?;
     let mut nodes = Vec::with_capacity(g.nodes.len());
     for n in &g.nodes {
-        let (tw, th) = measure::text_size(&n.label);
+        let (tw, th) = crate::measure::text_size(&n.label);
         let (w, h) = shapes::size_for(n.shape, tw, th);
         nodes.push(crate::layout::LNode { width: w, height: h, cluster: n.subgraph });
     }
@@ -93,7 +92,7 @@ pub(crate) fn render_flowchart(source: &str) -> Result<String, crate::ParseError
             from: e.from,
             to: e.to,
             label: e.label.as_deref().map(|l| {
-                let (w, h) = measure::text_size(l);
+                let (w, h) = crate::measure::text_size(l);
                 (w + 8.0, h + 4.0)
             }),
         })
@@ -103,7 +102,7 @@ pub(crate) fn render_flowchart(source: &str) -> Result<String, crate::ParseError
         .iter()
         .map(|s| crate::layout::LCluster {
             parent: s.parent,
-            title: measure::text_size(&s.title),
+            title: crate::measure::text_size(&s.title),
         })
         .collect();
     let input = crate::layout::LayoutInput {
