@@ -1297,3 +1297,55 @@ async fn recovery_wrong_code_writes_recovery_failed_audit_row() {
 
     app.cleanup().await;
 }
+
+/// Issue #14: recovery codes are minted uppercase from a case-free
+/// base32 alphabet, so a lowercase transcription is the same code —
+/// redemption must accept it end to end (and not burn a lockout-counter
+/// attempt on letter case).
+#[tokio::test]
+async fn recovery_with_lowercase_code_mints_session() {
+    common::require_infra!();
+    std::sync::LazyLock::force(&common::MFA_KEY_INIT);
+    let app = common::TestApp::new().await;
+
+    let email = "mfa-recovery-lowercase@test.com";
+    let (_user_id, token) = app.create_user(email).await;
+    let (_, enroll) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/auth/mfa/enroll",
+            Some(&token),
+            None,
+        )
+        .await;
+    let secret = enroll["secret"].as_str().unwrap().to_string();
+    let recovery_code = enroll["recoveryCodes"][0].as_str().unwrap().to_string();
+    let code = current_code(&secret, email);
+    let (status, _) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/auth/mfa/verify",
+            Some(&token),
+            Some(serde_json::json!({ "code": code })),
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let (_, json) = dev_login(&app, email).await;
+    let handle = json["handle"].as_str().unwrap().to_string();
+
+    let (status, body) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/auth/mfa/recovery",
+            None,
+            Some(serde_json::json!({
+                "handle": handle,
+                "code": recovery_code.to_lowercase(),
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "lowercase recovery body: {body}");
+
+    app.cleanup().await;
+}

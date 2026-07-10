@@ -184,15 +184,26 @@ fn one_recovery_code() -> String {
 /// balance the bcrypt crate's defaults pick — ~100 ms verify on a
 /// modern server, slow enough to thwart offline attack on the small
 /// 50-bit search space if the DDB row leaks.
+///
+/// The code is uppercased before hashing so redemption can be
+/// case-insensitive (issue #14): the base32 alphabet (A-Z2-7) is
+/// case-free, so letter case carries no entropy — minted codes are
+/// uppercase already, making this a no-op for the enroll path.
 pub fn hash_recovery_code(code: &str) -> Result<String, MfaError> {
-    bcrypt::hash(code, 10).map_err(|e| MfaError::Bcrypt(e.to_string()))
+    bcrypt::hash(code.to_ascii_uppercase(), 10).map_err(|e| MfaError::Bcrypt(e.to_string()))
 }
 
 /// Verify a presented code against its stored bcrypt hash. Returns
 /// `false` for any failure path so the caller can map cleanly to a
 /// single 401.
+///
+/// Case-insensitive (issue #14): a user retyping a code from paper in
+/// lowercase presents the same code — rejecting it (and feeding the
+/// shared MFA lockout counter) over letter case was a UX trap. Stored
+/// hashes are over the uppercase form, so uppercasing the presented
+/// code keeps every previously-minted hash verifying.
 pub fn verify_recovery_code(code: &str, hash: &str) -> bool {
-    bcrypt::verify(code, hash).unwrap_or(false)
+    bcrypt::verify(code.to_ascii_uppercase(), hash).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -458,14 +469,19 @@ mod tests {
     }
 
     #[test]
-    fn recovery_code_verification_is_case_sensitive() {
-        // Codes are minted uppercase; bcrypt compares exact bytes, so a
-        // lowercase transcription is rejected. Pins current behavior —
-        // making redemption case-insensitive would require normalizing
-        // before hashing AND before verifying.
+    fn recovery_code_verification_is_case_insensitive() {
+        // Issue #14 (deliberate behavior change): codes are minted
+        // uppercase from a case-free base32 alphabet (A-Z2-7), so a
+        // lowercase transcription is the same code, not a different
+        // one — a user retyping from paper must not be rejected (and
+        // fed into the shared MFA lockout counter) over letter case.
+        // Both sides normalize, so pre-existing uppercase-minted
+        // hashes keep verifying.
         let hash = hash_recovery_code("ABCDE-FGHIJ").unwrap();
         assert!(verify_recovery_code("ABCDE-FGHIJ", &hash));
-        assert!(!verify_recovery_code("abcde-fghij", &hash));
+        assert!(verify_recovery_code("abcde-fghij", &hash));
+        assert!(verify_recovery_code("AbCdE-fGhIj", &hash));
+        assert!(!verify_recovery_code("VWXYZ-VWXYZ", &hash));
     }
 
     #[test]
