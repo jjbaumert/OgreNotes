@@ -123,6 +123,8 @@ pub fn default_keymap() -> Keymap {
         .bind("Mod-Alt-3", Box::new(|s, d| commands::set_heading(3, s, d)))
         // Block commands
         .bind("Mod-Alt-0", Box::new(|s, d| commands::set_paragraph(s, d)))
+        // design/rich-text-editor.md's promised code-block shortcut
+        .bind("Mod-Alt-c", Box::new(|s, d| commands::set_code_block(s, d)))
         .bind("Mod-Shift-l", Box::new(|s, d| commands::toggle_list(NodeType::BulletList, NodeType::ListItem, s, d)))
         // Text commands
         .bind("Mod-a", Box::new(commands::select_all))
