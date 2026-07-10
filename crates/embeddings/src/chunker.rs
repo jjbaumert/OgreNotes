@@ -71,6 +71,11 @@ pub fn chunk_document(title: &str, body: &str, config: &ChunkerConfig) -> Vec<Ch
 
             for word_chunk in split_at_words(para, content_budget) {
                 let mut text = overlap_text.clone();
+                // Word-boundary seam (issue #19): never weld the
+                // overlap's last word onto the next segment's first.
+                if !text.is_empty() {
+                    text.push(' ');
+                }
                 text.push_str(&word_chunk);
                 overlap_text = tail_overlap(&text, config.overlap);
                 chunks.push(Chunk {
@@ -92,11 +97,23 @@ pub fn chunk_document(title: &str, body: &str, config: &ChunkerConfig) -> Vec<Ch
                 index: chunks.len(),
                 text: format!("{header}{current}"),
             });
-            // Start new chunk with overlap + current paragraph
-            current = format!("{overlap_text}{para}");
+            // Start new chunk with overlap + current paragraph, joined
+            // at a word boundary (issue #19).
+            current = if overlap_text.is_empty() {
+                para.to_string()
+            } else {
+                format!("{overlap_text} {para}")
+            };
         } else {
             if !current.is_empty() {
                 current.push_str("\n\n");
+            } else if !overlap_text.is_empty() {
+                // First paragraph after an oversized-paragraph flush:
+                // carry the computed overlap forward instead of
+                // dropping it at exactly those boundaries (issue #19).
+                current.push_str(&overlap_text);
+                current.push(' ');
+                overlap_text.clear();
             }
             current.push_str(para);
         }
@@ -354,6 +371,69 @@ mod tests {
         assert!(c1.contains("foxtrot"));
     }
 
+    /// Issue #19 (1/3): the overlap tail and the next paragraph must
+    /// join at a word boundary — the seam used to concatenate them
+    /// directly, welding "...echo" + "foxtrot..." into "echofoxtrot"
+    /// and degrading embeddings at every chunk seam.
+    #[test]
+    fn overlap_seam_joins_at_a_word_boundary() {
+        let body = "alpha bravo charlie delta echo\n\nfoxtrot golf hotel india juliet";
+        let config = ChunkerConfig {
+            chunk_size: 45,
+            overlap: 12,
+        };
+        let chunks = chunk_document("T", body, &config);
+        assert_eq!(chunks.len(), 2);
+        let c1 = chunks[1].text.strip_prefix("Title: T\n\n").expect("header");
+        assert!(c1.contains("echo foxtrot"), "welded seam: {c1:?}");
+    }
+
+    /// Issue #19 (2/3): same word-boundary rule on the oversized-
+    /// paragraph word-split path — every whitespace-separated token in
+    /// every chunk must be a real body/header token, never a weld of
+    /// two source words.
+    #[test]
+    fn word_split_seam_never_welds_words() {
+        let body = "one two three four five six seven eight nine ten \
+                    eleven twelve thirteen fourteen fifteen";
+        let config = ChunkerConfig {
+            chunk_size: 40,
+            overlap: 10,
+        };
+        let chunks = chunk_document("T", body, &config);
+        assert!(chunks.len() > 1);
+        let vocab: std::collections::HashSet<&str> =
+            body.split_whitespace().chain(["Title:", "T"]).collect();
+        for chunk in &chunks {
+            for token in chunk.text.split_whitespace() {
+                assert!(vocab.contains(token), "welded token {token:?} in {:?}", chunk.text);
+            }
+        }
+    }
+
+    /// Issue #19 (3/3): the overlap computed after an oversized-
+    /// paragraph flush must carry into the next chunk instead of
+    /// silently disappearing at exactly those boundaries.
+    #[test]
+    fn overlap_survives_an_oversized_paragraph_flush() {
+        let config = ChunkerConfig {
+            chunk_size: 48,
+            overlap: 12,
+        };
+        // First paragraph exceeds the content budget (word-split path);
+        // the following ordinary paragraph must open with overlap
+        // context from the tail of the previous chunk.
+        let body = "aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp\n\nzz yy xx";
+        let chunks = chunk_document("T", body, &config);
+        assert!(chunks.len() >= 2);
+        let last = chunks.last().unwrap().text.strip_prefix("Title: T\n\n").unwrap();
+        assert!(
+            !last.starts_with("zz"),
+            "overlap dropped after oversized-paragraph flush: {last:?}"
+        );
+        assert!(last.ends_with("zz yy xx"), "last: {last:?}");
+    }
+
     #[test]
     fn split_at_words_keeps_overlong_word_whole() {
         // A single word longer than max_len cannot be split at a word
@@ -496,14 +576,15 @@ mod prop_tests {
             for (i, chunk) in chunks.iter().enumerate() {
                 prop_assert_eq!(chunk.index, i);
                 prop_assert!(chunk.text.starts_with("Title: T\n\n"));
-                // header + content budget + overlap is the hard ceiling
-                // when no single word exceeds the budget.
+                // header + content budget + overlap + the one-byte
+                // word-boundary seam separator (issue #19) is the hard
+                // ceiling when no single word exceeds the budget.
                 prop_assert!(
-                    chunk.text.len() <= chunk_size + overlap,
+                    chunk.text.len() <= chunk_size + overlap + 1,
                     "chunk {} is {} bytes; ceiling {}",
                     i,
                     chunk.text.len(),
-                    chunk_size + overlap
+                    chunk_size + overlap + 1
                 );
             }
             // No word from the body is ever lost.
