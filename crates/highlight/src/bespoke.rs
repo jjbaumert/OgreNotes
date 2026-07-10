@@ -17,9 +17,9 @@ pub(crate) fn html(src: &str) -> Vec<Token<'_>> {
     while i < src.len() {
         let rest = &src[i..];
 
-        if rest.starts_with("<!--") {
+        if let Some(after_open) = rest.strip_prefix("<!--") {
             flush(&mut out, src, &mut plain_start, i);
-            let end = rest[4..].find("-->").map(|p| i + 4 + p + 3).unwrap_or(src.len());
+            let end = after_open.find("-->").map(|p| i + 4 + p + 3).unwrap_or(src.len());
             out.push(Token { text: &src[i..end], kind: TokenKind::Comment });
             i = end;
             continue;
@@ -179,7 +179,7 @@ fn lex_yaml_line<'a>(src: &'a str, start: usize, end: usize, out: &mut Vec<Token
                 && src[word_end + 1..end]
                     .chars()
                     .next()
-                    .map_or(true, |n| n == ' ' || n == '\t');
+                    .is_none_or(|n| n == ' ' || n == '\t');
             let kind = if key_possible && colon_next {
                 TokenKind::Keyword
             } else if matches!(word, "true" | "false" | "null" | "yes" | "no") {

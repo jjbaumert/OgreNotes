@@ -73,9 +73,9 @@ pub(crate) fn tokenize<'a>(src: &'a str, spec: &LexerSpec) -> Vec<Token<'a>> {
 
         // Block comment
         if let Some((open, close)) = spec.block_comment {
-            if rest.starts_with(open) {
+            if let Some(after_open) = rest.strip_prefix(open) {
                 flush_plain(&mut out, src, &mut plain_start, i);
-                let end = rest[open.len()..]
+                let end = after_open
                     .find(close)
                     .map(|p| i + open.len() + p + close.len())
                     .unwrap_or(src.len());
