@@ -49,25 +49,31 @@ impl TokenKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Theme {
+    Light,
+    Dark,
+}
+
 /// Single source of truth for token colors. The CSS custom
 /// properties in `frontend/style/main.css` mirror these values;
 /// HTML export inlines them directly.
-pub fn color_for(kind: TokenKind, dark: bool) -> Option<&'static str> {
-    Some(match (kind, dark) {
-        (TokenKind::Keyword, false) => "#cf222e",
-        (TokenKind::Keyword, true) => "#ff7b72",
-        (TokenKind::Type, false) => "#953800",
-        (TokenKind::Type, true) => "#ffa657",
-        (TokenKind::String, false) => "#0a3069",
-        (TokenKind::String, true) => "#a5d6ff",
-        (TokenKind::Comment, false) => "#6e7781",
-        (TokenKind::Comment, true) => "#8b949e",
-        (TokenKind::Number, false) => "#0550ae",
-        (TokenKind::Number, true) => "#79c0ff",
-        (TokenKind::Function, false) => "#8250df",
-        (TokenKind::Function, true) => "#d2a8ff",
-        (TokenKind::Meta, false) => "#116329",
-        (TokenKind::Meta, true) => "#7ee787",
+pub fn color_for(kind: TokenKind, theme: Theme) -> Option<&'static str> {
+    Some(match (kind, theme) {
+        (TokenKind::Keyword, Theme::Light) => "#cf222e",
+        (TokenKind::Keyword, Theme::Dark) => "#ff7b72",
+        (TokenKind::Type, Theme::Light) => "#953800",
+        (TokenKind::Type, Theme::Dark) => "#ffa657",
+        (TokenKind::String, Theme::Light) => "#0a3069",
+        (TokenKind::String, Theme::Dark) => "#a5d6ff",
+        (TokenKind::Comment, Theme::Light) => "#6e7781",
+        (TokenKind::Comment, Theme::Dark) => "#8b949e",
+        (TokenKind::Number, Theme::Light) => "#0550ae",
+        (TokenKind::Number, Theme::Dark) => "#79c0ff",
+        (TokenKind::Function, Theme::Light) => "#8250df",
+        (TokenKind::Function, Theme::Dark) => "#d2a8ff",
+        (TokenKind::Meta, Theme::Light) => "#116329",
+        (TokenKind::Meta, Theme::Dark) => "#7ee787",
         (TokenKind::Plain, _) => return None,
     })
 }
@@ -254,10 +260,10 @@ mod tests {
                      TokenKind::Comment, TokenKind::Number, TokenKind::Function,
                      TokenKind::Meta] {
             assert!(kind.css_class().is_some());
-            assert!(color_for(kind, false).is_some());
-            assert!(color_for(kind, true).is_some());
+            assert!(color_for(kind, Theme::Light).is_some());
+            assert!(color_for(kind, Theme::Dark).is_some());
         }
         assert_eq!(TokenKind::Plain.css_class(), None);
-        assert_eq!(color_for(TokenKind::Plain, false), None);
+        assert_eq!(color_for(TokenKind::Plain, Theme::Light), None);
     }
 }

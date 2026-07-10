@@ -1174,7 +1174,7 @@ fn render_code_block_highlighted<T: ReadTxn>(
         out.push_str(&html_escape(&text));
     } else {
         for token in ogrenotes_highlight::highlight(&text, lang) {
-            match ogrenotes_highlight::color_for(token.kind, false) {
+            match ogrenotes_highlight::color_for(token.kind, ogrenotes_highlight::Theme::Light) {
                 None => out.push_str(&html_escape(token.text)),
                 Some(color) => out.push_str(&format!(
                     "<span style=\"color:{}\">{}</span>",
@@ -2142,6 +2142,16 @@ mod tests {
         assert!(html.contains("<pre>"), "got: {html}");
         assert!(!html.contains("class="), "no language class without attr: {html}");
         assert!(html.contains("plain code"), "got: {html}");
+    }
+
+    #[test]
+    fn html_code_block_known_language_empty_content_uses_new_shape() {
+        let doc = doc_with(|txn, frag| {
+            let cb = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()));
+            cb.insert_attribute(txn, "language", "rust");
+        });
+        let html = to_html(&doc);
+        assert!(html.contains("<pre><code class=\"language-rust\"></code></pre>"), "got: {html}");
     }
 
     #[test]
