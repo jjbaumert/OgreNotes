@@ -431,7 +431,9 @@ async fn challenge(
 struct RecoveryRequest {
     handle: String,
     /// One of the ten codes minted at enroll-time, in `xxxxx-xxxxx`
-    /// format. Case is preserved as written.
+    /// format. Verified case-insensitively (issue #14) — the base32
+    /// alphabet (A-Z2-7) carries no case entropy, so a lowercase
+    /// retype is the same code. See `mfa::verify_recovery_code`.
     code: String,
 }
 
