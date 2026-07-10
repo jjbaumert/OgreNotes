@@ -31,6 +31,19 @@ pub(crate) enum Head { None, Arrow, Cross, Async }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FragmentKind { Loop, Alt, Opt, Par, Critical, Break }
 
+impl FragmentKind {
+    pub(crate) fn keyword(self) -> &'static str {
+        match self {
+            FragmentKind::Loop => "loop",
+            FragmentKind::Alt => "alt",
+            FragmentKind::Opt => "opt",
+            FragmentKind::Par => "par",
+            FragmentKind::Critical => "critical",
+            FragmentKind::Break => "break",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum NotePlacement {
     LeftOf(usize),

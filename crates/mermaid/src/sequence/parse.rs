@@ -4,8 +4,8 @@
 //! is bounded before layout.
 
 use crate::sequence::{
-    Event, Head, LineStyle, Participant, SeqDiagram,
-    MAX_EVENTS, MAX_PARTICIPANTS,
+    Event, FragmentKind, Head, LineStyle, NotePlacement, Participant, SeqDiagram,
+    MAX_EVENTS, MAX_FRAGMENT_DEPTH, MAX_PARTICIPANTS,
 };
 use crate::ParseError;
 use std::collections::HashMap;
@@ -14,6 +14,7 @@ struct Parser {
     g: SeqDiagram,
     ids: HashMap<String, usize>,
     active_depth: Vec<usize>,
+    frags: Vec<(FragmentKind, usize)>,
     line: usize,
 }
 
@@ -22,6 +23,7 @@ pub(crate) fn parse(source: &str) -> Result<SeqDiagram, ParseError> {
         g: SeqDiagram { participants: vec![], events: vec![] },
         ids: HashMap::new(),
         active_depth: vec![],
+        frags: vec![],
         line: 0,
     };
     let mut seen_header = false;
@@ -45,6 +47,12 @@ pub(crate) fn parse(source: &str) -> Result<SeqDiagram, ParseError> {
         return Err(ParseError {
             message: "sequence diagram must start with `sequenceDiagram`".into(),
             line: Some(1),
+        });
+    }
+    if let Some((kind, opening_line)) = p.frags.first() {
+        return Err(ParseError {
+            message: format!("unclosed `{}` fragment", kind.keyword()),
+            line: Some(*opening_line),
         });
     }
     Ok(p.g)
@@ -106,14 +114,150 @@ impl Parser {
         match first {
             "participant" | "actor" => return self.parse_participant(stmt, first == "actor"),
             "autonumber" => return self.push_event(Event::Autonumber),
-            // Task 4 adds: activate/deactivate, Note, fragments, end,
-            // out-of-scope keywords. Until then:
+            "activate" | "deactivate" => return self.parse_activation(stmt, first == "activate"),
+            "loop" | "alt" | "opt" | "par" | "critical" | "break" => {
+                return self.parse_fragment_open(stmt, first)
+            }
+            "else" | "and" => return self.parse_divider(stmt, first),
+            "end" if stmt == "end" => return self.parse_fragment_close(),
+            "box" | "create" | "destroy" | "rect" | "links" | "link" | "properties" => {
+                return Err(self.err(format!("`{first}` statements are not supported")));
+            }
+            _ if first.eq_ignore_ascii_case("note") => return self.parse_note(stmt),
             _ => {}
         }
         if self.try_parse_message(stmt)? {
             return Ok(());
         }
         Err(self.err(format!("unsupported statement: {first:?}")))
+    }
+
+    /// `activate ID` / `deactivate ID` — shares `active_depth` with the
+    /// `+`/`-` message shorthand.
+    fn parse_activation(&mut self, stmt: &str, activate: bool) -> Result<(), ParseError> {
+        let rest = stmt
+            .split_once(char::is_whitespace)
+            .map(|(_, r)| r.trim())
+            .unwrap_or("");
+        if rest.is_empty() {
+            return Err(self.err(format!(
+                "{} needs a participant id",
+                if activate { "activate" } else { "deactivate" }
+            )));
+        }
+        let id = self.intern(rest, None, false, false)?;
+        if activate {
+            self.active_depth[id] += 1;
+            self.push_event(Event::Activate { p: id })
+        } else {
+            if self.active_depth[id] == 0 {
+                let pid = self.g.participants[id].id.clone();
+                return Err(self.err(format!("cannot deactivate {pid:?}: not active")));
+            }
+            self.active_depth[id] -= 1;
+            self.push_event(Event::Deactivate { p: id })
+        }
+    }
+
+    /// `loop|alt|opt|par|critical|break [label]` — opens a fragment.
+    fn parse_fragment_open(&mut self, stmt: &str, keyword: &str) -> Result<(), ParseError> {
+        if self.frags.len() >= MAX_FRAGMENT_DEPTH {
+            return Err(self.err(format!(
+                "diagram too large: fragment nesting deeper than {MAX_FRAGMENT_DEPTH}"
+            )));
+        }
+        let kind = match keyword {
+            "loop" => FragmentKind::Loop,
+            "alt" => FragmentKind::Alt,
+            "opt" => FragmentKind::Opt,
+            "par" => FragmentKind::Par,
+            "critical" => FragmentKind::Critical,
+            "break" => FragmentKind::Break,
+            _ => unreachable!("caller only dispatches fragment keywords"),
+        };
+        let label = stmt
+            .split_once(char::is_whitespace)
+            .map(|(_, r)| r.trim().to_string())
+            .unwrap_or_default();
+        self.frags.push((kind, self.line));
+        self.push_event(Event::FragmentOpen { kind, label })
+    }
+
+    /// `else` (valid inside `alt`) / `and` (valid inside `par`).
+    fn parse_divider(&mut self, stmt: &str, keyword: &str) -> Result<(), ParseError> {
+        let want = if keyword == "else" { FragmentKind::Alt } else { FragmentKind::Par };
+        let top = self.frags.last().map(|(k, _)| *k);
+        if top != Some(want) {
+            return Err(self.err(format!(
+                "`{keyword}` outside an `{}` fragment",
+                want.keyword()
+            )));
+        }
+        let label = stmt
+            .split_once(char::is_whitespace)
+            .map(|(_, r)| r.trim().to_string())
+            .unwrap_or_default();
+        self.push_event(Event::FragmentDivider { label })
+    }
+
+    /// `end` — closes the innermost open fragment.
+    fn parse_fragment_close(&mut self) -> Result<(), ParseError> {
+        if self.frags.pop().is_none() {
+            return Err(self.err("found `end` outside a fragment"));
+        }
+        self.push_event(Event::FragmentClose)
+    }
+
+    /// `Note left of|right of|over A[,B]: text` — keyword and placement
+    /// words are case-insensitive; text is required.
+    fn parse_note(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt
+            .split_once(char::is_whitespace)
+            .map(|(_, r)| r.trim_start())
+            .unwrap_or("");
+
+        const PLACEMENTS: &[&str] = &["left of", "right of", "over"];
+        let mut matched: Option<&str> = None;
+        for &lit in PLACEMENTS {
+            let n = lit.len();
+            if rest.len() >= n && rest.is_char_boundary(n) && rest[..n].eq_ignore_ascii_case(lit) {
+                matched = Some(lit);
+                break;
+            }
+        }
+        let Some(placement_kw) = matched else {
+            return Err(self.err("note needs a placement (`left of`, `right of`, or `over`)"));
+        };
+        let after_placement = rest[placement_kw.len()..].trim_start();
+        let (ids_part, text) = match after_placement.split_once(':') {
+            Some((ids, t)) => (ids.trim(), t.trim().to_string()),
+            None => return Err(self.err("note needs `: text`")),
+        };
+        if ids_part.is_empty() {
+            return Err(self.err("note needs at least one participant id"));
+        }
+
+        let placement = if placement_kw == "over" {
+            let mut parts = ids_part.split(',').map(str::trim);
+            let a = parts.next().unwrap_or("");
+            if a.is_empty() {
+                return Err(self.err("note needs at least one participant id"));
+            }
+            let a_idx = self.intern(a, None, false, false)?;
+            let b_idx = match parts.next() {
+                Some(b) if !b.is_empty() => Some(self.intern(b, None, false, false)?),
+                _ => None,
+            };
+            NotePlacement::Over(a_idx, b_idx)
+        } else {
+            let idx = self.intern(ids_part, None, false, false)?;
+            if placement_kw == "left of" {
+                NotePlacement::LeftOf(idx)
+            } else {
+                NotePlacement::RightOf(idx)
+            }
+        };
+        self.push_event(Event::Note { placement, text })
     }
 
     fn parse_participant(&mut self, stmt: &str, is_actor: bool) -> Result<(), ParseError> {
@@ -381,5 +525,104 @@ mod tests {
         // Multi-byte whitespace and emoji in display/text must not panic.
         let _ = parse("sequenceDiagram\nparticipant A as Émile 🎭\nA->>B: héllo 🎉");
         let _ = parse("sequenceDiagram\nA\u{2003}->>B: x");
+    }
+
+    #[test]
+    fn activate_deactivate_statements() {
+        let g = p("sequenceDiagram\nA->>B: go\nactivate B\nB-->>A: ok\ndeactivate B");
+        assert!(matches!(g.events[1], Event::Activate { p: 1 }));
+        assert!(matches!(g.events[3], Event::Deactivate { p: 1 }));
+    }
+
+    #[test]
+    fn deactivate_statement_without_active_errors() {
+        let e = parse("sequenceDiagram\nparticipant A\ndeactivate A").unwrap_err();
+        assert_eq!(e.line, Some(3));
+        assert!(e.message.contains("not active"));
+    }
+
+    #[test]
+    fn note_placements() {
+        use crate::sequence::NotePlacement;
+        let g = p("sequenceDiagram\nA->>B: x\nNote left of A: la\nnote right of B: rb\nNote over A: oa\nNote over A,B: ab");
+        assert!(matches!(&g.events[1], Event::Note { placement: NotePlacement::LeftOf(0), .. }));
+        assert!(matches!(&g.events[2], Event::Note { placement: NotePlacement::RightOf(1), .. }));
+        assert!(matches!(&g.events[3], Event::Note { placement: NotePlacement::Over(0, None), .. }));
+        assert!(matches!(&g.events[4], Event::Note { placement: NotePlacement::Over(0, Some(1)), .. }));
+    }
+
+    #[test]
+    fn note_without_text_errors() {
+        let e = parse("sequenceDiagram\nA->>B: x\nNote over A").unwrap_err();
+        assert_eq!(e.line, Some(3));
+    }
+
+    #[test]
+    fn note_implicitly_creates_participant() {
+        let g = p("sequenceDiagram\nNote over Ghost: boo");
+        assert_eq!(g.participants[0].id, "Ghost");
+    }
+
+    #[test]
+    fn fragments_all_kinds_and_nesting() {
+        use crate::sequence::FragmentKind;
+        let g = p("sequenceDiagram\nloop every day\nA->>B: hi\nalt ok\nB-->>A: yes\nelse bad\nB--xA: no\nend\nend");
+        assert!(matches!(&g.events[0], Event::FragmentOpen { kind: FragmentKind::Loop, .. }));
+        assert!(matches!(&g.events[2], Event::FragmentOpen { kind: FragmentKind::Alt, .. }));
+        assert!(matches!(&g.events[4], Event::FragmentDivider { .. }));
+        assert!(matches!(&g.events[6], Event::FragmentClose));
+        assert!(matches!(&g.events[7], Event::FragmentClose));
+        for kw in ["opt", "par", "critical", "break"] {
+            assert!(parse(&format!("sequenceDiagram\n{kw} l\nA->>B: x\nend")).is_ok(), "{kw}");
+        }
+    }
+
+    #[test]
+    fn par_uses_and_divider() {
+        assert!(parse("sequenceDiagram\npar one\nA->>B: x\nand two\nA->>C: y\nend").is_ok());
+        let e = parse("sequenceDiagram\npar one\nA->>B: x\nelse two\nend").unwrap_err();
+        assert!(e.message.contains("else"));
+    }
+
+    #[test]
+    fn else_outside_alt_errors() {
+        let e = parse("sequenceDiagram\nloop l\nelse x\nend").unwrap_err();
+        assert_eq!(e.line, Some(3));
+    }
+
+    #[test]
+    fn end_without_fragment_errors() {
+        let e = parse("sequenceDiagram\nend").unwrap_err();
+        assert_eq!(e.line, Some(2));
+    }
+
+    #[test]
+    fn unclosed_fragment_errors_at_opening_line() {
+        let e = parse("sequenceDiagram\nA->>B: x\nloop forever\nB-->>A: y").unwrap_err();
+        assert_eq!(e.line, Some(3));
+        assert!(e.message.contains("unclosed"));
+        assert!(e.message.contains("loop"));
+    }
+
+    #[test]
+    fn fragment_depth_cap() {
+        let mut src = String::from("sequenceDiagram\n");
+        for _ in 0..=crate::sequence::MAX_FRAGMENT_DEPTH {
+            src.push_str("loop l\n");
+        }
+        let e = parse(&src).unwrap_err();
+        assert!(e.message.contains("too large"));
+    }
+
+    #[test]
+    fn out_of_scope_statements_error_named() {
+        for stmt in ["box Purple", "create participant X", "destroy A",
+                     "rect rgb(0,0,0)", "links A: {}", "link A: x", "properties A: {}"] {
+            let src = format!("sequenceDiagram\nA->>B: x\n{stmt}");
+            let e = parse(&src).unwrap_err();
+            assert_eq!(e.line, Some(3), "for {stmt}");
+            let kw = stmt.split_whitespace().next().unwrap();
+            assert!(e.message.contains(kw), "message names {kw}: {}", e.message);
+        }
     }
 }
