@@ -1804,10 +1804,12 @@ fn renders_code_block() {
     let (view, _txns) = create_editor(container.clone(), code_block_doc("fn main()", "rust"));
 
     let html = inner_html(&view);
-    // Not `<pre>` literally: the CodeBlock render path also stamps
-    // `data-block-id` on the `<pre>` (same commit as the token-span
-    // change), so match the open tag without requiring it to be
-    // attribute-free.
+    // Match `<pre` without the closing bracket: CodeBlock is in
+    // needs_block_id(), so the rendered element carries data-block-id —
+    // long-standing block-identity stamping (since the initial release),
+    // NOT part of the 2026-07-09 highlighting change. Several sibling
+    // tests asserting bare tags (e.g. renders_heading) still fail on this
+    // and are tracked as a pre-existing suite gap.
     assert!(html.contains("<pre"), "Expected <pre>, got: {html}");
     assert!(html.contains("<code"), "Expected <code>, got: {html}");
     assert!(html.contains("language-rust"), "Expected language class, got: {html}");
