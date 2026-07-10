@@ -13,6 +13,7 @@ pub(crate) mod measure;
 pub(crate) mod flowchart;
 pub(crate) mod sequence;
 pub(crate) mod boxgraph;
+pub(crate) mod state;
 
 /// Max diagram source length (chars). Shared cap: the single source of
 /// truth for both the `crates/collab` write-gate validator
