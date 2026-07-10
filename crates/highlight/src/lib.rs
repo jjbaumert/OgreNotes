@@ -1,5 +1,7 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
+#![forbid(unsafe_code)]
+
 //! Pure-Rust syntax tokenizer shared by the WASM frontend (editor
 //! rendering) and the server (HTML export) — same shared-crate shape
 //! as `ogrenotes-mermaid`. std-only, no dependencies, wasm-clean.

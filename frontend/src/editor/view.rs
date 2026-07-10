@@ -2329,4 +2329,67 @@ mod embed_render_tests {
         assert_eq!(read_atom_size(el), Some(1));
         assert_eq!(dom_node_model_size(&rendered), 1);
     }
+
+    /// Spec acceptance guard (syntax-highlighted code blocks, 2026-07-09):
+    /// the `<span class="tok-*">` wrappers the highlighter inserts must be
+    /// as transparent to the caret-mapping walkers as any other mark tag —
+    /// a model position that lands *inside* a token's rendered text (not
+    /// just at a token boundary) must round-trip through
+    /// `find_dom_position` → `dom_position_to_model` back to the exact
+    /// same position.
+    #[wasm_bindgen_test]
+    fn code_block_token_spans_are_position_transparent() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container_el = document.create_element("div").unwrap();
+        document.body().unwrap().append_child(&container_el).unwrap();
+        let container: HtmlElement = container_el.dyn_into().unwrap();
+
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("language".to_string(), "rust".to_string());
+        let source = "fn main() {}\nlet x = 1;";
+        let code_block = Node::element_with_attrs(
+            NodeType::CodeBlock,
+            attrs,
+            Fragment::from(vec![Node::text(source)]),
+        );
+        let doc_content = Fragment::from(vec![code_block]);
+
+        // Mirrors how the real editor populates its container: render the
+        // Doc's top-level content directly into the container element,
+        // without a wrapper node for the (unmodeled) Doc boundary itself.
+        render_children(&document, container.as_ref(), &doc_content);
+
+        // Sanity: highlighting actually ran — the render path produced
+        // `tok-*` spans, not a plain unhighlighted text node.
+        let pre = container.first_element_child().expect("pre renders");
+        let code = pre.first_element_child().expect("code renders");
+        assert!(
+            code.inner_html().contains("tok-"),
+            "expected tok-* token spans, got: {}",
+            code.inner_html()
+        );
+
+        // Model position of the 'a' in "main" — a position INSIDE a token
+        // span's text, not at a span boundary. Position accounting: +1 for
+        // the CodeBlock's own open boundary (model position 0 is "before
+        // the CodeBlock" at the Doc root), then the flat char offset into
+        // the block's text — the `code`/`span` wrappers around it are mark
+        // tags (`is_mark_tag`) and contribute no boundary positions of
+        // their own.
+        let main_idx = source.find("main").expect("fixture contains 'main'");
+        let a_offset_in_main = 1; // "main" → m(0) a(1) i(2) n(3)
+        let target_pos = 1 + main_idx + a_offset_in_main;
+
+        let (dom_node, dom_offset) =
+            find_dom_position(&container, target_pos).expect("position resolves in DOM");
+        let round_tripped = dom_position_to_model(&container, &dom_node, dom_offset)
+            .expect("DOM position maps back to a model position");
+
+        assert_eq!(
+            round_tripped, target_pos,
+            "position inside a token span must round-trip unchanged"
+        );
+
+        container.remove();
+    }
 }

@@ -123,9 +123,22 @@ fn refresh_code_lang_chip(
     };
     let pre_rect = pre.get_bounding_client_rect();
     let wrap_rect = wrapper.get_bounding_client_rect();
+    // `pre_rect`/`wrap_rect` are viewport-space (getBoundingClientRect), but
+    // the chip is absolutely positioned in `wrapper`'s (`.editor-container`)
+    // content space, which scrolls independently of the viewport. Add back
+    // the wrapper's scroll offset so the chip tracks the code block instead
+    // of drifting as the document scrolls.
+    let top = pre_rect.top() - wrap_rect.top() + wrapper.scroll_top() as f64 + 4.0;
+    // `right` doesn't need the symmetric `scroll_left()` compensation:
+    // `.editor-content` is capped at `max-width` and never exceeds
+    // `.editor-container`'s own width, and `.editor-content pre` has its
+    // own `overflow-x: auto` that absorbs long code lines internally — so
+    // `.editor-container` itself never accumulates horizontal scroll from
+    // a code block and `scroll_left()` is always 0 on this path.
+    let right = wrap_rect.right() - pre_rect.right() + 4.0;
     chip.set(Some(CodeLangChipState {
-        top: pre_rect.top() - wrap_rect.top() + 4.0,
-        right: wrap_rect.right() - pre_rect.right() + 4.0,
+        top,
+        right,
         current,
     }));
 }
