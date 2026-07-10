@@ -77,6 +77,19 @@ RUN case "${TARGETARCH}" in \
     | tar -xz -C /usr/local/bin && \
     rustup target add wasm32-unknown-unknown
 
+# The frontend path-depends on sibling workspace crates
+# (`ogrenotes-mermaid = ../crates/mermaid`, `ogrenotes-highlight =
+# ../crates/highlight` in frontend/Cargo.toml). Those crates inherit
+# keys from the backend workspace root (`license.workspace = true`,
+# `proptest = { workspace = true }`), so cargo needs the root
+# manifests AND every workspace member present to parse them —
+# copying just the two crates fails with "failed to find a workspace
+# root". Cache tradeoff: any backend crate change now invalidates
+# this stage's layer and re-runs the trunk build; acceptable, since
+# deploys rebuild the backend stage anyway.
+COPY Cargo.toml Cargo.lock /app/
+COPY crates/ /app/crates/
+
 WORKDIR /app/frontend
 
 COPY frontend/ .
