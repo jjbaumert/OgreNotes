@@ -77,6 +77,11 @@ pub fn create_access_token(
 /// Validate a JWT access token and return claims.
 pub fn validate_token(token: &str, secret: &str) -> Result<Claims, AuthError> {
     let mut validation = Validation::new(Algorithm::HS256);
+    // Exact expiry (issue #16): jsonwebtoken defaults to a 60s exp
+    // leeway meant for cross-service clock skew. This service mints and
+    // validates its own tokens (instances share AWS NTP), so the leeway
+    // only made ACCESS_TOKEN_TTL_SECS quietly inaccurate.
+    validation.leeway = 0;
     validation.set_required_spec_claims(&["sub", "exp", "iat", "iss", "aud"]);
     validation.set_issuer(&[EXPECTED_ISSUER]);
     validation.set_audience(&[EXPECTED_AUDIENCE]);
@@ -423,13 +428,13 @@ mod tests {
     }
 
     #[test]
-    fn expiry_leeway_is_60_seconds() {
-        // Characterization: validate_token leaves jsonwebtoken's default
-        // 60-second exp leeway in place, so a token expired <60s ago
-        // still validates, while one expired beyond the leeway maps to
-        // TokenExpired. If the leeway is ever tightened to zero the
-        // first assertion flips — that is a deliberate behavior change,
-        // not a refactor.
+    fn expired_tokens_are_rejected_without_leeway() {
+        // Issue #16 (deliberate behavior change): validate_token used to
+        // inherit jsonwebtoken's default 60-second exp leeway, so access
+        // tokens outlived the documented 15 minutes by up to a minute.
+        // This service both mints and validates its own tokens (inter-
+        // instance NTP skew on AWS is sub-millisecond), so the leeway
+        // bought nothing; expiry is now exact.
         let mint = |exp_offset: i64| {
             let now = jsonwebtoken::get_current_timestamp();
             let mut claims = valid_claims();
@@ -442,8 +447,13 @@ mod tests {
             .unwrap()
         };
 
-        // Expired 5s ago: inside the 60s leeway → currently accepted.
-        assert!(validate_token(&mint(-5), TEST_SECRET).is_ok());
+        // Expired 5s ago: rejected — no leeway window.
+        assert!(matches!(
+            validate_token(&mint(-5), TEST_SECRET),
+            Err(AuthError::TokenExpired)
+        ));
+        // Still-valid token: accepted.
+        assert!(validate_token(&mint(30), TEST_SECRET).is_ok());
         // Expired 120s ago: beyond the leeway → TokenExpired.
         assert!(matches!(
             validate_token(&mint(-120), TEST_SECRET),
