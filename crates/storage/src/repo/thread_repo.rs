@@ -88,8 +88,12 @@ impl ThreadRepo {
     }
 
     /// List all threads for a document.
-    /// Tries the GSI5-docid-updated GSI first; falls back to a scan if the GSI
-    /// doesn't exist (common in dev environments without full infra).
+    /// Tries the GSI5-docid-updated GSI first; falls back to a scan only when
+    /// the query fails with a classified missing-index/missing-table error
+    /// (common in dev environments without full infra — see
+    /// `is_missing_index_error`). Any other query failure (throttling, auth,
+    /// transient service error) propagates as `RepoError::Dynamo` instead of
+    /// silently degrading to a scan (issue #11).
     pub async fn list_threads_for_doc(&self, doc_id: &str) -> Result<Vec<Thread>, RepoError> {
         let items = match self.db.query_index(
             "GSI5-docid-updated",
@@ -799,6 +803,11 @@ fn is_missing_index_error(code: Option<&str>, message: Option<&str>) -> bool {
         // other ValidationExceptions (bad key condition, reserved word)
         // are code bugs and must propagate.
         Some("ValidationException") => {
+            // Query's smithy model has no dedicated ValidationException
+            // variant (unlike ResourceNotFoundException) — it always lands
+            // in Unhandled, so message-matching is the only mechanism the
+            // SDK exposes for distinguishing "missing index" from other
+            // validation failures.
             message.is_some_and(|m| m.contains("does not have the specified index"))
         }
         _ => false,
