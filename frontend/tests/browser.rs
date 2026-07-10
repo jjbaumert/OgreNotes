@@ -1797,16 +1797,35 @@ fn renders_task_list_checked() {
     cleanup(&container);
 }
 
+// Updated for syntax-highlighted code blocks (2026-07-09 spec): token spans split the literal text; assertions now target text content / individual tokens.
 #[wasm_bindgen_test]
 fn renders_code_block() {
     let container = create_container();
     let (view, _txns) = create_editor(container.clone(), code_block_doc("fn main()", "rust"));
 
     let html = inner_html(&view);
-    assert!(html.contains("<pre>"), "Expected <pre>, got: {html}");
+    // Not `<pre>` literally: the CodeBlock render path also stamps
+    // `data-block-id` on the `<pre>` (same commit as the token-span
+    // change), so match the open tag without requiring it to be
+    // attribute-free.
+    assert!(html.contains("<pre"), "Expected <pre>, got: {html}");
     assert!(html.contains("<code"), "Expected <code>, got: {html}");
     assert!(html.contains("language-rust"), "Expected language class, got: {html}");
-    assert!(html.contains("fn main()"), "Expected code content, got: {html}");
+    // The render path splits the literal text into `tok-*` token spans, so
+    // "fn main()" is no longer a contiguous substring of the HTML — pin the
+    // individual tokens instead.
+    assert!(html.contains("fn"), "Expected 'fn' token, got: {html}");
+    assert!(html.contains("main"), "Expected 'main' token, got: {html}");
+    // Positive assertion that highlighting actually happened, not just that
+    // the raw text tolerates being split.
+    assert!(html.contains("tok-keyword"), "Expected a tok-keyword span, got: {html}");
+    // text_content() flattens the token spans back into the exact source
+    // text, so it still pins the full literal string.
+    assert_eq!(
+        view.container().text_content().as_deref(),
+        Some("fn main()"),
+        "Expected code content preserved verbatim via text_content()"
+    );
 
     cleanup(&container);
 }
@@ -4123,6 +4142,7 @@ fn paste_pre_code_without_language_preserves_codeblock() {
 
 /// Real code blocks (rendered markdown — `<pre><code class="language-X">`)
 /// carry a language attribute and must be preserved as-is, not re-parsed.
+// Updated for syntax-highlighted code blocks (2026-07-09 spec): token spans split the literal text; assertions now target text content / individual tokens.
 #[wasm_bindgen_test]
 fn paste_real_code_block_preserves_codeblock() {
     let container = create_container();
@@ -4138,8 +4158,13 @@ fn paste_real_code_block_preserves_codeblock() {
     let dom = inner_html(&view);
     assert!(dom.contains("<pre"),
         "expected <pre> for a real language-tagged code block, got: {}", dom);
-    assert!(dom.contains("fn main"),
-        "expected code text preserved, got: {}", dom);
+    // The render path splits the literal code text into `tok-*` token
+    // spans, so "fn main" is no longer a contiguous substring of the HTML.
+    // text_content() flattens the spans back to the exact source text, so
+    // it still pins that the code text was preserved verbatim.
+    let text = view.container().text_content().unwrap_or_default();
+    assert!(text.contains("fn main"),
+        "expected code text preserved, got text_content: {}", text);
 
     cleanup(&container);
 }
