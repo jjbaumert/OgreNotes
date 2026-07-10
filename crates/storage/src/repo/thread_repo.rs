@@ -101,7 +101,21 @@ impl ThreadRepo {
             None,
         ).await {
             Ok(items) => items,
-            Err(_) => {
+            Err(err) => {
+                use aws_sdk_dynamodb::error::ProvideErrorMetadata;
+                // Only a genuinely absent index/table may degrade to the
+                // scan; any other query failure — throttling, auth,
+                // transient service error — must surface to the caller
+                // instead of silently masquerading as "GSI missing" and
+                // triggering a table scan in production (issue #11).
+                if !is_missing_index_error(err.code(), err.message()) {
+                    return Err(RepoError::Dynamo(err.to_string()));
+                }
+                tracing::warn!(
+                    doc_id,
+                    error = %err,
+                    "GSI5-docid-updated unavailable; using dev scan fallback"
+                );
                 // GSI doesn't exist — fall back to scan with filter.
                 // This is slower but works without the GSI. Dev path
                 // only; production has the GSI and never reaches
@@ -766,6 +780,31 @@ fn read_receipt_from_item(
     })
 }
 
+/// True when a Query error means the target index (or its table) doesn't
+/// exist — the one condition `list_threads_for_doc`'s dev scan fallback
+/// is for (issue #11). DynamoDB reports a missing GSI on an existing
+/// table as `ValidationException` with a message naming the index, and a
+/// missing table as `ResourceNotFoundException`. Anything else —
+/// throttling, auth, transient service errors — is a real failure that
+/// must surface to the caller, not silently degrade into a table scan.
+fn is_missing_index_error(code: Option<&str>, message: Option<&str>) -> bool {
+    match code {
+        // Missing table entirely (bare dev environment). If the table is
+        // truly gone the fallback scan fails too, so this can't mask a
+        // real outage — it just keeps the two absent-infra cases on the
+        // same path.
+        Some("ResourceNotFoundException") => true,
+        // Missing GSI on an existing table. DynamoDB (and DDB Local)
+        // phrase it "The table does not have the specified index: ..." —
+        // other ValidationExceptions (bad key condition, reserved word)
+        // are code bugs and must propagate.
+        Some("ValidationException") => {
+            message.is_some_and(|m| m.contains("does not have the specified index"))
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1047,5 +1086,40 @@ mod tests {
         assert_eq!(back.thread_id, "t1");
         assert_eq!(back.user_id, "u1");
         assert_eq!(back.last_read_at, 1_700_000_000_000_000);
+    }
+
+    /// Issue #11: only genuinely-missing-index errors may trigger the
+    /// scan fallback; throttling/auth/transient errors must propagate.
+    #[test]
+    fn missing_index_classifier_accepts_only_absent_index_conditions() {
+        // Missing GSI on an existing table (real DynamoDB and DDB Local
+        // both phrase it this way).
+        assert!(is_missing_index_error(
+            Some("ValidationException"),
+            Some("The table does not have the specified index: GSI5-docid-updated"),
+        ));
+        // Missing table entirely (bare dev environment).
+        assert!(is_missing_index_error(
+            Some("ResourceNotFoundException"),
+            Some("Requested resource not found"),
+        ));
+
+        // Real failures must NOT fall back to a scan.
+        assert!(!is_missing_index_error(
+            Some("ProvisionedThroughputExceededException"),
+            Some("The level of configured provisioned throughput for the table was exceeded"),
+        ));
+        assert!(!is_missing_index_error(
+            Some("AccessDeniedException"),
+            Some("User is not authorized to perform: dynamodb:Query"),
+        ));
+        // A ValidationException about something other than a missing
+        // index (e.g. a bad key condition) is a code bug, not a
+        // missing-infra condition.
+        assert!(!is_missing_index_error(
+            Some("ValidationException"),
+            Some("Invalid KeyConditionExpression: Attribute name is a reserved keyword"),
+        ));
+        assert!(!is_missing_index_error(None, None));
     }
 }
