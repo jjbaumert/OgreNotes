@@ -408,6 +408,41 @@ impl Transaction {
         let before_content = block.content.cut(0, inner_pos);
         let after_content = block.content.cut(inner_pos, block.content.size());
 
+        // Enter inside a code block extends it with a literal newline
+        // (design/rich-text-editor.md's `newlineInCode`) instead of
+        // splitting — a code block holds text lines, not sibling
+        // blocks. Exception: Enter on a trailing empty line (the text
+        // ends with '\n' and the caret sits at the very end) exits to
+        // a paragraph below — the same double-Enter escape the
+        // blockquote and empty-list-item branches below implement.
+        if block.node_type == NodeType::CodeBlock {
+            let at_end = inner_pos == block.content.size();
+            let text: String = block
+                .content
+                .children
+                .iter()
+                .map(|c| c.text_content())
+                .collect();
+            if at_end && text.ends_with('\n') {
+                // Remove the trailing newline…
+                let mut result = txn.delete(pos - 1, pos)?;
+                // …and insert an empty paragraph after the code block
+                // (one char shorter now, hence the -1 on its end).
+                let block_end = block.offset + block.node_size - 1;
+                let para = Node::element(NodeType::Paragraph);
+                let slice = Slice::new(Fragment::from(vec![para]), 0, 0);
+                result = result.replace(block_end, block_end, slice)?;
+                result.selection = Selection::cursor(block_end + 1);
+                result.stored_marks = None;
+                return Ok(result);
+            }
+            let nl = Slice::new(Fragment::from(vec![Node::text("\n")]), 0, 0);
+            let mut result = txn.replace(pos, pos, nl)?;
+            result.selection = Selection::cursor(pos + 1);
+            result.stored_marks = None;
+            return Ok(result);
+        }
+
         // Check if we're inside a list item — if so, handle empty items specially
         if let Some(item) = find_item_at(&txn.doc, pos) {
             // Check if the current list item is empty (paragraph with no text)
@@ -1908,6 +1943,105 @@ mod tests {
         assert_eq!(new_state.doc.child_count(), 2);
         assert_eq!(new_state.doc.child(0).unwrap().text_content(), "Hello world");
         assert_eq!(new_state.doc.child(1).unwrap().text_content(), "");
+    }
+
+    #[test]
+    fn split_block_in_code_block_inserts_newline() {
+        // Enter inside a code block extends it (newlineInCode), never
+        // splits it — the user stays in the block on the next line.
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("language".to_string(), "python".to_string());
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::CodeBlock,
+                attrs,
+                Fragment::from(vec![Node::text("class PythonClass:")]),
+            )]),
+        );
+        let state = EditorState {
+            selection: Selection::cursor(19), // end of the text (1 + 18)
+            ..EditorState::create_default(doc)
+        };
+        let txn = state.transaction().split_block().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 1, "block must not split");
+        let block = new_state.doc.child(0).unwrap();
+        assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+        assert_eq!(block.text_content(), "class PythonClass:\n");
+        assert_eq!(block.attrs().get("language").unwrap(), "python");
+        assert_eq!(new_state.selection.from(), 20, "caret after the newline");
+    }
+
+    #[test]
+    fn split_block_mid_code_block_inserts_newline_between_lines() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::CodeBlock,
+                Fragment::from(vec![Node::text("ab")]),
+            )]),
+        );
+        let state = EditorState {
+            selection: Selection::cursor(2), // between 'a' and 'b'
+            ..EditorState::create_default(doc)
+        };
+        let txn = state.transaction().split_block().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 1);
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "a\nb");
+        assert_eq!(new_state.selection.from(), 3);
+    }
+
+    #[test]
+    fn split_block_on_code_block_trailing_empty_line_exits() {
+        // Double-Enter escape: Enter on a trailing empty line removes
+        // that line and drops the caret into a paragraph below — same
+        // convention as the blockquote / empty-list-item exits.
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::CodeBlock,
+                Fragment::from(vec![Node::text("code\n")]),
+            )]),
+        );
+        let state = EditorState {
+            selection: Selection::cursor(6), // after the trailing '\n' (1 + 5)
+            ..EditorState::create_default(doc)
+        };
+        let txn = state.transaction().split_block().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 2);
+        let block = new_state.doc.child(0).unwrap();
+        assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+        assert_eq!(block.text_content(), "code", "trailing newline removed");
+        let para = new_state.doc.child(1).unwrap();
+        assert_eq!(para.node_type(), Some(NodeType::Paragraph));
+        assert_eq!(para.text_content(), "");
+        // caret inside the new paragraph: block(6 chars → hmm computed) —
+        // assert via containment instead of a magic number:
+        let caret = new_state.selection.from();
+        let block0_end = 1 + new_state.doc.child(0).unwrap().node_size();
+        assert!(caret > block0_end - 1, "caret must be past the code block");
+    }
+
+    #[test]
+    fn split_block_in_code_block_with_selection_replaces_with_newline() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::CodeBlock,
+                Fragment::from(vec![Node::text("aXXb")]),
+            )]),
+        );
+        let state = EditorState {
+            selection: Selection::text(2, 4), // the "XX"
+            ..EditorState::create_default(doc)
+        };
+        let txn = state.transaction().split_block().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 1);
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "a\nb");
     }
 
     #[test]
