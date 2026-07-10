@@ -5,7 +5,7 @@
 // TODO(slice3): removed in Task 7
 #![allow(dead_code)]
 
-// pub(crate) mod parse;   // Task 3
+pub(crate) mod parse;
 // pub(crate) mod layout;  // Task 5
 // pub(crate) mod svg;     // Task 6
 
