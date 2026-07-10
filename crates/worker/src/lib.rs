@@ -772,6 +772,21 @@ mod tests {
         assert_eq!(status, parsed);
     }
 
+    /// Cross-target schema agreement (#9): the frontend's import poll
+    /// loop (frontend/src/api/documents.rs::import_result_doc_id) reads
+    /// this exact key. The enum-level camelCase rename covers the
+    /// `state` tag only — variant fields stay snake_case on the wire.
+    /// If this ever fails, the frontend needs a matching change.
+    #[test]
+    fn succeeded_result_json_key_is_snake_case_on_the_wire() {
+        let status = JobStatus::Succeeded {
+            finished_at_ms: 1,
+            result_json: Some(r#"{"docId":"d1"}"#.to_string()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains(r#""result_json":"#), "wire shape: {json}");
+    }
+
     /// Owner derivation is the input to the #85 poll-time ownership
     /// gate: both import variants must yield their `owner_id`, and
     /// Noop must stay ownerless (bearer-capability polling).

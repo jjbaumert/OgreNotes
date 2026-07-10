@@ -286,8 +286,19 @@ impl SearchIndex {
         // only ever produce an empty page, and an offset+limit that
         // overflows usize has no sane finite answer either — both cases
         // answer with an empty page instead of collecting or panicking.
-        let Some(total_needed) = query.offset.checked_add(query.limit).filter(|&n| n > 0) else {
-            return Ok(vec![]);
+        // The overflow arm logs: no current caller can reach it, so if it
+        // ever fires it's a caller bug worth surfacing, not a real query.
+        let total_needed = match query.offset.checked_add(query.limit) {
+            Some(0) => return Ok(vec![]),
+            Some(n) => n,
+            None => {
+                tracing::warn!(
+                    offset = query.offset,
+                    limit = query.limit,
+                    "search: offset+limit overflowed usize; likely a caller bug, returning empty page"
+                );
+                return Ok(vec![]);
+            }
         };
         let top_docs = searcher.search(&combined, &TopDocs::with_limit(total_needed))?;
 

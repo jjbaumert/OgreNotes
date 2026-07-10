@@ -401,10 +401,12 @@ mod tests {
         assert!(tail.chars().all(|c| c == 'α'));
     }
 
-    /// Regression: issue #8 — multibyte documents long enough to span
-    /// chunks must chunk without panicking, end to end.
+    /// Regression: issue #8 — the oversized-single-word path must
+    /// survive a mid-char byte budget (whitespace-free multibyte input
+    /// yields one chunk, but the word-split branch still computes a
+    /// tail_overlap over pure multibyte text).
     #[test]
-    fn multibyte_multi_chunk_document_does_not_panic() {
+    fn multibyte_oversized_word_flush_does_not_panic() {
         let config = ChunkerConfig {
             chunk_size: 64,
             overlap: 13, // odd: guaranteed to bisect a 2-byte char
@@ -415,6 +417,25 @@ mod tests {
         let chunks = chunk_document("T", &body, &config);
 
         assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert!(chunk.text.starts_with("Title: T\n\n"));
+        }
+    }
+
+    /// Regression: issue #8 — a *paragraph-boundary* flush (the common
+    /// multi-chunk path, distinct from the oversized-single-word path
+    /// above) must also survive a mid-char byte budget on multibyte text.
+    #[test]
+    fn multibyte_paragraph_flush_spans_multiple_chunks_without_panicking() {
+        let config = ChunkerConfig {
+            chunk_size: 64,
+            overlap: 13, // odd: guaranteed to bisect a 2-byte char
+        };
+        let para = "α".repeat(20);
+        let body = vec![para; 6].join("\n\n");
+        let chunks = chunk_document("T", &body, &config);
+
+        assert!(chunks.len() > 1, "expected the body to span multiple chunks");
         for chunk in &chunks {
             assert!(chunk.text.starts_with("Title: T\n\n"));
         }
