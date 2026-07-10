@@ -7,7 +7,15 @@
 
 pub(crate) mod parse;
 pub(crate) mod layout;
-// pub(crate) mod svg;     // Task 6
+pub(crate) mod svg;
+
+/// Render mermaid sequence-diagram `source` to a self-contained `<svg>`
+/// string: parse → lifeline layout → SVG assembly.
+pub(crate) fn render_sequence(source: &str) -> Result<String, crate::ParseError> {
+    let d = parse::parse(source)?;
+    let l = layout::run(&d);
+    Ok(svg::emit(&d, &l))
+}
 
 /// Caps enforced during parse — sequence rendering runs server-side on
 /// untrusted document content; work is bounded before layout begins.
