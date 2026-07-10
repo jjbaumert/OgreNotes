@@ -68,10 +68,15 @@ pub fn build_authorization_url(
 }
 
 /// Verify that a received state matches the expected state.
+///
+/// An empty state never verifies (issue #13): a caller that maps
+/// "no stored state" to `""` on both sides must fail CSRF
+/// verification, not pass it — safe by construction rather than
+/// relying on every caller to reject absent state first.
 pub fn verify_state(received: &str, expected: &str) -> bool {
     // Constant-time comparison would be ideal but for state params
     // timing attacks are not practical. Simple equality suffices.
-    received == expected
+    !received.is_empty() && received == expected
 }
 
 /// Hash a refresh token for storage (never store plaintext).
@@ -266,10 +271,11 @@ mod tests {
         assert!(!verify_state("abcd", "abc"));
         assert!(!verify_state("", "expected"));
         assert!(!verify_state("received", ""));
-        // Characterization: two empty strings compare equal. Callers
-        // must therefore never map "state missing" to "" on both sides —
-        // the routes layer must reject an absent state before calling
-        // verify_state.
-        assert!(verify_state("", ""));
+        // Issue #13 (deliberate behavior change): an absent state must
+        // never verify. A caller that maps "no stored state" to "" on
+        // both sides used to pass CSRF verification; the function is now
+        // safe by construction instead of relying on every caller to
+        // reject absent state first.
+        assert!(!verify_state("", ""));
     }
 }
