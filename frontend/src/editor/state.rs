@@ -416,19 +416,35 @@ impl Transaction {
         // a paragraph below — the same double-Enter escape the
         // blockquote and empty-list-item branches below implement.
         if block.node_type == NodeType::CodeBlock {
-            let at_end = inner_pos == block.content.size();
             let text: String = block
                 .content
                 .children
                 .iter()
                 .map(|c| c.text_content())
                 .collect();
-            if at_end && text.ends_with('\n') {
-                // Remove the trailing newline…
-                let mut result = txn.delete(pos - 1, pos)?;
-                // …and insert an empty paragraph after the code block
-                // (one char shorter now, hence the -1 on its end).
-                let block_end = block.offset + block.node_size - 1;
+            let chars: Vec<char> = text.chars().collect();
+            let at_end = inner_pos == block.content.size();
+            let clamped = inner_pos.min(chars.len());
+            let line_start = chars[..clamped]
+                .iter()
+                .rposition(|&c| c == '\n')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+
+            // Double-Enter escape: Enter at the very end of a
+            // whitespace-only last line (auto-indent leaves spaces on
+            // the "empty" line) strips that line and exits to a
+            // paragraph below — same convention as the blockquote and
+            // empty-list-item branches.
+            if at_end
+                && line_start > 0
+                && chars[line_start..].iter().all(|&c| c == ' ' || c == '\t')
+            {
+                let del_from = block.content_start + line_start - 1; // the '\n'
+                let del_to = block.content_start + chars.len();
+                let removed = del_to - del_from;
+                let mut result = txn.delete(del_from, del_to)?;
+                let block_end = block.offset + block.node_size - removed;
                 let para = Node::element(NodeType::Paragraph);
                 let slice = Slice::new(Fragment::from(vec![para]), 0, 0);
                 result = result.replace(block_end, block_end, slice)?;
@@ -436,9 +452,35 @@ impl Transaction {
                 result.stored_marks = None;
                 return Ok(result);
             }
-            let nl = Slice::new(Fragment::from(vec![Node::text("\n")]), 0, 0);
+
+            // newlineInCode with editor-style auto-indent: keep the
+            // current line's leading whitespace, plus one language
+            // indent unit when the text before the caret ends with a
+            // block opener (':' for Python-style suites, '{' for brace
+            // languages).
+            let indent_unit = block
+                .attrs
+                .get("language")
+                .and_then(|l| ogrenotes_highlight::Language::from_tag(l))
+                .map(|l| l.indent_unit())
+                .unwrap_or(ogrenotes_highlight::DEFAULT_INDENT_UNIT);
+            let current_indent: String = chars[line_start..clamped]
+                .iter()
+                .take_while(|&&c| c == ' ' || c == '\t')
+                .collect();
+            let opener = chars[line_start..clamped]
+                .iter()
+                .rev()
+                .find(|c| !c.is_whitespace());
+            let mut insert = String::from("\n");
+            insert.push_str(&current_indent);
+            if matches!(opener, Some(':') | Some('{')) {
+                insert.push_str(indent_unit);
+            }
+            let insert_len = insert.chars().count();
+            let nl = Slice::new(Fragment::from(vec![Node::text(&insert)]), 0, 0);
             let mut result = txn.replace(pos, pos, nl)?;
-            result.selection = Selection::cursor(pos + 1);
+            result.selection = Selection::cursor(pos + insert_len);
             result.stored_marks = None;
             return Ok(result);
         }
@@ -1949,6 +1991,8 @@ mod tests {
     fn split_block_in_code_block_inserts_newline() {
         // Enter inside a code block extends it (newlineInCode), never
         // splits it — the user stays in the block on the next line.
+        // Updated for auto-indent (2026-07-10, user-requested): the
+        // ':' block opener adds one indent unit on the new line.
         let mut attrs = std::collections::HashMap::new();
         attrs.insert("language".to_string(), "python".to_string());
         let doc = Node::element_with_content(
@@ -1968,9 +2012,9 @@ mod tests {
         assert_eq!(new_state.doc.child_count(), 1, "block must not split");
         let block = new_state.doc.child(0).unwrap();
         assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
-        assert_eq!(block.text_content(), "class PythonClass:\n");
+        assert_eq!(block.text_content(), "class PythonClass:\n    ");
         assert_eq!(block.attrs().get("language").unwrap(), "python");
-        assert_eq!(new_state.selection.from(), 20, "caret after the newline");
+        assert_eq!(new_state.selection.from(), 24, "caret after the indent");
     }
 
     #[test]
@@ -1991,6 +2035,133 @@ mod tests {
         assert_eq!(new_state.doc.child_count(), 1);
         assert_eq!(new_state.doc.child(0).unwrap().text_content(), "a\nb");
         assert_eq!(new_state.selection.from(), 3);
+    }
+
+    fn python_code_block(text: &str) -> EditorState {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("language".to_string(), "python".to_string());
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::CodeBlock,
+                attrs,
+                Fragment::from(vec![Node::text(text)]),
+            )]),
+        );
+        let pos = 1 + crate::editor::model::char_len(text);
+        EditorState {
+            selection: Selection::cursor(pos),
+            ..EditorState::create_default(doc)
+        }
+    }
+
+    #[test]
+    fn split_block_after_colon_line_adds_one_indent_unit() {
+        // Python block opener: Enter after "class A:" auto-indents the
+        // new line by one unit (4 spaces for Python).
+        let state = python_code_block("class A:");
+        let txn = state.transaction().split_block().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 1);
+        assert_eq!(
+            new_state.doc.child(0).unwrap().text_content(),
+            "class A:\n    "
+        );
+        assert_eq!(new_state.selection.from(), 1 + 13, "caret after the indent");
+    }
+
+    #[test]
+    fn split_block_preserves_and_extends_nested_indent() {
+        // Enter after an indented ":"-line keeps the current indent and
+        // adds one more unit: 4 → 8.
+        let state = python_code_block("class A:\n    def set_x(self):");
+        let txn = state.transaction().split_block().unwrap();
+        let new_state = state.apply(txn);
+        let text = new_state.doc.child(0).unwrap().text_content();
+        assert!(
+            text.ends_with("\n        "),
+            "expected 8-space continuation, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn split_block_preserves_indent_without_block_opener() {
+        // A plain indented line continues at the same depth.
+        let state = python_code_block("    x = 1");
+        let txn = state.transaction().split_block().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(
+            new_state.doc.child(0).unwrap().text_content(),
+            "    x = 1\n    "
+        );
+    }
+
+    #[test]
+    fn split_block_after_open_brace_adds_indent_unit() {
+        // Brace languages: '{' is the block opener.
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("language".to_string(), "rust".to_string());
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::CodeBlock,
+                attrs,
+                Fragment::from(vec![Node::text("fn main() {")]),
+            )]),
+        );
+        let state = EditorState {
+            selection: Selection::cursor(12),
+            ..EditorState::create_default(doc)
+        };
+        let txn = state.transaction().split_block().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(
+            new_state.doc.child(0).unwrap().text_content(),
+            "fn main() {\n    "
+        );
+    }
+
+    #[test]
+    fn split_block_exits_on_whitespace_only_trailing_line() {
+        // Auto-indent leaves whitespace on the "empty" trailing line;
+        // the double-Enter escape must still work: Enter at the end of
+        // a whitespace-only last line strips it and exits below.
+        let state = python_code_block("class A:\n    ");
+        let txn = state.transaction().split_block().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 2);
+        let block = new_state.doc.child(0).unwrap();
+        assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+        assert_eq!(block.text_content(), "class A:", "whitespace line stripped");
+        assert_eq!(
+            new_state.doc.child(1).unwrap().node_type(),
+            Some(NodeType::Paragraph)
+        );
+    }
+
+    #[test]
+    fn typing_python_class_body_auto_indents_like_an_editor() {
+        // End-to-end typing sequence (user acceptance case):
+        //   ```python → class A: ⏎ def set_x(self): ⏎ self.x=3
+        // Enter never leaves the block; each ':' line indents one more
+        // unit; the result reads like an editor laid it out.
+        let mut state = python_code_block("");
+        for (i, keys) in ["class A:", "def set_x(self):", "self.x=3"]
+            .iter()
+            .enumerate()
+        {
+            if i > 0 {
+                let txn = state.transaction().split_block().unwrap();
+                state = state.apply(txn);
+            }
+            let txn = state.transaction().insert_text(keys).unwrap();
+            state = state.apply(txn);
+        }
+        assert_eq!(state.doc.child_count(), 1, "still one code block");
+        assert_eq!(
+            state.doc.child(0).unwrap().text_content(),
+            "class A:\n    def set_x(self):\n        self.x=3"
+        );
     }
 
     #[test]
