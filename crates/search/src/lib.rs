@@ -282,12 +282,13 @@ impl SearchIndex {
         }
 
         let combined = BooleanQuery::new(clauses);
-        let total_needed = query.offset + query.limit;
-        // TopDocs::with_limit asserts limit >= 1; a zero fetch budget can
-        // only ever produce an empty page, so answer it without collecting.
-        if total_needed == 0 {
+        // TopDocs::with_limit asserts limit >= 1. A zero fetch budget can
+        // only ever produce an empty page, and an offset+limit that
+        // overflows usize has no sane finite answer either — both cases
+        // answer with an empty page instead of collecting or panicking.
+        let Some(total_needed) = query.offset.checked_add(query.limit).filter(|&n| n > 0) else {
             return Ok(vec![]);
-        }
+        };
         let top_docs = searcher.search(&combined, &TopDocs::with_limit(total_needed))?;
 
         let mut hits = Vec::with_capacity(query.limit);
@@ -1221,6 +1222,22 @@ mod tests {
 
         let mut query = q("hello");
         query.limit = 0;
+        assert!(idx.search(&query).unwrap().is_empty());
+    }
+
+    /// Companion to the zero-limit guard: an `offset + limit` that would
+    /// overflow `usize` has no finite answer either — it must yield an
+    /// empty page, not a debug-build overflow panic or a release-build
+    /// wrapped (undersized) fetch window.
+    #[test]
+    fn test_offset_limit_overflow_returns_empty() {
+        let idx = SearchIndex::open_in_memory().unwrap();
+        idx.index_document(&sample_doc("d1", "Hello World", "some body"))
+            .unwrap();
+
+        let mut query = q("hello");
+        query.offset = usize::MAX;
+        query.limit = 10;
         assert!(idx.search(&query).unwrap().is_empty());
     }
 }
