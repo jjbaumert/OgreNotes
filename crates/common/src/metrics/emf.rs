@@ -60,10 +60,23 @@ pub fn emit_once(recorder: &Recorder, deploy_env: &str) {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    // Group metrics by (label keys) so each EMF doc has a consistent dimension set.
-    // Metrics without labels share a bucket; metrics with labels {doc_type} share
-    // one bucket; etc. CloudWatch needs dimension keys to be consistent per doc.
-    let mut buckets: std::collections::BTreeMap<Vec<&'static str>, Vec<EmfMetric>> =
+    for doc in collect_emf_docs(recorder, deploy_env, ts_ms) {
+        // Print as a single JSON line — CloudWatch Logs ingests line-by-line.
+        println!("{doc}");
+    }
+}
+
+/// Build the flush's EMF documents without emitting them. Separated from
+/// `emit_once` so the document set is observable by tests.
+fn collect_emf_docs(recorder: &Recorder, deploy_env: &str, ts_ms: u64) -> Vec<String> {
+    // Group metrics by their full label set — keys AND values — so each EMF
+    // doc carries exactly one dimension-value combination, per the EMF spec.
+    // Keys alone aren't enough: req{route="/a"} and req{route="/b"} share
+    // dimension keys, but a single doc has one top-level `route` and one
+    // `req` field, so whichever series lands last would silently overwrite
+    // the other and drop its data point for the flush interval (issue #10).
+    type BucketKey = (Vec<&'static str>, Vec<(String, String)>);
+    let mut buckets: std::collections::BTreeMap<BucketKey, Vec<EmfMetric>> =
         std::collections::BTreeMap::new();
 
     // Hold the LAST_FLUSH lock only for the counter-delta pass; the gauge and
@@ -81,11 +94,13 @@ pub fn emit_once(recorder: &Recorder, deploy_env: &str) {
                 continue;
             }
             let dim_keys: Vec<&'static str> = key.labels.iter().map(|(k, _)| *k).collect();
-            buckets.entry(dim_keys.clone()).or_default().push(EmfMetric {
+            let label_values: Vec<(String, String)> =
+                key.labels.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect();
+            buckets.entry((dim_keys, label_values.clone())).or_default().push(EmfMetric {
                 name: key.name.to_string(),
                 unit: "Count",
                 values: vec![delta as f64],
-                label_values: key.labels.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect(),
+                label_values,
                 stats: None,
             });
         }
@@ -93,11 +108,13 @@ pub fn emit_once(recorder: &Recorder, deploy_env: &str) {
 
     for (key, value) in recorder.raw_gauges() {
         let dim_keys: Vec<&'static str> = key.labels.iter().map(|(k, _)| *k).collect();
-        buckets.entry(dim_keys.clone()).or_default().push(EmfMetric {
+        let label_values: Vec<(String, String)> =
+            key.labels.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect();
+        buckets.entry((dim_keys, label_values.clone())).or_default().push(EmfMetric {
             name: key.name.to_string(),
             unit: "None",
             values: vec![value as f64],
-            label_values: key.labels.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect(),
+            label_values,
             stats: None,
         });
     }
@@ -110,11 +127,13 @@ pub fn emit_once(recorder: &Recorder, deploy_env: &str) {
         } else {
             "None"
         };
-        buckets.entry(dim_keys.clone()).or_default().push(EmfMetric {
+        let label_values: Vec<(String, String)> =
+            key.labels.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect();
+        buckets.entry((dim_keys, label_values.clone())).or_default().push(EmfMetric {
             name: key.name.to_string(),
             unit,
             values: vec![],
-            label_values: key.labels.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect(),
+            label_values,
             stats: Some(StatSet {
                 count: summary.count,
                 sum: summary.sum,
@@ -124,13 +143,13 @@ pub fn emit_once(recorder: &Recorder, deploy_env: &str) {
         });
     }
 
-    for (dim_keys, metrics) in buckets {
+    let mut docs = Vec::new();
+    for ((dim_keys, _label_values), metrics) in buckets {
         for chunk in metrics.chunks(MAX_METRICS_PER_DOC) {
-            let doc = build_emf_doc(ts_ms, deploy_env, &dim_keys, chunk);
-            // Print as a single JSON line — CloudWatch Logs ingests line-by-line.
-            println!("{}", doc);
+            docs.push(build_emf_doc(ts_ms, deploy_env, &dim_keys, chunk));
         }
     }
+    docs
 }
 
 struct EmfMetric {
@@ -347,6 +366,39 @@ mod tests {
             .expect("Dimensions array");
         assert_eq!(dims.len(), 1);
         assert_eq!(dims[0], json!(["Environment"]));
+    }
+
+    /// Regression: issue #10 — the same metric name with different label
+    /// values must yield one EMF document per dimension-value combination.
+    /// Bucketing by label *keys* alone merged them into one document whose
+    /// single top-level field silently dropped all but the last series.
+    #[test]
+    fn same_metric_different_label_values_get_separate_docs() {
+        let r = Recorder::default();
+        // Unique name: the counter-delta store is process-global.
+        r.counter_add(
+            MetricKey::new("req_emf_split_test_total", &[("route", "/a")]),
+            5,
+        );
+        r.counter_add(
+            MetricKey::new("req_emf_split_test_total", &[("route", "/b")]),
+            3,
+        );
+
+        let docs: Vec<Value> = collect_emf_docs(&r, "test", 1)
+            .iter()
+            .map(|d| serde_json::from_str(d).unwrap())
+            .collect();
+
+        // Both data points must survive the flush, each in a document whose
+        // dimension value matches its own series.
+        let find = |route: &str| {
+            docs.iter().find(|v| v["route"] == route).unwrap_or_else(|| {
+                panic!("no document for route={route}; docs: {docs:?}")
+            })
+        };
+        assert_eq!(find("/a")["req_emf_split_test_total"], 5.0);
+        assert_eq!(find("/b")["req_emf_split_test_total"], 3.0);
     }
 
     #[test]
