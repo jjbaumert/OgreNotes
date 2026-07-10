@@ -63,6 +63,18 @@ impl Parser {
         ParseError { message: msg.into(), line: Some(self.line) }
     }
 
+    /// Same id charset `parse_participant` enforces on explicit
+    /// declarations: ASCII alphanumeric or `_`, non-empty. Ids reaching
+    /// `intern` from comma/whitespace splits (notes, activate/deactivate)
+    /// were previously ungated, so e.g. `Note over A B: t` silently
+    /// interned the id `"A B"` instead of erroring.
+    fn validate_id(&self, id: &str) -> Result<(), ParseError> {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(self.err(format!("invalid participant id {id:?}")));
+        }
+        Ok(())
+    }
+
     fn push_event(&mut self, e: Event) -> Result<(), ParseError> {
         if self.g.events.len() >= MAX_EVENTS {
             return Err(self.err(format!(
@@ -113,7 +125,14 @@ impl Parser {
         let first = stmt.split_whitespace().next().unwrap_or("");
         match first {
             "participant" | "actor" => return self.parse_participant(stmt, first == "actor"),
-            "autonumber" => return self.push_event(Event::Autonumber),
+            "autonumber" if stmt == "autonumber" => return self.push_event(Event::Autonumber),
+            "autonumber" => {
+                // Real mermaid supports `autonumber off` / `autonumber 10
+                // 10` (start/step) forms; silently treating either as a
+                // bare `autonumber` would restart numbering with the
+                // wrong semantics, so refuse rather than misparse.
+                return Err(self.err("autonumber arguments are not supported"))
+            }
             "activate" | "deactivate" => return self.parse_activation(stmt, first == "activate"),
             "loop" | "alt" | "opt" | "par" | "critical" | "break" => {
                 return self.parse_fragment_open(stmt, first)
@@ -145,6 +164,7 @@ impl Parser {
                 if activate { "activate" } else { "deactivate" }
             )));
         }
+        self.validate_id(rest)?;
         let id = self.intern(rest, None, false, false)?;
         if activate {
             self.active_depth[id] += 1;
@@ -220,7 +240,19 @@ impl Parser {
         let mut matched: Option<&str> = None;
         for &lit in PLACEMENTS {
             let n = lit.len();
-            if rest.len() >= n && rest.is_char_boundary(n) && rest[..n].eq_ignore_ascii_case(lit) {
+            // `is_char_boundary(n)` (checked before any byte/str slicing
+            // at `n`) guarantees `rest[n..]` is a valid slice start, so
+            // reading the next char there is safe even though `rest` may
+            // contain multibyte UTF-8 past this ASCII literal. Requiring
+            // whitespace (or end-of-string) right after the literal is
+            // what turns `Note overheadA: t` / `Note left ofArthur: t`
+            // into a placement-not-found error instead of a misparse of
+            // "over"+"headA" / "left of"+"Arthur".
+            if rest.len() >= n
+                && rest.is_char_boundary(n)
+                && rest[..n].eq_ignore_ascii_case(lit)
+                && (rest.len() == n || rest[n..].starts_with(char::is_whitespace))
+            {
                 matched = Some(lit);
                 break;
             }
@@ -243,13 +275,18 @@ impl Parser {
             if a.is_empty() {
                 return Err(self.err("note needs at least one participant id"));
             }
+            self.validate_id(a)?;
             let a_idx = self.intern(a, None, false, false)?;
             let b_idx = match parts.next() {
-                Some(b) if !b.is_empty() => Some(self.intern(b, None, false, false)?),
+                Some(b) if !b.is_empty() => {
+                    self.validate_id(b)?;
+                    Some(self.intern(b, None, false, false)?)
+                }
                 _ => None,
             };
             NotePlacement::Over(a_idx, b_idx)
         } else {
+            self.validate_id(ids_part)?;
             let idx = self.intern(ids_part, None, false, false)?;
             if placement_kw == "left of" {
                 NotePlacement::LeftOf(idx)
@@ -272,9 +309,7 @@ impl Parser {
             Some((id, d)) => (id.trim(), Some(d.trim().to_string())),
             None => (rest, None),
         };
-        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return Err(self.err(format!("invalid participant id {id:?}")));
-        }
+        self.validate_id(id)?;
         if matches!(&display, Some(d) if d.is_empty()) {
             return Err(self.err("participant alias must not be empty"));
         }
@@ -475,6 +510,21 @@ mod tests {
     }
 
     #[test]
+    fn autonumber_with_arguments_errors() {
+        // Real mermaid supports `autonumber off` / `autonumber 10 10`
+        // (start/step) forms. Matching only the first token would
+        // silently treat either as a bare `autonumber`, restarting
+        // numbering with the wrong semantics — must error instead.
+        let e = parse("sequenceDiagram\nA->>B: x\nautonumber off").unwrap_err();
+        assert_eq!(e.line, Some(3));
+        assert!(e.message.contains("autonumber"), "got: {}", e.message);
+
+        let e = parse("sequenceDiagram\nautonumber 10 10\nA->>B: x").unwrap_err();
+        assert_eq!(e.line, Some(2));
+        assert!(e.message.contains("autonumber"), "got: {}", e.message);
+    }
+
+    #[test]
     fn comments_and_blanks_skipped() {
         let g = p("sequenceDiagram\n%% c\n\nA->>B: hi");
         assert_eq!(g.events.len(), 1);
@@ -561,6 +611,39 @@ mod tests {
     fn note_implicitly_creates_participant() {
         let g = p("sequenceDiagram\nNote over Ghost: boo");
         assert_eq!(g.participants[0].id, "Ghost");
+    }
+
+    #[test]
+    fn note_placement_keyword_requires_word_boundary() {
+        // "over" and "left of" must not misparse as a prefix of a longer
+        // word: "overheadA" is not "over" + id "headA", and "ofArthur"
+        // is not "of" + id "Arthur". Both must fail to find a placement
+        // and error, never silently misparse.
+        let e = parse("sequenceDiagram\nNote overheadA: t").unwrap_err();
+        assert_eq!(e.line, Some(2));
+        assert!(e.message.contains("placement"), "got: {}", e.message);
+
+        let e = parse("sequenceDiagram\nNote left ofArthur: t").unwrap_err();
+        assert_eq!(e.line, Some(2));
+        assert!(e.message.contains("placement"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn note_over_multi_word_id_errors() {
+        // Ids from the comma/whitespace split were previously interned
+        // unvalidated, so "Note over A B: t" silently interned the id
+        // "A B" instead of rejecting it against the id charset
+        // `parse_participant` enforces.
+        let e = parse("sequenceDiagram\nNote over A B: t").unwrap_err();
+        assert_eq!(e.line, Some(2));
+        assert!(e.message.contains("invalid participant id"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn activate_multi_word_id_errors() {
+        let e = parse("sequenceDiagram\nactivate A B").unwrap_err();
+        assert_eq!(e.line, Some(2));
+        assert!(e.message.contains("invalid participant id"), "got: {}", e.message);
     }
 
     #[test]

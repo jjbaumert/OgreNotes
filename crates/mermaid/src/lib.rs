@@ -79,6 +79,14 @@ pub fn detect_kind(source: &str) -> DiagramKind {
         return DiagramKind::Unknown;
     };
     let keyword = header.split_whitespace().next().unwrap_or("");
+    // Strip ONE trailing `;` before matching: `sequenceDiagram;` (and,
+    // ahead of slice 4, `classDiagram;` etc.) is valid mermaid and the
+    // per-kind parsers already tolerate the trailing `;` on the header
+    // line — but only if `detect_kind` routes them there in the first
+    // place. `graph`/`flowchart` are unaffected: their keyword is the
+    // first *token*, and the `;` (if any) lands on a later token like
+    // `graph TD;`.
+    let keyword = keyword.strip_suffix(';').unwrap_or(keyword);
     match keyword {
         "pie" => DiagramKind::Pie,
         "graph" | "flowchart" => DiagramKind::Flowchart,
@@ -289,6 +297,23 @@ mod tests {
                 out
             );
         }
+    }
+
+    #[test]
+    fn header_trailing_semicolon_still_detects_kind() {
+        // Regression: the first-token match used to compare the WHOLE
+        // token, so "sequenceDiagram;" fell through to Unknown and
+        // sequence::parse (which tolerates the trailing `;`, see its own
+        // `header_required` test) was never reached via render().
+        assert_eq!(detect_kind("sequenceDiagram;"), DiagramKind::Sequence);
+    }
+
+    #[test]
+    fn header_trailing_semicolon_renders_via_public_render() {
+        let out = render("sequenceDiagram;\nA->>B: x");
+        assert_eq!(out.kind, DiagramKind::Sequence);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
+        assert!(out.svg.is_some());
     }
 
     #[test]

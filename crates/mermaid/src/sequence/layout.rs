@@ -25,6 +25,13 @@ pub(crate) const FRAME_BOTTOM_PAD: f64 = 10.0;
 pub(crate) const DIVIDER_H: f64 = 22.0;
 pub(crate) const ACT_W: f64 = 10.0;
 pub(crate) const ACT_OFFSET: f64 = 6.0;
+/// Floor for a fragment frame's width. Deeply-nested frames with no (or
+/// narrow) participants can otherwise compute a non-positive width
+/// (`canvas_w - PAD - 2*inset`), which would violate the
+/// `f.rect.w > 0.0` invariant `sequence/props.rs` asserts on every
+/// successful layout. Keeping a small positive floor keeps frames
+/// visible instead of collapsing to a sliver.
+pub(crate) const FRAME_MIN_W: f64 = 8.0;
 
 pub(crate) struct MsgLayout {
     pub event: usize,
@@ -310,7 +317,7 @@ fn pass2_rows(
                     let rect = crate::layout::Rect {
                         x: PAD / 2.0 + inset,
                         y: top,
-                        w: (canvas_w - PAD - 2.0 * inset).max(0.0),
+                        w: (canvas_w - PAD - 2.0 * inset).max(FRAME_MIN_W),
                         h: cursor + 6.0 - top,
                     };
                     cursor += FRAME_BOTTOM_PAD;
@@ -478,6 +485,21 @@ mod tests {
         let plain = lay("sequenceDiagram\nA->>B: x");
         let actor = lay("sequenceDiagram\nactor A\nA->>B: x");
         assert!(actor.head_h > plain.head_h);
+    }
+
+    #[test]
+    fn frame_width_floored_when_no_participants() {
+        // No participants + deep fragment nesting drives
+        // `canvas_w - PAD - 2*inset` non-positive; the width must be
+        // floored at `FRAME_MIN_W` so frames stay visible AND the
+        // `f.rect.w > 0.0` property in `sequence/props.rs` holds.
+        let l = lay("sequenceDiagram\nloop a\nloop b\nloop c\nend\nend\nend");
+        assert_eq!(l.frames.len(), 3);
+        for f in &l.frames {
+            assert!(f.rect.w >= FRAME_MIN_W, "frame width {} below floor", f.rect.w);
+            assert!(f.rect.w.is_finite() && f.rect.h.is_finite());
+        }
+        assert!(l.size.0.is_finite() && l.size.1.is_finite());
     }
 
     #[test]
