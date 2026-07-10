@@ -2,12 +2,11 @@
 //! Bespoke layout (participant columns + event rows) — the layered
 //! graph engine in `crate::layout` is deliberately not involved.
 
-// TODO(slice3): removed in Task 7
-#![allow(dead_code)]
-
 pub(crate) mod parse;
 pub(crate) mod layout;
 pub(crate) mod svg;
+#[cfg(test)]
+mod props;
 
 /// Render mermaid sequence-diagram `source` to a self-contained `<svg>`
 /// string: parse → lifeline layout → SVG assembly.

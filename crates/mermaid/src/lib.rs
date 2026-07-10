@@ -3,8 +3,8 @@
 //! Pure-Rust Mermaid → SVG renderer. `render()` never panics; every
 //! failure or not-yet-supported diagram kind returns a structured error
 //! and no SVG, so callers can fall back to raw source. Supports pie
-//! charts and flowcharts (graph/flowchart); other diagram kinds are
-//! detected but not yet rendered. See
+//! charts, flowcharts (graph/flowchart), and sequence diagrams; other
+//! diagram kinds are detected but not yet rendered. See
 //! docs/superpowers/specs/2026-07-08-mermaid-support-design.md.
 
 mod pie;
@@ -119,6 +119,10 @@ pub fn render(source: &str) -> RenderOutput {
             Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
             Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
         },
+        DiagramKind::Sequence => match sequence::render_sequence(source) {
+            Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
         DiagramKind::Unknown => RenderOutput {
             kind,
             svg: None,
@@ -162,8 +166,12 @@ mod tests {
 
     #[test]
     fn unsupported_kind_returns_error_with_kind_preserved() {
-        let out = render("sequenceDiagram\nAlice->>Bob: hi");
-        assert_eq!(out.kind, DiagramKind::Sequence);
+        // Was sequenceDiagram through slices 1-2; Task 7 makes sequence
+        // diagrams render, so the fixture moves to a kind that's still
+        // unsupported (state/class/er) — same treatment slice 2 gave
+        // "flowchart LR" leaving `each_unsupported_kind_error_names_its_label`.
+        let out = render("classDiagram\nclassA <|-- classB");
+        assert_eq!(out.kind, DiagramKind::Class);
         assert!(out.svg.is_none());
         let err = out.error.expect("unsupported kind must carry an error");
         assert!(err.message.to_lowercase().contains("not yet supported"), "got: {}", err.message);
@@ -261,6 +269,16 @@ mod tests {
             "graph TD\nA --> A --> A",
             "graph TD\nA[🥧<br/>🥧] -->|🥧| B",
             &format!("graph TD\n{}", "A --> B\n".repeat(3000)), // over MAX_SOURCE_LEN
+            "sequenceDiagram",
+            "sequenceDiagram\nA->>",
+            "sequenceDiagram\n->>B: x",
+            "sequenceDiagram\nend\nend",
+            &format!("sequenceDiagram\n{}", "loop l\n".repeat(50)),
+            &format!("sequenceDiagram\n{}", "A->>B: x\n".repeat(2000)),
+            &format!("sequenceDiagram\n{}", (0..60).map(|i| format!("participant p{i}\n")).collect::<String>()),
+            "sequenceDiagram\nautonumber\nA->>A: 🎭<br/>🎭\nNote left of A: 🎉",
+            "sequenceDiagram\nactivate A",
+            "sequenceDiagram\nA-->>-B: under",
         ];
         for inp in inputs {
             let out = render(inp); // must return, not panic
@@ -287,6 +305,29 @@ mod tests {
     fn comment_or_blank_only_source_is_unknown() {
         assert_eq!(detect_kind(""), DiagramKind::Unknown);
         assert_eq!(detect_kind("%% just a comment\n\n  %% another"), DiagramKind::Unknown);
+    }
+
+    #[test]
+    fn sequence_renders_svg_via_public_render() {
+        let out = render("sequenceDiagram\nAlice->>+Bob: Hello\nBob-->>-Alice: Hi");
+        assert_eq!(out.kind, DiagramKind::Sequence);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
+        assert!(out.svg.expect("sequence should render").starts_with("<svg"));
+    }
+
+    #[test]
+    fn sequence_parse_error_flows_through_render() {
+        let out = render("sequenceDiagram\nloop forever\nA->>B: x");
+        assert_eq!(out.kind, DiagramKind::Sequence);
+        assert!(out.svg.is_none());
+        assert_eq!(out.error.expect("error").line, Some(2));
+    }
+
+    #[test]
+    fn sequence_with_fragments_and_notes_renders() {
+        let src = "sequenceDiagram\nautonumber\nactor U as User\nU->>+S: request\nalt cached\nS-->>U: fast\nelse miss\nS->>D: query\nNote over S,D: slow path\nD-->>S: rows\nend\nS-->>-U: response";
+        let out = render(src);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
     }
 
     #[test]

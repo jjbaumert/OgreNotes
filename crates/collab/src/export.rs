@@ -2493,10 +2493,14 @@ mod tests {
 
     #[test]
     fn mermaid_html_falls_back_to_raw_source_on_error() {
-        let html = to_html_of_single_mermaid("sequenceDiagram\nAlice->>Bob: hi");
+        // Was sequenceDiagram; mermaid slice 3 (Task 7) made sequence
+        // diagrams render, so this now needs a still-unsupported kind to
+        // exercise the error fallback path — same swap made in
+        // ogrenotes-mermaid's lib.rs tests for the same reason.
+        let html = to_html_of_single_mermaid("classDiagram\nclassA <|-- classB");
         assert!(html.contains("mermaid-error"));
         // raw source preserved and escaped
-        assert!(html.contains("Alice-&gt;&gt;Bob") || html.contains("Alice->>Bob"));
+        assert!(html.contains("classA &lt;|-- classB") || html.contains("classA <|-- classB"));
         assert!(!html.contains("<svg"));
     }
 

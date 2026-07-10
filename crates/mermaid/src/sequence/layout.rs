@@ -57,6 +57,12 @@ pub(crate) struct SeqLayout {
     pub col_x: Vec<f64>,
     pub box_w: Vec<f64>,
     pub head_h: f64,
+    /// Not read by the render pipeline (svg.rs derives its own vertical
+    /// anchors from `head_h`/messages/frames); kept because
+    /// `rows_monotonic_and_finite` asserts on it to verify the row
+    /// cursor starts below the header strip. Same precedent as
+    /// `flowchart::FlowNode.id` — see task-14-report.md.
+    #[allow(dead_code)]
     pub body_top: f64,
     pub body_bottom: f64,
     pub messages: Vec<MsgLayout>,
