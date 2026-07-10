@@ -81,9 +81,11 @@ impl Language {
 /// Total function: never panics; worst case one Plain token.
 pub fn highlight(source: &str, lang: Language) -> Vec<Token<'_>>;
 
+pub enum Theme { Light, Dark }
+
 /// Single source of truth for token colors, shared by client CSS
 /// and export inline styles.
-pub fn color_for(kind: TokenKind, dark: bool) -> &'static str; // "#rrggbb"
+pub fn color_for(kind: TokenKind, theme: Theme) -> Option<&'static str>; // None for Plain — no sentinel value
 ```
 
 ### Lexers
