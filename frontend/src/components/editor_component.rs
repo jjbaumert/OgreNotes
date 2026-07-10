@@ -103,44 +103,48 @@ fn refresh_code_lang_chip(
     wrapper: &web_sys::Element,
     chip: RwSignal<Option<CodeLangChipState>>,
 ) {
-    let Some(current) = commands::code_block_language(state) else {
-        chip.set(None);
-        return;
-    };
-    // Find the code block's <pre> from the DOM selection anchor.
-    let pre = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_selection().ok().flatten())
-        .and_then(|s| s.anchor_node())
-        .and_then(|n| match n.dyn_ref::<web_sys::Element>() {
-            Some(el) => Some(el.clone()),
-            None => n.parent_element(),
+    // Compute the new value first (early-return via `?` for the "no code
+    // block here" cases) and only write the signal if it actually changed.
+    // This runs inside a reactive Effect on every dispatch, so an
+    // unconditional `chip.set(...)` would force a full chip `<select>`
+    // rebuild on every keystroke inside a code block; `get_untracked` avoids
+    // adding a dependency on `chip` itself.
+    let new = (|| {
+        let current = commands::code_block_language(state)?;
+        // Find the code block's <pre> from the DOM selection anchor.
+        let pre = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_selection().ok().flatten())
+            .and_then(|s| s.anchor_node())
+            .and_then(|n| match n.dyn_ref::<web_sys::Element>() {
+                Some(el) => Some(el.clone()),
+                None => n.parent_element(),
+            })
+            .and_then(|el| el.closest("pre").ok().flatten())?;
+        let pre_rect = pre.get_bounding_client_rect();
+        let wrap_rect = wrapper.get_bounding_client_rect();
+        // `pre_rect`/`wrap_rect` are viewport-space (getBoundingClientRect), but
+        // the chip is absolutely positioned in `wrapper`'s (`.editor-container`)
+        // content space, which scrolls independently of the viewport. Add back
+        // the wrapper's scroll offset so the chip tracks the code block instead
+        // of drifting as the document scrolls.
+        let top = pre_rect.top() - wrap_rect.top() + wrapper.scroll_top() as f64 + 4.0;
+        // `right` doesn't need the symmetric `scroll_left()` compensation:
+        // `.editor-content` is capped at `max-width` and never exceeds
+        // `.editor-container`'s own width, and `.editor-content pre` has its
+        // own `overflow-x: auto` that absorbs long code lines internally — so
+        // `.editor-container` itself never accumulates horizontal scroll from
+        // a code block and `scroll_left()` is always 0 on this path.
+        let right = wrap_rect.right() - pre_rect.right() + 4.0;
+        Some(CodeLangChipState {
+            top,
+            right,
+            current,
         })
-        .and_then(|el| el.closest("pre").ok().flatten());
-    let Some(pre) = pre else {
-        chip.set(None);
-        return;
-    };
-    let pre_rect = pre.get_bounding_client_rect();
-    let wrap_rect = wrapper.get_bounding_client_rect();
-    // `pre_rect`/`wrap_rect` are viewport-space (getBoundingClientRect), but
-    // the chip is absolutely positioned in `wrapper`'s (`.editor-container`)
-    // content space, which scrolls independently of the viewport. Add back
-    // the wrapper's scroll offset so the chip tracks the code block instead
-    // of drifting as the document scrolls.
-    let top = pre_rect.top() - wrap_rect.top() + wrapper.scroll_top() as f64 + 4.0;
-    // `right` doesn't need the symmetric `scroll_left()` compensation:
-    // `.editor-content` is capped at `max-width` and never exceeds
-    // `.editor-container`'s own width, and `.editor-content pre` has its
-    // own `overflow-x: auto` that absorbs long code lines internally — so
-    // `.editor-container` itself never accumulates horizontal scroll from
-    // a code block and `scroll_left()` is always 0 on this path.
-    let right = wrap_rect.right() - pre_rect.right() + 4.0;
-    chip.set(Some(CodeLangChipState {
-        top,
-        right,
-        current,
-    }));
+    })();
+    if chip.get_untracked() != new {
+        chip.set(new);
+    }
 }
 
 /// Find the model position just after the top-level block containing the cursor.

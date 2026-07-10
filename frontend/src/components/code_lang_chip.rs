@@ -84,11 +84,3 @@ pub fn CodeLangChip(
         </Show>
     }
 }
-
-fn event_target_value(e: &web_sys::Event) -> String {
-    use wasm_bindgen::JsCast;
-    e.target()
-        .and_then(|t| t.dyn_into::<web_sys::HtmlSelectElement>().ok())
-        .map(|el| el.value())
-        .unwrap_or_default()
-}
