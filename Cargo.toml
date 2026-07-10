@@ -6,6 +6,7 @@ members = [
     "crates/auth",
     "crates/collab",
     "crates/mermaid",
+    "crates/highlight",
     "crates/search",
     "crates/embeddings",
     "crates/notify",
@@ -118,6 +119,7 @@ ogrenotes-storage = { path = "crates/storage" }
 ogrenotes-auth = { path = "crates/auth" }
 ogrenotes-collab = { path = "crates/collab" }
 ogrenotes-mermaid = { path = "crates/mermaid" }
+ogrenotes-highlight = { path = "crates/highlight" }
 ogrenotes-search = { path = "crates/search" }
 ogrenotes-embeddings = { path = "crates/embeddings" }
 ogrenotes-notify = { path = "crates/notify" }

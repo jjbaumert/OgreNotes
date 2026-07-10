@@ -663,7 +663,7 @@ Default 100. Higher values load first, affecting plugin order and schema precede
 | **TableCell** | `<td>` | `block+` | `colspan`, `rowspan`, `colwidth` attrs |
 | **TableHeader** | `<th>` | `block+` | Same attrs as cell; header role |
 | **Mention** | `<span>` | leaf, atom, inline | `id`, `label` attrs; suggestion system |
-| **CodeBlockLowlight** | `<pre><code>` | `text*` | Extends CodeBlock with syntax highlighting |
+| **CodeBlockLowlight** | `<pre><code>` | `text*` | Implemented as render-time syntax highlighting on **CodeBlock** (`language` attr) — not a separate node type |
 | **Details** | `<details>` | `detailsSummary detailsContent` | Collapsible content |
 | **DetailsSummary** | `<summary>` | `inline*` | Summary text |
 | **DetailsContent** | `<div>` | `block+` | Collapsible body |

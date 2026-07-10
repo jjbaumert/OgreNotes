@@ -67,7 +67,17 @@ env:
   # apart, proving the drift is on main, not in either diff. Bumping
   # to 1,700,000 (~1.62 MiB) ≈ measurement + ~2.7% headroom; ratchet
   # down after the first green main run establishes a fresh baseline.
-  WASM_GZ_LIMIT: "1700000"   # ~1.62 MiB
+  #
+  # 2026-07-09 rebaseline: PR #23 (code-block syntax highlighting,
+  # +17.6 KB measured against its merge-base) tripped the gate at
+  # 1,702,855 B — 2,855 B over. Attribution in issue #21: main-side
+  # growth since 2026-07-02 (Mermaid slice 2 #17, coverage suite,
+  # et al.) consumed the headroom; the highlighting branch was the
+  # straw. Bumping to 1,850,000 (~1.76 MiB) ≈ measurement + ~8.6%
+  # headroom, matching the 2026-06-04 ratio. The optimization /
+  # ratchet-down pass stays tracked in #21 — do not bump again
+  # without closing or updating that issue.
+  WASM_GZ_LIMIT: "1850000"   # ~1.76 MiB
   # Soft regression budget — a no-op-change PR that adds > 5% to the
   # bundle (without crossing the hard limit) gets a warning so a
   # quiet drift can be caught before it eats the headroom.

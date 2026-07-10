@@ -7,6 +7,7 @@ pub mod ask_dialog;
 pub mod at_menu;
 pub mod block_menu;
 pub mod calendar_modal;
+pub mod code_lang_chip;
 pub mod kanban_card_modal;
 pub mod chat_panel;
 pub mod comment_highlights;

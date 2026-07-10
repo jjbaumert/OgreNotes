@@ -63,6 +63,11 @@ fuzzy-matcher = "0.3"
 # rendering; frontend uses it directly for the live-app block view.
 ogrenotes-mermaid = { path = "../crates/mermaid" }
 
+# Pure-Rust syntax tokenizer, zero deps, wasm-clean. Shared with the
+# backend (crates/highlight) — server HTML export uses the same
+# tokenizer + palette, so editor and export always agree.
+ogrenotes-highlight = { path = "../crates/highlight" }
+
 [dependencies.web-sys]
 version = "0.3"
 features = [

@@ -1150,6 +1150,21 @@ impl Drop for EditorView {
 
 // ─── DOM Rendering ──────────────────────────────────────────────
 
+/// The code block's content as one plain string — `None` when the
+/// content is anything but bare (unmarked) text runs, or empty.
+/// Highlighting only applies to the plain-text case; anything else
+/// falls back to `render_children` so nothing is ever dropped.
+fn code_block_plain_text(content: &super::model::Fragment) -> Option<String> {
+    let mut text = String::new();
+    for child in &content.children {
+        match child {
+            Node::Text { text: t, marks } if marks.is_empty() => text.push_str(t),
+            _ => return None,
+        }
+    }
+    if text.is_empty() { None } else { Some(text) }
+}
+
 /// Render a model Node to a DOM Node.
 fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
     match node {
@@ -1204,7 +1219,42 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                                 .ok()?;
                         }
                     }
-                    render_children(doc, &code, content);
+
+                    // Syntax highlighting: render-only token spans.
+                    // Bare `span`s with just a class are transparent
+                    // to the DOM↔model walkers (is_mark_tag), so the
+                    // model and caret mapping are untouched. The
+                    // tokenizer is a pure partition of the text, so
+                    // the summed text-node lengths stay identical to
+                    // the plain path.
+                    let lang = attrs
+                        .get("language")
+                        .and_then(|l| ogrenotes_highlight::Language::from_tag(l));
+                    let plain = code_block_plain_text(content);
+                    match (lang, plain) {
+                        (Some(lang), Some(text))
+                            if char_len(&text)
+                                <= ogrenotes_highlight::MAX_HIGHLIGHT_CHARS =>
+                        {
+                            for token in ogrenotes_highlight::highlight(&text, lang) {
+                                match token.kind.css_class() {
+                                    None => {
+                                        code.append_child(
+                                            &doc.create_text_node(token.text),
+                                        )
+                                        .ok()?;
+                                    }
+                                    Some(cls) => {
+                                        let span = doc.create_element("span").ok()?;
+                                        span.set_attribute("class", cls).ok()?;
+                                        span.set_text_content(Some(token.text));
+                                        code.append_child(&span).ok()?;
+                                    }
+                                }
+                            }
+                        }
+                        _ => render_children(doc, &code, content),
+                    }
                     pre.append_child(&code).ok()?;
                     return Some(pre.into());
                 }
@@ -2119,6 +2169,57 @@ mod tests {
     }
 
     #[test]
+    fn code_block_plain_text_concatenates_bare_runs() {
+        let content = Fragment::from(vec![
+            Node::text("fn main() {\n"),
+            Node::text("    println!(\"hi\");\n}"),
+        ]);
+        assert_eq!(
+            code_block_plain_text(&content).as_deref(),
+            Some("fn main() {\n    println!(\"hi\");\n}")
+        );
+    }
+
+    #[test]
+    fn code_block_plain_text_bails_on_marks_or_elements() {
+        // Marked text (schema forbids it, but render defensively) →
+        // fall back to the un-highlighted path rather than dropping marks.
+        let marked = Fragment::from(vec![Node::text_with_marks(
+            "x",
+            vec![Mark::new(MarkType::Bold)],
+        )]);
+        assert_eq!(code_block_plain_text(&marked), None);
+
+        let with_element = Fragment::from(vec![
+            Node::text("a"),
+            Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![])),
+        ]);
+        assert_eq!(code_block_plain_text(&with_element), None);
+    }
+
+    #[test]
+    fn code_block_plain_text_empty_is_none() {
+        assert_eq!(code_block_plain_text(&Fragment::from(vec![])), None);
+    }
+
+    #[test]
+    fn position_sizes_match_code_block_with_language() {
+        // Token spans are render-only: the MODEL is unchanged, so the
+        // walker-size mirror must agree exactly as it does today.
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("language".to_string(), "rust".to_string());
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::CodeBlock,
+                attrs,
+                Fragment::from(vec![Node::text("fn main() {}\nlet x = 1;")]),
+            )]),
+        );
+        assert_sizes_match(&doc);
+    }
+
+    #[test]
     fn position_sizes_match_hr_and_image() {
         let doc = Node::element_with_content(
             NodeType::Doc,
@@ -2227,5 +2328,68 @@ mod embed_render_tests {
         assert_eq!(mention.node_size(), 1);
         assert_eq!(read_atom_size(el), Some(1));
         assert_eq!(dom_node_model_size(&rendered), 1);
+    }
+
+    /// Spec acceptance guard (syntax-highlighted code blocks, 2026-07-09):
+    /// the `<span class="tok-*">` wrappers the highlighter inserts must be
+    /// as transparent to the caret-mapping walkers as any other mark tag —
+    /// a model position that lands *inside* a token's rendered text (not
+    /// just at a token boundary) must round-trip through
+    /// `find_dom_position` → `dom_position_to_model` back to the exact
+    /// same position.
+    #[wasm_bindgen_test]
+    fn code_block_token_spans_are_position_transparent() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container_el = document.create_element("div").unwrap();
+        document.body().unwrap().append_child(&container_el).unwrap();
+        let container: HtmlElement = container_el.dyn_into().unwrap();
+
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("language".to_string(), "rust".to_string());
+        let source = "fn main() {}\nlet x = 1;";
+        let code_block = Node::element_with_attrs(
+            NodeType::CodeBlock,
+            attrs,
+            Fragment::from(vec![Node::text(source)]),
+        );
+        let doc_content = Fragment::from(vec![code_block]);
+
+        // Mirrors how the real editor populates its container: render the
+        // Doc's top-level content directly into the container element,
+        // without a wrapper node for the (unmodeled) Doc boundary itself.
+        render_children(&document, container.as_ref(), &doc_content);
+
+        // Sanity: highlighting actually ran — the render path produced
+        // `tok-*` spans, not a plain unhighlighted text node.
+        let pre = container.first_element_child().expect("pre renders");
+        let code = pre.first_element_child().expect("code renders");
+        assert!(
+            code.inner_html().contains("tok-"),
+            "expected tok-* token spans, got: {}",
+            code.inner_html()
+        );
+
+        // Model position of the 'a' in "main" — a position INSIDE a token
+        // span's text, not at a span boundary. Position accounting: +1 for
+        // the CodeBlock's own open boundary (model position 0 is "before
+        // the CodeBlock" at the Doc root), then the flat char offset into
+        // the block's text — the `code`/`span` wrappers around it are mark
+        // tags (`is_mark_tag`) and contribute no boundary positions of
+        // their own.
+        let main_idx = source.find("main").expect("fixture contains 'main'");
+        let a_offset_in_main = 1; // "main" → m(0) a(1) i(2) n(3)
+        let target_pos = 1 + main_idx + a_offset_in_main;
+
+        let (dom_node, dom_offset) =
+            find_dom_position(&container, target_pos).expect("position resolves in DOM");
+        let round_tripped = dom_position_to_model(&container, &dom_node, dom_offset)
+            .expect("DOM position maps back to a model position");
+
+        assert_eq!(
+            round_tripped, target_pos,
+            "position inside a token span must round-trip unchanged"
+        );
+
+        container.remove();
     }
 }

@@ -3755,6 +3755,7 @@ dependencies = [
  "markup5ever_rcdom",
  "nanoid",
  "ogrenotes-common",
+ "ogrenotes-highlight",
  "ogrenotes-mermaid",
  "ogrenotes-storage",
  "pdf-extract",
@@ -3806,6 +3807,13 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ogrenotes-highlight"
+version = "0.1.0"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]

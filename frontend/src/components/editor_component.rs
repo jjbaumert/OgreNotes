@@ -19,6 +19,7 @@ use crate::editor::yrs_bridge;
 use super::calendar_modal::{
     CalendarModal, CalendarModalMode, CalendarModalState, ModalOutcome,
 };
+use super::code_lang_chip::{CodeLangChip, CodeLangChipState};
 use super::editor_context_menu::{EditorContextCommand, EditorContextMenu};
 use super::kanban_card_modal::{
     KanbanCardModal, KanbanCardModalMode, KanbanCardModalState, KanbanCardOutcome,
@@ -88,6 +89,61 @@ fn apply_and_notify(
         if let Some(cb) = on_mapping {
             cb.run((step_maps, old_doc));
         }
+    }
+}
+
+/// Task 7 — recompute the language-chip overlay state from the
+/// current editor state + live DOM selection. Chip shows iff the
+/// caret is inside a code block. Coordinates are relative to
+/// `wrapper` (the chip's positioned offset parent — `.editor-
+/// container`, a sibling of `.editor-content`, not the
+/// contenteditable div itself).
+fn refresh_code_lang_chip(
+    state: &EditorState,
+    wrapper: &web_sys::Element,
+    chip: RwSignal<Option<CodeLangChipState>>,
+) {
+    // Compute the new value first (early-return via `?` for the "no code
+    // block here" cases) and only write the signal if it actually changed.
+    // This runs inside a reactive Effect on every dispatch, so an
+    // unconditional `chip.set(...)` would force a full chip `<select>`
+    // rebuild on every keystroke inside a code block; `get_untracked` avoids
+    // adding a dependency on `chip` itself.
+    let new = (|| {
+        let current = commands::code_block_language(state)?;
+        // Find the code block's <pre> from the DOM selection anchor.
+        let pre = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_selection().ok().flatten())
+            .and_then(|s| s.anchor_node())
+            .and_then(|n| match n.dyn_ref::<web_sys::Element>() {
+                Some(el) => Some(el.clone()),
+                None => n.parent_element(),
+            })
+            .and_then(|el| el.closest("pre").ok().flatten())?;
+        let pre_rect = pre.get_bounding_client_rect();
+        let wrap_rect = wrapper.get_bounding_client_rect();
+        // `pre_rect`/`wrap_rect` are viewport-space (getBoundingClientRect), but
+        // the chip is absolutely positioned in `wrapper`'s (`.editor-container`)
+        // content space, which scrolls independently of the viewport. Add back
+        // the wrapper's scroll offset so the chip tracks the code block instead
+        // of drifting as the document scrolls.
+        let top = pre_rect.top() - wrap_rect.top() + wrapper.scroll_top() as f64 + 4.0;
+        // `right` doesn't need the symmetric `scroll_left()` compensation:
+        // `.editor-content` is capped at `max-width` and never exceeds
+        // `.editor-container`'s own width, and `.editor-content pre` has its
+        // own `overflow-x: auto` that absorbs long code lines internally — so
+        // `.editor-container` itself never accumulates horizontal scroll from
+        // a code block and `scroll_left()` is always 0 on this path.
+        let right = wrap_rect.right() - pre_rect.right() + 4.0;
+        Some(CodeLangChipState {
+            top,
+            right,
+            current,
+        })
+    })();
+    if chip.get_untracked() != new {
+        chip.set(new);
     }
 }
 
@@ -1716,10 +1772,44 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     // dispatches `commands::update_mermaid_source`.
     let mermaid_modal_state: RwSignal<Option<MermaidModalState>> = RwSignal::new(None);
 
+    // Task 7 — language-selector chip overlay. `None` = hidden.
+    // Rendered OUTSIDE `.editor-content` (a sibling inside the
+    // positioned `.editor-container` wrapper — see `editor_wrapper_ref`
+    // below), so it can never disturb the DOM<->model position
+    // walkers and is never wiped by `render()`'s `set_inner_html("")`.
+    //
+    // Visibility + `current` are caret-based: recomputed after every
+    // dispatch, not just ones the user makes with the mouse/keyboard
+    // inside the editor. `apply_and_notify` (above) is the single
+    // function every dispatch path in this component funnels its
+    // resulting `EditorState` through — the toolbar-command effect,
+    // every modal outcome, drag-drop, remote CRDT updates, and
+    // EditorView's own keydown/click/selectionchange dispatch — so
+    // wrapping `props.on_state_change` once here, and having every
+    // call site below clone the wrapper instead of `props.on_state_change`
+    // directly, is the one hook point that covers all of them.
+    let code_lang_chip_state: RwSignal<Option<CodeLangChipState>> = RwSignal::new(None);
+    let editor_wrapper_ref = NodeRef::<leptos::html::Div>::new();
+    let (chip_state_tick, set_chip_state_tick) = signal::<Option<EditorState>>(None);
+    let on_state_change_shared: Callback<EditorState> = {
+        let outer = props.on_state_change.clone();
+        Callback::new(move |state: EditorState| {
+            outer.run(state.clone());
+            set_chip_state_tick.set(Some(state));
+        })
+    };
+    Effect::new(move |_| {
+        let Some(state) = chip_state_tick.get() else { return };
+        let Some(wrapper) = editor_wrapper_ref.get() else { return };
+        let wrapper_html: web_sys::HtmlElement = wrapper.into();
+        refresh_code_lang_chip(&state, &wrapper_html, code_lang_chip_state);
+    });
+
     // Initialize the editor after the DOM element is mounted
     let view_ref_init = Rc::clone(&view_ref);
     let history_ref_init = Rc::clone(&history_ref);
     let props_clone = props.clone();
+    let on_state_change_init = on_state_change_shared.clone();
 
     Effect::new(move |_| {
         let Some(container) = container_ref.get() else { return };
@@ -1734,12 +1824,12 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
         };
 
         let state = EditorState::create_default(doc);
-        props_clone.on_state_change.run(state.clone());
+        on_state_change_init.run(state.clone());
 
         // Use Weak to break the Rc cycle: dispatch -> view_ref -> EditorView -> dispatch
         let view_ref_weak: Weak<RefCell<Option<EditorView>>> = Rc::downgrade(&view_ref_init);
         let on_change = props_clone.on_change.clone();
-        let on_state_change = props_clone.on_state_change.clone();
+        let on_state_change = on_state_change_init.clone();
         let on_mapping_dispatch = props_clone.on_mapping.clone();
 
         let dispatch = move |txn: Transaction| {
@@ -1826,7 +1916,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let view_ref_attr = Rc::clone(&view_ref);
     let history_ref_attr = Rc::clone(&history_ref);
     let on_change_attr = props.on_change.clone();
-    let on_state_change_attr = props.on_state_change.clone();
+    let on_state_change_attr = on_state_change_shared.clone();
     let on_mapping_attr = props.on_mapping.clone();
     Effect::new(move |_| {
         let Some((block_id, updates)) = calendar_attr_update_signal.get() else {
@@ -1987,7 +2077,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let view_ref_col = Rc::clone(&view_ref);
     let history_ref_col = Rc::clone(&history_ref);
     let on_change_col = props.on_change.clone();
-    let on_state_change_col = props.on_state_change.clone();
+    let on_state_change_col = on_state_change_shared.clone();
     let on_mapping_col = props.on_mapping.clone();
     Effect::new(move |_| {
         let Some(action) = kanban_column_action_signal.get() else {
@@ -2097,7 +2187,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let history_ref_kanban_modal =
         send_wrapper::SendWrapper::new(Rc::clone(&history_ref));
     let on_change_kanban_modal = props.on_change.clone();
-    let on_state_change_kanban_modal = props.on_state_change.clone();
+    let on_state_change_kanban_modal = on_state_change_shared.clone();
     let on_mapping_kanban_modal = props.on_mapping.clone();
     let on_kanban_outcome = Callback::new(move |outcome: KanbanCardOutcome| {
         let view = view_ref_kanban_modal.borrow();
@@ -2156,7 +2246,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let history_ref_mermaid_modal =
         send_wrapper::SendWrapper::new(Rc::clone(&history_ref));
     let on_change_mermaid_modal = props.on_change.clone();
-    let on_state_change_mermaid_modal = props.on_state_change.clone();
+    let on_state_change_mermaid_modal = on_state_change_shared.clone();
     let on_mapping_mermaid_modal = props.on_mapping.clone();
     let on_mermaid_outcome = Callback::new(move |outcome: MermaidModalOutcome| {
         let view = view_ref_mermaid_modal.borrow();
@@ -2187,6 +2277,42 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                 );
             }
         }
+    });
+
+    // Task 7 — code-block language-chip selection dispatcher. Same
+    // borrow/dispatch scaffolding as `on_mermaid_outcome` above: the
+    // view is read fresh at select-time, the transaction goes
+    // through the shared history + on_change/on_state_change/
+    // on_mapping routing so undo and the toolbar both see it.
+    // `on_state_change_shared` also drives `refresh_code_lang_chip`
+    // (via `chip_state_tick`), so the chip's `current` reflects the
+    // new value immediately after this dispatch.
+    let view_ref_code_lang_chip =
+        send_wrapper::SendWrapper::new(Rc::clone(&view_ref));
+    let history_ref_code_lang_chip =
+        send_wrapper::SendWrapper::new(Rc::clone(&history_ref));
+    let on_change_code_lang_chip = props.on_change.clone();
+    let on_state_change_code_lang_chip = on_state_change_shared.clone();
+    let on_mapping_code_lang_chip = props.on_mapping.clone();
+    let on_code_lang_select = Callback::new(move |tag: String| {
+        let view = view_ref_code_lang_chip.borrow();
+        let Some(view) = view.as_ref() else { return };
+        let state = view.state();
+        let history_ref_dispatch = Rc::clone(&*history_ref_code_lang_chip);
+        let on_change_dispatch = on_change_code_lang_chip.clone();
+        let on_state_change_dispatch = on_state_change_code_lang_chip.clone();
+        let on_mapping_dispatch = on_mapping_code_lang_chip.clone();
+        let dispatch_fn = move |txn: Transaction| {
+            apply_and_notify(
+                view,
+                txn,
+                Some(&history_ref_dispatch),
+                &on_change_dispatch,
+                &on_state_change_dispatch,
+                on_mapping_dispatch.as_ref(),
+            );
+        };
+        commands::set_code_block_language(&tag, &state, Some(&dispatch_fn));
     });
 
     // #136 — Pointer-driven drag pipeline for calendar events.
@@ -2284,7 +2410,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let view_ref_drag = Rc::clone(&view_ref);
     let history_ref_drag = Rc::clone(&history_ref);
     let on_change_drag = props.on_change.clone();
-    let on_state_change_drag = props.on_state_change.clone();
+    let on_state_change_drag = on_state_change_shared.clone();
     let on_mapping_drag = props.on_mapping.clone();
     Effect::new(move |_| {
         let Some(commit) = drag_commit_signal.get() else { return };
@@ -2406,7 +2532,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let view_ref_kdrag = Rc::clone(&view_ref);
     let history_ref_kdrag = Rc::clone(&history_ref);
     let on_change_kdrag = props.on_change.clone();
-    let on_state_change_kdrag = props.on_state_change.clone();
+    let on_state_change_kdrag = on_state_change_shared.clone();
     let on_mapping_kdrag = props.on_mapping.clone();
     Effect::new(move |_| {
         let Some(commit) = kanban_drag_commit_signal.get() else { return };
@@ -2450,7 +2576,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
 
     // Apply remote document updates from collaborators.
     let view_ref_remote = Rc::clone(&view_ref);
-    let on_state_change_remote = props.on_state_change.clone();
+    let on_state_change_remote = on_state_change_shared.clone();
     let remote_state_signal = props.remote_state;
     let history_ref_remote = Rc::clone(&history_ref);
     Effect::new(move |_| {
@@ -2483,7 +2609,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let view_ref_cmd = Rc::clone(&view_ref);
     let history_ref_cmd = Rc::clone(&history_ref);
     let on_change_cmd = props.on_change.clone();
-    let on_state_change_cmd = props.on_state_change.clone();
+    let on_state_change_cmd = on_state_change_shared.clone();
     let on_mapping_cmd = props.on_mapping.clone();
 
     Effect::new(move |_| {
@@ -2626,7 +2752,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let view_ref_cmd2 = Rc::clone(&view_ref);
     let history_ref_cmd2 = Rc::clone(&history_ref);
     let on_change_cmd2 = props.on_change.clone();
-    let on_state_change_cmd2 = props.on_state_change.clone();
+    let on_state_change_cmd2 = on_state_change_shared.clone();
     let on_mapping_cmd2 = props.on_mapping.clone();
     let on_request_comment_prop = props.on_request_comment;
 
@@ -2846,7 +2972,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let history_ref_modal =
         send_wrapper::SendWrapper::new(Rc::clone(&history_ref));
     let on_change_modal = props.on_change.clone();
-    let on_state_change_modal = props.on_state_change.clone();
+    let on_state_change_modal = on_state_change_shared.clone();
     let on_mapping_modal = props.on_mapping.clone();
     let on_modal_outcome = Callback::new(move |outcome: ModalOutcome| {
         let view = view_ref_modal.borrow();
@@ -2904,11 +3030,15 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let on_scroll = props.on_scroll.clone();
     let view_ref_ctx_open = Rc::clone(&view_ref);
     view! {
-        <div class="editor-container" on:scroll=move |_| {
-            if let Some(ref cb) = on_scroll {
-                cb.run(());
+        <div
+            node_ref=editor_wrapper_ref
+            class="editor-container"
+            on:scroll=move |_| {
+                if let Some(ref cb) = on_scroll {
+                    cb.run(());
+                }
             }
-        }>
+        >
             <div
                 node_ref=container_ref
                 class="editor-content"
@@ -2949,6 +3079,10 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             <MermaidModal
                 state=mermaid_modal_state
                 on_outcome=on_mermaid_outcome
+            />
+            <CodeLangChip
+                state=code_lang_chip_state
+                on_select=on_code_lang_select
             />
         </div>
     }
