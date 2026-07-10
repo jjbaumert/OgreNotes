@@ -4,6 +4,13 @@ version = "0.1.2"
 edition = "2024"
 license = "MIT"
 
+# Standalone crate, never a member of the backend workspace. The empty
+# table stops cargo's upward manifest walk here — without it, building
+# from a git worktree nested under .claude/worktrees/ escapes past the
+# worktree root (whose `exclude = ["frontend"]` only covers its own
+# copy) and misresolves against the primary checkout's workspace.
+[workspace]
+
 [lib]
 name = "ogrenotes_frontend"
 path = "src/lib.rs"

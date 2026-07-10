@@ -358,22 +358,7 @@ pub async fn import_document_via_job(
         gloo_timers::future::TimeoutFuture::new(500).await;
         let status: serde_json::Value = api_get(&job_path).await?;
         match status.get("state").and_then(|s| s.as_str()) {
-            Some("succeeded") => {
-                // `resultJson` is a JSON *string* carrying { "docId": ... }.
-                let result_json = status
-                    .get("resultJson")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("");
-                let parsed: serde_json::Value = serde_json::from_str(result_json)
-                    .map_err(|e| ApiClientError::Deserialize(e.to_string()))?;
-                return parsed
-                    .get("docId")
-                    .and_then(|d| d.as_str())
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| {
-                        ApiClientError::Deserialize("import result missing docId".to_string())
-                    });
-            }
+            Some("succeeded") => return import_result_doc_id(&status),
             Some("failed") => {
                 // #47: `error` here is a field on the import job's
                 // structured status DTO (a deserialized 200 response),
@@ -392,6 +377,27 @@ pub async fn import_document_via_job(
     Err(ApiClientError::Network(
         "import timed out waiting for the converter".to_string(),
     ))
+}
+
+/// Extract the created document id from a terminal `succeeded` job
+/// status. The result field is a JSON *string* carrying { "docId": ... }.
+///
+/// Field name is snake_case on purpose: the worker's `JobStatus` enum
+/// camelCases its `state` *tag* only — serde's enum-level `rename_all`
+/// does not touch variant fields, so the wire carries `result_json`
+/// (issue #9).
+fn import_result_doc_id(status: &serde_json::Value) -> Result<String, ApiClientError> {
+    let result_json = status
+        .get("result_json")
+        .and_then(|r| r.as_str())
+        .unwrap_or("");
+    let parsed: serde_json::Value = serde_json::from_str(result_json)
+        .map_err(|e| ApiClientError::Deserialize(e.to_string()))?;
+    parsed
+        .get("docId")
+        .and_then(|d| d.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| ApiClientError::Deserialize("import result missing docId".to_string()))
 }
 
 /// M-P6 piece B — call the backend embed resolver. Returns the
@@ -588,4 +594,24 @@ pub async fn request_ws_token(id: &str) -> Result<WsTokenResponse, ApiClientErro
     api_post(&format!("/documents/{id}/ws-token"), &serde_json::json!({
         "clientVersion": env!("CARGO_PKG_VERSION")
     })).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: issue #9 — the job-status DTO's enum-level camelCase
+    /// rename covers the `state` tag only; variant *fields* stay
+    /// snake_case on the wire. A succeeded import must be parsed from
+    /// the shape the API actually returns.
+    #[test]
+    fn import_result_parses_actual_wire_shape() {
+        let status = serde_json::json!({
+            "state": "succeeded",
+            "started_at_ms": 1,
+            "finished_at_ms": 2,
+            "result_json": "{\"docId\":\"d1\"}",
+        });
+        assert_eq!(import_result_doc_id(&status).unwrap(), "d1");
+    }
 }
