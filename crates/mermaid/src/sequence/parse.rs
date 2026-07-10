@@ -65,12 +65,23 @@ impl Parser {
         Ok(())
     }
 
-    fn intern(&mut self, id: &str, display: Option<String>, is_actor: bool) -> Result<usize, ParseError> {
+    /// `explicit` is true for `participant`/`actor` declarations, false
+    /// for implicit message references.
+    fn intern(
+        &mut self,
+        id: &str,
+        display: Option<String>,
+        is_actor: bool,
+        explicit: bool,
+    ) -> Result<usize, ParseError> {
         if let Some(&i) = self.ids.get(id) {
-            // Explicit declaration after implicit use upgrades display/actor.
-            if let Some(d) = display {
-                self.g.participants[i].display = d;
+            // Explicit declaration after implicit use upgrades
+            // display/is_actor — even a bare `actor A` with no alias.
+            if explicit {
                 self.g.participants[i].is_actor = is_actor;
+                if let Some(d) = display {
+                    self.g.participants[i].display = d;
+                }
             }
             return Ok(i);
         }
@@ -123,7 +134,7 @@ impl Parser {
         if matches!(&display, Some(d) if d.is_empty()) {
             return Err(self.err("participant alias must not be empty"));
         }
-        self.intern(id, display, is_actor)?;
+        self.intern(id, display, is_actor, true)?;
         Ok(())
     }
 
@@ -168,6 +179,7 @@ impl Parser {
             deactivate_source = true;
             after = r;
         }
+        // Target id: same ASCII-only predicate, so char count == byte length.
         let to_len = after
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
@@ -186,8 +198,8 @@ impl Parser {
                 )))
             }
         };
-        let from = self.intern(from_id, None, false)?;
-        let to = self.intern(to_id, None, false)?;
+        let from = self.intern(from_id, None, false, false)?;
+        let to = self.intern(to_id, None, false, false)?;
         if activate_target {
             self.active_depth[to] += 1;
         }
@@ -348,6 +360,20 @@ mod tests {
     fn unknown_statement_errors_with_line() {
         let e = parse("sequenceDiagram\nA->>B: ok\nwibble wobble").unwrap_err();
         assert_eq!(e.line, Some(3));
+    }
+
+    #[test]
+    fn explicit_actor_after_implicit_use_upgrades() {
+        // Bare `actor A` (no `as`) after an implicit message reference
+        // must still upgrade is_actor.
+        let g = p("sequenceDiagram\nA->>B: x\nactor A");
+        assert!(g.participants[0].is_actor);
+        assert_eq!(g.participants[0].display, "A");
+        // `participant B as Bee` after implicit use upgrades display but
+        // leaves is_actor false.
+        let g = p("sequenceDiagram\nA->>B: x\nparticipant B as Bee");
+        assert_eq!(g.participants[1].display, "Bee");
+        assert!(!g.participants[1].is_actor);
     }
 
     #[test]
