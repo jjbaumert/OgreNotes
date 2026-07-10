@@ -11,9 +11,10 @@ pub struct Chunk {
 
 /// Configuration for text chunking.
 pub struct ChunkerConfig {
-    /// Target chunk size in characters (~4 chars/token, so 2048 ≈ 512 tokens).
+    /// Target chunk size in bytes (~4 bytes/token for ASCII text, so
+    /// 2048 ≈ 512 tokens; multibyte scripts land fewer chars per chunk).
     pub chunk_size: usize,
-    /// Overlap size in characters between consecutive chunks.
+    /// Overlap size in bytes between consecutive chunks.
     pub overlap: usize,
 }
 
@@ -145,12 +146,19 @@ fn split_at_words(text: &str, max_len: usize) -> Vec<String> {
     segments
 }
 
-/// Get the last `n` characters of `text`, breaking at a word boundary.
+/// Get the last `n` bytes of `text` (possibly fewer), breaking at a
+/// word boundary.
 fn tail_overlap(text: &str, n: usize) -> String {
     if text.len() <= n {
         return text.to_string();
     }
-    let start = text.len() - n;
+    let mut start = text.len() - n;
+    // The byte budget may land inside a multibyte character; advance to
+    // the next char boundary so the slice below can't panic (issue #8).
+    // Advancing (not retreating) keeps the overlap within `n` bytes.
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
     // Find the next word boundary after `start`
     match text[start..].find(' ') {
         Some(pos) => text[start + pos..].trim_start().to_string(),
@@ -379,6 +387,37 @@ mod tests {
     #[test]
     fn tail_overlap_zero_budget_returns_empty() {
         assert_eq!(tail_overlap("some words here", 0), "");
+    }
+
+    /// Regression: issue #8 — a byte budget landing inside a multibyte
+    /// character must not panic on a non-char-boundary slice.
+    #[test]
+    fn tail_overlap_mid_char_budget_does_not_panic() {
+        // 10 × 'α' = 20 bytes; a 5-byte tail starts at byte 15, inside
+        // the 8th 'α' (bytes 14..16).
+        let text = "α".repeat(10);
+        let tail = tail_overlap(&text, 5);
+        assert!(tail.len() <= 5);
+        assert!(tail.chars().all(|c| c == 'α'));
+    }
+
+    /// Regression: issue #8 — multibyte documents long enough to span
+    /// chunks must chunk without panicking, end to end.
+    #[test]
+    fn multibyte_multi_chunk_document_does_not_panic() {
+        let config = ChunkerConfig {
+            chunk_size: 64,
+            overlap: 13, // odd: guaranteed to bisect a 2-byte char
+        };
+        // One oversized 600-byte Greek "word" forces the word-split path
+        // and a tail_overlap call over pure multibyte text.
+        let body = "α".repeat(300);
+        let chunks = chunk_document("T", &body, &config);
+
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert!(chunk.text.starts_with("Title: T\n\n"));
+        }
     }
 
     #[test]
