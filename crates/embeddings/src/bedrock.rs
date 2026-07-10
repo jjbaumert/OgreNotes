@@ -61,6 +61,16 @@ impl BedrockEmbedder {
             })
             .collect::<Result<Vec<f32>, _>>()?;
 
+        // Issue #15: a wrong-length vector (model/config drift, partial
+        // response) would otherwise propagate silently and fail only at
+        // Qdrant upsert time with an error that doesn't name Bedrock.
+        if embedding.len() != self.dimensions as usize {
+            return Err(EmbeddingError::DimensionMismatch {
+                got: embedding.len(),
+                expected: self.dimensions,
+            });
+        }
+
         Ok(embedding)
     }
 
@@ -122,12 +132,14 @@ mod tests {
 
     #[tokio::test]
     async fn embed_parses_embedding_and_sends_expected_request_shape() {
+        // Fixture note (issue #15): dimensions matches the canned
+        // 3-float response — embed() now rejects length mismatches.
         let (embedder, http_client) = replay_embedder(
             vec![event(
                 200,
                 r#"{"embedding": [0.25, -0.5, 1.0], "inputTextTokenCount": 3}"#,
             )],
-            512,
+            3,
         );
 
         let vector = embedder.embed("hello world").await.expect("embed");
@@ -145,8 +157,29 @@ mod tests {
             serde_json::from_slice(requests[0].body().bytes().expect("in-memory body"))
                 .expect("request body is JSON");
         assert_eq!(body["inputText"], "hello world");
-        assert_eq!(body["dimensions"], 512);
+        assert_eq!(body["dimensions"], 3);
         assert_eq!(body["normalize"], true);
+    }
+
+    /// Issue #15: a well-formed response whose vector length doesn't
+    /// match the configured dimensions must fail fast here, naming the
+    /// mismatch — not propagate to Qdrant and die at upsert time with
+    /// an opaque error that doesn't point back at Bedrock.
+    #[tokio::test]
+    async fn embed_rejects_wrong_length_embedding() {
+        let (embedder, _http) = replay_embedder(
+            vec![event(200, r#"{"embedding": [0.25, -0.5, 1.0]}"#)],
+            512,
+        );
+
+        let err = embedder.embed("hello").await.unwrap_err();
+        match err {
+            EmbeddingError::DimensionMismatch { got, expected } => {
+                assert_eq!(got, 3);
+                assert_eq!(expected, 512);
+            }
+            other => panic!("expected DimensionMismatch, got {other:?}"),
+        }
     }
 
     #[tokio::test]
