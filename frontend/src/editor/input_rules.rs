@@ -67,6 +67,7 @@ pub fn default_input_rules() -> Vec<InputRule> {
         heading_rule("## ", 2),
         heading_rule("### ", 3),
         blockquote_rule(),
+        code_block_rule(),
         bullet_list_rule("* "),
         bullet_list_rule("- "),
         bullet_list_rule("+ "),
@@ -109,6 +110,51 @@ fn heading_rule(trigger: &'static str, level: u8) -> InputRule {
                 .delete(from, to)
                 .ok()?
                 .set_node_type(block_pos, NodeType::Heading, attrs)
+                .ok()?;
+            Some(txn)
+        }),
+    }
+}
+
+/// Markdown fence rule: `"``` "` converts the block to a plain code
+/// block; `"```lang "` also stores the raw tag in the `language` attr
+/// (aliases like `rs` resolve at render time via `Language::from_tag`,
+/// exactly as markdown import's fence info does — markdown.rs stores
+/// the first fence token verbatim too). Anchored like `heading_rule`:
+/// the fence must be the block's entire text before the cursor.
+/// Promised by design/rich-text-editor.md's input-rule table.
+fn code_block_rule() -> InputRule {
+    InputRule {
+        name: "code_block",
+        matcher: Box::new(|text| {
+            let tag = text.strip_prefix("```")?.strip_suffix(' ')?;
+            // ASCII-only tags: model positions are char-based but this
+            // API byte-slices the match, so decline anything multibyte
+            // rather than let the two diverge. Real fence infos are
+            // ASCII; `+ # . - _` cover c++, c#, objective-c, tf-vars…
+            // A backtick in the tag (e.g. "````rust ") also lands here
+            // and is rejected.
+            if !tag
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+#.-_".contains(c))
+            {
+                return None;
+            }
+            Some((0, text.len()))
+        }),
+        handler: Box::new(|state, from, to, matched| {
+            let block_pos = from - 1;
+            // strip the leading ``` and the trailing space
+            let tag = &matched[3..matched.len() - 1];
+            let mut attrs = HashMap::new();
+            if !tag.is_empty() {
+                attrs.insert("language".to_string(), tag.to_string());
+            }
+            let txn = state
+                .transaction()
+                .delete(from, to)
+                .ok()?
+                .set_node_type(block_pos, NodeType::CodeBlock, attrs)
                 .ok()?;
             Some(txn)
         }),
@@ -557,6 +603,87 @@ mod tests {
         let block = new_state.doc.child(0).unwrap();
         assert_eq!(block.node_type(), Some(NodeType::Heading));
         assert_eq!(block.attrs().get("level").unwrap(), "2");
+    }
+
+    #[test]
+    fn triple_backtick_converts_paragraph_to_code_block() {
+        let rules = default_input_rules();
+        let state = make_state("``` ");
+        let txn = check_input_rules(&rules, &state, "``` ", 1).unwrap();
+        let new_state = state.apply(txn);
+        let block = new_state.doc.child(0).unwrap();
+        assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+        assert!(block.attrs().get("language").is_none(), "bare fence sets no language");
+        assert_eq!(block.text_content(), ""); // trigger text deleted
+    }
+
+    #[test]
+    fn triple_backtick_with_lang_sets_language_attr() {
+        let rules = default_input_rules();
+        let state = make_state("```python ");
+        let txn = check_input_rules(&rules, &state, "```python ", 1).unwrap();
+        let new_state = state.apply(txn);
+        let block = new_state.doc.child(0).unwrap();
+        assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+        assert_eq!(block.attrs().get("language").unwrap(), "python");
+        assert_eq!(block.text_content(), "");
+    }
+
+    #[test]
+    fn triple_backtick_stores_alias_tag_verbatim() {
+        // "rs" resolves via Language::from_tag at render time; the attr
+        // stores the raw tag, exactly like markdown import does.
+        let rules = default_input_rules();
+        let state = make_state("```rs ");
+        let txn = check_input_rules(&rules, &state, "```rs ", 1).unwrap();
+        let new_state = state.apply(txn);
+        let block = new_state.doc.child(0).unwrap();
+        assert_eq!(block.attrs().get("language").unwrap(), "rs");
+    }
+
+    #[test]
+    fn triple_backtick_tag_allows_symbol_language_names() {
+        // c++, c#, and dotted/dashed tags are real fence infos.
+        let rules = default_input_rules();
+        let state = make_state("```c++ ");
+        let txn = check_input_rules(&rules, &state, "```c++ ", 1).unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(
+            new_state.doc.child(0).unwrap().attrs().get("language").unwrap(),
+            "c++"
+        );
+    }
+
+    #[test]
+    fn triple_backtick_does_not_fire_mid_text() {
+        // The fence must be the entire block text before the cursor,
+        // same as the heading rules.
+        let rules = default_input_rules();
+        let state = make_state("x``` ");
+        assert!(check_input_rules(&rules, &state, "x``` ", 1).is_none());
+        let state = make_state("x```python ");
+        assert!(check_input_rules(&rules, &state, "x```python ", 1).is_none());
+    }
+
+    #[test]
+    fn triple_backtick_rejects_tags_with_inner_space_or_backtick() {
+        let rules = default_input_rules();
+        for text in ["``` x ", "````rust ", "```a`b "] {
+            let state = make_state(text);
+            assert!(
+                check_input_rules(&rules, &state, text, 1).is_none(),
+                "{text:?} must not create a code block"
+            );
+        }
+    }
+
+    #[test]
+    fn triple_backtick_rejects_non_ascii_tag_without_panicking() {
+        // Positions are char-based but the matcher API byte-slices;
+        // non-ASCII tags are declined outright so the two never diverge.
+        let rules = default_input_rules();
+        let state = make_state("```pythön ");
+        assert!(check_input_rules(&rules, &state, "```pythön ", 1).is_none());
     }
 
     #[test]
