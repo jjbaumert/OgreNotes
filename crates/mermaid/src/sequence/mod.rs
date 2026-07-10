@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod parse;
-// pub(crate) mod layout;  // Task 5
+pub(crate) mod layout;
 // pub(crate) mod svg;     // Task 6
 
 /// Caps enforced during parse — sequence rendering runs server-side on
