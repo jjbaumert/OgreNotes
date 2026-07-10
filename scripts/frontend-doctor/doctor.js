@@ -3659,7 +3659,14 @@ async function scenarioEmbedYouTube(ctx, collector) {
   // YouTube watch URL; the backend's allowlist matcher should
   // rewrite it to the /embed/ form.
   const watchUrl = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
-  const expectedSrc = "https://www.youtube.com/embed/dQw4w9WgXcQ";
+  // The backend rewrites watch URLs to /embed/ form, then applies the
+  // EMBED_YOUTUBE_NOCOOKIE privacy rewrite (crates/api/src/embed_allowlist.rs
+  // apply_privacy; config default "true"). Track the same env the server
+  // reads so this assertion follows the deployment's flag.
+  const nocookie = (process.env.EMBED_YOUTUBE_NOCOOKIE ?? "true") === "true";
+  const expectedSrc = nocookie
+    ? "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ"
+    : "https://www.youtube.com/embed/dQw4w9WgXcQ";
   page.on("dialog", async (d) => {
     await d.accept(watchUrl);
   });
@@ -3695,8 +3702,11 @@ async function scenarioEmbedYouTube(ctx, collector) {
     steps.srcRewrittenToEmbed = src === expectedSrc;
     const sandbox = await iframe.getAttribute("sandbox");
     steps.sandboxAllowsScripts = sandbox === "allow-scripts allow-same-origin";
+    // ddc03be: no-referrer broke YouTube's embedding-origin validation
+    // (Error 153); production now sends strict-origin-when-cross-origin
+    // (frontend/src/editor/view.rs Embed render).
     const referrerpolicy = await iframe.getAttribute("referrerpolicy");
-    steps.referrerNoReferrer = referrerpolicy === "no-referrer";
+    steps.referrerPolicyCorrect = referrerpolicy === "strict-origin-when-cross-origin";
     const loading = await iframe.getAttribute("loading");
     steps.loadingLazy = loading === "lazy";
 
@@ -6275,7 +6285,7 @@ async function main() {
     "embed-youtube": [
       "editorReady", "embedButtonVisible", "iframeInserted",
       "srcRewrittenToEmbed", "sandboxAllowsScripts",
-      "referrerNoReferrer", "loadingLazy",
+      "referrerPolicyCorrect", "loadingLazy",
       "wrapperContenteditableFalse",
     ],
     "bulk-delete": [

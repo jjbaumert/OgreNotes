@@ -976,6 +976,133 @@ mod tests {
     }
 
     #[test]
+    fn user_from_item_round_trips_fully_populated_user() {
+        // One pass over the fully-populated shape: every optional
+        // attribute written by user_to_item must decode back
+        // identically. Catches an encode/decode drift on any single
+        // field even without a focused test for it.
+        use crate::models::user::{AskPolicy, EncryptedString, ThemePref, UiPrefs, UserStatus};
+        let mut user = sample_user();
+        user.avatar_url = Some("https://example.com/a.png".to_string());
+        user.provider = AuthProvider::Github;
+        user.provider_subject_id = Some("gh-12345".to_string());
+        user.archive_folder_id = Some("f-arch".to_string());
+        user.pinned_folder_id = Some("f-pin".to_string());
+        user.default_workspace_id = Some("ws-1".to_string());
+        user.mfa_secret = Some(EncryptedString {
+            nonce: "bm9uY2U".to_string(),
+            ct: "Y2lwaGVydGV4dA".to_string(),
+        });
+        user.mfa_enrolled_at = Some(1_700_000_000_000_000);
+        user.external_id = Some("scim-42".to_string());
+        user.role = UserRole::Admin;
+        user.is_disabled = true;
+        user.ask_policy = Some(AskPolicy::SystemOnly);
+        user.ui_prefs = Some(UiPrefs {
+            theme: Some(ThemePref::Dark),
+            doc_theme: Some("editorial".to_string()),
+            dyslexic_font: Some(true),
+            reduce_motion: None,
+            locale: Some("en-US".to_string()),
+        });
+        user.status = Some(UserStatus {
+            text: "afk".to_string(),
+            emoji: None,
+            expires_at: None,
+        });
+        user.last_active_at = 1_700_000_000_000_001;
+
+        let back = user_from_item(&user_to_item(&user)).expect("from_item");
+        assert_eq!(back, user);
+    }
+
+    #[test]
+    fn user_from_item_defaults_absent_provider_to_unknown() {
+        // Legacy rows written before provider tracking carry no
+        // `provider` attribute; they must decode as Unknown (the
+        // "accept and upgrade" state), not fail.
+        let mut item = user_to_item(&sample_user());
+        item.remove("provider");
+        let back = user_from_item(&item).expect("from_item");
+        assert_eq!(back.provider, AuthProvider::Unknown);
+    }
+
+    #[test]
+    fn user_from_item_corrupt_ui_prefs_degrades_to_none() {
+        // Documented graceful-degrade posture: a corrupted prefs blob
+        // must read as None (defaults) rather than block login.
+        let mut item = user_to_item(&sample_user());
+        item.insert("ui_prefs".to_string(), AttributeValue::S("{broken".to_string()));
+        let back = user_from_item(&item).expect("from_item");
+        assert!(back.ui_prefs.is_none());
+    }
+
+    #[test]
+    fn user_from_item_reads_legacy_ask_enabled_bool() {
+        // #148 pre-migration row: no ask_policy attribute, legacy
+        // `ask_enabled: true` Bool. Decode must populate
+        // legacy_ask_enabled so the ask_policy() getter derives
+        // SystemOrByok (the pre-migration behavior).
+        use crate::models::user::AskPolicy;
+        let mut item = user_to_item(&sample_user());
+        assert!(!item.contains_key("ask_policy"));
+        item.insert("ask_enabled".to_string(), AttributeValue::Bool(true));
+        let back = user_from_item(&item).expect("from_item");
+        assert!(back.ask_policy.is_none());
+        assert!(back.legacy_ask_enabled);
+        assert_eq!(back.ask_policy(), AskPolicy::SystemOrByok);
+    }
+
+    #[test]
+    fn user_to_item_round_trips_every_ask_policy() {
+        use crate::models::user::AskPolicy;
+        for policy in [
+            AskPolicy::Disabled,
+            AskPolicy::SystemOnly,
+            AskPolicy::SystemOrByok,
+        ] {
+            let mut user = sample_user();
+            user.ask_policy = Some(policy);
+            let back = user_from_item(&user_to_item(&user))
+                .unwrap_or_else(|e| panic!("roundtrip failed for {policy:?}: {e}"));
+            assert_eq!(back.ask_policy, Some(policy));
+        }
+    }
+
+    #[test]
+    fn user_to_item_mfa_secret_is_a_self_describing_map() {
+        // The encrypted secret is stored as an M AttributeValue with
+        // {nonce, ct} keys (not an opaque string) — pinned because
+        // both this writer and set_mfa_secret must produce the same
+        // shape user_from_item reads.
+        use crate::models::user::EncryptedString;
+        let mut user = sample_user();
+        user.mfa_secret = Some(EncryptedString {
+            nonce: "n1".to_string(),
+            ct: "c1".to_string(),
+        });
+        let item = user_to_item(&user);
+        let m = item
+            .get("mfa_secret")
+            .and_then(|v| v.as_m().ok())
+            .expect("mfa_secret must be an M attribute");
+        assert_eq!(m.get("nonce").and_then(|v| v.as_s().ok()).map(String::as_str), Some("n1"));
+        assert_eq!(m.get("ct").and_then(|v| v.as_s().ok()).map(String::as_str), Some("c1"));
+        let back = user_from_item(&item).expect("from_item");
+        assert_eq!(back.mfa_secret, user.mfa_secret);
+    }
+
+    #[test]
+    fn user_to_item_is_disabled_false_is_sparse() {
+        // `is_disabled: false` writes no attribute (the shape every
+        // healthy row has); absence decodes to false/enabled.
+        let item = user_to_item(&sample_user());
+        assert!(!item.contains_key("is_disabled"));
+        let back = user_from_item(&item).expect("from_item");
+        assert!(!back.is_disabled);
+    }
+
+    #[test]
     fn user_from_item_reports_invalid_role_distinctly_from_missing() {
         // A corrupt or future-tier value should NOT surface as `MissingField("role")`
         // — that would mislead an operator into re-running a backfill that

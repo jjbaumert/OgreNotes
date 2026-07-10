@@ -66,3 +66,53 @@ pub mod histogram {
         global().histogram_record(key, value);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests exercise the public facade against the process-global
+    // recorder — the path every instrumentation call site in the workspace
+    // actually uses. Metric names are unique to this module so parallel
+    // tests sharing the global recorder cannot interfere.
+
+    #[test]
+    fn facade_counter_inc_and_add_reach_global_recorder() {
+        let key = MetricKey::new("facade_test.counter_total", &[]);
+        counter::inc(key.clone());
+        counter::add(key.clone(), 4);
+        let snap = snapshot();
+        assert_eq!(snap.counters["facade_test.counter_total"], 5);
+    }
+
+    #[test]
+    fn facade_gauge_set_and_add_reach_global_recorder() {
+        let key = MetricKey::new("facade_test.gauge", &[]);
+        gauge::set(key.clone(), 10);
+        gauge::add(key.clone(), -3);
+        let snap = snapshot();
+        assert_eq!(snap.gauges["facade_test.gauge"], 7);
+    }
+
+    #[test]
+    fn facade_histogram_record_reaches_global_recorder() {
+        let key = MetricKey::new("facade_test.hist_ms", &[]);
+        histogram::record(key.clone(), 2.0);
+        histogram::record(key.clone(), 8.0);
+        let snap = snapshot();
+        let h = &snap.histograms["facade_test.hist_ms"];
+        assert_eq!(h.count, 2);
+        assert_eq!(h.sum, 10.0);
+    }
+
+    #[test]
+    fn init_is_idempotent_and_preserves_state() {
+        // init() after the global is already populated must not wipe
+        // previously recorded metrics (OnceLock::set is a no-op then).
+        let key = MetricKey::new("facade_test.init_total", &[]);
+        counter::inc(key.clone());
+        init();
+        let snap = snapshot();
+        assert_eq!(snap.counters["facade_test.init_total"], 1);
+    }
+}

@@ -211,3 +211,112 @@ mod tests {
         }
     }
 }
+
+// ─── Coverage-gap tests: LiveAppValidationMode + violation emission ──
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    fn violation(field: &'static str) -> LiveAppViolation {
+        LiveAppViolation {
+            node_type: NodeType::KanbanCard,
+            field: Cow::Borrowed(field),
+            reason: "test reason".to_string(),
+            block_id: None,
+        }
+    }
+
+    /// Env-var parsing: `off` and `reject` opt in explicitly;
+    /// everything else — including unset and typos — falls back to
+    /// `Log`, the observability-preserving rollout default.
+    #[test]
+    fn validation_mode_env_parse() {
+        assert_eq!(
+            LiveAppValidationMode::from_env_value(Some("off")),
+            LiveAppValidationMode::Off
+        );
+        assert_eq!(
+            LiveAppValidationMode::from_env_value(Some("reject")),
+            LiveAppValidationMode::Reject
+        );
+        assert_eq!(
+            LiveAppValidationMode::from_env_value(Some("log")),
+            LiveAppValidationMode::Log
+        );
+        // Case-insensitive and whitespace-tolerant.
+        assert_eq!(
+            LiveAppValidationMode::from_env_value(Some("REJECT")),
+            LiveAppValidationMode::Reject
+        );
+        assert_eq!(
+            LiveAppValidationMode::from_env_value(Some("  off  ")),
+            LiveAppValidationMode::Off
+        );
+        // Unknown values and unset must be Log, not Off — a config
+        // typo should never silently disable the gate.
+        assert_eq!(
+            LiveAppValidationMode::from_env_value(Some("garbage")),
+            LiveAppValidationMode::Log
+        );
+        assert_eq!(
+            LiveAppValidationMode::from_env_value(None),
+            LiveAppValidationMode::Log
+        );
+    }
+
+    /// Reject mode returns the FIRST violation so callers can shape
+    /// a deterministic error message out of a multi-violation batch.
+    #[test]
+    fn emit_reject_returns_first_violation() {
+        let violations = vec![violation("color"), violation("title")];
+        let got = emit_violations_and_should_reject(
+            &violations,
+            LiveAppValidationMode::Reject,
+            &[("path", "test")],
+        );
+        let first = got.expect("Reject mode must return a violation");
+        assert_eq!(first.field, "color");
+    }
+
+    /// Log and Off both apply the update — neither returns a
+    /// violation for the caller to reject on.
+    #[test]
+    fn emit_log_and_off_return_none() {
+        let violations = vec![violation("color")];
+        assert!(emit_violations_and_should_reject(
+            &violations,
+            LiveAppValidationMode::Log,
+            &[],
+        )
+        .is_none());
+        assert!(emit_violations_and_should_reject(
+            &violations,
+            LiveAppValidationMode::Off,
+            &[],
+        )
+        .is_none());
+    }
+
+    /// An empty violation batch never rejects, even in Reject mode.
+    #[test]
+    fn emit_reject_with_no_violations_returns_none() {
+        assert!(emit_violations_and_should_reject(
+            &[],
+            LiveAppValidationMode::Reject,
+            &[],
+        )
+        .is_none());
+    }
+
+    /// Kanban lookup parity with the sibling module's calendar and
+    /// mermaid checks: the board type resolves to the block owning
+    /// the column and card types too.
+    #[test]
+    fn block_for_kanban_resolves_to_kanban_block() {
+        let b = block_for(NodeType::Kanban).expect("Kanban has a block");
+        assert!(b.node_types().contains(&NodeType::KanbanColumn));
+        assert!(b.node_types().contains(&NodeType::KanbanCard));
+    }
+}

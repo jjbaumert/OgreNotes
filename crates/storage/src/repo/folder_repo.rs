@@ -387,3 +387,182 @@ fn folder_child_from_item(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::InheritMode;
+
+    fn folder_fixture() -> Folder {
+        Folder {
+            folder_id: "f1".to_string(),
+            title: "My Folder".to_string(),
+            color: 4,
+            parent_id: Some("f0".to_string()),
+            owner_id: "u1".to_string(),
+            folder_type: FolderType::User,
+            inherit_mode: InheritMode::Inherit,
+            created_at: 100,
+            updated_at: 200,
+        }
+    }
+
+    #[test]
+    fn folder_round_trips_through_item() {
+        let folder = folder_fixture();
+        let back = folder_from_item(&folder_to_item(&folder)).expect("from_item");
+        assert_eq!(back, folder);
+    }
+
+    #[test]
+    fn folder_default_inherit_mode_is_sparse_and_decodes_as_inherit() {
+        // Sparse invariant: Inherit (the default) writes no attribute
+        // — the shape every pre-inherit-mode row has — and absence
+        // decodes back to Inherit.
+        let item = folder_to_item(&folder_fixture());
+        assert!(
+            !item.contains_key("inherit_mode"),
+            "Inherit (default) must not write an attribute"
+        );
+        let back = folder_from_item(&item).expect("from_item");
+        assert_eq!(back.inherit_mode, InheritMode::Inherit);
+    }
+
+    #[test]
+    fn folder_restricted_inherit_mode_round_trips() {
+        // Restricted is the permission-tightening state; losing it on
+        // read would silently re-open a folder to parent members.
+        let mut folder = folder_fixture();
+        folder.inherit_mode = InheritMode::Restricted;
+        let item = folder_to_item(&folder);
+        assert!(item.contains_key("inherit_mode"));
+        let back = folder_from_item(&item).expect("from_item");
+        assert_eq!(back.inherit_mode, InheritMode::Restricted);
+    }
+
+    #[test]
+    fn folder_without_parent_decodes_none() {
+        let mut folder = folder_fixture();
+        folder.parent_id = None;
+        let item = folder_to_item(&folder);
+        assert!(!item.contains_key("parent_id"));
+        let back = folder_from_item(&item).expect("from_item");
+        assert_eq!(back.parent_id, None);
+    }
+
+    #[test]
+    fn folder_system_type_round_trips_and_unknown_type_errors() {
+        let mut folder = folder_fixture();
+        folder.folder_type = FolderType::System;
+        let back = folder_from_item(&folder_to_item(&folder)).expect("from_item");
+        assert_eq!(back.folder_type, FolderType::System);
+
+        let mut item = folder_to_item(&folder_fixture());
+        item.insert("folder_type".to_string(), AttributeValue::S("shared".to_string()));
+        match folder_from_item(&item) {
+            Err(RepoError::MissingField(msg)) => {
+                assert!(msg.contains("folder_type"), "must name the field: {msg}")
+            }
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folder_missing_or_garbage_color_decodes_as_zero() {
+        // Color is cosmetic; a legacy row without it (or with a
+        // non-u8 value) degrades to 0 rather than failing decode.
+        let mut item = folder_to_item(&folder_fixture());
+        item.remove("color");
+        assert_eq!(folder_from_item(&item).expect("from_item").color, 0);
+
+        let mut item = folder_to_item(&folder_fixture());
+        item.insert("color".to_string(), AttributeValue::N("999".to_string()));
+        assert_eq!(folder_from_item(&item).expect("from_item").color, 0);
+    }
+
+    /// Mimic `add_member`'s column construction (no live table).
+    fn member_item(level: &AccessLevel) -> HashMap<String, AttributeValue> {
+        let member = FolderMember {
+            folder_id: "f1".to_string(),
+            user_id: "u2".to_string(),
+            access_level: level.clone(),
+            added_at: 42,
+        };
+        let mut item = HashMap::new();
+        item.insert("PK".to_string(), AttributeValue::S(member.pk()));
+        item.insert("SK".to_string(), AttributeValue::S(member.sk()));
+        item.insert(
+            "access_level".to_string(),
+            AttributeValue::S(
+                serde_json::to_string(&member.access_level)
+                    .unwrap()
+                    .trim_matches('"')
+                    .to_string(),
+            ),
+        );
+        item.insert("added_at".to_string(), AttributeValue::N(member.added_at.to_string()));
+        item.insert("user_id".to_string(), AttributeValue::S(member.user_id.clone()));
+        item
+    }
+
+    #[test]
+    fn folder_member_access_level_round_trips_for_every_level() {
+        // Access levels are stored as the UPPERCASE serde tags
+        // ("OWN"/"EDIT"/"COMMENT"/"VIEW"). Losing or misreading one
+        // is a permission bug, so all four are pinned.
+        for level in [
+            AccessLevel::Own,
+            AccessLevel::Edit,
+            AccessLevel::Comment,
+            AccessLevel::View,
+        ] {
+            let back = folder_member_from_item(&member_item(&level), "f1")
+                .unwrap_or_else(|e| panic!("roundtrip failed for {level:?}: {e}"));
+            assert_eq!(back.access_level, level);
+            assert_eq!(back.folder_id, "f1");
+            assert_eq!(back.user_id, "u2");
+        }
+    }
+
+    #[test]
+    fn folder_member_unknown_access_level_errors() {
+        let mut item = member_item(&AccessLevel::View);
+        item.insert("access_level".to_string(), AttributeValue::S("SUDO".to_string()));
+        match folder_member_from_item(&item, "f1") {
+            Err(RepoError::MissingField(msg)) => {
+                assert!(msg.contains("access_level"), "must name the field: {msg}")
+            }
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folder_child_round_trips_both_child_types() {
+        // Mimic `add_child`'s column construction.
+        for ct in [ChildType::Doc, ChildType::Folder] {
+            let child = FolderChild {
+                folder_id: "f1".to_string(),
+                child_id: "c1".to_string(),
+                child_type: ct.clone(),
+                added_at: 42,
+            };
+            let mut item = HashMap::new();
+            item.insert("PK".to_string(), AttributeValue::S(child.pk()));
+            item.insert("SK".to_string(), AttributeValue::S(child.sk()));
+            item.insert(
+                "child_type".to_string(),
+                AttributeValue::S(
+                    serde_json::to_string(&child.child_type)
+                        .unwrap()
+                        .trim_matches('"')
+                        .to_string(),
+                ),
+            );
+            item.insert("added_at".to_string(), AttributeValue::N(child.added_at.to_string()));
+            item.insert("child_id".to_string(), AttributeValue::S(child.child_id.clone()));
+            let back = folder_child_from_item(&item, "f1")
+                .unwrap_or_else(|e| panic!("roundtrip failed for {ct:?}: {e}"));
+            assert_eq!(back, child);
+        }
+    }
+}
+

@@ -152,3 +152,67 @@ fn session_from_item(item: &HashMap<String, AttributeValue>) -> Result<Session, 
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(device_info: Option<String>) -> Session {
+        Session {
+            user_id: "u1".to_string(),
+            session_id: "s1".to_string(),
+            refresh_token_hash: "sha256:abc".to_string(),
+            expires_at: 1_700_000_000_000_000,
+            device_info,
+            created_at: 1_699_999_999_000_000,
+        }
+    }
+
+    #[test]
+    fn to_item_from_item_round_trips_with_device_info() {
+        let session = fixture(Some("Chrome/Linux".to_string()));
+        let back = session_from_item(&session_to_item(&session)).expect("from_item");
+        assert_eq!(back, session);
+    }
+
+    #[test]
+    fn device_info_is_sparse_and_decodes_as_none() {
+        // `device_info: None` must not write an attribute, and a row
+        // without one must decode back to None — the shape every
+        // pre-device-tracking session row has.
+        let session = fixture(None);
+        let item = session_to_item(&session);
+        assert!(
+            !item.contains_key("device_info"),
+            "None device_info must not write an attribute"
+        );
+        let back = session_from_item(&item).expect("from_item");
+        assert_eq!(back, session);
+    }
+
+    #[test]
+    fn missing_refresh_token_hash_errors() {
+        // The token hash is the session's whole reason to exist; a row
+        // without it must fail decode, not come back with a default
+        // that could never verify (or worse, always "verify").
+        let mut item = session_to_item(&fixture(None));
+        item.remove("refresh_token_hash");
+        match session_from_item(&item) {
+            Err(RepoError::MissingField(f)) => assert_eq!(f, "refresh_token_hash"),
+            other => panic!("expected MissingField(refresh_token_hash), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_expires_at_errors() {
+        // A session that can't report its expiry must not decode —
+        // is_expired() on a defaulted 0 would read as always-expired
+        // (fail-safe) but hides the data-loss; surface it instead.
+        let mut item = session_to_item(&fixture(None));
+        item.remove("expires_at");
+        match session_from_item(&item) {
+            Err(RepoError::MissingField(f)) => assert_eq!(f, "expires_at"),
+            other => panic!("expected MissingField(expires_at), got {other:?}"),
+        }
+    }
+}
+

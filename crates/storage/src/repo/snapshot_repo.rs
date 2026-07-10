@@ -72,3 +72,58 @@ fn snapshot_from_item(item: &HashMap<String, AttributeValue>) -> Result<DocSnaps
         created_at: get_n(item, "created_at")?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> DocSnapshot {
+        DocSnapshot {
+            doc_id: "doc1".to_string(),
+            version: 5,
+            s3_key: "docs/doc1/snapshots/5.bin".to_string(),
+            size_bytes: 1024,
+            user_id: "u1".to_string(),
+            created_at: 1_700_000_000_000_000,
+        }
+    }
+
+    /// Mimic `create`'s column construction (no live table).
+    fn item_for(snap: &DocSnapshot) -> HashMap<String, AttributeValue> {
+        let mut item = HashMap::new();
+        item.insert("PK".to_string(), AttributeValue::S(snap.pk()));
+        item.insert("SK".to_string(), AttributeValue::S(snap.sk()));
+        item.insert("doc_id".to_string(), AttributeValue::S(snap.doc_id.clone()));
+        item.insert("version".to_string(), AttributeValue::N(snap.version.to_string()));
+        item.insert("s3_key".to_string(), AttributeValue::S(snap.s3_key.clone()));
+        item.insert("size_bytes".to_string(), AttributeValue::N(snap.size_bytes.to_string()));
+        item.insert("user_id".to_string(), AttributeValue::S(snap.user_id.clone()));
+        item.insert("created_at".to_string(), AttributeValue::N(snap.created_at.to_string()));
+        item
+    }
+
+    #[test]
+    fn from_item_round_trips_create_shape() {
+        let snap = fixture();
+        let back = snapshot_from_item(&item_for(&snap)).expect("from_item");
+        assert_eq!(back.doc_id, snap.doc_id);
+        assert_eq!(back.version, snap.version);
+        assert_eq!(back.s3_key, snap.s3_key);
+        assert_eq!(back.size_bytes, snap.size_bytes);
+        assert_eq!(back.user_id, snap.user_id);
+        assert_eq!(back.created_at, snap.created_at);
+    }
+
+    #[test]
+    fn missing_s3_key_errors() {
+        // The row's whole purpose is pointing at the blob; a row
+        // without the pointer must fail decode, not come back with an
+        // empty key that get_object would treat as a real path.
+        let mut item = item_for(&fixture());
+        item.remove("s3_key");
+        match snapshot_from_item(&item) {
+            Err(RepoError::MissingField(f)) => assert_eq!(f, "s3_key"),
+            other => panic!("expected MissingField(s3_key), got {other:?}"),
+        }
+    }
+}

@@ -765,3 +765,287 @@ fn read_receipt_from_item(
         last_read_at: get_n(item, "last_read_at")?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::thread::{Mention, MentionType, MessagePart, PartStyle};
+
+    fn thread_fixture() -> Thread {
+        Thread {
+            thread_id: "t1".to_string(),
+            doc_id: "doc1".to_string(),
+            thread_type: ThreadType::Chat,
+            status: ThreadStatus::Open,
+            created_by: "u1".to_string(),
+            title: Some("Team chat".to_string()),
+            member_ids: vec!["u1".to_string(), "u2".to_string()],
+            block_id: Some("blk-1".to_string()),
+            anchor_start: Some(3),
+            anchor_end: Some(17),
+            created_at: 100,
+            updated_at: 200,
+        }
+    }
+
+    /// Mimic `create_thread`'s column construction (no live table),
+    /// including its conditional writes for the optional fields.
+    fn thread_item(thread: &Thread) -> HashMap<String, AttributeValue> {
+        let mut item = HashMap::new();
+        item.insert("PK".to_string(), AttributeValue::S(thread.pk()));
+        item.insert("SK".to_string(), AttributeValue::S(thread.sk()));
+        item.insert("doc_id".to_string(), AttributeValue::S(thread.doc_id.clone()));
+        item.insert(
+            "thread_type".to_string(),
+            AttributeValue::S(
+                serde_json::to_string(&thread.thread_type).unwrap().trim_matches('"').to_string(),
+            ),
+        );
+        item.insert(
+            "status".to_string(),
+            AttributeValue::S(
+                serde_json::to_string(&thread.status).unwrap().trim_matches('"').to_string(),
+            ),
+        );
+        item.insert("created_by".to_string(), AttributeValue::S(thread.created_by.clone()));
+        if let Some(ref bid) = thread.block_id {
+            item.insert("block_id".to_string(), AttributeValue::S(bid.clone()));
+        }
+        if let Some(start) = thread.anchor_start {
+            item.insert("anchor_start".to_string(), AttributeValue::N(start.to_string()));
+        }
+        if let Some(end) = thread.anchor_end {
+            item.insert("anchor_end".to_string(), AttributeValue::N(end.to_string()));
+        }
+        if let Some(ref title) = thread.title {
+            item.insert("title".to_string(), AttributeValue::S(title.clone()));
+        }
+        if !thread.member_ids.is_empty() {
+            item.insert("member_ids".to_string(), AttributeValue::Ss(thread.member_ids.clone()));
+        }
+        item.insert("created_at".to_string(), AttributeValue::N(thread.created_at.to_string()));
+        item.insert("updated_at".to_string(), AttributeValue::N(thread.updated_at.to_string()));
+        item
+    }
+
+    #[test]
+    fn thread_round_trips_with_all_optional_fields() {
+        let thread = thread_fixture();
+        let back = thread_from_item(&thread_item(&thread), "t1").expect("from_item");
+        assert_eq!(back.thread_id, "t1");
+        assert_eq!(back.doc_id, thread.doc_id);
+        assert_eq!(back.thread_type, thread.thread_type);
+        assert_eq!(back.status, thread.status);
+        assert_eq!(back.created_by, thread.created_by);
+        assert_eq!(back.title, thread.title);
+        assert_eq!(back.member_ids, thread.member_ids);
+        assert_eq!(back.block_id, thread.block_id);
+        assert_eq!(back.anchor_start, thread.anchor_start);
+        assert_eq!(back.anchor_end, thread.anchor_end);
+        assert_eq!(back.created_at, thread.created_at);
+        assert_eq!(back.updated_at, thread.updated_at);
+    }
+
+    #[test]
+    fn thread_minimal_row_decodes_optionals_as_absent() {
+        // An inline-comment row written without title/members/anchors
+        // (the create path omits them) must decode to None / empty,
+        // not error.
+        let mut thread = thread_fixture();
+        thread.thread_type = ThreadType::Inline;
+        thread.title = None;
+        thread.member_ids = Vec::new();
+        thread.block_id = None;
+        thread.anchor_start = None;
+        thread.anchor_end = None;
+        let back = thread_from_item(&thread_item(&thread), "t1").expect("from_item");
+        assert_eq!(back.title, None);
+        assert!(back.member_ids.is_empty());
+        assert_eq!(back.block_id, None);
+        assert_eq!(back.anchor_start, None);
+        assert_eq!(back.anchor_end, None);
+    }
+
+    #[test]
+    fn thread_type_round_trips_for_every_variant() {
+        // create_thread stores the serde tag ("inline" / "document" /
+        // "chat" / "directMessage"); the decoder must accept each one.
+        for tt in [
+            ThreadType::Inline,
+            ThreadType::Document,
+            ThreadType::Chat,
+            ThreadType::DirectMessage,
+        ] {
+            let mut thread = thread_fixture();
+            thread.thread_type = tt.clone();
+            let back = thread_from_item(&thread_item(&thread), "t1")
+                .unwrap_or_else(|e| panic!("roundtrip failed for {tt:?}: {e}"));
+            assert_eq!(back.thread_type, tt);
+        }
+    }
+
+    #[test]
+    fn thread_unknown_type_or_status_errors() {
+        let mut item = thread_item(&thread_fixture());
+        item.insert("thread_type".to_string(), AttributeValue::S("broadcast".to_string()));
+        match thread_from_item(&item, "t1") {
+            Err(RepoError::MissingField(msg)) => {
+                assert!(msg.contains("thread_type"), "must name the field: {msg}")
+            }
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+
+        let mut item = thread_item(&thread_fixture());
+        item.insert("status".to_string(), AttributeValue::S("archived".to_string()));
+        match thread_from_item(&item, "t1") {
+            Err(RepoError::MissingField(msg)) => {
+                assert!(msg.contains("status"), "must name the field: {msg}")
+            }
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    fn message_fixture() -> Message {
+        Message {
+            thread_id: "t1".to_string(),
+            message_id: "m1".to_string(),
+            user_id: "u1".to_string(),
+            content: "hello".to_string(),
+            created_at: 42,
+            updated_at: None,
+            parts: vec![MessagePart {
+                style: PartStyle::Body,
+                text: "hello".to_string(),
+            }],
+            mentions: vec![Mention {
+                mention_type: MentionType::Person,
+                id: "u2".to_string(),
+                label: "Bob".to_string(),
+            }],
+            attachments: vec!["blob-key-1".to_string()],
+        }
+    }
+
+    /// Mimic `add_message`'s column construction (no live table).
+    fn message_item(msg: &Message) -> HashMap<String, AttributeValue> {
+        let mut item = HashMap::new();
+        item.insert("PK".to_string(), AttributeValue::S(msg.pk()));
+        item.insert("SK".to_string(), AttributeValue::S(msg.sk()));
+        item.insert("user_id".to_string(), AttributeValue::S(msg.user_id.clone()));
+        item.insert("content".to_string(), AttributeValue::S(msg.content.clone()));
+        item.insert("message_id".to_string(), AttributeValue::S(msg.message_id.clone()));
+        item.insert("created_at".to_string(), AttributeValue::N(msg.created_at.to_string()));
+        if !msg.parts.is_empty() {
+            item.insert(
+                "parts".to_string(),
+                AttributeValue::S(serde_json::to_string(&msg.parts).unwrap()),
+            );
+        }
+        if !msg.mentions.is_empty() {
+            item.insert(
+                "mentions".to_string(),
+                AttributeValue::S(serde_json::to_string(&msg.mentions).unwrap()),
+            );
+        }
+        if !msg.attachments.is_empty() {
+            item.insert(
+                "attachments".to_string(),
+                AttributeValue::S(serde_json::to_string(&msg.attachments).unwrap()),
+            );
+        }
+        item
+    }
+
+    #[test]
+    fn message_round_trips_parts_mentions_attachments() {
+        let msg = message_fixture();
+        let back = message_from_item(&message_item(&msg), "t1").expect("from_item");
+        assert_eq!(back.message_id, msg.message_id);
+        assert_eq!(back.content, msg.content);
+        assert_eq!(back.parts.len(), 1);
+        assert_eq!(back.parts[0].style, PartStyle::Body);
+        assert_eq!(back.parts[0].text, "hello");
+        assert_eq!(back.mentions.len(), 1);
+        assert_eq!(back.mentions[0].mention_type, MentionType::Person);
+        assert_eq!(back.mentions[0].id, "u2");
+        assert_eq!(back.attachments, vec!["blob-key-1".to_string()]);
+        assert_eq!(back.updated_at, None);
+    }
+
+    #[test]
+    fn message_without_rich_fields_decodes_empty() {
+        // add_message omits parts/mentions/attachments when empty;
+        // the decode must fill empty Vecs, not error.
+        let mut msg = message_fixture();
+        msg.parts = Vec::new();
+        msg.mentions = Vec::new();
+        msg.attachments = Vec::new();
+        let back = message_from_item(&message_item(&msg), "t1").expect("from_item");
+        assert!(back.parts.is_empty());
+        assert!(back.mentions.is_empty());
+        assert!(back.attachments.is_empty());
+    }
+
+    #[test]
+    fn message_corrupt_parts_json_degrades_to_empty() {
+        // Graceful-degrade posture: a corrupt `parts` blob must not
+        // make the whole message unreadable — the plain `content`
+        // column still renders. (The decoder logs and returns empty.)
+        let mut item = message_item(&message_fixture());
+        item.insert("parts".to_string(), AttributeValue::S("{not json".to_string()));
+        let back = message_from_item(&item, "t1").expect("corrupt parts must not fail decode");
+        assert!(back.parts.is_empty());
+        assert_eq!(back.content, "hello", "content survives a corrupt parts blob");
+    }
+
+    #[test]
+    fn message_missing_content_errors() {
+        let mut item = message_item(&message_fixture());
+        item.remove("content");
+        match message_from_item(&item, "t1") {
+            Err(RepoError::MissingField(f)) => assert_eq!(f, "content"),
+            other => panic!("expected MissingField(content), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reaction_round_trips_and_tolerates_missing_user_ids() {
+        // Shape written by add_reaction (ADD user_ids + SET message_id,
+        // emoji).
+        let mut item = HashMap::new();
+        item.insert("message_id".to_string(), AttributeValue::S("m1".to_string()));
+        item.insert("emoji".to_string(), AttributeValue::S("👍".to_string()));
+        item.insert(
+            "user_ids".to_string(),
+            AttributeValue::Ss(vec!["u1".to_string(), "u2".to_string()]),
+        );
+        let back = reaction_from_item(&item, "t1").expect("from_item");
+        assert_eq!(back.thread_id, "t1");
+        assert_eq!(back.message_id, "m1");
+        assert_eq!(back.emoji, "👍");
+        assert_eq!(back.user_ids, vec!["u1".to_string(), "u2".to_string()]);
+
+        // The narrow race documented on list_reactions_for_thread: a
+        // last-user removal can leave a row whose user_ids attribute
+        // was dropped by DynamoDB. It must decode as empty, not error,
+        // so callers can filter it out.
+        item.remove("user_ids");
+        let back = reaction_from_item(&item, "t1").expect("empty reaction row must decode");
+        assert!(back.user_ids.is_empty());
+    }
+
+    #[test]
+    fn read_receipt_round_trips() {
+        // Shape written by upsert_read_receipt.
+        let mut item = HashMap::new();
+        item.insert("user_id".to_string(), AttributeValue::S("u1".to_string()));
+        item.insert(
+            "last_read_at".to_string(),
+            AttributeValue::N("1700000000000000".to_string()),
+        );
+        let back = read_receipt_from_item(&item, "t1").expect("from_item");
+        assert_eq!(back.thread_id, "t1");
+        assert_eq!(back.user_id, "u1");
+        assert_eq!(back.last_read_at, 1_700_000_000_000_000);
+    }
+}

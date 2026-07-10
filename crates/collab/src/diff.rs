@@ -734,3 +734,234 @@ mod tests {
         assert_eq!(diffs[0].node_type, "heading");
     }
 }
+
+// ─── Coverage-gap tests (additive; see module docs for the contracts
+//     each one pins) ─────────────────────────────────────────────────
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+    use yrs::{
+        types::Attrs,
+        types::xml::{Xml, XmlElementPrelim, XmlFragment, XmlTextPrelim},
+        Text, Transact, WriteTxn,
+    };
+
+    /// One bullet_list (blockId "list-1") whose `items` are
+    /// `(blockId, text)` list_item children.
+    fn list_doc(items: &[(&str, &str)]) -> Doc {
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let frag = txn.get_or_insert_xml_fragment("content");
+            let list = frag.insert(&mut txn, 0, XmlElementPrelim::empty("bullet_list"));
+            list.insert_attribute(&mut txn, "blockId", "list-1");
+            for (i, (id, text)) in items.iter().enumerate() {
+                let li = list.insert(&mut txn, i as u32, XmlElementPrelim::empty("list_item"));
+                li.insert_attribute(&mut txn, "blockId", *id);
+                li.insert(&mut txn, 0, XmlTextPrelim::new(*text));
+            }
+        }
+        doc
+    }
+
+    /// One heading (blockId "h-1") with a `level` attribute.
+    fn heading_doc(level: &str, text: &str) -> Doc {
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let frag = txn.get_or_insert_xml_fragment("content");
+            let el = frag.insert(&mut txn, 0, XmlElementPrelim::empty("heading"));
+            el.insert_attribute(&mut txn, "blockId", "h-1");
+            el.insert_attribute(&mut txn, "level", level);
+            el.insert(&mut txn, 0, XmlTextPrelim::new(text));
+        }
+        doc
+    }
+
+    /// Single paragraph whose text is split into formatted runs —
+    /// same shape as the sibling test module's `doc_with_marked_text`
+    /// (which is private to that module).
+    fn marked_doc(runs: &[(&str, &[(&str, Any)])]) -> Doc {
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let frag = txn.get_or_insert_xml_fragment("content");
+            let el = frag.insert(&mut txn, 0, XmlElementPrelim::empty("paragraph"));
+            el.insert_attribute(&mut txn, "blockId", "id-0");
+            let combined: String = runs.iter().map(|(t, _)| *t).collect();
+            let text = el.insert(&mut txn, 0, XmlTextPrelim::new(combined.as_str()));
+            let mut offset: u32 = 0;
+            for (run_text, run_marks) in runs {
+                let len = run_text.chars().count() as u32;
+                if !run_marks.is_empty() {
+                    let mut attrs = Attrs::new();
+                    for (k, v) in run_marks.iter() {
+                        attrs.insert(std::sync::Arc::from(*k), v.clone());
+                    }
+                    text.format(&mut txn, offset, len, attrs);
+                }
+                offset += len;
+            }
+        }
+        doc
+    }
+
+    /// Find the marks of the run carrying `text` in the doc's single
+    /// paragraph, via the same walker `diff_documents` uses.
+    fn marks_of_run(doc: &Doc, run_text: &str) -> Vec<Mark> {
+        let blocks = extract_blocks(doc);
+        assert_eq!(blocks.len(), 1, "expected a single top-level block");
+        blocks[0]
+            .inline
+            .iter()
+            .find(|r| r.text == run_text)
+            .unwrap_or_else(|| panic!("no run with text {run_text:?} in {blocks:?}"))
+            .marks
+            .clone()
+    }
+
+    /// The module contract: block equality ignores `blockId` at
+    /// every recursion level. Reassigning nested list_item ids
+    /// without touching content must produce an empty diff.
+    #[test]
+    fn nested_child_block_id_reassignment_is_unchanged() {
+        let old = list_doc(&[("li-a", "One"), ("li-b", "Two")]);
+        let new = list_doc(&[("li-x", "One"), ("li-y", "Two")]);
+        assert!(
+            diff_documents(&old, &new).is_empty(),
+            "child blockId reassignment alone must not produce a diff"
+        );
+    }
+
+    /// An attribute-only change (heading level) with identical text
+    /// classifies as Modified, and both attr versions surface in the
+    /// entry's old/new blocks.
+    #[test]
+    fn attr_only_change_is_modified() {
+        let old = heading_doc("1", "Title");
+        let new = heading_doc("2", "Title");
+        let diffs = diff_documents(&old, &new);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].kind, DiffKind::Modified);
+        assert_eq!(diffs[0].blocks[0].attrs.get("level").map(String::as_str), Some("1"));
+        assert_eq!(diffs[0].blocks[1].attrs.get("level").map(String::as_str), Some("2"));
+    }
+
+    /// A change buried in a nested child (list item text) classifies
+    /// the top-level container as Modified and the new child content
+    /// is reachable through the entry's `children`.
+    #[test]
+    fn nested_child_text_change_is_modified_on_parent() {
+        let old = list_doc(&[("li-a", "One"), ("li-b", "Two")]);
+        let new = list_doc(&[("li-a", "One"), ("li-b", "Two changed")]);
+        let diffs = diff_documents(&old, &new);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].kind, DiffKind::Modified);
+        assert_eq!(diffs[0].node_type, "bullet_list");
+        let new_block = &diffs[0].blocks[1];
+        assert_eq!(new_block.children.len(), 2);
+        assert_eq!(new_block.children[1].inline[0].text, "Two changed");
+    }
+
+    /// TextColor and Highlight are loose CRDT-attribute marks outside
+    /// the validated schema, but version-history attribution must
+    /// still recognize them (module docs on `Mark`). Pins the two
+    /// payload-carrying match arms nothing else exercises.
+    #[test]
+    fn text_color_and_highlight_marks_extracted() {
+        let doc = marked_doc(&[
+            ("plain ", &[]),
+            (
+                "colored",
+                &[(
+                    "textColor",
+                    Any::String(std::sync::Arc::from(r##"{"color":"#ff0000"}"##)),
+                )],
+            ),
+            (
+                "highlit",
+                &[(
+                    "highlight",
+                    Any::String(std::sync::Arc::from(r##"{"color":"#ffff00"}"##)),
+                )],
+            ),
+        ]);
+        assert_eq!(
+            marks_of_run(&doc, "colored"),
+            vec![Mark::TextColor { color: "#ff0000".to_string() }]
+        );
+        assert_eq!(
+            marks_of_run(&doc, "highlit"),
+            vec![Mark::Highlight { color: "#ffff00".to_string() }]
+        );
+    }
+
+    /// A link mark whose stored value isn't valid JSON degrades to an
+    /// empty href instead of panicking or dropping the run.
+    #[test]
+    fn malformed_link_json_yields_empty_href() {
+        let doc = marked_doc(&[(
+            "broken",
+            &[("link", Any::String(std::sync::Arc::from("not-json")))],
+        )]);
+        assert_eq!(
+            marks_of_run(&doc, "broken"),
+            vec![Mark::Link { href: String::new() }]
+        );
+    }
+
+    /// The remaining boolean mark arms (underline, strike, code,
+    /// subscript, superscript) each map to their Mark variant. Bold
+    /// and italic are covered by the sibling module's tests.
+    #[test]
+    fn all_boolean_marks_extracted() {
+        let doc = marked_doc(&[
+            ("u", &[("underline", Any::Bool(true))]),
+            ("s", &[("strike", Any::Bool(true))]),
+            ("c", &[("code", Any::Bool(true))]),
+            ("b", &[("subscript", Any::Bool(true))]),
+            ("p", &[("superscript", Any::Bool(true))]),
+        ]);
+        assert_eq!(marks_of_run(&doc, "u"), vec![Mark::Underline]);
+        assert_eq!(marks_of_run(&doc, "s"), vec![Mark::Strike]);
+        assert_eq!(marks_of_run(&doc, "c"), vec![Mark::Code]);
+        assert_eq!(marks_of_run(&doc, "b"), vec![Mark::Subscript]);
+        assert_eq!(marks_of_run(&doc, "p"), vec![Mark::Superscript]);
+    }
+
+    /// Mixed id presence at the same index — one side identified, the
+    /// other legacy-unidentified — is an id mismatch, so it classifies
+    /// as Removed + Added even when the content is identical. (Both-
+    /// None pairs by position; Some-vs-None must not.)
+    #[test]
+    fn mixed_id_presence_at_same_index_is_remove_add() {
+        let with_id = {
+            let doc = Doc::new();
+            {
+                let mut txn = doc.transact_mut();
+                let frag = txn.get_or_insert_xml_fragment("content");
+                let el = frag.insert(&mut txn, 0, XmlElementPrelim::empty("paragraph"));
+                el.insert_attribute(&mut txn, "blockId", "a");
+                el.insert(&mut txn, 0, XmlTextPrelim::new("Same"));
+            }
+            doc
+        };
+        let without_id = {
+            let doc = Doc::new();
+            {
+                let mut txn = doc.transact_mut();
+                let frag = txn.get_or_insert_xml_fragment("content");
+                let el = frag.insert(&mut txn, 0, XmlElementPrelim::empty("paragraph"));
+                el.insert(&mut txn, 0, XmlTextPrelim::new("Same"));
+            }
+            doc
+        };
+        let diffs = diff_documents(&with_id, &without_id);
+        assert_eq!(diffs.len(), 2, "expected Removed + Added, got {diffs:?}");
+        assert_eq!(diffs[0].kind, DiffKind::Removed);
+        assert_eq!(diffs[0].block_id.as_deref(), Some("a"));
+        assert_eq!(diffs[1].kind, DiffKind::Added);
+        assert_eq!(diffs[1].block_id, None);
+    }
+}

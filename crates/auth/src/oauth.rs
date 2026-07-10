@@ -178,4 +178,98 @@ mod tests {
             }
         }
     }
+
+    // ─── Injection resistance, entropy, and algorithm pinning ───────
+
+    #[test]
+    fn authorization_url_resists_parameter_injection() {
+        // Values containing '&' and '=' must arrive percent-encoded so a
+        // malicious value can't smuggle extra query parameters (e.g. a
+        // second redirect_uri) into the authorize request.
+        let pkce = generate_pkce();
+        let url = build_authorization_url(
+            "https://idp.example/authorize",
+            "evil&redirect_uri=https://attacker.example",
+            "http://localhost:3000/cb?x=1&y=2",
+            &pkce,
+            "state&scope=admin",
+            &["user:email"],
+        );
+        let query = url.split_once('?').expect("url has a query").1;
+        // Exactly the 7 parameters we set — nothing smuggled in.
+        assert_eq!(query.split('&').count(), 7, "unexpected params in {url}");
+        assert!(!url.contains("redirect_uri=https://attacker.example"));
+        assert!(url.contains("client_id=evil%26redirect_uri%3D"));
+        assert!(url.contains("state=state%26scope%3Dadmin"));
+    }
+
+    #[test]
+    fn authorization_url_encodes_multi_scope_list() {
+        // Scopes join with a space, which must be %20 in the query, and
+        // the ':' inside each scope must be percent-encoded too.
+        let pkce = generate_pkce();
+        let url = build_authorization_url(
+            "https://idp.example/authorize",
+            "cid",
+            "http://localhost/cb",
+            &pkce,
+            "st",
+            &["user:email", "read:org"],
+        );
+        assert!(url.contains("scope=user%3Aemail%20read%3Aorg"), "got {url}");
+    }
+
+    #[test]
+    fn hash_token_pins_sha256_base64url() {
+        // Known-answer test: hash_token must remain SHA-256 →
+        // base64url-no-pad. Every stored session row depends on this
+        // exact algorithm — an accidental change would invalidate all
+        // refresh-token hashes (mass logout) or silently weaken them.
+        assert_eq!(
+            hash_token("test-token-value"),
+            "vGo0hptylCKH-yD9zgkvw5LpJLTxmGtd-kf7wQHix_s"
+        );
+    }
+
+    #[test]
+    fn state_and_refresh_tokens_are_unique_and_url_safe() {
+        // 32 bytes of fresh randomness per call: consecutive calls must
+        // differ, and the encoding must be strict base64url so the value
+        // is safe in a query string or cookie without further escaping.
+        let (s1, s2) = (generate_state(), generate_state());
+        assert_ne!(s1, s2, "states must not repeat");
+        let (t1, t2) = (generate_refresh_token(), generate_refresh_token());
+        assert_ne!(t1, t2, "refresh tokens must not repeat");
+        for v in [&s1, &s2, &t1, &t2] {
+            assert_eq!(v.len(), 43); // 32 bytes → 43 base64url chars
+            assert!(
+                v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "non-url-safe char in {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn pkce_pairs_are_unique_per_call() {
+        let a = generate_pkce();
+        let b = generate_pkce();
+        assert_ne!(a.code_verifier, b.code_verifier);
+        assert_ne!(a.code_challenge, b.code_challenge);
+        // The challenge is a digest, never the verifier itself.
+        assert_ne!(a.code_verifier, a.code_challenge);
+    }
+
+    #[test]
+    fn verify_state_edge_cases() {
+        // Prefix / suffix near-misses must fail.
+        assert!(!verify_state("abc", "abcd"));
+        assert!(!verify_state("abcd", "abc"));
+        assert!(!verify_state("", "expected"));
+        assert!(!verify_state("received", ""));
+        // Characterization: two empty strings compare equal. Callers
+        // must therefore never map "state missing" to "" on both sides —
+        // the routes layer must reject an absent state before calling
+        // verify_state.
+        assert!(verify_state("", ""));
+    }
 }

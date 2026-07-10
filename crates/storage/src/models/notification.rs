@@ -196,4 +196,64 @@ mod tests {
         let t: NotifType = serde_json::from_str("\"documentopened\"").unwrap();
         assert_eq!(t, NotifType::DocumentOpened);
     }
+
+    #[test]
+    fn notif_pref_pk_sk_format() {
+        // "NOTIF_PREF#…" shares only "NOTIF" with the "NOTIF#" query
+        // prefix — the sixth character ('_' vs '#') keeps pref rows
+        // out of every begins_with(SK, "NOTIF#") query. Load-bearing
+        // for delete_all/mark_all_read: preferences must survive a
+        // clear-all of the notification list.
+        let p = NotifPref {
+            user_id: "u1".to_string(),
+            thread_id: "t1".to_string(),
+            level: NotifLevel::Mute,
+        };
+        assert_eq!(p.pk(), "USER#u1");
+        assert_eq!(p.sk(), "NOTIF_PREF#t1");
+        assert!(
+            !p.sk().starts_with("NOTIF#"),
+            "a NOTIF_PREF row must not match the NOTIF# query prefix"
+        );
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn notif_at(created_at: i64, id: &str) -> Notification {
+        Notification {
+            notif_id: id.to_string(),
+            user_id: "u".to_string(),
+            notif_type: NotifType::Shared,
+            doc_id: None,
+            thread_id: None,
+            actor_id: "a".to_string(),
+            message: String::new(),
+            preview: None,
+            block_id: None,
+            read: false,
+            created_at,
+        }
+    }
+
+    proptest! {
+        /// The 20-digit zero-pad makes lexicographic SK order equal
+        /// numeric timestamp order for every representable non-negative
+        /// timestamp (i64::MAX < 10^20, so the pad never overflows).
+        /// Newest-first listing sorts on this — a violation reorders a
+        /// user's notification feed.
+        #[test]
+        fn sk_lexicographic_order_matches_timestamp_order(
+            a in 0..i64::MAX,
+            b in 0..i64::MAX,
+        ) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            prop_assume!(lo != hi);
+            // Fix the id so ordering is decided purely by timestamp.
+            prop_assert!(notif_at(lo, "x").sk() < notif_at(hi, "x").sk());
+        }
+    }
 }

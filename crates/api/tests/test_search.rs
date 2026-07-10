@@ -302,3 +302,57 @@ async fn test_query_too_long_returns_400() {
 
     app.cleanup().await;
 }
+
+/// Regression: issue #7 — `count=0` used to flow unclamped into
+/// `SearchIndex::search` and panic the handler task via tantivy's
+/// `TopDocs::with_limit >= 1` assert. It must produce a valid response.
+#[tokio::test]
+async fn test_search_count_zero_does_not_panic() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let token = app.create_user_token("countzero@test.com").await;
+    let doc_id = app.create_doc(&token, "Zero Count Doc", None).await;
+
+    upload_content(&app, &token, &doc_id, "unique zerocount keyword quandary").await;
+
+    let (status, json) = app
+        .json_request(
+            Method::GET,
+            "/api/v1/search?q=quandary&count=0",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert!(json["results"].is_array());
+
+    app.cleanup().await;
+}
+
+/// Companion to the count=0 regression: the upper clamp (50) must also
+/// hold — an oversized count is coerced, not an error and not unbounded.
+#[tokio::test]
+async fn test_search_count_above_cap_is_clamped() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let token = app.create_user_token("countcap@test.com").await;
+    let doc_id = app.create_doc(&token, "Cap Doc", None).await;
+
+    upload_content(&app, &token, &doc_id, "unique countcap keyword zephyrblue").await;
+
+    let (status, json) = app
+        .json_request(
+            Method::GET,
+            "/api/v1/search?q=zephyrblue&count=999",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    let results = json["results"].as_array().unwrap();
+    assert!(results.len() <= 50);
+
+    app.cleanup().await;
+}

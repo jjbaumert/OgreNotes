@@ -209,4 +209,75 @@ mod tests {
         let back = from_item(&item).unwrap();
         assert_eq!(back.doc_ids, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
     }
+
+    #[test]
+    fn from_item_corrupt_doc_ids_json_errors() {
+        let mut item = item_for(&fixture());
+        item.insert("doc_ids".to_string(), AttributeValue::S("[broken".to_string()));
+        let err = from_item(&item).expect_err("corrupt doc_ids must error");
+        match err {
+            RepoError::Dynamo(msg) => assert!(msg.contains("doc_ids"), "got: {msg}"),
+            other => panic!("expected Dynamo(decode doc_ids), got {other:?}"),
+        }
+    }
+
+    // ── put() caps (offline — validation bails before any IO) ─────
+
+    fn offline_repo() -> TemplateGalleryRepo {
+        let conf = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .build();
+        let client = aws_sdk_dynamodb::Client::from_conf(conf);
+        TemplateGalleryRepo::new(crate::dynamo::DynamoClient::new(
+            client,
+            "test-table".to_string(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn put_rejects_over_long_name_before_any_io() {
+        // The repo re-enforces the API-layer caps so writers that
+        // bypass the admin route (migrations, maintenance scripts)
+        // can't land a row past the DDB item limit.
+        let repo = offline_repo();
+        let mut gallery = fixture();
+        gallery.name = "x".repeat(MAX_GALLERY_NAME_LEN + 1);
+        let err = repo.put(&gallery).await.expect_err("over-long name must be rejected");
+        match err {
+            RepoError::InvalidArgument(msg) => {
+                assert!(msg.contains("name"), "got: {msg}")
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_accepts_name_at_exactly_the_cap_by_chars_not_bytes() {
+        // The cap counts characters, not bytes — a name of
+        // MAX_GALLERY_NAME_LEN multibyte characters is legal. The
+        // offline client then fails at the network layer with a
+        // Dynamo error, proving validation passed.
+        let repo = offline_repo();
+        let mut gallery = fixture();
+        gallery.name = "é".repeat(MAX_GALLERY_NAME_LEN);
+        let err = repo.put(&gallery).await.expect_err("offline send must fail");
+        match err {
+            RepoError::Dynamo(_) => {} // validation passed, send failed
+            other => panic!("expected Dynamo (send failure), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_rejects_too_many_doc_ids_before_any_io() {
+        let repo = offline_repo();
+        let mut gallery = fixture();
+        gallery.doc_ids = (0..=MAX_GALLERY_DOC_IDS).map(|i| format!("doc-{i}")).collect();
+        let err = repo.put(&gallery).await.expect_err("over-cap doc_ids must be rejected");
+        match err {
+            RepoError::InvalidArgument(msg) => {
+                assert!(msg.contains("templates"), "got: {msg}")
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
 }

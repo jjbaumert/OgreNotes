@@ -31,3 +31,54 @@ impl<S: Subscriber> Layer<S> for LogEventCounterLayer {
         counter::add(MetricKey::new("log.events_total", &[("level", level)]), 1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// Current value of `log.events_total{level=...}` in the global recorder.
+    /// The layer writes to process-global state, so assertions are made on
+    /// before/after deltas to stay robust against other tests in the binary.
+    fn level_count(level: &str) -> u64 {
+        metrics::snapshot()
+            .counters
+            .get(&format!(r#"log.events_total{{level="{level}"}}"#))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn counts_warn_and_error_events_but_not_info() {
+        let warn_before = level_count("warn");
+        let error_before = level_count("error");
+
+        let subscriber = tracing_subscriber::registry().with(LogEventCounterLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!("test warning");
+            tracing::warn!("another warning");
+            tracing::error!("test error");
+            // Below warn — must NOT be counted (volume would dominate).
+            tracing::info!("test info");
+            tracing::debug!("test debug");
+            tracing::trace!("test trace");
+        });
+
+        assert_eq!(
+            level_count("warn") - warn_before,
+            2,
+            "each warn event increments the warn counter exactly once"
+        );
+        assert_eq!(
+            level_count("error") - error_before,
+            1,
+            "each error event increments the error counter exactly once"
+        );
+        assert_eq!(
+            level_count("info"),
+            0,
+            "info events must never mint a level=\"info\" series"
+        );
+    }
+}

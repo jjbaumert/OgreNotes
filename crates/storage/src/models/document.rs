@@ -357,4 +357,191 @@ mod tests {
         assert!(json.contains("\"is_deleted\":true"));
         assert!(json.contains("deleted_at"));
     }
+
+    #[test]
+    fn relation_type_as_str_from_str_round_trips_every_variant() {
+        // from_str is the storage decode path (doc_rel_from_item);
+        // as_str is the encode path. They must stay inverses or
+        // relationship rows silently vanish from listings.
+        for rt in [
+            RelationType::Implements,
+            RelationType::DerivedFrom,
+            RelationType::DependsOn,
+            RelationType::References,
+            RelationType::Supersedes,
+        ] {
+            assert_eq!(RelationType::from_str(rt.as_str()), Some(rt.clone()));
+        }
+        assert_eq!(RelationType::from_str("blames"), None);
+        assert_eq!(RelationType::from_str(""), None);
+    }
+
+    #[test]
+    fn relation_type_as_str_agrees_with_serde_kebab_case() {
+        // The enum carries both a hand-written as_str() and a
+        // kebab-case serde rename. If they drift, the same value
+        // serializes to two different wire strings depending on code
+        // path (same invariant class as models/mod.rs's
+        // as_str_agrees_with_serde).
+        for rt in [
+            RelationType::Implements,
+            RelationType::DerivedFrom,
+            RelationType::DependsOn,
+            RelationType::References,
+            RelationType::Supersedes,
+        ] {
+            let serde_token = serde_json::to_string(&rt)
+                .unwrap()
+                .trim_matches('"')
+                .to_string();
+            assert_eq!(rt.as_str(), serde_token, "drift on {rt:?}");
+        }
+    }
+
+    #[test]
+    fn doc_relationship_forward_and_reverse_keys() {
+        let rel = DocRelationship {
+            source_doc_id: "src".to_string(),
+            target_doc_id: "dst".to_string(),
+            relation_type: RelationType::DependsOn,
+            created_by: "u1".to_string(),
+            created_at: 0,
+        };
+        assert_eq!(rel.pk(), "DOC#src");
+        assert_eq!(rel.sk(), "REL#depends-on#dst");
+        assert_eq!(rel.reverse_pk(), "DOC#dst");
+        assert_eq!(rel.reverse_sk(), "RREL#depends-on#src");
+    }
+
+    #[test]
+    fn doc_update_pk_sk_format() {
+        let upd = DocUpdate {
+            doc_id: "doc1".to_string(),
+            clock: "000042-client7".to_string(),
+            update_bytes: vec![],
+            user_id: "u1".to_string(),
+            created_at: 0,
+            client_version: None,
+        };
+        assert_eq!(upd.pk(), "DOC#doc1");
+        assert_eq!(upd.sk(), "UPDATE#000042-client7");
+    }
+
+    #[test]
+    fn doc_open_favorite_key_formats() {
+        let open = DocOpen {
+            doc_id: "doc1".to_string(),
+            user_id: "u1".to_string(),
+            first_opened_at: 0,
+        };
+        assert_eq!(open.pk(), "DOC#doc1");
+        assert_eq!(open.sk(), "OPEN#u1");
+
+        // #144: favorites hang off the USER# partition, not DOC#.
+        let fav = Favorite {
+            user_id: "u1".to_string(),
+            doc_id: "doc1".to_string(),
+            added_at: 0,
+        };
+        assert_eq!(fav.pk(), "USER#u1");
+        assert_eq!(fav.sk(), "FAV#doc1");
+    }
+
+    #[test]
+    fn collection_key_formats_and_prefix_consistency() {
+        // #144: the repo queries collections by Collection::SK_PREFIX
+        // and membership rows by CollectionItem::sk_prefix(id) /
+        // SK_PREFIX_ALL. Each sk() must start with its query prefix or
+        // the corresponding listing returns nothing.
+        let coll = Collection {
+            user_id: "u1".to_string(),
+            collection_id: "c1".to_string(),
+            name: "Reading list".to_string(),
+            created_at: 0,
+        };
+        assert_eq!(coll.pk(), "USER#u1");
+        assert_eq!(coll.sk(), "COLLECTION#c1");
+        assert!(coll.sk().starts_with(Collection::SK_PREFIX));
+
+        let item = CollectionItem {
+            user_id: "u1".to_string(),
+            collection_id: "c1".to_string(),
+            doc_id: "doc1".to_string(),
+            added_at: 0,
+        };
+        assert_eq!(item.pk(), "USER#u1");
+        assert_eq!(item.sk(), "COLLITEM#c1#doc1");
+        assert!(item.sk().starts_with(&CollectionItem::sk_prefix("c1")));
+        assert!(item.sk().starts_with(CollectionItem::SK_PREFIX_ALL));
+        assert_eq!(CollectionItem::sk_prefix("c1"), "COLLITEM#c1#");
+    }
+
+    #[test]
+    fn collection_item_prefix_cannot_match_sibling_collection() {
+        // The per-collection prefix ends with '#'. Without it, listing
+        // collection "c1" would also match rows of a collection named
+        // "c10" — a cross-collection leak.
+        let in_c10 = CollectionItem {
+            user_id: "u1".to_string(),
+            collection_id: "c10".to_string(),
+            doc_id: "doc1".to_string(),
+            added_at: 0,
+        };
+        assert!(!in_c10.sk().starts_with(&CollectionItem::sk_prefix("c1")));
+    }
+
+    #[test]
+    fn doc_update_bytes_json_round_trip_is_base64() {
+        // DocUpdate.update_bytes serializes via the local serde_bytes
+        // shim as a base64 string (CRDT payloads are binary). Pin
+        // both the encoding and the round trip.
+        let upd = DocUpdate {
+            doc_id: "d".to_string(),
+            clock: "c".to_string(),
+            update_bytes: vec![0, 1, 2, 255, 254, 253],
+            user_id: "u".to_string(),
+            created_at: 0,
+            client_version: Some("1.2.3".to_string()),
+        };
+        let json = serde_json::to_string(&upd).unwrap();
+        assert!(
+            json.contains("\"update_bytes\":\"AAEC//79\""),
+            "expected standard-base64 payload, got {json}"
+        );
+        let back: DocUpdate = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.update_bytes, upd.update_bytes);
+        assert_eq!(back.client_version, upd.client_version);
+    }
+
+    #[test]
+    fn doc_update_bytes_rejects_invalid_base64() {
+        let json = r#"{"doc_id":"d","clock":"c","update_bytes":"@@not-base64@@","user_id":"u","created_at":0}"#;
+        assert!(serde_json::from_str::<DocUpdate>(json).is_err());
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Any byte payload survives the base64 serde shim. The CRDT
+        /// op-log depends on this codec being lossless for arbitrary
+        /// binary — a single corrupted byte breaks Y.Doc replay.
+        #[test]
+        fn doc_update_bytes_round_trip_any_payload(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let upd = DocUpdate {
+                doc_id: "d".to_string(),
+                clock: "c".to_string(),
+                update_bytes: bytes.clone(),
+                user_id: "u".to_string(),
+                created_at: 0,
+                client_version: None,
+            };
+            let json = serde_json::to_string(&upd).unwrap();
+            let back: DocUpdate = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(back.update_bytes, bytes);
+        }
+    }
 }

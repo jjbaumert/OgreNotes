@@ -276,4 +276,69 @@ mod tests {
         let t: ThreadType = serde_json::from_str("\"directmessage\"").unwrap();
         assert_eq!(t, ThreadType::DirectMessage);
     }
+
+    #[test]
+    fn reaction_pk_sk_format() {
+        // SK embeds both the message and the emoji so one row exists
+        // per (message, emoji) pair with a user-id set inside.
+        let r = Reaction {
+            thread_id: "t1".to_string(),
+            message_id: "m1".to_string(),
+            emoji: "👍".to_string(),
+            user_ids: vec!["u1".to_string()],
+        };
+        assert_eq!(r.pk(), "THREAD#t1");
+        assert_eq!(r.sk(), "REACTION#m1#👍");
+    }
+
+    #[test]
+    fn read_receipt_pk_sk_format() {
+        let rr = ReadReceipt {
+            thread_id: "t1".to_string(),
+            user_id: "u1".to_string(),
+            last_read_at: 0,
+        };
+        assert_eq!(rr.pk(), "THREAD#t1");
+        assert_eq!(rr.sk(), "READ#u1");
+    }
+
+    #[test]
+    fn thread_status_serializes_lowercase() {
+        assert_eq!(serde_json::to_string(&ThreadStatus::Open).unwrap(), "\"open\"");
+        assert_eq!(
+            serde_json::to_string(&ThreadStatus::Resolved).unwrap(),
+            "\"resolved\""
+        );
+    }
+
+    #[test]
+    fn mention_uses_camel_case_on_the_wire() {
+        // The API surface promises `mentionType`, not `mention_type`
+        // (see the type's doc comment).
+        let m = Mention {
+            mention_type: MentionType::Document,
+            id: "doc1".to_string(),
+            label: "Spec".to_string(),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"mentionType\":\"document\""), "got {json}");
+        assert!(!json.contains("mention_type"), "snake_case leaked: {json}");
+        let back: Mention = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mention_type, MentionType::Document);
+        assert_eq!(back.id, "doc1");
+    }
+
+    #[test]
+    fn part_style_serializes_lowercase() {
+        // MessagePart blobs are stored as JSON strings on the MSG#
+        // row; the lowercase tags are the stored wire shape.
+        for (style, tag) in [
+            (PartStyle::Body, "\"body\""),
+            (PartStyle::System, "\"system\""),
+            (PartStyle::Monospace, "\"monospace\""),
+            (PartStyle::Status, "\"status\""),
+        ] {
+            assert_eq!(serde_json::to_string(&style).unwrap(), tag);
+        }
+    }
 }
