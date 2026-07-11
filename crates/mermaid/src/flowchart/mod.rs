@@ -1,6 +1,8 @@
 pub(crate) mod parse;
 pub(crate) mod shapes;
 pub(crate) mod svg;
+#[cfg(test)]
+mod props;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShapeKind {
