@@ -1,7 +1,8 @@
-//! Sequence-diagram parser. Line-oriented; ids are ASCII word chars
-//! (char count == byte length — do not relax without a byte-position
-//! scan); arrows matched longest-first; caps enforced inline so work
-//! is bounded before layout.
+//! Sequence-diagram parser. Line-oriented; each line splits on `;` into
+//! statements (entity-code tokens like `#59;` excepted); ids are ASCII
+//! word chars (char count == byte length — do not relax without a
+//! byte-position scan); arrows matched longest-first; caps enforced
+//! inline so work is bounded before layout.
 
 use crate::sequence::{
     Event, FragmentKind, Head, LineStyle, NotePlacement, Participant, SeqDiagram,
@@ -33,15 +34,20 @@ pub(crate) fn parse(source: &str) -> Result<SeqDiagram, ParseError> {
         if line.is_empty() || line.starts_with("%%") {
             continue;
         }
-        if !seen_header {
-            let header = line.strip_suffix(';').unwrap_or(line).trim_end();
-            if header != "sequenceDiagram" {
-                return Err(p.err("sequence diagram must start with `sequenceDiagram`"));
+        for stmt in split_statements(line) {
+            let stmt = stmt.trim();
+            if stmt.is_empty() {
+                continue;
             }
-            seen_header = true;
-            continue;
+            if !seen_header {
+                if stmt != "sequenceDiagram" {
+                    return Err(p.err("sequence diagram must start with `sequenceDiagram`"));
+                }
+                seen_header = true;
+                continue;
+            }
+            p.parse_statement(stmt)?;
         }
-        p.parse_statement(line)?;
     }
     if !seen_header {
         return Err(ParseError {
@@ -56,6 +62,37 @@ pub(crate) fn parse(source: &str) -> Result<SeqDiagram, ParseError> {
         });
     }
     Ok(p.g)
+}
+
+/// Split a line into `;`-separated statements — mermaid treats `;` as a
+/// line terminator everywhere (its docs mandate `#59;` for a literal
+/// semicolon) — EXCEPT a `;` that closes an entity-code token: `#`
+/// followed directly by one or more ASCII alphanumerics (`#59;`,
+/// `#9829;`, `#infin;`), which stays inside its statement so entity
+/// codes keep rendering literally. `;`, `#`, and the probed
+/// alphanumerics are ASCII, and `char_indices` yields char-start byte
+/// offsets, so every slice below lands on a char boundary.
+fn split_statements(line: &str) -> Vec<&str> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, c) in line.char_indices() {
+        if c != ';' {
+            continue;
+        }
+        // Entity-code guard: walk back over [A-Za-z0-9]+ to a `#`.
+        let mut j = i;
+        while j > start && b[j - 1].is_ascii_alphanumeric() {
+            j -= 1;
+        }
+        if j > start && j < i && b[j - 1] == b'#' {
+            continue; // this `;` closes `#…;` — not a separator
+        }
+        out.push(&line[start..i]);
+        start = i + 1;
+    }
+    out.push(&line[start..]);
+    out
 }
 
 impl Parser {
@@ -707,5 +744,67 @@ mod tests {
             let kw = stmt.split_whitespace().next().unwrap();
             assert!(e.message.contains(kw), "message names {kw}: {}", e.message);
         }
+    }
+
+    // ── Polish slice (issue #45): semicolon statement separation ────
+    // (docs/superpowers/specs/2026-07-11-mermaid-sequence-polish-design.md)
+
+    #[test]
+    fn semicolon_splits_statements_like_newlines() {
+        // THE silent-misparse regression (issue #45): this used to parse
+        // as ONE message with `; B-->>A: yo` inside its text.
+        let g = p("sequenceDiagram\nA->>B: hi; B-->>A: yo");
+        assert_eq!(g.events.len(), 2);
+        assert_eq!(msg(&g.events[0]).4, "hi");
+        let (from, to, _, _, text) = msg(&g.events[1]);
+        assert_eq!(text, "yo");
+        assert_eq!((from, to), (1, 0)); // B -> A
+    }
+
+    #[test]
+    fn entity_code_semicolons_do_not_split() {
+        // `#59;` / `#9829;` / `#infin;` are entity-code tokens: their
+        // closing `;` is not a separator (they still render literally —
+        // the accepted entity-code divergence is unchanged).
+        for text in ["hi#59;there", "I #9829; you", "x #infin; y"] {
+            let g = p(&format!("sequenceDiagram\nA->>B: {text}"));
+            assert_eq!(g.events.len(), 1, "for {text}");
+            assert_eq!(msg(&g.events[0]).4, text, "for {text}");
+        }
+    }
+
+    #[test]
+    fn non_entity_hash_semicolons_still_split() {
+        // A `;` only gets the guard when alphanumerics directly connect
+        // it back to a `#`.
+        for (src, first_text) in [
+            ("A->>B: x #5 9; C->>D: y", "x #5 9"),
+            ("A->>B: x#; C->>D: y", "x#"),
+        ] {
+            let g = p(&format!("sequenceDiagram\n{src}"));
+            assert_eq!(g.events.len(), 2, "for {src}");
+            assert_eq!(msg(&g.events[0]).4, first_text, "for {src}");
+        }
+    }
+
+    #[test]
+    fn semicolon_fragments_report_their_line() {
+        let e = parse("sequenceDiagram\nA->>B: ok\nA->>B: x; wibble wobble").unwrap_err();
+        assert_eq!(e.line, Some(3));
+    }
+
+    #[test]
+    fn header_with_same_line_statement_after_semicolon() {
+        let g = p("sequenceDiagram; A->>B: hi");
+        assert_eq!(g.events.len(), 1);
+        assert_eq!(g.participants.len(), 2);
+    }
+
+    #[test]
+    fn note_text_semicolon_terminates_the_note() {
+        // mermaid: `;` ends the note statement too (docs mandate #59;);
+        // the tail is then an invalid statement -> loud error.
+        let e = parse("sequenceDiagram\nNote over A: watch; this").unwrap_err();
+        assert_eq!(e.line, Some(2));
     }
 }
