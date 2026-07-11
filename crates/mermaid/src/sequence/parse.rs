@@ -174,7 +174,7 @@ impl Parser {
             "loop" | "alt" | "opt" | "par" | "critical" | "break" => {
                 return self.parse_fragment_open(stmt, first)
             }
-            "else" | "and" => return self.parse_divider(stmt, first),
+            "else" | "and" | "option" => return self.parse_divider(stmt, first),
             "end" if stmt == "end" => return self.parse_fragment_close(),
             "box" | "create" | "destroy" | "rect" | "links" | "link" | "properties" => {
                 return Err(self.err(format!("`{first}` statements are not supported")));
@@ -240,9 +240,13 @@ impl Parser {
         self.push_event(Event::FragmentOpen { kind, label })
     }
 
-    /// `else` (valid inside `alt`) / `and` (valid inside `par`).
+    /// `else` (valid inside `alt`) / `and` (valid inside `par`) / `option` (valid inside `critical`).
     fn parse_divider(&mut self, stmt: &str, keyword: &str) -> Result<(), ParseError> {
-        let want = if keyword == "else" { FragmentKind::Alt } else { FragmentKind::Par };
+        let want = match keyword {
+            "else" => FragmentKind::Alt,
+            "and" => FragmentKind::Par,
+            _ => FragmentKind::Critical, // "option" — dispatch guarantees the set
+        };
         let top = self.frags.last().map(|(k, _)| *k);
         if top != Some(want) {
             return Err(self.err(format!(
@@ -708,6 +712,21 @@ mod tests {
     fn else_outside_alt_errors() {
         let e = parse("sequenceDiagram\nloop l\nelse x\nend").unwrap_err();
         assert_eq!(e.line, Some(3));
+    }
+
+    #[test]
+    fn critical_uses_option_divider() {
+        let g = p("sequenceDiagram\ncritical connect\nA-->B: c\noption Network timeout\nA-->A: log\noption Credentials rejected\nA-->A: log2\nend");
+        assert!(matches!(&g.events[2], Event::FragmentDivider { label } if label == "Network timeout"));
+        assert!(matches!(&g.events[4], Event::FragmentDivider { label } if label == "Credentials rejected"));
+    }
+
+    #[test]
+    fn option_outside_critical_errors() {
+        let e = parse("sequenceDiagram\nalt c\noption x\nend").unwrap_err();
+        assert_eq!(e.line, Some(3));
+        assert!(e.message.contains("option"), "got: {}", e.message);
+        assert!(e.message.contains("critical"), "got: {}", e.message);
     }
 
     #[test]
