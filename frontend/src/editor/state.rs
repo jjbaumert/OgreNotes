@@ -759,6 +759,23 @@ impl Transaction {
             })
             .ok_or_else(|| StepError("no previous textblock".into()))?;
 
+        // Mirror of join_forward's code-block guard: Backspace at the
+        // start of a code block never dissolves it into the previous
+        // block. An empty textblock above is removed; a non-empty one
+        // just steps the caret out to its end.
+        if block.node_type == NodeType::CodeBlock && prev.node_type != NodeType::CodeBlock {
+            if prev.content.size() == 0 {
+                let mut txn =
+                    self.delete(prev.offset, prev.offset + prev.node_size)?;
+                txn.selection =
+                    Selection::cursor(block.content_start - prev.node_size);
+                return Ok(txn);
+            }
+            let mut txn = self;
+            txn.selection = Selection::cursor(prev.offset + prev.node_size - 1);
+            return Ok(txn);
+        }
+
         // If prev sits inside a different container than the current block
         // (e.g. prev is the last paragraph of a blockquote and block is a
         // doc-level paragraph after it), a single replace spanning both
@@ -961,6 +978,25 @@ impl Transaction {
         let after_block = block.offset + block.node_size;
         let next = find_block_at(&self.doc, after_block + 1)
             .ok_or_else(|| StepError("no next textblock".into()))?;
+
+        // Code blocks are sturdy: forward-delete never dissolves one
+        // into the caret's block (2026-07-11 repro — Delete in the
+        // empty paragraph the triple-Enter escape leaves behind turned
+        // the next code block into plain text). An empty textblock
+        // before the code block is simply removed; a non-empty one
+        // just steps the caret into the block.
+        if next.node_type == NodeType::CodeBlock && block.node_type != NodeType::CodeBlock {
+            if block.content.size() == 0 {
+                let mut txn =
+                    self.delete(block.offset, block.offset + block.node_size)?;
+                txn.selection =
+                    Selection::cursor(next.content_start - block.node_size);
+                return Ok(txn);
+            }
+            let mut txn = self;
+            txn.selection = Selection::cursor(next.content_start);
+            return Ok(txn);
+        }
 
         // Merge: replace both blocks with one block (current type) containing combined content
         let merged_content = block.content.append_fragment(next.content);
@@ -2812,6 +2848,134 @@ mod tests {
     }
 
     // ── join_forward ──
+
+    fn para_and_code_doc(para_text: &str, code_text: &str) -> Node {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("language".to_string(), "python".to_string());
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    if para_text.is_empty() {
+                        Fragment::from(vec![])
+                    } else {
+                        Fragment::from(vec![Node::text(para_text)])
+                    },
+                ),
+                Node::element_with_attrs(
+                    NodeType::CodeBlock,
+                    attrs,
+                    Fragment::from(vec![Node::text(code_text)]),
+                ),
+            ]),
+        )
+    }
+
+    #[test]
+    fn join_forward_before_code_block_removes_empty_paragraph_not_the_block() {
+        // Bug repro (2026-07-11): Delete in the empty paragraph between
+        // blocks dissolved the code block into plain text. The block is
+        // sturdy: the empty paragraph goes, the block and its text stay,
+        // the caret lands at the block's content start.
+        let state = EditorState {
+            selection: Selection::cursor(1), // inside the empty paragraph
+            ..EditorState::create_default(para_and_code_doc("", "code"))
+        };
+        let txn = state.transaction().join_forward().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 1);
+        let block = new_state.doc.child(0).unwrap();
+        assert_eq!(block.node_type(), Some(NodeType::CodeBlock), "block survives");
+        assert_eq!(block.text_content(), "code", "text intact");
+        assert_eq!(block.attrs().get("language").unwrap(), "python");
+        assert_eq!(new_state.selection.from(), 1, "caret at code content start");
+    }
+
+    #[test]
+    fn join_forward_before_code_block_with_text_steps_into_block() {
+        // Non-empty paragraph before the block: nothing merges; the
+        // caret just steps into the block.
+        let state = EditorState {
+            selection: Selection::cursor(3), // end of "hi"
+            ..EditorState::create_default(para_and_code_doc("hi", "code"))
+        };
+        let txn = state.transaction().join_forward().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 2, "no merge");
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "hi");
+        assert_eq!(
+            new_state.doc.child(1).unwrap().node_type(),
+            Some(NodeType::CodeBlock)
+        );
+        // paragraph "hi" node_size 4 → code block offset 4, content start 5
+        assert_eq!(new_state.selection.from(), 5, "caret steps into the block");
+    }
+
+    #[test]
+    fn join_forward_at_end_of_code_block_pulls_paragraph_text_in() {
+        // Pin the non-destructive direction: Delete at the end of a
+        // code block absorbs the following paragraph's text AS code.
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("language".to_string(), "python".to_string());
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_attrs(
+                    NodeType::CodeBlock,
+                    attrs,
+                    Fragment::from(vec![Node::text("code")]),
+                ),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("hi")]),
+                ),
+            ]),
+        );
+        let state = EditorState {
+            selection: Selection::cursor(5), // end of "code"
+            ..EditorState::create_default(doc)
+        };
+        let txn = state.transaction().join_forward().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 1);
+        let block = new_state.doc.child(0).unwrap();
+        assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+        assert_eq!(block.text_content(), "codehi");
+    }
+
+    #[test]
+    fn join_backward_at_code_block_start_removes_empty_paragraph_above() {
+        // Backspace at the code block's start with an empty paragraph
+        // above: the paragraph goes, the block survives.
+        let state = EditorState {
+            selection: Selection::cursor(3), // code content start (P size 2)
+            ..EditorState::create_default(para_and_code_doc("", "code"))
+        };
+        let txn = state.transaction().join_backward().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 1);
+        let block = new_state.doc.child(0).unwrap();
+        assert_eq!(block.node_type(), Some(NodeType::CodeBlock), "block survives");
+        assert_eq!(block.text_content(), "code");
+        assert_eq!(new_state.selection.from(), 1, "caret stays at code start");
+    }
+
+    #[test]
+    fn join_backward_at_code_block_start_with_text_above_steps_out() {
+        let state = EditorState {
+            selection: Selection::cursor(5), // code content start (P "hi" size 4)
+            ..EditorState::create_default(para_and_code_doc("hi", "code"))
+        };
+        let txn = state.transaction().join_backward().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 2, "no merge");
+        assert_eq!(
+            new_state.doc.child(1).unwrap().node_type(),
+            Some(NodeType::CodeBlock)
+        );
+        assert_eq!(new_state.selection.from(), 3, "caret at end of paragraph text");
+    }
 
     #[test]
     fn join_forward_merges_paragraphs() {
