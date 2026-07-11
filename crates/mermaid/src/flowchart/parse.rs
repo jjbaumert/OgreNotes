@@ -22,6 +22,10 @@ struct Parser {
     /// Open subgraphs: (subgraph index, opening line). Top of stack is
     /// the innermost currently-open subgraph.
     stack: Vec<(usize, usize)>,
+    /// Source line of each pushed edge (parallel to `g.edges`), for the
+    /// post-parse edge-to-subgraph check — errors must point at the
+    /// edge's own line, but subgraph ids can be declared later.
+    edge_lines: Vec<usize>,
 }
 
 pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
@@ -36,6 +40,7 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
         ids: HashMap::new(),
         line: 0,
         stack: Vec::new(),
+        edge_lines: Vec::new(),
     };
     let mut seen_header = false;
     for (idx, raw) in source.lines().enumerate() {
@@ -83,6 +88,23 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
             message: format!("unclosed subgraph `{}`", p.g.subgraphs[idx].id),
             line: Some(opening_line),
         });
+    }
+    // Post-parse: edges whose endpoint id names a subgraph are real
+    // mermaid syntax (edge attaches to the cluster box) that we don't
+    // lay out yet — error loudly instead of drawing a phantom node.
+    // Post-parse because subgraph ids may be declared below the edge.
+    for (i, e) in p.g.edges.iter().enumerate() {
+        for end in [e.from, e.to] {
+            let id = &p.g.nodes[end].id;
+            if p.g.subgraphs.iter().any(|s| &s.id == id) {
+                return Err(ParseError {
+                    message: format!(
+                        "edges to/from subgraph ids are not yet supported (subgraph {id:?})"
+                    ),
+                    line: Some(p.edge_lines[i]),
+                });
+            }
+        }
     }
     Ok(p.g)
 }
@@ -187,6 +209,7 @@ impl Parser {
                         to_head: op.to_head,
                         label: op.label.clone(),
                     });
+                    self.edge_lines.push(self.line);
                     // Bail INSIDE the fan-out loop, not after it: an
                     // `a&a&...&a --> a&...&a` chain with N ids on each
                     // side pushes N*N edges before this loop would
@@ -1060,5 +1083,39 @@ mod tests {
             let e = parse(&format!("graph TD\n{src}")).unwrap_err();
             assert_eq!(e.line, Some(2), "for {src}");
         }
+    }
+
+    #[test]
+    fn edge_to_subgraph_id_errors_loudly() {
+        // Silent-misparse #2 (issue #32): this used to create a phantom
+        // node `sgID`. Real edge-to-subgraph routing is deferred; v1
+        // errors loudly, naming the subgraph.
+        let e = parse("graph TD\nsubgraph sgID[T]\nA --> B\nend\nsgID --> C").unwrap_err();
+        assert_eq!(e.line, Some(5));
+        assert!(e.message.contains("subgraph"), "got: {}", e.message);
+        assert!(e.message.contains("sgID"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn edge_from_and_to_subgraph_both_error() {
+        let e = parse("graph TD\nsubgraph s\nA\nend\nC --> s").unwrap_err();
+        assert_eq!(e.line, Some(5));
+    }
+
+    #[test]
+    fn edge_above_subgraph_declaration_still_errors() {
+        // Real mermaid resolves subgraph ids declared LATER; the check
+        // must therefore run post-parse, not inline.
+        let e = parse("graph TD\ns --> C\nsubgraph s\nA\nend").unwrap_err();
+        assert_eq!(e.line, Some(2));
+        assert!(e.message.contains("\"s\""), "got: {}", e.message);
+    }
+
+    #[test]
+    fn bare_subgraph_id_statement_does_not_error() {
+        // Only EDGES to subgraph ids are the misparse class; a bare node
+        // statement that happens to shadow a subgraph id parses (as
+        // today) — no edge, no silent-wrong-graph.
+        assert!(parse("graph TD\nsubgraph s\nA\nend\ns").is_ok());
     }
 }
