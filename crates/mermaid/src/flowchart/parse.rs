@@ -1201,9 +1201,16 @@ mod tests {
 
     #[test]
     fn edge_error_reports_the_full_operator_including_reverse_head() {
-        let e = parse("graph TD\nA <~~ B").unwrap_err();
-        assert_eq!(e.line, Some(2));
-        assert!(e.message.contains("<~~"), "got: {}", e.message);
+        // `A <-- B` is the case that regresses without `r_orig`: the `<`
+        // is consumed as a reverse head before the 2-dash run errors, so
+        // a post-strip diagnostic would print only `"-- B"`. The `<~~`
+        // case never strips (`~` isn't a run-body byte) and guards the
+        // no-strip path's message instead.
+        for (src, op) in [("A <-- B", "<--"), ("A <~~ B", "<~~")] {
+            let e = parse(&format!("graph TD\n{src}")).unwrap_err();
+            assert_eq!(e.line, Some(2), "for {src}");
+            assert!(e.message.contains(op), "for {src}, got: {}", e.message);
+        }
     }
 
     #[test]
