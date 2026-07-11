@@ -491,11 +491,6 @@ impl Parser {
         let Some(after_open) = r.strip_prefix(open) else {
             return Err(self.err(format!("expected an edge (e.g. `-->`), found {r:?}")));
         };
-        if !after_open.starts_with(' ') {
-            return Err(self.err(format!(
-                "expected an edge (e.g. `-->`) or a closed inline label, found {r:?}"
-            )));
-        }
         let Some(i) = after_open.find(close) else {
             return Err(self.err(format!(
                 "unclosed inline edge label (missing `{close}`)"
@@ -1028,5 +1023,42 @@ mod tests {
         assert_eq!(g.nodes[1].id, "ops");
         assert_eq!(g.edges[0].to_head, Head::Circle);
         assert_eq!(g.edges[1].to_head, Head::Arrow);
+    }
+
+    #[test]
+    fn no_space_inline_labels() {
+        // The docs' no-space spellings (previously loud errors).
+        for (src, kind, to_head, label) in [
+            ("A-.text.-B", EdgeKind::Dotted, Head::None, "text"),
+            ("A-.text.->B", EdgeKind::Dotted, Head::Arrow, "text"),
+            ("A==text==>B", EdgeKind::Thick, Head::Arrow, "text"),
+            ("A--text-->B", EdgeKind::Arrow, Head::Arrow, "text"),
+            ("A--text---B", EdgeKind::Open, Head::None, "text"),
+            ("A-- text --xB", EdgeKind::Open, Head::Cross, "text"),
+        ] {
+            let g = p(&format!("graph TD\n{src}"));
+            assert_eq!(g.edges[0].kind, kind, "for {src}");
+            assert_eq!(g.edges[0].to_head, to_head, "for {src}");
+            assert_eq!(g.edges[0].label.as_deref(), Some(label), "for {src}");
+            assert_eq!(g.nodes.len(), 2, "for {src}");
+            assert_eq!(g.nodes[1].id, "B", "for {src}");
+        }
+    }
+
+    #[test]
+    fn multi_length_inline_label_closer() {
+        // Docs example: `A --text---- E` (long closer run).
+        let g = p("graph TD\nA --text---- E");
+        assert_eq!(g.edges[0].label.as_deref(), Some("text"));
+        assert_eq!(g.edges[0].kind, EdgeKind::Open);
+        assert_eq!(g.nodes[1].id, "E");
+    }
+
+    #[test]
+    fn unclosed_inline_label_is_line_error() {
+        for src in ["A--text", "A-.text", "A==text"] {
+            let e = parse(&format!("graph TD\n{src}")).unwrap_err();
+            assert_eq!(e.line, Some(2), "for {src}");
+        }
     }
 }
