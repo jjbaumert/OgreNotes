@@ -3,13 +3,15 @@
 //! Pure-Rust Mermaid → SVG renderer. `render()` never panics; every
 //! failure or not-yet-supported diagram kind returns a structured error
 //! and no SVG, so callers can fall back to raw source. Supports pie
-//! charts and flowcharts (graph/flowchart); other diagram kinds are
-//! detected but not yet rendered. See
+//! charts, flowcharts (graph/flowchart), and sequence diagrams; other
+//! diagram kinds are detected but not yet rendered. See
 //! docs/superpowers/specs/2026-07-08-mermaid-support-design.md.
 
 mod pie;
 mod layout;
+pub(crate) mod measure;
 pub(crate) mod flowchart;
+pub(crate) mod sequence;
 
 /// Max diagram source length (chars). Shared cap: the single source of
 /// truth for both the `crates/collab` write-gate validator
@@ -77,6 +79,14 @@ pub fn detect_kind(source: &str) -> DiagramKind {
         return DiagramKind::Unknown;
     };
     let keyword = header.split_whitespace().next().unwrap_or("");
+    // Strip ONE trailing `;` before matching: `sequenceDiagram;` (and,
+    // ahead of slice 4, `classDiagram;` etc.) is valid mermaid and the
+    // per-kind parsers already tolerate the trailing `;` on the header
+    // line — but only if `detect_kind` routes them there in the first
+    // place. `graph`/`flowchart` are unaffected: their keyword is the
+    // first *token*, and the `;` (if any) lands on a later token like
+    // `graph TD;`.
+    let keyword = keyword.strip_suffix(';').unwrap_or(keyword);
     match keyword {
         "pie" => DiagramKind::Pie,
         "graph" | "flowchart" => DiagramKind::Flowchart,
@@ -114,6 +124,10 @@ pub fn render(source: &str) -> RenderOutput {
             Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
         },
         DiagramKind::Flowchart => match flowchart::render_flowchart(source) {
+            Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
+        DiagramKind::Sequence => match sequence::render_sequence(source) {
             Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
             Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
         },
@@ -160,8 +174,12 @@ mod tests {
 
     #[test]
     fn unsupported_kind_returns_error_with_kind_preserved() {
-        let out = render("sequenceDiagram\nAlice->>Bob: hi");
-        assert_eq!(out.kind, DiagramKind::Sequence);
+        // Was sequenceDiagram through slices 1-2; Task 7 makes sequence
+        // diagrams render, so the fixture moves to a kind that's still
+        // unsupported (state/class/er) — same treatment slice 2 gave
+        // "flowchart LR" leaving `each_unsupported_kind_error_names_its_label`.
+        let out = render("classDiagram\nclassA <|-- classB");
+        assert_eq!(out.kind, DiagramKind::Class);
         assert!(out.svg.is_none());
         let err = out.error.expect("unsupported kind must carry an error");
         assert!(err.message.to_lowercase().contains("not yet supported"), "got: {}", err.message);
@@ -259,6 +277,16 @@ mod tests {
             "graph TD\nA --> A --> A",
             "graph TD\nA[🥧<br/>🥧] -->|🥧| B",
             &format!("graph TD\n{}", "A --> B\n".repeat(3000)), // over MAX_SOURCE_LEN
+            "sequenceDiagram",
+            "sequenceDiagram\nA->>",
+            "sequenceDiagram\n->>B: x",
+            "sequenceDiagram\nend\nend",
+            &format!("sequenceDiagram\n{}", "loop l\n".repeat(50)),
+            &format!("sequenceDiagram\n{}", "A->>B: x\n".repeat(2000)),
+            &format!("sequenceDiagram\n{}", (0..60).map(|i| format!("participant p{i}\n")).collect::<String>()),
+            "sequenceDiagram\nautonumber\nA->>A: 🎭<br/>🎭\nNote left of A: 🎉",
+            "sequenceDiagram\nactivate A",
+            "sequenceDiagram\nA-->>-B: under",
         ];
         for inp in inputs {
             let out = render(inp); // must return, not panic
@@ -269,6 +297,23 @@ mod tests {
                 out
             );
         }
+    }
+
+    #[test]
+    fn header_trailing_semicolon_still_detects_kind() {
+        // Regression: the first-token match used to compare the WHOLE
+        // token, so "sequenceDiagram;" fell through to Unknown and
+        // sequence::parse (which tolerates the trailing `;`, see its own
+        // `header_required` test) was never reached via render().
+        assert_eq!(detect_kind("sequenceDiagram;"), DiagramKind::Sequence);
+    }
+
+    #[test]
+    fn header_trailing_semicolon_renders_via_public_render() {
+        let out = render("sequenceDiagram;\nA->>B: x");
+        assert_eq!(out.kind, DiagramKind::Sequence);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
+        assert!(out.svg.is_some());
     }
 
     #[test]
@@ -285,6 +330,29 @@ mod tests {
     fn comment_or_blank_only_source_is_unknown() {
         assert_eq!(detect_kind(""), DiagramKind::Unknown);
         assert_eq!(detect_kind("%% just a comment\n\n  %% another"), DiagramKind::Unknown);
+    }
+
+    #[test]
+    fn sequence_renders_svg_via_public_render() {
+        let out = render("sequenceDiagram\nAlice->>+Bob: Hello\nBob-->>-Alice: Hi");
+        assert_eq!(out.kind, DiagramKind::Sequence);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
+        assert!(out.svg.expect("sequence should render").starts_with("<svg"));
+    }
+
+    #[test]
+    fn sequence_parse_error_flows_through_render() {
+        let out = render("sequenceDiagram\nloop forever\nA->>B: x");
+        assert_eq!(out.kind, DiagramKind::Sequence);
+        assert!(out.svg.is_none());
+        assert_eq!(out.error.expect("error").line, Some(2));
+    }
+
+    #[test]
+    fn sequence_with_fragments_and_notes_renders() {
+        let src = "sequenceDiagram\nautonumber\nactor U as User\nU->>+S: request\nalt cached\nS-->>U: fast\nelse miss\nS->>D: query\nNote over S,D: slow path\nD-->>S: rows\nend\nS-->>-U: response";
+        let out = render(src);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
     }
 
     #[test]

@@ -1325,6 +1325,88 @@ async function scenarioFocusMode(ctx, collector) {
   await browser.close();
 }
 
+// ─── settings-appearance scenario ───────────────────────────────
+//
+// Regression for the settings-page fit-content collapse: .settings-page
+// carries `margin: 0 auto` inside the column-flex .main-content, and auto
+// cross-axis margins disable align-items:stretch — without an explicit
+// `width: 100%` the page shrank to fit-content, starving .settings-panel
+// (~210px at a 1280px viewport) until the third theme button (Dark)
+// rendered outside the Appearance card. Asserts the panel actually
+// stretches and every theme button's box sits inside the panel's box.
+async function scenarioSettingsAppearance(ctx, collector) {
+  const { baseUrlA, baseUrl, emailA, outDir } = ctx;
+  const target = baseUrlA || baseUrl;
+
+  const tokens = await devLogin(
+    target,
+    emailA || "doctor-settings@ogrenotes.example.com"
+  );
+  logJson({ at: "dev-login", userId: tokens.userId });
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    ...DOCTOR_CONTEXT_DEFAULTS,
+    recordHar: { path: join(outDir, "tab-a.har"), mode: "full" },
+  });
+  await seedAuth(context, tokens);
+
+  const page = await context.newPage();
+  instrument(context, page, "tab-a", collector);
+
+  await page.goto(`${target}/settings#appearance`, {
+    waitUntil: "domcontentloaded",
+    timeout: 30000,
+  });
+
+  const steps = {};
+  try {
+    await page.waitForSelector(".theme-selector-btn", { timeout: 15000 });
+    // Guard against a green-wash: if main.css fails to load (stale
+    // hash, MIME refusal), the raw-HTML flow layout can satisfy the
+    // box assertions below. Require the stylesheet to have applied.
+    steps.stylesheetApplied = await page
+      .locator(".settings-body")
+      .evaluate((el) => getComputedStyle(el).display === "flex");
+    const panel = await page.locator(".settings-panel").boundingBox();
+    const buttons = page.locator(".theme-selector-btn");
+    const count = await buttons.count();
+    steps.threeThemeButtons = count === 3;
+    // Pre-fix the panel collapsed to ~210px; healthy is ~624px at the
+    // default 1280px viewport. 400 splits the two with wide margins.
+    steps.panelStretches = !!panel && panel.width >= 400;
+
+    let contained = count > 0 && !!panel;
+    for (let i = 0; i < count; i++) {
+      const b = await buttons.nth(i).boundingBox();
+      const inside =
+        !!b &&
+        !!panel &&
+        b.x >= panel.x - 1 &&
+        b.y >= panel.y - 1 &&
+        b.x + b.width <= panel.x + panel.width + 1 &&
+        b.y + b.height <= panel.y + panel.height + 1;
+      if (!inside) contained = false;
+    }
+    steps.themeButtonsInsidePanel = contained;
+  } catch (e) {
+    collector.stepError = `${e.message}`;
+  }
+
+  const tab = collector["tab-a"] || { errors: [], console: [] };
+  steps.noPageErrors = (tab.errors || []).length === 0;
+
+  collector.scenario = {
+    name: collector.scenario?.name || "settings-appearance",
+    dialogs: collector.scenario?.dialogs || [],
+    steps,
+  };
+
+  await page.screenshot({ path: join(outDir, "tab-a.png"), fullPage: false }).catch(() => {});
+  await context.close();
+  await browser.close();
+}
+
 // ─── menu-switch scenario ───────────────────────────────────────
 //
 // Regression for the menu-bar backdrop-intercept bug: with a menu open, its
@@ -5779,6 +5861,8 @@ async function main() {
       await scenarioSpreadsheetLifecycle(ctx, collector);
     } else if (scenario === "focus-mode") {
       await scenarioFocusMode(ctx, collector);
+    } else if (scenario === "settings-appearance") {
+      await scenarioSettingsAppearance(ctx, collector);
     } else if (scenario === "menu-switch") {
       await scenarioMenuSwitch(ctx, collector);
     } else if (scenario === "doc-actions") {
@@ -6248,6 +6332,10 @@ async function main() {
 
   // ─── May 2026 UI batch — six required-steps gates ───────────────
   const requiredSteps = {
+    "settings-appearance": [
+      "stylesheetApplied", "threeThemeButtons", "panelStretches",
+      "themeButtonsInsidePanel", "noPageErrors",
+    ],
     "spreadsheet-keyboard": [
       "gridMounted", "valueTyped", "undoCleared", "redoRestored",
     ],

@@ -16,7 +16,9 @@ name: WASM browser tests
 #   collab-e2e — frontend/tests/collab_e2e.rs (integration target) against
 #     a live axum stack: WS connect / sync / comment broadcast.
 #   lib-wasm — the frontend lib's inline `#[wasm_bindgen_test]` tests
-#     (render_node output, DOM↔model position walkers, focus traps). Pure
+#     (render_node output, DOM↔model position walkers, focus traps) plus
+#     the frontend/tests/browser.rs DOM suite (rendering, input rules,
+#     backspace/list handling, markdown paste — issue #20). Pure
 #     browser-DOM, no backend. `--test collab_e2e` excludes the `--lib`
 #     target, so these need their own job or they never run in CI.
 #
@@ -261,3 +263,12 @@ jobs:
       - name: Run frontend lib wasm-bindgen tests
         working-directory: frontend
         run: wasm-pack test --headless --firefox -- --lib
+
+      # Issue #20: the browser.rs DOM suite (148 tests — rendering, input
+      # rules, backspace/list handling, markdown paste) existed but was
+      # never run by CI, so a DOM-observable regression could ship
+      # unnoticed. Pure browser-DOM, no backend — it shares this job's
+      # build cache with the --lib target.
+      - name: Run frontend browser DOM tests
+        working-directory: frontend
+        run: wasm-pack test --headless --firefox -- --test browser

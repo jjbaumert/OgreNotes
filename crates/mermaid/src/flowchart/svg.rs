@@ -7,7 +7,8 @@
 //! normative attribute lists this file implements verbatim.
 
 use crate::escape_xml;
-use crate::flowchart::{measure, shapes, EdgeKind, FlowGraph, FlowNode};
+use crate::flowchart::{shapes, EdgeKind, FlowGraph, FlowNode};
+use crate::measure;
 use crate::layout::Layout;
 
 /// Resolves a node's style attr from its classes against the graph's

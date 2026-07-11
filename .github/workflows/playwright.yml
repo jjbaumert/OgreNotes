@@ -563,6 +563,19 @@ jobs:
             --base-url http://127.0.0.1:3000 \
             --out ../../artifacts/doctor/a11y-audit
 
+      # Settings → Appearance layout guard: the theme buttons must render
+      # inside the panel card (regression for the .settings-page
+      # fit-content collapse — see scenarioSettingsAppearance in doctor.js).
+      - name: Run settings-appearance scenario
+        id: settings-appearance
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario settings-appearance \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/settings-appearance
+
       # M-6.2 piece E: end-to-end agentic Ask flow. Real Claude API
       # call (paid). Gated on ANTHROPIC_API_KEY being set so PRs
       # from forks (which can't access repo secrets) don't fail —

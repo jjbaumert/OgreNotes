@@ -3329,6 +3329,8 @@ tr:hover .folder-row-actions,
    * so it tracks data-theme. (Moved off the Ogre-Brown sidebar in the
    * account-menu step 2.) */
   display: flex;
+  /* Wrap instead of escaping the card if the panel is ever narrow. */
+  flex-wrap: wrap;
   gap: var(--space-sm);
   padding: 0;
   max-width: 360px;
@@ -5523,6 +5525,11 @@ tr:hover .folder-row-actions,
  * Tabs collapse above the panel on narrow viewports. Uses the
  * shared design tokens so it tracks light/dark automatically. */
 .settings-page {
+  /* `width: 100%` is load-bearing: .main-content is a column flex
+   * container, and auto cross-axis margins disable align-items:stretch,
+   * so without a definite width this box shrinks to fit-content — the
+   * panel then starves and the theme buttons overflow the card. */
+  width: 100%;
   max-width: 880px;
   margin: 0 auto;
   padding: var(--space-lg) var(--space-md);
