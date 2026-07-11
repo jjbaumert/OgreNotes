@@ -1,6 +1,8 @@
 //! Flowchart parser. Line-oriented; each line splits on `;` into
-//! statements; chain statements are scanned left-to-right with
-//! longest-first token matching (std only, no regex).
+//! statements (quoted spans are respected, so a `;` inside a
+//! double-quoted label does not split); chain statements are scanned
+//! left-to-right with longest-first token matching (std only, no
+//! regex).
 
 use crate::flowchart::{EdgeKind, FlowEdge, FlowGraph, FlowNode, Head, ShapeKind};
 use crate::layout::Direction;
@@ -26,6 +28,30 @@ struct Parser {
     /// post-parse edge-to-subgraph check — errors must point at the
     /// edge's own line, but subgraph ids can be declared later.
     edge_lines: Vec<usize>,
+}
+
+/// Split a line into `;`-separated statements, ignoring `;` inside
+/// double-quoted spans (labels like `A["has ; inside"]`). Quote state
+/// is a simple toggle — quoted labels have no escape sequences. `;`
+/// and `"` are ASCII, and char_indices yields char-start byte offsets,
+/// so every slice below lands on a char boundary regardless of
+/// multi-byte content.
+fn split_statements(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ';' if !in_quotes => {
+                out.push(&line[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&line[start..]);
+    out
 }
 
 pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
@@ -56,7 +82,7 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
             // statement line is split below: the first segment is the
             // header, any remaining non-empty segments are ordinary
             // statements on the same line.
-            let mut segs = line.split(';');
+            let mut segs = split_statements(line).into_iter();
             let header = segs.next().unwrap_or("").trim();
             p.parse_header(header)?;
             seen_header = true;
@@ -69,7 +95,7 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
             }
             continue;
         }
-        for stmt in line.split(';') {
+        for stmt in split_statements(line) {
             let stmt = stmt.trim();
             if stmt.is_empty() {
                 continue;
@@ -665,6 +691,31 @@ mod tests {
         assert!(parse("graph XX").unwrap_err().message.contains("unknown direction"));
         let e = parse("graph XX;").unwrap_err();
         assert!(e.message.contains("unknown direction"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn semicolon_inside_quoted_label_is_not_a_statement_split() {
+        // The docs' entity-code example: quote-unaware `;` splitting
+        // used to truncate the label mid-quote (gallery find).
+        let g = p("graph TD\nA[\"This is a #35; test\"]");
+        assert_eq!(g.nodes.len(), 1);
+        assert_eq!(g.nodes[0].label, "This is a #35; test");
+    }
+
+    #[test]
+    fn semicolons_outside_quotes_still_split_statements() {
+        let g = p("graph TD\nA[\"x;y\"] --> B; B --> C;");
+        assert_eq!(g.edges.len(), 2);
+        assert_eq!(g.nodes[0].label, "x;y");
+    }
+
+    #[test]
+    fn unclosed_quote_with_semicolon_errors_cleanly() {
+        // Odd quote count: the `;` counts as quoted, the statement
+        // reaches bracket parsing whole, and fails with a line error
+        // (never a panic).
+        let e = parse("graph TD\nA[\"oops; B").unwrap_err();
+        assert_eq!(e.line, Some(2));
     }
 
     #[test]
