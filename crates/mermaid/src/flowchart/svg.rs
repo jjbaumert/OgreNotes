@@ -277,4 +277,10 @@ mod tests {
         assert_eq!(svg.matches("marker-end").count(), 0, "{svg}");
         assert!(svg.contains("stroke-dasharray=\"3 3\""));
     }
+
+    #[test]
+    fn class_def_default_styles_every_unclassed_node() {
+        let svg = render_flowchart("graph TD\nclassDef default fill:#f9f\nA --> B").unwrap();
+        assert_eq!(svg.matches("style=\"fill:#f9f\"").count(), 2, "{svg}");
+    }
 }

@@ -106,6 +106,16 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
             }
         }
     }
+    // mermaid auto-applies the class named `default` to every node with
+    // no explicit class assignment (explicitly-classed nodes keep their
+    // own resolution order untouched).
+    if p.g.class_defs.iter().any(|d| d.name == "default") {
+        for n in &mut p.g.nodes {
+            if n.classes.is_empty() {
+                n.classes.push("default".to_string());
+            }
+        }
+    }
     Ok(p.g)
 }
 
@@ -1117,5 +1127,18 @@ mod tests {
         // statement that happens to shadow a subgraph id parses (as
         // today) — no edge, no silent-wrong-graph.
         assert!(parse("graph TD\nsubgraph s\nA\nend\ns").is_ok());
+    }
+
+    #[test]
+    fn class_def_default_applies_to_unclassed_nodes_only() {
+        let g = p("graph TD\nclassDef default fill:#f9f\nclassDef hot fill:#f00\nA --> B:::hot");
+        assert_eq!(g.nodes[0].classes, vec!["default"]); // A: auto
+        assert_eq!(g.nodes[1].classes, vec!["hot"]);     // B: explicit wins
+    }
+
+    #[test]
+    fn no_default_class_def_means_no_auto_class() {
+        let g = p("graph TD\nclassDef hot fill:#f00\nA");
+        assert!(g.nodes[0].classes.is_empty());
     }
 }
