@@ -8,6 +8,31 @@ use super::schema::{default_schema, Schema};
 use super::selection::Selection;
 use super::transform::{Step, StepError, StepMap};
 
+/// Start of the line containing char-index `pos` within `chars` — the
+/// index just past the nearest preceding `'\n'`, or 0 on the first
+/// line. Shared by `split_block`'s code-block auto-indent and
+/// triple-Enter escape, and by `commands::dedent_code_block_line`
+/// (Shift-Tab): all answer "where does the caret's line start" against
+/// a char-indexed code-block text buffer and must agree.
+pub(crate) fn line_start_at(chars: &[char], pos: usize) -> usize {
+    chars[..pos]
+        .iter()
+        .rposition(|&c| c == '\n')
+        .map(|i| i + 1)
+        .unwrap_or(0)
+}
+
+/// Indent unit for a code block's `language` attr tag —
+/// `DEFAULT_INDENT_UNIT` when the tag is absent/empty/unresolved.
+/// Shared by `split_block`'s auto-indent and
+/// `commands::code_block_indent_unit` (Tab/Shift-Tab): Enter and Tab
+/// must insert the same string for the same block.
+pub(crate) fn indent_unit_for_language_tag(tag: Option<&str>) -> &'static str {
+    tag.and_then(ogrenotes_highlight::Language::from_tag)
+        .map(|l| l.indent_unit())
+        .unwrap_or(ogrenotes_highlight::DEFAULT_INDENT_UNIT)
+}
+
 /// The complete, immutable editor state at a point in time.
 /// New states are produced by applying transactions.
 #[derive(Debug, Clone)]
@@ -425,32 +450,46 @@ impl Transaction {
             let chars: Vec<char> = text.chars().collect();
             let at_end = inner_pos == block.content.size();
             let clamped = inner_pos.min(chars.len());
-            let line_start = chars[..clamped]
-                .iter()
-                .rposition(|&c| c == '\n')
-                .map(|i| i + 1)
-                .unwrap_or(0);
+            let line_start = line_start_at(&chars, clamped);
 
-            // Double-Enter escape: Enter at the very end of a
-            // whitespace-only last line (auto-indent leaves spaces on
-            // the "empty" line) strips that line and exits to a
-            // paragraph below — same convention as the blockquote and
-            // empty-list-item branches.
+            // Triple-Enter escape (user-tuned): Enter at the very end
+            // of TWO consecutive whitespace-only trailing lines
+            // (auto-indent leaves spaces on "empty" lines) strips both
+            // and exits to a paragraph below. One empty line is not
+            // enough — the second Enter just adds another line, the
+            // third breaks free.
+            let is_ws = |c: &char| *c == ' ' || *c == '\t';
             if at_end
                 && line_start > 0
-                && chars[line_start..].iter().all(|&c| c == ' ' || c == '\t')
+                && chars[line_start..].iter().all(|c| is_ws(c))
             {
-                let del_from = block.content_start + line_start - 1; // the '\n'
-                let del_to = block.content_start + chars.len();
-                let removed = del_to - del_from;
-                let mut result = txn.delete(del_from, del_to)?;
-                let block_end = block.offset + block.node_size - removed;
-                let para = Node::element(NodeType::Paragraph);
-                let slice = Slice::new(Fragment::from(vec![para]), 0, 0);
-                result = result.replace(block_end, block_end, slice)?;
-                result.selection = Selection::cursor(block_end + 1);
-                result.stored_marks = None;
-                return Ok(result);
+                let prev_line_start = line_start_at(&chars, line_start - 1);
+                let prev_line_ws_only =
+                    chars[prev_line_start..line_start - 1].iter().all(is_ws);
+                // `prev_line_start > 0` requires a THIRD line-start
+                // boundary before the two blank trailing lines — i.e.
+                // genuinely three Enters' worth of lines. Without it,
+                // a code block that started completely empty (toolbar-
+                // created, or a fence rule with nothing typed) counts
+                // its own pre-existing first line as one blank line and
+                // the escape fires on the SECOND Enter, not the third.
+                if prev_line_ws_only && prev_line_start > 0 {
+                    // Delete from the newline that opens the first
+                    // empty line (or from the content start when the
+                    // whole block is just the two empty lines).
+                    let del_from =
+                        block.content_start + prev_line_start.saturating_sub(1);
+                    let del_to = block.content_start + chars.len();
+                    let removed = del_to - del_from;
+                    let mut result = txn.delete(del_from, del_to)?;
+                    let block_end = block.offset + block.node_size - removed;
+                    let para = Node::element(NodeType::Paragraph);
+                    let slice = Slice::new(Fragment::from(vec![para]), 0, 0);
+                    result = result.replace(block_end, block_end, slice)?;
+                    result.selection = Selection::cursor(block_end + 1);
+                    result.stored_marks = None;
+                    return Ok(result);
+                }
             }
 
             // newlineInCode with editor-style auto-indent: keep the
@@ -458,12 +497,8 @@ impl Transaction {
             // indent unit when the text before the caret ends with a
             // block opener (':' for Python-style suites, '{' for brace
             // languages).
-            let indent_unit = block
-                .attrs
-                .get("language")
-                .and_then(|l| ogrenotes_highlight::Language::from_tag(l))
-                .map(|l| l.indent_unit())
-                .unwrap_or(ogrenotes_highlight::DEFAULT_INDENT_UNIT);
+            let indent_unit =
+                indent_unit_for_language_tag(block.attrs.get("language").map(String::as_str));
             let current_indent: String = chars[line_start..clamped]
                 .iter()
                 .take_while(|&&c| c == ' ' || c == '\t')
@@ -2122,17 +2157,56 @@ mod tests {
     }
 
     #[test]
-    fn split_block_exits_on_whitespace_only_trailing_line() {
-        // Auto-indent leaves whitespace on the "empty" trailing line;
-        // the double-Enter escape must still work: Enter at the end of
-        // a whitespace-only last line strips it and exits below.
+    fn split_block_second_enter_adds_another_empty_line() {
+        // Triple-Enter escape (user-requested 2026-07-10): ONE
+        // whitespace-only trailing line is not enough to exit — the
+        // second Enter just adds another empty line at the same
+        // indent.
         let state = python_code_block("class A:\n    ");
+        let txn = state.transaction().split_block().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 1, "must NOT exit yet");
+        assert_eq!(
+            new_state.doc.child(0).unwrap().text_content(),
+            "class A:\n    \n    "
+        );
+    }
+
+    #[test]
+    fn split_block_from_empty_code_block_takes_three_enters_to_exit() {
+        // Review finding (2026-07-10): a block that never had typed
+        // content must not count its own pre-existing first line as a
+        // user-typed blank — the escape still takes three Enters.
+        let mut state = python_code_block("");
+        for enters in 1..=2 {
+            let txn = state.transaction().split_block().unwrap();
+            state = state.apply(txn);
+            assert_eq!(state.doc.child_count(), 1, "Enter {enters} must not exit");
+        }
+        let txn = state.transaction().split_block().unwrap();
+        let state = state.apply(txn);
+        assert_eq!(state.doc.child_count(), 2, "Enter 3 must exit");
+        assert_eq!(
+            state.doc.child(1).unwrap().node_type(),
+            Some(NodeType::Paragraph)
+        );
+    }
+
+    #[test]
+    fn split_block_third_enter_exits_stripping_both_empty_lines() {
+        // Two whitespace-only trailing lines + Enter = break free; both
+        // empty lines are stripped on the way out.
+        let state = python_code_block("class A:\n    \n    ");
         let txn = state.transaction().split_block().unwrap();
         let new_state = state.apply(txn);
         assert_eq!(new_state.doc.child_count(), 2);
         let block = new_state.doc.child(0).unwrap();
         assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
-        assert_eq!(block.text_content(), "class A:", "whitespace line stripped");
+        assert_eq!(
+            block.text_content(),
+            "class A:",
+            "both whitespace lines stripped"
+        );
         assert_eq!(
             new_state.doc.child(1).unwrap().node_type(),
             Some(NodeType::Paragraph)
@@ -2166,18 +2240,18 @@ mod tests {
 
     #[test]
     fn split_block_on_code_block_trailing_empty_line_exits() {
-        // Double-Enter escape: Enter on a trailing empty line removes
-        // that line and drops the caret into a paragraph below — same
-        // convention as the blockquote / empty-list-item exits.
+        // Triple-Enter escape (updated 2026-07-10): exit fires on the
+        // Enter pressed at the end of TWO empty trailing lines, and
+        // removes both on the way out.
         let doc = Node::element_with_content(
             NodeType::Doc,
             Fragment::from(vec![Node::element_with_content(
                 NodeType::CodeBlock,
-                Fragment::from(vec![Node::text("code\n")]),
+                Fragment::from(vec![Node::text("code\n\n")]),
             )]),
         );
         let state = EditorState {
-            selection: Selection::cursor(6), // after the trailing '\n' (1 + 5)
+            selection: Selection::cursor(7), // after both '\n' (1 + 6)
             ..EditorState::create_default(doc)
         };
         let txn = state.transaction().split_block().unwrap();
@@ -2185,7 +2259,7 @@ mod tests {
         assert_eq!(new_state.doc.child_count(), 2);
         let block = new_state.doc.child(0).unwrap();
         assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
-        assert_eq!(block.text_content(), "code", "trailing newline removed");
+        assert_eq!(block.text_content(), "code", "both trailing newlines removed");
         let para = new_state.doc.child(1).unwrap();
         assert_eq!(para.node_type(), Some(NodeType::Paragraph));
         assert_eq!(para.text_content(), "");
