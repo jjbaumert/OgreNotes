@@ -69,7 +69,15 @@ impl ThreadRepo {
         self.db
             .put_item(item)
             .await
-            .map_err(|e| RepoError::Dynamo(e.to_string()))
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+
+        // Chat/DM threads carry members; emit a reverse edge per member so
+        // `list_user_chats` is a Query, not a table Scan (issue #34).
+        // Comment threads have no members, so this is a no-op for them.
+        for member in &thread.member_ids {
+            self.put_chat_edge(member, &thread.thread_id).await?;
+        }
+        Ok(())
     }
 
     /// Get a thread by ID.
@@ -231,41 +239,50 @@ impl ThreadRepo {
     /// that it could drop a user's chats regardless of how few they have.
     /// Still O(table size); the real perf fix is a membership-row model +
     /// GSI for user → thread, tracked separately.
+    /// List the chat/DM threads a user belongs to.
+    ///
+    /// Reads the user's chat-membership edges (`PK=USER#<uid>,
+    /// SK=CHAT#<thread_id>`, maintained by `create_thread` /
+    /// `add_chat_member` / `remove_chat_member` / `delete_thread`) with
+    /// a single-partition `Query`, then hydrates each thread. This
+    /// replaced a full-table `Scan` filtering `contains(member_ids,
+    /// uid)`, whose cost scaled with *every* thread in the table rather
+    /// than the caller's own handful (issue #34).
+    ///
+    /// An edge whose thread has since been deleted is skipped and the
+    /// stale edge is cleaned up best-effort, so the list self-heals
+    /// against a partial `delete_thread`.
     pub async fn list_user_chats(&self, user_id: &str) -> Result<Vec<Thread>, RepoError> {
-        let mut threads = Vec::new();
-        let mut start_key: Option<HashMap<String, AttributeValue>> = None;
-        loop {
-            let mut builder = self
-                .db
-                .inner()
-                .scan()
-                .table_name(self.db.table_name())
-                .filter_expression("contains(member_ids, :uid) AND SK = :meta")
-                .expression_attribute_values(":uid", AttributeValue::S(user_id.to_string()))
-                .expression_attribute_values(":meta", AttributeValue::S("METADATA".to_string()));
-            if let Some(start) = start_key.take() {
-                builder = builder.set_exclusive_start_key(Some(start));
-            }
-            let result = builder
-                .send()
-                .await
-                .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+        let edges = self
+            .db
+            .query(&chat_edge_pk(user_id), Some("CHAT#"))
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
 
-            for item in result.items.unwrap_or_default() {
-                if let Some(thread_id) = item
-                    .get("PK")
-                    .and_then(|v| v.as_s().ok())
-                    .and_then(|pk| pk.strip_prefix("THREAD#"))
-                {
-                    if let Ok(t) = thread_from_item(&item, thread_id) {
-                        threads.push(t);
-                    }
+        let mut threads = Vec::with_capacity(edges.len());
+        for edge in &edges {
+            // Prefer the explicit attribute; fall back to parsing the SK
+            // so an edge written by any historical shape still resolves.
+            let Some(thread_id) = edge
+                .get("thread_id")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    edge.get("SK")
+                        .and_then(|v| v.as_s().ok())
+                        .and_then(|sk| sk.strip_prefix("CHAT#"))
+                        .map(|s| s.to_string())
+                })
+            else {
+                continue;
+            };
+            match self.get_thread(&thread_id).await? {
+                Some(t) => threads.push(t),
+                None => {
+                    // Edge outlived its thread — drop it so it doesn't
+                    // resurface. Best-effort; a failure here is harmless.
+                    let _ = self.delete_chat_edge(user_id, &thread_id).await;
                 }
-            }
-
-            match result.last_evaluated_key {
-                Some(key) => start_key = Some(key),
-                None => break,
             }
         }
         Ok(threads)
@@ -293,7 +310,10 @@ impl ThreadRepo {
                 None,
             )
             .await
-            .map_err(|e| RepoError::Dynamo(e.to_string()))
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+
+        // Keep the reverse membership edge in sync (issue #34).
+        self.put_chat_edge(user_id, thread_id).await
     }
 
     /// Remove a member from a chat thread (atomic — uses DynamoDB DELETE on String Set).
@@ -318,7 +338,10 @@ impl ThreadRepo {
                 None,
             )
             .await
-            .map_err(|e| RepoError::Dynamo(e.to_string()))
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+
+        // Drop the reverse membership edge (issue #34).
+        self.delete_chat_edge(user_id, thread_id).await
     }
 
     /// Bump the thread's updated_at timestamp (e.g., when a new message is added).
@@ -634,7 +657,7 @@ impl ThreadRepo {
     pub async fn delete_thread(&self, thread_id: &str) -> Result<(), RepoError> {
         let pk = format!("THREAD#{thread_id}");
 
-        for _pass in 0..2 {
+        for pass in 0..2 {
             let items = self.db
                 .query(&pk, None)
                 .await
@@ -642,6 +665,26 @@ impl ThreadRepo {
 
             if items.is_empty() {
                 break;
+            }
+
+            // First pass only: read the member set off the METADATA row and
+            // tear down each member's reverse chat edge (issue #34). Doing it
+            // before the rows are deleted keeps `member_ids` available; a
+            // failed edge delete would only leave a stale edge, which
+            // `list_user_chats` self-heals.
+            if pass == 0 {
+                let members = items
+                    .iter()
+                    .find(|it| {
+                        it.get("SK").and_then(|v| v.as_s().ok()) == Some(&"METADATA".to_string())
+                    })
+                    .and_then(|meta| meta.get("member_ids"))
+                    .and_then(|v| v.as_ss().ok())
+                    .cloned()
+                    .unwrap_or_default();
+                for member in &members {
+                    self.delete_chat_edge(member, thread_id).await?;
+                }
             }
 
             for item in &items {
@@ -654,6 +697,102 @@ impl ThreadRepo {
         }
         Ok(())
     }
+
+    // ─── Chat membership edges (issue #34) ──────────────────────────
+    //
+    // A user's chat list was historically a full-table `Scan` filtering
+    // `contains(member_ids, uid)` — cost O(all threads) per load. We now
+    // maintain a reverse edge row per (member, chat):
+    //   PK = USER#<uid>, SK = CHAT#<thread_id>
+    // written on create / add-member and removed on remove-member /
+    // delete-thread, so `list_user_chats` is a single-partition `Query`.
+
+    /// Write (idempotent) the reverse membership edge for one member.
+    async fn put_chat_edge(&self, user_id: &str, thread_id: &str) -> Result<(), RepoError> {
+        let mut item = HashMap::new();
+        item.insert("PK".to_string(), AttributeValue::S(chat_edge_pk(user_id)));
+        item.insert("SK".to_string(), AttributeValue::S(chat_edge_sk(thread_id)));
+        item.insert(
+            "thread_id".to_string(),
+            AttributeValue::S(thread_id.to_string()),
+        );
+        self.db
+            .put_item(item)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Remove the reverse membership edge for one member (idempotent).
+    async fn delete_chat_edge(&self, user_id: &str, thread_id: &str) -> Result<(), RepoError> {
+        self.db
+            .delete_item(&chat_edge_pk(user_id), &chat_edge_sk(thread_id))
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// One-time migration: emit chat-membership edges for every existing
+    /// chat/DM thread. Idempotent (edges are put-overwrites), so it is safe
+    /// to re-run. Returns `(threads_scanned, edges_written)`. This is the
+    /// only place that still Scans for chat membership — run once at the
+    /// #34 cutover, before the new `list_user_chats` becomes authoritative,
+    /// so existing chats don't briefly disappear from users' lists.
+    pub async fn backfill_chat_edges(&self) -> Result<(usize, usize), RepoError> {
+        let mut scanned = 0usize;
+        let mut written = 0usize;
+        let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+        loop {
+            let mut builder = self
+                .db
+                .inner()
+                .scan()
+                .table_name(self.db.table_name())
+                .filter_expression("SK = :meta AND attribute_exists(member_ids)")
+                .expression_attribute_values(":meta", AttributeValue::S("METADATA".to_string()));
+            if let Some(start) = start_key.take() {
+                builder = builder.set_exclusive_start_key(Some(start));
+            }
+            let result = builder
+                .send()
+                .await
+                .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+
+            for item in result.items.unwrap_or_default() {
+                let Some(thread_id) = item
+                    .get("PK")
+                    .and_then(|v| v.as_s().ok())
+                    .and_then(|pk| pk.strip_prefix("THREAD#"))
+                else {
+                    continue;
+                };
+                scanned += 1;
+                let members = item
+                    .get("member_ids")
+                    .and_then(|v| v.as_ss().ok())
+                    .cloned()
+                    .unwrap_or_default();
+                for member in &members {
+                    self.put_chat_edge(member, thread_id).await?;
+                    written += 1;
+                }
+            }
+
+            match result.last_evaluated_key {
+                Some(key) => start_key = Some(key),
+                None => break,
+            }
+        }
+        Ok((scanned, written))
+    }
+}
+
+/// Partition key for a user's chat-membership edges (issue #34).
+fn chat_edge_pk(user_id: &str) -> String {
+    format!("USER#{user_id}")
+}
+
+/// Sort key for the edge from a user to one chat thread (issue #34).
+fn chat_edge_sk(thread_id: &str) -> String {
+    format!("CHAT#{thread_id}")
 }
 
 // ─── Helpers ────────────────────────────────────────────────────

@@ -163,6 +163,123 @@ async fn test_list_chats_returns_all_member_chats() {
     app.cleanup().await;
 }
 
+/// #34: the reverse-edge `list_user_chats` must surface a chat to a
+/// member who is NOT the creator — proving `create_thread` writes an
+/// edge for every member, not just the caller.
+#[tokio::test]
+async fn test_invited_member_sees_chat_in_own_list() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (_, token_a) = app.create_user("alice@test.com").await;
+    let (bob_id, token_b) = app.create_user("bob@test.com").await;
+
+    let body = serde_json::json!({
+        "chatType": "chat",
+        "title": "Team",
+        "memberIds": [bob_id]
+    });
+    let (status, created) = app
+        .json_request(Method::POST, "/api/v1/chats", Some(&token_a), Some(body))
+        .await;
+    assert_eq!(status, 201);
+    let chat_id = created["id"].as_str().unwrap().to_string();
+
+    // Bob, an invited (non-creator) member, must see the chat in his list.
+    let (status, json) = app
+        .json_request(Method::GET, "/api/v1/chats", Some(&token_b), None)
+        .await;
+    assert_eq!(status, 200);
+    let ids: Vec<&str> = json["chats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&chat_id.as_str()),
+        "invited member must see the chat via its membership edge; got {ids:?}"
+    );
+
+    app.cleanup().await;
+}
+
+/// #34: adding a member writes their edge (the chat appears in their
+/// list) and removing them deletes it (it disappears) — end to end
+/// through the `/members` endpoints.
+#[tokio::test]
+async fn test_add_then_remove_member_updates_their_chat_list() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (_, token_a) = app.create_user("alice@test.com").await;
+    let (bob_id, _) = app.create_user("bob@test.com").await;
+    let (charlie_id, token_c) = app.create_user("charlie@test.com").await;
+
+    // Alice creates a group chat with Bob; Charlie is not a member yet.
+    let body = serde_json::json!({
+        "chatType": "chat",
+        "title": "Team",
+        "memberIds": [bob_id]
+    });
+    let (status, created) = app
+        .json_request(Method::POST, "/api/v1/chats", Some(&token_a), Some(body))
+        .await;
+    assert_eq!(status, 201);
+    let chat_id = created["id"].as_str().unwrap().to_string();
+
+    // Helper: does Charlie's chat list contain `chat_id`?
+    async fn charlie_has(app: &common::TestApp, token: &str, chat_id: &str) -> bool {
+        let (status, json) = app
+            .json_request(Method::GET, "/api/v1/chats", Some(token), None)
+            .await;
+        assert_eq!(status, 200);
+        json["chats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"].as_str() == Some(chat_id))
+    }
+
+    assert!(
+        !charlie_has(&app, &token_c, &chat_id).await,
+        "charlie must not see the chat before he is added"
+    );
+
+    // Alice adds Charlie.
+    let add = serde_json::json!({ "userId": charlie_id });
+    let (status, _) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/chats/{chat_id}/members"),
+            Some(&token_a),
+            Some(add),
+        )
+        .await;
+    assert_eq!(status, 204);
+    assert!(
+        charlie_has(&app, &token_c, &chat_id).await,
+        "charlie must see the chat after being added (edge written)"
+    );
+
+    // Alice removes Charlie.
+    let (status, _) = app
+        .json_request(
+            Method::DELETE,
+            &format!("/api/v1/chats/{chat_id}/members/{charlie_id}"),
+            Some(&token_a),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+    assert!(
+        !charlie_has(&app, &token_c, &chat_id).await,
+        "charlie must not see the chat after removal (edge deleted)"
+    );
+
+    app.cleanup().await;
+}
+
 // ─── Get chat ──────────────────────────────────────────────────
 
 #[tokio::test]
