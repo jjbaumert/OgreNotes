@@ -22,7 +22,15 @@ fn arb_source() -> impl Strategy<Value = String> {
         Just("deactivate A".to_string()),
         Just("autonumber".to_string()),
         Just("participant Z as Zed".to_string()),
-        "[a-zA-Z<>:\\-x)+ ]{0,24}",
+        Just("A->>B: hi; B-->>A: yo".to_string()),
+        Just("A->>B: x#59;y".to_string()),
+        Just("A<<->>B: both".to_string()),
+        Just("A<<-->>B: both dotted".to_string()),
+        Just("Note over A,B,C: n3".to_string()),
+        Just("critical c".to_string()),
+        Just("option o".to_string()),
+        Just("participant M as Multi<br/>Line".to_string()),
+        "[a-zA-Z<>:\\-x)+;#/|() ]{0,24}",
     ];
     proptest::collection::vec(stmt, 0..40).prop_map(|v| {
         format!("sequenceDiagram\n{}", v.join("\n"))
