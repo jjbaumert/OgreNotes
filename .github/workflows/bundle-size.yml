@@ -77,6 +77,16 @@ env:
   # headroom, matching the 2026-06-04 ratio. The optimization /
   # ratchet-down pass stays tracked in #21 — do not bump again
   # without closing or updating that issue.
+  #
+  # 2026-07-10 optimization pass (#21, closed): measured 1,743,301 B
+  # on main at 07c0514 (~6.1% headroom). twiggy attribution and two
+  # tested levers concluded the bundle is efficiently packed —
+  # opt-level=z + fat LTO + wasm-opt -z + pervasive .into_any()
+  # erasure already claimed the wins (breaking up the largest single
+  # function recovered 0.07%). The one remaining cut (fetch-on-demand
+  # locales, ~55 KB gz) was declined to keep instant locale switching.
+  # Gate stays at 1,850,000; future headroom is managed by this file's
+  # rebaseline policy, not an optimization backlog.
   WASM_GZ_LIMIT: "1850000"   # ~1.76 MiB
   # Soft regression budget — a no-op-change PR that adds > 5% to the
   # bundle (without crossing the hard limit) gets a warning so a
