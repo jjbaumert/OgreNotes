@@ -3142,10 +3142,58 @@ pub fn table_tab_backward(
 /// fall back to inserting a literal tab character. The fallback prevents
 /// the browser from escaping focus out of the editor when the cursor is
 /// in a plain paragraph (issue #18).
+/// The indent unit for the code block containing the cursor — `None`
+/// when the cursor isn't in a code block. A missing or unresolved
+/// `language` falls back to `DEFAULT_INDENT_UNIT` (4 spaces).
+fn code_block_indent_unit(state: &EditorState) -> Option<&'static str> {
+    let lang = code_block_language(state)?;
+    Some(super::state::indent_unit_for_language_tag(Some(&lang)))
+}
+
+/// Remove one indent step from the start of the caret's line in a
+/// code block: a full indent `unit`, or a single leading tab, or a
+/// shorter run of leading spaces. `None` when the line isn't indented.
+fn dedent_code_block_line(state: &EditorState, unit: &str) -> Option<Transaction> {
+    let pos = state.selection.from();
+    let block = find_block_at(&state.doc, pos)?;
+    let text =
+        Node::element_with_content(block.node_type, block.content.clone()).text_content();
+    let chars: Vec<char> = text.chars().collect();
+    let caret = pos.checked_sub(block.content_start)?.min(chars.len());
+    let line_start = super::state::line_start_at(&chars, caret);
+    let remove = if chars.get(line_start) == Some(&'\t') {
+        1
+    } else {
+        let unit_len = unit.chars().count().max(1);
+        chars[line_start..]
+            .iter()
+            .take_while(|&&c| c == ' ')
+            .count()
+            .min(unit_len)
+    };
+    if remove == 0 {
+        return None;
+    }
+    let from = block.content_start + line_start;
+    state.transaction().delete(from, from + remove).ok()
+}
+
 pub fn tab_command(
     state: &EditorState,
     dispatch: Option<&dyn Fn(Transaction)>,
 ) -> bool {
+    // Innermost context wins: Tab inside a code block indents code by
+    // the language's unit (4 spaces for Python, a hard tab for Go, 2
+    // spaces for the web/config family), even when the block sits in
+    // a list item or table cell.
+    if let Some(unit) = code_block_indent_unit(state) {
+        if let Some(d) = dispatch {
+            if let Ok(txn) = state.transaction().insert_text(unit) {
+                d(txn);
+            }
+        }
+        return true;
+    }
     if is_in_table(state) {
         return table_tab_forward(state, dispatch);
     }
@@ -3168,6 +3216,18 @@ pub fn shift_tab_command(
     state: &EditorState,
     dispatch: Option<&dyn Fn(Transaction)>,
 ) -> bool {
+    // Mirror of tab_command's code-block branch: dedent the caret's
+    // line by one step. Consume the key even when there's nothing to
+    // remove — Shift-Tab must never fall through to list-lifting or
+    // browser focus navigation from inside a code block.
+    if let Some(unit) = code_block_indent_unit(state) {
+        if let Some(d) = dispatch {
+            if let Some(txn) = dedent_code_block_line(state, unit) {
+                d(txn);
+            }
+        }
+        return true;
+    }
     if is_in_table(state) {
         return table_tab_backward(state, dispatch);
     }
@@ -3182,6 +3242,127 @@ mod tests {
     use crate::editor::model::Fragment;
     use crate::editor::state::EditorState;
     use std::cell::RefCell;
+
+    fn code_doc(language: Option<&str>, text: &str, cursor: usize) -> EditorState {
+        let mut attrs = std::collections::HashMap::new();
+        if let Some(lang) = language {
+            attrs.insert("language".to_string(), lang.to_string());
+        }
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::CodeBlock,
+                attrs,
+                Fragment::from(vec![Node::text(text)]),
+            )]),
+        );
+        EditorState {
+            selection: Selection::cursor(cursor),
+            ..EditorState::create_default(doc)
+        }
+    }
+
+    fn apply_captured(
+        state: &EditorState,
+        f: impl Fn(&EditorState, Option<&dyn Fn(Transaction)>) -> bool,
+    ) -> (bool, EditorState) {
+        let captured: RefCell<Option<Transaction>> = RefCell::new(None);
+        let dispatch = |txn: Transaction| {
+            *captured.borrow_mut() = Some(txn);
+        };
+        let handled = f(state, Some(&dispatch));
+        let new_state = match captured.into_inner() {
+            Some(txn) => state.apply(txn),
+            None => state.clone(),
+        };
+        (handled, new_state)
+    }
+
+    #[test]
+    fn tab_in_python_code_block_inserts_four_spaces() {
+        // caret at end of "class X:\n" → 1 (block open) + 9 chars
+        let state = code_doc(Some("python"), "class X:\n", 10);
+        let (handled, new_state) = apply_captured(&state, tab_command);
+        assert!(handled);
+        assert_eq!(
+            new_state.doc.child(0).unwrap().text_content(),
+            "class X:\n    "
+        );
+        assert_eq!(new_state.selection.from(), 14, "caret after the 4 spaces");
+    }
+
+    #[test]
+    fn tab_in_go_code_block_inserts_tab_char() {
+        let state = code_doc(Some("go"), "x\n", 3);
+        let (handled, new_state) = apply_captured(&state, tab_command);
+        assert!(handled);
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "x\n\t");
+    }
+
+    #[test]
+    fn tab_in_unlabeled_code_block_inserts_four_spaces() {
+        let state = code_doc(None, "x", 2);
+        let (handled, new_state) = apply_captured(&state, tab_command);
+        assert!(handled);
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "x    ");
+    }
+
+    #[test]
+    fn tab_in_paragraph_still_inserts_literal_tab() {
+        // Regression: the pre-existing non-code-block fallback.
+        let state = EditorState {
+            selection: Selection::cursor(12),
+            ..EditorState::create_default(simple_doc())
+        };
+        let (handled, new_state) = apply_captured(&state, tab_command);
+        assert!(handled);
+        assert_eq!(
+            new_state.doc.child(0).unwrap().text_content(),
+            "Hello world\t"
+        );
+    }
+
+    #[test]
+    fn shift_tab_dedents_current_line_by_one_unit() {
+        // caret at end of "class X:\n    pass" → 1 + 17
+        let state = code_doc(Some("python"), "class X:\n    pass", 18);
+        let (handled, new_state) = apply_captured(&state, shift_tab_command);
+        assert!(handled);
+        assert_eq!(
+            new_state.doc.child(0).unwrap().text_content(),
+            "class X:\npass"
+        );
+        assert_eq!(
+            new_state.selection.from(),
+            14,
+            "caret shifts left with the line"
+        );
+    }
+
+    #[test]
+    fn shift_tab_removes_single_leading_tab() {
+        let state = code_doc(Some("go"), "\tx", 3);
+        let (handled, new_state) = apply_captured(&state, shift_tab_command);
+        assert!(handled);
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "x");
+    }
+
+    #[test]
+    fn shift_tab_removes_short_space_run() {
+        // 2 leading spaces < the 4-space unit: remove what's there.
+        let state = code_doc(None, "  x", 4);
+        let (handled, new_state) = apply_captured(&state, shift_tab_command);
+        assert!(handled);
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "x");
+    }
+
+    #[test]
+    fn shift_tab_noop_on_unindented_line_but_consumes_key() {
+        let state = code_doc(Some("python"), "a\nb", 4);
+        let (handled, new_state) = apply_captured(&state, shift_tab_command);
+        assert!(handled, "key must be consumed even with nothing to dedent");
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "a\nb");
+    }
 
     fn simple_doc() -> Node {
         Node::element_with_content(

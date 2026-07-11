@@ -1255,6 +1255,24 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                         }
                         _ => render_children(doc, &code, content),
                     }
+                    // Browsers collapse a trailing '\n' at the end of a
+                    // <pre>, so the blank last line the model holds after
+                    // newlineInCode (Enter in a code block) would render
+                    // as nothing and the caret would look stuck on the
+                    // previous line. Force the final line box with the
+                    // same data-sentinel <br> the empty-block path uses —
+                    // every position walker skips data-sentinel nodes, so
+                    // caret math is unaffected.
+                    let ends_with_newline = content
+                        .children
+                        .last()
+                        .map(|c| c.text_content().ends_with('\n'))
+                        .unwrap_or(false);
+                    if ends_with_newline {
+                        let br = doc.create_element("br").ok()?;
+                        br.set_attribute("data-sentinel", "").ok()?;
+                        code.append_child(&br).ok()?;
+                    }
                     pre.append_child(&code).ok()?;
                     return Some(pre.into());
                 }
@@ -1649,7 +1667,22 @@ fn find_in_element(
             let text = child.text_content().unwrap_or_default();
             let text_len = char_len(&text);
             if target >= *pos && target <= *pos + text_len {
-                return Some((child, target - *pos));
+                // Caret affinity at line boundaries: a position exactly
+                // at the end of a text run that ends with '\n' (only
+                // code blocks put newlines in text) is visually
+                // ambiguous — browsers paint that caret at the end of
+                // the PREVIOUS line. Decline it here so the walk
+                // resolves to the next boundary instead: the next
+                // line's first text (inside the following token span)
+                // or, on the last line, the element slot past the
+                // trailing-newline sentinel <br> — both paint on the
+                // new line. dom_to_model_walk maps either form back to
+                // the same model position.
+                let ambiguous_line_end =
+                    target == *pos + text_len && text.ends_with('\n');
+                if !ambiguous_line_end {
+                    return Some((child, target - *pos));
+                }
             }
             *pos += text_len;
         } else if child.node_type() == DomNode::ELEMENT_NODE {
@@ -2390,6 +2423,91 @@ mod embed_render_tests {
             "position inside a token span must round-trip unchanged"
         );
 
+        container.remove();
+    }
+
+    /// Regression (Enter-in-code-block, 2026-07-10): browsers collapse a
+    /// trailing `\n` at the end of a `<pre>`, so the blank last line the
+    /// model holds after `newlineInCode` was invisible and the caret
+    /// looked stuck on the previous line. The render must append a
+    /// `data-sentinel` `<br>` (skipped by every position walker) to force
+    /// the final line box — on BOTH the highlighted and plain paths.
+    #[wasm_bindgen_test]
+    fn code_block_trailing_newline_renders_sentinel_line() {
+        let document = web_sys::window().unwrap().document().unwrap();
+
+        // Highlighted path (language resolves).
+        let container_el = document.create_element("div").unwrap();
+        document.body().unwrap().append_child(&container_el).unwrap();
+        let container: HtmlElement = container_el.dyn_into().unwrap();
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("language".to_string(), "python".to_string());
+        let source = "class PythonClass:\n";
+        let code_block = Node::element_with_attrs(
+            NodeType::CodeBlock,
+            attrs,
+            Fragment::from(vec![Node::text(source)]),
+        );
+        render_children(
+            &document,
+            container.as_ref(),
+            &Fragment::from(vec![code_block]),
+        );
+        let code = container
+            .first_element_child()
+            .expect("pre renders")
+            .last_element_child()
+            .expect("code renders");
+        let last = code.last_element_child().expect("code has an element child");
+        assert_eq!(last.tag_name().to_lowercase(), "br");
+        assert!(
+            last.has_attribute("data-sentinel"),
+            "trailing-newline sentinel missing (highlighted path)"
+        );
+
+        // The caret position after the trailing newline must be reachable
+        // and round-trip unchanged — the sentinel contributes no positions.
+        let end_pos = 1 + source.chars().count();
+        let (dom_node, dom_offset) =
+            find_dom_position(&container, end_pos).expect("end position resolves");
+        // Caret affinity: the position after the trailing '\n' must NOT
+        // resolve into the text node's end (browsers paint that caret at
+        // the end of the PREVIOUS visual line); it must resolve to an
+        // element slot past the sentinel <br>, which paints on the new
+        // empty line.
+        assert_eq!(
+            dom_node.node_type(),
+            DomNode::ELEMENT_NODE,
+            "end-of-newline caret must be an element position, not a text offset"
+        );
+        let round_tripped = dom_position_to_model(&container, &dom_node, dom_offset)
+            .expect("maps back to a model position");
+        assert_eq!(round_tripped, end_pos, "sentinel must not shift positions");
+        container.remove();
+
+        // Plain fallback path (unknown language) needs the sentinel too.
+        let container_el = document.create_element("div").unwrap();
+        document.body().unwrap().append_child(&container_el).unwrap();
+        let container: HtmlElement = container_el.dyn_into().unwrap();
+        let code_block = Node::element_with_content(
+            NodeType::CodeBlock,
+            Fragment::from(vec![Node::text("plain\n")]),
+        );
+        render_children(
+            &document,
+            container.as_ref(),
+            &Fragment::from(vec![code_block]),
+        );
+        let code = container
+            .first_element_child()
+            .expect("pre renders")
+            .last_element_child()
+            .expect("code renders");
+        let has_sentinel = code
+            .last_element_child()
+            .map(|el| el.has_attribute("data-sentinel"))
+            .unwrap_or(false);
+        assert!(has_sentinel, "trailing-newline sentinel missing (plain path)");
         container.remove();
     }
 }

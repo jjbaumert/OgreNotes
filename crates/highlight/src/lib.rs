@@ -213,7 +213,39 @@ impl Language {
             Language::Protobuf => "Protobuf",
         }
     }
+
+    /// The indent unit a Tab keypress inserts inside a code block of
+    /// this language — each community's dominant convention: hard tabs
+    /// for Go (gofmt), 2 spaces for the web/config family, 4 spaces
+    /// for the rest. Editors render '\t' at `tab-size: 4`.
+    pub fn indent_unit(self) -> &'static str {
+        match self {
+            Language::Go => "\t",
+            Language::JavaScript
+            | Language::TypeScript
+            | Language::Json
+            | Language::Yaml
+            | Language::Html
+            | Language::Css
+            | Language::Hcl
+            | Language::Protobuf => "  ",
+            Language::Rust
+            | Language::Python
+            | Language::Toml
+            | Language::Bash
+            | Language::Sql
+            | Language::Java
+            | Language::Kotlin
+            | Language::CSharp
+            | Language::C
+            | Language::Cpp
+            | Language::Dockerfile => "    ",
+        }
+    }
 }
+
+/// Indent unit for a code block with no (or an unresolved) language.
+pub const DEFAULT_INDENT_UNIT: &str = "    ";
 
 /// Tokenize `source`. Total function: never panics; the concatenation
 /// of all returned token texts equals `source` exactly.
@@ -265,5 +297,22 @@ mod tests {
         }
         assert_eq!(TokenKind::Plain.css_class(), None);
         assert_eq!(color_for(TokenKind::Plain, Theme::Light), None);
+    }
+
+    #[test]
+    fn indent_units_are_tabs_or_space_runs() {
+        assert_eq!(Language::Python.indent_unit(), "    ");
+        assert_eq!(Language::Rust.indent_unit(), "    ");
+        assert_eq!(Language::Go.indent_unit(), "\t");
+        assert_eq!(Language::JavaScript.indent_unit(), "  ");
+        assert_eq!(Language::Yaml.indent_unit(), "  ");
+        assert_eq!(DEFAULT_INDENT_UNIT, "    ");
+        for lang in Language::ALL {
+            let unit = lang.indent_unit();
+            assert!(
+                unit == "\t" || (!unit.is_empty() && unit.chars().all(|c| c == ' ')),
+                "{lang:?} indent unit must be a tab or a non-empty space run"
+            );
+        }
     }
 }

@@ -1,17 +1,25 @@
 #![forbid(unsafe_code)]
 
 //! Pure-Rust Mermaid → SVG renderer. `render()` never panics; every
-//! failure or not-yet-supported diagram kind returns a structured error
-//! and no SVG, so callers can fall back to raw source. Supports pie
-//! charts, flowcharts (graph/flowchart), and sequence diagrams; other
-//! diagram kinds are detected but not yet rendered. See
-//! docs/superpowers/specs/2026-07-08-mermaid-support-design.md.
+//! failure returns a structured error and no SVG, so callers can fall
+//! back to raw source. Supports pie charts, flowcharts (graph/flowchart),
+//! sequence diagrams, state diagrams (stateDiagram/stateDiagram-v2),
+//! class diagrams, and entity-relationship (ER) diagrams — every
+//! diagram kind this project scoped. Any other/unrecognized kind is
+//! `DiagramKind::Unknown` and always errors. See
+//! docs/superpowers/specs/2026-07-08-mermaid-support-design.md (index)
+//! and docs/superpowers/specs/2026-07-10-mermaid-slice4-state-class-er-design.md
+//! (state/class/ER).
 
 mod pie;
 mod layout;
 pub(crate) mod measure;
 pub(crate) mod flowchart;
 pub(crate) mod sequence;
+pub(crate) mod boxgraph;
+pub(crate) mod state;
+pub(crate) mod class;
+pub(crate) mod er;
 
 /// Max diagram source length (chars). Shared cap: the single source of
 /// truth for both the `crates/collab` write-gate validator
@@ -31,7 +39,7 @@ pub enum DiagramKind {
 }
 
 impl DiagramKind {
-    /// Human-facing name used in "‹label› not yet supported" errors.
+    /// Human-facing name for a diagram kind. Retained as public API; formerly used by the now-removed 'not yet supported' error path.
     pub fn label(self) -> &'static str {
         match self {
             DiagramKind::Pie => "pie",
@@ -131,19 +139,23 @@ pub fn render(source: &str) -> RenderOutput {
             Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
             Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
         },
+        DiagramKind::State => match state::render_state(source) {
+            Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
+        DiagramKind::Class => match class::render_class(source) {
+            Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
+        DiagramKind::Er => match er::render_er(source) {
+            Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
         DiagramKind::Unknown => RenderOutput {
             kind,
             svg: None,
             error: Some(ParseError {
                 message: "unrecognized diagram type".to_string(),
-                line: None,
-            }),
-        },
-        other => RenderOutput {
-            kind,
-            svg: None,
-            error: Some(ParseError {
-                message: format!("{} diagrams are not yet supported", other.label()),
                 line: None,
             }),
         },
@@ -170,19 +182,6 @@ mod tests {
     #[test]
     fn detection_skips_blank_and_comment_lines() {
         assert_eq!(detect_kind("\n\n  %% a comment\npie\n\"A\": 1"), DiagramKind::Pie);
-    }
-
-    #[test]
-    fn unsupported_kind_returns_error_with_kind_preserved() {
-        // Was sequenceDiagram through slices 1-2; Task 7 makes sequence
-        // diagrams render, so the fixture moves to a kind that's still
-        // unsupported (state/class/er) — same treatment slice 2 gave
-        // "flowchart LR" leaving `each_unsupported_kind_error_names_its_label`.
-        let out = render("classDiagram\nclassA <|-- classB");
-        assert_eq!(out.kind, DiagramKind::Class);
-        assert!(out.svg.is_none());
-        let err = out.error.expect("unsupported kind must carry an error");
-        assert!(err.message.to_lowercase().contains("not yet supported"), "got: {}", err.message);
     }
 
     #[test]
@@ -287,6 +286,14 @@ mod tests {
             "sequenceDiagram\nautonumber\nA->>A: 🎭<br/>🎭\nNote left of A: 🎉",
             "sequenceDiagram\nactivate A",
             "sequenceDiagram\nA-->>-B: under",
+            "stateDiagram-v2",
+            "stateDiagram-v2\n[*] --> [*]",
+            "classDiagram\nclass A {",
+            "classDiagram\nA <|-- A",
+            "erDiagram\nA ||--o{ A : self",
+            &format!("stateDiagram-v2\n{}", "state s {\n".repeat(30)),
+            &format!("classDiagram\n{}", "A --> B\n".repeat(2000)),
+            "erDiagram\nÉ ||--|| 中 : 🎉",
         ];
         for inp in inputs {
             let out = render(inp); // must return, not panic
@@ -355,25 +362,57 @@ mod tests {
         assert!(out.error.is_none(), "err: {:?}", out.error);
     }
 
+    // Sanctioned retirement (Task 8, see
+    // docs/superpowers/specs/2026-07-10-mermaid-slice4-state-class-er-design.md):
+    // `each_unsupported_kind_error_names_its_label` and
+    // `unsupported_kind_returns_error_with_kind_preserved` both existed to
+    // exercise the generic "‹kind› diagrams are not yet supported" catch-all
+    // arm in `render()`. Slice 4 wires state/class/er into `render()`,
+    // leaving `Unknown` as the only kind that still errors — the catch-all
+    // arm has no variants left to hit, so both tests are deleted rather
+    // than retargeted (there is no more "still unsupported" family left).
+    // `unknown_kind_still_errors` (below) covers the one remaining error
+    // path.
+
     #[test]
-    fn each_unsupported_kind_error_names_its_label() {
-        // "flowchart LR" left this list when slice 2 made flowcharts
-        // render (see flowchart_renders_svg_via_public_render); the
-        // remaining kinds are slice-4 territory.
-        let cases = [
-            ("stateDiagram-v2", "state"),
-            ("classDiagram", "class"),
-            ("erDiagram", "entity-relationship"),
-        ];
-        for (src, label) in cases {
+    fn state_renders_svg_via_public_render() {
+        let out = render("stateDiagram-v2\n[*] --> A\nA --> [*]");
+        assert_eq!(out.kind, DiagramKind::State);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
+        assert!(out.svg.unwrap().starts_with("<svg"));
+    }
+
+    #[test]
+    fn class_renders_svg_via_public_render() {
+        let out = render("classDiagram\nAnimal <|-- Dog");
+        assert_eq!(out.kind, DiagramKind::Class);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
+    }
+
+    #[test]
+    fn er_renders_svg_via_public_render() {
+        let out = render("erDiagram\nA ||--o{ B : has");
+        assert_eq!(out.kind, DiagramKind::Er);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
+    }
+
+    #[test]
+    fn unknown_kind_still_errors() {
+        let out = render("total gibberish");
+        assert_eq!(out.kind, DiagramKind::Unknown);
+        assert!(out.svg.is_none() && out.error.is_some());
+    }
+
+    #[test]
+    fn family_parse_errors_flow_through_render() {
+        for (src, line) in [
+            ("stateDiagram-v2\n}", 2),
+            ("classDiagram\nnamespace N {", 2),
+            ("erDiagram\nA ||--o{ B", 2),
+        ] {
             let out = render(src);
-            assert!(out.svg.is_none());
-            let err = out.error.expect("unsupported kind must carry an error");
-            assert!(
-                err.message.contains(label),
-                "error for {src:?} should mention {label:?}, got: {}",
-                err.message
-            );
+            assert!(out.svg.is_none(), "for {src:?}");
+            assert_eq!(out.error.expect("err").line, Some(line), "for {src:?}");
         }
     }
 }

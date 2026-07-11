@@ -27,6 +27,17 @@ pub fn check_input_rules(
     text_before: &str,
     block_start: usize,
 ) -> Option<Transaction> {
+    // Code blocks hold literal text — markdown trigger characters must
+    // not auto-format there. Without this gate the inline mark rules
+    // fire on code (`__init__` bolds, backticks make Code marks the
+    // schema forbids in code blocks), and a block whose entire text is
+    // a block trigger ("# ", "> ", "``` ") would even convert the code
+    // block's node type.
+    if let Some(block) = find_block_at(&state.doc, state.selection.from()) {
+        if block.node_type == NodeType::CodeBlock {
+            return None;
+        }
+    }
     for rule in rules {
         if let Some((match_offset, match_len)) = (rule.matcher)(text_before) {
             let from = block_start + match_offset;
@@ -684,6 +695,53 @@ mod tests {
         let rules = default_input_rules();
         let state = make_state("```pythön ");
         assert!(check_input_rules(&rules, &state, "```pythön ", 1).is_none());
+    }
+
+    fn code_block_state(text: &str) -> EditorState {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::CodeBlock,
+                Fragment::from(vec![Node::text(text)]),
+            )]),
+        );
+        let pos = 1 + super::super::model::char_len(text);
+        EditorState {
+            selection: Selection::cursor(pos),
+            ..EditorState::create_default(doc)
+        }
+    }
+
+    #[test]
+    fn no_input_rule_fires_inside_a_code_block() {
+        // Code blocks hold literal text — markdown trigger characters
+        // must not auto-format. `__init__` was bolding (the
+        // bold-underscore mark rule), and a block whose whole text is
+        // a block trigger would even convert node type.
+        let rules = default_input_rules();
+        for text in [
+            "def __init__",  // bold-underscore
+            "x *y*",         // italic
+            "a `b`",         // inline code mark
+            "# ",            // heading trigger
+            "> ",            // blockquote trigger
+            "``` ",          // nested fence
+            "- ",            // bullet list trigger
+        ] {
+            let state = code_block_state(text);
+            assert!(
+                check_input_rules(&rules, &state, text, 1).is_none(),
+                "rule fired inside a code block for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bold_underscore_still_fires_in_paragraph() {
+        // Guard the gate's scope: normal blocks keep their rules.
+        let rules = default_input_rules();
+        let state = make_state("def __init__");
+        assert!(check_input_rules(&rules, &state, "def __init__", 1).is_some());
     }
 
     #[test]

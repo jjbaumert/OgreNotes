@@ -65,6 +65,24 @@ fn inner_html(view: &EditorView) -> String {
     view.container().inner_html()
 }
 
+/// innerHTML with the editor's stamped `data-block-id="..."` attributes
+/// stripped, so structural assertions can match plain tags ("<li>",
+/// "<h1>Title</h1>") without pinning the (random, per-run) block ids.
+/// Issue #20: these attributes are deliberate production behavior; the
+/// literal-tag assertions predate them and never ran in CI to notice.
+fn normalized_html(view: &EditorView) -> String {
+    let mut html = inner_html(view);
+    const ATTR: &str = " data-block-id=\"";
+    while let Some(start) = html.find(ATTR) {
+        let value_end = html[start + ATTR.len()..]
+            .find('"')
+            .map(|i| start + ATTR.len() + i + 1)
+            .expect("unterminated data-block-id attribute");
+        html.replace_range(start..value_end, "");
+    }
+    html
+}
+
 /// Dispatch a synthetic `paste` event with a given plain-text payload.
 /// Applies any transactions the handler dispatches, then updates the DOM.
 fn dispatch_paste(
@@ -95,6 +113,14 @@ fn dispatch_paste_html(
     init.set_bubbles(true);
     init.set_cancelable(true);
     let event = web_sys::ClipboardEvent::new_with_event_init_dict("paste", &init).unwrap();
+    // Firefox moves a synthetic ClipboardEvent's DataTransfer into
+    // protected mode during dispatch, so getData() inside the handler
+    // returns "" and the editor sees an empty clipboard (issue #20).
+    // Shadow the protected getter with a plain value property carrying
+    // our payload — the jsdom/jest-style workaround.
+    let desc = js_sys::Object::new();
+    js_sys::Reflect::set(&desc, &"value".into(), &dt).unwrap();
+    js_sys::Object::define_property(&event, &"clipboardData".into(), &desc);
     view.container().dispatch_event(&event).unwrap();
     apply_all(view, txns);
 }
@@ -337,7 +363,7 @@ fn renders_paragraph_text() {
     let container = create_container();
     let (view, _txns) = create_editor(container.clone(), simple_doc());
 
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     assert!(html.contains("<p>Hello world</p>"), "Expected paragraph, got: {html}");
 
     cleanup(&container);
@@ -369,7 +395,7 @@ fn renders_heading() {
     let container = create_container();
     let (view, _txns) = create_editor(container.clone(), doc);
 
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     assert!(html.contains("<h1>Title</h1>"), "Expected h1, got: {html}");
 
     cleanup(&container);
@@ -933,7 +959,7 @@ fn hr_renders_hr_element_in_dom() {
     dispatch_before_input(view.container(), "insertText", Some("-"));
     apply_all(&view, &txns);
 
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     assert!(html.contains("<hr"), "DOM should contain <hr> element, got: {html}");
     assert!(html.contains("<p>"), "DOM should contain a new paragraph after HR, got: {html}");
 
@@ -1039,7 +1065,7 @@ fn enter_in_list_renders_two_li_elements() {
     dispatch_before_input(view.container(), "insertParagraph", None);
     apply_all(&view, &txns);
 
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     let li_count = html.matches("<li>").count();
     assert_eq!(li_count, 2, "Should render 2 <li> elements in DOM, got: {html}");
 
@@ -1114,7 +1140,7 @@ fn tab_indent_renders_nested_ul() {
     dispatch_keydown(view.container(), "Tab", false, false, false);
     apply_all(&view, &txns);
 
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     // Should have nested <ul> inside the first <li>
     assert!(
         html.contains("<ul>") && html.matches("<ul>").count() >= 2,
@@ -1510,7 +1536,7 @@ fn bullet_list_asterisk_input_rule() {
     let state = apply_all(&view, &txns);
     let list = state.doc.child(0).unwrap();
     assert_eq!(list.node_type(), Some(NodeType::BulletList));
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     assert!(html.contains("<ul>") && html.contains("<li>"), "DOM: {html}");
 
     cleanup(&container);
@@ -1534,7 +1560,7 @@ fn ordered_list_input_rule() {
     let state = apply_all(&view, &txns);
     let list = state.doc.child(0).unwrap();
     assert_eq!(list.node_type(), Some(NodeType::OrderedList));
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     assert!(html.contains("<ol>"), "DOM: {html}");
 
     cleanup(&container);
@@ -1582,7 +1608,7 @@ fn blockquote_input_rule() {
     let state = apply_all(&view, &txns);
     let block = state.doc.child(0).unwrap();
     assert_eq!(block.node_type(), Some(NodeType::Blockquote));
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     assert!(html.contains("<blockquote>"), "DOM: {html}");
 
     cleanup(&container);
@@ -1751,7 +1777,7 @@ fn renders_blockquote() {
     let container = create_container();
     let (view, _txns) = create_editor(container.clone(), blockquote_doc("Quote text"));
 
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     assert!(
         html.contains("<blockquote>") && html.contains("Quote text"),
         "Expected blockquote, got: {html}"
@@ -1765,7 +1791,7 @@ fn renders_ordered_list() {
     let container = create_container();
     let (view, _txns) = create_editor(container.clone(), ordered_list_doc("Item"));
 
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     assert!(
         html.contains("<ol>") && html.contains("<li>") && html.contains("Item"),
         "Expected ordered list, got: {html}"
@@ -1837,7 +1863,7 @@ fn renders_hard_break() {
     let container = create_container();
     let (view, _txns) = create_editor(container.clone(), hard_break_doc());
 
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     assert!(html.contains("before"), "Expected 'before', got: {html}");
     assert!(html.contains("after"), "Expected 'after', got: {html}");
     assert!(html.contains("<br>") || html.contains("<br/>"), "Expected <br>, got: {html}");
@@ -2067,7 +2093,7 @@ fn ctrl_alt_2_on_h1_changes_level() {
     let block = state.doc.child(0).unwrap();
     assert_eq!(block.node_type(), Some(NodeType::Heading));
     assert_eq!(block.attrs().get("level").unwrap(), "2");
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     assert!(html.contains("<h2>"), "DOM: {html}");
 
     cleanup(&container);
@@ -2339,7 +2365,7 @@ fn typing_in_empty_doc() {
 
     let state = apply_all(&view, &txns);
     assert_eq!(state.doc.child(0).unwrap().text_content(), "X");
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     assert!(html.contains("<p>X</p>"), "DOM: {html}");
 
     cleanup(&container);
@@ -2452,7 +2478,7 @@ fn nested_list_three_levels() {
     dispatch_keydown(view.container(), "Tab", false, false, false);
     let state = apply_all(&view, &txns);
 
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     let ul_count = html.matches("<ul>").count();
     assert!(ul_count >= 3, "Should have 3 nested <ul> levels, got {ul_count}: {html}");
 
@@ -2847,7 +2873,7 @@ fn shift_enter_inserts_hard_break() {
     let para = state.doc.child(0).unwrap();
     // Should have: "Hello" + HardBreak + " world"
     assert!(para.child_count() >= 3, "Should have text + br + text, got {} children", para.child_count());
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     assert!(html.contains("<br>") || html.contains("<br/>"), "DOM should contain <br>, got: {html}");
 
     cleanup(&container);
@@ -4034,7 +4060,7 @@ fn paste_markdown_heading_creates_h1_in_dom() {
 
     dispatch_paste(&view, &txns, "# Hello");
 
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     assert!(html.contains("<h1"),
         "expected <h1> after pasting '# Hello', got: {}", html);
     assert!(html.contains("Hello"),
@@ -4051,7 +4077,7 @@ fn paste_markdown_bullet_list_creates_ul_in_dom() {
 
     dispatch_paste(&view, &txns, "- a\n- b");
 
-    let html = inner_html(&view);
+    let html = normalized_html(&view);
     assert!(html.contains("<ul"),
         "expected <ul> after pasting bullet list, got: {}", html);
     let li_count = html.matches("<li").count();
@@ -4078,7 +4104,7 @@ fn paste_pre_wrapped_markdown_with_text_plain_parses_as_markdown() {
     let html = format!("<pre>{}</pre>", md);
     dispatch_paste_html(&view, &txns, md, &html);
 
-    let dom = inner_html(&view);
+    let dom = normalized_html(&view);
     assert!(dom.contains("<h1"),
         "expected <h1> from re-parsed markdown, got: {}", dom);
     assert!(dom.contains("<ul"),
@@ -4102,7 +4128,7 @@ fn paste_pre_wrapped_markdown_without_text_plain_parses_as_markdown() {
     let html = "<pre># Title\n\nFirst paragraph.\n\n- one\n- two\n</pre>";
     dispatch_paste_html(&view, &txns, "", html);
 
-    let dom = inner_html(&view);
+    let dom = normalized_html(&view);
     assert!(dom.contains("<h1"),
         "expected <h1> from re-parsed CodeBlock text, got: {}", dom);
     assert!(dom.contains("<ul"),
@@ -4131,7 +4157,7 @@ fn paste_pre_code_without_language_preserves_codeblock() {
         html,
     );
 
-    let dom = inner_html(&view);
+    let dom = normalized_html(&view);
     assert!(dom.contains("<pre"),
         "expected <pre>/CodeBlock for unlabeled <pre><code>, got: {}", dom);
     assert!(!dom.contains("<h1"),
@@ -4157,7 +4183,7 @@ fn paste_real_code_block_preserves_codeblock() {
 </code></pre>"#;
     dispatch_paste_html(&view, &txns, "fn main() {\n    println!(\"hi\");\n}\n", html);
 
-    let dom = inner_html(&view);
+    let dom = normalized_html(&view);
     assert!(dom.contains("<pre"),
         "expected <pre> for a real language-tagged code block, got: {}", dom);
     // The render path splits the literal code text into `tok-*` token

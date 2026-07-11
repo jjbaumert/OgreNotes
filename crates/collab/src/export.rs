@@ -2624,14 +2624,21 @@ mod tests {
 
     #[test]
     fn mermaid_html_falls_back_to_raw_source_on_error() {
-        // Was sequenceDiagram; mermaid slice 3 (Task 7) made sequence
-        // diagrams render, so this now needs a still-unsupported kind to
-        // exercise the error fallback path — same swap made in
-        // ogrenotes-mermaid's lib.rs tests for the same reason.
-        let html = to_html_of_single_mermaid("classDiagram\nclassA <|-- classB");
+        // Sanctioned fixture swap (Task 8, see
+        // docs/superpowers/specs/2026-07-10-mermaid-slice4-state-class-er-design.md):
+        // slice 4 wires state/class/er into `render()`, so `classDiagram`
+        // (the prior fixture, itself a slice-3 swap from `sequenceDiagram`
+        // for the same reason) now renders successfully instead of
+        // erroring. Every mermaid kind this project scopes now renders, so
+        // there is no longer a "still unsupported" diagram kind to reach
+        // for — this test's actual purpose ("any render error falls back
+        // to raw source") only needs a source `render()` can never parse,
+        // regardless of kind detection. This ends the per-slice fixture
+        // churn.
+        let html = to_html_of_single_mermaid("not a diagram at all");
         assert!(html.contains("mermaid-error"));
         // raw source preserved and escaped
-        assert!(html.contains("classA &lt;|-- classB") || html.contains("classA <|-- classB"));
+        assert!(html.contains("not a diagram at all"));
         assert!(!html.contains("<svg"));
     }
 

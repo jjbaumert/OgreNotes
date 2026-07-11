@@ -988,6 +988,9 @@ html, body {
   --tok-function: #d2a8ff;
   --tok-meta: #7ee787;
 }
+/* Hard tabs in code blocks (Go's indent unit) render 4 columns wide,
+   matching Language::indent_unit's space-based units. */
+.editor-content pre { tab-size: 4; }
 .tok-keyword { color: var(--tok-keyword); }
 .tok-type { color: var(--tok-type); }
 .tok-string { color: var(--tok-string); }
