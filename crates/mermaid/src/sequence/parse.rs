@@ -390,10 +390,10 @@ impl Parser {
         let mut deactivate_source = false;
         if let Some(r) = after.strip_prefix('+') {
             activate_target = true;
-            after = r;
+            after = r.trim_start();
         } else if let Some(r) = after.strip_prefix('-') {
             deactivate_source = true;
-            after = r;
+            after = r.trim_start();
         }
         // Target id: same ASCII-only predicate, so char count == byte length.
         let to_len = after
@@ -806,5 +806,20 @@ mod tests {
         // the tail is then an invalid statement -> loud error.
         let e = parse("sequenceDiagram\nNote over A: watch; this").unwrap_err();
         assert_eq!(e.line, Some(2));
+    }
+
+    #[test]
+    fn spaced_activation_shorthand() {
+        // The docs' Background-Highlighting example spells it with
+        // spaces: `Alice ->>+ John: ...` / `John -->>- Alice: ...`.
+        let g = p("sequenceDiagram\nAlice ->>+ John: hi\nJohn -->>- Alice: yo");
+        match &g.events[0] {
+            Event::Message { activate_target, .. } => assert!(*activate_target),
+            other => panic!("expected message, got {other:?}"),
+        }
+        match &g.events[1] {
+            Event::Message { deactivate_source, .. } => assert!(*deactivate_source),
+            other => panic!("expected message, got {other:?}"),
+        }
     }
 }
