@@ -946,6 +946,10 @@ html, body {
   background: var(--color-code-bg);
   color: var(--color-code-fg);
   padding: var(--space-md);
+  /* The light-mode slab (#F4F1EA on white) needs an edge to read as
+   * a block; --color-border flips per theme so dark mode just gains
+   * a subtle inset outline. */
+  border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
   margin: 8px 0;
   font-family: var(--font-mono);

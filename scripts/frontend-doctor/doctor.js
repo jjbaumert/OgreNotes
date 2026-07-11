@@ -4657,6 +4657,212 @@ async function scenarioTypePastAtom(ctx, collector) {
   await browser.close();
 }
 
+// ─── code-block-enter scenario ──────────────────────────────────
+//
+// Regression guard for Enter-inside-a-fenced-code-block (the
+// triple-backtick input rule + `Mod-Alt-c` code-block shortcut
+// landed in 8d7146f). A generic `split_block` — the path every
+// other textblock's Enter key rides — turns the block at the caret
+// into two SIBLING blocks (first keeps the original node type,
+// second becomes a plain Paragraph). That's exactly right for a
+// heading or a list item, but inside a `pre > code` it must NOT
+// apply: pressing Enter while still writing code has to insert a
+// newline in the SAME code block, and only a double-Enter (a blank
+// line) should exit into a trailing paragraph — mirroring the
+// GitHub / CodeMirror convention. This scenario types a fenced
+// Python block, asserts the language chip + keyword highlighting
+// wire up, presses Enter once (asserting the block does NOT split),
+// types a second line, then double-Enters to confirm the block IS
+// exited cleanly afterward.
+//
+//   A. "```python " → `pre > code.language-python` appears; the
+//      `.code-lang-chip` overlay `<select>` shows "Python".
+//   B. "class PythonClass:" → a `span.tok-keyword` wraps "class".
+//   C. Enter once → still exactly one `pre`; `code.textContent ===
+//      "class PythonClass:\n"`; code's last element child is
+//      `br[data-sentinel]`; the caret is still inside the `pre`.
+//   D. "pass" → `code.textContent === "class PythonClass:\npass"`;
+//      still exactly one `pre`.
+//   E. Enter twice (blank line) → a `p` now follows the `pre`; the
+//      caret moved into that paragraph, not the `pre`; the code
+//      block's text is unchanged.
+async function scenarioCodeBlockEnter(ctx, collector) {
+  const { baseUrlA, baseUrl, emailA, outDir } = ctx;
+  const target = baseUrlA || baseUrl;
+  const tokens = await devLogin(
+    target, emailA || "doctor-codeblock-enter@ogrenotes.example.com",
+  );
+  const title = `doctor-code-block-enter-${Date.now()}`;
+  const doc = await createDocViaApi(target, tokens.accessToken, title);
+  logJson({ at: "doc-created", docId: doc.id });
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    ...DOCTOR_CONTEXT_DEFAULTS,
+    recordHar: { path: join(outDir, "tab-a.har"), mode: "full" },
+  });
+  await seedAuth(context, tokens);
+  const page = await context.newPage();
+  instrument(context, page, "tab-a", collector);
+
+  await page.goto(`${target}/d/${doc.id}/probe`, {
+    waitUntil: "domcontentloaded", timeout: 30000,
+  });
+
+  const steps = {};
+  const evidence = {};
+  try {
+    await page.waitForSelector(".editor-content[data-editor-ready]", { timeout: 15000 });
+    const ed = page.locator(".editor-content");
+    await ed.click();
+    steps.editorReady = true;
+
+    // ── Step a: ```python + trailing space triggers the code-block
+    // input rule. Per-key typing (not clipboard paste) so beforeinput
+    // fires for every character, exactly like a real user.
+    await page.keyboard.type("```python ", { delay: 20 });
+    const codeBlockAppeared = await page
+      .waitForSelector("pre > code.language-python", { timeout: 5000 })
+      .then(() => true)
+      .catch(() => false);
+    steps.aCodeBlockCreated = codeBlockAppeared;
+    evidence.aCodeBlockCreated = codeBlockAppeared
+      ? "pre > code.language-python present"
+      : "selector never appeared";
+
+    const chip = await page
+      .locator(".code-lang-chip select")
+      .evaluate((sel) => ({
+        value: sel.value,
+        label: sel.selectedOptions[0] ? sel.selectedOptions[0].label : null,
+      }))
+      .catch((e) => ({ error: e.message }));
+    evidence.aChip = chip;
+    steps.aChipShowsPython =
+      !!chip && (chip.value === "python" || chip.label === "Python");
+
+    // ── Step b: type a line containing a Python keyword.
+    await page.keyboard.type("class PythonClass:", { delay: 20 });
+    await page.waitForTimeout(200);
+    const keywordCount = await page
+      .locator("pre > code span.tok-keyword", { hasText: "class" })
+      .count()
+      .catch(() => 0);
+    steps.bKeywordSpan = keywordCount > 0;
+    evidence.bKeywordSpan = `tok-keyword spans matching "class": ${keywordCount}`;
+
+    // ── Step c: press Enter ONCE — the regression under test. Must
+    // stay inside the same `pre`, not split into a second block.
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(200);
+    await page.screenshot({
+      path: join(outDir, "tab-a-step-c.png"), fullPage: false,
+    }).catch(() => {});
+
+    const preCountC = await page.locator("pre").count();
+    steps.cSinglePre = preCountC === 1;
+    evidence.cSinglePre = `pre count: ${preCountC}`;
+
+    const codeTextC = await page.locator("pre > code").first().textContent();
+    steps.cTextContent = codeTextC === "class PythonClass:\n";
+    evidence.cTextContent = JSON.stringify(codeTextC);
+
+    const sentinelC = await page
+      .locator("pre > code")
+      .first()
+      .evaluate((code) => {
+        const last = code.lastElementChild;
+        return !!(last && last.tagName === "BR" && last.hasAttribute("data-sentinel"));
+      })
+      .catch(() => false);
+    steps.cSentinelBr = sentinelC;
+    evidence.cSentinelBr = sentinelC
+      ? "last element child is br[data-sentinel]"
+      : "last element child is not br[data-sentinel]";
+
+    const selInPreC = await page.evaluate(() => {
+      const sel = window.getSelection();
+      const pre = document.querySelector("pre");
+      if (!sel || !sel.anchorNode || !pre) return false;
+      return pre.contains(sel.anchorNode);
+    });
+    steps.cSelectionInPre = selInPreC;
+    evidence.cSelectionInPre = `selection.anchorNode inside pre: ${selInPreC}`;
+
+    // ── Step d: type a second line inside the (still single) block.
+    await page.keyboard.type("pass", { delay: 20 });
+    await page.waitForTimeout(150);
+
+    const codeTextD = await page.locator("pre > code").first().textContent();
+    steps.dTextContent = codeTextD === "class PythonClass:\npass";
+    evidence.dTextContent = JSON.stringify(codeTextD);
+
+    const preCountD = await page.locator("pre").count();
+    steps.dSinglePre = preCountD === 1;
+    evidence.dSinglePre = `pre count: ${preCountD}`;
+
+    // ── Step e: blank line (Enter twice) exits the code block.
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(200);
+    await page.screenshot({
+      path: join(outDir, "tab-a-step-e.png"), fullPage: false,
+    }).catch(() => {});
+
+    const paragraphAfterPre = await page.evaluate(() => {
+      const pre = document.querySelector("pre");
+      if (!pre) return false;
+      let sib = pre.nextElementSibling;
+      while (sib) {
+        if (sib.tagName === "P") return true;
+        sib = sib.nextElementSibling;
+      }
+      return false;
+    });
+    steps.eParagraphAfterPre = paragraphAfterPre;
+    evidence.eParagraphAfterPre = `paragraph found after pre: ${paragraphAfterPre}`;
+
+    const selE = await page.evaluate(() => {
+      const sel = window.getSelection();
+      const pre = document.querySelector("pre");
+      if (!sel || !sel.anchorNode) return { inParagraph: false, inPre: false };
+      const node = sel.anchorNode.nodeType === Node.TEXT_NODE
+        ? sel.anchorNode.parentElement
+        : sel.anchorNode;
+      const inPre = !!(pre && node && pre.contains(node));
+      let p = node;
+      while (p && p !== document.body) {
+        if (p.tagName === "P") return { inParagraph: true, inPre };
+        p = p.parentElement;
+      }
+      return { inParagraph: false, inPre };
+    });
+    steps.eSelectionInParagraph = selE.inParagraph === true && selE.inPre === false;
+    evidence.eSelection = selE;
+
+    const codeTextE = await page.locator("pre > code").first().textContent();
+    steps.eTextContentUnchanged = codeTextE === "class PythonClass:\npass";
+    evidence.eTextContent = JSON.stringify(codeTextE);
+  } catch (e) {
+    collector.stepError = `${e.message}\n${e.stack || ""}`;
+  }
+
+  const tab = collector["tab-a"] || { errors: [], console: [] };
+  const consoleErrors = (tab.console || []).filter((m) => m.type === "error");
+  steps.noPageErrors = (tab.errors || []).length === 0;
+  steps.noConsoleErrors = consoleErrors.length === 0;
+  evidence.consoleErrors = consoleErrors.map((m) => m.text);
+
+  collector.scenario = {
+    name: "code-block-enter", docId: doc.id, title, steps, evidence,
+  };
+  await page.screenshot({
+    path: join(outDir, "tab-a.png"), fullPage: false,
+  }).catch(() => {});
+  await context.close();
+  await browser.close();
+}
+
 // ─── bulk-delete scenario ───────────────────────────────────────
 //
 // Phase 5 M-P7 piece D. Creates three docs via API, navigates
@@ -5829,7 +6035,7 @@ async function main() {
         "spreadsheet-keyboard|spreadsheet-headers|spreadsheet-toolbar|" +
         "spreadsheet-freeze|spreadsheet-sheet-tabs|" +
         "spreadsheet-remote-cursor|mobile-spreadsheet-keyboards|" +
-        "command-palette-actions|embed-youtube|calendar-block|kanban-block|kanban-drag|kanban-column-reorder|kanban-wip-limit|kanban-card-metadata|type-past-atom|bulk-delete|" +
+        "command-palette-actions|embed-youtube|calendar-block|kanban-block|kanban-drag|kanban-column-reorder|kanban-wip-limit|kanban-card-metadata|type-past-atom|code-block-enter|bulk-delete|" +
         "a11y-audit|ask-flow|admin-console|mfa-flow|" +
         "semantic-search|import-job-round-trip|" +
         "menu-export-downloads|pre-sync-edit-preserved|" +
@@ -5915,6 +6121,8 @@ async function main() {
       await scenarioKanbanCardMetadata(ctx, collector);
     } else if (scenario === "type-past-atom") {
       await scenarioTypePastAtom(ctx, collector);
+    } else if (scenario === "code-block-enter") {
+      await scenarioCodeBlockEnter(ctx, collector);
     } else if (scenario === "bulk-delete") {
       await scenarioBulkDelete(ctx, collector);
     } else if (scenario === "a11y-audit") {
@@ -6391,6 +6599,13 @@ async function main() {
       "questionSubmitted", "askEndpointAvailable",
       "answerStreamed", "sourcesAppeared",
       "firstCitationMatchesSeed",
+    ],
+    "code-block-enter": [
+      "editorReady", "aCodeBlockCreated", "aChipShowsPython",
+      "bKeywordSpan", "cSinglePre", "cTextContent", "cSentinelBr",
+      "cSelectionInPre", "dTextContent", "dSinglePre",
+      "eParagraphAfterPre", "eSelectionInParagraph",
+      "eTextContentUnchanged", "noPageErrors", "noConsoleErrors",
     ],
   };
   if (ok && Object.prototype.hasOwnProperty.call(requiredSteps, scenario)) {
