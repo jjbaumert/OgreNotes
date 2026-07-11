@@ -42,12 +42,27 @@ fn draw_box(out: &mut String, cx: f64, top_y: f64, box_w: f64, box_h: f64, label
         box_w,
         box_h
     ));
+    // Display may contain <br/> line breaks; measure::lines splits the
+    // same way the box width/head height were measured. Single-line
+    // output is position-identical to the old code (dy = +5 baseline).
+    let lines = measure::lines(label);
+    let n = lines.len();
     out.push_str(&format!(
-        r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
-        cx,
-        top_y + box_h / 2.0 + 5.0,
-        escape_xml(label)
+        r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">"#,
+        top_y + box_h / 2.0
     ));
+    for (idx, line) in lines.iter().enumerate() {
+        let dy = if idx == 0 {
+            -((n as f64 - 1.0) / 2.0) * measure::LINE_H + 5.0
+        } else {
+            measure::LINE_H
+        };
+        out.push_str(&format!(
+            r#"<tspan x="{cx:.1}" dy="{dy:.1}">{}</tspan>"#,
+            escape_xml(line)
+        ));
+    }
+    out.push_str("</text>");
 }
 
 /// An actor-header participant: stick figure (head circle + body/arms/legs
@@ -70,12 +85,19 @@ fn draw_actor(out: &mut String, cx: f64, top_y: f64, label: &str) {
         y32 = head_cy + 32.0,
         xrr = cx + 7.0,
     ));
+    let lines = measure::lines(label);
     out.push_str(&format!(
-        r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
-        cx,
-        head_cy + 32.0 + 14.0,
-        escape_xml(label)
+        r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">"#,
+        head_cy + 32.0 + 14.0
     ));
+    for (idx, line) in lines.iter().enumerate() {
+        let dy = if idx == 0 { 0.0 } else { measure::LINE_H };
+        out.push_str(&format!(
+            r#"<tspan x="{cx:.1}" dy="{dy:.1}">{}</tspan>"#,
+            escape_xml(line)
+        ));
+    }
+    out.push_str("</text>");
 }
 
 pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
@@ -387,5 +409,19 @@ mod tests {
     #[test]
     fn parse_error_propagates() {
         assert!(render_sequence("sequenceDiagram\nend").is_err());
+    }
+
+    #[test]
+    fn participant_display_line_breaks_render_as_tspans() {
+        let svg = render_sequence(
+            "sequenceDiagram\nparticipant A as Alice<br/>Johnson\nactor B as Bob<br/>Builder\nA->>B: x",
+        )
+        .unwrap();
+        assert!(!svg.contains("&lt;br/&gt;"), "literal <br/> leaked: {svg}");
+        // Each display line appears in top AND bottom header passes,
+        // box form (Alice/Johnson) and actor form (Bob/Builder).
+        for frag in [">Alice<", ">Johnson<", ">Bob<", ">Builder<"] {
+            assert!(svg.matches(frag).count() >= 2, "{frag} missing: {svg}");
+        }
     }
 }
