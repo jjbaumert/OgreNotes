@@ -311,21 +311,29 @@ impl Parser {
         }
 
         let placement = if placement_kw == "over" {
-            let mut parts = ids_part.split(',').map(str::trim);
-            let a = parts.next().unwrap_or("");
-            if a.is_empty() {
-                return Err(self.err("note needs at least one participant id"));
-            }
-            self.validate_id(a)?;
-            let a_idx = self.intern(a, None, false, false)?;
-            let b_idx = match parts.next() {
-                Some(b) if !b.is_empty() => {
-                    self.validate_id(b)?;
-                    Some(self.intern(b, None, false, false)?)
+            // Mermaid allows any number of comma-separated participants;
+            // the note spans the outermost lifelines. Intern every id
+            // (creating lifelines as needed) and store (min, max) by
+            // participant index — index order is column order.
+            let mut bounds: Option<(usize, usize)> = None;
+            for id in ids_part.split(',').map(str::trim) {
+                if id.is_empty() {
+                    return Err(self.err("note needs at least one participant id"));
                 }
-                _ => None,
-            };
-            NotePlacement::Over(a_idx, b_idx)
+                self.validate_id(id)?;
+                let idx = self.intern(id, None, false, false)?;
+                bounds = Some(match bounds {
+                    None => (idx, idx),
+                    Some((lo, hi)) => (lo.min(idx), hi.max(idx)),
+                });
+            }
+            // ids_part is non-empty (checked above), so bounds is Some.
+            let (lo, hi) = bounds.unwrap_or((0, 0));
+            if lo == hi {
+                NotePlacement::Over(lo, None)
+            } else {
+                NotePlacement::Over(lo, Some(hi))
+            }
         } else {
             self.validate_id(ids_part)?;
             let idx = self.intern(ids_part, None, false, false)?;
@@ -709,6 +717,29 @@ mod tests {
         let e = parse("sequenceDiagram\nNote over A B: t").unwrap_err();
         assert_eq!(e.line, Some(2));
         assert!(e.message.contains("invalid participant id"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn note_over_three_or_more_spans_outermost() {
+        use crate::sequence::NotePlacement;
+        // Every listed participant is interned; the stored pair is
+        // (min, max) by index. (Was: third participant silently
+        // dropped — filed on #32, fixed here.)
+        let g = p("sequenceDiagram\nA->>B: x\nB->>C: y\nNote over C,A,B: all");
+        assert_eq!(g.participants.len(), 3);
+        assert!(matches!(&g.events[2],
+            Event::Note { placement: NotePlacement::Over(0, Some(2)), .. }));
+        // Note-first form creates all three lifelines.
+        let g = p("sequenceDiagram\nNote over X,Y,Z: trio");
+        assert_eq!(g.participants.len(), 3);
+    }
+
+    #[test]
+    fn note_over_trailing_comma_errors() {
+        // Previously a trailing comma was silently ignored; empty ids
+        // now error like every other id-position empty.
+        let e = parse("sequenceDiagram\nNote over A,: t").unwrap_err();
+        assert_eq!(e.line, Some(2));
     }
 
     #[test]

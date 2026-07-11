@@ -318,6 +318,43 @@ mod tests {
     }
 
     #[test]
+    fn note_over_three_spans_outer_lifelines() {
+        let svg = render_sequence(
+            "sequenceDiagram\nA->>B: x\nB->>C: y\nNote over A,C: wide",
+        )
+        .unwrap();
+        // Lifelines are the dasharray-"3 3" <line> elements; the note
+        // rect (note-fill) must span at least from the first to the
+        // last lifeline x.
+        let cols: Vec<f64> = svg
+            .match_indices("<line ")
+            .filter_map(|(i, _)| {
+                let seg = &svg[i..i + svg[i..].find("/>").unwrap()];
+                if !seg.contains("stroke-dasharray=\"3 3\"") {
+                    return None;
+                }
+                let j = seg.find("x1=\"").unwrap() + 4;
+                seg[j..].split('"').next().unwrap().parse().ok()
+            })
+            .collect();
+        assert_eq!(cols.len(), 3, "{svg}");
+        let ri = svg.find("--mermaid-note-fill").unwrap();
+        let rect = &svg[svg[..ri].rfind("<rect").unwrap()..ri];
+        let attr = |name: &str| -> f64 {
+            let j = rect.find(&format!("{name}=\"")).unwrap() + name.len() + 2;
+            rect[j..].split('"').next().unwrap().parse().unwrap()
+        };
+        let (x, w) = (attr("x"), attr("width"));
+        let cmin = cols.iter().cloned().fold(f64::MAX, f64::min);
+        let cmax = cols.iter().cloned().fold(f64::MIN, f64::max);
+        assert!(
+            x <= cmin && x + w >= cmax,
+            "note {x}..{} vs cols {cmin}..{cmax}: {svg}",
+            x + w
+        );
+    }
+
+    #[test]
     fn fragment_frame_and_divider() {
         let svg = render_sequence("sequenceDiagram\nalt good\nA->>B: y\nelse bad\nA-xB: n\nend").unwrap();
         assert!(svg.contains(">alt<") || svg.contains(">alt</"));
