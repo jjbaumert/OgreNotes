@@ -1,17 +1,25 @@
 //! Mermaid state diagrams: model types shared by the parser (this
 //! slice) and the SVG renderer (Task 3).
 
-// TODO(slice4): removed in Task 8
-#![allow(dead_code)]
 pub(crate) mod parse;
 pub(crate) mod svg;
+#[cfg(test)]
+mod props;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StateKind { Normal, Start, End, Choice, ForkJoin }
 
 #[derive(Debug, Clone)]
 pub(crate) struct StateNode {
-    pub id: String,          // synthetic ids for [*]: "__start_N"/"__end_N"
+    /// Mermaid source identifier (synthetic ids for `[*]`:
+    /// "__start_N"/"__end_N"). Not read by the render pipeline
+    /// (downstream stages address nodes by index); kept because parser
+    /// tests assert on it to verify id-extraction and synthetic-node
+    /// generation are correct. Same precedent as
+    /// `flowchart::FlowNode.id` / `sequence::SeqLayout.body_top` — see
+    /// task-14-report.md.
+    #[allow(dead_code)]
+    pub id: String,
     pub display: String,
     pub kind: StateKind,
     pub composite: Option<usize>, // index into composites

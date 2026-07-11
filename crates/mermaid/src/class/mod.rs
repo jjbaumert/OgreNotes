@@ -1,10 +1,10 @@
 //! Mermaid class diagrams: model types shared by the parser and the SVG
 //! renderer (this slice).
 
-// TODO(slice4): removed in Task 8
-#![allow(dead_code)]
 pub(crate) mod parse;
 pub(crate) mod svg;
+#[cfg(test)]
+mod props;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RelKind {
