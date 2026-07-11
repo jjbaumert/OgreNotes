@@ -9,6 +9,7 @@ use crate::flowchart::ShapeKind;
 pub(crate) fn size_for(shape: ShapeKind, tw: f64, th: f64) -> (f64, f64) {
     match shape {
         ShapeKind::Rect | ShapeKind::Rounded => (tw + 24.0, th + 16.0),
+        ShapeKind::Subroutine => (tw + 40.0, th + 16.0),
         ShapeKind::Stadium => (tw + 32.0, th + 16.0),
         ShapeKind::Circle => {
             let d = tw.max(th) + 28.0;
@@ -36,6 +37,13 @@ pub(crate) fn emit(shape: ShapeKind, cx: f64, cy: f64, w: f64, h: f64) -> String
         ShapeKind::Rect => format!(
             r#"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" {common}/>"#
         ),
+        ShapeKind::Subroutine => {
+            let inset = 6.0;
+            let (x1, x2, yb) = (x + inset, x + w - inset, y + h);
+            format!(
+                r#"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" {common}/><line x1="{x1:.1}" y1="{y:.1}" x2="{x1:.1}" y2="{yb:.1}" stroke="currentColor" stroke-width="1"/><line x1="{x2:.1}" y1="{y:.1}" x2="{x2:.1}" y2="{yb:.1}" stroke="currentColor" stroke-width="1"/>"#
+            )
+        }
         ShapeKind::Rounded => format!(
             r#"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" rx="8" {common}/>"#
         ),
@@ -224,5 +232,15 @@ mod tests {
         assert_eq!(poly_points(ShapeKind::Parallelogram), 4);
         assert_eq!(poly_points(ShapeKind::Trapezoid), 4);
         assert_eq!(poly_points(ShapeKind::Flag), 5);
+    }
+
+    #[test]
+    fn subroutine_fits_text_and_emits_rect_with_two_bars() {
+        let (w, h) = size_for(ShapeKind::Subroutine, 80.0, 19.0);
+        assert!(w >= 80.0 && h >= 19.0);
+        let svg = emit(ShapeKind::Subroutine, 100.0, 50.0, 120.0, 40.0);
+        assert!(svg.contains("<rect"), "{svg}");
+        assert_eq!(svg.matches("<line").count(), 2, "{svg}");
+        assert!(svg.contains("currentColor") && !svg.contains("NaN"));
     }
 }

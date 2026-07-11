@@ -315,6 +315,7 @@ impl Parser {
             ("(((", &[(")))", ShapeKind::DoubleCircle)]),
             ("((", &[("))", ShapeKind::Circle)]),
             ("([", &[("])", ShapeKind::Stadium)]),
+            ("[[", &[("]]", ShapeKind::Subroutine)]),
             ("[(", &[(")]", ShapeKind::Cylinder)]),
             ("[/", &[("/]", ShapeKind::Parallelogram), ("\\]", ShapeKind::Trapezoid)]),
             ("[\\", &[("\\]", ShapeKind::ParallelogramRev), ("/]", ShapeKind::TrapezoidRev)]),
@@ -1140,5 +1141,17 @@ mod tests {
     fn no_default_class_def_means_no_auto_class() {
         let g = p("graph TD\nclassDef hot fill:#f00\nA");
         assert!(g.nodes[0].classes.is_empty());
+    }
+
+    #[test]
+    fn subroutine_shape_parses() {
+        let g = p("graph TD\nA[[call me]]");
+        assert_eq!(g.nodes[0].shape, ShapeKind::Subroutine);
+        assert_eq!(g.nodes[0].label, "call me");
+        // Quoted form and precedence vs `[` / `[(`:
+        let g = p("graph TD\nB[[\"quoted [x]\"]]\nC[(db)]\nD[plain]");
+        assert_eq!(g.nodes[0].label, "quoted [x]");
+        assert_eq!(g.nodes[1].shape, ShapeKind::Cylinder);
+        assert_eq!(g.nodes[2].shape, ShapeKind::Rect);
     }
 }

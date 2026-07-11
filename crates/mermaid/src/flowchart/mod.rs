@@ -5,6 +5,7 @@ pub(crate) mod svg;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShapeKind {
     Rect,
+    Subroutine,
     Rounded,
     Stadium,
     Circle,
