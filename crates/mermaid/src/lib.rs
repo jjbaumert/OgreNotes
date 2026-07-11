@@ -106,8 +106,45 @@ pub fn detect_kind(source: &str) -> DiagramKind {
     }
 }
 
+/// Mermaid sources may open with a YAML front-matter block
+/// (`---` … `---`) carrying config/theme data we don't consume. When
+/// the very first line is `---`, blank the block's lines (delimiters
+/// inclusive) rather than slicing them away, so every downstream error
+/// still points at the original 1-based line numbers. Contents are
+/// ignored in v1.
+fn strip_front_matter(source: &str) -> Result<Option<String>, ParseError> {
+    match source.lines().next() {
+        Some(first) if first.trim() == "---" => {}
+        _ => return Ok(None),
+    }
+    let Some(close_rel) = source.lines().skip(1).position(|l| l.trim() == "---") else {
+        return Err(ParseError {
+            message: "unterminated front matter: missing closing `---`".into(),
+            line: Some(1),
+        });
+    };
+    let close_idx = close_rel + 1; // position() counted from line 2
+    let blanked: Vec<&str> = source
+        .lines()
+        .enumerate()
+        .map(|(i, l)| if i <= close_idx { "" } else { l })
+        .collect();
+    Ok(Some(blanked.join("\n")))
+}
+
 /// Render mermaid `source` to an SVG string. Never panics.
 pub fn render(source: &str) -> RenderOutput {
+    let stripped;
+    let source = match strip_front_matter(source) {
+        Ok(None) => source,
+        Ok(Some(s)) => {
+            stripped = s;
+            stripped.as_str()
+        }
+        Err(e) => {
+            return RenderOutput { kind: DiagramKind::Unknown, svg: None, error: Some(e) }
+        }
+    };
     let kind = detect_kind(source);
     // Self-contained gate: `crates/collab`'s write-gate validator already
     // rejects over-cap sources before they're ever stored, but `render()`
@@ -414,6 +451,42 @@ mod tests {
             assert!(out.svg.is_none(), "for {src:?}");
             assert_eq!(out.error.expect("err").line, Some(line), "for {src:?}");
         }
+    }
+
+    #[test]
+    fn front_matter_is_skipped_for_kind_detection_and_render() {
+        let src = "---\ntitle: My chart\nconfig:\n  theme: forest\n---\ngraph TD\nA --> B";
+        let out = render(src);
+        assert_eq!(out.kind, DiagramKind::Flowchart);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
+        // Works for a non-flowchart kind too (stripping precedes detection).
+        let out = render("---\ntitle: t\n---\npie\n\"A\" : 1");
+        assert_eq!(out.kind, DiagramKind::Pie);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
+    }
+
+    #[test]
+    fn front_matter_preserves_original_error_lines() {
+        // Front matter occupies lines 1-3; the broken statement is on
+        // line 5 of the ORIGINAL source and must be reported as 5.
+        let out = render("---\ntitle: x\n---\ngraph TD\nA[unclosed");
+        assert_eq!(out.error.expect("err").line, Some(5));
+    }
+
+    #[test]
+    fn unterminated_front_matter_errors_at_line_1() {
+        let out = render("---\ntitle: x\ngraph TD\nA");
+        assert_eq!(out.kind, DiagramKind::Unknown);
+        let e = out.error.expect("err");
+        assert_eq!(e.line, Some(1));
+        assert!(e.message.contains("front matter"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn dashes_not_on_line_one_are_not_front_matter() {
+        // `---` as an EDGE on a later line must be untouched.
+        let out = render("graph TD\nA --- B");
+        assert!(out.error.is_none(), "err: {:?}", out.error);
     }
 }
 
