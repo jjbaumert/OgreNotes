@@ -160,7 +160,7 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
 
     // 6. messages: line/path + text + autonumber prefix.
     for m in &l.messages {
-        let Some(Event::Message { from, to, line, head, text, .. }) = d.events.get(m.event) else {
+        let Some(Event::Message { from, to, line, head, from_head, text, .. }) = d.events.get(m.event) else {
             continue;
         };
         let self_msg = from == to;
@@ -170,10 +170,14 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
             Some(id) => format!(r#" marker-end="url(#{id})""#),
             None => String::new(),
         };
+        let marker_start_attr = match marker_id(*from_head) {
+            Some(id) => format!(r#" marker-start="url(#{id})""#),
+            None => String::new(),
+        };
         let dash_attr = if *line == LineStyle::Dotted { r#" stroke-dasharray="4 3""# } else { "" };
         if self_msg {
             out.push_str(&format!(
-                r#"<path d="M {x0:.1} {y0:.1} H {x1:.1} V {y1:.1} H {x0:.1}" fill="none" stroke="currentColor"{dash_attr}{marker_attr}/>"#,
+                r#"<path d="M {x0:.1} {y0:.1} H {x1:.1} V {y1:.1} H {x0:.1}" fill="none" stroke="currentColor"{dash_attr}{marker_attr}{marker_start_attr}/>"#,
                 x0 = fx + ACT_W / 2.0,
                 y0 = m.y - SELF_EXTRA / 2.0,
                 x1 = fx + SELF_STUB,
@@ -181,7 +185,7 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
             ));
         } else {
             out.push_str(&format!(
-                r#"<line x1="{fx:.1}" y1="{y:.1}" x2="{tx:.1}" y2="{y:.1}" stroke="currentColor"{dash_attr}{marker_attr}/>"#,
+                r#"<line x1="{fx:.1}" y1="{y:.1}" x2="{tx:.1}" y2="{y:.1}" stroke="currentColor"{dash_attr}{marker_attr}{marker_start_attr}/>"#,
                 y = m.y,
             ));
         }
@@ -291,6 +295,13 @@ mod tests {
     fn open_head_has_no_marker_reference_on_its_line() {
         let svg = render_sequence("sequenceDiagram\nA->B: plain").unwrap();
         assert_eq!(svg.matches("marker-end").count(), 0);
+    }
+
+    #[test]
+    fn bidirectional_message_has_markers_both_ends() {
+        let svg = render_sequence("sequenceDiagram\nA<<->>B: both").unwrap();
+        assert!(svg.contains(r##"marker-start="url(#mmd-arrow)""##), "{svg}");
+        assert!(svg.contains(r##"marker-end="url(#mmd-arrow)""##), "{svg}");
     }
 
     #[test]

@@ -371,21 +371,23 @@ impl Parser {
         }
         let from_id = &stmt[..id_len];
         let rest = stmt[id_len..].trim_start();
-        // Arrows longest-first; each maps to (line, head).
-        const ARROWS: &[(&str, LineStyle, Head)] = &[
-            ("-->>", LineStyle::Dotted, Head::Arrow),
-            ("-->", LineStyle::Dotted, Head::None),
-            ("->>", LineStyle::Solid, Head::Arrow),
-            ("->", LineStyle::Solid, Head::None),
-            ("--x", LineStyle::Dotted, Head::Cross),
-            ("-x", LineStyle::Solid, Head::Cross),
-            ("--)", LineStyle::Dotted, Head::Async),
-            ("-)", LineStyle::Solid, Head::Async),
+        // Arrows longest-first; each maps to (line, from-head, to-head).
+        const ARROWS: &[(&str, LineStyle, Head, Head)] = &[
+            ("<<-->>", LineStyle::Dotted, Head::Arrow, Head::Arrow),
+            ("<<->>", LineStyle::Solid, Head::Arrow, Head::Arrow),
+            ("-->>", LineStyle::Dotted, Head::None, Head::Arrow),
+            ("-->", LineStyle::Dotted, Head::None, Head::None),
+            ("->>", LineStyle::Solid, Head::None, Head::Arrow),
+            ("->", LineStyle::Solid, Head::None, Head::None),
+            ("--x", LineStyle::Dotted, Head::None, Head::Cross),
+            ("-x", LineStyle::Solid, Head::None, Head::Cross),
+            ("--)", LineStyle::Dotted, Head::None, Head::Async),
+            ("-)", LineStyle::Solid, Head::None, Head::Async),
         ];
-        let Some((arrow, line_style, head)) = ARROWS
+        let Some((arrow, line_style, from_head, head)) = ARROWS
             .iter()
-            .find(|(a, _, _)| rest.starts_with(a))
-            .map(|(a, l, h)| (*a, *l, *h))
+            .find(|(a, _, _, _)| rest.starts_with(a))
+            .map(|(a, l, fh, h)| (*a, *l, *fh, *h))
         else {
             return Ok(false);
         };
@@ -435,6 +437,7 @@ impl Parser {
             to,
             line: line_style,
             head,
+            from_head,
             text,
             activate_target,
             deactivate_source,
@@ -504,6 +507,34 @@ mod tests {
             assert_eq!(line, *want_line, "for {src}");
             assert_eq!(head, *want_head, "for {src}");
             assert_eq!(text, "t", "for {src}");
+        }
+    }
+
+    #[test]
+    fn bidirectional_arrows() {
+        for (src, want_line) in [
+            ("A<<->>B: t", LineStyle::Solid),
+            ("A<<-->>B: t", LineStyle::Dotted),
+        ] {
+            let g = p(&format!("sequenceDiagram\n{src}"));
+            match &g.events[0] {
+                Event::Message { line, head, from_head, text, .. } => {
+                    assert_eq!(*line, want_line, "for {src}");
+                    assert_eq!(*head, Head::Arrow, "for {src}");
+                    assert_eq!(*from_head, Head::Arrow, "for {src}");
+                    assert_eq!(text, "t", "for {src}");
+                }
+                other => panic!("expected message, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn plain_arrows_have_no_source_head() {
+        let g = p("sequenceDiagram\nA->>B: t");
+        match &g.events[0] {
+            Event::Message { from_head, .. } => assert_eq!(*from_head, Head::None),
+            other => panic!("expected message, got {other:?}"),
         }
     }
 
