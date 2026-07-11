@@ -368,14 +368,14 @@ When `dispatch` is `None`, the command checks applicability without executing. W
 | `wrapIn(type, attrs?)` | Wrap selection in a node | varies |
 | `lift` | Lift selection out of wrapping node | |
 | `splitBlock` | Split the block at cursor | `Enter` |
-| `joinBackward` | Join with block before | `Backspace` |
-| `joinForward` | Join with block after | `Delete` |
+| `joinBackward` | Join with block before (code blocks are sturdy: never dissolved by a join — see Code block editing) | `Backspace` |
+| `joinForward` | Join with block after (same code-block guard) | `Delete` |
 | `selectAll` | Select entire document | `Ctrl+A` |
-| `exitCode` | Exit a code block | `Enter` (in code) |
+| `exitCode` | Exit a code block | `Enter` ×3 — fires on two trailing empty lines, strips both |
 | `liftEmptyBlock` | Lift empty block | `Enter` (at list end) |
 | `createParagraphNear` | Create paragraph adjacent to non-text block | |
 | `deleteSelection` | Delete selected content | |
-| `newlineInCode` | Insert newline in code block | |
+| `newlineInCode` | Insert newline in code block, auto-indented | `Enter` (in code) |
 | `chainCommands(...)` | Try commands in sequence until one succeeds | |
 
 ### TipTap Command Chaining
@@ -457,8 +457,8 @@ for the actual MVP keymap).
 | `Ctrl+Shift+Z` | redo |
 | `Ctrl+A` | selectAll |
 | `Shift+Enter` | setHardBreak |
-| `Tab` | indent / sinkListItem / goToNextCell |
-| `Shift+Tab` | outdent / liftListItem / goToPreviousCell |
+| `Tab` | code-block indent (one language unit) / sinkListItem / goToNextCell |
+| `Shift+Tab` | code-block dedent (one step) / liftListItem / goToPreviousCell |
 | `Ctrl+Shift+L` | textAlign left |
 | `Ctrl+Shift+E` | textAlign center |
 | `Ctrl+Shift+R` | textAlign right |
@@ -671,6 +671,43 @@ Default 100. Higher values load first, affecting plugin order and schema precede
 | **Mathematics** | inline/block | leaf | KaTeX rendering; `$...$` input rule |
 | **YouTube** | `<iframe>` | leaf | YouTube embed with video options |
 | **Audio** | `<audio>` | leaf | Audio player with controls |
+
+### Code block editing (as shipped, 2026-07)
+
+Code blocks hold literal text and behave like a lightweight code
+editor. The contract, end to end:
+
+- **Creation**: toolbar/`/`-menu/context menu, `Ctrl+Alt+C`
+  (`Mod-Alt-c`), or the ` ``` ` input rule — ` ```lang ` + space stores
+  the raw fence tag in the `language` attr (aliases like `rs`, `py`,
+  `c++` resolve at render time via `ogrenotes_highlight::Language::from_tag`,
+  matching markdown import's verbatim fence-info storage).
+- **Highlighting**: render-time token `<span class="tok-*">`s from the
+  shared `crates/highlight` tokenizer (20 languages; pure-partition
+  invariant guards caret math; blocks over 50,000 chars render plain).
+  Colors come from one palette (`color_for`) mirrored into `--tok-*`
+  CSS custom properties for light/dark; server HTML export emits the
+  same tokens inline-styled. A caret-driven language chip (native
+  `<select>` overlay outside the contenteditable tree) sets the attr.
+- **Enter** (`newlineInCode`): inserts `\n` plus the current line's
+  leading whitespace, plus one language indent unit after a block
+  opener (`:` or `{`). A trailing newline renders via a
+  `data-sentinel <br>` so the empty last line is visible; caret
+  affinity places the cursor on the new line.
+- **Escape** (`exitCode`): three Enters — the escape fires when Enter
+  is pressed at the end of two consecutive whitespace-only trailing
+  lines, strips both, and drops the caret into a paragraph below.
+- **Tab / Shift+Tab**: insert / remove one indent unit —
+  `Language::indent_unit` per community convention (4 spaces default,
+  2 for the JS/web/config family, hard tab for Go, rendered
+  `tab-size: 4`).
+- **Sturdy joins**: `Delete`/`Backspace` at a block boundary never
+  dissolves a code block — an empty neighboring textblock is removed
+  (caret crosses onto the block edge); a non-empty one just moves the
+  caret across. The only merge kept is Delete at the block's end
+  absorbing the next paragraph's text *as code*.
+- **No markdown inside**: input rules (marks and block triggers) are
+  gated off within code blocks; `__init__` stays literal.
 
 ---
 

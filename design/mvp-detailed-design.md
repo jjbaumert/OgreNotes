@@ -10,7 +10,7 @@ Ship a single-user collaborative document editor that proves the core architectu
 
 1. OAuth 2.0 login (single provider)
 2. Document CRUD (create, open, edit, rename, delete)
-3. Rich text editing (headings, lists, bold/italic/underline/code/link, code blocks, horizontal rules, images)
+3. Rich text editing (headings, lists, bold/italic/underline/code/link, syntax-highlighted code blocks, horizontal rules, images)
 4. yrs-backed persistence (single-user, no real-time sync yet)
 5. Folder management (create, rename, delete, move documents)
 6. System folders (Home, Private, Trash)
