@@ -431,26 +431,41 @@ impl Transaction {
                 .map(|i| i + 1)
                 .unwrap_or(0);
 
-            // Double-Enter escape: Enter at the very end of a
-            // whitespace-only last line (auto-indent leaves spaces on
-            // the "empty" line) strips that line and exits to a
-            // paragraph below — same convention as the blockquote and
-            // empty-list-item branches.
+            // Triple-Enter escape (user-tuned): Enter at the very end
+            // of TWO consecutive whitespace-only trailing lines
+            // (auto-indent leaves spaces on "empty" lines) strips both
+            // and exits to a paragraph below. One empty line is not
+            // enough — the second Enter just adds another line, the
+            // third breaks free.
+            let is_ws = |c: &char| *c == ' ' || *c == '\t';
             if at_end
                 && line_start > 0
-                && chars[line_start..].iter().all(|&c| c == ' ' || c == '\t')
+                && chars[line_start..].iter().all(|c| is_ws(c))
             {
-                let del_from = block.content_start + line_start - 1; // the '\n'
-                let del_to = block.content_start + chars.len();
-                let removed = del_to - del_from;
-                let mut result = txn.delete(del_from, del_to)?;
-                let block_end = block.offset + block.node_size - removed;
-                let para = Node::element(NodeType::Paragraph);
-                let slice = Slice::new(Fragment::from(vec![para]), 0, 0);
-                result = result.replace(block_end, block_end, slice)?;
-                result.selection = Selection::cursor(block_end + 1);
-                result.stored_marks = None;
-                return Ok(result);
+                let prev_line_start = chars[..line_start - 1]
+                    .iter()
+                    .rposition(|&c| c == '\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let prev_line_ws_only =
+                    chars[prev_line_start..line_start - 1].iter().all(is_ws);
+                if prev_line_ws_only {
+                    // Delete from the newline that opens the first
+                    // empty line (or from the content start when the
+                    // whole block is just the two empty lines).
+                    let del_from =
+                        block.content_start + prev_line_start.saturating_sub(1);
+                    let del_to = block.content_start + chars.len();
+                    let removed = del_to - del_from;
+                    let mut result = txn.delete(del_from, del_to)?;
+                    let block_end = block.offset + block.node_size - removed;
+                    let para = Node::element(NodeType::Paragraph);
+                    let slice = Slice::new(Fragment::from(vec![para]), 0, 0);
+                    result = result.replace(block_end, block_end, slice)?;
+                    result.selection = Selection::cursor(block_end + 1);
+                    result.stored_marks = None;
+                    return Ok(result);
+                }
             }
 
             // newlineInCode with editor-style auto-indent: keep the
@@ -2122,17 +2137,36 @@ mod tests {
     }
 
     #[test]
-    fn split_block_exits_on_whitespace_only_trailing_line() {
-        // Auto-indent leaves whitespace on the "empty" trailing line;
-        // the double-Enter escape must still work: Enter at the end of
-        // a whitespace-only last line strips it and exits below.
+    fn split_block_second_enter_adds_another_empty_line() {
+        // Triple-Enter escape (user-requested 2026-07-10): ONE
+        // whitespace-only trailing line is not enough to exit — the
+        // second Enter just adds another empty line at the same
+        // indent.
         let state = python_code_block("class A:\n    ");
+        let txn = state.transaction().split_block().unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child_count(), 1, "must NOT exit yet");
+        assert_eq!(
+            new_state.doc.child(0).unwrap().text_content(),
+            "class A:\n    \n    "
+        );
+    }
+
+    #[test]
+    fn split_block_third_enter_exits_stripping_both_empty_lines() {
+        // Two whitespace-only trailing lines + Enter = break free; both
+        // empty lines are stripped on the way out.
+        let state = python_code_block("class A:\n    \n    ");
         let txn = state.transaction().split_block().unwrap();
         let new_state = state.apply(txn);
         assert_eq!(new_state.doc.child_count(), 2);
         let block = new_state.doc.child(0).unwrap();
         assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
-        assert_eq!(block.text_content(), "class A:", "whitespace line stripped");
+        assert_eq!(
+            block.text_content(),
+            "class A:",
+            "both whitespace lines stripped"
+        );
         assert_eq!(
             new_state.doc.child(1).unwrap().node_type(),
             Some(NodeType::Paragraph)
@@ -2166,18 +2200,18 @@ mod tests {
 
     #[test]
     fn split_block_on_code_block_trailing_empty_line_exits() {
-        // Double-Enter escape: Enter on a trailing empty line removes
-        // that line and drops the caret into a paragraph below — same
-        // convention as the blockquote / empty-list-item exits.
+        // Triple-Enter escape (updated 2026-07-10): exit fires on the
+        // Enter pressed at the end of TWO empty trailing lines, and
+        // removes both on the way out.
         let doc = Node::element_with_content(
             NodeType::Doc,
             Fragment::from(vec![Node::element_with_content(
                 NodeType::CodeBlock,
-                Fragment::from(vec![Node::text("code\n")]),
+                Fragment::from(vec![Node::text("code\n\n")]),
             )]),
         );
         let state = EditorState {
-            selection: Selection::cursor(6), // after the trailing '\n' (1 + 5)
+            selection: Selection::cursor(7), // after both '\n' (1 + 6)
             ..EditorState::create_default(doc)
         };
         let txn = state.transaction().split_block().unwrap();
@@ -2185,7 +2219,7 @@ mod tests {
         assert_eq!(new_state.doc.child_count(), 2);
         let block = new_state.doc.child(0).unwrap();
         assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
-        assert_eq!(block.text_content(), "code", "trailing newline removed");
+        assert_eq!(block.text_content(), "code", "both trailing newlines removed");
         let para = new_state.doc.child(1).unwrap();
         assert_eq!(para.node_type(), Some(NodeType::Paragraph));
         assert_eq!(para.text_content(), "");
