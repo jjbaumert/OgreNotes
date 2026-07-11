@@ -185,6 +185,19 @@ impl Parser {
         if self.try_parse_message(stmt)? {
             return Ok(());
         }
+        // Best-effort recognition of known-unsupported arrow families so
+        // the error names the construct. Runs only after every supported
+        // parse declined, so it can never shadow a valid statement; a
+        // false positive still yields a loud error, just better-labeled.
+        let compact: String = stmt.chars().filter(|c| !c.is_whitespace()).collect();
+        if compact.contains("()") && (compact.contains("->") || compact.contains("<<")) {
+            // `Alice()->>John` — source-side central connection (the
+            // target-side form errors inside try_parse_message).
+            return Err(self.err("central connections (`()`) are not supported"));
+        }
+        if ["-|", "|-", "-\\", "\\-", "-/", "/-"].iter().any(|t| compact.contains(t)) {
+            return Err(self.err("half arrows are not supported"));
+        }
         Err(self.err(format!("unsupported statement: {first:?}")))
     }
 
@@ -415,6 +428,11 @@ impl Parser {
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .count();
         if to_len == 0 {
+            // `A->>()B` — the arrow parsed, the target starts with `(`:
+            // that's mermaid's central-connection syntax (v11.12.3).
+            if after.starts_with('(') {
+                return Err(self.err("central connections (`()`) are not supported"));
+            }
             return Err(self.err("expected a target participant after the arrow"));
         }
         let to_id = &after[..to_len];
@@ -634,6 +652,28 @@ mod tests {
     fn unknown_statement_errors_with_line() {
         let e = parse("sequenceDiagram\nA->>B: ok\nwibble wobble").unwrap_err();
         assert_eq!(e.line, Some(3));
+    }
+
+    #[test]
+    fn half_arrows_error_naming_the_construct() {
+        for src in ["A-|\\B: t", "A-|/B: t", "A/|-B: t", "A-\\\\B: t", "A--//B: t"] {
+            let e = parse(&format!("sequenceDiagram\n{src}")).unwrap_err();
+            assert_eq!(e.line, Some(2), "for {src}");
+            assert!(e.message.contains("half arrow"), "for {src}, got: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn central_connections_error_naming_the_construct() {
+        for src in ["Alice->>()John: x", "Alice()->>John: x", "John()->>()Alice: x"] {
+            let e = parse(&format!("sequenceDiagram\n{src}")).unwrap_err();
+            assert_eq!(e.line, Some(2), "for {src}");
+            assert!(
+                e.message.contains("central connection"),
+                "for {src}, got: {}",
+                e.message
+            );
+        }
     }
 
     #[test]
