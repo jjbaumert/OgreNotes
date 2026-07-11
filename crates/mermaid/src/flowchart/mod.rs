@@ -1,10 +1,13 @@
 pub(crate) mod parse;
 pub(crate) mod shapes;
 pub(crate) mod svg;
+#[cfg(test)]
+mod props;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShapeKind {
     Rect,
+    Subroutine,
     Rounded,
     Stadium,
     Circle,
@@ -25,16 +28,26 @@ pub(crate) enum EdgeKind {
     Open,
     Dotted,
     Thick,
+    /// `~~~` — participates in layout, draws nothing.
+    Invisible,
+}
+
+/// Per-end edge decoration. `from_head` renders as `marker-start`,
+/// `to_head` as `marker-end` (edge paths run from→to after the layout
+/// engine restores true direction on reversed edges).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Head {
+    None,
+    Arrow,
+    Circle,
+    Cross,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct FlowNode {
-    /// Mermaid source identifier. Not read by the render pipeline
-    /// (downstream stages address nodes by index); kept because parser
-    /// tests assert on it to verify id-extraction is correct (bare ids,
-    /// subgraph-membership lookup, class-assignment lookup). See
-    /// task-14-report.md for why this isn't deleted outright.
-    #[allow(dead_code)]
+    /// Mermaid source identifier. Read by the post-parse
+    /// edge-to-subgraph check (parse.rs) and asserted on by parser
+    /// tests; downstream render stages address nodes by index.
     pub id: String,
     pub label: String,          // raw; escaped only at SVG emission
     pub shape: ShapeKind,
@@ -46,7 +59,12 @@ pub(crate) struct FlowNode {
 pub(crate) struct FlowEdge {
     pub from: usize,
     pub to: usize,
+    /// Line-style family. `Arrow` is retained (rather than folding into
+    /// `Open`) because the parser's pre-polish tests assert it for `-->`;
+    /// solid edges map to `Arrow` iff either head is `Head::Arrow`.
     pub kind: EdgeKind,
+    pub from_head: Head,
+    pub to_head: Head,
     pub label: Option<String>,
 }
 

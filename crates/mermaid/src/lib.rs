@@ -106,6 +106,37 @@ pub fn detect_kind(source: &str) -> DiagramKind {
     }
 }
 
+/// Mermaid sources may open with a YAML front-matter block
+/// (`---` … `---`) carrying config/theme data we don't consume. When
+/// the very first line is `---`, blank the block's lines (delimiters
+/// inclusive) rather than slicing them away, so every downstream error
+/// still points at the original 1-based line numbers. Contents are
+/// ignored in v1.
+///
+/// Only ever called from `render()` AFTER the `MAX_SOURCE_LEN` gate, so
+/// its line scan and the `Vec`/`String::join` allocation it performs are
+/// bounded by the cap — this function must not be called on untrusted,
+/// unbounded input directly.
+fn strip_front_matter(source: &str) -> Result<Option<String>, ParseError> {
+    match source.lines().next() {
+        Some(first) if first.trim() == "---" => {}
+        _ => return Ok(None),
+    }
+    let Some(close_rel) = source.lines().skip(1).position(|l| l.trim() == "---") else {
+        return Err(ParseError {
+            message: "unterminated front matter: missing closing `---`".into(),
+            line: Some(1),
+        });
+    };
+    let close_idx = close_rel + 1; // position() counted from line 2
+    let blanked: Vec<&str> = source
+        .lines()
+        .enumerate()
+        .map(|(i, l)| if i <= close_idx { "" } else { l })
+        .collect();
+    Ok(Some(blanked.join("\n")))
+}
+
 /// Render mermaid `source` to an SVG string. Never panics.
 pub fn render(source: &str) -> RenderOutput {
     let kind = detect_kind(source);
@@ -115,7 +146,10 @@ pub fn render(source: &str) -> RenderOutput {
     // (tests, future callers, anything that bypasses the write gate), so
     // it must not rely on an upstream caller to have checked this. Kept
     // AFTER `detect_kind` (which is only ever O(first line), cheap even
-    // on a huge string) so the returned `kind` is still meaningful.
+    // on a huge string) so the returned `kind` is still meaningful, but
+    // BEFORE `strip_front_matter` (which is an O(n) scan plus a
+    // source-sized allocation) so an oversized source is rejected before
+    // that work is ever done.
     if source.chars().count() > MAX_SOURCE_LEN {
         return RenderOutput {
             kind,
@@ -126,6 +160,18 @@ pub fn render(source: &str) -> RenderOutput {
             }),
         };
     }
+    let stripped;
+    let (source, kind) = match strip_front_matter(source) {
+        Ok(None) => (source, kind),
+        Ok(Some(s)) => {
+            stripped = s;
+            let kind = detect_kind(&stripped);
+            (stripped.as_str(), kind)
+        }
+        Err(e) => {
+            return RenderOutput { kind: DiagramKind::Unknown, svg: None, error: Some(e) }
+        }
+    };
     match kind {
         DiagramKind::Pie => match pie::parse(source) {
             Ok(p) => RenderOutput { kind, svg: Some(pie::render_svg(&p)), error: None },
@@ -242,6 +288,18 @@ mod tests {
         let err = out.error.expect("oversized source must error");
         assert!(err.message.contains("too large"), "got: {}", err.message);
         assert!(err.line.is_none());
+    }
+
+    #[test]
+    fn oversized_front_matter_source_is_gated_before_stripping() {
+        // The cap must reject before any front-matter scan/allocation;
+        // kind comes from the raw source (`---` header -> Unknown).
+        let big = format!("---\ntitle: x\n---\npie\n{}", "\"A\" : 1\n".repeat(MAX_SOURCE_LEN));
+        assert!(big.chars().count() > MAX_SOURCE_LEN);
+        let out = render(&big);
+        assert_eq!(out.kind, DiagramKind::Unknown);
+        let err = out.error.expect("oversized source must error");
+        assert!(err.message.contains("too large"), "got: {}", err.message);
     }
 
     #[test]
@@ -414,6 +472,42 @@ mod tests {
             assert!(out.svg.is_none(), "for {src:?}");
             assert_eq!(out.error.expect("err").line, Some(line), "for {src:?}");
         }
+    }
+
+    #[test]
+    fn front_matter_is_skipped_for_kind_detection_and_render() {
+        let src = "---\ntitle: My chart\nconfig:\n  theme: forest\n---\ngraph TD\nA --> B";
+        let out = render(src);
+        assert_eq!(out.kind, DiagramKind::Flowchart);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
+        // Works for a non-flowchart kind too (stripping precedes detection).
+        let out = render("---\ntitle: t\n---\npie\n\"A\" : 1");
+        assert_eq!(out.kind, DiagramKind::Pie);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
+    }
+
+    #[test]
+    fn front_matter_preserves_original_error_lines() {
+        // Front matter occupies lines 1-3; the broken statement is on
+        // line 5 of the ORIGINAL source and must be reported as 5.
+        let out = render("---\ntitle: x\n---\ngraph TD\nA[unclosed");
+        assert_eq!(out.error.expect("err").line, Some(5));
+    }
+
+    #[test]
+    fn unterminated_front_matter_errors_at_line_1() {
+        let out = render("---\ntitle: x\ngraph TD\nA");
+        assert_eq!(out.kind, DiagramKind::Unknown);
+        let e = out.error.expect("err");
+        assert_eq!(e.line, Some(1));
+        assert!(e.message.contains("front matter"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn dashes_not_on_line_one_are_not_front_matter() {
+        // `---` as an EDGE on a later line must be untouched.
+        let out = render("graph TD\nA --- B");
+        assert!(out.error.is_none(), "err: {:?}", out.error);
     }
 }
 

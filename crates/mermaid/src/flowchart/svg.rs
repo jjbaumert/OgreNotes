@@ -7,7 +7,7 @@
 //! normative attribute lists this file implements verbatim.
 
 use crate::escape_xml;
-use crate::flowchart::{shapes, EdgeKind, FlowGraph, FlowNode};
+use crate::flowchart::{shapes, EdgeKind, FlowGraph, FlowNode, Head};
 use crate::measure;
 use crate::layout::Layout;
 
@@ -30,7 +30,13 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
     let mut out = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:14px">"#
     );
-    out.push_str(r#"<defs><marker id="mmd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker></defs>"#);
+    out.push_str(concat!(
+        "<defs>",
+        r#"<marker id="mmd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>"#,
+        r#"<marker id="mmd-circle" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><circle cx="5" cy="5" r="3.5" fill="currentColor"/></marker>"#,
+        r#"<marker id="mmd-cross" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 1 1 L 9 9 M 9 1 L 1 9" stroke="currentColor" stroke-width="1.5" fill="none"/></marker>"#,
+        "</defs>",
+    ));
 
     // 3. clusters, parents first (depth ascending) so children paint on top.
     let mut order: Vec<usize> = (0..g.subgraphs.len()).collect();
@@ -62,6 +68,9 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
     // 4. edges (+ label mask rects + label texts)
     for ep in &l.edge_paths {
         let e = &g.edges[ep.edge];
+        if e.kind == EdgeKind::Invisible {
+            continue; // participates in layout; draws nothing
+        }
         let d: String = ep
             .points
             .iter()
@@ -74,20 +83,25 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
                 }
             })
             .collect();
-        let attrs = match e.kind {
-            EdgeKind::Arrow => {
-                r#"stroke="currentColor" fill="none" marker-end="url(#mmd-arrow)""#.to_string()
-            }
-            EdgeKind::Open => r#"stroke="currentColor" fill="none""#.to_string(),
-            EdgeKind::Dotted => {
-                r#"stroke="currentColor" fill="none" stroke-dasharray="3 3" marker-end="url(#mmd-arrow)""#
-                    .to_string()
-            }
-            EdgeKind::Thick => {
-                r#"stroke="currentColor" fill="none" stroke-width="2.5" marker-end="url(#mmd-arrow)""#
-                    .to_string()
-            }
+        // Line style from the kind family; heads from the edge ends.
+        let line_attrs = match e.kind {
+            EdgeKind::Arrow | EdgeKind::Open | EdgeKind::Invisible => "",
+            EdgeKind::Dotted => r#" stroke-dasharray="3 3""#,
+            EdgeKind::Thick => r#" stroke-width="2.5""#,
         };
+        let marker = |h: Head| match h {
+            Head::None => None,
+            Head::Arrow => Some("mmd-arrow"),
+            Head::Circle => Some("mmd-circle"),
+            Head::Cross => Some("mmd-cross"),
+        };
+        let mut attrs = format!(r#"stroke="currentColor" fill="none"{line_attrs}"#);
+        if let Some(m) = marker(e.from_head) {
+            attrs.push_str(&format!(r#" marker-start="url(#{m})""#));
+        }
+        if let Some(m) = marker(e.to_head) {
+            attrs.push_str(&format!(r#" marker-end="url(#{m})""#));
+        }
         out.push_str(&format!(r#"<path d="{d}" {attrs}/>"#));
 
         if let (Some(label), Some((lx, ly))) = (&e.label, ep.label_at) {
@@ -223,5 +237,59 @@ mod tests {
         }
         let e = render_flowchart(&src).unwrap_err();
         assert!(e.message.contains("too large"));
+    }
+
+    #[test]
+    fn circle_and_cross_heads_render_their_markers() {
+        let svg = render_flowchart("graph TD\nA --o B\nB --x C").unwrap();
+        assert!(svg.contains(r##"marker-end="url(#mmd-circle)""##), "{svg}");
+        assert!(svg.contains(r##"marker-end="url(#mmd-cross)""##), "{svg}");
+        assert!(svg.contains(r#"<marker id="mmd-circle""#));
+        assert!(svg.contains(r#"<marker id="mmd-cross""#));
+    }
+
+    #[test]
+    fn bidirectional_edge_gets_marker_start_and_end() {
+        let svg = render_flowchart("graph TD\nA <--> B").unwrap();
+        assert!(svg.contains(r##"marker-start="url(#mmd-arrow)""##), "{svg}");
+        assert!(svg.contains(r##"marker-end="url(#mmd-arrow)""##), "{svg}");
+    }
+
+    #[test]
+    fn invisible_edge_emits_no_path_but_constrains_layout() {
+        let svg = render_flowchart("graph TD\nA ~~~ B").unwrap();
+        // Both nodes render; the edge draws nothing. (Can't assert on
+        // `<path` — the always-present marker DEFS contain paths. Edge
+        // paths are the only elements carrying this exact attr prefix;
+        // the marker defs order their attributes differently.)
+        assert!(svg.contains(">A<") && svg.contains(">B<"), "{svg}");
+        assert!(
+            !svg.contains(r#"stroke="currentColor" fill="none""#),
+            "invisible edge drew a path: {svg}"
+        );
+    }
+
+    #[test]
+    fn plain_dotted_edge_has_no_arrowhead() {
+        // mermaid semantics fix: `-.-` is open (the old table always
+        // arrowed dotted edges).
+        let svg = render_flowchart("graph TD\nA -.- B").unwrap();
+        assert_eq!(svg.matches("marker-end").count(), 0, "{svg}");
+        assert!(svg.contains("stroke-dasharray=\"3 3\""));
+    }
+
+    #[test]
+    fn thick_open_edge_has_no_arrowhead() {
+        // `===` is an open thick link — line style without any head.
+        let svg = render_flowchart("graph TD\nA === B").unwrap();
+        assert_eq!(svg.matches("marker-end").count(), 0, "{svg}");
+        assert_eq!(svg.matches("marker-start").count(), 0, "{svg}");
+        assert!(svg.contains("stroke-width=\"2.5\""));
+    }
+
+    #[test]
+    fn class_def_default_styles_every_unclassed_node() {
+        let svg = render_flowchart("graph TD\nclassDef default fill:#f9f\nA --> B").unwrap();
+        assert_eq!(svg.matches("style=\"fill:#f9f\"").count(), 2, "{svg}");
     }
 }

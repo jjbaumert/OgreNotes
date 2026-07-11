@@ -1,11 +1,21 @@
 //! Flowchart parser. Line-oriented; each line splits on `;` into
-//! statements; chain statements are scanned left-to-right with
-//! longest-first token matching (std only, no regex).
+//! statements (quoted spans are respected, so a `;` inside a
+//! double-quoted label does not split); chain statements are scanned
+//! left-to-right with longest-first token matching (std only, no
+//! regex).
 
-use crate::flowchart::{EdgeKind, FlowEdge, FlowGraph, FlowNode, ShapeKind};
+use crate::flowchart::{EdgeKind, FlowEdge, FlowGraph, FlowNode, Head, ShapeKind};
 use crate::layout::Direction;
 use crate::ParseError;
 use std::collections::HashMap;
+
+/// A fully-resolved edge operator, including any inline label.
+struct EdgeOp {
+    kind: EdgeKind,
+    from_head: Head,
+    to_head: Head,
+    label: Option<String>,
+}
 
 struct Parser {
     g: FlowGraph,
@@ -14,6 +24,34 @@ struct Parser {
     /// Open subgraphs: (subgraph index, opening line). Top of stack is
     /// the innermost currently-open subgraph.
     stack: Vec<(usize, usize)>,
+    /// Source line of each pushed edge (parallel to `g.edges`), for the
+    /// post-parse edge-to-subgraph check — errors must point at the
+    /// edge's own line, but subgraph ids can be declared later.
+    edge_lines: Vec<usize>,
+}
+
+/// Split a line into `;`-separated statements, ignoring `;` inside
+/// double-quoted spans (labels like `A["has ; inside"]`). Quote state
+/// is a simple toggle — quoted labels have no escape sequences. `;`
+/// and `"` are ASCII, and char_indices yields char-start byte offsets,
+/// so every slice below lands on a char boundary regardless of
+/// multi-byte content.
+fn split_statements(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ';' if !in_quotes => {
+                out.push(&line[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&line[start..]);
+    out
 }
 
 pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
@@ -28,6 +66,7 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
         ids: HashMap::new(),
         line: 0,
         stack: Vec::new(),
+        edge_lines: Vec::new(),
     };
     let mut seen_header = false;
     for (idx, raw) in source.lines().enumerate() {
@@ -43,7 +82,7 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
             // statement line is split below: the first segment is the
             // header, any remaining non-empty segments are ordinary
             // statements on the same line.
-            let mut segs = line.split(';');
+            let mut segs = split_statements(line).into_iter();
             let header = segs.next().unwrap_or("").trim();
             p.parse_header(header)?;
             seen_header = true;
@@ -56,7 +95,7 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
             }
             continue;
         }
-        for stmt in line.split(';') {
+        for stmt in split_statements(line) {
             let stmt = stmt.trim();
             if stmt.is_empty() {
                 continue;
@@ -75,6 +114,33 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
             message: format!("unclosed subgraph `{}`", p.g.subgraphs[idx].id),
             line: Some(opening_line),
         });
+    }
+    // Post-parse: edges whose endpoint id names a subgraph are real
+    // mermaid syntax (edge attaches to the cluster box) that we don't
+    // lay out yet — error loudly instead of drawing a phantom node.
+    // Post-parse because subgraph ids may be declared below the edge.
+    for (i, e) in p.g.edges.iter().enumerate() {
+        for end in [e.from, e.to] {
+            let id = &p.g.nodes[end].id;
+            if p.g.subgraphs.iter().any(|s| &s.id == id) {
+                return Err(ParseError {
+                    message: format!(
+                        "edges to/from subgraph ids are not yet supported (subgraph {id:?})"
+                    ),
+                    line: Some(p.edge_lines[i]),
+                });
+            }
+        }
+    }
+    // mermaid auto-applies the class named `default` to every node with
+    // no explicit class assignment (explicitly-classed nodes keep their
+    // own resolution order untouched).
+    if p.g.class_defs.iter().any(|d| d.name == "default") {
+        for n in &mut p.g.nodes {
+            if n.classes.is_empty() {
+                n.classes.push("default".to_string());
+            }
+        }
     }
     Ok(p.g)
 }
@@ -167,11 +233,19 @@ impl Parser {
                 return Ok(());
             }
             rest = r;
-            let (kind, label) = self.parse_edge_op(&mut rest)?;
+            let op = self.parse_edge_op(&mut rest)?;
             let rhs = self.parse_node_group(&mut rest)?;
             for &f in &lhs {
                 for &t in &rhs {
-                    self.g.edges.push(FlowEdge { from: f, to: t, kind, label: label.clone() });
+                    self.g.edges.push(FlowEdge {
+                        from: f,
+                        to: t,
+                        kind: op.kind,
+                        from_head: op.from_head,
+                        to_head: op.to_head,
+                        label: op.label.clone(),
+                    });
+                    self.edge_lines.push(self.line);
                     // Bail INSIDE the fan-out loop, not after it: an
                     // `a&a&...&a --> a&...&a` chain with N ids on each
                     // side pushes N*N edges before this loop would
@@ -267,6 +341,7 @@ impl Parser {
             ("(((", &[(")))", ShapeKind::DoubleCircle)]),
             ("((", &[("))", ShapeKind::Circle)]),
             ("([", &[("])", ShapeKind::Stadium)]),
+            ("[[", &[("]]", ShapeKind::Subroutine)]),
             ("[(", &[(")]", ShapeKind::Cylinder)]),
             ("[/", &[("/]", ShapeKind::Parallelogram), ("\\]", ShapeKind::Trapezoid)]),
             ("[\\", &[("\\]", ShapeKind::ParallelogramRev), ("/]", ShapeKind::TrapezoidRev)]),
@@ -324,57 +399,195 @@ impl Parser {
         Ok(None)
     }
 
-    /// Edge operator with optional label (inline or |pipe| form).
-    fn parse_edge_op(&mut self, rest: &mut &str) -> Result<(EdgeKind, Option<String>), ParseError> {
+    /// Unified edge-operator scanner (polish slice, see
+    /// docs/superpowers/specs/2026-07-11-mermaid-polish-design.md):
+    ///
+    ///   edge-op    := [rev-head] body [terminator] [label]
+    ///   rev-head   := '<' | 'o' | 'x'   (only when a body char follows)
+    ///   body       := '-'{2,} | '-' '.'{1,} '-' | '='{2,} | '~'{3,}
+    ///   terminator := '>' | 'o' | 'x'   (bound IMMEDIATELY after the
+    ///                  run — mermaid's documented `A---oB` = circle rule)
+    ///   label      := inline (`--text-->`, `-. text .->`, `==text==>`)
+    ///                 or `|text|` after a plain operator
+    ///
+    /// A 2-length solid/thick run with no terminator opens an inline
+    /// label; `-.` not followed by dots-then-`-` likewise. Multi-length
+    /// runs collapse to the base kind (rank-span hint not honored — a
+    /// documented cosmetic divergence). All operator characters are
+    /// ASCII, so the byte indexing below always lands on char boundaries.
+    fn parse_edge_op(&mut self, rest: &mut &str) -> Result<EdgeOp, ParseError> {
         let r = rest.trim_start();
-        // Inline label forms first: `-- text -->`, `-. text .->`, `== text ==>`.
-        for (open, close, kind) in [
-            ("--", "-->", EdgeKind::Arrow),
-            ("-.", ".->", EdgeKind::Dotted),
-            ("==", "==>", EdgeKind::Thick),
-        ] {
-            if let Some(after_open) = r.strip_prefix(open) {
-                // Inline form requires a space after the opener (else it's
-                // the plain operator like `-->` sharing the prefix).
-                if after_open.starts_with(' ') {
-                    if let Some(i) = after_open.find(close) {
-                        let label = after_open[..i].trim().to_string();
-                        *rest = &after_open[i + close.len()..];
-                        return Ok((kind, Some(label)));
-                    }
+        let b = r.as_bytes();
+        // Diagnostics use the pre-strip string: if a reverse head gets
+        // consumed below and the body then fails to parse, the error
+        // must still show what the user actually typed (e.g. the `<` in
+        // `A <~~ B`), not just the remainder after the head was eaten.
+        let r_orig = r;
+        // Optional reverse head. `o`/`x` are also id characters, so they
+        // only count when the NEXT byte starts a run body; `<` gets the
+        // same guard so a stray `<` falls through to the clean error.
+        let (from_head, r) = match (b.first(), b.get(1)) {
+            (Some(b'<'), Some(b'-' | b'=')) => (Head::Arrow, &r[1..]),
+            (Some(b'o'), Some(b'-' | b'=')) => (Head::Circle, &r[1..]),
+            (Some(b'x'), Some(b'-' | b'=')) => (Head::Cross, &r[1..]),
+            _ => (Head::None, r),
+        };
+        let b = r.as_bytes();
+        let expected = || format!("expected an edge (e.g. `-->`), found {r_orig:?}");
+        // Body run. `body_len` is a byte length over ASCII-only chars.
+        let (family, body_len) = match b.first() {
+            Some(b'~') => {
+                let n = b.iter().take_while(|&&c| c == b'~').count();
+                if n < 3 {
+                    return Err(self.err("invisible links need at least `~~~`"));
+                }
+                if from_head != Head::None {
+                    return Err(self.err("invisible links cannot have arrow heads"));
+                }
+                // No terminator, no label: `~~~xB` is an invisible edge
+                // to node `xB` (mermaid binds no terminator after `~`).
+                *rest = &r[n..];
+                if rest.trim_start().starts_with('|') {
+                    return Err(self.err("invisible links cannot carry a label"));
+                }
+                return Ok(EdgeOp {
+                    kind: EdgeKind::Invisible,
+                    from_head: Head::None,
+                    to_head: Head::None,
+                    label: None,
+                });
+            }
+            Some(b'=') => {
+                let n = b.iter().take_while(|&&c| c == b'=').count();
+                if n < 2 {
+                    return Err(self.err(expected()));
+                }
+                (EdgeKind::Thick, n)
+            }
+            Some(b'-') if b.get(1) == Some(&b'.') => {
+                // Dotted plain body is `-` `.`+ `-`; if the dots are not
+                // followed by `-`, this is the `-.label.-` inline form.
+                let dots = b[1..].iter().take_while(|&&c| c == b'.').count();
+                if b.get(1 + dots) == Some(&b'-') {
+                    (EdgeKind::Dotted, 1 + dots + 1)
+                } else {
+                    return self.parse_inline_label(rest, r, from_head, EdgeKind::Dotted);
                 }
             }
-        }
-        // Plain operators, longest first.
-        for (op, kind) in [
-            ("-.->", EdgeKind::Dotted),
-            ("-.-", EdgeKind::Dotted),
-            ("==>", EdgeKind::Thick),
-            ("===", EdgeKind::Thick),
-            ("-->", EdgeKind::Arrow),
-            ("---", EdgeKind::Open),
-        ] {
-            if let Some(after) = r.strip_prefix(op) {
-                let mut rest2 = after;
-                // Optional |label|.
-                let label = {
-                    let r2 = rest2.trim_start();
-                    if let Some(after_pipe) = r2.strip_prefix('|') {
-                        let Some(i) = after_pipe.find('|') else {
-                            return Err(self.err("unclosed `|` edge label"));
-                        };
-                        let l = after_pipe[..i].trim().to_string();
-                        rest2 = &after_pipe[i + 1..];
-                        Some(l)
-                    } else {
-                        None
-                    }
-                };
-                *rest = rest2;
-                return Ok((kind, label));
+            Some(b'-') => {
+                let n = b.iter().take_while(|&&c| c == b'-').count();
+                if n < 2 {
+                    return Err(self.err(expected()));
+                }
+                (EdgeKind::Arrow, n) // family placeholder; final kind below
             }
+            _ => return Err(self.err(expected())),
+        };
+        // Terminator, bound immediately after the run (no whitespace).
+        let after = &r[body_len..];
+        let (to_head, after) = match after.as_bytes().first() {
+            Some(b'>') => (Head::Arrow, &after[1..]),
+            Some(b'o') => (Head::Circle, &after[1..]),
+            Some(b'x') => (Head::Cross, &after[1..]),
+            _ => (Head::None, after),
+        };
+        // A minimum-length solid/thick run with neither terminator nor
+        // reverse head is only valid as an inline-label opener
+        // (`A--text-->B`); mermaid's shortest plain open links are `---`
+        // and `===`.
+        if body_len == 2
+            && to_head == Head::None
+            && matches!(family, EdgeKind::Arrow | EdgeKind::Thick)
+        {
+            if from_head == Head::None {
+                return self.parse_inline_label(
+                    rest,
+                    r,
+                    from_head,
+                    if family == EdgeKind::Thick { EdgeKind::Thick } else { EdgeKind::Arrow },
+                );
+            }
+            return Err(self.err(expected()));
         }
-        Err(self.err(format!("expected an edge (e.g. `-->`), found {r:?}")))
+        let kind = match family {
+            EdgeKind::Arrow => {
+                if to_head == Head::Arrow || from_head == Head::Arrow {
+                    EdgeKind::Arrow
+                } else {
+                    EdgeKind::Open
+                }
+            }
+            other => other,
+        };
+        let mut rest2 = after;
+        // Optional |label|.
+        let label = {
+            let r2 = rest2.trim_start();
+            if let Some(after_pipe) = r2.strip_prefix('|') {
+                let Some(i) = after_pipe.find('|') else {
+                    return Err(self.err("unclosed `|` edge label"));
+                };
+                let l = after_pipe[..i].trim().to_string();
+                rest2 = &after_pipe[i + 1..];
+                Some(l)
+            } else {
+                None
+            }
+        };
+        *rest = rest2;
+        Ok(EdgeOp { kind, from_head, to_head, label })
+    }
+
+    /// Inline-label forms. `r` starts at the opener (`--`, `==`, or
+    /// `-.`). Spaced forms (`A-- text -->B`) work as before; Task 2
+    /// extends this to the docs' no-space spellings.
+    fn parse_inline_label<'a>(
+        &mut self,
+        rest: &mut &'a str,
+        r: &'a str,
+        from_head: Head,
+        family: EdgeKind,
+    ) -> Result<EdgeOp, ParseError> {
+        let (open, close, kind) = match family {
+            EdgeKind::Dotted => ("-.", ".-", EdgeKind::Dotted),
+            EdgeKind::Thick => ("==", "==", EdgeKind::Thick),
+            _ => ("--", "--", EdgeKind::Arrow),
+        };
+        let Some(after_open) = r.strip_prefix(open) else {
+            return Err(self.err(format!("expected an edge (e.g. `-->`), found {r:?}")));
+        };
+        let Some(i) = after_open.find(close) else {
+            return Err(self.err(format!(
+                "unclosed inline edge label (missing `{close}`)"
+            )));
+        };
+        let label = after_open[..i].trim().to_string();
+        let after_close = &after_open[i + close.len()..];
+        // Closer run may be longer (`---`), then an optional terminator.
+        let extra = after_close
+            .as_bytes()
+            .iter()
+            .take_while(|&&c| c == close.as_bytes()[close.len() - 1])
+            .count();
+        let after_run = &after_close[extra..];
+        let (to_head, after_run) = match after_run.as_bytes().first() {
+            Some(b'>') => (Head::Arrow, &after_run[1..]),
+            Some(b'o') => (Head::Circle, &after_run[1..]),
+            Some(b'x') => (Head::Cross, &after_run[1..]),
+            _ => (Head::None, after_run),
+        };
+        let kind = match kind {
+            EdgeKind::Arrow => {
+                if to_head == Head::Arrow || from_head == Head::Arrow {
+                    EdgeKind::Arrow
+                } else {
+                    EdgeKind::Open
+                }
+            }
+            other => other,
+        };
+        *rest = after_run;
+        Ok(EdgeOp { kind, from_head, to_head, label: Some(label) })
     }
 
     /// The style allowlist is the CSS-injection boundary: only these
@@ -483,6 +696,31 @@ mod tests {
         assert!(parse("graph XX").unwrap_err().message.contains("unknown direction"));
         let e = parse("graph XX;").unwrap_err();
         assert!(e.message.contains("unknown direction"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn semicolon_inside_quoted_label_is_not_a_statement_split() {
+        // The docs' entity-code example: quote-unaware `;` splitting
+        // used to truncate the label mid-quote (gallery find).
+        let g = p("graph TD\nA[\"This is a #35; test\"]");
+        assert_eq!(g.nodes.len(), 1);
+        assert_eq!(g.nodes[0].label, "This is a #35; test");
+    }
+
+    #[test]
+    fn semicolons_outside_quotes_still_split_statements() {
+        let g = p("graph TD\nA[\"x;y\"] --> B; B --> C;");
+        assert_eq!(g.edges.len(), 2);
+        assert_eq!(g.nodes[0].label, "x;y");
+    }
+
+    #[test]
+    fn unclosed_quote_with_semicolon_errors_cleanly() {
+        // Odd quote count: the `;` counts as quoted, the statement
+        // reaches bracket parsing whole, and fails with a line error
+        // (never a panic).
+        let e = parse("graph TD\nA[\"oops; B").unwrap_err();
+        assert_eq!(e.line, Some(2));
     }
 
     #[test]
@@ -735,5 +973,255 @@ mod tests {
                 Err(e) => assert!(e.line.is_some(), "clean error for {ws:?}"),
             }
         }
+    }
+
+    // ── Polish slice: unified edge-operator scanner ──────────────────
+    // (docs/superpowers/specs/2026-07-11-mermaid-polish-design.md)
+
+    use crate::flowchart::Head;
+
+    #[test]
+    fn circle_and_cross_terminators_bind_to_the_edge_not_the_node() {
+        // THE silent-misparse regression tests (issue #32): these used to
+        // parse an edge to a phantom node named `oB`/`xB`.
+        for (src, to_head) in [
+            ("A--oB", Head::Circle),
+            ("A--xB", Head::Cross),
+            ("A---oB", Head::Circle),
+            ("A---xB", Head::Cross),
+            ("A --o B", Head::Circle),
+            ("A --x B", Head::Cross),
+        ] {
+            let g = p(&format!("graph TD\n{src}"));
+            assert_eq!(g.nodes.len(), 2, "exactly A and B for {src}");
+            assert_eq!(g.nodes[1].id, "B", "no phantom node for {src}");
+            assert_eq!(g.edges[0].to_head, to_head, "for {src}");
+            assert_eq!(g.edges[0].from_head, Head::None, "for {src}");
+            assert_eq!(g.edges[0].kind, EdgeKind::Open, "for {src}");
+        }
+    }
+
+    #[test]
+    fn arrow_terminator_then_o_is_a_node_like_mermaid() {
+        // `>` already terminated the link, so `oB` IS a node — mermaid
+        // parses this identically (the docs' o/x warning only covers a
+        // terminator directly after the run).
+        let g = p("graph TD\nA-->oB");
+        assert_eq!(g.nodes[1].id, "oB");
+        assert_eq!(g.edges[0].to_head, Head::Arrow);
+    }
+
+    #[test]
+    fn spaced_o_after_open_run_is_a_node() {
+        // mermaid's own documented escape hatch: the space breaks the
+        // terminator binding.
+        let g = p("graph TD\nA--- oB");
+        assert_eq!(g.nodes[1].id, "oB");
+        assert_eq!(g.edges[0].kind, EdgeKind::Open);
+        assert_eq!(g.edges[0].to_head, Head::None);
+    }
+
+    #[test]
+    fn multi_length_runs_collapse_to_base_kind() {
+        for (src, kind, to_head) in [
+            ("A ----> B", EdgeKind::Arrow, Head::Arrow),
+            ("A -----> B", EdgeKind::Arrow, Head::Arrow),
+            ("A ---- B", EdgeKind::Open, Head::None),
+            ("A ====> B", EdgeKind::Thick, Head::Arrow),
+            ("A ==== B", EdgeKind::Thick, Head::None),
+            ("A -..-> B", EdgeKind::Dotted, Head::Arrow),
+            ("A -...- B", EdgeKind::Dotted, Head::None),
+        ] {
+            let g = p(&format!("graph TD\n{src}"));
+            assert_eq!(g.edges[0].kind, kind, "for {src}");
+            assert_eq!(g.edges[0].to_head, to_head, "for {src}");
+            assert_eq!(g.nodes.len(), 2, "for {src}");
+        }
+    }
+
+    #[test]
+    fn bidirectional_and_reverse_heads() {
+        for (src, from_head, to_head) in [
+            ("A <--> B", Head::Arrow, Head::Arrow),
+            ("A o--o B", Head::Circle, Head::Circle),
+            ("A x--x B", Head::Cross, Head::Cross),
+            ("A <-.-> B", Head::Arrow, Head::Arrow),
+            ("A <==> B", Head::Arrow, Head::Arrow),
+            // `<---` is mermaid's reverse-open form; bare `<--` is
+            // invalid there (a link needs one more run/terminator char)
+            // and is covered by the error test below.
+            ("A <--- B", Head::Arrow, Head::None),
+        ] {
+            let g = p(&format!("graph TD\n{src}"));
+            assert_eq!(g.edges[0].from_head, from_head, "for {src}");
+            assert_eq!(g.edges[0].to_head, to_head, "for {src}");
+            assert_eq!(g.nodes.len(), 2, "for {src}");
+        }
+    }
+
+    #[test]
+    fn plain_dotted_and_thick_are_open_no_heads() {
+        // mermaid semantics: `-.-` and `===` have NO arrowhead. (The old
+        // fixed table wrongly gave them one; no test locked that.)
+        for src in ["A -.- B", "A === B"] {
+            let g = p(&format!("graph TD\n{src}"));
+            assert_eq!(g.edges[0].to_head, Head::None, "for {src}");
+        }
+    }
+
+    #[test]
+    fn invisible_link_parses_as_invisible_edge() {
+        let g = p("graph TD\nA ~~~ B\nA ~~~~ B");
+        assert_eq!(g.edges.len(), 2);
+        for e in &g.edges {
+            assert_eq!(e.kind, EdgeKind::Invisible);
+            assert_eq!((e.from_head, e.to_head), (Head::None, Head::None));
+            assert!(e.label.is_none());
+        }
+    }
+
+    #[test]
+    fn invisible_link_rejects_labels_and_short_runs() {
+        for src in ["A ~~~|x| B", "A ~~ B"] {
+            let e = parse(&format!("graph TD\n{src}")).unwrap_err();
+            assert_eq!(e.line, Some(2), "for {src}");
+        }
+    }
+
+    #[test]
+    fn two_dash_run_without_terminator_or_label_errors() {
+        // `<--` is also invalid in mermaid (reverse-open is `<---`).
+        for src in ["A -- B", "A == B", "A <-- B"] {
+            let e = parse(&format!("graph TD\n{src}")).unwrap_err();
+            assert_eq!(e.line, Some(2), "for {src}");
+        }
+    }
+
+    #[test]
+    fn pipe_label_still_works_on_new_operators() {
+        let g = p("graph TD\nA --o|maybe| B\nA <-->|both| B");
+        assert_eq!(g.edges[0].label.as_deref(), Some("maybe"));
+        assert_eq!(g.edges[1].label.as_deref(), Some("both"));
+    }
+
+    #[test]
+    fn terminator_binding_inside_would_be_labels_matches_mermaid() {
+        // `--o` binds before any label scan, so `A--oops-->B` is a
+        // circle-edge to `ops`, then `ops-->B` — mermaid's documented
+        // footgun, reproduced deliberately (never-silent: same graph).
+        let g = p("graph TD\nA--oops-->B");
+        assert_eq!(g.nodes[1].id, "ops");
+        assert_eq!(g.edges[0].to_head, Head::Circle);
+        assert_eq!(g.edges[1].to_head, Head::Arrow);
+    }
+
+    #[test]
+    fn no_space_inline_labels() {
+        // The docs' no-space spellings (previously loud errors).
+        for (src, kind, to_head, label) in [
+            ("A-.text.-B", EdgeKind::Dotted, Head::None, "text"),
+            ("A-.text.->B", EdgeKind::Dotted, Head::Arrow, "text"),
+            ("A==text==>B", EdgeKind::Thick, Head::Arrow, "text"),
+            ("A--text-->B", EdgeKind::Arrow, Head::Arrow, "text"),
+            ("A--text---B", EdgeKind::Open, Head::None, "text"),
+            ("A-- text --xB", EdgeKind::Open, Head::Cross, "text"),
+        ] {
+            let g = p(&format!("graph TD\n{src}"));
+            assert_eq!(g.edges[0].kind, kind, "for {src}");
+            assert_eq!(g.edges[0].to_head, to_head, "for {src}");
+            assert_eq!(g.edges[0].label.as_deref(), Some(label), "for {src}");
+            assert_eq!(g.nodes.len(), 2, "for {src}");
+            assert_eq!(g.nodes[1].id, "B", "for {src}");
+        }
+    }
+
+    #[test]
+    fn multi_length_inline_label_closer() {
+        // Docs example: `A --text---- E` (long closer run).
+        let g = p("graph TD\nA --text---- E");
+        assert_eq!(g.edges[0].label.as_deref(), Some("text"));
+        assert_eq!(g.edges[0].kind, EdgeKind::Open);
+        assert_eq!(g.nodes[1].id, "E");
+    }
+
+    #[test]
+    fn unclosed_inline_label_is_line_error() {
+        for src in ["A--text", "A-.text", "A==text"] {
+            let e = parse(&format!("graph TD\n{src}")).unwrap_err();
+            assert_eq!(e.line, Some(2), "for {src}");
+        }
+    }
+
+    #[test]
+    fn edge_to_subgraph_id_errors_loudly() {
+        // Silent-misparse #2 (issue #32): this used to create a phantom
+        // node `sgID`. Real edge-to-subgraph routing is deferred; v1
+        // errors loudly, naming the subgraph.
+        let e = parse("graph TD\nsubgraph sgID[T]\nA --> B\nend\nsgID --> C").unwrap_err();
+        assert_eq!(e.line, Some(5));
+        assert!(e.message.contains("subgraph"), "got: {}", e.message);
+        assert!(e.message.contains("sgID"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn edge_from_and_to_subgraph_both_error() {
+        let e = parse("graph TD\nsubgraph s\nA\nend\nC --> s").unwrap_err();
+        assert_eq!(e.line, Some(5));
+    }
+
+    #[test]
+    fn edge_above_subgraph_declaration_still_errors() {
+        // Real mermaid resolves subgraph ids declared LATER; the check
+        // must therefore run post-parse, not inline.
+        let e = parse("graph TD\ns --> C\nsubgraph s\nA\nend").unwrap_err();
+        assert_eq!(e.line, Some(2));
+        assert!(e.message.contains("\"s\""), "got: {}", e.message);
+    }
+
+    #[test]
+    fn bare_subgraph_id_statement_does_not_error() {
+        // Only EDGES to subgraph ids are the misparse class; a bare node
+        // statement that happens to shadow a subgraph id parses (as
+        // today) — no edge, no silent-wrong-graph.
+        assert!(parse("graph TD\nsubgraph s\nA\nend\ns").is_ok());
+    }
+
+    #[test]
+    fn class_def_default_applies_to_unclassed_nodes_only() {
+        let g = p("graph TD\nclassDef default fill:#f9f\nclassDef hot fill:#f00\nA --> B:::hot");
+        assert_eq!(g.nodes[0].classes, vec!["default"]); // A: auto
+        assert_eq!(g.nodes[1].classes, vec!["hot"]);     // B: explicit wins
+    }
+
+    #[test]
+    fn no_default_class_def_means_no_auto_class() {
+        let g = p("graph TD\nclassDef hot fill:#f00\nA");
+        assert!(g.nodes[0].classes.is_empty());
+    }
+
+    #[test]
+    fn edge_error_reports_the_full_operator_including_reverse_head() {
+        // `A <-- B` is the case that regresses without `r_orig`: the `<`
+        // is consumed as a reverse head before the 2-dash run errors, so
+        // a post-strip diagnostic would print only `"-- B"`. The `<~~`
+        // case never strips (`~` isn't a run-body byte) and guards the
+        // no-strip path's message instead.
+        for (src, op) in [("A <-- B", "<--"), ("A <~~ B", "<~~")] {
+            let e = parse(&format!("graph TD\n{src}")).unwrap_err();
+            assert_eq!(e.line, Some(2), "for {src}");
+            assert!(e.message.contains(op), "for {src}, got: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn subroutine_shape_parses() {
+        let g = p("graph TD\nA[[call me]]");
+        assert_eq!(g.nodes[0].shape, ShapeKind::Subroutine);
+        assert_eq!(g.nodes[0].label, "call me");
+        // Quoted form and precedence vs `[` / `[(`:
+        let g = p("graph TD\nB[[\"quoted [x]\"]]\nC[(db)]\nD[plain]");
+        assert_eq!(g.nodes[0].label, "quoted [x]");
+        assert_eq!(g.nodes[1].shape, ShapeKind::Cylinder);
+        assert_eq!(g.nodes[2].shape, ShapeKind::Rect);
     }
 }
