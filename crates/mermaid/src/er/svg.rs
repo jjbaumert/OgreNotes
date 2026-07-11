@@ -193,7 +193,7 @@ mod tests {
         assert!(svg.contains("stroke-dasharray"));
         let solid = render_er("erDiagram\nA ||--|| B : strong").unwrap();
         // markers use stroke but relation paths in the solid case carry no dasharray
-        assert!(!solid.contains("<path stroke-dasharray"));
+        assert!(!solid.contains("stroke-dasharray"));
     }
 
     #[test]

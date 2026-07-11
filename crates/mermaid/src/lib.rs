@@ -39,7 +39,7 @@ pub enum DiagramKind {
 }
 
 impl DiagramKind {
-    /// Human-facing name used in "‹label› not yet supported" errors.
+    /// Human-facing name for a diagram kind. Retained as public API; formerly used by the now-removed 'not yet supported' error path.
     pub fn label(self) -> &'static str {
         match self {
             DiagramKind::Pie => "pie",
