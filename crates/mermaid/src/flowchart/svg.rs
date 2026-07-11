@@ -279,6 +279,15 @@ mod tests {
     }
 
     #[test]
+    fn thick_open_edge_has_no_arrowhead() {
+        // `===` is an open thick link — line style without any head.
+        let svg = render_flowchart("graph TD\nA === B").unwrap();
+        assert_eq!(svg.matches("marker-end").count(), 0, "{svg}");
+        assert_eq!(svg.matches("marker-start").count(), 0, "{svg}");
+        assert!(svg.contains("stroke-width=\"2.5\""));
+    }
+
+    #[test]
     fn class_def_default_styles_every_unclassed_node() {
         let svg = render_flowchart("graph TD\nclassDef default fill:#f9f\nA --> B").unwrap();
         assert_eq!(svg.matches("style=\"fill:#f9f\"").count(), 2, "{svg}");

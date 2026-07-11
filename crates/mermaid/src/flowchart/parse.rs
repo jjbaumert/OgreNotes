@@ -418,6 +418,11 @@ impl Parser {
     fn parse_edge_op(&mut self, rest: &mut &str) -> Result<EdgeOp, ParseError> {
         let r = rest.trim_start();
         let b = r.as_bytes();
+        // Diagnostics use the pre-strip string: if a reverse head gets
+        // consumed below and the body then fails to parse, the error
+        // must still show what the user actually typed (e.g. the `<` in
+        // `A <~~ B`), not just the remainder after the head was eaten.
+        let r_orig = r;
         // Optional reverse head. `o`/`x` are also id characters, so they
         // only count when the NEXT byte starts a run body; `<` gets the
         // same guard so a stray `<` falls through to the clean error.
@@ -428,7 +433,7 @@ impl Parser {
             _ => (Head::None, r),
         };
         let b = r.as_bytes();
-        let expected = || format!("expected an edge (e.g. `-->`), found {r:?}");
+        let expected = || format!("expected an edge (e.g. `-->`), found {r_orig:?}");
         // Body run. `body_len` is a byte length over ASCII-only chars.
         let (family, body_len) = match b.first() {
             Some(b'~') => {
@@ -1192,6 +1197,13 @@ mod tests {
     fn no_default_class_def_means_no_auto_class() {
         let g = p("graph TD\nclassDef hot fill:#f00\nA");
         assert!(g.nodes[0].classes.is_empty());
+    }
+
+    #[test]
+    fn edge_error_reports_the_full_operator_including_reverse_head() {
+        let e = parse("graph TD\nA <~~ B").unwrap_err();
+        assert_eq!(e.line, Some(2));
+        assert!(e.message.contains("<~~"), "got: {}", e.message);
     }
 
     #[test]

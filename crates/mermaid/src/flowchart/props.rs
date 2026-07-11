@@ -34,7 +34,8 @@ fn arb_source() -> impl Strategy<Value = String> {
         Just("classDef default fill:#f9f".to_string()),
         Just("C:::default".to_string()),
         Just("s --> A".to_string()),
-        "[a-zA-Z0-9_ <>ox~=.|&-]{0,24}",
+        Just("A[\"x;y\"] --> B".to_string()),
+        "[a-zA-Z0-9_ <>ox~=.|&;\"-]{0,24}",
     ];
     proptest::collection::vec(stmt, 0..40)
         .prop_map(|v| format!("flowchart TD\n{}", v.join("\n")))
