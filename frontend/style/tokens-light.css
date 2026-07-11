@@ -83,11 +83,15 @@
    * Lifts every timestamp / byline / metadata caption to AA. */
   --color-text-tertiary: #767676;
 
-  /* Code blocks — inverted (dark bg + light fg) in light mode for
-   * syntax-highlighting visual feel. Dark mode keeps the inversion
-   * direction but pushes bg darker than canvas for inset look. */
-  --color-code-bg: #1A1A1A;
-  --color-code-fg: #E0E0E0;
+  /* Code blocks — light slab in light mode (2026-07-11, was inverted
+   * near-black). The syntax-highlight token palette for light mode
+   * (--tok-* in main.css, GitHub-light hues) is designed for a light
+   * background; the old inverted slab made those tokens low-contrast
+   * and read as a jarring black slab on the white page. Warm paper
+   * tint one step off --color-mist so inline code and block code stay
+   * distinguishable. Dark mode is unchanged (tokens-dark.css). */
+  --color-code-bg: #F4F1EA;
+  --color-code-fg: #1A1A1A;
 
   /* "On-X" text colors — what to draw on top of a colored
    * surface. Primary button text needs to flip with the primary
