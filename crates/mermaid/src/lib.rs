@@ -112,6 +112,11 @@ pub fn detect_kind(source: &str) -> DiagramKind {
 /// inclusive) rather than slicing them away, so every downstream error
 /// still points at the original 1-based line numbers. Contents are
 /// ignored in v1.
+///
+/// Only ever called from `render()` AFTER the `MAX_SOURCE_LEN` gate, so
+/// its line scan and the `Vec`/`String::join` allocation it performs are
+/// bounded by the cap — this function must not be called on untrusted,
+/// unbounded input directly.
 fn strip_front_matter(source: &str) -> Result<Option<String>, ParseError> {
     match source.lines().next() {
         Some(first) if first.trim() == "---" => {}
@@ -134,17 +139,6 @@ fn strip_front_matter(source: &str) -> Result<Option<String>, ParseError> {
 
 /// Render mermaid `source` to an SVG string. Never panics.
 pub fn render(source: &str) -> RenderOutput {
-    let stripped;
-    let source = match strip_front_matter(source) {
-        Ok(None) => source,
-        Ok(Some(s)) => {
-            stripped = s;
-            stripped.as_str()
-        }
-        Err(e) => {
-            return RenderOutput { kind: DiagramKind::Unknown, svg: None, error: Some(e) }
-        }
-    };
     let kind = detect_kind(source);
     // Self-contained gate: `crates/collab`'s write-gate validator already
     // rejects over-cap sources before they're ever stored, but `render()`
@@ -152,7 +146,10 @@ pub fn render(source: &str) -> RenderOutput {
     // (tests, future callers, anything that bypasses the write gate), so
     // it must not rely on an upstream caller to have checked this. Kept
     // AFTER `detect_kind` (which is only ever O(first line), cheap even
-    // on a huge string) so the returned `kind` is still meaningful.
+    // on a huge string) so the returned `kind` is still meaningful, but
+    // BEFORE `strip_front_matter` (which is an O(n) scan plus a
+    // source-sized allocation) so an oversized source is rejected before
+    // that work is ever done.
     if source.chars().count() > MAX_SOURCE_LEN {
         return RenderOutput {
             kind,
@@ -163,6 +160,18 @@ pub fn render(source: &str) -> RenderOutput {
             }),
         };
     }
+    let stripped;
+    let (source, kind) = match strip_front_matter(source) {
+        Ok(None) => (source, kind),
+        Ok(Some(s)) => {
+            stripped = s;
+            let kind = detect_kind(&stripped);
+            (stripped.as_str(), kind)
+        }
+        Err(e) => {
+            return RenderOutput { kind: DiagramKind::Unknown, svg: None, error: Some(e) }
+        }
+    };
     match kind {
         DiagramKind::Pie => match pie::parse(source) {
             Ok(p) => RenderOutput { kind, svg: Some(pie::render_svg(&p)), error: None },
@@ -279,6 +288,18 @@ mod tests {
         let err = out.error.expect("oversized source must error");
         assert!(err.message.contains("too large"), "got: {}", err.message);
         assert!(err.line.is_none());
+    }
+
+    #[test]
+    fn oversized_front_matter_source_is_gated_before_stripping() {
+        // The cap must reject before any front-matter scan/allocation;
+        // kind comes from the raw source (`---` header -> Unknown).
+        let big = format!("---\ntitle: x\n---\npie\n{}", "\"A\" : 1\n".repeat(MAX_SOURCE_LEN));
+        assert!(big.chars().count() > MAX_SOURCE_LEN);
+        let out = render(&big);
+        assert_eq!(out.kind, DiagramKind::Unknown);
+        let err = out.error.expect("oversized source must error");
+        assert!(err.message.contains("too large"), "got: {}", err.message);
     }
 
     #[test]
