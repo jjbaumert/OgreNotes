@@ -8,6 +8,31 @@ use super::schema::{default_schema, Schema};
 use super::selection::Selection;
 use super::transform::{Step, StepError, StepMap};
 
+/// Start of the line containing char-index `pos` within `chars` — the
+/// index just past the nearest preceding `'\n'`, or 0 on the first
+/// line. Shared by `split_block`'s code-block auto-indent and
+/// triple-Enter escape, and by `commands::dedent_code_block_line`
+/// (Shift-Tab): all answer "where does the caret's line start" against
+/// a char-indexed code-block text buffer and must agree.
+pub(crate) fn line_start_at(chars: &[char], pos: usize) -> usize {
+    chars[..pos]
+        .iter()
+        .rposition(|&c| c == '\n')
+        .map(|i| i + 1)
+        .unwrap_or(0)
+}
+
+/// Indent unit for a code block's `language` attr tag —
+/// `DEFAULT_INDENT_UNIT` when the tag is absent/empty/unresolved.
+/// Shared by `split_block`'s auto-indent and
+/// `commands::code_block_indent_unit` (Tab/Shift-Tab): Enter and Tab
+/// must insert the same string for the same block.
+pub(crate) fn indent_unit_for_language_tag(tag: Option<&str>) -> &'static str {
+    tag.and_then(ogrenotes_highlight::Language::from_tag)
+        .map(|l| l.indent_unit())
+        .unwrap_or(ogrenotes_highlight::DEFAULT_INDENT_UNIT)
+}
+
 /// The complete, immutable editor state at a point in time.
 /// New states are produced by applying transactions.
 #[derive(Debug, Clone)]
@@ -425,11 +450,7 @@ impl Transaction {
             let chars: Vec<char> = text.chars().collect();
             let at_end = inner_pos == block.content.size();
             let clamped = inner_pos.min(chars.len());
-            let line_start = chars[..clamped]
-                .iter()
-                .rposition(|&c| c == '\n')
-                .map(|i| i + 1)
-                .unwrap_or(0);
+            let line_start = line_start_at(&chars, clamped);
 
             // Triple-Enter escape (user-tuned): Enter at the very end
             // of TWO consecutive whitespace-only trailing lines
@@ -442,14 +463,17 @@ impl Transaction {
                 && line_start > 0
                 && chars[line_start..].iter().all(|c| is_ws(c))
             {
-                let prev_line_start = chars[..line_start - 1]
-                    .iter()
-                    .rposition(|&c| c == '\n')
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
+                let prev_line_start = line_start_at(&chars, line_start - 1);
                 let prev_line_ws_only =
                     chars[prev_line_start..line_start - 1].iter().all(is_ws);
-                if prev_line_ws_only {
+                // `prev_line_start > 0` requires a THIRD line-start
+                // boundary before the two blank trailing lines — i.e.
+                // genuinely three Enters' worth of lines. Without it,
+                // a code block that started completely empty (toolbar-
+                // created, or a fence rule with nothing typed) counts
+                // its own pre-existing first line as one blank line and
+                // the escape fires on the SECOND Enter, not the third.
+                if prev_line_ws_only && prev_line_start > 0 {
                     // Delete from the newline that opens the first
                     // empty line (or from the content start when the
                     // whole block is just the two empty lines).
@@ -473,12 +497,8 @@ impl Transaction {
             // indent unit when the text before the caret ends with a
             // block opener (':' for Python-style suites, '{' for brace
             // languages).
-            let indent_unit = block
-                .attrs
-                .get("language")
-                .and_then(|l| ogrenotes_highlight::Language::from_tag(l))
-                .map(|l| l.indent_unit())
-                .unwrap_or(ogrenotes_highlight::DEFAULT_INDENT_UNIT);
+            let indent_unit =
+                indent_unit_for_language_tag(block.attrs.get("language").map(String::as_str));
             let current_indent: String = chars[line_start..clamped]
                 .iter()
                 .take_while(|&&c| c == ' ' || c == '\t')
@@ -2149,6 +2169,26 @@ mod tests {
         assert_eq!(
             new_state.doc.child(0).unwrap().text_content(),
             "class A:\n    \n    "
+        );
+    }
+
+    #[test]
+    fn split_block_from_empty_code_block_takes_three_enters_to_exit() {
+        // Review finding (2026-07-10): a block that never had typed
+        // content must not count its own pre-existing first line as a
+        // user-typed blank — the escape still takes three Enters.
+        let mut state = python_code_block("");
+        for enters in 1..=2 {
+            let txn = state.transaction().split_block().unwrap();
+            state = state.apply(txn);
+            assert_eq!(state.doc.child_count(), 1, "Enter {enters} must not exit");
+        }
+        let txn = state.transaction().split_block().unwrap();
+        let state = state.apply(txn);
+        assert_eq!(state.doc.child_count(), 2, "Enter 3 must exit");
+        assert_eq!(
+            state.doc.child(1).unwrap().node_type(),
+            Some(NodeType::Paragraph)
         );
     }
 

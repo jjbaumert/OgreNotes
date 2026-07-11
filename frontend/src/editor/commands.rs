@@ -3147,11 +3147,7 @@ pub fn table_tab_backward(
 /// `language` falls back to `DEFAULT_INDENT_UNIT` (4 spaces).
 fn code_block_indent_unit(state: &EditorState) -> Option<&'static str> {
     let lang = code_block_language(state)?;
-    Some(
-        ogrenotes_highlight::Language::from_tag(&lang)
-            .map(|l| l.indent_unit())
-            .unwrap_or(ogrenotes_highlight::DEFAULT_INDENT_UNIT),
-    )
+    Some(super::state::indent_unit_for_language_tag(Some(&lang)))
 }
 
 /// Remove one indent step from the start of the caret's line in a
@@ -3164,11 +3160,7 @@ fn dedent_code_block_line(state: &EditorState, unit: &str) -> Option<Transaction
         Node::element_with_content(block.node_type, block.content.clone()).text_content();
     let chars: Vec<char> = text.chars().collect();
     let caret = pos.checked_sub(block.content_start)?.min(chars.len());
-    let line_start = chars[..caret]
-        .iter()
-        .rposition(|&c| c == '\n')
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    let line_start = super::state::line_start_at(&chars, caret);
     let remove = if chars.get(line_start) == Some(&'\t') {
         1
     } else {
