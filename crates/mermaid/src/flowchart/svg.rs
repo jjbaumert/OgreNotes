@@ -74,7 +74,11 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
                 }
             })
             .collect();
+        if e.kind == EdgeKind::Invisible {
+            continue; // layout-only; draws nothing (Task 3 reworks markers)
+        }
         let attrs = match e.kind {
+            EdgeKind::Invisible => String::new(), // unreachable: guarded above
             EdgeKind::Arrow => {
                 r#"stroke="currentColor" fill="none" marker-end="url(#mmd-arrow)""#.to_string()
             }

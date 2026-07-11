@@ -2,10 +2,18 @@
 //! statements; chain statements are scanned left-to-right with
 //! longest-first token matching (std only, no regex).
 
-use crate::flowchart::{EdgeKind, FlowEdge, FlowGraph, FlowNode, ShapeKind};
+use crate::flowchart::{EdgeKind, FlowEdge, FlowGraph, FlowNode, Head, ShapeKind};
 use crate::layout::Direction;
 use crate::ParseError;
 use std::collections::HashMap;
+
+/// A fully-resolved edge operator, including any inline label.
+struct EdgeOp {
+    kind: EdgeKind,
+    from_head: Head,
+    to_head: Head,
+    label: Option<String>,
+}
 
 struct Parser {
     g: FlowGraph,
@@ -167,11 +175,18 @@ impl Parser {
                 return Ok(());
             }
             rest = r;
-            let (kind, label) = self.parse_edge_op(&mut rest)?;
+            let op = self.parse_edge_op(&mut rest)?;
             let rhs = self.parse_node_group(&mut rest)?;
             for &f in &lhs {
                 for &t in &rhs {
-                    self.g.edges.push(FlowEdge { from: f, to: t, kind, label: label.clone() });
+                    self.g.edges.push(FlowEdge {
+                        from: f,
+                        to: t,
+                        kind: op.kind,
+                        from_head: op.from_head,
+                        to_head: op.to_head,
+                        label: op.label.clone(),
+                    });
                     // Bail INSIDE the fan-out loop, not after it: an
                     // `a&a&...&a --> a&...&a` chain with N ids on each
                     // side pushes N*N edges before this loop would
@@ -324,57 +339,195 @@ impl Parser {
         Ok(None)
     }
 
-    /// Edge operator with optional label (inline or |pipe| form).
-    fn parse_edge_op(&mut self, rest: &mut &str) -> Result<(EdgeKind, Option<String>), ParseError> {
+    /// Unified edge-operator scanner (polish slice, see
+    /// docs/superpowers/specs/2026-07-11-mermaid-polish-design.md):
+    ///
+    ///   edge-op    := [rev-head] body [terminator] [label]
+    ///   rev-head   := '<' | 'o' | 'x'   (only when a body char follows)
+    ///   body       := '-'{2,} | '-' '.'{1,} '-' | '='{2,} | '~'{3,}
+    ///   terminator := '>' | 'o' | 'x'   (bound IMMEDIATELY after the
+    ///                  run — mermaid's documented `A---oB` = circle rule)
+    ///   label      := inline (`--text-->`, `-. text .->`, `==text==>`)
+    ///                 or `|text|` after a plain operator
+    ///
+    /// A 2-length solid/thick run with no terminator opens an inline
+    /// label; `-.` not followed by dots-then-`-` likewise. Multi-length
+    /// runs collapse to the base kind (rank-span hint not honored — a
+    /// documented cosmetic divergence). All operator characters are
+    /// ASCII, so the byte indexing below always lands on char boundaries.
+    fn parse_edge_op(&mut self, rest: &mut &str) -> Result<EdgeOp, ParseError> {
         let r = rest.trim_start();
-        // Inline label forms first: `-- text -->`, `-. text .->`, `== text ==>`.
-        for (open, close, kind) in [
-            ("--", "-->", EdgeKind::Arrow),
-            ("-.", ".->", EdgeKind::Dotted),
-            ("==", "==>", EdgeKind::Thick),
-        ] {
-            if let Some(after_open) = r.strip_prefix(open) {
-                // Inline form requires a space after the opener (else it's
-                // the plain operator like `-->` sharing the prefix).
-                if after_open.starts_with(' ') {
-                    if let Some(i) = after_open.find(close) {
-                        let label = after_open[..i].trim().to_string();
-                        *rest = &after_open[i + close.len()..];
-                        return Ok((kind, Some(label)));
-                    }
+        let b = r.as_bytes();
+        // Optional reverse head. `o`/`x` are also id characters, so they
+        // only count when the NEXT byte starts a run body; `<` gets the
+        // same guard so a stray `<` falls through to the clean error.
+        let (from_head, r) = match (b.first(), b.get(1)) {
+            (Some(b'<'), Some(b'-' | b'=')) => (Head::Arrow, &r[1..]),
+            (Some(b'o'), Some(b'-' | b'=')) => (Head::Circle, &r[1..]),
+            (Some(b'x'), Some(b'-' | b'=')) => (Head::Cross, &r[1..]),
+            _ => (Head::None, r),
+        };
+        let b = r.as_bytes();
+        let expected = || format!("expected an edge (e.g. `-->`), found {r:?}");
+        // Body run. `body_len` is a byte length over ASCII-only chars.
+        let (family, body_len) = match b.first() {
+            Some(b'~') => {
+                let n = b.iter().take_while(|&&c| c == b'~').count();
+                if n < 3 {
+                    return Err(self.err("invisible links need at least `~~~`"));
+                }
+                if from_head != Head::None {
+                    return Err(self.err("invisible links cannot have arrow heads"));
+                }
+                // No terminator, no label: `~~~xB` is an invisible edge
+                // to node `xB` (mermaid binds no terminator after `~`).
+                *rest = &r[n..];
+                if rest.trim_start().starts_with('|') {
+                    return Err(self.err("invisible links cannot carry a label"));
+                }
+                return Ok(EdgeOp {
+                    kind: EdgeKind::Invisible,
+                    from_head: Head::None,
+                    to_head: Head::None,
+                    label: None,
+                });
+            }
+            Some(b'=') => {
+                let n = b.iter().take_while(|&&c| c == b'=').count();
+                if n < 2 {
+                    return Err(self.err(expected()));
+                }
+                (EdgeKind::Thick, n)
+            }
+            Some(b'-') if b.get(1) == Some(&b'.') => {
+                // Dotted plain body is `-` `.`+ `-`; if the dots are not
+                // followed by `-`, this is the `-.label.-` inline form.
+                let dots = b[1..].iter().take_while(|&&c| c == b'.').count();
+                if b.get(1 + dots) == Some(&b'-') {
+                    (EdgeKind::Dotted, 1 + dots + 1)
+                } else {
+                    return self.parse_inline_label(rest, r, from_head, EdgeKind::Dotted);
                 }
             }
-        }
-        // Plain operators, longest first.
-        for (op, kind) in [
-            ("-.->", EdgeKind::Dotted),
-            ("-.-", EdgeKind::Dotted),
-            ("==>", EdgeKind::Thick),
-            ("===", EdgeKind::Thick),
-            ("-->", EdgeKind::Arrow),
-            ("---", EdgeKind::Open),
-        ] {
-            if let Some(after) = r.strip_prefix(op) {
-                let mut rest2 = after;
-                // Optional |label|.
-                let label = {
-                    let r2 = rest2.trim_start();
-                    if let Some(after_pipe) = r2.strip_prefix('|') {
-                        let Some(i) = after_pipe.find('|') else {
-                            return Err(self.err("unclosed `|` edge label"));
-                        };
-                        let l = after_pipe[..i].trim().to_string();
-                        rest2 = &after_pipe[i + 1..];
-                        Some(l)
-                    } else {
-                        None
-                    }
-                };
-                *rest = rest2;
-                return Ok((kind, label));
+            Some(b'-') => {
+                let n = b.iter().take_while(|&&c| c == b'-').count();
+                if n < 2 {
+                    return Err(self.err(expected()));
+                }
+                (EdgeKind::Arrow, n) // family placeholder; final kind below
             }
+            _ => return Err(self.err(expected())),
+        };
+        // Terminator, bound immediately after the run (no whitespace).
+        let after = &r[body_len..];
+        let (to_head, after) = match after.as_bytes().first() {
+            Some(b'>') => (Head::Arrow, &after[1..]),
+            Some(b'o') => (Head::Circle, &after[1..]),
+            Some(b'x') => (Head::Cross, &after[1..]),
+            _ => (Head::None, after),
+        };
+        // A minimum-length solid/thick run with neither terminator nor
+        // reverse head is only valid as an inline-label opener
+        // (`A--text-->B`); mermaid's shortest plain open links are `---`
+        // and `===`.
+        if body_len == 2
+            && to_head == Head::None
+            && matches!(family, EdgeKind::Arrow | EdgeKind::Thick)
+        {
+            if from_head == Head::None {
+                return self.parse_inline_label(
+                    rest,
+                    r,
+                    from_head,
+                    if family == EdgeKind::Thick { EdgeKind::Thick } else { EdgeKind::Arrow },
+                );
+            }
+            return Err(self.err(expected()));
         }
-        Err(self.err(format!("expected an edge (e.g. `-->`), found {r:?}")))
+        let kind = match family {
+            EdgeKind::Arrow => {
+                if to_head == Head::Arrow || from_head == Head::Arrow {
+                    EdgeKind::Arrow
+                } else {
+                    EdgeKind::Open
+                }
+            }
+            other => other,
+        };
+        let mut rest2 = after;
+        // Optional |label|.
+        let label = {
+            let r2 = rest2.trim_start();
+            if let Some(after_pipe) = r2.strip_prefix('|') {
+                let Some(i) = after_pipe.find('|') else {
+                    return Err(self.err("unclosed `|` edge label"));
+                };
+                let l = after_pipe[..i].trim().to_string();
+                rest2 = &after_pipe[i + 1..];
+                Some(l)
+            } else {
+                None
+            }
+        };
+        *rest = rest2;
+        Ok(EdgeOp { kind, from_head, to_head, label })
+    }
+
+    /// Inline-label forms. `r` starts at the opener (`--`, `==`, or
+    /// `-.`). Spaced forms (`A-- text -->B`) work as before; Task 2
+    /// extends this to the docs' no-space spellings.
+    fn parse_inline_label<'a>(
+        &mut self,
+        rest: &mut &'a str,
+        r: &'a str,
+        from_head: Head,
+        family: EdgeKind,
+    ) -> Result<EdgeOp, ParseError> {
+        let (open, close, kind) = match family {
+            EdgeKind::Dotted => ("-.", ".-", EdgeKind::Dotted),
+            EdgeKind::Thick => ("==", "==", EdgeKind::Thick),
+            _ => ("--", "--", EdgeKind::Arrow),
+        };
+        let Some(after_open) = r.strip_prefix(open) else {
+            return Err(self.err(format!("expected an edge (e.g. `-->`), found {r:?}")));
+        };
+        if !after_open.starts_with(' ') {
+            return Err(self.err(format!(
+                "expected an edge (e.g. `-->`) or a closed inline label, found {r:?}"
+            )));
+        }
+        let Some(i) = after_open.find(close) else {
+            return Err(self.err(format!(
+                "unclosed inline edge label (missing `{close}`)"
+            )));
+        };
+        let label = after_open[..i].trim().to_string();
+        let after_close = &after_open[i + close.len()..];
+        // Closer run may be longer (`---`), then an optional terminator.
+        let extra = after_close
+            .as_bytes()
+            .iter()
+            .take_while(|&&c| c == close.as_bytes()[close.len() - 1])
+            .count();
+        let after_run = &after_close[extra..];
+        let (to_head, after_run) = match after_run.as_bytes().first() {
+            Some(b'>') => (Head::Arrow, &after_run[1..]),
+            Some(b'o') => (Head::Circle, &after_run[1..]),
+            Some(b'x') => (Head::Cross, &after_run[1..]),
+            _ => (Head::None, after_run),
+        };
+        let kind = match kind {
+            EdgeKind::Arrow => {
+                if to_head == Head::Arrow || from_head == Head::Arrow {
+                    EdgeKind::Arrow
+                } else {
+                    EdgeKind::Open
+                }
+            }
+            other => other,
+        };
+        *rest = after_run;
+        Ok(EdgeOp { kind, from_head, to_head, label: Some(label) })
     }
 
     /// The style allowlist is the CSS-injection boundary: only these
@@ -735,5 +888,145 @@ mod tests {
                 Err(e) => assert!(e.line.is_some(), "clean error for {ws:?}"),
             }
         }
+    }
+
+    // ── Polish slice: unified edge-operator scanner ──────────────────
+    // (docs/superpowers/specs/2026-07-11-mermaid-polish-design.md)
+
+    use crate::flowchart::Head;
+
+    #[test]
+    fn circle_and_cross_terminators_bind_to_the_edge_not_the_node() {
+        // THE silent-misparse regression tests (issue #32): these used to
+        // parse an edge to a phantom node named `oB`/`xB`.
+        for (src, to_head) in [
+            ("A--oB", Head::Circle),
+            ("A--xB", Head::Cross),
+            ("A---oB", Head::Circle),
+            ("A---xB", Head::Cross),
+            ("A --o B", Head::Circle),
+            ("A --x B", Head::Cross),
+        ] {
+            let g = p(&format!("graph TD\n{src}"));
+            assert_eq!(g.nodes.len(), 2, "exactly A and B for {src}");
+            assert_eq!(g.nodes[1].id, "B", "no phantom node for {src}");
+            assert_eq!(g.edges[0].to_head, to_head, "for {src}");
+            assert_eq!(g.edges[0].from_head, Head::None, "for {src}");
+            assert_eq!(g.edges[0].kind, EdgeKind::Open, "for {src}");
+        }
+    }
+
+    #[test]
+    fn arrow_terminator_then_o_is_a_node_like_mermaid() {
+        // `>` already terminated the link, so `oB` IS a node — mermaid
+        // parses this identically (the docs' o/x warning only covers a
+        // terminator directly after the run).
+        let g = p("graph TD\nA-->oB");
+        assert_eq!(g.nodes[1].id, "oB");
+        assert_eq!(g.edges[0].to_head, Head::Arrow);
+    }
+
+    #[test]
+    fn spaced_o_after_open_run_is_a_node() {
+        // mermaid's own documented escape hatch: the space breaks the
+        // terminator binding.
+        let g = p("graph TD\nA--- oB");
+        assert_eq!(g.nodes[1].id, "oB");
+        assert_eq!(g.edges[0].kind, EdgeKind::Open);
+        assert_eq!(g.edges[0].to_head, Head::None);
+    }
+
+    #[test]
+    fn multi_length_runs_collapse_to_base_kind() {
+        for (src, kind, to_head) in [
+            ("A ----> B", EdgeKind::Arrow, Head::Arrow),
+            ("A -----> B", EdgeKind::Arrow, Head::Arrow),
+            ("A ---- B", EdgeKind::Open, Head::None),
+            ("A ====> B", EdgeKind::Thick, Head::Arrow),
+            ("A ==== B", EdgeKind::Thick, Head::None),
+            ("A -..-> B", EdgeKind::Dotted, Head::Arrow),
+            ("A -...- B", EdgeKind::Dotted, Head::None),
+        ] {
+            let g = p(&format!("graph TD\n{src}"));
+            assert_eq!(g.edges[0].kind, kind, "for {src}");
+            assert_eq!(g.edges[0].to_head, to_head, "for {src}");
+            assert_eq!(g.nodes.len(), 2, "for {src}");
+        }
+    }
+
+    #[test]
+    fn bidirectional_and_reverse_heads() {
+        for (src, from_head, to_head) in [
+            ("A <--> B", Head::Arrow, Head::Arrow),
+            ("A o--o B", Head::Circle, Head::Circle),
+            ("A x--x B", Head::Cross, Head::Cross),
+            ("A <-.-> B", Head::Arrow, Head::Arrow),
+            ("A <==> B", Head::Arrow, Head::Arrow),
+            // `<---` is mermaid's reverse-open form; bare `<--` is
+            // invalid there (a link needs one more run/terminator char)
+            // and is covered by the error test below.
+            ("A <--- B", Head::Arrow, Head::None),
+        ] {
+            let g = p(&format!("graph TD\n{src}"));
+            assert_eq!(g.edges[0].from_head, from_head, "for {src}");
+            assert_eq!(g.edges[0].to_head, to_head, "for {src}");
+            assert_eq!(g.nodes.len(), 2, "for {src}");
+        }
+    }
+
+    #[test]
+    fn plain_dotted_and_thick_are_open_no_heads() {
+        // mermaid semantics: `-.-` and `===` have NO arrowhead. (The old
+        // fixed table wrongly gave them one; no test locked that.)
+        for src in ["A -.- B", "A === B"] {
+            let g = p(&format!("graph TD\n{src}"));
+            assert_eq!(g.edges[0].to_head, Head::None, "for {src}");
+        }
+    }
+
+    #[test]
+    fn invisible_link_parses_as_invisible_edge() {
+        let g = p("graph TD\nA ~~~ B\nA ~~~~ B");
+        assert_eq!(g.edges.len(), 2);
+        for e in &g.edges {
+            assert_eq!(e.kind, EdgeKind::Invisible);
+            assert_eq!((e.from_head, e.to_head), (Head::None, Head::None));
+            assert!(e.label.is_none());
+        }
+    }
+
+    #[test]
+    fn invisible_link_rejects_labels_and_short_runs() {
+        for src in ["A ~~~|x| B", "A ~~ B"] {
+            let e = parse(&format!("graph TD\n{src}")).unwrap_err();
+            assert_eq!(e.line, Some(2), "for {src}");
+        }
+    }
+
+    #[test]
+    fn two_dash_run_without_terminator_or_label_errors() {
+        // `<--` is also invalid in mermaid (reverse-open is `<---`).
+        for src in ["A -- B", "A == B", "A <-- B"] {
+            let e = parse(&format!("graph TD\n{src}")).unwrap_err();
+            assert_eq!(e.line, Some(2), "for {src}");
+        }
+    }
+
+    #[test]
+    fn pipe_label_still_works_on_new_operators() {
+        let g = p("graph TD\nA --o|maybe| B\nA <-->|both| B");
+        assert_eq!(g.edges[0].label.as_deref(), Some("maybe"));
+        assert_eq!(g.edges[1].label.as_deref(), Some("both"));
+    }
+
+    #[test]
+    fn terminator_binding_inside_would_be_labels_matches_mermaid() {
+        // `--o` binds before any label scan, so `A--oops-->B` is a
+        // circle-edge to `ops`, then `ops-->B` — mermaid's documented
+        // footgun, reproduced deliberately (never-silent: same graph).
+        let g = p("graph TD\nA--oops-->B");
+        assert_eq!(g.nodes[1].id, "ops");
+        assert_eq!(g.edges[0].to_head, Head::Circle);
+        assert_eq!(g.edges[1].to_head, Head::Arrow);
     }
 }

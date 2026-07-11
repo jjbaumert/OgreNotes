@@ -25,6 +25,19 @@ pub(crate) enum EdgeKind {
     Open,
     Dotted,
     Thick,
+    /// `~~~` — participates in layout, draws nothing.
+    Invisible,
+}
+
+/// Per-end edge decoration. `from_head` renders as `marker-start`,
+/// `to_head` as `marker-end` (edge paths run from→to after the layout
+/// engine restores true direction on reversed edges).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Head {
+    None,
+    Arrow,
+    Circle,
+    Cross,
 }
 
 #[derive(Debug, Clone)]
@@ -46,7 +59,12 @@ pub(crate) struct FlowNode {
 pub(crate) struct FlowEdge {
     pub from: usize,
     pub to: usize,
+    /// Line-style family. `Arrow` is retained (rather than folding into
+    /// `Open`) because the parser's pre-polish tests assert it for `-->`;
+    /// solid edges map to `Arrow` iff either head is `Head::Arrow`.
     pub kind: EdgeKind,
+    pub from_head: Head,
+    pub to_head: Head,
     pub label: Option<String>,
 }
 
