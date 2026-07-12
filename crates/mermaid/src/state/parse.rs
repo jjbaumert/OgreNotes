@@ -174,7 +174,7 @@ impl Parser {
             let id = id.trim();
             let cls = cls.trim();
             if !id.is_empty() && !cls.is_empty() && !cls.contains(char::is_whitespace)
-                && !id.contains(char::is_whitespace)
+                && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             {
                 let idx = self.ensure_node(id)?;
                 self.g.nodes[idx].classes.push(cls.to_string());
@@ -793,6 +793,20 @@ mod tests {
         let g = p("stateDiagram-v2\nStill:::notMoving --> [*]");
         let still = g.nodes.iter().find(|n| n.id == "Still").unwrap();
         assert_eq!(still.classes, vec!["notMoving".to_string()]);
+    }
+
+    #[test]
+    fn spaceless_arrow_with_class_suffix_is_a_transition() {
+        // Regression: `A-->B:::c` must be a transition (2 nodes + 1 edge)
+        // with class `c` on B — not swallowed as one node id "A-->B".
+        let g = p("stateDiagram-v2\nA-->B:::c");
+        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.transitions.len(), 1);
+        let b = g.nodes.iter().find(|n| n.id == "B").expect("node B exists");
+        assert_eq!(b.classes, vec!["c".to_string()]);
+        // Standalone form still attaches.
+        let g2 = p("stateDiagram-v2\n[*] --> S\nS:::hot");
+        assert_eq!(g2.nodes.iter().find(|n| n.id == "S").unwrap().classes, vec!["hot".to_string()]);
     }
 
     #[test]
