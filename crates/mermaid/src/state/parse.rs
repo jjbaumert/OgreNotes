@@ -107,7 +107,57 @@ impl Parser {
             _ if first.eq_ignore_ascii_case("note") => return self.parse_note(stmt),
             _ => {}
         }
+        if self.try_parse_decl(stmt)? {
+            return Ok(());
+        }
         self.parse_transition(stmt)
+    }
+
+    /// Bare-id declarations (`stateId`) and colon descriptions
+    /// (`id : display text`) — both start with an id and are NOT
+    /// transitions. Returns Ok(false) when the statement doesn't match
+    /// either form (so the transition parser gets its turn).
+    fn try_parse_decl(&mut self, stmt: &str) -> Result<bool, ParseError> {
+        // ASCII id scan: char count == byte length only because the
+        // predicate is ASCII-only; do not relax without a byte-position
+        // scan.
+        let id_len = stmt.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+        if id_len == 0 {
+            return Ok(false);
+        }
+        let id = &stmt[..id_len];
+        let after = stmt[id_len..].trim_start();
+        let description = if after.is_empty() {
+            None
+        } else if let Some(rest) = after.strip_prefix(':') {
+            // `:::`/`::` are not descriptions; let the transition parser
+            // produce its loud error (Task 1 owns `:::` targets).
+            if rest.starts_with(':') {
+                return Ok(false);
+            }
+            Some(rest.trim().to_string())
+        } else {
+            return Ok(false);
+        };
+        if self.composite_ids.contains_key(id) {
+            return Err(self.err(format!(
+                "`{id}` is a composite state; composites are not states"
+            )));
+        }
+        let idx = self.ensure_node(id)?;
+        if let Some(text) = description {
+            // mermaid stacks repeated descriptions as extra lines; the
+            // label emitter renders `<br/>`-separated lines already. A
+            // display still equal to the id is the untouched default and
+            // is replaced rather than appended to.
+            if self.g.nodes[idx].display == self.g.nodes[idx].id {
+                self.g.nodes[idx].display = text;
+            } else {
+                self.g.nodes[idx].display.push_str("<br/>");
+                self.g.nodes[idx].display.push_str(&text);
+            }
+        }
+        Ok(true)
     }
 
     /// `state "Display" as ID` / `state ID {` / `state ID <<stereotype>>`
@@ -570,5 +620,51 @@ mod tests {
         // keyword are not captured by the named-error arms.
         let g = p("stateDiagram-v2\nclassA --> stateB");
         assert_eq!(g.nodes.len(), 2);
+    }
+
+    #[test]
+    fn bare_id_declares_a_state() {
+        // The docs' intro example: a statement that is just an id.
+        let g = p("stateDiagram-v2\nstateId");
+        assert_eq!(g.nodes.len(), 1);
+        assert_eq!(g.nodes[0].id, "stateId");
+        // Re-declaring is a no-op.
+        let g = p("stateDiagram-v2\ns\ns\ns --> t");
+        assert_eq!(g.nodes.len(), 2);
+    }
+
+    #[test]
+    fn colon_description_sets_display() {
+        let g = p("stateDiagram-v2\ns2 : This is a state description");
+        assert_eq!(g.nodes[0].display, "This is a state description");
+        assert_eq!(g.nodes[0].id, "s2");
+    }
+
+    #[test]
+    fn repeated_colon_description_appends_lines() {
+        let g = p("stateDiagram-v2\ns : first line\ns : second line");
+        assert_eq!(g.nodes[0].display, "first line<br/>second line");
+    }
+
+    #[test]
+    fn colon_description_composes_with_quoted_decl() {
+        let g = p("stateDiagram-v2\nstate \"Base\" as s\ns : more");
+        assert_eq!(g.nodes[0].display, "Base<br/>more");
+    }
+
+    #[test]
+    fn bare_or_described_composite_id_errors() {
+        let e = parse("stateDiagram-v2\nstate X {\na\n}\nX").unwrap_err();
+        assert_eq!(e.line, Some(5));
+        assert!(e.message.contains("composite"));
+        let e = parse("stateDiagram-v2\nstate X {\na\n}\nX : desc").unwrap_err();
+        assert_eq!(e.line, Some(5));
+    }
+
+    #[test]
+    fn double_colon_still_falls_through_to_a_loud_error() {
+        // `s ::x` is not a description; the transition parser rejects it.
+        let e = parse("stateDiagram-v2\ns ::x").unwrap_err();
+        assert_eq!(e.line, Some(2));
     }
 }
