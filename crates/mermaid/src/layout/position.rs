@@ -93,6 +93,40 @@ mod tests {
     }
 
     #[test]
+    fn connected_boxes_converge_onto_a_shared_center_axis() {
+        // Regression: a single-neighbour child must land at the same x as its
+        // parent (straight, centered edge) even amid other components and
+        // long edges. The old fixed 3 sweeps stopped early and left these
+        // pairs offset ~40px; running the sweeps to convergence aligns them.
+        let src = "classDiagram\n\
+                   Class01 <|-- AveryLongClass : Cool\n\
+                   Class03 *-- Class04\n\
+                   Class05 o-- Class06\n\
+                   Class07 <|-- Class09\n\
+                   Class09 --* C3\n\
+                   Class09 --> C2 : Where am i?\n\
+                   Class07 .. Class08\n\
+                   Class08 --> C2 : Cool label\n\
+                   Class01 : int chimp\n\
+                   Class01 : int gorilla\n\
+                   Class01 : size()\n\
+                   Class07 : Object[] elementData\n\
+                   Class07 : equals()";
+        let svg = crate::render(src).svg.expect("renders");
+        // x-center of a class = the x of its bold title <text>.
+        let cx = |name: &str| -> f64 {
+            let tag = format!(">{name}</text>");
+            let end = svg.find(&tag).unwrap_or_else(|| panic!("title {name} present"));
+            let open = svg[..end].rfind("<text x=\"").unwrap() + "<text x=\"".len();
+            svg[open..].split('"').next().unwrap().parse().unwrap()
+        };
+        for (child, parent) in [("AveryLongClass", "Class01"), ("Class04", "Class03"), ("Class06", "Class05")] {
+            let (a, b) = (cx(child), cx(parent));
+            assert!((a - b).abs() < 1.0, "{child}@{a} not center-aligned with {parent}@{b}");
+        }
+    }
+
+    #[test]
     fn all_coords_finite_and_on_canvas() {
         let nodes = vec![n(40.0), n(40.0), n(40.0), n(40.0), n(40.0)];
         let edges = vec![e(0, 2), e(1, 2), e(2, 3), e(2, 4), e(0, 4)];
@@ -117,7 +151,15 @@ pub(crate) struct Coords {
     pub size: (f64, f64),
 }
 
-const COORD_SWEEPS: usize = 3;
+/// x-assignment runs alternating median sweeps until the layout stops
+/// moving (a `CONVERGE_EPS`-quiet sweep) or the cap is hit. The original
+/// fixed 3 sweeps stopped before single-neighbor chains settled onto a
+/// shared center axis, leaving connected boxes offset and their edges
+/// curved; running to convergence lands them on straight, centered edges
+/// (matching Mermaid). The early-exit keeps simple graphs cheap, and the
+/// cap bounds the rare oscillating graph.
+const MAX_COORD_SWEEPS: usize = 30;
+const CONVERGE_EPS: f64 = 0.25;
 const CANVAS_PAD: f64 = 20.0;
 
 pub(crate) fn assign_coords(g: &OrderGraph) -> Coords {
@@ -149,14 +191,15 @@ pub(crate) fn assign_coords(g: &OrderGraph) -> Coords {
         })
         .collect();
 
-    // Median sweeps with separation enforcement.
-    for sweep in 0..COORD_SWEEPS {
+    // Median sweeps with separation enforcement, run to convergence.
+    for sweep in 0..MAX_COORD_SWEEPS {
         let downward = sweep % 2 == 0;
         let ranks_iter: Vec<usize> = if downward {
             (1..g.ranks.len()).collect()
         } else {
             (0..g.ranks.len().saturating_sub(1)).rev().collect()
         };
+        let mut moved = 0.0_f64;
         for r in ranks_iter {
             let nbrs = super::order::neighbor_positions(g, r, downward);
             let adj = if downward { r - 1 } else { r + 1 };
@@ -184,8 +227,17 @@ pub(crate) fn assign_coords(g: &OrderGraph) -> Coords {
                     }
                 })
                 .collect();
-            xs[r] = desired;
+            let before = std::mem::replace(&mut xs[r], desired);
             enforce_separation(&g.ranks[r], &mut xs[r]);
+            for (a, b) in before.iter().zip(xs[r].iter()) {
+                moved = moved.max((a - b).abs());
+            }
+        }
+        // Stop once a sweep barely moves anything — but only after both
+        // directions have run a couple of times, so a quiet down-sweep
+        // doesn't exit before the following up-sweep pulls chains taut.
+        if sweep >= 3 && moved < CONVERGE_EPS {
+            break;
         }
     }
 
