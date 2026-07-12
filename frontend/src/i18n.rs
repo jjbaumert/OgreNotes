@@ -274,6 +274,37 @@ mod locale_precedence_tests {
     }
 }
 
+#[cfg(test)]
+mod wasm_locale_tests {
+    use wasm_bindgen_test::*;
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn set_ls(key: &str, val: &str) {
+        web_sys::window().unwrap().local_storage().unwrap().unwrap()
+            .set_item(key, val).unwrap();
+    }
+    fn clear_ls(key: &str) {
+        web_sys::window().unwrap().local_storage().unwrap().unwrap()
+            .remove_item(key).unwrap();
+    }
+
+    #[wasm_bindgen_test]
+    fn hint_wins_over_stored_localstorage() {
+        set_ls("ogrenotes.locale", "es");
+        // No ?locale= in the test URL, so URL layer is empty; the hint
+        // (server pref) must beat the cached localStorage value.
+        assert_eq!(super::resolve_locale_with_hint(Some("ar")), "ar");
+        clear_ls("ogrenotes.locale");
+    }
+
+    #[wasm_bindgen_test]
+    fn falls_back_to_localstorage_without_hint() {
+        set_ls("ogrenotes.locale", "de");
+        assert_eq!(super::resolve_locale_with_hint(None), "de");
+        clear_ls("ogrenotes.locale");
+    }
+}
+
 /// Stamp `<html lang="...">` and `<html dir="...">` to match the
 /// active locale. The `lang` attribute helps screen readers
 /// pronounce text correctly; the `dir` attribute drives the
