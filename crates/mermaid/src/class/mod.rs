@@ -34,6 +34,7 @@ pub(crate) struct Relation {
     pub to: usize,   // the MARKER end (normalized during parse)
     pub kind: RelKind,
     pub arrow: bool, // Association `--` (false) vs `-->` (true)
+    pub back_arrow: bool, // second arrowhead on the `from` end (`<-->`, `<..>`)
     pub m_from: Option<String>, // multiplicity near `from`
     pub m_to: Option<String>,
     pub label: Option<String>,

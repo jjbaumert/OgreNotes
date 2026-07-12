@@ -47,15 +47,36 @@ pub(crate) struct ErGraph {
     pub relations: Vec<ErRelation>,
 }
 
+/// Per-column pixel widths — `(type, name, key, comment)` — of an entity's
+/// attribute grid. This is the single source of truth shared by box sizing
+/// (`render_er`) and column layout (`svg.rs`); computing them in one place
+/// keeps the box from ever being narrower than the columns it must hold
+/// (else a wide comment overflows and clips). Type/name/key each carry a
+/// +12 inter-column gap; the trailing comment column is bare (its right
+/// padding comes from the box's own margin).
+pub(crate) fn attr_columns(e: &Entity) -> (f64, f64, f64, f64) {
+    let mut ty = 0.0_f64;
+    let mut name = 0.0_f64;
+    let mut key = 0.0_f64;
+    let mut comment = 0.0_f64;
+    for a in &e.attributes {
+        ty = ty.max(crate::measure::text_size(&a.ty).0);
+        name = name.max(crate::measure::text_size(&a.name).0);
+        key = key.max(crate::measure::text_size(&a.keys.join(", ")).0);
+        comment = comment.max(crate::measure::text_size(a.comment.as_deref().unwrap_or("")).0);
+    }
+    (ty + 12.0, name + 12.0, key + 12.0, comment)
+}
+
 /// Full ER-diagram pipeline: parse -> size each entity's title +
 /// attribute-grid box -> lay out via the shared `boxgraph` adapter ->
 /// SVG. Never panics; a layout failure (diagram too large) surfaces as
 /// a `ParseError` with no source line, same as `boxgraph::layout_boxgraph`'s
 /// other consumers.
 ///
-/// Box width per the brief: `max(text_size(title).0, max over attrs of
-/// (type_w + name_w + key_w + comment_w + 4*12 column gaps)) + 24`,
-/// floored at 100. `title` is the entity's alias when present, else its
+/// Box width: `max(text_size(title).0, sum of the per-column widths from
+/// `attr_columns`) + 24`, floored at 100 — matching the column offsets
+/// `svg.rs` lays out. `title` is the entity's alias when present, else its
 /// id. Box height: `(1 + attrs.len()) * (LINE_H + 6) + 10` (title row
 /// plus one row per attribute).
 pub(crate) fn render_er(source: &str) -> Result<String, crate::ParseError> {
@@ -65,17 +86,11 @@ pub(crate) fn render_er(source: &str) -> Result<String, crate::ParseError> {
     let mut nodes = Vec::with_capacity(g.entities.len());
     for e in &g.entities {
         let title_w = crate::measure::text_size(e.display.as_deref().unwrap_or(&e.id)).0;
-        let attrs_w = e
-            .attributes
-            .iter()
-            .map(|a| {
-                let ty_w = crate::measure::text_size(&a.ty).0;
-                let name_w = crate::measure::text_size(&a.name).0;
-                let key_w = crate::measure::text_size(&a.keys.join(", ")).0;
-                let comment_w = crate::measure::text_size(a.comment.as_deref().unwrap_or("")).0;
-                ty_w + name_w + key_w + comment_w + 4.0 * 12.0
-            })
-            .fold(0.0_f64, f64::max);
+        // Sum the same per-column widths svg.rs positions with, so the box
+        // always contains its widest column stack (incl. the comment).
+        let (ty_col, name_col, key_col, comment_col) = attr_columns(e);
+        let attrs_w =
+            if e.attributes.is_empty() { 0.0 } else { ty_col + name_col + key_col + comment_col };
         let width = (title_w.max(attrs_w) + 24.0).max(100.0);
         let height = (1.0 + e.attributes.len() as f64) * (crate::measure::LINE_H + 6.0) + 10.0;
 

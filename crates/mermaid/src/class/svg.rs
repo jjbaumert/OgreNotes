@@ -90,6 +90,12 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
         if let Some(m) = marker {
             attrs.push_str(&format!(r#" marker-end="url(#{m})""#));
         }
+        // Bidirectional relations (`<-->`, `<..>`) carry a second open
+        // arrowhead on the `from` end. `orient="auto-start-reverse"` flips
+        // the marker so it points outward from the start node.
+        if r.back_arrow {
+            attrs.push_str(r#" marker-start="url(#mmd-open)""#);
+        }
         out.push_str(&format!(r#"<path d="{d}" {attrs}/>"#));
 
         if let (Some(label), Some((lx, ly))) = (&r.label, ep.label_at) {

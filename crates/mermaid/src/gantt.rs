@@ -162,33 +162,46 @@ pub(crate) fn parse(source: &str) -> Result<Gantt, ParseError> {
         if rest.is_empty() || rest[0].is_empty() {
             return Err(err("task needs a start date or `after <id>`", line_no));
         }
-        // A start spec is a date or `after ...`; anything else in the first
-        // slot is the (optional) task id.
+        // Classify the metadata as [id?] [start?] [end?]. A start spec is a
+        // date or `after ...`; a non-start token that precedes the end is the
+        // task id. Mermaid lets the start be omitted, in which case the task
+        // begins when the previous task ends.
         let is_start = |t: &str| t.starts_with("after ") || parse_date(t).is_some();
-        let (id, start_spec, end_spec): (Option<&str>, &str, Option<&str>) =
+        let (id, start_spec, end_spec): (Option<&str>, Option<&str>, Option<&str>) =
             if is_start(rest[0]) {
-                (None, rest[0], rest.get(1).copied())
+                // start [end]
+                (None, Some(rest[0]), rest.get(1).copied())
+            } else if rest.len() >= 2 && is_start(rest[1]) {
+                // id start [end]
+                (Some(rest[0]), Some(rest[1]), rest.get(2).copied())
+            } else if rest.len() >= 2 {
+                // id end — start omitted (implicit: after the previous task)
+                (Some(rest[0]), None, Some(rest[1]))
             } else {
-                let start = rest
-                    .get(1)
-                    .copied()
-                    .ok_or_else(|| err("task needs a start date or `after <id>`", line_no))?;
-                (Some(rest[0]), start, rest.get(2).copied())
+                // a lone duration/end — start omitted, no id
+                (None, None, Some(rest[0]))
             };
 
-        let start = if let Some(after) = start_spec.strip_prefix("after ") {
-            let mut acc: Option<f64> = None;
-            for rid in after.split_whitespace() {
-                let &ti = ids.get(rid).ok_or_else(|| {
-                    err(format!("`after` references unknown task `{rid}`"), line_no)
-                })?;
-                let e = tasks[ti].end;
-                acc = Some(acc.map_or(e, |x| x.max(e)));
+        let start = match start_spec {
+            Some(s) if s.starts_with("after ") => {
+                let after = s.strip_prefix("after ").unwrap();
+                let mut acc: Option<f64> = None;
+                for rid in after.split_whitespace() {
+                    let &ti = ids.get(rid).ok_or_else(|| {
+                        err(format!("`after` references unknown task `{rid}`"), line_no)
+                    })?;
+                    let e = tasks[ti].end;
+                    acc = Some(acc.map_or(e, |x| x.max(e)));
+                }
+                acc.ok_or_else(|| err("`after` needs a task id", line_no))?
             }
-            acc.ok_or_else(|| err("`after` needs a task id", line_no))?
-        } else {
-            parse_date(start_spec)
-                .ok_or_else(|| err(format!("invalid start date {start_spec:?}"), line_no))?
+            Some(s) => {
+                parse_date(s).ok_or_else(|| err(format!("invalid start date {s:?}"), line_no))?
+            }
+            // Start omitted → begin when the previous task ends (Mermaid rule).
+            None => tasks.last().map(|t| t.end).ok_or_else(|| {
+                err("a task with no start date must follow another task", line_no)
+            })?,
         };
 
         let end = match end_spec {
@@ -386,6 +399,28 @@ mod tests {
         assert_eq!(g.tasks[0].name, "A task");
         assert_eq!(g.tasks[0].end - g.tasks[0].start, 12.0);
         assert_eq!(g.tasks[0].status, Status::Normal);
+    }
+
+    #[test]
+    fn duration_only_task_starts_after_previous() {
+        // A task with only a duration (no start / no `after`) begins when the
+        // previous task ends — the canonical intro gantt uses this on its last
+        // task. Regression for the "task needs a start date" parse failure.
+        let g = p("gantt\ndateFormat YYYY-MM-DD\nsection S\n\
+                   First :2014-01-12, 12d\n\
+                   another task :24d");
+        assert_eq!(g.tasks.len(), 2);
+        assert_eq!(g.tasks[1].start, g.tasks[0].end); // starts at First's end
+        assert_eq!(g.tasks[1].end - g.tasks[1].start, 24.0);
+
+        // id + duration, start still implicit; the id is registered.
+        let g2 = p("gantt\nsection S\nA :2014-01-01, 5d\nB :b2, 10d\nC :after b2, 2d");
+        assert_eq!(g2.tasks[1].start, g2.tasks[0].end);
+        assert_eq!(g2.tasks[1].end - g2.tasks[1].start, 10.0);
+        assert_eq!(g2.tasks[2].start, g2.tasks[1].end); // `after b2` resolves
+
+        // A leading task with no start has nothing to follow → error.
+        assert!(parse("gantt\nsection S\nLonely :5d").is_err());
     }
 
     #[test]
