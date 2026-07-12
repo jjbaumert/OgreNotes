@@ -33,6 +33,43 @@ struct Parser {
     end_count: usize,
 }
 
+/// Truncate a line at the first `%%` that begins the line or follows
+/// whitespace — mermaid comments run to end of line. A `%%` glued to
+/// non-whitespace (e.g. inside a label like `a%%b`) is left alone; a
+/// single `%` never matches. `%` is ASCII, so the byte offset from
+/// `match_indices` is a char boundary.
+fn strip_trailing_comment(line: &str) -> &str {
+    for (i, _) in line.match_indices("%%") {
+        if i == 0 || line[..i].ends_with(char::is_whitespace) {
+            return &line[..i];
+        }
+    }
+    line
+}
+
+/// Split a post-header line into `;`-separated statements — EXCEPT that
+/// once a `:` has appeared in the current statement (a transition label,
+/// colon description, or note text), the `;` belongs to that text and
+/// the statement runs to end of line, matching mermaid. `;` and `:` are
+/// ASCII, so char_indices offsets are boundary-safe.
+fn split_statements(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut colon_seen = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            ':' => colon_seen = true,
+            ';' if !colon_seen => {
+                out.push(&line[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&line[start..]);
+    out
+}
+
 pub(crate) fn parse(source: &str) -> Result<StateGraph, ParseError> {
     let mut p = Parser {
         g: StateGraph { nodes: vec![], transitions: vec![], notes: vec![], composites: vec![] },
@@ -50,6 +87,10 @@ pub(crate) fn parse(source: &str) -> Result<StateGraph, ParseError> {
         if line.is_empty() || line.starts_with("%%") {
             continue;
         }
+        let line = strip_trailing_comment(line).trim_end();
+        if line.is_empty() {
+            continue;
+        }
         if !seen_header {
             let header = line.strip_suffix(';').unwrap_or(line).trim_end();
             if header != "stateDiagram-v2" && header != "stateDiagram" {
@@ -60,7 +101,7 @@ pub(crate) fn parse(source: &str) -> Result<StateGraph, ParseError> {
             seen_header = true;
             continue;
         }
-        for stmt in line.split(';') {
+        for stmt in split_statements(line) {
             let stmt = stmt.trim();
             if stmt.is_empty() {
                 continue;
@@ -96,11 +137,72 @@ impl Parser {
         match first {
             "state" => return self.parse_state_decl(stmt),
             "direction" => return Err(self.err("`direction` statements are not supported")),
+            "classDef" | "class" => {
+                return Err(self.err(format!("`{first}` statements are not supported")));
+            }
+            _ if stmt.starts_with("accTitle") || stmt.starts_with("accDescr") => {
+                let kw = if stmt.starts_with("accTitle") { "accTitle" } else { "accDescr" };
+                return Err(self.err(format!("`{kw}` statements are not supported")));
+            }
             "}" if stmt == "}" => return self.parse_composite_close(),
             _ if first.eq_ignore_ascii_case("note") => return self.parse_note(stmt),
             _ => {}
         }
+        if self.try_parse_decl(stmt)? {
+            return Ok(());
+        }
         self.parse_transition(stmt)
+    }
+
+    /// Bare-id declarations (`stateId`) and colon descriptions
+    /// (`id : display text`) — both start with an id and are NOT
+    /// transitions. Returns Ok(false) when the statement doesn't match
+    /// either form (so the transition parser gets its turn).
+    fn try_parse_decl(&mut self, stmt: &str) -> Result<bool, ParseError> {
+        // ASCII id scan: char count == byte length only because the
+        // predicate is ASCII-only; do not relax without a byte-position
+        // scan.
+        let id_len = stmt.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+        if id_len == 0 {
+            return Ok(false);
+        }
+        let id = &stmt[..id_len];
+        let after = stmt[id_len..].trim_start();
+        let description = if after.is_empty() {
+            None
+        } else if let Some(rest) = after.strip_prefix(':') {
+            // `:::`/`::` are not descriptions; let the transition parser
+            // produce its loud error (Task 1 owns `:::` targets).
+            if rest.starts_with(':') {
+                return Ok(false);
+            }
+            let text = rest.trim();
+            if text.is_empty() {
+                return Err(self.err("empty state description"));
+            }
+            Some(text.to_string())
+        } else {
+            return Ok(false);
+        };
+        if self.composite_ids.contains_key(id) {
+            return Err(self.err(format!(
+                "`{id}` is a composite state; composites are not states"
+            )));
+        }
+        let idx = self.ensure_node(id)?;
+        if let Some(text) = description {
+            // mermaid stacks repeated descriptions as extra lines; the
+            // label emitter renders `<br/>`-separated lines already. A
+            // display still equal to the id is the untouched default and
+            // is replaced rather than appended to.
+            if self.g.nodes[idx].display == self.g.nodes[idx].id {
+                self.g.nodes[idx].display = text;
+            } else {
+                self.g.nodes[idx].display.push_str("<br/>");
+                self.g.nodes[idx].display.push_str(&text);
+            }
+        }
+        Ok(true)
     }
 
     /// `state "Display" as ID` / `state ID {` / `state ID <<stereotype>>`
@@ -255,6 +357,9 @@ impl Parser {
         {
             return Err(self.err(format!("invalid state id {id_part:?}")));
         }
+        if id_part.starts_with("__") {
+            return Err(self.err("cannot attach a note to a synthetic state id"));
+        }
         let idx = self.ensure_node(id_part)?;
         self.g.notes.push(StateNote { state: idx, right, text: text.trim().to_string() });
         Ok(())
@@ -271,6 +376,12 @@ impl Parser {
         rest = after_arrow;
         let to = self.parse_endpoint(&mut rest, EndpointRole::Target)?;
         let tail = rest.trim_start();
+        // `X:::class` — the label branch below would eat the first colon
+        // and render an edge labeled `::class` (silent misparse, issue
+        // #47). Styling application is out of scope; error naming it.
+        if tail.starts_with(":::") {
+            return Err(self.err("`:::` class styling is not supported"));
+        }
         let label = match tail.strip_prefix(':') {
             Some(t) => Some(t.trim().to_string()),
             None if tail.is_empty() => None,
@@ -505,5 +616,174 @@ mod tests {
             src.push_str(&format!("s{i} --> s{}\n", i + 1));
         }
         assert!(parse(&src).unwrap_err().message.contains("too large"));
+    }
+
+    // ── Polish slice (issue #47) ─────────────────────────────────────
+    // (docs/superpowers/specs/2026-07-11-mermaid-state-polish-design.md)
+
+    #[test]
+    fn triple_colon_target_errors_naming_the_operator() {
+        // THE silent-misparse regression: the docs' own example used to
+        // render an edge labeled `::notMoving`.
+        let e = parse("stateDiagram-v2\n[*] --> Still:::notMoving").unwrap_err();
+        assert_eq!(e.line, Some(2));
+        assert!(e.message.contains(":::"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn triple_colon_source_still_errors() {
+        // Source-side was already loud (the arrow check finds `:::`);
+        // pin it so the two sides stay consistent.
+        let e = parse("stateDiagram-v2\nStill:::notMoving --> [*]").unwrap_err();
+        assert_eq!(e.line, Some(2));
+    }
+
+    #[test]
+    fn ordinary_labels_unaffected_by_colon_guard() {
+        let g = p("stateDiagram-v2\na --> b: go: now");
+        assert_eq!(g.transitions[0].label.as_deref(), Some("go: now"));
+    }
+
+    #[test]
+    fn styling_and_acc_statements_error_named() {
+        // These fell through to the transition parser and produced
+        // misleading `expected a transition` messages.
+        for stmt in [
+            "classDef notMoving fill:white",
+            "class Moving, Crash movement",
+            "accTitle: My title",
+            "accDescr: My description",
+        ] {
+            let src = format!("stateDiagram-v2\na --> b\n{stmt}");
+            let e = parse(&src).unwrap_err();
+            assert_eq!(e.line, Some(3), "for {stmt}");
+            let kw = stmt.split([' ', ':']).next().unwrap();
+            assert!(e.message.contains(kw), "message names {kw}: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn keyword_prefixed_ids_still_parse() {
+        // `first` is a whole-token match: ids that merely start with a
+        // keyword are not captured by the named-error arms.
+        let g = p("stateDiagram-v2\nclassA --> stateB");
+        assert_eq!(g.nodes.len(), 2);
+    }
+
+    #[test]
+    fn bare_id_declares_a_state() {
+        // The docs' intro example: a statement that is just an id.
+        let g = p("stateDiagram-v2\nstateId");
+        assert_eq!(g.nodes.len(), 1);
+        assert_eq!(g.nodes[0].id, "stateId");
+        // Re-declaring is a no-op.
+        let g = p("stateDiagram-v2\ns\ns\ns --> t");
+        assert_eq!(g.nodes.len(), 2);
+    }
+
+    #[test]
+    fn colon_description_sets_display() {
+        let g = p("stateDiagram-v2\ns2 : This is a state description");
+        assert_eq!(g.nodes[0].display, "This is a state description");
+        assert_eq!(g.nodes[0].id, "s2");
+    }
+
+    #[test]
+    fn repeated_colon_description_appends_lines() {
+        let g = p("stateDiagram-v2\ns : first line\ns : second line");
+        assert_eq!(g.nodes[0].display, "first line<br/>second line");
+    }
+
+    #[test]
+    fn colon_description_composes_with_quoted_decl() {
+        let g = p("stateDiagram-v2\nstate \"Base\" as s\ns : more");
+        assert_eq!(g.nodes[0].display, "Base<br/>more");
+    }
+
+    #[test]
+    fn bare_or_described_composite_id_errors() {
+        let e = parse("stateDiagram-v2\nstate X {\na\n}\nX").unwrap_err();
+        assert_eq!(e.line, Some(5));
+        assert!(e.message.contains("composite"));
+        let e = parse("stateDiagram-v2\nstate X {\na\n}\nX : desc").unwrap_err();
+        assert_eq!(e.line, Some(5));
+    }
+
+    #[test]
+    fn double_colon_still_falls_through_to_a_loud_error() {
+        // `s ::x` is not a description; the transition parser rejects it.
+        let e = parse("stateDiagram-v2\ns ::x").unwrap_err();
+        assert_eq!(e.line, Some(2));
+    }
+
+    #[test]
+    fn trailing_comment_after_transition() {
+        // Doc-blessed spelling: `Moving --> Still %% another comment`.
+        let g = p("stateDiagram-v2\nMoving --> Still %% another comment");
+        assert_eq!(g.transitions.len(), 1);
+        assert_eq!(g.transitions[0].label, None);
+    }
+
+    #[test]
+    fn trailing_comment_runs_to_end_of_line_across_semicolons() {
+        let g = p("stateDiagram-v2\na --> b %% comment; not --> parsed");
+        assert_eq!(g.transitions.len(), 1);
+    }
+
+    #[test]
+    fn single_percent_in_label_survives() {
+        let g = p("stateDiagram-v2\na --> b: 50% done");
+        assert_eq!(g.transitions[0].label.as_deref(), Some("50% done"));
+    }
+
+    #[test]
+    fn note_on_synthetic_id_errors() {
+        // `__start_0`/`__end_0` are the synthesizer's reserved ids;
+        // targeting one used to mint a phantom normal node (filed on
+        // #32). A user state deliberately named `__x` also errors —
+        // acceptable per the spec.
+        let e = parse("stateDiagram-v2\n[*] --> A\nnote right of __start_0: boo").unwrap_err();
+        assert_eq!(e.line, Some(3));
+        assert!(e.message.contains("synthetic"), "got: {}", e.message);
+    }
+
+    // ── Final review fix wave ────────────────────────────────────────
+
+    #[test]
+    fn semicolon_inside_label_stays_in_the_label() {
+        // Final-review regression find: bare-id support turned the old
+        // loud error into a phantom node `Stop`. Mermaid keeps `;` in
+        // the label to end of line.
+        let g = p("stateDiagram-v2\na --> b: go; Stop");
+        assert_eq!(g.transitions.len(), 1);
+        assert_eq!(g.transitions[0].label.as_deref(), Some("go; Stop"));
+        assert_eq!(g.nodes.len(), 2, "no phantom node");
+    }
+
+    #[test]
+    fn semicolon_inside_description_stays_in_the_description() {
+        let g = p("stateDiagram-v2\ns : Hello; World");
+        assert_eq!(g.nodes[0].display, "Hello; World");
+        assert_eq!(g.nodes.len(), 1);
+    }
+
+    #[test]
+    fn semicolons_before_any_colon_still_split() {
+        let g = p("stateDiagram-v2\na --> b; c --> d");
+        assert_eq!(g.transitions.len(), 2);
+    }
+
+    #[test]
+    fn empty_colon_description_errors() {
+        let e = parse("stateDiagram-v2\ns :").unwrap_err();
+        assert_eq!(e.line, Some(2));
+        assert!(e.message.contains("empty"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn single_underscore_note_target_is_valid() {
+        // Only the double-underscore synthetic prefix is reserved.
+        let g = p("stateDiagram-v2\n_x --> y\nnote right of _x: fine");
+        assert_eq!(g.notes.len(), 1);
     }
 }

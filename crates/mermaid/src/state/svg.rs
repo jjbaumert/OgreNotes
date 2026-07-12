@@ -17,7 +17,7 @@ use crate::escape_xml;
 use crate::flowchart::{shapes, ShapeKind};
 use crate::layout::Layout;
 use crate::measure;
-use crate::state::{StateGraph, StateKind};
+use crate::state::{StateGraph, StateKind, StateNote};
 
 /// Emits the label text for a node as centered tspans, mirroring
 /// `flowchart::svg::emit`'s node-label block exactly (multi-line labels
@@ -43,12 +43,46 @@ fn emit_label(out: &mut String, label: &str, cx: f64, cy: f64) {
     out.push_str("</text>");
 }
 
+/// Geometry of one note's box — shared by the canvas-extent pre-pass
+/// and the emission loop so the two cannot drift.
+fn note_rect(l: &Layout, sizes: &[(f64, f64)], note: &StateNote) -> (f64, f64, f64, f64) {
+    let (cx, cy) = l.node_centers[note.state];
+    let (nw, _nh) = sizes[note.state];
+    let (tw, th) = measure::text_size(&note.text);
+    let (bw, bh) = (tw + 16.0, th + 12.0);
+    let x = if note.right {
+        cx + nw / 2.0 + 12.0
+    } else {
+        cx - nw / 2.0 - 12.0 - bw
+    };
+    (x, cy - bh / 2.0, bw, bh)
+}
+
 pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
-    let (w, h) = l.size;
+    let (lw, lh) = l.size;
+    // Notes are a post-layout overlay; union their rects into the
+    // canvas so none can land off-canvas. They may still OVERLAP other
+    // content (accepted v1 behavior) — but never be invisible.
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (0.0f64, 0.0f64, lw, lh);
+    for note in &g.notes {
+        let (x, y, bw, bh) = note_rect(l, sizes, note);
+        min_x = min_x.min(x - 4.0);
+        min_y = min_y.min(y - 4.0);
+        max_x = max_x.max(x + bw + 4.0);
+        max_y = max_y.max(y + bh + 4.0);
+    }
+    let (dx, dy) = (-min_x, -min_y); // ≥ 0 by construction (mins start at 0)
+    let (w, h) = (max_x - min_x, max_y - min_y);
     let mut out = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:14px">"#
     );
     out.push_str(r#"<defs><marker id="mmd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker></defs>"#);
+    // One wrapper re-homes everything when a note overflowed left/top;
+    // per-element coordinates stay untouched.
+    let wrapped = dx > 0.0 || dy > 0.0;
+    if wrapped {
+        out.push_str(&format!(r#"<g transform="translate({dx:.1},{dy:.1})">"#));
+    }
 
     // 3. composites (clusters), parents first (depth ascending) so
     // children paint on top — same idiom as flowchart::svg's subgraph
@@ -156,19 +190,9 @@ pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
 
     // 6. notes. Placed post-layout beside their state's laid-out center;
     // notes are not boxgraph nodes, so this is a best-effort overlay that
-    // can overlap other elements (edges, neighboring nodes/notes) —
-    // accepted for v1, per the brief.
+    // can overlap other elements (edges, neighboring nodes/notes).
     for note in &g.notes {
-        let (cx, cy) = l.node_centers[note.state];
-        let (nw, _nh) = sizes[note.state];
-        let (tw, th) = measure::text_size(&note.text);
-        let (bw, bh) = (tw + 16.0, th + 12.0);
-        let x = if note.right {
-            cx + nw / 2.0 + 12.0
-        } else {
-            cx - nw / 2.0 - 12.0 - bw
-        };
-        let y = cy - bh / 2.0;
+        let (x, y, bw, bh) = note_rect(l, sizes, note);
         out.push_str(&format!(
             r#"<rect x="{x:.1}" y="{y:.1}" width="{bw:.1}" height="{bh:.1}" fill="var(--mermaid-note-fill, #fff5ad)" stroke="currentColor" rx="2"/>"#
         ));
@@ -193,6 +217,9 @@ pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
         out.push_str("</text>");
     }
 
+    if wrapped {
+        out.push_str("</g>");
+    }
     out.push_str("</svg>");
     out
 }
@@ -248,5 +275,70 @@ mod tests {
     #[test]
     fn parse_error_propagates() {
         assert!(render_state("stateDiagram-v2\n}").is_err());
+    }
+
+    #[test]
+    fn left_note_is_inside_the_canvas() {
+        let svg = render_state(
+            "stateDiagram-v2\nState1 --> State2\nnote left of State2 : This is the note to the left.",
+        )
+        .unwrap();
+        let (w, _h) = view_size(&svg);
+        let dx = translate_dx(&svg);
+        assert!(dx > 0.0, "expected a translate wrapper: {svg}");
+        for (x, bw) in note_rects(&svg) {
+            let on_canvas_x = x + dx;
+            assert!(on_canvas_x >= -0.5, "note off-canvas left: {on_canvas_x} in {svg}");
+            assert!(on_canvas_x + bw <= w + 0.5, "note off-canvas right in {svg}");
+        }
+    }
+
+    #[test]
+    fn right_note_extends_the_canvas_without_a_wrapper() {
+        let svg = render_state("stateDiagram-v2\nA --> B\nnote right of A: a fairly long note text").unwrap();
+        let (w, _h) = view_size(&svg);
+        for (x, bw) in note_rects(&svg) {
+            assert!(x >= 0.0 && x + bw <= w + 0.5, "{svg}");
+        }
+        assert!(!svg.contains("<g transform=\"translate("), "no left/top overflow: {svg}");
+    }
+
+    #[test]
+    fn no_notes_means_no_wrapper_and_unchanged_size() {
+        let svg = render_state("stateDiagram-v2\nA --> B").unwrap();
+        assert!(!svg.contains("<g transform"), "{svg}");
+    }
+
+    // Test helpers (module-level in `mod tests`):
+    fn view_size(svg: &str) -> (f64, f64) {
+        let vb: Vec<f64> = svg.split("viewBox=\"").nth(1).unwrap()
+            .split('"').next().unwrap()
+            .split(' ').map(|v| v.parse().unwrap()).collect();
+        (vb[2], vb[3])
+    }
+
+    /// (x, width) of every note rect (identified by the note fill var).
+    fn note_rects(svg: &str) -> Vec<(f64, f64)> {
+        let mut out = Vec::new();
+        let mut rest = svg;
+        while let Some(fi) = rest.find("--mermaid-note-fill") {
+            let rect_start = rest[..fi].rfind("<rect").unwrap();
+            let rect = &rest[rect_start..fi];
+            let attr = |name: &str| -> f64 {
+                let j = rect.find(&format!("{name}=\"")).unwrap() + name.len() + 2;
+                rect[j..].split('"').next().unwrap().parse().unwrap()
+            };
+            out.push((attr("x"), attr("width")));
+            rest = &rest[fi + 1..];
+        }
+        out
+    }
+
+    /// dx of the single translate wrapper, or 0.0 when absent.
+    fn translate_dx(svg: &str) -> f64 {
+        svg.split("<g transform=\"translate(").nth(1)
+            .and_then(|s| s.split(',').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0)
     }
 }
