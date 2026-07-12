@@ -382,6 +382,16 @@ mod tests {
     }
 
     #[test]
+    fn header_with_same_line_statement_renders_via_public_render() {
+        // The sequence parser splits statements on `;` (seq-polish);
+        // detect_kind's first-token match must still route the header.
+        let out = render("sequenceDiagram; A->>B: hi");
+        assert_eq!(out.kind, DiagramKind::Sequence);
+        assert!(out.error.is_none(), "err: {:?}", out.error);
+        assert!(out.svg.is_some());
+    }
+
+    #[test]
     fn detection_requires_exact_keyword_match() {
         // Keywords must match whole-token: prefixes, suffixes, and case
         // variants are not diagram headers.

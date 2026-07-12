@@ -42,12 +42,27 @@ fn draw_box(out: &mut String, cx: f64, top_y: f64, box_w: f64, box_h: f64, label
         box_w,
         box_h
     ));
+    // Display may contain <br/> line breaks; measure::lines splits the
+    // same way the box width/head height were measured. Single-line
+    // output is position-identical to the old code (dy = +5 baseline).
+    let lines = measure::lines(label);
+    let n = lines.len();
     out.push_str(&format!(
-        r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
-        cx,
-        top_y + box_h / 2.0 + 5.0,
-        escape_xml(label)
+        r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">"#,
+        top_y + box_h / 2.0
     ));
+    for (idx, line) in lines.iter().enumerate() {
+        let dy = if idx == 0 {
+            -((n as f64 - 1.0) / 2.0) * measure::LINE_H + 5.0
+        } else {
+            measure::LINE_H
+        };
+        out.push_str(&format!(
+            r#"<tspan x="{cx:.1}" dy="{dy:.1}">{}</tspan>"#,
+            escape_xml(line)
+        ));
+    }
+    out.push_str("</text>");
 }
 
 /// An actor-header participant: stick figure (head circle + body/arms/legs
@@ -70,12 +85,19 @@ fn draw_actor(out: &mut String, cx: f64, top_y: f64, label: &str) {
         y32 = head_cy + 32.0,
         xrr = cx + 7.0,
     ));
+    let lines = measure::lines(label);
     out.push_str(&format!(
-        r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
-        cx,
-        head_cy + 32.0 + 14.0,
-        escape_xml(label)
+        r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">"#,
+        head_cy + 32.0 + 14.0
     ));
+    for (idx, line) in lines.iter().enumerate() {
+        let dy = if idx == 0 { 0.0 } else { measure::LINE_H };
+        out.push_str(&format!(
+            r#"<tspan x="{cx:.1}" dy="{dy:.1}">{}</tspan>"#,
+            escape_xml(line)
+        ));
+    }
+    out.push_str("</text>");
 }
 
 pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
@@ -160,7 +182,7 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
 
     // 6. messages: line/path + text + autonumber prefix.
     for m in &l.messages {
-        let Some(Event::Message { from, to, line, head, text, .. }) = d.events.get(m.event) else {
+        let Some(Event::Message { from, to, line, head, from_head, text, .. }) = d.events.get(m.event) else {
             continue;
         };
         let self_msg = from == to;
@@ -170,10 +192,14 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
             Some(id) => format!(r#" marker-end="url(#{id})""#),
             None => String::new(),
         };
+        let marker_start_attr = match marker_id(*from_head) {
+            Some(id) => format!(r#" marker-start="url(#{id})""#),
+            None => String::new(),
+        };
         let dash_attr = if *line == LineStyle::Dotted { r#" stroke-dasharray="4 3""# } else { "" };
         if self_msg {
             out.push_str(&format!(
-                r#"<path d="M {x0:.1} {y0:.1} H {x1:.1} V {y1:.1} H {x0:.1}" fill="none" stroke="currentColor"{dash_attr}{marker_attr}/>"#,
+                r#"<path d="M {x0:.1} {y0:.1} H {x1:.1} V {y1:.1} H {x0:.1}" fill="none" stroke="currentColor"{dash_attr}{marker_attr}{marker_start_attr}/>"#,
                 x0 = fx + ACT_W / 2.0,
                 y0 = m.y - SELF_EXTRA / 2.0,
                 x1 = fx + SELF_STUB,
@@ -181,7 +207,7 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
             ));
         } else {
             out.push_str(&format!(
-                r#"<line x1="{fx:.1}" y1="{y:.1}" x2="{tx:.1}" y2="{y:.1}" stroke="currentColor"{dash_attr}{marker_attr}/>"#,
+                r#"<line x1="{fx:.1}" y1="{y:.1}" x2="{tx:.1}" y2="{y:.1}" stroke="currentColor"{dash_attr}{marker_attr}{marker_start_attr}/>"#,
                 y = m.y,
             ));
         }
@@ -294,6 +320,13 @@ mod tests {
     }
 
     #[test]
+    fn bidirectional_message_has_markers_both_ends() {
+        let svg = render_sequence("sequenceDiagram\nA<<->>B: both").unwrap();
+        assert!(svg.contains(r##"marker-start="url(#mmd-arrow)""##), "{svg}");
+        assert!(svg.contains(r##"marker-end="url(#mmd-arrow)""##), "{svg}");
+    }
+
+    #[test]
     fn actor_renders_stick_figure() {
         let svg = render_sequence("sequenceDiagram\nactor U as User\nU->>S: go").unwrap();
         assert!(svg.contains("<circle")); // head
@@ -304,6 +337,43 @@ mod tests {
         let svg = render_sequence("sequenceDiagram\nA->>B: x\nNote over A,B: spanning note").unwrap();
         assert!(svg.contains("--mermaid-note-fill"));
         assert!(svg.contains("spanning note"));
+    }
+
+    #[test]
+    fn note_over_three_spans_outer_lifelines() {
+        let svg = render_sequence(
+            "sequenceDiagram\nA->>B: x\nB->>C: y\nNote over A,C: wide",
+        )
+        .unwrap();
+        // Lifelines are the dasharray-"3 3" <line> elements; the note
+        // rect (note-fill) must span at least from the first to the
+        // last lifeline x.
+        let cols: Vec<f64> = svg
+            .match_indices("<line ")
+            .filter_map(|(i, _)| {
+                let seg = &svg[i..i + svg[i..].find("/>").unwrap()];
+                if !seg.contains("stroke-dasharray=\"3 3\"") {
+                    return None;
+                }
+                let j = seg.find("x1=\"").unwrap() + 4;
+                seg[j..].split('"').next().unwrap().parse().ok()
+            })
+            .collect();
+        assert_eq!(cols.len(), 3, "{svg}");
+        let ri = svg.find("--mermaid-note-fill").unwrap();
+        let rect = &svg[svg[..ri].rfind("<rect").unwrap()..ri];
+        let attr = |name: &str| -> f64 {
+            let j = rect.find(&format!("{name}=\"")).unwrap() + name.len() + 2;
+            rect[j..].split('"').next().unwrap().parse().unwrap()
+        };
+        let (x, w) = (attr("x"), attr("width"));
+        let cmin = cols.iter().cloned().fold(f64::MAX, f64::min);
+        let cmax = cols.iter().cloned().fold(f64::MIN, f64::max);
+        assert!(
+            x <= cmin && x + w >= cmax,
+            "note {x}..{} vs cols {cmin}..{cmax}: {svg}",
+            x + w
+        );
     }
 
     #[test]
@@ -339,5 +409,19 @@ mod tests {
     #[test]
     fn parse_error_propagates() {
         assert!(render_sequence("sequenceDiagram\nend").is_err());
+    }
+
+    #[test]
+    fn participant_display_line_breaks_render_as_tspans() {
+        let svg = render_sequence(
+            "sequenceDiagram\nparticipant A as Alice<br/>Johnson\nactor B as Bob<br/>Builder\nA->>B: x",
+        )
+        .unwrap();
+        assert!(!svg.contains("&lt;br/&gt;"), "literal <br/> leaked: {svg}");
+        // Each display line appears in top AND bottom header passes,
+        // box form (Alice/Johnson) and actor form (Bob/Builder).
+        for frag in [">Alice<", ">Johnson<", ">Bob<", ">Builder<"] {
+            assert!(svg.matches(frag).count() >= 2, "{frag} missing: {svg}");
+        }
     }
 }

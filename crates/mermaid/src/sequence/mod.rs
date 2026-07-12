@@ -64,7 +64,11 @@ pub(crate) enum Event {
         from: usize,
         to: usize,
         line: LineStyle,
+        /// Head at the `to` end (`marker-end`).
         head: Head,
+        /// Head at the `from` end (`marker-start`) — `Head::None` except
+        /// for bidirectional arrows (`<<->>` / `<<-->>`).
+        from_head: Head,
         text: String,
         /// `->>+B`: activate the TARGET on arrival.
         activate_target: bool,

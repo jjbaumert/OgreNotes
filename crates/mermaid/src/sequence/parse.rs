@@ -1,7 +1,8 @@
-//! Sequence-diagram parser. Line-oriented; ids are ASCII word chars
-//! (char count == byte length — do not relax without a byte-position
-//! scan); arrows matched longest-first; caps enforced inline so work
-//! is bounded before layout.
+//! Sequence-diagram parser. Line-oriented; each line splits on `;` into
+//! statements (entity-code tokens like `#59;` excepted); ids are ASCII
+//! word chars (char count == byte length — do not relax without a
+//! byte-position scan); arrows matched longest-first; caps enforced
+//! inline so work is bounded before layout.
 
 use crate::sequence::{
     Event, FragmentKind, Head, LineStyle, NotePlacement, Participant, SeqDiagram,
@@ -33,15 +34,20 @@ pub(crate) fn parse(source: &str) -> Result<SeqDiagram, ParseError> {
         if line.is_empty() || line.starts_with("%%") {
             continue;
         }
-        if !seen_header {
-            let header = line.strip_suffix(';').unwrap_or(line).trim_end();
-            if header != "sequenceDiagram" {
-                return Err(p.err("sequence diagram must start with `sequenceDiagram`"));
+        for stmt in split_statements(line) {
+            let stmt = stmt.trim();
+            if stmt.is_empty() {
+                continue;
             }
-            seen_header = true;
-            continue;
+            if !seen_header {
+                if stmt != "sequenceDiagram" {
+                    return Err(p.err("sequence diagram must start with `sequenceDiagram`"));
+                }
+                seen_header = true;
+                continue;
+            }
+            p.parse_statement(stmt)?;
         }
-        p.parse_statement(line)?;
     }
     if !seen_header {
         return Err(ParseError {
@@ -56,6 +62,37 @@ pub(crate) fn parse(source: &str) -> Result<SeqDiagram, ParseError> {
         });
     }
     Ok(p.g)
+}
+
+/// Split a line into `;`-separated statements — mermaid treats `;` as a
+/// line terminator everywhere (its docs mandate `#59;` for a literal
+/// semicolon) — EXCEPT a `;` that closes an entity-code token: `#`
+/// followed directly by one or more ASCII alphanumerics (`#59;`,
+/// `#9829;`, `#infin;`), which stays inside its statement so entity
+/// codes keep rendering literally. `;`, `#`, and the probed
+/// alphanumerics are ASCII, and `char_indices` yields char-start byte
+/// offsets, so every slice below lands on a char boundary.
+fn split_statements(line: &str) -> Vec<&str> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, c) in line.char_indices() {
+        if c != ';' {
+            continue;
+        }
+        // Entity-code guard: walk back over [A-Za-z0-9]+ to a `#`.
+        let mut j = i;
+        while j > start && b[j - 1].is_ascii_alphanumeric() {
+            j -= 1;
+        }
+        if j > start && j < i && b[j - 1] == b'#' {
+            continue; // this `;` closes `#…;` — not a separator
+        }
+        out.push(&line[start..i]);
+        start = i + 1;
+    }
+    out.push(&line[start..]);
+    out
 }
 
 impl Parser {
@@ -137,7 +174,7 @@ impl Parser {
             "loop" | "alt" | "opt" | "par" | "critical" | "break" => {
                 return self.parse_fragment_open(stmt, first)
             }
-            "else" | "and" => return self.parse_divider(stmt, first),
+            "else" | "and" | "option" => return self.parse_divider(stmt, first),
             "end" if stmt == "end" => return self.parse_fragment_close(),
             "box" | "create" | "destroy" | "rect" | "links" | "link" | "properties" => {
                 return Err(self.err(format!("`{first}` statements are not supported")));
@@ -147,6 +184,19 @@ impl Parser {
         }
         if self.try_parse_message(stmt)? {
             return Ok(());
+        }
+        // Best-effort recognition of known-unsupported arrow families so
+        // the error names the construct. Runs only after every supported
+        // parse declined, so it can never shadow a valid statement; a
+        // false positive still yields a loud error, just better-labeled.
+        let compact: String = stmt.chars().filter(|c| !c.is_whitespace()).collect();
+        if compact.contains("()") && (compact.contains("->") || compact.contains("<<")) {
+            // `Alice()->>John` — source-side central connection (the
+            // target-side form errors inside try_parse_message).
+            return Err(self.err("central connections (`()`) are not supported"));
+        }
+        if ["-|", "|-", "-\\", "\\-", "-/", "/-"].iter().any(|t| compact.contains(t)) {
+            return Err(self.err("half arrows are not supported"));
         }
         Err(self.err(format!("unsupported statement: {first:?}")))
     }
@@ -203,9 +253,13 @@ impl Parser {
         self.push_event(Event::FragmentOpen { kind, label })
     }
 
-    /// `else` (valid inside `alt`) / `and` (valid inside `par`).
+    /// `else` (valid inside `alt`) / `and` (valid inside `par`) / `option` (valid inside `critical`).
     fn parse_divider(&mut self, stmt: &str, keyword: &str) -> Result<(), ParseError> {
-        let want = if keyword == "else" { FragmentKind::Alt } else { FragmentKind::Par };
+        let want = match keyword {
+            "else" => FragmentKind::Alt,
+            "and" => FragmentKind::Par,
+            _ => FragmentKind::Critical, // "option" — dispatch guarantees the set
+        };
         let top = self.frags.last().map(|(k, _)| *k);
         if top != Some(want) {
             return Err(self.err(format!(
@@ -270,21 +324,29 @@ impl Parser {
         }
 
         let placement = if placement_kw == "over" {
-            let mut parts = ids_part.split(',').map(str::trim);
-            let a = parts.next().unwrap_or("");
-            if a.is_empty() {
-                return Err(self.err("note needs at least one participant id"));
-            }
-            self.validate_id(a)?;
-            let a_idx = self.intern(a, None, false, false)?;
-            let b_idx = match parts.next() {
-                Some(b) if !b.is_empty() => {
-                    self.validate_id(b)?;
-                    Some(self.intern(b, None, false, false)?)
+            // Mermaid allows any number of comma-separated participants;
+            // the note spans the outermost lifelines. Intern every id
+            // (creating lifelines as needed) and store (min, max) by
+            // participant index — index order is column order.
+            let mut bounds: Option<(usize, usize)> = None;
+            for id in ids_part.split(',').map(str::trim) {
+                if id.is_empty() {
+                    return Err(self.err("note needs at least one participant id"));
                 }
-                _ => None,
-            };
-            NotePlacement::Over(a_idx, b_idx)
+                self.validate_id(id)?;
+                let idx = self.intern(id, None, false, false)?;
+                bounds = Some(match bounds {
+                    None => (idx, idx),
+                    Some((lo, hi)) => (lo.min(idx), hi.max(idx)),
+                });
+            }
+            // ids_part is non-empty (checked above), so bounds is Some.
+            let (lo, hi) = bounds.unwrap_or((0, 0));
+            if lo == hi {
+                NotePlacement::Over(lo, None)
+            } else {
+                NotePlacement::Over(lo, Some(hi))
+            }
         } else {
             self.validate_id(ids_part)?;
             let idx = self.intern(ids_part, None, false, false)?;
@@ -330,21 +392,23 @@ impl Parser {
         }
         let from_id = &stmt[..id_len];
         let rest = stmt[id_len..].trim_start();
-        // Arrows longest-first; each maps to (line, head).
-        const ARROWS: &[(&str, LineStyle, Head)] = &[
-            ("-->>", LineStyle::Dotted, Head::Arrow),
-            ("-->", LineStyle::Dotted, Head::None),
-            ("->>", LineStyle::Solid, Head::Arrow),
-            ("->", LineStyle::Solid, Head::None),
-            ("--x", LineStyle::Dotted, Head::Cross),
-            ("-x", LineStyle::Solid, Head::Cross),
-            ("--)", LineStyle::Dotted, Head::Async),
-            ("-)", LineStyle::Solid, Head::Async),
+        // Arrows longest-first; each maps to (line, from-head, to-head).
+        const ARROWS: &[(&str, LineStyle, Head, Head)] = &[
+            ("<<-->>", LineStyle::Dotted, Head::Arrow, Head::Arrow),
+            ("<<->>", LineStyle::Solid, Head::Arrow, Head::Arrow),
+            ("-->>", LineStyle::Dotted, Head::None, Head::Arrow),
+            ("-->", LineStyle::Dotted, Head::None, Head::None),
+            ("->>", LineStyle::Solid, Head::None, Head::Arrow),
+            ("->", LineStyle::Solid, Head::None, Head::None),
+            ("--x", LineStyle::Dotted, Head::None, Head::Cross),
+            ("-x", LineStyle::Solid, Head::None, Head::Cross),
+            ("--)", LineStyle::Dotted, Head::None, Head::Async),
+            ("-)", LineStyle::Solid, Head::None, Head::Async),
         ];
-        let Some((arrow, line_style, head)) = ARROWS
+        let Some((arrow, line_style, from_head, head)) = ARROWS
             .iter()
-            .find(|(a, _, _)| rest.starts_with(a))
-            .map(|(a, l, h)| (*a, *l, *h))
+            .find(|(a, _, _, _)| rest.starts_with(a))
+            .map(|(a, l, fh, h)| (*a, *l, *fh, *h))
         else {
             return Ok(false);
         };
@@ -353,10 +417,10 @@ impl Parser {
         let mut deactivate_source = false;
         if let Some(r) = after.strip_prefix('+') {
             activate_target = true;
-            after = r;
+            after = r.trim_start();
         } else if let Some(r) = after.strip_prefix('-') {
             deactivate_source = true;
-            after = r;
+            after = r.trim_start();
         }
         // Target id: same ASCII-only predicate, so char count == byte length.
         let to_len = after
@@ -364,6 +428,11 @@ impl Parser {
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .count();
         if to_len == 0 {
+            // `A->>()B` — the arrow parsed, the target starts with `(`:
+            // that's mermaid's central-connection syntax (v11.12.3).
+            if after.starts_with('(') {
+                return Err(self.err("central connections (`()`) are not supported"));
+            }
             return Err(self.err("expected a target participant after the arrow"));
         }
         let to_id = &after[..to_len];
@@ -394,6 +463,7 @@ impl Parser {
             to,
             line: line_style,
             head,
+            from_head,
             text,
             activate_target,
             deactivate_source,
@@ -463,6 +533,34 @@ mod tests {
             assert_eq!(line, *want_line, "for {src}");
             assert_eq!(head, *want_head, "for {src}");
             assert_eq!(text, "t", "for {src}");
+        }
+    }
+
+    #[test]
+    fn bidirectional_arrows() {
+        for (src, want_line) in [
+            ("A<<->>B: t", LineStyle::Solid),
+            ("A<<-->>B: t", LineStyle::Dotted),
+        ] {
+            let g = p(&format!("sequenceDiagram\n{src}"));
+            match &g.events[0] {
+                Event::Message { line, head, from_head, text, .. } => {
+                    assert_eq!(*line, want_line, "for {src}");
+                    assert_eq!(*head, Head::Arrow, "for {src}");
+                    assert_eq!(*from_head, Head::Arrow, "for {src}");
+                    assert_eq!(text, "t", "for {src}");
+                }
+                other => panic!("expected message, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn plain_arrows_have_no_source_head() {
+        let g = p("sequenceDiagram\nA->>B: t");
+        match &g.events[0] {
+            Event::Message { from_head, .. } => assert_eq!(*from_head, Head::None),
+            other => panic!("expected message, got {other:?}"),
         }
     }
 
@@ -557,6 +655,28 @@ mod tests {
     }
 
     #[test]
+    fn half_arrows_error_naming_the_construct() {
+        for src in ["A-|\\B: t", "A-|/B: t", "A/|-B: t", "A-\\\\B: t", "A--//B: t", "A\\-B: t", "A/-B: t"] {
+            let e = parse(&format!("sequenceDiagram\n{src}")).unwrap_err();
+            assert_eq!(e.line, Some(2), "for {src}");
+            assert!(e.message.contains("half arrow"), "for {src}, got: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn central_connections_error_naming_the_construct() {
+        for src in ["Alice->>()John: x", "Alice()->>John: x", "John()->>()Alice: x"] {
+            let e = parse(&format!("sequenceDiagram\n{src}")).unwrap_err();
+            assert_eq!(e.line, Some(2), "for {src}");
+            assert!(
+                e.message.contains("central connection"),
+                "for {src}, got: {}",
+                e.message
+            );
+        }
+    }
+
+    #[test]
     fn explicit_actor_after_implicit_use_upgrades() {
         // Bare `actor A` (no `as`) after an implicit message reference
         // must still upgrade is_actor.
@@ -640,6 +760,29 @@ mod tests {
     }
 
     #[test]
+    fn note_over_three_or_more_spans_outermost() {
+        use crate::sequence::NotePlacement;
+        // Every listed participant is interned; the stored pair is
+        // (min, max) by index. (Was: third participant silently
+        // dropped — filed on #32, fixed here.)
+        let g = p("sequenceDiagram\nA->>B: x\nB->>C: y\nNote over C,A,B: all");
+        assert_eq!(g.participants.len(), 3);
+        assert!(matches!(&g.events[2],
+            Event::Note { placement: NotePlacement::Over(0, Some(2)), .. }));
+        // Note-first form creates all three lifelines.
+        let g = p("sequenceDiagram\nNote over X,Y,Z: trio");
+        assert_eq!(g.participants.len(), 3);
+    }
+
+    #[test]
+    fn note_over_trailing_comma_errors() {
+        // Previously a trailing comma was silently ignored; empty ids
+        // now error like every other id-position empty.
+        let e = parse("sequenceDiagram\nNote over A,: t").unwrap_err();
+        assert_eq!(e.line, Some(2));
+    }
+
+    #[test]
     fn activate_multi_word_id_errors() {
         let e = parse("sequenceDiagram\nactivate A B").unwrap_err();
         assert_eq!(e.line, Some(2));
@@ -671,6 +814,21 @@ mod tests {
     fn else_outside_alt_errors() {
         let e = parse("sequenceDiagram\nloop l\nelse x\nend").unwrap_err();
         assert_eq!(e.line, Some(3));
+    }
+
+    #[test]
+    fn critical_uses_option_divider() {
+        let g = p("sequenceDiagram\ncritical connect\nA-->B: c\noption Network timeout\nA-->A: log\noption Credentials rejected\nA-->A: log2\nend");
+        assert!(matches!(&g.events[2], Event::FragmentDivider { label } if label == "Network timeout"));
+        assert!(matches!(&g.events[4], Event::FragmentDivider { label } if label == "Credentials rejected"));
+    }
+
+    #[test]
+    fn option_outside_critical_errors() {
+        let e = parse("sequenceDiagram\nalt c\noption x\nend").unwrap_err();
+        assert_eq!(e.line, Some(3));
+        assert!(e.message.contains("option"), "got: {}", e.message);
+        assert!(e.message.contains("critical"), "got: {}", e.message);
     }
 
     #[test]
@@ -706,6 +864,83 @@ mod tests {
             assert_eq!(e.line, Some(3), "for {stmt}");
             let kw = stmt.split_whitespace().next().unwrap();
             assert!(e.message.contains(kw), "message names {kw}: {}", e.message);
+        }
+    }
+
+    // ── Polish slice (issue #45): semicolon statement separation ────
+    // (docs/superpowers/specs/2026-07-11-mermaid-sequence-polish-design.md)
+
+    #[test]
+    fn semicolon_splits_statements_like_newlines() {
+        // THE silent-misparse regression (issue #45): this used to parse
+        // as ONE message with `; B-->>A: yo` inside its text.
+        let g = p("sequenceDiagram\nA->>B: hi; B-->>A: yo");
+        assert_eq!(g.events.len(), 2);
+        assert_eq!(msg(&g.events[0]).4, "hi");
+        let (from, to, _, _, text) = msg(&g.events[1]);
+        assert_eq!(text, "yo");
+        assert_eq!((from, to), (1, 0)); // B -> A
+    }
+
+    #[test]
+    fn entity_code_semicolons_do_not_split() {
+        // `#59;` / `#9829;` / `#infin;` are entity-code tokens: their
+        // closing `;` is not a separator (they still render literally —
+        // the accepted entity-code divergence is unchanged).
+        for text in ["hi#59;there", "I #9829; you", "x #infin; y"] {
+            let g = p(&format!("sequenceDiagram\nA->>B: {text}"));
+            assert_eq!(g.events.len(), 1, "for {text}");
+            assert_eq!(msg(&g.events[0]).4, text, "for {text}");
+        }
+    }
+
+    #[test]
+    fn non_entity_hash_semicolons_still_split() {
+        // A `;` only gets the guard when alphanumerics directly connect
+        // it back to a `#`.
+        for (src, first_text) in [
+            ("A->>B: x #5 9; C->>D: y", "x #5 9"),
+            ("A->>B: x#; C->>D: y", "x#"),
+        ] {
+            let g = p(&format!("sequenceDiagram\n{src}"));
+            assert_eq!(g.events.len(), 2, "for {src}");
+            assert_eq!(msg(&g.events[0]).4, first_text, "for {src}");
+        }
+    }
+
+    #[test]
+    fn semicolon_fragments_report_their_line() {
+        let e = parse("sequenceDiagram\nA->>B: ok\nA->>B: x; wibble wobble").unwrap_err();
+        assert_eq!(e.line, Some(3));
+    }
+
+    #[test]
+    fn header_with_same_line_statement_after_semicolon() {
+        let g = p("sequenceDiagram; A->>B: hi");
+        assert_eq!(g.events.len(), 1);
+        assert_eq!(g.participants.len(), 2);
+    }
+
+    #[test]
+    fn note_text_semicolon_terminates_the_note() {
+        // mermaid: `;` ends the note statement too (docs mandate #59;);
+        // the tail is then an invalid statement -> loud error.
+        let e = parse("sequenceDiagram\nNote over A: watch; this").unwrap_err();
+        assert_eq!(e.line, Some(2));
+    }
+
+    #[test]
+    fn spaced_activation_shorthand() {
+        // The docs' Background-Highlighting example spells it with
+        // spaces: `Alice ->>+ John: ...` / `John -->>- Alice: ...`.
+        let g = p("sequenceDiagram\nAlice ->>+ John: hi\nJohn -->>- Alice: yo");
+        match &g.events[0] {
+            Event::Message { activate_target, .. } => assert!(*activate_target),
+            other => panic!("expected message, got {other:?}"),
+        }
+        match &g.events[1] {
+            Event::Message { deactivate_source, .. } => assert!(*deactivate_source),
+            other => panic!("expected message, got {other:?}"),
         }
     }
 }
