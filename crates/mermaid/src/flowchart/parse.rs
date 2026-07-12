@@ -666,12 +666,12 @@ impl Parser {
         }
         for tok in targets.split(',') {
             let tok = tok.trim();
-            let n: usize = tok
-                .parse()
-                .map_err(|_| self.err(format!("linkStyle expects an edge index, found {tok:?}")))?;
-            let Some(edge) = self.g.edges.get_mut(n) else {
-                return Err(self.err(format!("linkStyle refers to unknown edge index {n}")));
-            };
+            // Lenient, matching class/state/ER: a non-numeric or out-of-range
+            // index is a no-op, not a hard error — a cosmetic styling typo
+            // shouldn't fail the whole diagram (same fail-soft stance as the
+            // `sanitize_style` allowlist, which drops unknown props silently).
+            let Ok(n) = tok.parse::<usize>() else { continue };
+            let Some(edge) = self.g.edges.get_mut(n) else { continue };
             // Only set a non-empty style: a `Some("")` would suppress the
             // `linkStyle default` fallback for this edge at render time
             // (`edge.style.or(default)`). Mirrors `parse_style`.
@@ -1032,9 +1032,10 @@ mod tests {
         let g = p("graph TD\nA-->B\nA-->C\nlinkStyle 0,1 stroke-width:2px");
         assert_eq!(g.edges[0].style.as_deref(), Some("stroke-width:2px"));
         assert_eq!(g.edges[1].style.as_deref(), Some("stroke-width:2px"));
-        // Out-of-range index errors.
-        let e = parse("graph TD\nA-->B\nlinkStyle 5 stroke:red").unwrap_err();
-        assert!(e.message.contains("unknown edge index"), "got: {}", e.message);
+        // Out-of-range / non-numeric index is a lenient no-op (matches
+        // class/state/ER), not a hard error — the diagram still renders.
+        let g = p("graph TD\nA-->B\nlinkStyle 5 stroke:red\nlinkStyle zz stroke:red");
+        assert!(g.edges[0].style.is_none());
         // An all-dropped (empty after sanitize) linkStyle must NOT suppress
         // the `default` fallback for that edge.
         let g = p("graph TD\nA-->B\nlinkStyle 0 badprop:x\nlinkStyle default stroke:blue");
