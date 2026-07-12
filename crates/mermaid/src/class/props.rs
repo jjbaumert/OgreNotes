@@ -29,7 +29,16 @@ fn arb_source() -> impl Strategy<Value = String> {
         Just("A ..> B".to_string()),
         Just("A <.. B".to_string()),
         Just("Customer \"1\" --> \"0..*\" Order : places".to_string()),
-        "[a-zA-Z0-9_\\-: <>*.\"]{0,24}",
+        // New-syntax coverage: dashed link, no-space operators, labels,
+        // CSS-shorthand + classDef reject paths.
+        Just("A .. B".to_string()),
+        Just("A-->B".to_string()),
+        Just("Customer\"1\"-->\"0..*\"Order".to_string()),
+        Just("class A[\"Nice Label\"]".to_string()),
+        Just("class A[\"Label\"] {".to_string()),
+        Just("A:::styleName".to_string()),
+        Just("classDef default fill:#f9f".to_string()),
+        "[a-zA-Z0-9_\\-:: <>*.\"\\[\\]]{0,24}",
     ];
     proptest::collection::vec(stmt, 0..40)
         .prop_map(|v| format!("classDiagram\n{}", v.join("\n")))

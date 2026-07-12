@@ -109,7 +109,7 @@ pub(crate) fn emit(g: &ErGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
             r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" font-weight="600" fill="currentColor">{}</text>"#,
             cx,
             y - 6.0,
-            escape_xml(&e.id)
+            escape_xml(e.display.as_deref().unwrap_or(&e.id))
         ));
         out.push_str(&format!(
             r#"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="currentColor"/>"#,
@@ -133,6 +133,12 @@ pub(crate) fn emit(g: &ErGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
             .map(|a| measure::text_size(&a.name).0)
             .fold(0.0_f64, f64::max)
             + 12.0;
+        let key_col_w = e
+            .attributes
+            .iter()
+            .map(|a| measure::text_size(&a.keys.join(", ")).0)
+            .fold(0.0_f64, f64::max)
+            + 12.0;
 
         for a in &e.attributes {
             y += row_h;
@@ -149,12 +155,21 @@ pub(crate) fn emit(g: &ErGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
                 text_y,
                 escape_xml(&a.name)
             ));
-            if let Some(key) = &a.key {
+            let key_str = a.keys.join(", ");
+            if !key_str.is_empty() {
                 out.push_str(&format!(
                     r#"<text x="{:.1}" y="{:.1}" fill="currentColor">{}</text>"#,
                     box_left + 8.0 + type_col_w + name_col_w,
                     text_y,
-                    escape_xml(key)
+                    escape_xml(&key_str)
+                ));
+            }
+            if let Some(comment) = &a.comment {
+                out.push_str(&format!(
+                    r#"<text x="{:.1}" y="{:.1}" fill="currentColor">{}</text>"#,
+                    box_left + 8.0 + type_col_w + name_col_w + key_col_w,
+                    text_y,
+                    escape_xml(comment)
                 ));
             }
         }
@@ -204,6 +219,29 @@ mod tests {
 
     #[test]
     fn parse_error_propagates() {
-        assert!(render_er("erDiagram\nA {\nint code UK\n}").is_err());
+        assert!(render_er("erDiagram\nA {\nint code XX\n}").is_err());
+    }
+
+    #[test]
+    fn canonical_mermaid_docs_example_renders() {
+        // Mermaid's own documentation example, end to end: hyphenated
+        // entity names, an alias, combined + UK keys, a quoted comment,
+        // and a word-form cardinality relationship all in one diagram.
+        let src = "erDiagram\n\
+                   CUSTOMER[\"Customer Account\"]\n\
+                   CUSTOMER ||--o{ ORDER : places\n\
+                   CUSTOMER only one to zero or more DELIVERY-ADDRESS : has\n\
+                   ORDER ||--|{ LINE-ITEM : contains\n\
+                   ORDER {\n\
+                   int orderNumber PK, UK\n\
+                   string status \"pending|shipped\"\n\
+                   }";
+        let svg = render_er(src).expect("canonical example renders");
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains("Customer Account")); // alias shown as title
+        assert!(svg.contains("LINE-ITEM"));
+        assert!(svg.contains("DELIVERY-ADDRESS"));
+        assert!(svg.contains("PK, UK")); // combined keys joined
+        assert!(svg.contains("pending|shipped")); // comment column
     }
 }

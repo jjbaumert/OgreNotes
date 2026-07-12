@@ -100,7 +100,7 @@ pub fn detect_kind(source: &str) -> DiagramKind {
         "graph" | "flowchart" => DiagramKind::Flowchart,
         "sequenceDiagram" => DiagramKind::Sequence,
         "stateDiagram" | "stateDiagram-v2" => DiagramKind::State,
-        "classDiagram" => DiagramKind::Class,
+        "classDiagram" | "classDiagram-v2" => DiagramKind::Class,
         "erDiagram" => DiagramKind::Er,
         _ => DiagramKind::Unknown,
     }
@@ -221,6 +221,7 @@ mod tests {
         assert_eq!(detect_kind("sequenceDiagram"), DiagramKind::Sequence);
         assert_eq!(detect_kind("stateDiagram-v2"), DiagramKind::State);
         assert_eq!(detect_kind("classDiagram"), DiagramKind::Class);
+        assert_eq!(detect_kind("classDiagram-v2"), DiagramKind::Class);
         assert_eq!(detect_kind("erDiagram"), DiagramKind::Er);
         assert_eq!(detect_kind("nonsense here"), DiagramKind::Unknown);
     }

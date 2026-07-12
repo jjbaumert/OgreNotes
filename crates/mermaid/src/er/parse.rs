@@ -1,23 +1,92 @@
 //! ER-diagram parser. Line-oriented, mirrors `class::parse` and
-//! `state::parse`: `err()` helper, ASCII id scan with byte-safety
-//! comment, `split_once(':')` for labels, exact-match guards for
-//! keyword/brace statements, an attribute-block state shaped like
-//! class's single-slot member block (nesting one level, opening line
-//! tracked, bare `}` closes).
+//! `state::parse`: `err()` helper, comment/blank skipping, an
+//! attribute-block state shaped like class's single-slot member block
+//! (nesting one level, opening line tracked, bare `}` closes).
 //!
-//! Relationship-token strategy: the `:` label split happens FIRST on
-//! the original statement (same reasoning as class's operator scan) so
-//! label text can never be mistaken for grammar. The pre-colon portion
-//! must then be exactly three whitespace-separated tokens: `id token
-//! id`. The middle token is the relationship token; per the brief it is
-//! validated `is_ascii()` UP FRONT (before any slicing) and errors
-//! naming the token otherwise, then sliced as `2 + 2 + 2` bytes (left
-//! cardinality symbol, `--`/`..`, right cardinality symbol) — safe
-//! because ASCII guarantees every byte offset is a char boundary.
+//! Entity names may be bare (`[A-Za-z0-9_-]+`, so Mermaid's canonical
+//! hyphenated names like `LINE-ITEM` / `DELIVERY-ADDRESS` parse) or
+//! `"double quoted"` (any characters, including spaces). A quoted name
+//! keeps its inner text verbatim as the canonical id. Entities may carry
+//! a display alias: `CUSTOMER["Customer Account"] { ... }`.
+//!
+//! Relationship strategy: the `:` label split happens FIRST (on the
+//! first colon that is OUTSIDE any quoted span) so label text can never
+//! be mistaken for grammar. The pre-colon portion is tokenized
+//! quote-aware into `name … cardinality … name`; the FIRST and LAST
+//! tokens are the entity endpoints and everything between is the
+//! cardinality spec. That spec is either the compact symbol form
+//! (`||--o{`, a single ASCII 6-byte token sliced `2+2+2`) or the
+//! word-alias form (`only one to zero or more`, `}o..o{` written out),
+//! whose line word (`to` / `optionally to`) selects identifying vs not.
 
 use crate::er::{Cardinality, Entity, ErAttribute, ErGraph, ErRelation};
 use crate::ParseError;
 use std::collections::HashMap;
+
+/// One whitespace-or-quote-delimited token, remembering whether it came
+/// from a `"quoted"` span (quoted names bypass the bare-id charset check
+/// and may hold spaces / non-ASCII).
+struct Tok {
+    text: String,
+    quoted: bool,
+}
+
+/// Splits on whitespace but keeps `"double quoted"` spans intact (quotes
+/// stripped, inner spaces preserved). `Err(())` on an unterminated quote.
+fn split_ws_quoted(s: &str) -> Result<Vec<Tok>, ()> {
+    let mut toks = Vec::new();
+    let mut cur = String::new();
+    let mut in_bare = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            if in_bare {
+                toks.push(Tok { text: std::mem::take(&mut cur), quoted: false });
+                in_bare = false;
+            }
+            let mut q = String::new();
+            let mut closed = false;
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    closed = true;
+                    break;
+                }
+                q.push(c2);
+            }
+            if !closed {
+                return Err(());
+            }
+            toks.push(Tok { text: q, quoted: true });
+        } else if c.is_whitespace() {
+            if in_bare {
+                toks.push(Tok { text: std::mem::take(&mut cur), quoted: false });
+                in_bare = false;
+            }
+        } else {
+            cur.push(c);
+            in_bare = true;
+        }
+    }
+    if in_bare {
+        toks.push(Tok { text: cur, quoted: false });
+    }
+    Ok(toks)
+}
+
+/// Finds the first `:` that is NOT inside a `"quoted"` span and splits
+/// there into `(before, Some(after))`; returns `(s, None)` if none. `"`
+/// and `:` are ASCII, so the byte indices are always char boundaries.
+fn split_label_colon(s: &str) -> (&str, Option<&str>) {
+    let mut in_q = false;
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' => in_q = !in_q,
+            ':' if !in_q => return (&s[..i], Some(&s[i + 1..])),
+            _ => {}
+        }
+    }
+    (s, None)
+}
 
 /// Maps a 2-char cardinality symbol to its `Cardinality`, independent of
 /// which side (left/right) it appears on — the brief's normalization
@@ -32,9 +101,20 @@ fn symbol_cardinality(sym: &str) -> Option<Cardinality> {
     }
 }
 
-/// Parses one relationship token (e.g. `||--o{`) into
-/// `(card_from, identifying, card_to)`. `None` means invalid; the
-/// caller attaches the token text and source line to the error.
+/// Maps a spelled-out cardinality alias (Mermaid's word forms) to its
+/// `Cardinality`. Case-sensitive, matching Mermaid.
+fn alias_cardinality(phrase: &str) -> Option<Cardinality> {
+    match phrase {
+        "only one" | "1" | "one and only one" => Some(Cardinality::ExactlyOne),
+        "zero or one" | "one or zero" => Some(Cardinality::ZeroOrOne),
+        "one or more" | "one or many" | "many(1)" | "1+" => Some(Cardinality::OneOrMore),
+        "zero or more" | "zero or many" | "many(0)" | "0+" => Some(Cardinality::ZeroOrMore),
+        _ => None,
+    }
+}
+
+/// Parses the compact symbol token (e.g. `||--o{`) into
+/// `(card_from, identifying, card_to)`. `None` means invalid.
 fn parse_relationship_token(tok: &str) -> Option<(Cardinality, bool, Cardinality)> {
     // Validate ASCII up front: guarantees every byte index below is a
     // char boundary, so the slices that follow can never panic or split
@@ -113,63 +193,153 @@ impl Parser {
         ParseError { message: msg.into(), line: Some(self.line) }
     }
 
-    /// Top-level (non-block) statement: `ENTITY {` opens an attribute
-    /// block, `ENTITY [...]` (alias) and `ENTITY` bare are handled
-    /// here, everything else is a relationship.
-    fn parse_statement(&mut self, stmt: &str) -> Result<(), ParseError> {
-        // ASCII id scan: char count == byte length only because the
-        // predicate is ASCII-only; do not relax without a byte-position
-        // scan.
-        let id_len = stmt.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
-        if id_len == 0 {
-            return Err(self.err(format!("expected an entity id, found {stmt:?}")));
-        }
-        let id = &stmt[..id_len];
-        let after = stmt[id_len..].trim_start();
-        if let Some(rest) = after.strip_prefix('{') {
-            let rest = rest.trim();
-            if !rest.is_empty() {
-                return Err(self.err(format!("unexpected text after `{{`: {rest:?}")));
+    /// Peels a leading entity name — `"quoted"` (any inner text) or bare
+    /// (`[A-Za-z0-9_-]+`) — off the front, returning
+    /// `(canonical_name, was_quoted, trimmed_remainder)`. The bare scan
+    /// is ASCII-only, so `char count == byte length` and `s[..len]` is a
+    /// valid slice; the quoted scan cuts on the ASCII `"` bytes.
+    fn take_entity_name<'a>(&self, s: &'a str) -> Result<(String, bool, &'a str), ParseError> {
+        if let Some(rest) = s.strip_prefix('"') {
+            match rest.find('"') {
+                Some(end) => Ok((rest[..end].to_string(), true, rest[end + 1..].trim_start())),
+                None => Err(self.err("unterminated quoted entity name")),
             }
-            let idx = self.ensure_entity(id)?;
-            self.block = Some((idx, self.line));
-            return Ok(());
+        } else {
+            let len = s
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .count();
+            if len == 0 {
+                return Err(self.err(format!("expected an entity id, found {s:?}")));
+            }
+            Ok((s[..len].to_string(), false, s[len..].trim_start()))
         }
+    }
+
+    /// Parses `[alias]` (optionally `["quoted alias"]`) starting at the
+    /// leading `[`, returning `(alias_text, trimmed_remainder)`. `[` and
+    /// `]` are ASCII, so the byte slices are char-boundary-safe.
+    fn parse_alias<'a>(&self, s: &'a str) -> Result<(String, &'a str), ParseError> {
+        let inner = &s[1..];
+        match inner.find(']') {
+            Some(end) => {
+                let raw = inner[..end].trim();
+                let alias = raw
+                    .strip_prefix('"')
+                    .and_then(|x| x.strip_suffix('"'))
+                    .unwrap_or(raw);
+                if alias.is_empty() {
+                    return Err(self.err("empty entity alias `[]`"));
+                }
+                Ok((alias.to_string(), inner[end + 1..].trim_start()))
+            }
+            None => Err(self.err("unterminated entity alias `[...]`")),
+        }
+    }
+
+    /// Top-level (non-block) statement: `ENTITY {` / `ENTITY [alias] {`
+    /// opens an attribute block, `ENTITY` / `ENTITY [alias]` bare declare
+    /// an entity, everything else is a relationship.
+    fn parse_statement(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let (name, quoted, after) = self.take_entity_name(stmt)?;
+        if !quoted {
+            self.validate_id(&name)?;
+        } else if name.is_empty() {
+            return Err(self.err("empty quoted entity name"));
+        }
+
         if after.starts_with('[') {
-            return Err(self.err("entity aliases (`ENTITY [\"alias\"]`) are not supported"));
+            let (alias, tail) = self.parse_alias(after)?;
+            let idx = self.ensure_entity(&name)?;
+            self.g.entities[idx].display = Some(alias);
+            return self.open_block_or_end(idx, tail);
+        }
+        if after.starts_with('{') {
+            let idx = self.ensure_entity(&name)?;
+            return self.open_block_or_end(idx, after);
         }
         if after.is_empty() {
-            self.ensure_entity(id)?;
+            self.ensure_entity(&name)?;
             return Ok(());
         }
         self.parse_relationship(stmt)
     }
 
-    /// `A <lcard><line><rcard> B : label` — the pre-colon portion must
-    /// be exactly three whitespace-separated tokens; the label after
-    /// `:` is required by the grammar.
+    /// After an entity name (+ optional alias), the remainder is either
+    /// empty (bare declaration) or `{` opening an attribute block; any
+    /// other trailing text is an error.
+    fn open_block_or_end(&mut self, idx: usize, tail: &str) -> Result<(), ParseError> {
+        let tail = tail.trim();
+        if tail.is_empty() {
+            return Ok(());
+        }
+        if let Some(rest) = tail.strip_prefix('{') {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                return Err(self.err(format!("unexpected text after `{{`: {rest:?}")));
+            }
+            self.block = Some((idx, self.line));
+            return Ok(());
+        }
+        Err(self.err(format!("unexpected text after entity: {tail:?}")))
+    }
+
+    /// `A <cardinality-spec> B : label` — first/last pre-colon tokens are
+    /// the endpoints, the middle is the cardinality spec, and the label
+    /// after `:` is required by the grammar.
     fn parse_relationship(&mut self, stmt: &str) -> Result<(), ParseError> {
-        let (before, after) = match stmt.split_once(':') {
-            Some((b, a)) => (b, Some(a)),
-            None => (stmt, None),
-        };
-        let tokens: Vec<&str> = before.split_whitespace().collect();
-        if tokens.len() != 3 {
+        let (before, after) = split_label_colon(stmt);
+        let toks = split_ws_quoted(before)
+            .map_err(|()| self.err("unterminated quoted entity name"))?;
+        if toks.len() < 3 {
             return Err(self.err(format!("expected `A <cardinality> B`, found {before:?}")));
         }
-        let (left_id, card_tok, right_id) = (tokens[0], tokens[1], tokens[2]);
-        self.validate_id(left_id)?;
-        self.validate_id(right_id)?;
-        let Some((card_from, identifying, card_to)) = parse_relationship_token(card_tok) else {
-            return Err(self.err(format!("invalid relationship token {card_tok:?}")));
-        };
+        let left = &toks[0];
+        let right = &toks[toks.len() - 1];
+        let middle: Vec<&Tok> = toks[1..toks.len() - 1].iter().collect();
+        let (card_from, identifying, card_to) = self.parse_cardinality_spec(&middle)?;
         let label = match after.map(str::trim) {
             Some(l) if !l.is_empty() => l.to_string(),
             _ => return Err(self.err("relationship needs a `: label`")),
         };
-        let from = self.ensure_entity(left_id)?;
-        let to = self.ensure_entity(right_id)?;
+        self.validate_entity_token(left)?;
+        self.validate_entity_token(right)?;
+        let from = self.ensure_entity(&left.text)?;
+        let to = self.ensure_entity(&right.text)?;
         self.push_relation(ErRelation { from, to, card_from, card_to, identifying, label })
+    }
+
+    /// The tokens between the two endpoints: either one compact symbol
+    /// token (`||--o{`) or a word-alias phrase (`only one to zero or
+    /// more`). The line word `to` / `optionally to` picks identifying vs
+    /// non-identifying and splits the left/right alias phrases.
+    fn parse_cardinality_spec(
+        &self,
+        middle: &[&Tok],
+    ) -> Result<(Cardinality, bool, Cardinality), ParseError> {
+        if let [only] = middle {
+            if !only.quoted {
+                if let Some(t) = parse_relationship_token(&only.text) {
+                    return Ok(t);
+                }
+            }
+        }
+        if middle.is_empty() || middle.iter().any(|t| t.quoted) {
+            return Err(self.err("invalid relationship cardinality"));
+        }
+        let phrase = middle.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+        let (identifying, lp, rp) = if let Some((l, r)) = phrase.split_once(" optionally to ") {
+            (false, l, r)
+        } else if let Some((l, r)) = phrase.split_once(" to ") {
+            (true, l, r)
+        } else {
+            return Err(self.err(format!("invalid relationship cardinality {phrase:?}")));
+        };
+        let card_from = alias_cardinality(lp.trim())
+            .ok_or_else(|| self.err(format!("unknown cardinality {:?}", lp.trim())))?;
+        let card_to = alias_cardinality(rp.trim())
+            .ok_or_else(|| self.err(format!("unknown cardinality {:?}", rp.trim())))?;
+        Ok((card_from, identifying, card_to))
     }
 
     /// One line inside an open attribute block: bare `}` closes it;
@@ -185,54 +355,89 @@ impl Parser {
         Ok(())
     }
 
-    /// `type name [PK|FK]` — 2 or 3 whitespace-separated tokens.
-    /// `type`/`name` are stored VERBATIM (free text, not id-validated —
-    /// the svg renderer escapes them; only entity ids get the
-    /// `[A-Za-z0-9_]+` check). A 3rd token other than `PK`/`FK` errors
-    /// naming it (`UK` gets its own message naming `UK`); a trailing
-    /// quoted comment errors mentioning "comment"; more than 3 tokens
-    /// errors.
+    /// `type name [keys] ["comment"]` — `type`/`name` are stored VERBATIM
+    /// (free text; the svg renderer escapes them). `keys` is any
+    /// comma-or-space-separated combination of `PK` / `FK` / `UK`; a
+    /// trailing `"..."` is the comment (verbatim, may contain spaces).
     fn parse_attribute_row(&self, line: &str) -> Result<ErAttribute, ParseError> {
-        let mut tokens = line.split_whitespace();
+        // Peel a trailing quoted comment first: the first `"` opens it and
+        // it must run to a closing `"` with nothing after. `"` is ASCII,
+        // so `line[..q]` splits on a char boundary.
+        let (main, comment) = match line.find('"') {
+            Some(q) => {
+                let inner = &line[q + 1..];
+                match inner.find('"') {
+                    Some(e) => {
+                        let after = inner[e + 1..].trim();
+                        if !after.is_empty() {
+                            return Err(
+                                self.err(format!("unexpected text after attribute comment: {after:?}"))
+                            );
+                        }
+                        (line[..q].trim_end(), Some(inner[..e].to_string()))
+                    }
+                    None => return Err(self.err("unterminated attribute comment")),
+                }
+            }
+            None => (line, None),
+        };
+
+        let mut tokens = main.split_whitespace();
         let (Some(ty), Some(name)) = (tokens.next(), tokens.next()) else {
             return Err(self.err(format!("expected `type name` attribute row, found {line:?}")));
         };
-        let rest: Vec<&str> = tokens.collect();
-        let key = match rest.as_slice() {
-            [] => None,
-            [tok] => match *tok {
-                "PK" | "FK" => Some((*tok).to_string()),
-                "UK" => return Err(self.err("`UK` (unique key marker) is not supported")),
-                other if other.starts_with('"') => {
-                    return Err(self.err("attribute comments are not supported"));
-                }
-                other => return Err(self.err(format!("unsupported attribute key marker {other:?}"))),
-            },
-            [first, ..] if first.starts_with('"') => {
-                return Err(self.err("attribute comments are not supported"));
+
+        let key_str = tokens.collect::<Vec<_>>().join(" ");
+        let mut keys = Vec::new();
+        for k in key_str.split(|c: char| c == ',' || c.is_whitespace()) {
+            let k = k.trim();
+            if k.is_empty() {
+                continue;
             }
-            _ => return Err(self.err(format!("too many tokens in attribute row: {line:?}"))),
-        };
-        Ok(ErAttribute { ty: ty.to_string(), name: name.to_string(), key })
+            match k {
+                "PK" | "FK" | "UK" => keys.push(k.to_string()),
+                other => {
+                    return Err(self.err(format!(
+                        "unsupported attribute key marker {other:?} (expected PK, FK, or UK)"
+                    )))
+                }
+            }
+        }
+        Ok(ErAttribute { ty: ty.to_string(), name: name.to_string(), keys, comment })
     }
 
     fn validate_id(&self, id: &str) -> Result<(), ParseError> {
-        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        if id.is_empty()
+            || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
             return Err(self.err(format!("invalid entity id {id:?}")));
         }
         Ok(())
     }
 
-    /// Look up an existing entity by id, or create it (implicit
-    /// creation on first reference, whether from a block-open or a
-    /// relationship endpoint).
+    /// A relationship endpoint: quoted tokens are free text (any non-empty
+    /// content); bare tokens must satisfy the bare-id charset.
+    fn validate_entity_token(&self, t: &Tok) -> Result<(), ParseError> {
+        if t.quoted {
+            if t.text.is_empty() {
+                return Err(self.err("empty quoted entity name"));
+            }
+            Ok(())
+        } else {
+            self.validate_id(&t.text)
+        }
+    }
+
+    /// Look up an existing entity by id, or create it (implicit creation
+    /// on first reference). The caller is responsible for having
+    /// validated the id — quoted names legitimately fall outside the
+    /// bare-id charset.
     fn ensure_entity(&mut self, id: &str) -> Result<usize, ParseError> {
-        self.validate_id(id)?;
         if let Some(&i) = self.ids.get(id) {
             return Ok(i);
         }
         let idx = self.g.entities.len();
-        self.g.entities.push(Entity { id: id.to_string(), attributes: vec![] });
+        self.g.entities.push(Entity { id: id.to_string(), display: None, attributes: vec![] });
         self.ids.insert(id.to_string(), idx);
         if self.g.entities.len() > crate::layout::MAX_NODES {
             return Err(self.err(format!(
@@ -277,9 +482,9 @@ mod tests {
         assert_eq!(c.attributes.len(), 3);
         assert_eq!(c.attributes[0].ty, "string");
         assert_eq!(c.attributes[0].name, "name");
-        assert_eq!(c.attributes[0].key, None);
-        assert_eq!(c.attributes[1].key.as_deref(), Some("PK"));
-        assert_eq!(c.attributes[2].key.as_deref(), Some("FK"));
+        assert!(c.attributes[0].keys.is_empty());
+        assert_eq!(c.attributes[1].keys, vec!["PK"]);
+        assert_eq!(c.attributes[2].keys, vec!["FK"]);
     }
 
     #[test]
@@ -317,17 +522,93 @@ mod tests {
         assert_eq!(e.line, Some(2));
     }
 
+    // --- new coverage: parity gaps closed against the Mermaid ER spec ---
+
     #[test]
-    fn attribute_comment_errors() {
-        let e = parse("erDiagram\nA {\nstring name \"the name\"\n}").unwrap_err();
-        assert_eq!(e.line, Some(3));
-        assert!(e.message.contains("comment"));
+    fn hyphenated_entity_names() {
+        // Mermaid's canonical docs example uses hyphenated names.
+        let g = p("erDiagram\n\
+                   CUSTOMER ||--o{ ORDER : places\n\
+                   ORDER ||--|{ LINE-ITEM : contains\n\
+                   CUSTOMER }|..|{ DELIVERY-ADDRESS : uses");
+        let ids: Vec<&str> = g.entities.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"LINE-ITEM"));
+        assert!(ids.contains(&"DELIVERY-ADDRESS"));
+        assert_eq!(g.relations.len(), 3);
     }
 
     #[test]
-    fn unique_key_errors_named() {
-        let e = parse("erDiagram\nA {\nint code UK\n}").unwrap_err();
-        assert!(e.message.contains("UK"));
+    fn quoted_entity_names_with_spaces() {
+        let g = p("erDiagram\n\"Order Detail\" ||--|| CUSTOMER : x");
+        assert_eq!(g.entities[0].id, "Order Detail");
+        assert_eq!(g.entities[1].id, "CUSTOMER");
+        // Same quoted name refers to the same entity.
+        let g2 = p("erDiagram\n\"Order Detail\" {\nstring sku\n}\n\"Order Detail\" ||--|| A : x");
+        assert_eq!(g2.entities.len(), 2);
+        assert_eq!(g2.entities[0].attributes.len(), 1);
+    }
+
+    #[test]
+    fn entity_alias() {
+        let g = p("erDiagram\np[\"Customer Account\"] {\nstring firstName\n}\np ||--|| q : x");
+        assert_eq!(g.entities[0].id, "p");
+        assert_eq!(g.entities[0].display.as_deref(), Some("Customer Account"));
+        assert_eq!(g.entities[0].attributes.len(), 1);
+        // Unquoted alias too.
+        let g2 = p("erDiagram\nCUSTOMER[Person]");
+        assert_eq!(g2.entities[0].display.as_deref(), Some("Person"));
+    }
+
+    #[test]
+    fn word_form_cardinalities() {
+        let g = p("erDiagram\nCUSTOMER only one to zero or more ORDER : places");
+        assert_eq!(g.relations[0].card_from, Cardinality::ExactlyOne);
+        assert_eq!(g.relations[0].card_to, Cardinality::ZeroOrMore);
+        assert!(g.relations[0].identifying);
+
+        let g2 = p("erDiagram\nA one or more optionally to zero or one B : r");
+        assert_eq!(g2.relations[0].card_from, Cardinality::OneOrMore);
+        assert_eq!(g2.relations[0].card_to, Cardinality::ZeroOrOne);
+        assert!(!g2.relations[0].identifying); // `optionally to` = non-identifying
+
+        // Short aliases.
+        let g3 = p("erDiagram\nA 1 to 1+ B : r");
+        assert_eq!(g3.relations[0].card_from, Cardinality::ExactlyOne);
+        assert_eq!(g3.relations[0].card_to, Cardinality::OneOrMore);
+    }
+
+    #[test]
+    fn unknown_word_cardinality_errors() {
+        let e = parse("erDiagram\nA several to many B : r").unwrap_err();
+        assert_eq!(e.line, Some(2));
+    }
+
+    #[test]
+    fn unique_key_supported() {
+        let g = p("erDiagram\nA {\nint code UK\n}");
+        assert_eq!(g.entities[0].attributes[0].keys, vec!["UK"]);
+    }
+
+    #[test]
+    fn combined_keys() {
+        let g = p("erDiagram\nA {\nint id PK, FK\nint x PK,UK\n}");
+        assert_eq!(g.entities[0].attributes[0].keys, vec!["PK", "FK"]);
+        assert_eq!(g.entities[0].attributes[1].keys, vec!["PK", "UK"]);
+    }
+
+    #[test]
+    fn attribute_comment_kept() {
+        let g = p("erDiagram\nA {\nstring name \"the display name\"\nint id PK \"primary\"\n}");
+        assert_eq!(g.entities[0].attributes[0].comment.as_deref(), Some("the display name"));
+        assert_eq!(g.entities[0].attributes[0].name, "name");
+        assert_eq!(g.entities[0].attributes[1].keys, vec!["PK"]);
+        assert_eq!(g.entities[0].attributes[1].comment.as_deref(), Some("primary"));
+    }
+
+    #[test]
+    fn unsupported_key_marker_errors_named() {
+        let e = parse("erDiagram\nA {\nint code XX\n}").unwrap_err();
+        assert!(e.message.contains("XX"));
     }
 
     #[test]
@@ -339,5 +620,7 @@ mod tests {
     #[test]
     fn multibyte_no_panic() {
         let _ = parse("erDiagram\nA ||--o{ B : héllo\u{2003}🎉\nÉ {\n}");
+        let _ = parse("erDiagram\n\"Café Ordér\" ||--|| A : naïve\nB { int \u{e9}x PK }");
+        let _ = parse("erDiagram\n\"unterminated ||--|| A : x");
     }
 }

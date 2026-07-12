@@ -18,12 +18,16 @@ pub(crate) enum Cardinality {
 pub(crate) struct ErAttribute {
     pub ty: String,
     pub name: String,
-    pub key: Option<String>, // "PK" | "FK"
+    pub keys: Vec<String>,       // any of "PK" / "FK" / "UK", in source order
+    pub comment: Option<String>, // trailing "quoted comment", verbatim
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Entity {
     pub id: String,
+    /// Display label from an `ENTITY [alias]` declaration; the canonical
+    /// `id` is still what relationships reference.
+    pub display: Option<String>,
     pub attributes: Vec<ErAttribute>,
 }
 
@@ -49,25 +53,27 @@ pub(crate) struct ErGraph {
 /// a `ParseError` with no source line, same as `boxgraph::layout_boxgraph`'s
 /// other consumers.
 ///
-/// Box width per the brief: `max(text_size(id).0, max over attrs of
-/// (type_w + name_w + key_w + 3*12 column gaps)) + 24`, floored at 100.
-/// Box height: `(1 + attrs.len()) * (LINE_H + 6) + 10` (title row plus
-/// one row per attribute).
+/// Box width per the brief: `max(text_size(title).0, max over attrs of
+/// (type_w + name_w + key_w + comment_w + 4*12 column gaps)) + 24`,
+/// floored at 100. `title` is the entity's alias when present, else its
+/// id. Box height: `(1 + attrs.len()) * (LINE_H + 6) + 10` (title row
+/// plus one row per attribute).
 pub(crate) fn render_er(source: &str) -> Result<String, crate::ParseError> {
     let g = parse::parse(source)?;
 
     let mut sizes = Vec::with_capacity(g.entities.len());
     let mut nodes = Vec::with_capacity(g.entities.len());
     for e in &g.entities {
-        let title_w = crate::measure::text_size(&e.id).0;
+        let title_w = crate::measure::text_size(e.display.as_deref().unwrap_or(&e.id)).0;
         let attrs_w = e
             .attributes
             .iter()
             .map(|a| {
                 let ty_w = crate::measure::text_size(&a.ty).0;
                 let name_w = crate::measure::text_size(&a.name).0;
-                let key_w = crate::measure::text_size(a.key.as_deref().unwrap_or("")).0;
-                ty_w + name_w + key_w + 3.0 * 12.0
+                let key_w = crate::measure::text_size(&a.keys.join(", ")).0;
+                let comment_w = crate::measure::text_size(a.comment.as_deref().unwrap_or("")).0;
+                ty_w + name_w + key_w + comment_w + 4.0 * 12.0
             })
             .fold(0.0_f64, f64::max);
         let width = (title_w.max(attrs_w) + 24.0).max(100.0);
