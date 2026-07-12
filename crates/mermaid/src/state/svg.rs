@@ -173,8 +173,14 @@ pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
                 emit_label(&mut out, &n.display, cx, cy);
             }
             StateKind::Normal => {
-                out.push_str(&shapes::emit(ShapeKind::Rounded, cx, cy, nw, nh, None));
+                let resolved = crate::style::resolve(&n.classes, n.style.as_deref(), &g.class_defs);
+                match &resolved {
+                    Some(s) => out.push_str(&format!(r#"<g style="{}">"#, escape_xml(s))),
+                    None => out.push_str("<g>"),
+                }
+                out.push_str(&shapes::emit(ShapeKind::Rounded, cx, cy, nw, nh, resolved.as_deref()));
                 emit_label(&mut out, &n.display, cx, cy);
+                out.push_str("</g>");
             }
         }
     }
@@ -310,6 +316,14 @@ mod tests {
     fn no_notes_means_no_wrapper_and_unchanged_size() {
         let svg = render_state("stateDiagram-v2\nA --> B").unwrap();
         assert!(!svg.contains("<g transform"), "{svg}");
+    }
+
+    #[test]
+    fn state_style_applied() {
+        let svg = crate::render("stateDiagram-v2\nclassDef mov fill:#0f0\n[*] --> S\nS:::mov").svg.unwrap();
+        assert!(svg.contains("fill:#0f0;color:#000"), "styled state: {svg}");
+        let plain = crate::render("stateDiagram-v2\n[*] --> S").svg.unwrap();
+        assert!(!plain.contains("<g style="), "unstyled must not wrap: {plain}");
     }
 
     // Test helpers (module-level in `mod tests`):
