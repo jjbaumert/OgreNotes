@@ -1,0 +1,32 @@
+/* OpenDyslexic — dyslexia-friendly document typeface (SIL-OFL 1.1,
+ * self-hosted under /fonts). Only fetched when the accessibility
+ * toggle sets [data-dyslexic="true"] and matches document text, so
+ * users who never enable it pay no bytes. See static/fonts/OFL.txt. */
+@font-face {
+  font-family: "OpenDyslexic";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/OpenDyslexic-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "OpenDyslexic";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/OpenDyslexic-Bold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "OpenDyslexic";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/OpenDyslexic-Italic.woff2") format("woff2");
+}
+@font-face {
+  font-family: "OpenDyslexic";
+  font-style: italic;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/OpenDyslexic-BoldItalic.woff2") format("woff2");
+}
