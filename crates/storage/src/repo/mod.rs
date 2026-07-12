@@ -31,6 +31,14 @@ pub enum RepoError {
     #[error("S3 error: {0}")]
     S3(String),
 
+    /// A guarded write (e.g. `attribute_exists(PK)`) found no existing row
+    /// to update — the row was deleted concurrently between the caller's
+    /// read and this write. Distinct from a plain "not found" read (which
+    /// callers usually express as `Option::None`) because it signals a
+    /// write that was refused, not absence discovered by a lookup.
+    #[error("not found: {0}")]
+    NotFound(String),
+
     /// Caller passed a semantically invalid argument that the repo
     /// refuses to write because it would corrupt downstream
     /// semantics (e.g. passing 0 to a "set disabled timestamp"

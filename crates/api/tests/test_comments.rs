@@ -2170,3 +2170,136 @@ async fn test_edit_message_preserves_created_at_and_thread_updated_at() {
 
     app.cleanup().await;
 }
+
+/// All the edit tests above send `{ "content": ... }` only, so
+/// `EditMessageRequest.parts`/`.mentions` are always the empty default —
+/// the non-empty SET branches in `ThreadRepo::update_message` and the
+/// "strip prior rich fields on a plain edit" REMOVE branch never run.
+/// This test posts a message with real `parts`/`mentions`, PATCHes it with
+/// a parts-carrying body (exercising SET), then PATCHes again with plain
+/// content only (exercising REMOVE) and asserts the rich fields are gone.
+#[tokio::test]
+async fn test_edit_message_rich_fields_set_and_strip() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let token = app.create_user_token("alice@test.com").await;
+    let doc_id = app.create_doc(&token, "Doc", None).await;
+
+    let body = serde_json::json!({ "threadType": "document" });
+    let (_, tj) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/documents/{doc_id}/threads"),
+            Some(&token),
+            Some(body),
+        )
+        .await;
+    let thread_id = tj["threadId"].as_str().unwrap().to_string();
+
+    // Post the original message with non-empty parts and mentions.
+    let body = serde_json::json!({
+        "content": "see @bob",
+        "parts": [
+            { "style": "body", "text": "see " },
+            { "style": "monospace", "text": "@bob" }
+        ],
+        "mentions": [
+            { "mentionType": "person", "id": "u-bob", "label": "@bob" }
+        ]
+    });
+    let (status, _) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/threads/{thread_id}/messages"),
+            Some(&token),
+            Some(body),
+        )
+        .await;
+    assert_eq!(status, 201);
+
+    let (_, msgs) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/threads/{thread_id}/messages"),
+            Some(&token),
+            None,
+        )
+        .await;
+    let msg_id = msgs["messages"][0]["messageId"].as_str().unwrap().to_string();
+
+    // Edit #1: PATCH with a new, still-rich parts/mentions body. Must
+    // overwrite the stored rich fields (SET branch).
+    let body = serde_json::json!({
+        "content": "actually @carol",
+        "parts": [
+            { "style": "body", "text": "actually " },
+            { "style": "monospace", "text": "@carol" }
+        ],
+        "mentions": [
+            { "mentionType": "person", "id": "u-carol", "label": "@carol" }
+        ]
+    });
+    let (status, _) = app
+        .json_request(
+            Method::PATCH,
+            &format!("/api/v1/threads/{thread_id}/messages/{msg_id}"),
+            Some(&token),
+            Some(body),
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let (_, msgs) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/threads/{thread_id}/messages"),
+            Some(&token),
+            None,
+        )
+        .await;
+    let msg = &msgs["messages"][0];
+    assert_eq!(msg["content"], "actually @carol");
+    let parts = msg["parts"].as_array().expect("parts must round-trip after SET");
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[1]["text"], "@carol");
+    let mentions = msg["mentions"].as_array().expect("mentions must round-trip after SET");
+    assert_eq!(mentions.len(), 1);
+    assert_eq!(mentions[0]["id"], "u-carol");
+
+    // Edit #2: PATCH with content only (parts/mentions default to empty).
+    // Must strip the previously-set rich fields (REMOVE branch) rather
+    // than leaving stale segments that no longer match the new text.
+    let (status, _) = app
+        .json_request(
+            Method::PATCH,
+            &format!("/api/v1/threads/{thread_id}/messages/{msg_id}"),
+            Some(&token),
+            Some(serde_json::json!({ "content": "plain now" })),
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let (_, msgs) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/threads/{thread_id}/messages"),
+            Some(&token),
+            None,
+        )
+        .await;
+    let msg = &msgs["messages"][0];
+    assert_eq!(msg["content"], "plain now");
+    assert!(
+        msg["parts"].as_array().map(|a| a.is_empty()).unwrap_or(true),
+        "parts must be stripped after a plain-content edit, got: {:?}",
+        msg["parts"]
+    );
+    assert!(
+        msg["mentions"].as_array().map(|a| a.is_empty()).unwrap_or(true),
+        "mentions must be stripped after a plain-content edit, got: {:?}",
+        msg["mentions"]
+    );
+
+    app.cleanup().await;
+}
