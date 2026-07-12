@@ -88,6 +88,10 @@ fn main() {
         ("class_default", "flowchart TD\n    A --> B\n    classDef default fill:#f9f,stroke:#333,stroke-width:4px;", "match: default auto-applied to unclassed nodes (added in polish slice)"),
         ("fontawesome", "flowchart TD\n    B[fa:fa-twitter]", "diverge-by-design: renders literal text, no icon"),
         ("spaced_no_semicolons", "flowchart LR\n    A --> B --> C\n    A --> D --> C\n    B --> E", "match"),
+        ("flowchart_styled", "flowchart TD\n    A[Hot] --> B[Cold]\n    style A fill:#f00,stroke:#900\n    linkStyle 0 stroke:green", "match: inline node style + linkStyle"),
+        ("gantt_basic", "gantt\n    title Project Timeline\n    dateFormat YYYY-MM-DD\n    section Planning\n      Requirements :done, req1, 2025-01-01, 5d\n      Wireframes :done, wire1, after req1, 5d\n    section Development\n      Frontend :active, front1, after wire1, 14d\n      Backend :back1, after wire1, 10d\n      Launch :milestone, m1, after front1, 0d", "match: sectioned gantt with statuses, after-deps, milestone"),
+        ("gitgraph_basic", "gitGraph\n   commit id: \"init\"\n   commit\n   branch develop\n   commit\n   commit tag: \"v0.9\"\n   checkout main\n   commit\n   merge develop tag: \"v1.0\"\n   commit type: HIGHLIGHT", "match: commit/branch/checkout/merge with tags + highlight"),
+        ("mindmap_basic", "mindmap\n  root((Mind Map))\n    Origins\n      Long history\n    Research\n      Effectiveness\n    Tools\n      Pen and paper\n      Mermaid", "match: indentation tree, shapes, horizontal tidy-tree layout"),
     ];
 
     let out_dir = Path::new("target/doc-gallery");

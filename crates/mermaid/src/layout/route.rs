@@ -28,6 +28,22 @@ pub(crate) fn route_edges(
 ) -> Vec<EdgePath> {
     let mut out: Vec<EdgePath> = Vec::with_capacity(input.edges.len());
 
+    // Per node-side edge counts (in rank space, a chain's source attaches
+    // at its bottom, its target at its top). A side with exactly one edge
+    // gets that edge centred on the box border rather than offset toward
+    // the neighbour — so e.g. the middle nodes of a diamond take their lone
+    // arrow head-on, while a fan-in/fan-out node keeps its spread.
+    let mut bottom_count = vec![0u32; input.nodes.len()];
+    let mut top_count = vec![0u32; input.nodes.len()];
+    for chain in &g.chains {
+        if let Some(SlotKind::Real(a)) = chain.first().copied() {
+            bottom_count[a] += 1;
+        }
+        if let Some(SlotKind::Real(b)) = chain.last().copied() {
+            top_count[b] += 1;
+        }
+    }
+
     // Surviving (non-self-loop) edges, chain index == acyclic edge index.
     for (ai, chain) in g.chains.iter().enumerate() {
         let orig = ac.orig[ai];
@@ -52,9 +68,21 @@ pub(crate) fn route_edges(
             let b_c = *pts.last().unwrap();
             let a_next = pts.get(1).copied().unwrap_or(b_c);
             let b_prev = pts[pts.len().saturating_sub(2)];
-            pts[0] = clip_to_box(a_c, (na.width / 2.0, na.height / 2.0), a_next);
+            // Source end (bottom side in rank space): centre it when it's
+            // the node's only outgoing edge, else clip toward the waypoint.
+            pts[0] = if bottom_count[a] == 1 {
+                (a_c.0, a_c.1 + na.height / 2.0)
+            } else {
+                clip_to_box(a_c, (na.width / 2.0, na.height / 2.0), a_next)
+            };
+            // Target end (top side): centre it when it's the node's only
+            // incoming edge.
             let n = pts.len();
-            pts[n - 1] = clip_to_box(b_c, (nb.width / 2.0, nb.height / 2.0), b_prev);
+            pts[n - 1] = if top_count[b] == 1 {
+                (b_c.0, b_c.1 - nb.height / 2.0)
+            } else {
+                clip_to_box(b_c, (nb.width / 2.0, nb.height / 2.0), b_prev)
+            };
         }
         // Single-span labeled edge: label at segment midpoint.
         if label_at.is_none() && input.edges[orig].label.is_some() {
@@ -92,4 +120,46 @@ pub(crate) fn route_edges(
     // Emit in original-edge order for determinism.
     out.sort_by_key(|p| p.edge);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::layout::{run, Direction, LEdge, LNode, LayoutInput};
+
+    fn node() -> LNode {
+        LNode { width: 40.0, height: 20.0, cluster: None }
+    }
+    fn e(from: usize, to: usize) -> LEdge {
+        LEdge { from, to, label: None }
+    }
+
+    #[test]
+    fn single_edge_side_centres_endpoint_multi_edge_side_stays_spread() {
+        // Diamond A->B, A->C, B->D, C->D. B and C have one edge per side, so
+        // those attach at the box centre; A (2 out) / D (2 in) stay spread.
+        let input = LayoutInput {
+            nodes: vec![node(), node(), node(), node()],
+            edges: vec![e(0, 1), e(0, 2), e(1, 3), e(2, 3)],
+            clusters: vec![],
+            direction: Direction::TB,
+        };
+        let l = run(&input).unwrap();
+        let cx = |i: usize| l.node_centers[i].0;
+        let ep = |edge: usize| l.edge_paths.iter().find(|p| p.edge == edge).unwrap();
+
+        // A->B arrives at B's (node 1) top-centre; B->D leaves B's bottom-centre.
+        assert!((ep(0).points.last().unwrap().0 - cx(1)).abs() < 1e-6, "A->B not centred on B");
+        assert!((ep(2).points[0].0 - cx(1)).abs() < 1e-6, "B->D not centred on B");
+        // A (node 0, two outgoing) keeps its exits spread, not both at A.cx.
+        assert!(
+            (ep(0).points[0].0 - cx(0)).abs() > 1e-6 || (ep(1).points[0].0 - cx(0)).abs() > 1e-6,
+            "fan-out endpoints should not both sit at the centre"
+        );
+        // D (node 3, two incoming) keeps its entries spread.
+        assert!(
+            (ep(2).points.last().unwrap().0 - cx(3)).abs() > 1e-6
+                || (ep(3).points.last().unwrap().0 - cx(3)).abs() > 1e-6,
+            "fan-in endpoints should not both sit at the centre"
+        );
+    }
 }

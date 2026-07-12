@@ -4,14 +4,17 @@
 //! failure returns a structured error and no SVG, so callers can fall
 //! back to raw source. Supports pie charts, flowcharts (graph/flowchart),
 //! sequence diagrams, state diagrams (stateDiagram/stateDiagram-v2),
-//! class diagrams, and entity-relationship (ER) diagrams — every
-//! diagram kind this project scoped. Any other/unrecognized kind is
+//! class diagrams, entity-relationship (ER) diagrams, gantt charts,
+//! git graphs (gitGraph), and mindmaps. Any other/unrecognized kind is
 //! `DiagramKind::Unknown` and always errors. See
 //! docs/superpowers/specs/2026-07-08-mermaid-support-design.md (index)
 //! and docs/superpowers/specs/2026-07-10-mermaid-slice4-state-class-er-design.md
 //! (state/class/ER).
 
 mod pie;
+mod gantt;
+mod gitgraph;
+mod mindmap;
 mod layout;
 pub(crate) mod measure;
 pub(crate) mod flowchart;
@@ -35,6 +38,9 @@ pub enum DiagramKind {
     State,
     Class,
     Er,
+    Gantt,
+    GitGraph,
+    Mindmap,
     Unknown,
 }
 
@@ -48,6 +54,9 @@ impl DiagramKind {
             DiagramKind::State => "state",
             DiagramKind::Class => "class",
             DiagramKind::Er => "entity-relationship",
+            DiagramKind::Gantt => "gantt",
+            DiagramKind::GitGraph => "git-graph",
+            DiagramKind::Mindmap => "mindmap",
             DiagramKind::Unknown => "unknown",
         }
     }
@@ -125,6 +134,8 @@ pub fn detect_kind(source: &str) -> DiagramKind {
     // first *token*, and the `;` (if any) lands on a later token like
     // `graph TD;`.
     let keyword = keyword.strip_suffix(';').unwrap_or(keyword);
+    // `gitGraph:` glues a colon to the keyword (git-graph's header form).
+    let keyword = keyword.strip_suffix(':').unwrap_or(keyword);
     match keyword {
         "pie" => DiagramKind::Pie,
         "graph" | "flowchart" => DiagramKind::Flowchart,
@@ -132,6 +143,9 @@ pub fn detect_kind(source: &str) -> DiagramKind {
         "stateDiagram" | "stateDiagram-v2" => DiagramKind::State,
         "classDiagram" | "classDiagram-v2" => DiagramKind::Class,
         "erDiagram" => DiagramKind::Er,
+        "gantt" => DiagramKind::Gantt,
+        "gitGraph" => DiagramKind::GitGraph,
+        "mindmap" => DiagramKind::Mindmap,
         _ => DiagramKind::Unknown,
     }
 }
@@ -227,6 +241,18 @@ pub fn render(source: &str) -> RenderOutput {
             Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
             Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
         },
+        DiagramKind::Gantt => match gantt::parse(source) {
+            Ok(g) => RenderOutput { kind, svg: Some(gantt::render_svg(&g)), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
+        DiagramKind::GitGraph => match gitgraph::parse(source) {
+            Ok(g) => RenderOutput { kind, svg: Some(gitgraph::render_svg(&g)), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
+        DiagramKind::Mindmap => match mindmap::parse(source) {
+            Ok(m) => RenderOutput { kind, svg: Some(mindmap::render_svg(&m)), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
         DiagramKind::Unknown => RenderOutput {
             kind,
             svg: None,
@@ -271,6 +297,11 @@ mod tests {
         assert_eq!(detect_kind("classDiagram"), DiagramKind::Class);
         assert_eq!(detect_kind("classDiagram-v2"), DiagramKind::Class);
         assert_eq!(detect_kind("erDiagram"), DiagramKind::Er);
+        assert_eq!(detect_kind("gantt"), DiagramKind::Gantt);
+        assert_eq!(detect_kind("gitGraph"), DiagramKind::GitGraph);
+        assert_eq!(detect_kind("gitGraph:"), DiagramKind::GitGraph);
+        assert_eq!(detect_kind("gitGraph LR:"), DiagramKind::GitGraph);
+        assert_eq!(detect_kind("mindmap"), DiagramKind::Mindmap);
         assert_eq!(detect_kind("nonsense here"), DiagramKind::Unknown);
     }
 

@@ -169,11 +169,11 @@ pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
                 ));
             }
             StateKind::Choice => {
-                out.push_str(&shapes::emit(ShapeKind::Diamond, cx, cy, nw, nh));
+                out.push_str(&shapes::emit(ShapeKind::Diamond, cx, cy, nw, nh, None));
                 emit_label(&mut out, &n.display, cx, cy);
             }
             StateKind::Normal => {
-                out.push_str(&shapes::emit(ShapeKind::Rounded, cx, cy, nw, nh));
+                out.push_str(&shapes::emit(ShapeKind::Rounded, cx, cy, nw, nh, None));
                 emit_label(&mut out, &n.display, cx, cy);
             }
         }

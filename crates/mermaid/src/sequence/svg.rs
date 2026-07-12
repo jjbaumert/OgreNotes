@@ -198,8 +198,12 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
         };
         let dash_attr = if *line == LineStyle::Dotted { r#" stroke-dasharray="4 3""# } else { "" };
         if self_msg {
+            // A rounded loop off the lifeline: cubic Bézier from the upper
+            // point out to the right and back to the lower point, so the
+            // arrowhead re-enters the lifeline pointing left (matching
+            // Mermaid's self-message arc rather than a square bracket).
             out.push_str(&format!(
-                r#"<path d="M {x0:.1} {y0:.1} H {x1:.1} V {y1:.1} H {x0:.1}" fill="none" stroke="currentColor"{dash_attr}{marker_attr}{marker_start_attr}/>"#,
+                r#"<path d="M {x0:.1} {y0:.1} C {x1:.1} {y0:.1} {x1:.1} {y1:.1} {x0:.1} {y1:.1}" fill="none" stroke="currentColor"{dash_attr}{marker_attr}{marker_start_attr}/>"#,
                 x0 = fx + ACT_W / 2.0,
                 y0 = m.y - SELF_EXTRA / 2.0,
                 x1 = fx + SELF_STUB,
@@ -293,6 +297,20 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
 #[cfg(test)]
 mod tests {
     use crate::sequence::render_sequence;
+
+    #[test]
+    fn self_message_renders_as_a_curved_loop() {
+        let svg = render_sequence("sequenceDiagram\nA->>A: think").unwrap();
+        // The self-message is a cubic Bézier loop (`C`), not a square
+        // `H`/`V` bracket, and still carries its arrowhead.
+        assert!(svg.contains(" C "), "self-message not curved: {svg}");
+        assert!(!svg.contains(" H "), "self-message still square: {svg}");
+        assert!(svg.contains("marker-end"), "{svg}");
+    }
+
+
+
+
 
     #[test]
     fn basic_exchange_renders() {
