@@ -36,6 +36,9 @@ const VARS: &[(&str, &str, &str)] = &[
     ("var(--mermaid-gantt-done, #b8b8b8)", "#b8b8b8", "#5A5A5A"),
     ("var(--mermaid-gantt-crit, #ff6b6b)", "#ff6b6b", "#C95A5A"),
     ("var(--mermaid-gantt-band, #00000010)", "#00000010", "#ffffff10"),
+    // Edge/relationship-label mask (ER, flowchart). Dark mirrors --surface
+    // in tokens-dark.css so labels stay legible on the dark canvas.
+    ("var(--surface, #fff)", "#ffffff", "#2A2A2A"),
 ];
 
 const TEXT_LIGHT: &str = "#1A1A1A";
