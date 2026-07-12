@@ -62,6 +62,36 @@ pub(crate) fn escape_xml(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// SVG path `d` drawing a smooth curve through `points` — one cubic
+/// Bézier per segment whose control points are pulled along the layout's
+/// flow axis (`vertical` = true for TB/BT, false for LR/RL). At every
+/// interior waypoint both the incoming and outgoing tangents are
+/// axis-aligned, so the joins are smooth (C1), and edges leave/enter
+/// their nodes along the flow direction — matching Mermaid's curved look
+/// instead of straight diagonals. A 2-point edge becomes a gentle
+/// S-curve; a single point (or fewer) degenerates to a bare `M`.
+pub(crate) fn curved_path(points: &[(f64, f64)], vertical: bool) -> String {
+    let Some(first) = points.first() else {
+        return String::new();
+    };
+    let mut d = format!("M {:.1} {:.1}", first.0, first.1);
+    for w in points.windows(2) {
+        let (p0, p1) = (w[0], w[1]);
+        let (c1, c2) = if vertical {
+            let dy = (p1.1 - p0.1) * 0.5;
+            ((p0.0, p0.1 + dy), (p1.0, p1.1 - dy))
+        } else {
+            let dx = (p1.0 - p0.0) * 0.5;
+            ((p0.0 + dx, p0.1), (p1.0 - dx, p1.1))
+        };
+        d.push_str(&format!(
+            " C {:.1} {:.1} {:.1} {:.1} {:.1} {:.1}",
+            c1.0, c1.1, c2.0, c2.1, p1.0, p1.1
+        ));
+    }
+    d
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
     pub message: String,
@@ -211,6 +241,24 @@ pub fn render(source: &str) -> RenderOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn curved_path_smooths_edges_and_degenerates() {
+        // 2-point vertical edge -> one cubic whose control points sit
+        // directly below/above the endpoints (leaves and enters vertically).
+        assert_eq!(
+            curved_path(&[(10.0, 0.0), (30.0, 100.0)], true),
+            "M 10.0 0.0 C 10.0 50.0 30.0 50.0 30.0 100.0"
+        );
+        // Horizontal (LR/RL) pulls the controls along x instead.
+        assert_eq!(
+            curved_path(&[(0.0, 10.0), (100.0, 30.0)], false),
+            "M 0.0 10.0 C 50.0 10.0 50.0 30.0 100.0 30.0"
+        );
+        // A single point is a bare move; empty is empty.
+        assert_eq!(curved_path(&[(5.0, 5.0)], true), "M 5.0 5.0");
+        assert_eq!(curved_path(&[], true), "");
+    }
 
     #[test]
     fn detects_each_known_kind() {

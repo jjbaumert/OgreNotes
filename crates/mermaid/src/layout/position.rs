@@ -73,6 +73,26 @@ mod tests {
     }
 
     #[test]
+    fn diamond_merge_node_centers_under_both_parents() {
+        // A->B, A->C, B->D, C->D. The classic diamond must be SYMMETRIC:
+        // D (the merge) centered under B and C, just like A (the split) is
+        // centered over them — an even-neighbor median must average the two
+        // middles, not snap D to the right parent.
+        let nodes = vec![n(40.0), n(40.0), n(40.0), n(40.0)];
+        let edges = vec![e(0, 1), e(0, 2), e(1, 3), e(2, 3)];
+        let g = build_order_graph(&nodes, &edges, &[0, 1, 1, 2]);
+        let c = assign_coords(&g);
+        let a = c.centers[&SlotKind::Real(0)].0;
+        let b = c.centers[&SlotKind::Real(1)].0;
+        let cc = c.centers[&SlotKind::Real(2)].0;
+        let d = c.centers[&SlotKind::Real(3)].0;
+        let mid = (b + cc) / 2.0;
+        assert!((d - mid).abs() < 1.0, "D {d} not centered under B,C mid {mid}");
+        assert!((a - mid).abs() < 1.0, "A {a} not centered over B,C mid {mid}");
+        assert!((a - d).abs() < 1.0, "diamond asymmetric: A {a} vs D {d}");
+    }
+
+    #[test]
     fn all_coords_finite_and_on_canvas() {
         let nodes = vec![n(40.0), n(40.0), n(40.0), n(40.0), n(40.0)];
         let edges = vec![e(0, 2), e(1, 2), e(2, 3), e(2, 4), e(0, 4)];
@@ -151,7 +171,16 @@ pub(crate) fn assign_coords(g: &OrderGraph) -> Coords {
                         let mut vals: Vec<f64> =
                             nbrs[i].iter().map(|&p| xs[adj][p]).collect();
                         vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                        vals[vals.len() / 2]
+                        // True median: for an EVEN neighbor count, average the
+                        // two middle values so a merge node lands centered
+                        // between its neighbors (e.g. the bottom of a diamond
+                        // over both parents), not snapped to the upper one.
+                        let mid = vals.len() / 2;
+                        if vals.len() % 2 == 0 {
+                            (vals[mid - 1] + vals[mid]) / 2.0
+                        } else {
+                            vals[mid]
+                        }
                     }
                 })
                 .collect();
