@@ -33,6 +33,20 @@ struct Parser {
     end_count: usize,
 }
 
+/// Truncate a line at the first `%%` that begins the line or follows
+/// whitespace — mermaid comments run to end of line. A `%%` glued to
+/// non-whitespace (e.g. inside a label like `a%%b`) is left alone; a
+/// single `%` never matches. `%` is ASCII, so the byte offset from
+/// `match_indices` is a char boundary.
+fn strip_trailing_comment(line: &str) -> &str {
+    for (i, _) in line.match_indices("%%") {
+        if i == 0 || line[..i].ends_with(char::is_whitespace) {
+            return &line[..i];
+        }
+    }
+    line
+}
+
 pub(crate) fn parse(source: &str) -> Result<StateGraph, ParseError> {
     let mut p = Parser {
         g: StateGraph { nodes: vec![], transitions: vec![], notes: vec![], composites: vec![] },
@@ -48,6 +62,10 @@ pub(crate) fn parse(source: &str) -> Result<StateGraph, ParseError> {
         p.line = idx + 1;
         let line = raw.trim();
         if line.is_empty() || line.starts_with("%%") {
+            continue;
+        }
+        let line = strip_trailing_comment(line).trim_end();
+        if line.is_empty() {
             continue;
         }
         if !seen_header {
@@ -666,5 +684,25 @@ mod tests {
         // `s ::x` is not a description; the transition parser rejects it.
         let e = parse("stateDiagram-v2\ns ::x").unwrap_err();
         assert_eq!(e.line, Some(2));
+    }
+
+    #[test]
+    fn trailing_comment_after_transition() {
+        // Doc-blessed spelling: `Moving --> Still %% another comment`.
+        let g = p("stateDiagram-v2\nMoving --> Still %% another comment");
+        assert_eq!(g.transitions.len(), 1);
+        assert_eq!(g.transitions[0].label, None);
+    }
+
+    #[test]
+    fn trailing_comment_runs_to_end_of_line_across_semicolons() {
+        let g = p("stateDiagram-v2\na --> b %% comment; not --> parsed");
+        assert_eq!(g.transitions.len(), 1);
+    }
+
+    #[test]
+    fn single_percent_in_label_survives() {
+        let g = p("stateDiagram-v2\na --> b: 50% done");
+        assert_eq!(g.transitions[0].label.as_deref(), Some("50% done"));
     }
 }
