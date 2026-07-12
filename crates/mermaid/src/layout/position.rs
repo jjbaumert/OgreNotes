@@ -127,6 +127,55 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_components_pack_without_a_wide_band() {
+        // Regression: a deep right-hand component used to drift ~430px away
+        // from shallow left pairs, leaving a wide empty band. Components must
+        // pack with only a small inter-component gap.
+        let svg = crate::render(
+            "classDiagram\n\
+             Class01 <|-- AveryLongClass\n\
+             Class03 *-- Class04\n\
+             Class05 o-- Class06\n\
+             Class09 --|> Class07\n\
+             Class09 --* C3\n\
+             Class09 --> C2\n\
+             Class07 .. Class08\n\
+             Class08 --> C2\n\
+             Class07 : Object[] elementData",
+        )
+        .svg
+        .expect("renders");
+        // x-extents of the class boxes (the node-fill rects).
+        let mut iv: Vec<(f64, f64)> = Vec::new();
+        let mut rest = svg.as_str();
+        while let Some(p) = rest.find("<rect") {
+            rest = &rest[p + 5..];
+            let end = rest.find("/>").unwrap();
+            let tag = &rest[..end];
+            if !tag.contains("var(--mermaid-node-fill") {
+                continue;
+            }
+            let get = |k: &str| -> f64 {
+                let i = tag.find(&format!(" {k}=\"")).unwrap() + k.len() + 3;
+                tag[i..].split('"').next().unwrap().parse().unwrap()
+            };
+            let x = get("x");
+            iv.push((x, x + get("width")));
+        }
+        assert!(iv.len() >= 10, "expected all class boxes");
+        iv.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let mut merged: Vec<(f64, f64)> = Vec::new();
+        for (lo, hi) in iv {
+            match merged.last_mut() {
+                Some(l) if lo <= l.1 + 1.0 => l.1 = l.1.max(hi),
+                _ => merged.push((lo, hi)),
+            }
+        }
+        let max_gap = merged.windows(2).map(|w| w[1].0 - w[0].1).fold(0.0_f64, f64::max);
+        assert!(max_gap < 120.0, "wide empty band between components: {max_gap}px");
+    }
+
+    #[test]
     fn all_coords_finite_and_on_canvas() {
         let nodes = vec![n(40.0), n(40.0), n(40.0), n(40.0), n(40.0)];
         let edges = vec![e(0, 2), e(1, 2), e(2, 3), e(2, 4), e(0, 4)];
@@ -241,6 +290,10 @@ pub(crate) fn assign_coords(g: &OrderGraph) -> Coords {
         }
     }
 
+    // Pack disconnected components: collapse horizontal bands no slot
+    // occupies, so independent subgraphs don't drift far apart.
+    compact_gaps(g, &mut xs);
+
     // Normalize: shift so min left edge = CANVAS_PAD; compute canvas size.
     let mut min_left = f64::INFINITY;
     let mut max_right = f64::NEG_INFINITY;
@@ -265,6 +318,66 @@ pub(crate) fn assign_coords(g: &OrderGraph) -> Coords {
     let total_h = y - RANK_GAP_Y + CANVAS_PAD; // y overshoots by one gap
     let size = (max_right + shift + CANVAS_PAD, total_h.max(2.0 * CANVAS_PAD));
     Coords { centers, size }
+}
+
+/// Target width of a collapsed inter-component band.
+const COMPONENT_GAP: f64 = NODE_GAP_X * 2.0;
+
+/// Squeeze out horizontal bands that no slot occupies — the empty space
+/// between disconnected components — so independent subgraphs pack together
+/// instead of drifting apart. Each band collapses with a rigid leftward
+/// shift of everything to its right, so a component's internal alignment is
+/// preserved. Dummy (edge-waypoint) slots are counted as occupancy, so a
+/// band an edge routes through is never collapsed — only bands with no node
+/// AND no edge between the two sides, i.e. true component boundaries.
+fn compact_gaps(g: &OrderGraph, xs: &mut [Vec<f64>]) {
+    let mut iv: Vec<(f64, f64)> = Vec::new();
+    for (r, row) in g.ranks.iter().enumerate() {
+        for (i, s) in row.iter().enumerate() {
+            iv.push((xs[r][i] - s.size.0 / 2.0, xs[r][i] + s.size.0 / 2.0));
+        }
+    }
+    if iv.len() < 2 {
+        return;
+    }
+    iv.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Merge into occupied intervals.
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for (lo, hi) in iv {
+        match merged.last_mut() {
+            Some(last) if lo <= last.1 + 1e-6 => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    // For each over-wide gap between occupied intervals, everything starting
+    // at the right interval shifts left by the excess (cumulative).
+    let mut cuts: Vec<(f64, f64)> = Vec::new(); // (threshold_x, cumulative shift)
+    let mut acc = 0.0;
+    for w in merged.windows(2) {
+        let gap = w[1].0 - w[0].1;
+        if gap > COMPONENT_GAP {
+            acc += gap - COMPONENT_GAP;
+            cuts.push((w[1].0, acc));
+        }
+    }
+    if cuts.is_empty() {
+        return;
+    }
+    for (r, row) in g.ranks.iter().enumerate() {
+        for i in 0..row.len() {
+            // Largest cut whose threshold this slot sits at or past.
+            let cx = xs[r][i];
+            let mut shift = 0.0;
+            for &(thr, a) in &cuts {
+                if cx + 1e-6 >= thr {
+                    shift = a;
+                } else {
+                    break;
+                }
+            }
+            xs[r][i] -= shift;
+        }
+    }
 }
 
 /// Two-pass min-gap enforcement that preserves order: push right, then
