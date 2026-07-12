@@ -1945,3 +1945,228 @@ async fn test_non_slash_messages_unaffected() {
 
     app.cleanup().await;
 }
+
+// ─── Edit message ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_edit_message_author() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let token = app.create_user_token("alice@test.com").await;
+    let doc_id = app.create_doc(&token, "Doc", None).await;
+    let (thread_id, msg_id) = seed_thread_with_message(&app, &token, &doc_id).await;
+
+    let (status, _) = app
+        .json_request(
+            Method::PATCH,
+            &format!("/api/v1/threads/{thread_id}/messages/{msg_id}"),
+            Some(&token),
+            Some(serde_json::json!({ "content": "edited text" })),
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let (_, msgs) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/threads/{thread_id}/messages"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(msgs["messages"][0]["content"], "edited text");
+    let updated_at = msgs["messages"][0]["updatedAt"].as_i64();
+    assert!(updated_at.is_some(), "updatedAt must be set after an edit");
+    let created_at = msgs["messages"][0]["createdAt"].as_i64().unwrap();
+    assert!(
+        updated_at.unwrap() >= created_at,
+        "updatedAt ({:?}) must be >= createdAt ({created_at})",
+        updated_at
+    );
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_edit_message_non_author_forbidden() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (_, token_a) = app.create_user("alice@test.com").await;
+    let (bob_id, token_b) = app.create_user("bob@test.com").await;
+    let folder_id = app.create_folder(&token_a, "Shared", None).await;
+    let doc_id = app.create_doc(&token_a, "Doc", Some(&folder_id)).await;
+    share_folder(&app, &token_a, &folder_id, &bob_id, "COMMENT").await;
+
+    let (thread_id, msg_id) = seed_thread_with_message(&app, &token_a, &doc_id).await;
+
+    let (status, _) = app
+        .json_request(
+            Method::PATCH,
+            &format!("/api/v1/threads/{thread_id}/messages/{msg_id}"),
+            Some(&token_b),
+            Some(serde_json::json!({ "content": "hijacked" })),
+        )
+        .await;
+    assert_eq!(status, 403);
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_edit_message_empty_rejected() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let token = app.create_user_token("alice@test.com").await;
+    let doc_id = app.create_doc(&token, "Doc", None).await;
+    let (thread_id, msg_id) = seed_thread_with_message(&app, &token, &doc_id).await;
+
+    let (status, _) = app
+        .json_request(
+            Method::PATCH,
+            &format!("/api/v1/threads/{thread_id}/messages/{msg_id}"),
+            Some(&token),
+            Some(serde_json::json!({ "content": "   " })),
+        )
+        .await;
+    assert_eq!(status, 400);
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_edit_chat_message_forbidden() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (_, token_a) = app.create_user("alice@test.com").await;
+    let (bob_id, _token_b) = app.create_user("bob@test.com").await;
+
+    // Create a chat room (thread_type = Chat) with a message.
+    let body = serde_json::json!({ "chatType": "chat", "title": "Team", "memberIds": [bob_id] });
+    let (_, json) = app
+        .json_request(Method::POST, "/api/v1/chats", Some(&token_a), Some(body))
+        .await;
+    let chat_id = json["id"].as_str().unwrap().to_string();
+
+    app.json_request(
+        Method::POST,
+        &format!("/api/v1/chats/{chat_id}/messages"),
+        Some(&token_a),
+        Some(serde_json::json!({ "content": "hey team" })),
+    )
+    .await;
+    let (_, msgs) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/chats/{chat_id}/messages"),
+            Some(&token_a),
+            None,
+        )
+        .await;
+    let msg_id = msgs["messages"][0]["messageId"].as_str().unwrap().to_string();
+
+    // Alice authored it, but chat/DM messages are not editable via the
+    // comments edit path — the thread_type gate must reject with 403.
+    let (status, _) = app
+        .json_request(
+            Method::PATCH,
+            &format!("/api/v1/threads/{chat_id}/messages/{msg_id}"),
+            Some(&token_a),
+            Some(serde_json::json!({ "content": "edit attempt" })),
+        )
+        .await;
+    assert_eq!(status, 403, "chat messages must not be editable via the comments path");
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_edit_message_preserves_created_at_and_thread_updated_at() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let token = app.create_user_token("alice@test.com").await;
+    let doc_id = app.create_doc(&token, "Doc", None).await;
+    let (thread_id, msg_id) = seed_thread_with_message(&app, &token, &doc_id).await;
+
+    // Capture message createdAt and thread updatedAt BEFORE the edit.
+    let (_, msgs) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/threads/{thread_id}/messages"),
+            Some(&token),
+            None,
+        )
+        .await;
+    let created_before = msgs["messages"][0]["createdAt"].as_i64().unwrap();
+
+    let (_, threads) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/documents/{doc_id}/threads"),
+            Some(&token),
+            None,
+        )
+        .await;
+    let thread_updated_before = threads["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["threadId"].as_str() == Some(&thread_id))
+        .unwrap()["updatedAt"]
+        .as_i64()
+        .unwrap();
+
+    // Sleep so a bug that bumped either timestamp would move it measurably.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let (status, _) = app
+        .json_request(
+            Method::PATCH,
+            &format!("/api/v1/threads/{thread_id}/messages/{msg_id}"),
+            Some(&token),
+            Some(serde_json::json!({ "content": "changed" })),
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let (_, msgs_after) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/threads/{thread_id}/messages"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        msgs_after["messages"][0]["createdAt"].as_i64().unwrap(),
+        created_before,
+        "editing must not change the message createdAt"
+    );
+
+    let (_, threads_after) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/documents/{doc_id}/threads"),
+            Some(&token),
+            None,
+        )
+        .await;
+    let thread_updated_after = threads_after["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["threadId"].as_str() == Some(&thread_id))
+        .unwrap()["updatedAt"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        thread_updated_after, thread_updated_before,
+        "editing a message must not resurface the thread (thread.updatedAt unchanged)"
+    );
+
+    app.cleanup().await;
+}
