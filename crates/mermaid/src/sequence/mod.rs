@@ -82,7 +82,11 @@ pub(crate) enum Event {
     FragmentClose,
     Activate { p: usize },
     Deactivate { p: usize },
-    Autonumber,
+    /// `autonumber` (start=1, step=1), `autonumber <start>` (step=1), or
+    /// `autonumber <start> <step>`.
+    Autonumber { start: u32, step: u32 },
+    /// `autonumber off` — stop numbering subsequent messages.
+    AutonumberOff,
 }
 
 #[derive(Debug, Clone)]
