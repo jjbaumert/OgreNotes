@@ -4,8 +4,8 @@
 //! failure returns a structured error and no SVG, so callers can fall
 //! back to raw source. Supports pie charts, flowcharts (graph/flowchart),
 //! sequence diagrams, state diagrams (stateDiagram/stateDiagram-v2),
-//! class diagrams, and entity-relationship (ER) diagrams — every
-//! diagram kind this project scoped. Any other/unrecognized kind is
+//! class diagrams, entity-relationship (ER) diagrams, gantt charts,
+//! git graphs (gitGraph), and mindmaps. Any other/unrecognized kind is
 //! `DiagramKind::Unknown` and always errors. See
 //! docs/superpowers/specs/2026-07-08-mermaid-support-design.md (index)
 //! and docs/superpowers/specs/2026-07-10-mermaid-slice4-state-class-er-design.md
