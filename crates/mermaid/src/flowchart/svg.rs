@@ -92,6 +92,12 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
         if let Some(m) = marker(e.to_head) {
             attrs.push_str(&format!(r#" marker-end="url(#{m})""#));
         }
+        // `linkStyle <index>` (or `linkStyle default`) overrides.
+        if let Some(style) = e.style.as_deref().or(g.default_link_style.as_deref()) {
+            if !style.is_empty() {
+                attrs.push_str(&format!(r#" style="{}""#, escape_xml(style)));
+            }
+        }
         out.push_str(&format!(r#"<path d="{d}" {attrs}/>"#));
 
         if let (Some(label), Some((lx, ly))) = (&e.label, ep.label_at) {
@@ -119,8 +125,15 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
         let (tw, th) = measure::text_size(&n.label);
         let (nw, nh) = shapes::size_for(n.shape, tw, th);
 
-        match node_style(g, n) {
-            Some(style) => out.push_str(&format!(r#"<g style="{}">"#, escape_xml(style))),
+        // Inline `style <id>` layers on top of any class style.
+        let combined = match (node_style(g, n), n.style.as_deref()) {
+            (Some(c), Some(inline)) => Some(format!("{c};{inline}")),
+            (Some(c), None) => Some(c.to_string()),
+            (None, Some(inline)) => Some(inline.to_string()),
+            (None, None) => None,
+        };
+        match combined {
+            Some(style) => out.push_str(&format!(r#"<g style="{}">"#, escape_xml(&style))),
             None => out.push_str("<g>"),
         }
         out.push_str(&shapes::emit(n.shape, cx, cy, nw, nh));
@@ -162,6 +175,16 @@ mod tests {
         assert!(svg.contains("mmd-arrow"));
         assert!(svg.contains("yes"));
         assert!(svg.contains("<polygon")); // the diamond
+    }
+
+    #[test]
+    fn styled_nodes_and_links_render() {
+        let svg = render_flowchart(
+            "graph TD\nA[Hot]-->B[Cold]\nstyle A fill:#f00,stroke:#900\nlinkStyle 0 stroke:green",
+        )
+        .unwrap();
+        assert!(svg.contains("fill:#f00;stroke:#900"), "node style: {svg}");
+        assert!(svg.contains("stroke:green"), "link style: {svg}");
     }
 
     #[test]

@@ -62,6 +62,7 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
             edges: vec![],
             subgraphs: vec![],
             class_defs: vec![],
+            default_link_style: None,
         },
         ids: HashMap::new(),
         line: 0,
@@ -173,8 +174,10 @@ impl Parser {
             "end" if stmt == "end" => return self.parse_subgraph_end(),
             "classDef" => return self.parse_class_def(stmt),
             "class" => return self.parse_class_assign(stmt),
+            "style" => return self.parse_style(stmt),
+            "linkStyle" => return self.parse_link_style(stmt),
             "direction" => return self.parse_direction(stmt),
-            "click" | "linkStyle" | "style" => {
+            "click" => {
                 return Err(self.err(format!("`{first}` statements are not supported")));
             }
             _ if stmt.starts_with("accTitle") || stmt.starts_with("accDescr") => {
@@ -271,6 +274,7 @@ impl Parser {
                         from_head: op.from_head,
                         to_head: op.to_head,
                         label: op.label.clone(),
+                        style: None,
                     });
                     self.edge_lines.push(self.line);
                     // Bail INSIDE the fan-out loop, not after it: an
@@ -344,6 +348,7 @@ impl Parser {
                     label: id.clone(),
                     shape: ShapeKind::Rect,
                     classes: vec![],
+                    style: None,
                     subgraph: self.stack.last().map(|&(i, _)| i),
                 });
                 self.ids.insert(id, i);
@@ -627,26 +632,76 @@ impl Parser {
         "color", "font-weight", "font-style", "opacity",
     ];
 
+    /// Sanitizes a comma-separated `prop:value` list against the
+    /// allowlist, returning `prop:value;`-joined survivors (possibly
+    /// empty). The CSS-injection boundary shared by `classDef`, `style`,
+    /// and `linkStyle`.
+    fn sanitize_style(styles: &str) -> String {
+        let mut kept = Vec::new();
+        for pair in styles.split(',') {
+            let Some((prop, value)) = pair.split_once(':') else { continue };
+            let (prop, value) = (prop.trim(), value.trim());
+            let value_ok =
+                value.chars().all(|c| c.is_ascii_alphanumeric() || " #.,%-".contains(c));
+            if Self::STYLE_PROPS.contains(&prop) && value_ok && !value.is_empty() {
+                kept.push(format!("{prop}:{value}"));
+            }
+        }
+        kept.join(";")
+    }
+
     fn parse_class_def(&mut self, stmt: &str) -> Result<(), ParseError> {
         let rest = stmt.strip_prefix("classDef").unwrap().trim();
         let Some((name, styles)) = rest.split_once(char::is_whitespace) else {
             return Err(self.err("classDef needs a name and styles"));
         };
-        let mut kept = Vec::new();
-        for pair in styles.split(',') {
-            let Some((prop, value)) = pair.split_once(':') else { continue };
-            let (prop, value) = (prop.trim(), value.trim());
-            let value_ok = value.chars().all(|c| {
-                c.is_ascii_alphanumeric() || " #.,%-".contains(c)
-            });
-            if Self::STYLE_PROPS.contains(&prop) && value_ok && !value.is_empty() {
-                kept.push(format!("{prop}:{value}"));
-            }
-        }
         self.g.class_defs.push(crate::flowchart::ClassDef {
             name: name.to_string(),
-            style: kept.join(";"),
+            style: Self::sanitize_style(styles),
         });
+        Ok(())
+    }
+
+    /// `style <nodeId> prop:value,...` — inline style on an existing node
+    /// (same allowlist as `classDef`; applied on top of class styles).
+    fn parse_style(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("style").unwrap().trim();
+        let Some((id, styles)) = rest.split_once(char::is_whitespace) else {
+            return Err(self.err("style needs a node id and styles"));
+        };
+        let id = id.trim();
+        let Some(&idx) = self.ids.get(id) else {
+            return Err(self.err(format!("style refers to unknown node `{id}`")));
+        };
+        let style = Self::sanitize_style(styles);
+        if !style.is_empty() {
+            self.g.nodes[idx].style = Some(style);
+        }
+        Ok(())
+    }
+
+    /// `linkStyle <index[,index...]|default> prop:value,...` — styles
+    /// edges by their declaration index (or every edge, for `default`).
+    fn parse_link_style(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("linkStyle").unwrap().trim();
+        let Some((targets, styles)) = rest.split_once(char::is_whitespace) else {
+            return Err(self.err("linkStyle needs edge indices and styles"));
+        };
+        let style = Self::sanitize_style(styles);
+        if targets.trim() == "default" {
+            self.g.default_link_style = Some(style);
+            return Ok(());
+        }
+        for tok in targets.split(',') {
+            let tok = tok.trim();
+            let n: usize = tok
+                .parse()
+                .map_err(|_| self.err(format!("linkStyle expects an edge index, found {tok:?}")))?;
+            let Some(edge) = self.g.edges.get_mut(n) else {
+                return Err(self.err(format!("linkStyle refers to unknown edge index {n}")));
+            };
+            edge.style = Some(style.clone());
+        }
         Ok(())
     }
 
@@ -968,14 +1023,41 @@ mod tests {
 
     #[test]
     fn out_of_scope_statements_error_with_line() {
-        for stmt in ["click A callback", "linkStyle 0 stroke:red", "style A fill:#f00",
-                     "accTitle: x", "accDescr: y", "direction LR"] {
+        for stmt in ["click A callback", "accTitle: x", "accDescr: y", "direction LR"] {
             let src = format!("graph TD\nA\n{stmt}");
             let e = parse(&src).unwrap_err();
             assert_eq!(e.line, Some(3), "for {stmt}");
             let kw = stmt.split([' ', ':']).next().unwrap();
             assert!(e.message.contains(kw), "message names the keyword: {}", e.message);
         }
+    }
+
+    #[test]
+    fn inline_node_style() {
+        let g = p("graph TD\nA --> B\nstyle A fill:#f00,stroke:#333");
+        assert_eq!(g.nodes[0].style.as_deref(), Some("fill:#f00;stroke:#333"));
+        assert!(g.nodes[1].style.is_none());
+        // Unknown node id errors.
+        let e = parse("graph TD\nA\nstyle Z fill:#f00").unwrap_err();
+        assert!(e.message.contains("unknown node"), "got: {}", e.message);
+        // Same allowlist as classDef: disallowed props dropped.
+        let g = p("graph TD\nA\nstyle A background-image:url(x),fill:#0f0");
+        assert_eq!(g.nodes[0].style.as_deref(), Some("fill:#0f0"));
+    }
+
+    #[test]
+    fn link_style_by_index_and_default() {
+        let g = p("graph TD\nA-->B\nB-->C\nlinkStyle 0 stroke:red\nlinkStyle default stroke:blue");
+        assert_eq!(g.edges[0].style.as_deref(), Some("stroke:red"));
+        assert!(g.edges[1].style.is_none()); // falls back to default at render
+        assert_eq!(g.default_link_style.as_deref(), Some("stroke:blue"));
+        // Multiple indices in one statement.
+        let g = p("graph TD\nA-->B\nA-->C\nlinkStyle 0,1 stroke-width:2px");
+        assert_eq!(g.edges[0].style.as_deref(), Some("stroke-width:2px"));
+        assert_eq!(g.edges[1].style.as_deref(), Some("stroke-width:2px"));
+        // Out-of-range index errors.
+        let e = parse("graph TD\nA-->B\nlinkStyle 5 stroke:red").unwrap_err();
+        assert!(e.message.contains("unknown edge index"), "got: {}", e.message);
     }
 
     #[test]

@@ -52,6 +52,9 @@ pub(crate) struct FlowNode {
     pub label: String,          // raw; escaped only at SVG emission
     pub shape: ShapeKind,
     pub classes: Vec<String>,
+    /// Inline `style <id> ...` — sanitized `prop:value;` pairs (same
+    /// allowlist as `classDef`), applied on top of any class styles.
+    pub style: Option<String>,
     pub subgraph: Option<usize>,
 }
 
@@ -66,6 +69,9 @@ pub(crate) struct FlowEdge {
     pub from_head: Head,
     pub to_head: Head,
     pub label: Option<String>,
+    /// `linkStyle <index> ...` — sanitized `prop:value;` pairs applied to
+    /// this edge's `<path>`. Falls back to `FlowGraph::default_link_style`.
+    pub style: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +99,9 @@ pub(crate) struct FlowGraph {
     pub edges: Vec<FlowEdge>,
     pub subgraphs: Vec<FlowSubgraph>,
     pub class_defs: Vec<ClassDef>,
+    /// `linkStyle default ...` — sanitized style applied to every edge
+    /// that has no explicit `linkStyle <index>`.
+    pub default_link_style: Option<String>,
 }
 
 /// Full flowchart pipeline: parse -> measure -> layout -> SVG. Never
