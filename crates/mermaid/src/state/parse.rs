@@ -47,6 +47,29 @@ fn strip_trailing_comment(line: &str) -> &str {
     line
 }
 
+/// Split a post-header line into `;`-separated statements — EXCEPT that
+/// once a `:` has appeared in the current statement (a transition label,
+/// colon description, or note text), the `;` belongs to that text and
+/// the statement runs to end of line, matching mermaid. `;` and `:` are
+/// ASCII, so char_indices offsets are boundary-safe.
+fn split_statements(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut colon_seen = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            ':' => colon_seen = true,
+            ';' if !colon_seen => {
+                out.push(&line[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&line[start..]);
+    out
+}
+
 pub(crate) fn parse(source: &str) -> Result<StateGraph, ParseError> {
     let mut p = Parser {
         g: StateGraph { nodes: vec![], transitions: vec![], notes: vec![], composites: vec![] },
@@ -78,7 +101,7 @@ pub(crate) fn parse(source: &str) -> Result<StateGraph, ParseError> {
             seen_header = true;
             continue;
         }
-        for stmt in line.split(';') {
+        for stmt in split_statements(line) {
             let stmt = stmt.trim();
             if stmt.is_empty() {
                 continue;
@@ -153,7 +176,11 @@ impl Parser {
             if rest.starts_with(':') {
                 return Ok(false);
             }
-            Some(rest.trim().to_string())
+            let text = rest.trim();
+            if text.is_empty() {
+                return Err(self.err("empty state description"));
+            }
+            Some(text.to_string())
         } else {
             return Ok(false);
         };
@@ -718,5 +745,45 @@ mod tests {
         let e = parse("stateDiagram-v2\n[*] --> A\nnote right of __start_0: boo").unwrap_err();
         assert_eq!(e.line, Some(3));
         assert!(e.message.contains("synthetic"), "got: {}", e.message);
+    }
+
+    // ── Final review fix wave ────────────────────────────────────────
+
+    #[test]
+    fn semicolon_inside_label_stays_in_the_label() {
+        // Final-review regression find: bare-id support turned the old
+        // loud error into a phantom node `Stop`. Mermaid keeps `;` in
+        // the label to end of line.
+        let g = p("stateDiagram-v2\na --> b: go; Stop");
+        assert_eq!(g.transitions.len(), 1);
+        assert_eq!(g.transitions[0].label.as_deref(), Some("go; Stop"));
+        assert_eq!(g.nodes.len(), 2, "no phantom node");
+    }
+
+    #[test]
+    fn semicolon_inside_description_stays_in_the_description() {
+        let g = p("stateDiagram-v2\ns : Hello; World");
+        assert_eq!(g.nodes[0].display, "Hello; World");
+        assert_eq!(g.nodes.len(), 1);
+    }
+
+    #[test]
+    fn semicolons_before_any_colon_still_split() {
+        let g = p("stateDiagram-v2\na --> b; c --> d");
+        assert_eq!(g.transitions.len(), 2);
+    }
+
+    #[test]
+    fn empty_colon_description_errors() {
+        let e = parse("stateDiagram-v2\ns :").unwrap_err();
+        assert_eq!(e.line, Some(2));
+        assert!(e.message.contains("empty"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn single_underscore_note_target_is_valid() {
+        // Only the double-underscore synthetic prefix is reserved.
+        let g = p("stateDiagram-v2\n_x --> y\nnote right of _x: fine");
+        assert_eq!(g.notes.len(), 1);
     }
 }
