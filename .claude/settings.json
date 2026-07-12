@@ -53,7 +53,13 @@
       "Bash(rg:*)",
       "Bash(jq:*)",
       "Bash(sed:*)",
-      "Bash(awk:*)"
+      "Bash(awk:*)",
+      "Bash(twiggy:*)",
+
+      "Bash(cargo test:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo clippy:*)"
     ],
     "deny": [
       "Bash(git push)",
