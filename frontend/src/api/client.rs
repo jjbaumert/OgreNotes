@@ -101,54 +101,55 @@ pub async fn logout() {
 ///
 /// Called once at app boot before mount. The cookie is
 /// auto-attached to same-origin fetches, so the empty body is
-/// sufficient. Returns `true` on success — caller decides what to
-/// render based on the result (typically: render the app vs. send
-/// the user to /login).
-pub async fn try_hydrate_from_cookie() -> bool {
-    try_refresh_token().await
+/// sufficient. Returns the user's decoded UI prefs on success (or
+/// `None` on failure) — caller decides what to render based on the
+/// result (typically: render the app vs. send the user to /login).
+pub async fn try_hydrate_from_cookie() -> Option<UiPrefsDto> {
+    refresh_token_inner().await.and_then(|t| t.ui_prefs)
 }
 
-/// POST /auth/refresh — the cookie supplies the refresh credentials,
-/// so the body carries no fields. We send `"{}"` (an empty JSON
-/// object) rather than truly no body because the backend extractor
-/// accepts both shapes today, and `"{}"` is unambiguous wire-level
+/// POST /auth/refresh via the HttpOnly cookie. Returns the decoded
+/// TokenResponse on success (and installs the access token), else None.
+/// Shared by boot hydration (which wants the ui_prefs) and mid-session
+/// token recovery (which ignores the body).
+///
+/// The body carries no fields — we send `"{}"` (an empty JSON object)
+/// rather than truly no body because the backend extractor accepts
+/// both shapes today, and `"{}"` is an unambiguous wire-level
 /// fingerprint for "cookie path" in CloudWatch traces. Once the
 /// backend drops the legacy body-fallback, this can become a
-/// bodyless POST. Used for both app-boot hydration and in-flight
-/// access-token expiry recovery in `ensure_token`.
-async fn try_refresh_token() -> bool {
-    let resp = match Request::post(&format!("{API_BASE}/auth/refresh"))
+/// bodyless POST.
+async fn refresh_token_inner() -> Option<TokenResponse> {
+    let resp = Request::post(&format!("{API_BASE}/auth/refresh"))
         .header("Content-Type", "application/json")
         .body("{}")
-    {
-        Ok(req) => match req.send().await {
-            Ok(r) => r,
-            Err(_) => return false,
-        },
-        Err(_) => return false,
-    };
-
+        .ok()?
+        .send()
+        .await
+        .ok()?;
     if !resp.ok() {
-        return false;
+        return None;
     }
-
     // The backend response carries `refreshToken` and `sessionId` for
     // transitional clients; we deliberately ignore them — the cookie
     // path is canonical now and those fields will be removed once
     // every deployed frontend ships this version.
-    let token_resp: TokenResponse = match resp.json().await {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-
+    let token_resp: TokenResponse = resp.json().await.ok()?;
     set_auth(AuthState {
-        access_token: token_resp.access_token,
-        user_id: token_resp.user_id,
-        email: token_resp.email,
-        name: token_resp.name,
+        access_token: token_resp.access_token.clone(),
+        user_id: token_resp.user_id.clone(),
+        email: token_resp.email.clone(),
+        name: token_resp.name.clone(),
         expires_at: now_ms() + ACCESS_TOKEN_TTL_MS,
     });
-    true
+    Some(token_resp)
+}
+
+/// Return a valid access token, refreshing proactively if expired.
+/// Mid-session path — deliberately ignores ui_prefs (a silent token
+/// renewal must not re-apply locale/theme).
+async fn try_refresh_token() -> bool {
+    refresh_token_inner().await.is_some()
 }
 
 /// Return a valid access token, refreshing proactively if expired.
@@ -184,6 +185,26 @@ pub struct TokenResponse {
     /// common no-MFA path (skip_serializing_if_none).
     #[serde(default)]
     pub mfa_enrollment_required: Option<bool>,
+    /// The user's stored UI prefs (Phase 5 M-P2). `serde(default)` so
+    /// older servers that omit the field still decode.
+    #[serde(default)]
+    pub ui_prefs: Option<UiPrefsDto>,
+}
+
+/// Slim decode of the server `UiPrefs` blob delivered on the auth
+/// response. Mirrors the backend camelCase shape; only the fields the
+/// boot path applies. Per the per-consumer-slim-decode pattern.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiPrefsDto {
+    #[serde(default)]
+    pub theme: Option<String>,
+    #[serde(default)]
+    pub locale: Option<String>,
+    #[serde(default)]
+    pub dyslexic_font: Option<bool>,
+    #[serde(default)]
+    pub reduce_motion: Option<bool>,
 }
 
 /// The body shape the server returns on a 202 from `/auth/dev-login`

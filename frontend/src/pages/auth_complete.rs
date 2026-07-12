@@ -17,7 +17,7 @@ pub fn AuthCompletePage() -> impl IntoView {
     let navigate = use_navigate();
 
     leptos::task::spawn_local(async move {
-        if client::try_hydrate_from_cookie().await {
+        if client::try_hydrate_from_cookie().await.is_some() {
             navigate("/", Default::default());
         } else {
             navigate("/login", Default::default());
