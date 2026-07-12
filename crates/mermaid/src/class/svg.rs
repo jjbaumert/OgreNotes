@@ -42,8 +42,40 @@ fn mult_pos(points: &[(f64, f64)], at_start: bool) -> (f64, f64) {
     (p0.0 + ux * 14.0 + px * 10.0, p0.1 + uy * 14.0 + py * 10.0)
 }
 
+/// Post-layout note-box geometry: an attached note sits to the right of its
+/// class; floating notes tile in a row below the diagram. Notes only extend
+/// the canvas right/down, so no coordinate re-homing is needed.
+fn note_rects(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)], base_h: f64) -> Vec<(f64, f64, f64, f64)> {
+    let mut float_x = 20.0;
+    let mut out = Vec::with_capacity(g.notes.len());
+    for note in &g.notes {
+        let (tw, th) = measure::text_size(&note.text);
+        let (bw, bh) = (tw + 16.0, th + 12.0);
+        let (x, y) = match note.target {
+            Some(ci) => {
+                let (cx, cy) = l.node_centers[ci];
+                let (nw, _) = sizes[ci];
+                (cx + nw / 2.0 + 16.0, cy - bh / 2.0)
+            }
+            None => {
+                let x = float_x;
+                float_x += bw + 16.0;
+                (x, base_h + 20.0)
+            }
+        };
+        out.push((x, y, bw, bh));
+    }
+    out
+}
+
 pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
-    let (w, h) = l.size;
+    let (base_w, base_h) = l.size;
+    let notes = note_rects(g, l, sizes, base_h);
+    let (mut w, mut h) = (base_w, base_h);
+    for &(x, y, bw, bh) in &notes {
+        w = w.max(x + bw + 12.0);
+        h = h.max(y + bh + 12.0);
+    }
     let mut out = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:14px">"#
     );
@@ -235,6 +267,42 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
             }
         }
         out.push_str("</g>");
+    }
+
+    // 5. notes (post-layout overlay): a dotted connector for attached notes,
+    // then the note box + centered text.
+    for (i, note) in g.notes.iter().enumerate() {
+        let (x, y, bw, bh) = notes[i];
+        if let Some(ci) = note.target {
+            let (cx, cy) = l.node_centers[ci];
+            let (nw, _) = sizes[ci];
+            out.push_str(&format!(
+                r#"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="currentColor" stroke-dasharray="4 2"/>"#,
+                cx + nw / 2.0,
+                cy,
+                x,
+                y + bh / 2.0
+            ));
+        }
+        out.push_str(&format!(
+            r#"<rect x="{x:.1}" y="{y:.1}" width="{bw:.1}" height="{bh:.1}" fill="var(--mermaid-note-fill, #fff5ad)" stroke="currentColor" rx="2"/>"#
+        ));
+        let ncx = x + bw / 2.0;
+        let ncy = y + bh / 2.0;
+        let lines = measure::lines(&note.text);
+        let n_lines = lines.len();
+        out.push_str(&format!(
+            r#"<text x="{ncx:.1}" y="{ncy:.1}" text-anchor="middle" fill="var(--mermaid-note-text, #333)">"#
+        ));
+        for (li, line) in lines.iter().enumerate() {
+            let dy = if li == 0 {
+                -((n_lines as f64 - 1.0) / 2.0) * measure::LINE_H + 4.0
+            } else {
+                measure::LINE_H
+            };
+            out.push_str(&format!(r#"<tspan x="{ncx:.1}" dy="{dy:.1}">{}</tspan>"#, escape_xml(line)));
+        }
+        out.push_str("</text>");
     }
 
     out.push_str("</svg>");

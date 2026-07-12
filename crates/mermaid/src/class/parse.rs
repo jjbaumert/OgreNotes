@@ -151,6 +151,7 @@ pub(crate) fn parse(source: &str) -> Result<ClassGraph, ParseError> {
         g: ClassGraph {
             direction: crate::layout::Direction::TB,
             namespaces: vec![],
+            notes: vec![],
             classes: vec![],
             relations: vec![],
             class_defs: vec![],
@@ -232,7 +233,8 @@ impl Parser {
         match first {
             "direction" => return self.parse_direction(stmt),
             "namespace" => return self.parse_namespace(stmt),
-            "click" | "callback" | "link" | "note" => {
+            "note" => return self.parse_note(stmt),
+            "click" | "callback" | "link" => {
                 return Err(self.err(format!("`{first}` statements are not supported")));
             }
             "classDef" => return self.parse_class_def(stmt),
@@ -253,6 +255,39 @@ impl Parser {
     }
 
     /// `classDef name prop:val,...`
+    /// `note for X "text"` (attached to a class) or `note "text"` (floating).
+    /// Text may be quoted or follow a `:`.
+    fn parse_note(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("note").unwrap().trim();
+        let (target, text_part) = if let Some(after) = rest.strip_prefix("for ") {
+            let after = after.trim();
+            let (id, text) = match after.split_once(char::is_whitespace) {
+                Some((id, t)) => (id.trim(), t.trim()),
+                None => return Err(self.err("`note for` needs a class id and text")),
+            };
+            self.validate_id(id)?;
+            (Some(self.ensure_class(id)?), text)
+        } else {
+            (None, rest)
+        };
+        // Text is a `"quoted"` string or follows a `:`.
+        let text = {
+            let t = text_part.trim();
+            if let Some(inner) = t.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+                inner.to_string()
+            } else if let Some(after) = t.strip_prefix(':') {
+                after.trim().to_string()
+            } else {
+                t.to_string()
+            }
+        };
+        if text.is_empty() {
+            return Err(self.err("note needs text"));
+        }
+        self.g.notes.push(crate::class::ClassNote { target, text });
+        Ok(())
+    }
+
     /// `namespace Name {` — opens a namespace block; classes declared inside
     /// (until the matching `}`) are grouped into it. Not nestable.
     fn parse_namespace(&mut self, stmt: &str) -> Result<(), ParseError> {
@@ -753,6 +788,22 @@ mod tests {
     }
 
     #[test]
+    fn notes_attached_and_floating() {
+        let g = p("classDiagram\nclass A\nnote for A \"attached\"\nnote \"floating\"");
+        assert_eq!(g.notes.len(), 2);
+        assert_eq!(g.notes[0].text, "attached");
+        assert_eq!(g.notes[0].target, Some(0)); // A
+        assert_eq!(g.notes[1].text, "floating");
+        assert_eq!(g.notes[1].target, None);
+        // `:`-delimited text and an implicit class both work.
+        let g2 = p("classDiagram\nnote for B : colon text");
+        assert_eq!(g2.notes[0].text, "colon text");
+        assert_eq!(g2.classes[g2.notes[0].target.unwrap()].id, "B");
+        // empty note errors
+        assert!(parse("classDiagram\nclass A\nnote for A \"\"").is_err());
+    }
+
+    #[test]
     fn namespace_groups_its_classes() {
         let g = p("classDiagram\nnamespace Shapes {\n  class Circle\n  class Square\n}\nclass Loose");
         assert_eq!(g.namespaces, vec!["Shapes".to_string()]);
@@ -773,8 +824,7 @@ mod tests {
         // `style` and `cssClass` moved out of this list: this task turns
         // them into supported styling statements (see
         // `class_styling_parses_and_resolves` / `css_shorthand_now_supported`).
-        for stmt in ["click A call x()", "callback A \"cb\"",
-                     "link A \"url\"", "note for A \"text\""] {
+        for stmt in ["click A call x()", "callback A \"cb\"", "link A \"url\""] {
             let src = format!("classDiagram\nclass A\n{stmt}");
             let e = parse(&src).unwrap_err();
             assert_eq!(e.line, Some(3), "for {stmt}");

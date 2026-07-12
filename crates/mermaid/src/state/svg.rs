@@ -166,13 +166,24 @@ pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
             }
             StateKind::ForkJoin => {
                 let (x, y) = (cx - nw / 2.0, cy - nh / 2.0);
+                let resolved = crate::style::resolve(&n.classes, n.style.as_deref(), &g.class_defs);
+                let style_attr = match &resolved {
+                    Some(s) => format!(r#" style="{}""#, escape_xml(s)),
+                    None => String::new(),
+                };
                 out.push_str(&format!(
-                    r#"<rect x="{x:.1}" y="{y:.1}" width="{nw:.1}" height="{nh:.1}" fill="currentColor"/>"#
+                    r#"<rect x="{x:.1}" y="{y:.1}" width="{nw:.1}" height="{nh:.1}" fill="currentColor"{style_attr}/>"#
                 ));
             }
             StateKind::Choice => {
-                out.push_str(&shapes::emit(ShapeKind::Diamond, cx, cy, nw, nh, None));
+                let resolved = crate::style::resolve(&n.classes, n.style.as_deref(), &g.class_defs);
+                match &resolved {
+                    Some(s) => out.push_str(&format!(r#"<g style="{}">"#, escape_xml(s))),
+                    None => out.push_str("<g>"),
+                }
+                out.push_str(&shapes::emit(ShapeKind::Diamond, cx, cy, nw, nh, resolved.as_deref()));
                 emit_label(&mut out, &n.display, cx, cy);
+                out.push_str("</g>");
             }
             StateKind::Normal => {
                 let resolved = crate::style::resolve(&n.classes, n.style.as_deref(), &g.class_defs);
@@ -326,6 +337,24 @@ mod tests {
         assert!(svg.contains("fill:#0f0;color:#000"), "styled state: {svg}");
         let plain = crate::render("stateDiagram-v2\n[*] --> S").svg.unwrap();
         assert!(!plain.contains("<g style="), "unstyled must not wrap: {plain}");
+    }
+
+    #[test]
+    fn choice_and_forkjoin_take_style() {
+        // Choice diamonds and fork/join bars now honor classDef/`:::`
+        // (previously only Normal states were styled).
+        let choice = crate::render(
+            "stateDiagram-v2\nclassDef hot fill:#f00\nstate C <<choice>>\nC:::hot",
+        )
+        .svg
+        .unwrap();
+        assert!(choice.contains("fill:#f00"), "choice styled: {choice}");
+        let fork = crate::render(
+            "stateDiagram-v2\nclassDef hot fill:#f00\nstate F <<fork>>\nF:::hot",
+        )
+        .svg
+        .unwrap();
+        assert!(fork.contains("fill:#f00"), "fork styled: {fork}");
     }
 
     #[test]

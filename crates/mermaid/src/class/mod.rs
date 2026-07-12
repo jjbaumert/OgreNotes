@@ -45,9 +45,16 @@ pub(crate) struct Relation {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ClassNote {
+    pub target: Option<usize>, // class index for `note for X`; None = floating
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct ClassGraph {
     pub direction: crate::layout::Direction,
     pub namespaces: Vec<String>, // namespace titles, indexed by ClassBox.namespace
+    pub notes: Vec<ClassNote>,
     pub classes: Vec<ClassBox>,
     pub relations: Vec<Relation>,
     pub class_defs: Vec<crate::style::ClassDef>,
