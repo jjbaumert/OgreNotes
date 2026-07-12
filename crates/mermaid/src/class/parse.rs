@@ -18,29 +18,36 @@ use crate::class::{ClassBox, ClassGraph, RelKind, Relation};
 use crate::ParseError;
 use std::collections::HashMap;
 
-/// (operator token, swap, kind, arrow). `swap` = true means the raw
-/// left/right order must flip to reach the normalized from/to (the
+/// (operator token, swap, kind, arrow, back_arrow). `swap` = true means the
+/// raw left/right order must flip to reach the normalized from/to (the
 /// marker sits on the raw-left side); false means raw order already
 /// matches normalized order (the marker sits on the raw-right side).
-const OPERATORS: &[(&str, bool, RelKind, bool)] = &[
-    ("<|--", true, RelKind::Inheritance, false),
-    ("--|>", false, RelKind::Inheritance, false),
-    ("<|..", true, RelKind::Realization, false),
-    ("..|>", false, RelKind::Realization, false),
-    ("*--", true, RelKind::Composition, false),
-    ("--*", false, RelKind::Composition, false),
-    ("o--", true, RelKind::Aggregation, false),
-    ("--o", false, RelKind::Aggregation, false),
-    ("-->", false, RelKind::Association, true),
-    ("<--", true, RelKind::Association, true),
-    ("--", false, RelKind::Association, false),
-    ("..>", false, RelKind::Dependency, false),
-    ("<..", true, RelKind::Dependency, false),
-    ("..", false, RelKind::DashedLink, false),
+/// `back_arrow` = a second arrowhead on the `from` end (the bidirectional
+/// `<-->` / `<..>` forms).
+const OPERATORS: &[(&str, bool, RelKind, bool, bool)] = &[
+    ("<|--", true, RelKind::Inheritance, false, false),
+    ("--|>", false, RelKind::Inheritance, false, false),
+    ("<|..", true, RelKind::Realization, false, false),
+    ("..|>", false, RelKind::Realization, false, false),
+    ("*--", true, RelKind::Composition, false, false),
+    ("--*", false, RelKind::Composition, false, false),
+    ("o--", true, RelKind::Aggregation, false, false),
+    ("--o", false, RelKind::Aggregation, false, false),
+    ("<-->", false, RelKind::Association, true, true),
+    ("-->", false, RelKind::Association, true, false),
+    ("<--", true, RelKind::Association, true, false),
+    ("--", false, RelKind::Association, false, false),
+    ("<..>", false, RelKind::Dependency, false, true),
+    ("..>", false, RelKind::Dependency, false, false),
+    ("<..", true, RelKind::Dependency, false, false),
+    ("..", false, RelKind::DashedLink, false, false),
 ];
 
-fn lookup_operator(tok: &str) -> Option<(bool, RelKind, bool)> {
-    OPERATORS.iter().find(|(s, ..)| *s == tok).map(|&(_, swap, kind, arrow)| (swap, kind, arrow))
+fn lookup_operator(tok: &str) -> Option<(bool, RelKind, bool, bool)> {
+    OPERATORS
+        .iter()
+        .find(|(s, ..)| *s == tok)
+        .map(|&(_, swap, kind, arrow, back)| (swap, kind, arrow, back))
 }
 
 /// The LONGEST operator that `sub` starts with, or `None`. Longest-first
@@ -283,7 +290,7 @@ impl Parser {
         if op_pos == 0 || op_pos == tokens.len() - 1 {
             return Err(self.err("relationship needs a class id on each side of the operator"));
         }
-        let (swap, kind, arrow) = lookup_operator(tokens[op_pos]).unwrap();
+        let (swap, kind, arrow, back_arrow) = lookup_operator(tokens[op_pos]).unwrap();
         let left_extra = &tokens[1..op_pos];
         let right_extra = &tokens[op_pos + 1..tokens.len() - 1];
         if left_extra.len() > 1 || right_extra.len() > 1 {
@@ -304,7 +311,7 @@ impl Parser {
         } else {
             (left_idx, right_idx, raw_left_mult, raw_right_mult)
         };
-        self.push_relation(Relation { from, to, kind, arrow, m_from, m_to, label })
+        self.push_relation(Relation { from, to, kind, arrow, back_arrow, m_from, m_to, label })
     }
 
     /// `Name : member` — same `(` classification as block members.
@@ -450,8 +457,34 @@ mod tests {
     fn plain_association_has_no_arrow() {
         let g = p("classDiagram\nA -- B");
         assert!(!g.relations[0].arrow);
+        assert!(!g.relations[0].back_arrow);
         let g2 = p("classDiagram\nA --> B");
         assert!(g2.relations[0].arrow);
+        assert!(!g2.relations[0].back_arrow);
+    }
+
+    #[test]
+    fn bidirectional_relations_arrow_both_ends() {
+        // `<-->` / `<..>` were previously rejected ("expected a quoted
+        // multiplicity, found >"), which broke the canonical intro class
+        // example. They must parse and carry an arrowhead on each end.
+        let g = p("classDiagram\nClass08 <--> C2: Cool label");
+        let r = &g.relations[0];
+        assert_eq!(r.kind, RelKind::Association);
+        assert!(r.arrow && r.back_arrow, "both ends should have arrowheads");
+        assert_eq!(r.label.as_deref(), Some("Cool label"));
+
+        let g2 = p("classDiagram\nA <..> B");
+        let r2 = &g2.relations[0];
+        assert_eq!(r2.kind, RelKind::Dependency);
+        assert!(r2.back_arrow);
+
+        // `<-->` must win the longest-match over `<--` so the trailing `>`
+        // is not left dangling.
+        let svg = crate::render("classDiagram\nClass08 <--> C2: Cool label")
+            .svg
+            .expect("intro class example renders");
+        assert!(svg.contains("marker-start"), "back arrowhead missing: {svg}");
     }
 
     #[test]
