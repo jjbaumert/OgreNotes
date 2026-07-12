@@ -114,6 +114,9 @@ struct Parser {
     /// nest at most one level deep (a nested `{` inside a block errors),
     /// so a single slot suffices — unlike flowchart/state's stack.
     block: Option<(usize, usize)>,
+    /// Open `namespace` block: (index into `g.namespaces`, opening line).
+    /// Classes created while this is set are tagged into that namespace.
+    cur_ns: Option<(usize, usize)>,
 }
 
 /// Rewrite Mermaid generic syntax `~Type~` to `<Type>` in a member string.
@@ -147,6 +150,7 @@ pub(crate) fn parse(source: &str) -> Result<ClassGraph, ParseError> {
     let mut p = Parser {
         g: ClassGraph {
             direction: crate::layout::Direction::TB,
+            namespaces: vec![],
             classes: vec![],
             relations: vec![],
             class_defs: vec![],
@@ -154,6 +158,7 @@ pub(crate) fn parse(source: &str) -> Result<ClassGraph, ParseError> {
         ids: HashMap::new(),
         line: 0,
         block: None,
+        cur_ns: None,
     };
     let mut seen_header = false;
     for (idx, raw) in source.lines().enumerate() {
@@ -188,6 +193,12 @@ pub(crate) fn parse(source: &str) -> Result<ClassGraph, ParseError> {
             line: Some(opening_line),
         });
     }
+    if let Some((ni, opening_line)) = p.cur_ns {
+        return Err(ParseError {
+            message: format!("unclosed `namespace {}`", p.g.namespaces[ni]),
+            line: Some(opening_line),
+        });
+    }
     Ok(p.g)
 }
 
@@ -197,6 +208,13 @@ impl Parser {
     }
 
     fn parse_statement(&mut self, stmt: &str) -> Result<(), ParseError> {
+        // A bare `}` at the top level closes an open `namespace` block.
+        if stmt == "}" {
+            if self.cur_ns.take().is_some() {
+                return Ok(());
+            }
+            return Err(self.err("unexpected `}`"));
+        }
         // Standalone annotation: `<<interface>> ClassName` sets that class's
         // annotation. (The `<<...>>`-on-its-own-line form inside a class block
         // is handled by `apply_member`.)
@@ -213,7 +231,8 @@ impl Parser {
         let first = stmt.split_whitespace().next().unwrap_or("");
         match first {
             "direction" => return self.parse_direction(stmt),
-            "namespace" | "click" | "callback" | "link" | "note" => {
+            "namespace" => return self.parse_namespace(stmt),
+            "click" | "callback" | "link" | "note" => {
                 return Err(self.err(format!("`{first}` statements are not supported")));
             }
             "classDef" => return self.parse_class_def(stmt),
@@ -234,6 +253,26 @@ impl Parser {
     }
 
     /// `classDef name prop:val,...`
+    /// `namespace Name {` — opens a namespace block; classes declared inside
+    /// (until the matching `}`) are grouped into it. Not nestable.
+    fn parse_namespace(&mut self, stmt: &str) -> Result<(), ParseError> {
+        if self.cur_ns.is_some() {
+            return Err(self.err("nested `namespace` blocks are not supported"));
+        }
+        let rest = stmt.strip_prefix("namespace").unwrap().trim();
+        let name = match rest.strip_suffix('{') {
+            Some(n) => n.trim(),
+            None => return Err(self.err("`namespace` needs a name and an opening `{`")),
+        };
+        if name.is_empty() {
+            return Err(self.err("`namespace` needs a name"));
+        }
+        let ni = self.g.namespaces.len();
+        self.g.namespaces.push(name.to_string());
+        self.cur_ns = Some((ni, self.line));
+        Ok(())
+    }
+
     /// `direction TB|BT|LR|RL` — sets the whole diagram's layout direction.
     fn parse_direction(&mut self, stmt: &str) -> Result<(), ParseError> {
         let rest = stmt.strip_prefix("direction").unwrap().trim();
@@ -574,6 +613,7 @@ impl Parser {
             methods: vec![],
             classes: vec![],
             style: None,
+            namespace: self.cur_ns.map(|(i, _)| i),
         });
         self.ids.insert(id.to_string(), idx);
         if self.g.classes.len() > crate::layout::MAX_NODES {
@@ -713,11 +753,27 @@ mod tests {
     }
 
     #[test]
+    fn namespace_groups_its_classes() {
+        let g = p("classDiagram\nnamespace Shapes {\n  class Circle\n  class Square\n}\nclass Loose");
+        assert_eq!(g.namespaces, vec!["Shapes".to_string()]);
+        let ns = |id: &str| g.classes.iter().find(|c| c.id == id).unwrap().namespace;
+        assert_eq!(ns("Circle"), Some(0));
+        assert_eq!(ns("Square"), Some(0));
+        assert_eq!(ns("Loose"), None); // declared outside the block
+        // a member block nested inside a namespace closes correctly
+        assert!(p("classDiagram\nnamespace N {\n class A {\n +int x\n }\n}").namespaces.len() == 1);
+        // an unclosed namespace is a loud error
+        assert!(parse("classDiagram\nnamespace N {\n class A").is_err());
+        // nested namespaces are rejected
+        assert!(parse("classDiagram\nnamespace A {\n namespace B {\n }\n}").is_err());
+    }
+
+    #[test]
     fn out_of_scope_statements_error_named() {
         // `style` and `cssClass` moved out of this list: this task turns
         // them into supported styling statements (see
         // `class_styling_parses_and_resolves` / `css_shorthand_now_supported`).
-        for stmt in ["namespace N {", "click A call x()", "callback A \"cb\"",
+        for stmt in ["click A call x()", "callback A \"cb\"",
                      "link A \"url\"", "note for A \"text\""] {
             let src = format!("classDiagram\nclass A\n{stmt}");
             let e = parse(&src).unwrap_err();

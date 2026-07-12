@@ -28,6 +28,7 @@ pub(crate) struct ClassBox {
     pub methods: Vec<String>,
     pub classes: Vec<String>, // cssClass/`:::`-assigned classDef names, in order
     pub style: Option<String>, // sanitized inline `style` override
+    pub namespace: Option<usize>, // enclosing `namespace` block, if any
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +47,7 @@ pub(crate) struct Relation {
 #[derive(Debug, Clone)]
 pub(crate) struct ClassGraph {
     pub direction: crate::layout::Direction,
+    pub namespaces: Vec<String>, // namespace titles, indexed by ClassBox.namespace
     pub classes: Vec<ClassBox>,
     pub relations: Vec<Relation>,
     pub class_defs: Vec<crate::style::ClassDef>,
@@ -80,8 +82,17 @@ pub(crate) fn render_class(source: &str) -> Result<String, crate::ParseError> {
         let height = lines.len() as f64 * (crate::measure::LINE_H + 4.0) + 16.0 + 8.0;
 
         sizes.push((width, height));
-        nodes.push(crate::boxgraph::BoxNode { width, height, cluster: None });
+        nodes.push(crate::boxgraph::BoxNode { width, height, cluster: c.namespace });
     }
+
+    let clusters: Vec<crate::boxgraph::BoxCluster> = g
+        .namespaces
+        .iter()
+        .map(|title| crate::boxgraph::BoxCluster {
+            parent: None,
+            title: crate::measure::text_size(title),
+        })
+        .collect();
 
     let edges: Vec<crate::boxgraph::BoxEdge> = g
         .relations
@@ -96,6 +107,6 @@ pub(crate) fn render_class(source: &str) -> Result<String, crate::ParseError> {
         })
         .collect();
 
-    let layout = crate::boxgraph::layout_boxgraph(&nodes, &edges, &[], g.direction)?;
+    let layout = crate::boxgraph::layout_boxgraph(&nodes, &edges, &clusters, g.direction)?;
     Ok(svg::emit(&g, &layout, &sizes))
 }

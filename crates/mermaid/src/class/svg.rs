@@ -56,6 +56,21 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
         r#"</defs>"#,
     ));
 
+    // 2. namespace boxes (behind everything): dashed rect + title.
+    for (i, title) in g.namespaces.iter().enumerate() {
+        let r = &l.cluster_rects[i];
+        out.push_str(&format!(
+            r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="var(--mermaid-cluster-fill, #7773)" stroke="currentColor" stroke-dasharray="4 2" rx="4"/>"#,
+            r.x, r.y, r.w, r.h
+        ));
+        out.push_str(&format!(
+            r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" fill="currentColor" font-weight="600">{}</text>"#,
+            r.x + r.w / 2.0,
+            r.y + 14.0,
+            escape_xml(title)
+        ));
+    }
+
     // 3. relations (+ label mask rects + label texts + multiplicities).
     // `Relation.to` is always the marker end and `EdgePath.points` was
     // built from -> to (route.rs restores true direction for internally
