@@ -5,7 +5,8 @@
 //! back to raw source. Supports pie charts, flowcharts (graph/flowchart),
 //! sequence diagrams, state diagrams (stateDiagram/stateDiagram-v2),
 //! class diagrams, entity-relationship (ER) diagrams, gantt charts,
-//! git graphs (gitGraph), and mindmaps. Any other/unrecognized kind is
+//! git graphs (gitGraph), mindmaps, timelines, and user journeys. Any
+//! other/unrecognized kind is
 //! `DiagramKind::Unknown` and always errors. See
 //! docs/superpowers/specs/2026-07-08-mermaid-support-design.md (index)
 //! and docs/superpowers/specs/2026-07-10-mermaid-slice4-state-class-er-design.md
@@ -15,6 +16,8 @@ mod pie;
 mod gantt;
 mod gitgraph;
 mod mindmap;
+mod timeline;
+mod journey;
 mod layout;
 pub(crate) mod measure;
 pub(crate) mod style;
@@ -42,6 +45,8 @@ pub enum DiagramKind {
     Gantt,
     GitGraph,
     Mindmap,
+    Timeline,
+    Journey,
     Unknown,
 }
 
@@ -58,6 +63,8 @@ impl DiagramKind {
             DiagramKind::Gantt => "gantt",
             DiagramKind::GitGraph => "git-graph",
             DiagramKind::Mindmap => "mindmap",
+            DiagramKind::Timeline => "timeline",
+            DiagramKind::Journey => "user-journey",
             DiagramKind::Unknown => "unknown",
         }
     }
@@ -147,6 +154,8 @@ pub fn detect_kind(source: &str) -> DiagramKind {
         "gantt" => DiagramKind::Gantt,
         "gitGraph" => DiagramKind::GitGraph,
         "mindmap" => DiagramKind::Mindmap,
+        "timeline" => DiagramKind::Timeline,
+        "journey" => DiagramKind::Journey,
         _ => DiagramKind::Unknown,
     }
 }
@@ -252,6 +261,14 @@ pub fn render(source: &str) -> RenderOutput {
         },
         DiagramKind::Mindmap => match mindmap::parse(source) {
             Ok(m) => RenderOutput { kind, svg: Some(mindmap::render_svg(&m)), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
+        DiagramKind::Timeline => match timeline::parse(source) {
+            Ok(t) => RenderOutput { kind, svg: Some(timeline::render_svg(&t)), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
+        DiagramKind::Journey => match journey::parse(source) {
+            Ok(j) => RenderOutput { kind, svg: Some(journey::render_svg(&j)), error: None },
             Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
         },
         DiagramKind::Unknown => RenderOutput {
