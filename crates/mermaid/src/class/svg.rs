@@ -76,12 +76,14 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
             })
             .collect();
 
-        let dashed = matches!(r.kind, RelKind::Realization | RelKind::Dependency);
+        let dashed =
+            matches!(r.kind, RelKind::Realization | RelKind::Dependency | RelKind::DashedLink);
         let marker: Option<&str> = match r.kind {
             RelKind::Inheritance | RelKind::Realization => Some("mmd-tri-hollow"),
             RelKind::Composition => Some("mmd-diamond-filled"),
             RelKind::Aggregation => Some("mmd-diamond-hollow"),
             RelKind::Dependency => Some("mmd-open"),
+            RelKind::DashedLink => None,
             RelKind::Association => {
                 if r.arrow {
                     Some("mmd-open")
@@ -164,7 +166,7 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
             r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" font-weight="600" fill="currentColor">{}</text>"#,
             cx,
             y - 4.0,
-            escape_xml(&c.id)
+            escape_xml(c.display.as_deref().unwrap_or(&c.id))
         ));
 
         if !c.attributes.is_empty() {
@@ -263,5 +265,43 @@ mod tests {
     #[test]
     fn parse_error_propagates() {
         assert!(render_class("classDiagram\nnamespace N {").is_err());
+    }
+
+    #[test]
+    fn dashed_link_renders_dashed_without_marker() {
+        let svg = render_class("classDiagram\nA .. B").unwrap();
+        assert!(svg.contains("stroke-dasharray"));
+        assert_eq!(svg.matches("marker-end").count(), 0);
+    }
+
+    #[test]
+    fn class_label_renders_as_title() {
+        let svg = render_class("classDiagram\nclass A[\"Account Holder\"]\nA : +id int").unwrap();
+        assert!(svg.contains("Account Holder"));
+        // The label replaces the raw id in the title row.
+        assert!(!svg.contains(">A<"));
+    }
+
+    #[test]
+    fn combined_new_features_render() {
+        // End to end: no-space inheritance, a class label, a dashed link,
+        // a member block, and a `..>` dependency all in one diagram.
+        let src = "classDiagram-v2\n\
+                   class Animal[\"Animal (base)\"]\n\
+                   Animal <|--Duck\n\
+                   Animal <|--Fish\n\
+                   Duck ..> Water : swims in\n\
+                   Duck .. Fish\n\
+                   class Duck {\n\
+                   +String beakColor\n\
+                   +swim()\n\
+                   +quack()\n\
+                   }";
+        let svg = render_class(src).unwrap();
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains("Animal (base)")); // label as title
+        assert!(svg.contains("+String beakColor"));
+        assert!(svg.contains("url(#mmd-tri-hollow)")); // inheritance
+        assert!(svg.contains("stroke-dasharray")); // dependency + dashed link
     }
 }

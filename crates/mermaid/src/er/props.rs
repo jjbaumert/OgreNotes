@@ -20,7 +20,17 @@ fn arb_source() -> impl Strategy<Value = String> {
         Just("A }o--o{ B : rel".to_string()),
         Just("A ||..|| B : rel".to_string()),
         Just("A |o..o| B : rel".to_string()),
-        "[a-zA-Z0-9_\\-: {}|.]{0,24}",
+        // New-syntax coverage: hyphenated + quoted names, aliases,
+        // word-form cardinalities, combined keys, comments.
+        Just("LINE-ITEM ||--|{ DELIVERY-ADDRESS : uses".to_string()),
+        Just("\"Order Detail\" ||--|| A : x".to_string()),
+        Just("CUSTOMER[\"Cust Acct\"] {".to_string()),
+        Just("A only one to zero or more B : has".to_string()),
+        Just("A 1 optionally to 0+ B : maybe".to_string()),
+        Just("int id PK, FK".to_string()),
+        Just("string name \"the label\"".to_string()),
+        Just("int code UK".to_string()),
+        "[a-zA-Z0-9_\\-:\" {}|.]{0,24}",
     ];
     proptest::collection::vec(stmt, 0..40)
         .prop_map(|v| format!("erDiagram\n{}", v.join("\n")))

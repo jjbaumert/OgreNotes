@@ -74,6 +74,24 @@ fn representative_of(input: &LayoutInput, v: usize, target: Option<usize>) -> Op
     }
 }
 
+/// The direction cluster `c` lays out in: its own `direction` if set,
+/// else the nearest ancestor's, falling back to `graph_dir`.
+fn effective_dir(clusters: &[super::LCluster], c: usize, graph_dir: Direction) -> Direction {
+    let mut cur = Some(c);
+    let mut guard = 0usize;
+    while let Some(ci) = cur {
+        if let Some(d) = clusters[ci].direction {
+            return d;
+        }
+        cur = clusters[ci].parent;
+        guard += 1;
+        if guard > clusters.len() {
+            break; // defensive only; validate() rules out parent cycles
+        }
+    }
+    graph_dir
+}
+
 /// Depth of cluster `c` in the parent forest (root clusters are depth 0).
 fn cluster_depth(clusters: &[super::LCluster], c: usize) -> usize {
     let mut depth = 0usize;
@@ -96,6 +114,7 @@ fn cluster_depth(clusters: &[super::LCluster], c: usize) -> usize {
 fn build_level(
     input: &LayoutInput,
     target: Option<usize>,
+    level_dir: Direction,
     sub_builds: &[Option<SubBuild>],
 ) -> Result<SubBuild, String> {
     let mut entities: Vec<Entity> = Vec::new();
@@ -143,45 +162,25 @@ fn build_level(
         }
     }
 
-    // `local_input.direction` below is ALWAYS `TB` (see comment on it), so
-    // `layout_tb` never does its own internal transpose for this level.
-    // But every level's local-x/local-y are the SAME shared axes: levels
-    // nest by pure translation in `expand_level` (no per-level rotation),
-    // and the terminal `apply_direction` runs exactly once, on the whole
-    // assembled layout. So the same "transpose-in, single swap-out" trick
-    // `layout_tb` applies at the top of a flat graph (see its comment) has
-    // to be applied here too, at the one place true node extents enter the
-    // hierarchy: real member nodes, as they're copied into `local_nodes`.
-    // Gate on the ORIGINAL (outer) `input.direction`, not `target`'s
-    // depth — it's a single global convention, not a per-level one.
-    let transpose = matches!(input.direction, Direction::LR | Direction::RL);
+    // Each level is laid out in ITS OWN direction (`level_dir`): member
+    // nodes enter at their true extents, and child clusters enter as
+    // opaque, already-oriented placeholder blocks (their `placeholder_size`
+    // is the FINAL oriented footprint produced when this same function ran
+    // one level down). `layout_tb` + `apply_direction(level_dir)` is exactly
+    // the "transpose-in, swap-out" `run_flat` performs for a flat graph, so
+    // this level's members are oriented and separated correctly for
+    // `level_dir`. Levels then nest by pure translation in `expand_level`,
+    // which is why a subgraph can flow in a different direction than its
+    // parent: each block is oriented before it is placed, and no global
+    // post-transform re-rotates it.
     let mut local_nodes: Vec<LNode> = Vec::with_capacity(entities.len());
     for e in &entities {
         match *e {
             Entity::Node(v) => {
                 let n = &input.nodes[v];
-                if transpose {
-                    local_nodes.push(LNode {
-                        width: n.height,
-                        height: n.width,
-                        cluster: n.cluster,
-                    });
-                } else {
-                    local_nodes.push(n.clone());
-                }
+                local_nodes.push(LNode { width: n.width, height: n.height, cluster: None });
             }
             Entity::Cluster(c) => {
-                // NOT transposed again here: `placeholder_size` comes from
-                // `sub_builds[c].layout.size`, which was already produced
-                // by THIS SAME function one level down, where that level's
-                // own real members went through the `Entity::Node` branch
-                // above and were transposed there. Because nesting is pure
-                // translation, a child's local-x/local-y extents are
-                // already expressed in the same shared axes this level's
-                // `layout_tb` call expects. Swapping again here would
-                // double-transpose every cluster one level deeper than its
-                // parent (a 2-level chain would swap-swap back to
-                // untransposed, a 3-level chain would swap once more, etc).
                 let (w, h) = sub_builds[c]
                     .as_ref()
                     .expect("child clusters are built before their parent")
@@ -195,9 +194,10 @@ fn build_level(
         nodes: local_nodes,
         edges: local_edges.clone(),
         clusters: vec![],
-        direction: Direction::TB,
+        direction: level_dir,
     };
-    let layout = layout_tb(&local_input)?;
+    let mut layout = layout_tb(&local_input)?;
+    apply_direction(&mut layout, level_dir);
 
     Ok(SubBuild {
         entities,
@@ -304,13 +304,14 @@ pub(crate) fn run_clustered(input: &LayoutInput) -> Result<Layout, String> {
 
     let mut sub_builds: Vec<Option<SubBuild>> = (0..input.clusters.len()).map(|_| None).collect();
     for c in order {
-        let build = build_level(input, Some(c), &sub_builds)?;
+        let level_dir = effective_dir(&input.clusters, c, input.direction);
+        let build = build_level(input, Some(c), level_dir, &sub_builds)?;
         let title_h = input.clusters[c].title.1;
         let placeholder_size = (build.layout.size.0, build.layout.size.1 + title_h + CLUSTER_PAD);
         sub_builds[c] = Some(SubBuild { placeholder_size, ..build });
     }
 
-    let top = build_level(input, None, &sub_builds)?;
+    let top = build_level(input, None, input.direction, &sub_builds)?;
 
     let mut node_centers = vec![(0.0, 0.0); input.nodes.len()];
     let mut cluster_rects: Vec<Option<Rect>> = (0..input.clusters.len()).map(|_| None).collect();
@@ -341,9 +342,12 @@ pub(crate) fn run_clustered(input: &LayoutInput) -> Result<Layout, String> {
         })
         .collect();
 
-    let mut layout =
+    // No global `apply_direction` here: every level (including the top) was
+    // already oriented inside `build_level`, so the assembled whole is in
+    // final coordinates. This is what lets a subgraph flow in a different
+    // direction than its parent.
+    let layout =
         Layout { node_centers, edge_paths: edges_out, cluster_rects, size: top.layout.size };
-    apply_direction(&mut layout, input.direction);
     Ok(layout)
 }
 
@@ -365,7 +369,7 @@ mod tests {
         LayoutInput {
             nodes: vec![node_in(None), node_in(Some(0)), node_in(Some(0)), node_in(None)],
             edges: vec![e(0, 1), e(1, 2), e(2, 3)],
-            clusters: vec![LCluster { parent: None, title: (50.0, 16.0) }],
+            clusters: vec![LCluster { parent: None, title: (50.0, 16.0), direction: None }],
             direction: Direction::TB,
         }
     }
@@ -401,8 +405,8 @@ mod tests {
             nodes: vec![node_in(Some(0)), node_in(Some(1))],
             edges: vec![e(0, 1)],
             clusters: vec![
-                LCluster { parent: None, title: (40.0, 16.0) },
-                LCluster { parent: Some(0), title: (40.0, 16.0) },
+                LCluster { parent: None, title: (40.0, 16.0), direction: None },
+                LCluster { parent: Some(0), title: (40.0, 16.0), direction: None },
             ],
             direction: Direction::TB,
         };
@@ -425,11 +429,62 @@ mod tests {
     }
 
     #[test]
+    fn subgraph_direction_overrides_parent() {
+        // Parent graph is TB, but the subgraph declares `direction LR`: its
+        // two members must flow left-to-right (node 2 right of node 1, same
+        // row) instead of top-to-bottom, while still nesting in the cluster.
+        let input = LayoutInput {
+            nodes: vec![node_in(None), node_in(Some(0)), node_in(Some(0))],
+            edges: vec![e(0, 1), e(1, 2)],
+            clusters: vec![LCluster {
+                parent: None,
+                title: (50.0, 16.0),
+                direction: Some(Direction::LR),
+            }],
+            direction: Direction::TB,
+        };
+        let l = run_clustered(&input).unwrap();
+        assert!(
+            l.node_centers[2].0 > l.node_centers[1].0 + 20.0,
+            "LR subgraph: node 2 {:?} must be right of node 1 {:?}",
+            l.node_centers[2],
+            l.node_centers[1]
+        );
+        assert!(
+            (l.node_centers[2].1 - l.node_centers[1].1).abs() < 20.0,
+            "LR subgraph: members share a row (y close): {:?} {:?}",
+            l.node_centers[1],
+            l.node_centers[2]
+        );
+        let r = &l.cluster_rects[0];
+        assert!(inside(l.node_centers[1], r));
+        assert!(inside(l.node_centers[2], r));
+        assert!(!inside(l.node_centers[0], r));
+    }
+
+    #[test]
+    fn same_members_flow_vertically_without_subgraph_direction() {
+        // Contrast to `subgraph_direction_overrides_parent`: the identical
+        // graph with a TB (default) subgraph stacks the members vertically.
+        let input = LayoutInput {
+            nodes: vec![node_in(None), node_in(Some(0)), node_in(Some(0))],
+            edges: vec![e(0, 1), e(1, 2)],
+            clusters: vec![LCluster { parent: None, title: (50.0, 16.0), direction: None }],
+            direction: Direction::TB,
+        };
+        let l = run_clustered(&input).unwrap();
+        assert!(
+            l.node_centers[2].1 > l.node_centers[1].1 + 10.0,
+            "TB subgraph: node 2 below node 1"
+        );
+    }
+
+    #[test]
     fn empty_cluster_is_harmless() {
         let input = LayoutInput {
             nodes: vec![node_in(None)],
             edges: vec![],
-            clusters: vec![LCluster { parent: None, title: (40.0, 16.0) }],
+            clusters: vec![LCluster { parent: None, title: (40.0, 16.0), direction: None }],
             direction: Direction::TB,
         };
         let l = run_clustered(&input).unwrap();
@@ -444,7 +499,7 @@ mod tests {
         let input = LayoutInput {
             nodes: vec![node_in(None), node_in(Some(0))],
             edges: vec![e(0, 1), e(1, 1)],
-            clusters: vec![LCluster { parent: None, title: (50.0, 16.0) }],
+            clusters: vec![LCluster { parent: None, title: (50.0, 16.0), direction: None }],
             direction: Direction::TB,
         };
         let l = run_clustered(&input).unwrap();
@@ -463,8 +518,8 @@ mod tests {
             nodes: vec![node_in(None), node_in(Some(1))],
             edges: vec![e(0, 1), e(1, 1)],
             clusters: vec![
-                LCluster { parent: None, title: (50.0, 16.0) },
-                LCluster { parent: Some(0), title: (50.0, 16.0) },
+                LCluster { parent: None, title: (50.0, 16.0), direction: None },
+                LCluster { parent: Some(0), title: (50.0, 16.0), direction: None },
             ],
             direction: Direction::TB,
         };
@@ -492,7 +547,7 @@ mod tests {
                 LNode { width: 120.0, height: 20.0, cluster: Some(0) },
             ],
             edges: vec![e(0, 1), e(1, 2)],
-            clusters: vec![LCluster { parent: None, title: (50.0, 16.0) }],
+            clusters: vec![LCluster { parent: None, title: (50.0, 16.0), direction: None }],
             direction: Direction::LR,
         };
         let l = run_clustered(&input).unwrap();

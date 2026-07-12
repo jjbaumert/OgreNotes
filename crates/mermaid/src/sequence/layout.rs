@@ -205,7 +205,10 @@ fn pass2_rows(
     canvas_w: f64,
 ) -> (Vec<MsgLayout>, Vec<NoteLayout>, Vec<ActRect>, Vec<FrameRect>, f64) {
     let mut cursor = body_top;
+    // `autonum` is the next number to assign (None = numbering disabled);
+    // `autonum_step` is the increment applied after each numbered message.
     let mut autonum: Option<u32> = None;
+    let mut autonum_step: u32 = 1;
     // (kind, label, top, depth-at-open, dividers)
     #[allow(clippy::type_complexity)]
     let mut frame_stack: Vec<(FragmentKind, String, f64, usize, Vec<(f64, String)>)> = Vec::new();
@@ -219,8 +222,12 @@ fn pass2_rows(
 
     for (idx, ev) in d.events.iter().enumerate() {
         match ev {
-            Event::Autonumber => {
-                autonum = Some(1);
+            Event::Autonumber { start, step } => {
+                autonum = Some(*start);
+                autonum_step = *step;
+            }
+            Event::AutonumberOff => {
+                autonum = None;
             }
             Event::Message { from, to, text, activate_target, deactivate_source, .. } => {
                 let self_msg = from == to;
@@ -246,8 +253,8 @@ fn pass2_rows(
                     ((fx + tx) / 2.0, line_y - 6.0)
                 };
                 let number = autonum;
-                if autonum.is_some() {
-                    autonum = autonum.map(|n| n + 1);
+                if let Some(n) = autonum {
+                    autonum = Some(n.saturating_add(autonum_step));
                 }
                 messages.push(MsgLayout { event: idx, y: line_y, text_anchor, number });
 
@@ -478,6 +485,15 @@ mod tests {
         assert_eq!(l.messages[0].number, None);
         assert_eq!(l.messages[1].number, Some(1));
         assert_eq!(l.messages[2].number, Some(2));
+    }
+
+    #[test]
+    fn autonumber_start_step_and_off() {
+        // start=10 step=5, then `off` stops numbering the last message.
+        let l = lay("sequenceDiagram\nautonumber 10 5\nA->>B: a\nA->>B: b\nautonumber off\nA->>B: c");
+        assert_eq!(l.messages[0].number, Some(10));
+        assert_eq!(l.messages[1].number, Some(15));
+        assert_eq!(l.messages[2].number, None);
     }
 
     #[test]

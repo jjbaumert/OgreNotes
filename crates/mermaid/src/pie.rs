@@ -107,6 +107,14 @@ const R: f64 = 110.0;
 /// `PALETTE`; all text uses `currentColor` so it tracks the app theme.
 pub(crate) fn render_svg(pie: &Pie) -> String {
     let total: f64 = pie.slices.iter().map(|(_, v)| *v).sum();
+    // Mermaid parity: a wedge is only drawn when its value is at least 1%
+    // of the total (`(value / total) * 100 >= 1`); the kept wedges are
+    // then re-normalized to fill the full circle (d3.pie recomputes angles
+    // from the *kept* sum). The legend still lists every slice, so `shown`
+    // gates the wedge only, never the legend row. `total > 0.0` guards the
+    // all-zero case (where the ratio would be `0/0`).
+    let shown = |v: f64| total > 0.0 && v >= total * 0.01;
+    let shown_total: f64 = pie.slices.iter().map(|&(_, v)| v).filter(|&v| shown(v)).sum();
     let mut svg = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" style="font-family:sans-serif;font-size:12px">"#
     );
@@ -119,10 +127,10 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
         ));
     }
 
-    // Zero-total: draw an empty outlined circle (no slice has any share of
-    // a 0.0 total, so every `frac` below is 0 and no wedge would be
-    // visible otherwise).
-    if total == 0.0 {
+    // No visible wedges (all-zero total, or every slice below the 1%
+    // threshold): draw an empty outlined circle so the chart area isn't
+    // blank.
+    if shown_total == 0.0 {
         svg.push_str(&format!(
             r#"<circle cx="{CX}" cy="{CY}" r="{R}" fill="none" stroke="currentColor" stroke-width="1"/>"#
         ));
@@ -130,7 +138,7 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
 
     let mut angle = -std::f64::consts::FRAC_PI_2; // start at 12 o'clock
     for (i, (label, value)) in pie.slices.iter().enumerate() {
-        let frac = if total > 0.0 { value / total } else { 0.0 };
+        let frac = if shown(*value) && shown_total > 0.0 { value / shown_total } else { 0.0 };
         let fill = PALETTE[i % PALETTE.len()];
         if frac >= 1.0 {
             // A full-sweep arc's start/end points coincide (especially
@@ -295,6 +303,36 @@ mod tests {
         let svg = render_svg(&p);
         assert!(svg.contains("<circle"), "expected an outlined empty circle, got: {svg}");
         assert!(svg.contains("fill=\"none\""), "zero-total circle must be unfilled, got: {svg}");
+    }
+
+    #[test]
+    fn sub_one_percent_slice_dropped_from_pie_but_kept_in_legend() {
+        // Mermaid parity: a wedge below 1% of the total is not drawn, but
+        // it still gets a legend row.
+        let p = parse("pie\n\"A\" : 60\n\"B\" : 39.5\n\"C\" : 0.5").unwrap();
+        let svg = render_svg(&p);
+        assert_eq!(svg.matches("<path").count(), 2, "sub-1% slice C gets no wedge");
+        assert_eq!(svg.matches("<text x=\"320\"").count(), 3, "all three slices in the legend");
+    }
+
+    #[test]
+    fn exactly_one_percent_slice_is_kept() {
+        // `(value / total) * 100 >= 1` keeps a slice at exactly 1%.
+        let p = parse("pie\n\"A\" : 99\n\"B\" : 1").unwrap();
+        let svg = render_svg(&p);
+        assert_eq!(svg.matches("<path").count(), 2, "exactly-1% slice B is kept as a wedge");
+    }
+
+    #[test]
+    fn kept_wedges_renormalize_to_fill_the_circle() {
+        // After a sub-1% slice is dropped, the remaining share is computed
+        // against the KEPT total — so a lone dominant slice becomes a full
+        // disc (frac == 1.0), rendered as a <circle>, not a partial arc.
+        let p = parse("pie\n\"Big\" : 199\n\"Tiny\" : 1").unwrap();
+        let svg = render_svg(&p);
+        assert!(svg.contains("<circle"), "Big re-normalizes to a full disc: {svg}");
+        assert_eq!(svg.matches("<path").count(), 0, "no partial arc when one wedge fills the circle");
+        assert_eq!(svg.matches("<text x=\"320\"").count(), 2, "both slices still in the legend");
     }
 
     #[test]

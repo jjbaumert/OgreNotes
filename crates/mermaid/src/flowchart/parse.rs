@@ -173,7 +173,8 @@ impl Parser {
             "end" if stmt == "end" => return self.parse_subgraph_end(),
             "classDef" => return self.parse_class_def(stmt),
             "class" => return self.parse_class_assign(stmt),
-            "click" | "linkStyle" | "style" | "direction" => {
+            "direction" => return self.parse_direction(stmt),
+            "click" | "linkStyle" | "style" => {
                 return Err(self.err(format!("`{first}` statements are not supported")));
             }
             _ if stmt.starts_with("accTitle") || stmt.starts_with("accDescr") => {
@@ -183,6 +184,27 @@ impl Parser {
             _ => {}
         }
         self.parse_chain(stmt)
+    }
+
+    /// `direction TB|BT|LR|RL` inside a subgraph sets that subgraph's own
+    /// layout direction. At the top level, direction comes from the header
+    /// (`flowchart LR`), so a top-level `direction` statement is rejected.
+    fn parse_direction(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let Some(&(idx, _)) = self.stack.last() else {
+            return Err(self.err(
+                "`direction` statements are only supported inside a subgraph (set the graph direction in the header, e.g. `flowchart LR`)",
+            ));
+        };
+        let rest = stmt.strip_prefix("direction").unwrap().trim();
+        let dir = match rest {
+            "TB" | "TD" => Direction::TB,
+            "BT" => Direction::BT,
+            "LR" => Direction::LR,
+            "RL" => Direction::RL,
+            other => return Err(self.err(format!("unknown direction {other:?}"))),
+        };
+        self.g.subgraphs[idx].direction = Some(dir);
+        Ok(())
     }
 
     fn parse_subgraph_open(&mut self, stmt: &str) -> Result<(), ParseError> {
@@ -211,7 +233,12 @@ impl Parser {
         }
         let parent = self.stack.last().map(|&(i, _)| i);
         let idx = self.g.subgraphs.len();
-        self.g.subgraphs.push(crate::flowchart::FlowSubgraph { id, title, parent });
+        self.g.subgraphs.push(crate::flowchart::FlowSubgraph {
+            id,
+            title,
+            parent,
+            direction: None,
+        });
         self.stack.push((idx, self.line));
         Ok(())
     }
@@ -952,9 +979,33 @@ mod tests {
     }
 
     #[test]
-    fn direction_inside_subgraph_errors() {
-        let e = parse("graph TD\nsubgraph s\ndirection LR\nend").unwrap_err();
+    fn direction_inside_subgraph_sets_subgraph_direction() {
+        let g = p("graph TD\nsubgraph s\ndirection LR\nA --> B\nend");
+        assert_eq!(g.subgraphs[0].direction, Some(Direction::LR));
+        // The graph direction still comes from the header.
+        assert_eq!(g.direction, Direction::TB);
+        // All four directions accepted; TD normalizes to TB.
+        for (kw, want) in [("TB", Direction::TB), ("TD", Direction::TB),
+                           ("BT", Direction::BT), ("RL", Direction::RL)] {
+            let g = p(&format!("graph LR\nsubgraph s\ndirection {kw}\nA\nend"));
+            assert_eq!(g.subgraphs[0].direction, Some(want), "for {kw}");
+        }
+    }
+
+    #[test]
+    fn top_level_direction_statement_still_errors() {
+        // Direction is set in the header at the top level; a bare
+        // `direction` statement outside any subgraph is rejected.
+        let e = parse("graph TD\nA\ndirection LR").unwrap_err();
         assert_eq!(e.line, Some(3));
+        assert!(e.message.contains("direction"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn unknown_subgraph_direction_errors() {
+        let e = parse("graph TD\nsubgraph s\ndirection XX\nend").unwrap_err();
+        assert_eq!(e.line, Some(3));
+        assert!(e.message.contains("unknown direction"), "got: {}", e.message);
     }
 
     #[test]

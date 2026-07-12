@@ -14,11 +14,15 @@ pub(crate) enum RelKind {
     Aggregation, // o--    hollow diamond at `to` end, solid
     Association, // --> or --  open arrow at `to` end (--> only), solid
     Dependency,  // ..>    open arrow at `to` end, dashed
+    DashedLink,  // ..     no marker, dashed (the dashed peer of `--`)
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ClassBox {
     pub id: String,
+    /// Display label from a `class Name["Label"]` declaration; the
+    /// canonical `id` is still what members and relationships reference.
+    pub display: Option<String>,
     pub annotation: Option<String>, // <<interface>> etc.
     pub attributes: Vec<String>,    // raw member text, verbatim
     pub methods: Vec<String>,
@@ -58,7 +62,7 @@ pub(crate) fn render_class(source: &str) -> Result<String, crate::ParseError> {
         if let Some(ann) = &c.annotation {
             lines.push(format!("«{ann}»"));
         }
-        lines.push(c.id.clone());
+        lines.push(c.display.clone().unwrap_or_else(|| c.id.clone()));
         lines.extend(c.attributes.iter().cloned());
         lines.extend(c.methods.iter().cloned());
 

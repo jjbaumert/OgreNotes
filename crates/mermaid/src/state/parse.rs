@@ -17,6 +17,15 @@ enum EndpointRole {
     Target,
 }
 
+/// An open multi-line note block (`note left of X` with no colon, body
+/// on following lines, closed by `end note`).
+struct NoteBlock {
+    state: usize,
+    right: bool,
+    body: Vec<String>,
+    opening_line: usize,
+}
+
 struct Parser {
     g: StateGraph,
     ids: HashMap<String, usize>,
@@ -28,6 +37,9 @@ struct Parser {
     /// Open composite states: (composite index, opening line). Top of
     /// stack is the innermost currently-open composite.
     stack: Vec<(usize, usize)>,
+    /// Open multi-line note block; body lines are captured verbatim until
+    /// `end note`.
+    note_block: Option<NoteBlock>,
     line: usize, // 1-based, for errors
     start_count: usize,
     end_count: usize,
@@ -76,6 +88,7 @@ pub(crate) fn parse(source: &str) -> Result<StateGraph, ParseError> {
         ids: HashMap::new(),
         composite_ids: HashMap::new(),
         stack: Vec::new(),
+        note_block: None,
         line: 0,
         start_count: 0,
         end_count: 0,
@@ -101,6 +114,17 @@ pub(crate) fn parse(source: &str) -> Result<StateGraph, ParseError> {
             seen_header = true;
             continue;
         }
+        // Inside a multi-line note block, every line is body text until
+        // the closing `end note` — no statement splitting or transition
+        // parsing applies.
+        if p.note_block.is_some() {
+            if line == "end note" {
+                p.close_note_block();
+            } else {
+                p.note_block.as_mut().expect("checked is_some").body.push(line.to_string());
+            }
+            continue;
+        }
         for stmt in split_statements(line) {
             let stmt = stmt.trim();
             if stmt.is_empty() {
@@ -113,6 +137,12 @@ pub(crate) fn parse(source: &str) -> Result<StateGraph, ParseError> {
         return Err(ParseError {
             message: "state diagram must start with `stateDiagram` or `stateDiagram-v2`".into(),
             line: Some(1),
+        });
+    }
+    if let Some(nb) = &p.note_block {
+        return Err(ParseError {
+            message: format!("unclosed note block on `{}`", p.g.nodes[nb.state].id),
+            line: Some(nb.opening_line),
         });
     }
     if let Some(&(idx, opening_line)) = p.stack.last() {
@@ -348,21 +378,46 @@ impl Parser {
             return Err(self.err("note needs a placement (`left of` or `right of`)"));
         };
         let after_placement = rest[lit.len()..].trim_start();
-        let Some((id_part, text)) = after_placement.split_once(':') else {
-            return Err(self.err("multi-line notes are not supported"));
-        };
-        let id_part = id_part.trim();
-        if id_part.is_empty()
-            || !id_part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            return Err(self.err(format!("invalid state id {id_part:?}")));
+        match after_placement.split_once(':') {
+            // Single-line form: `note left of X: text`.
+            Some((id_part, text)) => {
+                let idx = self.resolve_note_target(id_part.trim())?;
+                self.g.notes.push(StateNote { state: idx, right, text: text.trim().to_string() });
+                Ok(())
+            }
+            // Block form: `note left of X` opens a note whose body runs on
+            // the following lines until `end note`.
+            None => {
+                let idx = self.resolve_note_target(after_placement.trim())?;
+                self.note_block =
+                    Some(NoteBlock { state: idx, right, body: Vec::new(), opening_line: self.line });
+                Ok(())
+            }
         }
-        if id_part.starts_with("__") {
+    }
+
+    /// Validates and interns a note's target state id (shared by the
+    /// single-line and block note forms).
+    fn resolve_note_target(&mut self, id: &str) -> Result<usize, ParseError> {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(self.err(format!("invalid state id {id:?}")));
+        }
+        if id.starts_with("__") {
             return Err(self.err("cannot attach a note to a synthetic state id"));
         }
-        let idx = self.ensure_node(id_part)?;
-        self.g.notes.push(StateNote { state: idx, right, text: text.trim().to_string() });
-        Ok(())
+        self.ensure_node(id)
+    }
+
+    /// Closes an open note block, joining its body lines with `<br/>`
+    /// (the state label/note renderer already splits on `<br/>`).
+    fn close_note_block(&mut self) {
+        if let Some(nb) = self.note_block.take() {
+            self.g.notes.push(StateNote {
+                state: nb.state,
+                right: nb.right,
+                text: nb.body.join("<br/>"),
+            });
+        }
     }
 
     /// `endpoint --> endpoint [: label]`.
@@ -588,9 +643,36 @@ mod tests {
     }
 
     #[test]
-    fn multiline_note_block_errors() {
-        let e = parse("stateDiagram-v2\na --> b\nnote left of a\nsome text\nend note").unwrap_err();
+    fn multiline_note_block() {
+        let g = p("stateDiagram-v2\na --> b\nnote left of a\nline one\nline two\nend note");
+        assert_eq!(g.notes.len(), 1);
+        assert!(!g.notes[0].right);
+        assert_eq!(g.notes[0].text, "line one<br/>line two");
+        // right-of block form + a single-line note still coexist.
+        let g = p("stateDiagram-v2\na --> b\nnote right of b\nonly line\nend note\nnote left of a: quick");
+        assert_eq!(g.notes.len(), 2);
+        assert!(g.notes[0].right);
+        assert_eq!(g.notes[0].text, "only line");
+        assert_eq!(g.notes[1].text, "quick");
+    }
+
+    #[test]
+    fn unclosed_note_block_errors_at_opening_line() {
+        let e = parse("stateDiagram-v2\na --> b\nnote left of a\nsome text").unwrap_err();
         assert_eq!(e.line, Some(3));
+        assert!(e.message.contains("unclosed note"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn note_block_body_is_not_parsed_as_statements() {
+        // Body lines that look like transitions/keywords are literal text,
+        // not parsed — the whole block is one note.
+        let g = p("stateDiagram-v2\nnote left of a\nx --> y\nstate Z {\nend note\na --> b");
+        assert_eq!(g.notes.len(), 1);
+        assert_eq!(g.notes[0].text, "x --> y<br/>state Z {");
+        // Only the real transition outside the block was parsed.
+        assert_eq!(g.transitions.len(), 1);
+        assert_eq!(g.composites.len(), 0);
     }
 
     #[test]

@@ -162,14 +162,7 @@ impl Parser {
         let first = stmt.split_whitespace().next().unwrap_or("");
         match first {
             "participant" | "actor" => return self.parse_participant(stmt, first == "actor"),
-            "autonumber" if stmt == "autonumber" => return self.push_event(Event::Autonumber),
-            "autonumber" => {
-                // Real mermaid supports `autonumber off` / `autonumber 10
-                // 10` (start/step) forms; silently treating either as a
-                // bare `autonumber` would restart numbering with the
-                // wrong semantics, so refuse rather than misparse.
-                return Err(self.err("autonumber arguments are not supported"))
-            }
+            "autonumber" => return self.parse_autonumber(stmt),
             "activate" | "deactivate" => return self.parse_activation(stmt, first == "activate"),
             "loop" | "alt" | "opt" | "par" | "critical" | "break" => {
                 return self.parse_fragment_open(stmt, first)
@@ -199,6 +192,40 @@ impl Parser {
             return Err(self.err("half arrows are not supported"));
         }
         Err(self.err(format!("unsupported statement: {first:?}")))
+    }
+
+    /// `autonumber` / `autonumber off` / `autonumber <start>` /
+    /// `autonumber <start> <step>`. Start and step are non-negative
+    /// integers; non-integer (e.g. decimal) or extra arguments error
+    /// loudly rather than misparse.
+    fn parse_autonumber(&mut self, stmt: &str) -> Result<(), ParseError> {
+        // `stmt`'s first token is `autonumber` (dispatch guarantees it).
+        let rest = stmt["autonumber".len()..].trim();
+        if rest.is_empty() {
+            return self.push_event(Event::Autonumber { start: 1, step: 1 });
+        }
+        if rest.eq_ignore_ascii_case("off") {
+            return self.push_event(Event::AutonumberOff);
+        }
+        let mut nums = rest.split_whitespace();
+        let start_tok = nums.next().unwrap_or_default();
+        let start = start_tok.parse::<u32>().map_err(|_| {
+            self.err(format!(
+                "autonumber start must be a non-negative integer, found {start_tok:?}"
+            ))
+        })?;
+        let step = match nums.next() {
+            None => 1,
+            Some(step_tok) => step_tok.parse::<u32>().map_err(|_| {
+                self.err(format!(
+                    "autonumber increment must be a non-negative integer, found {step_tok:?}"
+                ))
+            })?,
+        };
+        if nums.next().is_some() {
+            return Err(self.err("autonumber takes at most `<start> <increment>`"));
+        }
+        self.push_event(Event::Autonumber { start, step })
     }
 
     /// `activate ID` / `deactivate ID` — shares `active_depth` with the
@@ -367,6 +394,12 @@ impl Parser {
         if rest.is_empty() {
             return Err(self.err("participant needs an id"));
         }
+        // `participant {"database":"X"}` (JSON participant types / symbol
+        // shapes / inline alias, v11.x) — reject with a named error rather
+        // than letting the `{…}` fall through to a generic invalid-id.
+        if rest.starts_with('{') {
+            return Err(self.err("JSON participant types (`participant {...}`) are not supported"));
+        }
         let (id, display) = match rest.split_once(" as ") {
             Some((id, d)) => (id.trim(), Some(d.trim().to_string())),
             None => (rest, None),
@@ -508,6 +541,19 @@ mod tests {
     }
 
     #[test]
+    fn json_participant_types_rejected_named() {
+        for src in [
+            "participant {\"database\":\"DB\"}",
+            "participant {\"alias\":\"A\"}",
+            "actor {\"actor\":\"Name\"}",
+        ] {
+            let e = parse(&format!("sequenceDiagram\n{src}")).unwrap_err();
+            assert_eq!(e.line, Some(2), "for {src}");
+            assert!(e.message.contains("JSON participant"), "for {src}, got: {}", e.message);
+        }
+    }
+
+    #[test]
     fn implicit_participants_in_declaration_order() {
         let g = p("sequenceDiagram\nZed->>Amy: hi\nAmy-->>Zed: yo");
         assert_eq!(g.participants[0].id, "Zed"); // first appearance wins
@@ -604,22 +650,35 @@ mod tests {
     #[test]
     fn autonumber_event() {
         let g = p("sequenceDiagram\nautonumber\nA->>B: hi");
-        assert!(matches!(g.events[0], Event::Autonumber));
+        assert!(matches!(g.events[0], Event::Autonumber { start: 1, step: 1 }));
     }
 
     #[test]
-    fn autonumber_with_arguments_errors() {
-        // Real mermaid supports `autonumber off` / `autonumber 10 10`
-        // (start/step) forms. Matching only the first token would
-        // silently treat either as a bare `autonumber`, restarting
-        // numbering with the wrong semantics — must error instead.
-        let e = parse("sequenceDiagram\nA->>B: x\nautonumber off").unwrap_err();
-        assert_eq!(e.line, Some(3));
-        assert!(e.message.contains("autonumber"), "got: {}", e.message);
+    fn autonumber_start_and_step() {
+        // `autonumber <start>` (step defaults to 1) and
+        // `autonumber <start> <step>` are both supported.
+        let g = p("sequenceDiagram\nautonumber 10\nA->>B: x");
+        assert!(matches!(g.events[0], Event::Autonumber { start: 10, step: 1 }));
+        let g = p("sequenceDiagram\nautonumber 10 5\nA->>B: x");
+        assert!(matches!(g.events[0], Event::Autonumber { start: 10, step: 5 }));
+    }
 
-        let e = parse("sequenceDiagram\nautonumber 10 10\nA->>B: x").unwrap_err();
-        assert_eq!(e.line, Some(2));
-        assert!(e.message.contains("autonumber"), "got: {}", e.message);
+    #[test]
+    fn autonumber_off_supported() {
+        let g = p("sequenceDiagram\nautonumber\nA->>B: x\nautonumber off\nB->>A: y");
+        assert!(matches!(g.events[0], Event::Autonumber { .. }));
+        assert!(matches!(g.events[2], Event::AutonumberOff));
+    }
+
+    #[test]
+    fn autonumber_non_integer_or_extra_args_error() {
+        // Decimals (mentioned by the docs but not modeled here) and
+        // surplus tokens fail loudly rather than misparse.
+        for bad in ["autonumber 1.5", "autonumber 10 0.5", "autonumber 1 2 3", "autonumber x"] {
+            let e = parse(&format!("sequenceDiagram\n{bad}")).unwrap_err();
+            assert_eq!(e.line, Some(2), "for {bad}");
+            assert!(e.message.contains("autonumber"), "for {bad}, got: {}", e.message);
+        }
     }
 
     #[test]

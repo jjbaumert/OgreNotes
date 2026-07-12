@@ -36,10 +36,67 @@ const OPERATORS: &[(&str, bool, RelKind, bool)] = &[
     ("--", false, RelKind::Association, false),
     ("..>", false, RelKind::Dependency, false),
     ("<..", true, RelKind::Dependency, false),
+    ("..", false, RelKind::DashedLink, false),
 ];
 
 fn lookup_operator(tok: &str) -> Option<(bool, RelKind, bool)> {
     OPERATORS.iter().find(|(s, ..)| *s == tok).map(|&(_, swap, kind, arrow)| (swap, kind, arrow))
+}
+
+/// The LONGEST operator that `sub` starts with, or `None`. Longest-first
+/// so that `-->` beats `--`, `..>` beats `..`, `<|--` beats nothing
+/// shorter, etc. — the key to splitting glued operators like `A-->B`.
+/// All operator tokens are ASCII, so a prefix match is byte-safe.
+fn match_operator_at(sub: &str) -> Option<&'static str> {
+    OPERATORS
+        .iter()
+        .map(|&(op, ..)| op)
+        .filter(|op| sub.starts_with(op))
+        .max_by_key(|op| op.len())
+}
+
+/// Tokenizes a relationship's pre-colon portion, splitting operators out
+/// as their own tokens even when glued to ids (`A-->B` → `[A, -->, B]`)
+/// while keeping `"quoted multiplicities"` intact (their inner `..` is
+/// never mistaken for an operator). Whitespace-separated input tokenizes
+/// identically, so spaced and unspaced forms share one path.
+fn tokenize_rel(s: &str) -> Vec<String> {
+    let mut toks = Vec::new();
+    let mut cur = String::new();
+    let mut chars = s.char_indices().peekable();
+    while let Some((idx, c)) = chars.next() {
+        if c == '"' {
+            if !cur.is_empty() {
+                toks.push(std::mem::take(&mut cur));
+            }
+            let mut q = String::from("\"");
+            for (_, c2) in chars.by_ref() {
+                q.push(c2);
+                if c2 == '"' {
+                    break;
+                }
+            }
+            toks.push(q); // an unterminated quote is left for parse_mult to reject
+        } else if c.is_whitespace() {
+            if !cur.is_empty() {
+                toks.push(std::mem::take(&mut cur));
+            }
+        } else if let Some(op) = match_operator_at(&s[idx..]) {
+            if !cur.is_empty() {
+                toks.push(std::mem::take(&mut cur));
+            }
+            toks.push(op.to_string());
+            for _ in 1..op.len() {
+                chars.next(); // ASCII operator: 1 byte == 1 char per step
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        toks.push(cur);
+    }
+    toks
 }
 
 struct Parser {
@@ -68,7 +125,7 @@ pub(crate) fn parse(source: &str) -> Result<ClassGraph, ParseError> {
         }
         if !seen_header {
             let header = line.strip_suffix(';').unwrap_or(line).trim_end();
-            if header != "classDiagram" {
+            if header != "classDiagram" && header != "classDiagram-v2" {
                 return Err(p.err("class diagram must start with `classDiagram`"));
             }
             seen_header = true;
@@ -101,9 +158,17 @@ impl Parser {
     }
 
     fn parse_statement(&mut self, stmt: &str) -> Result<(), ParseError> {
+        // `:::` is the CSS-class shorthand (`Node:::className`). We don't
+        // support styling; reject it explicitly so it can never slip
+        // through the `:` label split and be silently stored as a bogus
+        // member.
+        if stmt.contains(":::") {
+            return Err(self.err("CSS class shorthand `:::` is not supported"));
+        }
         let first = stmt.split_whitespace().next().unwrap_or("");
         match first {
-            "namespace" | "click" | "callback" | "style" | "cssClass" | "link" | "note" => {
+            "namespace" | "click" | "callback" | "style" | "cssClass" | "link" | "note"
+            | "classDef" | "direction" => {
                 return Err(self.err(format!("`{first}` statements are not supported")));
             }
             "class" => return self.parse_class_stmt(stmt),
@@ -112,7 +177,8 @@ impl Parser {
         self.parse_member_or_relationship(stmt)
     }
 
-    /// `class Name` / `class Name {`.
+    /// `class Name` / `class Name {` / `class Name["Label"]` (+ optional
+    /// `{`).
     fn parse_class_stmt(&mut self, stmt: &str) -> Result<(), ParseError> {
         let rest = stmt.strip_prefix("class").unwrap().trim_start();
         // ASCII id scan: char count == byte length only because the
@@ -123,8 +189,14 @@ impl Parser {
             return Err(self.err("expected a class id after `class`"));
         }
         let id = rest[..id_len].to_string();
-        let after = rest[id_len..].trim();
         let idx = self.ensure_class(&id)?;
+        let mut after = rest[id_len..].trim_start();
+        if after.starts_with('[') {
+            let (label, tail) = self.parse_class_label(after)?;
+            self.g.classes[idx].display = Some(label);
+            after = tail;
+        }
+        let after = after.trim();
         if after.is_empty() {
             return Ok(());
         }
@@ -133,6 +205,30 @@ impl Parser {
             return Ok(());
         }
         Err(self.err(format!("unexpected text after class id: {after:?}")))
+    }
+
+    /// `["Label text"]` (or `[Label]`, or a markdown-string
+    /// ``["`Label`"]``) starting at the leading `[`. Returns
+    /// `(label, trimmed_remainder)`. `[` / `]` are ASCII, so the byte
+    /// slices are char-boundary-safe.
+    fn parse_class_label<'a>(&self, s: &'a str) -> Result<(String, &'a str), ParseError> {
+        let inner = &s[1..];
+        match inner.find(']') {
+            Some(end) => {
+                let raw = inner[..end].trim();
+                let unquoted =
+                    raw.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(raw);
+                let label = unquoted
+                    .strip_prefix('`')
+                    .and_then(|x| x.strip_suffix('`'))
+                    .unwrap_or(unquoted);
+                if label.is_empty() {
+                    return Err(self.err("empty class label `[]`"));
+                }
+                Ok((label.to_string(), inner[end + 1..].trim_start()))
+            }
+            None => Err(self.err("unterminated class label `[...]`")),
+        }
     }
 
     /// One line inside an open member block: bare `}` closes it; a line
@@ -163,7 +259,8 @@ impl Parser {
             Some((b, a)) => (b, Some(a)),
             None => (stmt, None),
         };
-        let tokens: Vec<&str> = before.split_whitespace().collect();
+        let owned = tokenize_rel(before);
+        let tokens: Vec<&str> = owned.iter().map(String::as_str).collect();
         if let Some(op_pos) = tokens.iter().position(|t| lookup_operator(t).is_some()) {
             let label = after.map(|s| s.trim().to_string());
             return self.parse_relationship(&tokens, op_pos, label);
@@ -264,6 +361,7 @@ impl Parser {
         let idx = self.g.classes.len();
         self.g.classes.push(ClassBox {
             id: id.to_string(),
+            display: None,
             annotation: None,
             attributes: vec![],
             methods: vec![],
@@ -390,6 +488,76 @@ mod tests {
             let kw = stmt.split_whitespace().next().unwrap();
             assert!(e.message.contains(kw), "names {kw}: {}", e.message);
         }
+    }
+
+    #[test]
+    fn css_shorthand_rejected_not_misparsed() {
+        // Regression: `A:::styleName` used to silently split on `:` and
+        // store `::styleName` as a bogus attribute. It must error instead.
+        let e = parse("classDiagram\nclass A\nA:::styleName").unwrap_err();
+        assert_eq!(e.line, Some(3));
+        assert!(e.message.contains(":::"), "{}", e.message);
+    }
+
+    #[test]
+    fn classdef_and_direction_rejected_named() {
+        for stmt in ["classDef default fill:#f9f", "direction LR"] {
+            let e = parse(&format!("classDiagram\nclass A\n{stmt}")).unwrap_err();
+            assert_eq!(e.line, Some(3), "for {stmt}");
+            let kw = stmt.split_whitespace().next().unwrap();
+            assert!(e.message.contains(kw), "names {kw}: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn dashed_link_operator() {
+        let g = p("classDiagram\nA .. B");
+        assert_eq!(rel(&g, 0), ("A", "B", RelKind::DashedLink));
+        assert!(!g.relations[0].arrow);
+        // `..>` (dependency) must still win over `..` when glued/adjacent.
+        let g2 = p("classDiagram\nA ..> B");
+        assert_eq!(g2.relations[0].kind, RelKind::Dependency);
+    }
+
+    #[test]
+    fn no_space_operators() {
+        let cases = [
+            ("A-->B", ("A", "B", RelKind::Association)),
+            ("A<|--B", ("B", "A", RelKind::Inheritance)),
+            ("A*--B", ("B", "A", RelKind::Composition)),
+            ("A..>B", ("A", "B", RelKind::Dependency)),
+            ("A..B", ("A", "B", RelKind::DashedLink)),
+        ];
+        for (src, want) in cases {
+            let g = p(&format!("classDiagram\n{src}"));
+            assert_eq!(rel(&g, 0), want, "for {src}");
+        }
+        // Glued multiplicities still separate correctly.
+        let g = p("classDiagram\nCustomer\"1\"-->\"0..*\"Order : places");
+        let r = &g.relations[0];
+        assert_eq!(r.m_from.as_deref(), Some("1"));
+        assert_eq!(r.m_to.as_deref(), Some("0..*"));
+        assert_eq!(r.label.as_deref(), Some("places"));
+    }
+
+    #[test]
+    fn class_label() {
+        let g = p("classDiagram\nclass A[\"Nice Label\"]\nA : +x int");
+        assert_eq!(g.classes[0].id, "A");
+        assert_eq!(g.classes[0].display.as_deref(), Some("Nice Label"));
+        assert_eq!(g.classes[0].attributes, vec!["+x int"]);
+        // Label + member block on the same line.
+        let g2 = p("classDiagram\nclass B[\"Label B\"] {\n+y int\n}");
+        assert_eq!(g2.classes[0].display.as_deref(), Some("Label B"));
+        assert_eq!(g2.classes[0].attributes, vec!["+y int"]);
+        // Markdown-string label: backticks stripped.
+        let g3 = p("classDiagram\nclass C[\"`Markdown`\"]");
+        assert_eq!(g3.classes[0].display.as_deref(), Some("Markdown"));
+    }
+
+    #[test]
+    fn v2_header_accepted() {
+        assert!(parse("classDiagram-v2\nclass A").is_ok());
     }
 
     #[test]
