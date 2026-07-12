@@ -53,6 +53,23 @@
   --color-text: #E8E8E8;           /* derived: high-contrast on Deep Bog */
   --color-text-secondary: #B0B0B0; /* Ash — secondary */
 
+  /* Mermaid diagram surfaces. The renderer (crates/mermaid) emits fills
+   * as `var(--mermaid-*, <light fallback>)` and draws labels/strokes with
+   * `currentColor`. In light mode the fallbacks are correct; in dark mode
+   * `currentColor` becomes light (#E8E8E8), so the (unoverridden) light
+   * node fill left light-on-light, unreadable text. Override the fills
+   * dark here so the light text/strokes stay legible. */
+  --mermaid-node-fill: #2F2F45;     /* dark slate-lavender node */
+  --mermaid-cluster-fill: #ffffff14;/* faint light wash for subgraphs */
+  --mermaid-note-fill: #4A4636;     /* muted dark amber note */
+  --mermaid-note-text: #E8E8E8;
+  --mermaid-gantt-task: #6B74C9;
+  --mermaid-gantt-active: #8F99E6;
+  --mermaid-gantt-done: #5A5A5A;
+  --mermaid-gantt-crit: #C95A5A;
+  --mermaid-gantt-band: #ffffff10;
+  --surface: #2A2A2A;               /* edge-label masks match the dark surface */
+
   /* Status — re-tuned for legibility on dark surfaces. Hex values
    * derived to keep WCAG AA contrast against --color-surface
    * (#2A2A2A) at 4.5:1 body / 3:1 large.
