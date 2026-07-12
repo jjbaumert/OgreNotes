@@ -271,6 +271,12 @@ impl Parser {
         rest = after_arrow;
         let to = self.parse_endpoint(&mut rest, EndpointRole::Target)?;
         let tail = rest.trim_start();
+        // `X:::class` — the label branch below would eat the first colon
+        // and render an edge labeled `::class` (silent misparse, issue
+        // #47). Styling application is out of scope; error naming it.
+        if tail.starts_with(":::") {
+            return Err(self.err("`:::` class styling is not supported"));
+        }
         let label = match tail.strip_prefix(':') {
             Some(t) => Some(t.trim().to_string()),
             None if tail.is_empty() => None,
@@ -505,5 +511,31 @@ mod tests {
             src.push_str(&format!("s{i} --> s{}\n", i + 1));
         }
         assert!(parse(&src).unwrap_err().message.contains("too large"));
+    }
+
+    // ── Polish slice (issue #47) ─────────────────────────────────────
+    // (docs/superpowers/specs/2026-07-11-mermaid-state-polish-design.md)
+
+    #[test]
+    fn triple_colon_target_errors_naming_the_operator() {
+        // THE silent-misparse regression: the docs' own example used to
+        // render an edge labeled `::notMoving`.
+        let e = parse("stateDiagram-v2\n[*] --> Still:::notMoving").unwrap_err();
+        assert_eq!(e.line, Some(2));
+        assert!(e.message.contains(":::"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn triple_colon_source_still_errors() {
+        // Source-side was already loud (the arrow check finds `:::`);
+        // pin it so the two sides stay consistent.
+        let e = parse("stateDiagram-v2\nStill:::notMoving --> [*]").unwrap_err();
+        assert_eq!(e.line, Some(2));
+    }
+
+    #[test]
+    fn ordinary_labels_unaffected_by_colon_guard() {
+        let g = p("stateDiagram-v2\na --> b: go: now");
+        assert_eq!(g.transitions[0].label.as_deref(), Some("go: now"));
     }
 }
