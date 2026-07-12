@@ -5693,9 +5693,19 @@ tr:hover .folder-row-actions,
 /* Dyslexia-friendly typography. OpenDyslexic is bundled (self-hosted
  * WOFF2, @font-face in fonts.css) and leads the stack; the remaining
  * families are fallbacks for the brief font-display: swap window and
- * for glyphs OpenDyslexic doesn't cover (it is Latin-focused). */
+ * for glyphs OpenDyslexic doesn't cover (it is Latin-focused).
+ *
+ * A11y feature: applies app-wide, not just document text — override the
+ * UI-chrome token (--font-ui: sidebar, settings, buttons, dialogs) and
+ * the document-heading token (--font-doc-heading: titles, h1-h3) as well
+ * as the body token, so a dyslexic reader gets a legible face everywhere
+ * text is read. --font-mono is deliberately left alone: code needs a
+ * fixed-width face, and OpenDyslexic Mono isn't bundled. */
 [data-dyslexic="true"] {
-  --font-doc-body: "OpenDyslexic", "Comic Neue", "Comic Sans MS", sans-serif;
+  --font-dyslexic: "OpenDyslexic", "Comic Neue", "Comic Sans MS", sans-serif;
+  --font-ui: var(--font-dyslexic);
+  --font-doc-heading: var(--font-dyslexic);
+  --font-doc-body: var(--font-dyslexic);
 }
 
 /* ─── Account menu (account-menu step 3) ────────────────────────
