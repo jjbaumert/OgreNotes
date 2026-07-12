@@ -45,6 +45,7 @@ pub(crate) struct Relation {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ClassGraph {
+    pub direction: crate::layout::Direction,
     pub classes: Vec<ClassBox>,
     pub relations: Vec<Relation>,
     pub class_defs: Vec<crate::style::ClassDef>,
@@ -95,11 +96,6 @@ pub(crate) fn render_class(source: &str) -> Result<String, crate::ParseError> {
         })
         .collect();
 
-    let layout = crate::boxgraph::layout_boxgraph(
-        &nodes,
-        &edges,
-        &[],
-        crate::layout::Direction::TB,
-    )?;
+    let layout = crate::boxgraph::layout_boxgraph(&nodes, &edges, &[], g.direction)?;
     Ok(svg::emit(&g, &layout, &sizes))
 }

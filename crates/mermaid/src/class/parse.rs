@@ -145,7 +145,12 @@ fn generics_to_angle(s: &str) -> String {
 
 pub(crate) fn parse(source: &str) -> Result<ClassGraph, ParseError> {
     let mut p = Parser {
-        g: ClassGraph { classes: vec![], relations: vec![], class_defs: vec![] },
+        g: ClassGraph {
+            direction: crate::layout::Direction::TB,
+            classes: vec![],
+            relations: vec![],
+            class_defs: vec![],
+        },
         ids: HashMap::new(),
         line: 0,
         block: None,
@@ -207,7 +212,8 @@ impl Parser {
         }
         let first = stmt.split_whitespace().next().unwrap_or("");
         match first {
-            "namespace" | "click" | "callback" | "link" | "note" | "direction" => {
+            "direction" => return self.parse_direction(stmt),
+            "namespace" | "click" | "callback" | "link" | "note" => {
                 return Err(self.err(format!("`{first}` statements are not supported")));
             }
             "classDef" => return self.parse_class_def(stmt),
@@ -228,6 +234,19 @@ impl Parser {
     }
 
     /// `classDef name prop:val,...`
+    /// `direction TB|BT|LR|RL` — sets the whole diagram's layout direction.
+    fn parse_direction(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("direction").unwrap().trim();
+        self.g.direction = match rest {
+            "TB" | "TD" => crate::layout::Direction::TB,
+            "BT" => crate::layout::Direction::BT,
+            "LR" => crate::layout::Direction::LR,
+            "RL" => crate::layout::Direction::RL,
+            other => return Err(self.err(format!("unknown direction {other:?}"))),
+        };
+        Ok(())
+    }
+
     fn parse_class_def(&mut self, stmt: &str) -> Result<(), ParseError> {
         let rest = stmt.strip_prefix("classDef").unwrap().trim();
         let Some((name, styles)) = rest.split_once(char::is_whitespace) else {
@@ -721,12 +740,18 @@ mod tests {
     }
 
     #[test]
-    fn direction_rejected_named() {
-        // `classDef` moved out of this list: this task turns it into a
-        // supported styling statement (see `class_styling_parses_and_resolves`).
-        let e = parse("classDiagram\nclass A\ndirection LR").unwrap_err();
-        assert_eq!(e.line, Some(3));
-        assert!(e.message.contains("direction"), "{}", e.message);
+    fn direction_sets_layout_direction() {
+        assert_eq!(p("classDiagram\nclass A").direction, crate::layout::Direction::TB);
+        assert_eq!(
+            p("classDiagram\ndirection LR\nA --> B").direction,
+            crate::layout::Direction::LR
+        );
+        assert_eq!(
+            p("classDiagram\ndirection RL\nA --> B").direction,
+            crate::layout::Direction::RL
+        );
+        // An unknown direction is still a loud error.
+        assert!(parse("classDiagram\ndirection SIDEWAYS").is_err());
     }
 
     #[test]
