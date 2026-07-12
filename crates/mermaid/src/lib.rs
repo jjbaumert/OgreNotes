@@ -14,6 +14,7 @@
 mod pie;
 mod gantt;
 mod gitgraph;
+mod mindmap;
 mod layout;
 pub(crate) mod measure;
 pub(crate) mod flowchart;
@@ -39,6 +40,7 @@ pub enum DiagramKind {
     Er,
     Gantt,
     GitGraph,
+    Mindmap,
     Unknown,
 }
 
@@ -54,6 +56,7 @@ impl DiagramKind {
             DiagramKind::Er => "entity-relationship",
             DiagramKind::Gantt => "gantt",
             DiagramKind::GitGraph => "git-graph",
+            DiagramKind::Mindmap => "mindmap",
             DiagramKind::Unknown => "unknown",
         }
     }
@@ -142,6 +145,7 @@ pub fn detect_kind(source: &str) -> DiagramKind {
         "erDiagram" => DiagramKind::Er,
         "gantt" => DiagramKind::Gantt,
         "gitGraph" => DiagramKind::GitGraph,
+        "mindmap" => DiagramKind::Mindmap,
         _ => DiagramKind::Unknown,
     }
 }
@@ -245,6 +249,10 @@ pub fn render(source: &str) -> RenderOutput {
             Ok(g) => RenderOutput { kind, svg: Some(gitgraph::render_svg(&g)), error: None },
             Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
         },
+        DiagramKind::Mindmap => match mindmap::parse(source) {
+            Ok(m) => RenderOutput { kind, svg: Some(mindmap::render_svg(&m)), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
         DiagramKind::Unknown => RenderOutput {
             kind,
             svg: None,
@@ -293,6 +301,7 @@ mod tests {
         assert_eq!(detect_kind("gitGraph"), DiagramKind::GitGraph);
         assert_eq!(detect_kind("gitGraph:"), DiagramKind::GitGraph);
         assert_eq!(detect_kind("gitGraph LR:"), DiagramKind::GitGraph);
+        assert_eq!(detect_kind("mindmap"), DiagramKind::Mindmap);
         assert_eq!(detect_kind("nonsense here"), DiagramKind::Unknown);
     }
 
