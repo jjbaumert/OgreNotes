@@ -5690,11 +5690,10 @@ tr:hover .folder-row-actions,
   scroll-behavior: auto !important;
 }
 
-/* Dyslexia-friendly typography. OpenDyslexic isn't bundled yet, so
- * the stack degrades to widely-installed rounded faces that are
- * recognized as more legible for dyslexic readers; dropping the
- * OpenDyslexic web-font is a follow-up that needs no code change —
- * it's first in the stack already. */
+/* Dyslexia-friendly typography. OpenDyslexic is bundled (self-hosted
+ * WOFF2, @font-face in fonts.css) and leads the stack; the remaining
+ * families are fallbacks for the brief font-display: swap window and
+ * for glyphs OpenDyslexic doesn't cover (it is Latin-focused). */
 [data-dyslexic="true"] {
   --font-doc-body: "OpenDyslexic", "Comic Neue", "Comic Sans MS", sans-serif;
 }

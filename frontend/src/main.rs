@@ -30,25 +30,17 @@ fn main() {
     // call is a no-op when no flag is present.
     editor::debug::init_from_url();
 
-    // Phase 5 M-P2: initialize the i18n harness before mount so
-    // any component that renders translated strings has a valid
-    // bundle at render time. Piece 2 walks the URL → navigator
-    // .language → en-US precedence chain in `resolve_locale`;
-    // the user's stored UiPrefs.locale is consulted later by the
-    // locale-switcher component (piece 3) once /users/me resolves.
-    // Brief locale flash on first load is the same trade-off the
-    // theme bootstrap makes.
-    let locale = i18n::resolve_locale();
-    i18n::init(&locale);
-
     // Phase 5 M-P4 piece A: install the command palette's baseline
-    // action set. Has to run after `i18n::init` because each command's
-    // label resolves through the active fluent bundle at render time;
-    // the registration call itself doesn't touch translations, but
-    // any subsequent palette query would see raw keys if init hadn't
-    // run yet. Idempotent on `id`, so a future re-registration path
-    // (e.g. per-page scope extensions in M-P4 piece B) can layer on
-    // top safely.
+    // action set. Runs synchronously here, before `i18n::init` (which
+    // now runs inside the post-refresh `spawn_local` block below) —
+    // and doesn't depend on it: each `PaletteCommand` only stores a
+    // `&'static str` label_key, it doesn't translate anything at
+    // registration time. The bundle is only consulted later, when the
+    // palette is actually queried (`matching()` in commands/mod.rs),
+    // which happens post-mount, long after `i18n::init` has resolved.
+    // Idempotent on `id`, so a future re-registration path (e.g.
+    // per-page scope extensions in M-P4 piece B) can layer on top
+    // safely.
     commands::register_defaults();
     // M-P4 piece C: rehydrate the most-recently-used command list
     // from localStorage so the next palette open ranks familiar
@@ -60,11 +52,11 @@ fn main() {
     // there's no flash during WASM hydration. #152: apply the user's
     // locally-cached explicit theme synchronously first — otherwise a
     // stored Dark pref on a light-OS machine flashed a light background
-    // until `/users/me` resolved. Only when there's no cached explicit
+    // until the auth refresh resolved. Only when there's no cached explicit
     // choice do we fall back to the OS `prefers-color-scheme` pref (which
     // also installs the live OS-change listener). The authoritative
-    // `/users/me` prefs are applied — and the cache refreshed — post-auth
-    // in `apply_stored_prefs`.
+    // prefs (delivered on the auth response) are applied — and the cache
+    // refreshed — post-refresh in `apply_boot_prefs`.
     if !theme::apply_cached_prefs() {
         theme::apply_system_theme();
     }
@@ -82,7 +74,24 @@ fn main() {
     // ... before the Executor had been set". The wasm-bindgen variant
     // just queues a microtask on the JS event loop and is safe pre-mount.
     wasm_bindgen_futures::spawn_local(async {
-        let _ = api::client::try_hydrate_from_cookie().await;
+        // Hydrate auth from the refresh cookie BEFORE mount (route guards
+        // need it) and pick up the user's stored ui_prefs in the same
+        // round trip — no separate /users/me fetch.
+        let auth = api::client::try_hydrate_from_cookie().await;
+        let prefs = auth.as_ref().and_then(|t| t.ui_prefs.as_ref());
+
+        // Locale: the load-bearing order is refresh -> init -> mount.
+        // resolve_locale_with_hint folds the server pref into tier 2, so
+        // first paint is already in the right locale — no reload.
+        let locale = i18n::resolve_locale_with_hint(
+            prefs.and_then(|p| p.locale.as_deref()),
+        );
+        i18n::init(&locale);
+
+        // Theme + accessibility: apply authoritatively and refresh the
+        // localStorage cache so the next load's pre-mount stamp is right.
+        apply_boot_prefs(prefs);
+
         leptos::mount::mount_to_body(app::App);
         // #152: the real sidebar is now in the DOM — drop the static boot
         // skeleton (index.html) that covered the sidebar column during the
@@ -113,80 +122,23 @@ fn main() {
         // it must not import `crate::api`.
         observability::set_token_getter(api::client::get_token);
         observability::init_flush_loop();
-
-        // Apply the user's persisted UI prefs (theme + accessibility +
-        // locale) once auth is hydrated, so stored choices take effect
-        // on every page — independent of whether the settings UI is
-        // mounted. This lifts the responsibility that used to live on
-        // the sidebar's ThemeSelector/LocaleSelector mount (moved to
-        // /settings in the account-menu work). Best-effort: an
-        // unauthenticated load (login page) just no-ops on the 401.
-        apply_stored_prefs().await;
     });
 }
 
-/// Slim `/users/me` decode for the load-time prefs bootstrap — only
-/// the fields that drive global application. Mirrors the per-consumer
-/// slim-decode pattern the settings components use.
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BootstrapMe {
-    ui_prefs: Option<BootstrapPrefs>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BootstrapPrefs {
-    #[serde(default)]
-    theme: Option<String>,
-    #[serde(default)]
-    locale: Option<String>,
-    #[serde(default)]
-    dyslexic_font: Option<bool>,
-    #[serde(default)]
-    reduce_motion: Option<bool>,
-}
-
-/// Fetch the stored UI prefs and apply them to the document at load
-/// time. Theme: an explicit stored pref overrides the system default
-/// already applied pre-mount; absent / "system" leaves OS tracking in
-/// place. Accessibility: writes the `<html>` attributes the
-/// stylesheet keys off. Locale: first-login-on-a-new-device sync —
-/// localStorage is empty so `resolve_locale` fell back to
-/// navigator.language; if the stored pref differs, apply it + reload.
-/// The `same_locale` equality guard makes this a no-op once the
-/// reload settles (localStorage then carries the stored value).
-async fn apply_stored_prefs() {
-    let Ok(me) = api::client::api_get::<BootstrapMe>("/users/me").await else {
+/// Apply the user's stored theme + accessibility prefs to the document
+/// at boot (locale is applied via resolve_locale_with_hint + i18n::init
+/// before this runs). Also refreshes the localStorage cache so the next
+/// load paints correctly pre-mount (#152). No-op when the user has no
+/// stored prefs (logged-out boot, or a fresh account).
+fn apply_boot_prefs(prefs: Option<&api::client::UiPrefsDto>) {
+    let Some(prefs) = prefs else {
         return;
     };
-    let Some(prefs) = me.ui_prefs else {
-        return;
-    };
-
-    // Refresh the local cache from the server so the next load paints
-    // correctly pre-mount (#152) — also covers a pref changed on another
-    // device since this device last loaded.
     theme::cache_prefs(prefs.theme.as_deref(), prefs.dyslexic_font, prefs.reduce_motion);
-
-    // Apply the server's theme authoritatively: explicit Light/Dark, or
-    // re-engage OS tracking for "system". This corrects a stale cached
-    // value applied pre-mount (e.g. the pref was changed elsewhere). An
-    // absent theme field leaves the pre-mount state untouched.
     if let Some(theme_str) = prefs.theme.as_deref() {
         theme::apply_explicit_theme(theme::pref_from_str(theme_str));
     }
-
     theme::apply_a11y_prefs(prefs.dyslexic_font, prefs.reduce_motion);
-
-    if let Some(stored) = prefs.locale.filter(|s| !s.is_empty()) {
-        if !i18n::same_locale(&stored, &i18n::resolve_locale()) {
-            i18n::set_locale(&stored);
-            if let Some(window) = web_sys::window() {
-                let _ = window.location().reload();
-            }
-        }
-    }
 }
 
 /// Install the WASM panic hook. In debug builds (`cfg(debug_assertions)`)

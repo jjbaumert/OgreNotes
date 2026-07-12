@@ -131,6 +131,68 @@ async fn test_refresh_token_rotation() {
     app.cleanup().await;
 }
 
+/// The auth response carries the user's stored ui_prefs so the
+/// frontend can apply locale/theme/a11y on boot without a separate
+/// /users/me fetch. Covers both dev-login and refresh (the boot path).
+#[tokio::test]
+async fn auth_response_carries_ui_prefs_locale() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let (_, token) = app.create_user("prefs-auth@test.com").await;
+
+    // Store a non-default locale via the prefs endpoint.
+    let (status, _) = app
+        .json_request(
+            Method::PUT,
+            "/api/v1/users/me/prefs",
+            Some(&token),
+            Some(serde_json::json!({ "locale": "ar" })),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    // A fresh dev-login for the same user must echo the stored locale.
+    let (status, login_json) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/auth/dev-login",
+            None,
+            Some(serde_json::json!({ "email": "prefs-auth@test.com", "name": "Prefs Auth" })),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        login_json["uiPrefs"]["locale"], "ar",
+        "dev-login carries the stored locale hint"
+    );
+
+    // The refresh response carries it too (boot hydrates via refresh).
+    // (userId/sessionId are required alongside refreshToken by the
+    // non-cookie refresh path — see test_refresh_token_rotation.)
+    let refresh_token = login_json["refreshToken"].as_str().unwrap();
+    let user_id = login_json["userId"].as_str().unwrap();
+    let session_id = login_json["sessionId"].as_str().unwrap();
+    let (status, refresh_json) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/auth/refresh",
+            None,
+            Some(serde_json::json!({
+                "refreshToken": refresh_token,
+                "userId": user_id,
+                "sessionId": session_id,
+            })),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        refresh_json["uiPrefs"]["locale"], "ar",
+        "refresh carries the stored locale hint"
+    );
+
+    app.cleanup().await;
+}
+
 #[tokio::test]
 async fn test_refresh_invalid_token() {
     common::require_infra!();

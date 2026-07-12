@@ -14,35 +14,15 @@
 //! trade-off and avoids the complexity gradient; a future piece
 //! can land the reactive path when the UX cost actually bites.
 //!
-//! First-login-on-new-device path: on mount the component fetches
-//! `/users/me`. If the stored `ui_prefs.locale` differs from the
-//! currently-active locale (because localStorage is empty on the
-//! new device, so bootstrap fell through to navigator.language),
-//! apply the stored pref + reload. The next bootstrap picks up
-//! the new localStorage value and the chain settles. Net: a user
-//! sees one extra reload on first login per device, never again.
+//! First-login-on-new-device sync now happens at boot (the app
+//! applies the stored locale from the auth response before mount),
+//! so this component is purely a switcher.
 
 use leptos::prelude::*;
-use serde::Deserialize;
 use wasm_bindgen::JsCast;
 
 use crate::api::client;
 use crate::i18n;
-
-/// Slim /users/me decode — only the locale field, per the
-/// per-consumer-slim-decode pattern home.rs uses.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UserMeLocale {
-    ui_prefs: Option<UiPrefsRead>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UiPrefsRead {
-    #[serde(default)]
-    locale: Option<String>,
-}
 
 /// Locale catalog: the shipping locales. Adding a new locale here
 /// + dropping a `frontend/locales/<bcp47>/main.ftl` file + wiring
@@ -65,32 +45,13 @@ const LOCALE_CHOICES: &[(&str, &str)] = &[
 /// locale; on change fires the save+reload flow.
 #[component]
 pub fn LocaleSelector() -> impl IntoView {
-    // Initialize from the harness's resolved locale — same value
-    // it used to build the active bundle, so the `<select>`
-    // accurately reflects what the user is seeing.
-    let initial = i18n::resolve_locale();
+    // Initialize from the harness's ACTIVE locale (what `init` /
+    // `set_locale` actually applied, including any server-pref hint
+    // folded in at boot) rather than re-resolving precedence — on a
+    // fresh device with a stored server pref, `resolve_locale()`
+    // would disagree with what's actually rendered.
+    let initial = i18n::active_locale();
     let (current, set_current) = signal(initial);
-
-    // First-login-on-new-device sync: if the server has a stored
-    // pref that doesn't match the active locale, apply it +
-    // reload. The reload-loop guard is the equality check —
-    // after reload, localStorage carries the stored value, so
-    // `resolve_locale` returns it and this branch becomes a no-op.
-    leptos::task::spawn_local(async move {
-        let Ok(me) = client::api_get::<UserMeLocale>("/users/me").await else {
-            return;
-        };
-        let Some(stored) = me.ui_prefs.and_then(|p| p.locale) else {
-            return;
-        };
-        if stored.is_empty() {
-            return;
-        }
-        if !i18n::same_locale(&stored, &i18n::resolve_locale()) {
-            i18n::set_locale(&stored);
-            reload_page();
-        }
-    });
 
     let on_change = move |ev: web_sys::Event| {
         let Some(target) = ev.target() else { return };
