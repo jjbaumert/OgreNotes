@@ -4,6 +4,7 @@
 //! inflate more). `emit` renders the shape's geometry only; `svg.rs`
 //! overlays the label text on top.
 
+use crate::escape_xml;
 use crate::flowchart::ShapeKind;
 
 pub(crate) fn size_for(shape: ShapeKind, tw: f64, th: f64) -> (f64, f64) {
@@ -35,10 +36,15 @@ const FILL: &str = "var(--mermaid-node-fill, #ececff)";
 /// *presentation attributes*, which an inherited group style can't
 /// override — an inline `style` on the same element can. Callers still
 /// wrap the node in a `<g style>` too, so `color:` reaches the label text.
+///
+/// The style value is XML-escaped here so this helper is self-defending
+/// against attribute injection regardless of what a caller passes (the
+/// flowchart caller already sanitizes it against an allowlist, but a
+/// `pub(crate)` helper shouldn't rely on every caller doing so).
 pub(crate) fn emit(shape: ShapeKind, cx: f64, cy: f64, w: f64, h: f64, style: Option<&str>) -> String {
     let (x, y) = (cx - w / 2.0, cy - h / 2.0);
     let style_attr = match style {
-        Some(s) if !s.is_empty() => format!(r#" style="{s}""#),
+        Some(s) if !s.is_empty() => format!(r#" style="{}""#, escape_xml(s)),
         _ => String::new(),
     };
     let common = format!(r#"fill="{FILL}" stroke="currentColor" stroke-width="1"{style_attr}"#);
@@ -220,6 +226,15 @@ mod tests {
             assert!(svg.contains("currentColor"), "{s:?} not theme-aware");
             assert!(!svg.contains("NaN"), "{s:?} produced NaN");
         }
+    }
+
+    #[test]
+    fn emit_escapes_the_style_value() {
+        // Defense-in-depth: even if an unsanitized style reaches `emit`, it
+        // must not break out of the `style="…"` attribute.
+        let svg = emit(ShapeKind::Rect, 0.0, 0.0, 10.0, 10.0, Some(r#"x"/><script>y"#));
+        assert!(!svg.contains("<script>"), "style broke out: {svg}");
+        assert!(svg.contains("&quot;") && svg.contains("&lt;script&gt;"), "{svg}");
     }
 
     #[test]
