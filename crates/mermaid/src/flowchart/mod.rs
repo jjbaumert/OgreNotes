@@ -85,20 +85,12 @@ pub(crate) struct FlowSubgraph {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ClassDef {
-    pub name: String,
-    /// Sanitized `prop:value` pairs joined with `;` — allowlisted
-    /// properties only (see parse.rs), safe to emit as a style attr.
-    pub style: String,
-}
-
-#[derive(Debug, Clone)]
 pub(crate) struct FlowGraph {
     pub direction: crate::layout::Direction,
     pub nodes: Vec<FlowNode>,
     pub edges: Vec<FlowEdge>,
     pub subgraphs: Vec<FlowSubgraph>,
-    pub class_defs: Vec<ClassDef>,
+    pub class_defs: Vec<crate::style::ClassDef>,
     /// `linkStyle default ...` — sanitized style applied to every edge
     /// that has no explicit `linkStyle <index>`.
     pub default_link_style: Option<String>,
