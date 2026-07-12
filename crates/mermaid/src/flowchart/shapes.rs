@@ -30,9 +30,18 @@ pub(crate) fn size_for(shape: ShapeKind, tw: f64, th: f64) -> (f64, f64) {
 
 const FILL: &str = "var(--mermaid-node-fill, #ececff)";
 
-pub(crate) fn emit(shape: ShapeKind, cx: f64, cy: f64, w: f64, h: f64) -> String {
+/// `style`, when present, is emitted as an inline `style="…"` ON the shape
+/// element(s). This matters: the shape carries `fill`/`stroke`
+/// *presentation attributes*, which an inherited group style can't
+/// override — an inline `style` on the same element can. Callers still
+/// wrap the node in a `<g style>` too, so `color:` reaches the label text.
+pub(crate) fn emit(shape: ShapeKind, cx: f64, cy: f64, w: f64, h: f64, style: Option<&str>) -> String {
     let (x, y) = (cx - w / 2.0, cy - h / 2.0);
-    let common = format!(r#"fill="{FILL}" stroke="currentColor" stroke-width="1""#);
+    let style_attr = match style {
+        Some(s) if !s.is_empty() => format!(r#" style="{s}""#),
+        _ => String::new(),
+    };
+    let common = format!(r#"fill="{FILL}" stroke="currentColor" stroke-width="1"{style_attr}"#);
     match shape {
         ShapeKind::Rect => format!(
             r#"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" {common}/>"#
@@ -201,7 +210,7 @@ mod tests {
     #[test]
     fn every_shape_emits_geometry() {
         for &s in ALL {
-            let svg = emit(s, 100.0, 50.0, 120.0, 40.0);
+            let svg = emit(s, 100.0, 50.0, 120.0, 40.0, None);
             assert!(
                 svg.contains("<rect") || svg.contains("<circle")
                     || svg.contains("<polygon") || svg.contains("<path")
@@ -215,14 +224,14 @@ mod tests {
 
     #[test]
     fn double_circle_has_two_circles() {
-        let svg = emit(ShapeKind::DoubleCircle, 0.0, 0.0, 60.0, 60.0);
+        let svg = emit(ShapeKind::DoubleCircle, 0.0, 0.0, 60.0, 60.0, None);
         assert_eq!(svg.matches("<circle").count(), 2);
     }
 
     #[test]
     fn polygon_shapes_have_expected_point_counts() {
         let poly_points = |s: ShapeKind| {
-            let svg = emit(s, 0.0, 0.0, 100.0, 40.0);
+            let svg = emit(s, 0.0, 0.0, 100.0, 40.0, None);
             let pts = svg.split("points=\"").nth(1).unwrap()
                 .split('"').next().unwrap();
             pts.split_whitespace().count()
@@ -238,7 +247,7 @@ mod tests {
     fn subroutine_fits_text_and_emits_rect_with_two_bars() {
         let (w, h) = size_for(ShapeKind::Subroutine, 80.0, 19.0);
         assert!(w >= 80.0 && h >= 19.0);
-        let svg = emit(ShapeKind::Subroutine, 100.0, 50.0, 120.0, 40.0);
+        let svg = emit(ShapeKind::Subroutine, 100.0, 50.0, 120.0, 40.0, None);
         assert!(svg.contains("<rect"), "{svg}");
         assert_eq!(svg.matches("<line").count(), 2, "{svg}");
         assert!(svg.contains("currentColor") && !svg.contains("NaN"));

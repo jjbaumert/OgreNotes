@@ -700,7 +700,12 @@ impl Parser {
             let Some(edge) = self.g.edges.get_mut(n) else {
                 return Err(self.err(format!("linkStyle refers to unknown edge index {n}")));
             };
-            edge.style = Some(style.clone());
+            // Only set a non-empty style: a `Some("")` would suppress the
+            // `linkStyle default` fallback for this edge at render time
+            // (`edge.style.or(default)`). Mirrors `parse_style`.
+            if !style.is_empty() {
+                edge.style = Some(style.clone());
+            }
         }
         Ok(())
     }
@@ -1058,6 +1063,11 @@ mod tests {
         // Out-of-range index errors.
         let e = parse("graph TD\nA-->B\nlinkStyle 5 stroke:red").unwrap_err();
         assert!(e.message.contains("unknown edge index"), "got: {}", e.message);
+        // An all-dropped (empty after sanitize) linkStyle must NOT suppress
+        // the `default` fallback for that edge.
+        let g = p("graph TD\nA-->B\nlinkStyle 0 badprop:x\nlinkStyle default stroke:blue");
+        assert!(g.edges[0].style.is_none());
+        assert_eq!(g.default_link_style.as_deref(), Some("stroke:blue"));
     }
 
     #[test]

@@ -57,7 +57,18 @@ fn parse_date(s: &str) -> Option<f64> {
     let y: i64 = parts[0].parse().ok()?;
     let m: i64 = parts[1].parse().ok()?;
     let d: i64 = parts[2].parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || parts[0].len() != 4 {
+    if parts[0].len() != 4 || !(1..=12).contains(&m) {
+        return None;
+    }
+    // Validate the day against the month's real length, so `2024-02-31`
+    // is rejected instead of silently normalising into March.
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let max_day = match m {
+        2 => if leap { 29 } else { 28 },
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=max_day).contains(&d) {
         return None;
     }
     Some(days_from_civil(y, m, d) as f64)
@@ -338,8 +349,11 @@ mod tests {
     fn date_math() {
         // 2024-01-01 -> 2024-01-08 is 7 days.
         assert_eq!(parse_date("2024-01-08").unwrap() - parse_date("2024-01-01").unwrap(), 7.0);
-        // Leap day exists in 2024.
+        // Leap day exists in 2024 but not 2023; impossible days rejected.
         assert!(parse_date("2024-02-29").is_some());
+        assert!(parse_date("2023-02-29").is_none());
+        assert!(parse_date("2024-02-31").is_none());
+        assert!(parse_date("2024-04-31").is_none());
         assert_eq!(parse_duration("2w").unwrap(), 14.0);
         assert_eq!(parse_duration("5").unwrap(), 5.0);
         assert!(parse_date("2024-13-01").is_none());
@@ -406,7 +420,7 @@ mod tests {
         assert!(svg.contains("</svg>"));
         assert!(svg.contains("Task A") && svg.contains("Task B") && svg.contains("Done"));
         assert!(svg.contains("Phase 1") && svg.contains("Phase 2"));
-        assert_eq!(svg.matches("<rect").count() >= 2, true, "task bars"); // >=2 bars
+        assert!(svg.matches("<rect").count() >= 2, "task bars"); // >=2 bars
         assert!(svg.contains("<path"), "milestone diamond");
         assert!(svg.contains("T")); // title
     }

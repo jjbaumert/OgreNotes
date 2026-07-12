@@ -170,14 +170,11 @@ pub(crate) fn render_svg(m: &Mindmap) -> String {
     let cx = |i: usize| col_left(m.nodes[i].depth) + sizes[i].0 / 2.0;
     let cy = |i: usize| MARGIN + NODE_H / 2.0 + slots[i] * Y_GAP;
 
-    let max_depth = m.nodes.iter().map(|node| node.depth).max().unwrap_or(0);
-    let w = col_left(max_depth)
-        + m.nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, nd)| nd.depth == max_depth)
-            .map(|(i, _)| sizes[i].0)
-            .fold(48.0_f64, f64::max)
+    // Canvas width = the furthest right edge over ALL nodes (a wide label
+    // on a shallow node can reach past the deepest column), plus a margin.
+    let w = (0..n)
+        .map(|i| col_left(m.nodes[i].depth) + sizes[i].0)
+        .fold(0.0_f64, f64::max)
         + MARGIN;
     let h = MARGIN + NODE_H + next.max(1.0) * Y_GAP;
 
@@ -203,7 +200,7 @@ pub(crate) fn render_svg(m: &Mindmap) -> String {
     for (i, node) in m.nodes.iter().enumerate() {
         let (nw, nh) = sizes[i];
         svg.push_str("<g>");
-        svg.push_str(&shapes::emit(node.shape, cx(i), cy(i), nw, nh));
+        svg.push_str(&shapes::emit(node.shape, cx(i), cy(i), nw, nh, None));
         svg.push_str(&format!(
             r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
             cx(i),
@@ -295,6 +292,20 @@ mod tests {
         assert!(svg.contains("Ideas") && svg.contains("C"));
         assert!(svg.contains("<path"), "tree edges");
         assert_eq!(svg.matches("<text").count(), 4, "one label per node");
+    }
+
+    #[test]
+    fn wide_shallow_node_widens_canvas() {
+        let width = |src: &str| {
+            let svg = render_svg(&p(src));
+            svg.split("width=\"").nth(1).unwrap().split('"').next().unwrap().parse::<f64>().unwrap()
+        };
+        // Same tree shape; only the ROOT (depth 0) label width differs.
+        // Under the old "deepest column only" width these would be equal and
+        // the wide root would clip.
+        let narrow = width("mindmap\n  R\n    child");
+        let wide = width("mindmap\n  ((A very very very long root label))\n    child");
+        assert!(wide > narrow, "wide root ({wide}) must widen the canvas vs narrow ({narrow})");
     }
 
     #[test]

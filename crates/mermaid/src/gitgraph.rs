@@ -39,16 +39,30 @@ fn err(message: impl Into<String>, line: usize) -> ParseError {
 }
 
 /// Pulls `key: value` (value may be `"quoted"` or a bare token) out of an
-/// option string, returning the value. Case-sensitive keys.
+/// option string, returning the value. The key must appear at a word
+/// boundary (start or after whitespace) and be followed by `:`, so a key
+/// substring *inside* a quoted value (e.g. `tag: "id: 5"`) can't match.
+/// Case-sensitive keys.
 fn option(opts: &str, key: &str) -> Option<String> {
-    let at = opts.find(key)?;
-    let after = opts[at + key.len()..].trim_start();
-    let after = after.strip_prefix(':').unwrap_or(after).trim_start();
-    if let Some(rest) = after.strip_prefix('"') {
-        rest.find('"').map(|end| rest[..end].to_string())
-    } else {
-        after.split_whitespace().next().map(str::to_string)
+    let mut from = 0;
+    while let Some(rel) = opts[from..].find(key) {
+        let at = from + rel;
+        from = at + key.len();
+        if at != 0 && !opts[..at].ends_with(char::is_whitespace) {
+            continue; // not a word boundary — inside another token/value
+        }
+        let after = opts[at + key.len()..].trim_start();
+        let Some(value) = after.strip_prefix(':') else {
+            continue; // `key` not used as an option key here
+        };
+        let value = value.trim_start();
+        return Some(if let Some(rest) = value.strip_prefix('"') {
+            rest.split('"').next().unwrap_or("").to_string()
+        } else {
+            value.split_whitespace().next().unwrap_or("").to_string()
+        });
     }
+    None
 }
 
 pub(crate) fn parse(source: &str) -> Result<GitGraph, ParseError> {
@@ -323,6 +337,14 @@ mod tests {
         assert_eq!(g.commits[0].id.as_deref(), Some("init"));
         assert_eq!(g.commits[0].tag.as_deref(), Some("v1.0"));
         assert_eq!(g.commits[0].ctype, CommitType::Highlight);
+    }
+
+    #[test]
+    fn option_key_inside_quoted_value_does_not_match() {
+        // `tag: "id: 5"` must set only the tag, not spuriously the id.
+        let g = p("gitGraph\ncommit tag: \"id: 5\"");
+        assert_eq!(g.commits[0].tag.as_deref(), Some("id: 5"));
+        assert!(g.commits[0].id.is_none());
     }
 
     #[test]

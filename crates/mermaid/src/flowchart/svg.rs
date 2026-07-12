@@ -132,11 +132,14 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
             (None, Some(inline)) => Some(inline.to_string()),
             (None, None) => None,
         };
-        match combined {
-            Some(style) => out.push_str(&format!(r#"<g style="{}">"#, escape_xml(&style))),
+        match &combined {
+            Some(style) => out.push_str(&format!(r#"<g style="{}">"#, escape_xml(style))),
             None => out.push_str("<g>"),
         }
-        out.push_str(&shapes::emit(n.shape, cx, cy, nw, nh));
+        // Style also goes ON the shape element: its own fill/stroke
+        // presentation attributes would otherwise beat the inherited group
+        // style, so `style A fill:#f00` wouldn't recolour the node.
+        out.push_str(&shapes::emit(n.shape, cx, cy, nw, nh, combined.as_deref()));
 
         let lines = measure::lines(&n.label);
         let n_lines = lines.len();
@@ -323,6 +326,12 @@ mod tests {
     #[test]
     fn class_def_default_styles_every_unclassed_node() {
         let svg = render_flowchart("graph TD\nclassDef default fill:#f9f\nA --> B").unwrap();
-        assert_eq!(svg.matches("style=\"fill:#f9f\"").count(), 2, "{svg}");
+        // Each of the two unclassed nodes carries the style twice: on the
+        // `<g>` (so `color:` reaches the label) AND on the shape element
+        // (so `fill`/`stroke` actually override the shape's own attrs).
+        assert_eq!(svg.matches("style=\"fill:#f9f\"").count(), 4, "{svg}");
+        // The shape element itself must carry it (the group alone can't
+        // override the shape's `fill` presentation attribute).
+        assert!(svg.contains("stroke-width=\"1\" style=\"fill:#f9f\""), "style on shape: {svg}");
     }
 }
