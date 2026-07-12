@@ -288,60 +288,110 @@ impl ThreadRepo {
         Ok(threads)
     }
 
-    /// Add a member to a chat thread (atomic — uses DynamoDB ADD on String Set).
+    /// Add a member to a chat thread — atomic across *both* writes.
+    ///
+    /// A DynamoDB transaction combines the `ADD member_ids :member` on the
+    /// METADATA row with the `Put` of the reverse chat edge, so the two can
+    /// never be observed out of sync. Before this used two independent
+    /// requests: a crash or throttle between them could leave `member_ids`
+    /// updated with no edge written (the member silently vanishes from
+    /// their own `list_user_chats`) or an edge written with `member_ids`
+    /// unchanged (a phantom chat that isn't really shared) — a disclosure
+    /// failure mode either way. Same transaction pattern as
+    /// `DocRepo::create_relationship` (`crates/storage/src/repo/doc_repo.rs`).
     pub async fn add_chat_member(
         &self,
         thread_id: &str,
         user_id: &str,
     ) -> Result<(), RepoError> {
-        let pk = format!("THREAD#{thread_id}");
-        let mut values = HashMap::new();
-        values.insert(
-            ":member".to_string(),
-            AttributeValue::Ss(vec![user_id.to_string()]),
-        );
+        use aws_sdk_dynamodb::types::{Put, TransactWriteItem, Update};
 
-        self.db
-            .update_item(
-                &pk,
-                "METADATA",
-                "ADD member_ids :member",
-                values,
-                None,
+        let pk = format!("THREAD#{thread_id}");
+
+        let update = Update::builder()
+            .table_name(self.db.table_name())
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S("METADATA".to_string()))
+            .update_expression("ADD member_ids :member")
+            .expression_attribute_values(
+                ":member",
+                AttributeValue::Ss(vec![user_id.to_string()]),
             )
-            .await
+            .build()
             .map_err(|e| RepoError::Dynamo(e.to_string()))?;
 
-        // Keep the reverse membership edge in sync (issue #34).
-        self.put_chat_edge(user_id, thread_id).await
+        let mut edge_item = HashMap::new();
+        edge_item.insert("PK".to_string(), AttributeValue::S(chat_edge_pk(user_id)));
+        edge_item.insert("SK".to_string(), AttributeValue::S(chat_edge_sk(thread_id)));
+        edge_item.insert(
+            "thread_id".to_string(),
+            AttributeValue::S(thread_id.to_string()),
+        );
+        let put = Put::builder()
+            .table_name(self.db.table_name())
+            .set_item(Some(edge_item))
+            .build()
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+
+        let items = vec![
+            TransactWriteItem::builder().update(update).build(),
+            TransactWriteItem::builder().put(put).build(),
+        ];
+
+        self.db
+            .transact_write(items)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
-    /// Remove a member from a chat thread (atomic — uses DynamoDB DELETE on String Set).
+    /// Remove a member from a chat thread — atomic across *both* writes.
+    ///
+    /// A DynamoDB transaction combines the `DELETE member_ids :member` on
+    /// the METADATA row with the `Delete` of the reverse chat edge, so the
+    /// two can never be observed out of sync. Before this used two
+    /// independent requests: a crash or throttle between them could leave
+    /// `member_ids` updated with the edge still present (a removed member
+    /// keeps seeing the chat via `list_user_chats`, a disclosure failure)
+    /// or the edge dropped with `member_ids` unchanged (the chat vanishes
+    /// for a member who should still see it). Same transaction pattern as
+    /// `DocRepo::delete_relationship` (`crates/storage/src/repo/doc_repo.rs`).
     pub async fn remove_chat_member(
         &self,
         thread_id: &str,
         user_id: &str,
     ) -> Result<(), RepoError> {
-        let pk = format!("THREAD#{thread_id}");
-        let mut values = HashMap::new();
-        values.insert(
-            ":member".to_string(),
-            AttributeValue::Ss(vec![user_id.to_string()]),
-        );
+        use aws_sdk_dynamodb::types::{Delete, TransactWriteItem, Update};
 
-        self.db
-            .update_item(
-                &pk,
-                "METADATA",
-                "DELETE member_ids :member",
-                values,
-                None,
+        let pk = format!("THREAD#{thread_id}");
+
+        let update = Update::builder()
+            .table_name(self.db.table_name())
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S("METADATA".to_string()))
+            .update_expression("DELETE member_ids :member")
+            .expression_attribute_values(
+                ":member",
+                AttributeValue::Ss(vec![user_id.to_string()]),
             )
-            .await
+            .build()
             .map_err(|e| RepoError::Dynamo(e.to_string()))?;
 
-        // Drop the reverse membership edge (issue #34).
-        self.delete_chat_edge(user_id, thread_id).await
+        let delete = Delete::builder()
+            .table_name(self.db.table_name())
+            .key("PK", AttributeValue::S(chat_edge_pk(user_id)))
+            .key("SK", AttributeValue::S(chat_edge_sk(thread_id)))
+            .build()
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+
+        let items = vec![
+            TransactWriteItem::builder().update(update).build(),
+            TransactWriteItem::builder().delete(delete).build(),
+        ];
+
+        self.db
+            .transact_write(items)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
     /// Bump the thread's updated_at timestamp (e.g., when a new message is added).
