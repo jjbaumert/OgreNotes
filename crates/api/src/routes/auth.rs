@@ -348,6 +348,12 @@ pub struct TokenResponse {
     /// so the wire shape stays clean for the common case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mfa_enrollment_required: Option<bool>,
+    /// Phase 5 M-P2: the user's stored UI preferences, delivered on
+    /// the auth response so the frontend applies locale/theme/a11y on
+    /// boot without a separate /users/me fetch. Additive + optional;
+    /// omitted when the user has no stored prefs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_prefs: Option<ogrenotes_storage::models::user::UiPrefs>,
 }
 
 /// Phase 4 M-E3: response shape for the OAuth/dev-login → MFA
@@ -487,6 +493,7 @@ pub(crate) async fn issue_session_response(
             email: user.email.clone(),
             name: user.name.clone(),
             mfa_enrollment_required,
+            ui_prefs: user.ui_prefs.clone(),
         }),
     )
         .into_response())
@@ -861,6 +868,7 @@ async fn refresh(
             // mid-session — matches the plan's "must enroll on next
             // login" semantics.
             mfa_enrollment_required: None,
+            ui_prefs: user.ui_prefs.clone(),
         }),
     )
         .into_response())
@@ -1087,6 +1095,7 @@ async fn dev_login(
             email: user.email,
             name: user.name,
             mfa_enrollment_required,
+            ui_prefs: user.ui_prefs.clone(),
         }),
     )
         .into_response())
