@@ -140,16 +140,40 @@ pub fn set_locale(locale: &str) {
 /// Unknown / unsupported BCP-47 tags from any layer fall through
 /// to the next layer.
 pub fn resolve_locale() -> String {
-    if let Some(loc) = locale_from_url() {
-        return loc;
-    }
-    if let Some(loc) = locale_from_localstorage() {
-        return loc;
-    }
-    if let Some(loc) = locale_from_navigator() {
-        return loc;
-    }
-    "en-US".to_string()
+    pick_locale(
+        locale_from_url(),
+        None,
+        locale_from_localstorage(),
+        locale_from_navigator(),
+    )
+}
+
+/// Like [`resolve_locale`] but folds the server-stored pref (delivered
+/// on the auth response) into tier 2 of the precedence chain, matching
+/// `design/i18n.md`: URL → stored pref → localStorage → navigator →
+/// en-US. Called from `main.rs` once the boot refresh resolves.
+pub fn resolve_locale_with_hint(server_hint: Option<&str>) -> String {
+    pick_locale(
+        locale_from_url(),
+        server_hint.map(str::to_string),
+        locale_from_localstorage(),
+        locale_from_navigator(),
+    )
+}
+
+/// Pure precedence pick — first non-empty layer wins, else en-US.
+/// Split out from the web_sys readers so it is unit-testable natively.
+fn pick_locale(
+    url: Option<String>,
+    hint: Option<String>,
+    stored: Option<String>,
+    navigator: Option<String>,
+) -> String {
+    [url, hint, stored, navigator]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.is_empty())
+        .unwrap_or_else(|| "en-US".to_string())
 }
 
 /// Compare two BCP-47 tags as "the same locale", treating a bare
@@ -219,6 +243,35 @@ fn locale_from_navigator() -> Option<String> {
         return None;
     }
     Some(lang)
+}
+
+#[cfg(test)]
+mod locale_precedence_tests {
+    use super::pick_locale;
+
+    fn s(v: &str) -> Option<String> { Some(v.to_string()) }
+
+    #[test]
+    fn url_beats_everything() {
+        assert_eq!(pick_locale(s("fr"), s("ar"), s("es"), s("de")), "fr");
+    }
+    #[test]
+    fn hint_beats_localstorage_and_navigator() {
+        assert_eq!(pick_locale(None, s("ar"), s("es"), s("de")), "ar");
+    }
+    #[test]
+    fn localstorage_beats_navigator() {
+        assert_eq!(pick_locale(None, None, s("es"), s("de")), "es");
+    }
+    #[test]
+    fn navigator_is_the_last_real_layer() {
+        assert_eq!(pick_locale(None, None, None, s("de")), "de");
+    }
+    #[test]
+    fn empty_strings_are_skipped_and_default_applies() {
+        assert_eq!(pick_locale(s(""), None, None, None), "en-US");
+        assert_eq!(pick_locale(s(""), s(""), s(""), s("de")), "de");
+    }
 }
 
 /// Stamp `<html lang="...">` and `<html dir="...">` to match the
