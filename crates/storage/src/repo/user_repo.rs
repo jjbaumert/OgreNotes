@@ -123,12 +123,31 @@ impl UserRepo {
     }
 
     /// Search users by email or name substring (case-insensitive).
-    /// Returns up to 10 matches. Walks scan pagination until either 10 matches
-    /// are collected or the scan is exhausted — otherwise a match past the
-    /// first page is invisible (same defect as `get_by_email`).
+    /// Returns up to `MAX_MATCHES` matches.
+    ///
+    /// This is a `Scan` with a post-read `contains()` filter — DynamoDB
+    /// can't index a substring. It stops early once enough matches are
+    /// collected, but a query that matches *few or no* users would
+    /// otherwise paginate the whole table (the filter discards most
+    /// items server-side), so cost scaled with the entire user set, not
+    /// the result (issue #35). A **scanned-items budget** bounds that:
+    /// once `MAX_SCANNED_ITEMS` rows have been examined we stop and
+    /// return what we have. The budget comfortably exceeds expected
+    /// per-deployment user counts (typical workspaces are <500 members),
+    /// so real searches stay exhaustive; only a pathologically large
+    /// table is truncated to a best-effort result. The lasting fix is a
+    /// real search index (qdrant) rather than a scan — tracked in #35.
     pub async fn search_users(&self, query: &str) -> Result<Vec<User>, RepoError> {
+        const MAX_MATCHES: usize = 10;
+        // Cost guardrail: cap total rows examined across pages.
+        const MAX_SCANNED_ITEMS: i32 = 5000;
+        // Per-page evaluation cap so the budget is enforced at page
+        // granularity and no single page reads an unbounded slice.
+        const PAGE_LIMIT: i32 = 500;
+
         let query_lower = query.trim().to_lowercase();
         let mut out: Vec<User> = Vec::new();
+        let mut scanned: i32 = 0;
         let mut last_key: Option<HashMap<String, AttributeValue>> = None;
         loop {
             let mut builder = self
@@ -136,6 +155,7 @@ impl UserRepo {
                 .inner()
                 .scan()
                 .table_name(self.db.table_name())
+                .limit(PAGE_LIMIT)
                 .filter_expression("SK = :sk AND (contains(email, :q) OR contains(#n, :q))")
                 .expression_attribute_values(":sk", AttributeValue::S("PROFILE".to_string()))
                 .expression_attribute_values(":q", AttributeValue::S(query_lower.clone()))
@@ -148,18 +168,25 @@ impl UserRepo {
                 .await
                 .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
 
+            // `scanned_count` is rows *examined* (the RCU-bearing figure),
+            // not rows matched — that's exactly what the budget bounds.
+            scanned += result.scanned_count();
+
             if let Some(items) = result.items {
                 for item in items {
                     out.push(user_from_item(&item)?);
-                    if out.len() >= 10 {
+                    if out.len() >= MAX_MATCHES {
                         return Ok(out);
                     }
                 }
             }
 
             match result.last_evaluated_key {
-                Some(key) => last_key = Some(key),
-                None => return Ok(out),
+                // Keep paging only while under the scan budget; otherwise
+                // return a best-effort result rather than traverse the
+                // whole table for a sparse-match query.
+                Some(key) if scanned < MAX_SCANNED_ITEMS => last_key = Some(key),
+                _ => return Ok(out),
             }
         }
     }
