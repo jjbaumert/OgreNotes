@@ -127,15 +127,13 @@ pub fn set_locale(locale: &str) {
 ///   3. `navigator.language` (browser default)
 ///   4. `en-US` (last-resort fallback)
 ///
-/// The server-side `UiPrefs.locale` is authoritative across
-/// devices but isn't consulted here — it requires an async
-/// `/users/me` fetch and main.rs's pre-mount path is synchronous.
-/// The locale-switcher component (M-P2 piece 3) fetches
-/// `/users/me` on mount and, if the stored pref differs from the
-/// active locale (e.g. first login on a new device with empty
-/// localStorage), calls [`set_locale`] + reload. The next
-/// bootstrap then picks up the cached pref from localStorage and
-/// the chain settles.
+/// This is the no-server-hint resolver, used for the logged-out /
+/// pre-auth case where there is no server pref to fold in. Once
+/// the boot refresh resolves, `main.rs` instead calls
+/// [`resolve_locale_with_hint`], which folds the server-stored
+/// `UiPrefs.locale` (delivered on the auth response) into tier 2 of
+/// the precedence chain and is applied before mount — no async
+/// `/users/me` fetch and no reload required.
 ///
 /// Unknown / unsupported BCP-47 tags from any layer fall through
 /// to the next layer.
@@ -302,6 +300,20 @@ mod wasm_locale_tests {
         set_ls("ogrenotes.locale", "de");
         assert_eq!(super::resolve_locale_with_hint(None), "de");
         clear_ls("ogrenotes.locale");
+    }
+
+    #[wasm_bindgen_test]
+    fn active_locale_reflects_what_init_applied() {
+        // active_locale() must report the locale the harness actually
+        // applied, not re-resolve precedence — that's the whole point
+        // of the accessor (the locale switcher's initial <select>
+        // value depends on this being correct on a fresh device with
+        // a server-pref hint and empty localStorage).
+        super::init("ar");
+        assert_eq!(super::active_locale(), "ar");
+
+        super::init("en-US");
+        assert_eq!(super::active_locale(), "en-US");
     }
 }
 
@@ -660,4 +672,14 @@ fn current_locale_or_default() -> String {
             borrowed.clone()
         }
     })
+}
+
+/// The BCP-47 tag of the currently-active locale — what `init` /
+/// `set_locale` last applied (the locale the user is actually seeing).
+/// UI that needs to reflect the active locale (e.g. the locale
+/// switcher's initial `<select>` value) should read THIS rather than
+/// re-running `resolve_locale`, which recomputes precedence and can
+/// disagree with the applied server-pref hint on a fresh device.
+pub fn active_locale() -> String {
+    current_locale_or_default()
 }

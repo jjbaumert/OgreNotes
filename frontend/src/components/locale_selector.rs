@@ -45,10 +45,12 @@ const LOCALE_CHOICES: &[(&str, &str)] = &[
 /// locale; on change fires the save+reload flow.
 #[component]
 pub fn LocaleSelector() -> impl IntoView {
-    // Initialize from the harness's resolved locale — same value
-    // it used to build the active bundle, so the `<select>`
-    // accurately reflects what the user is seeing.
-    let initial = i18n::resolve_locale();
+    // Initialize from the harness's ACTIVE locale (what `init` /
+    // `set_locale` actually applied, including any server-pref hint
+    // folded in at boot) rather than re-resolving precedence — on a
+    // fresh device with a stored server pref, `resolve_locale()`
+    // would disagree with what's actually rendered.
+    let initial = i18n::active_locale();
     let (current, set_current) = signal(initial);
 
     let on_change = move |ev: web_sys::Event| {
