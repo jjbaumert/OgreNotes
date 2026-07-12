@@ -175,6 +175,7 @@ impl Parser {
             let cls = cls.trim();
             if !id.is_empty() && !cls.is_empty() && !cls.contains(char::is_whitespace)
                 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && cls.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             {
                 let idx = self.ensure_node(id)?;
                 self.g.nodes[idx].classes.push(cls.to_string());
@@ -287,7 +288,11 @@ impl Parser {
         let Some((id, styles)) = rest.split_once(char::is_whitespace) else {
             return Err(self.err("style needs a state id and styles"));
         };
-        let idx = self.ensure_node(id.trim())?;
+        let id = id.trim();
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(self.err("style refers to unknown/invalid id"));
+        }
+        let idx = self.ensure_node(id)?;
         let s = crate::style::sanitize_style(styles);
         if !s.is_empty() {
             self.g.nodes[idx].style = Some(s);
@@ -1001,5 +1006,15 @@ mod tests {
         assert_eq!(still.classes, vec!["mov".to_string()]);
         assert_eq!(still.style.as_deref(), Some("fill:#00f"));
         assert_eq!(g.class_defs.iter().find(|d| d.name == "mov").unwrap().style, "fill:#0f0");
+    }
+
+    #[test]
+    fn spaceless_arrow_on_class_side_is_a_transition() {
+        // Regression: `A:::c-->B` must be a transition (2 nodes + 1 edge),
+        // class `c` on A — not swallowed with class "c-->B".
+        let g = p("stateDiagram-v2\nA:::c-->B");
+        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.transitions.len(), 1);
+        assert_eq!(g.nodes.iter().find(|n| n.id == "A").unwrap().classes, vec!["c".to_string()]);
     }
 }

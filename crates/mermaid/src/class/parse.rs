@@ -246,7 +246,9 @@ impl Parser {
         let Some((id, styles)) = rest.split_once(char::is_whitespace) else {
             return Err(self.err("style needs a class id and styles"));
         };
-        let idx = self.ensure_class(id.trim())?;
+        let id = id.trim();
+        self.validate_id(id)?;
+        let idx = self.ensure_class(id)?;
         let s = crate::style::sanitize_style(styles);
         if !s.is_empty() {
             self.g.classes[idx].style = Some(s);
@@ -419,7 +421,9 @@ impl Parser {
         if let Some((id, cls)) = stmt.split_once(":::") {
             let id = id.trim();
             let cls = cls.trim();
-            if !id.is_empty() && !cls.is_empty() && !cls.contains(char::is_whitespace) {
+            if !id.is_empty() && !cls.is_empty() && !cls.contains(char::is_whitespace)
+                && cls.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
                 self.validate_id(id)?;
                 let idx = self.ensure_class(id)?;
                 self.g.classes[idx].classes.push(cls.to_string());

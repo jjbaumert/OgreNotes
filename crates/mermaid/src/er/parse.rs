@@ -248,7 +248,9 @@ impl Parser {
         if let Some((id, cls)) = stmt.split_once(":::") {
             let id = id.trim();
             let cls = cls.trim();
-            if !id.is_empty() && !cls.is_empty() && !cls.contains(char::is_whitespace) {
+            if !id.is_empty() && !cls.is_empty() && !cls.contains(char::is_whitespace)
+                && cls.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
                 self.validate_id(id)?;
                 let idx = self.ensure_entity(id)?;
                 self.g.entities[idx].classes.push(cls.to_string());
@@ -323,7 +325,9 @@ impl Parser {
         let Some((id, styles)) = rest.split_once(char::is_whitespace) else {
             return Err(self.err("style needs an entity id and styles"));
         };
-        let idx = self.ensure_entity(id.trim())?;
+        let id = id.trim();
+        self.validate_id(id)?;
+        let idx = self.ensure_entity(id)?;
         let s = crate::style::sanitize_style(styles);
         if !s.is_empty() {
             self.g.entities[idx].style = Some(s);
@@ -732,6 +736,13 @@ mod tests {
         assert_eq!(car.classes, vec!["warm".to_string()]);
         assert_eq!(car.style.as_deref(), Some("fill:#333"));
         assert_eq!(g.class_defs.iter().find(|d| d.name == "warm").unwrap().style, "fill:#f80");
+    }
+
+    #[test]
+    fn style_with_garbage_id_errors() {
+        // Regression: `style` must not silently create a phantom entity
+        // when the "id" token is actually a relationship fragment.
+        assert!(parse("erDiagram\nstyle A||--o{B fill:#333").is_err());
     }
 
     #[test]
