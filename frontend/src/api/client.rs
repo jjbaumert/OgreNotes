@@ -97,15 +97,14 @@ pub async fn logout() {
     clear_auth();
 }
 
-/// Hydrate the in-memory access token from the refresh cookie.
-///
-/// Called once at app boot before mount. The cookie is
-/// auto-attached to same-origin fetches, so the empty body is
-/// sufficient. Returns the user's decoded UI prefs on success (or
-/// `None` on failure) — caller decides what to render based on the
-/// result (typically: render the app vs. send the user to /login).
-pub async fn try_hydrate_from_cookie() -> Option<UiPrefsDto> {
-    refresh_token_inner().await.and_then(|t| t.ui_prefs)
+/// Hydrate the in-memory access token from the refresh cookie at boot.
+/// Returns the decoded response on success (`None` only when the refresh
+/// itself failed), so callers can both (a) treat `Some` as "authenticated"
+/// and (b) read `.ui_prefs` for the boot-time prefs application. The
+/// access token is installed inside `refresh_token_inner` before this
+/// returns.
+pub async fn try_hydrate_from_cookie() -> Option<TokenResponse> {
+    refresh_token_inner().await
 }
 
 /// POST /auth/refresh via the HttpOnly cookie. Returns the decoded
