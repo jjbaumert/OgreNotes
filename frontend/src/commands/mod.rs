@@ -307,9 +307,12 @@ fn persist_recent(v: &[String]) {
 fn persist_recent(_v: &[String]) {}
 
 /// Install the v1 baseline of Global-scope commands. Called once
-/// from `main.rs` after the i18n harness is initialized — the
-/// label_keys point at strings the bundle must already know how
-/// to resolve.
+/// from `main.rs`, synchronously, *before* the i18n harness is
+/// initialized — there's no ordering dependency, since each
+/// label_key is just a `&'static str` stored on the command struct.
+/// Resolution against the active fluent bundle happens later, only
+/// when the palette is queried (see `matching()` below), by which
+/// point `i18n::init` has long since resolved.
 ///
 /// Piece B extends this with the full ~40-command set, including
 /// Editor- and Spreadsheet-scoped commands. The current 5 are

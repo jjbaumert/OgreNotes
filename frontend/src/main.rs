@@ -31,13 +31,16 @@ fn main() {
     editor::debug::init_from_url();
 
     // Phase 5 M-P4 piece A: install the command palette's baseline
-    // action set. Has to run after `i18n::init` because each command's
-    // label resolves through the active fluent bundle at render time;
-    // the registration call itself doesn't touch translations, but
-    // any subsequent palette query would see raw keys if init hadn't
-    // run yet. Idempotent on `id`, so a future re-registration path
-    // (e.g. per-page scope extensions in M-P4 piece B) can layer on
-    // top safely.
+    // action set. Runs synchronously here, before `i18n::init` (which
+    // now runs inside the post-refresh `spawn_local` block below) —
+    // and doesn't depend on it: each `PaletteCommand` only stores a
+    // `&'static str` label_key, it doesn't translate anything at
+    // registration time. The bundle is only consulted later, when the
+    // palette is actually queried (`matching()` in commands/mod.rs),
+    // which happens post-mount, long after `i18n::init` has resolved.
+    // Idempotent on `id`, so a future re-registration path (e.g.
+    // per-page scope extensions in M-P4 piece B) can layer on top
+    // safely.
     commands::register_defaults();
     // M-P4 piece C: rehydrate the most-recently-used command list
     // from localStorage so the next palette open ranks familiar
