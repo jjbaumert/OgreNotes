@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn half_arrows_error_naming_the_construct() {
-        for src in ["A-|\\B: t", "A-|/B: t", "A/|-B: t", "A-\\\\B: t", "A--//B: t"] {
+        for src in ["A-|\\B: t", "A-|/B: t", "A/|-B: t", "A-\\\\B: t", "A--//B: t", "A\\-B: t", "A/-B: t"] {
             let e = parse(&format!("sequenceDiagram\n{src}")).unwrap_err();
             assert_eq!(e.line, Some(2), "for {src}");
             assert!(e.message.contains("half arrow"), "for {src}, got: {}", e.message);
