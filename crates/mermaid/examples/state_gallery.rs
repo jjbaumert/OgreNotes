@@ -59,7 +59,7 @@ fn main() {
          "match"),
         ("doc14_notes",
          "    stateDiagram-v2\n        State1: The state with a note\n        note right of State1\n            Important information! You can write\n            notes.\n        end note\n        State1 --> State2\n        note left of State2 : This is the note to the left.\n",
-         "error expected (multi-line notes unsupported; single-line colon notes now render on-canvas)"),
+         "match: multi-line `note ... end note` block renders as a multi-line note; single-line colon note renders on-canvas"),
         ("doc15_concurrency",
          "stateDiagram-v2\n    [*] --> Active\n\n    state Active {\n        [*] --> NumLockOff\n        NumLockOff --> NumLockOn : EvNumLockPressed\n        NumLockOn --> NumLockOff : EvNumLockPressed\n        --\n        [*] --> CapsLockOff\n        CapsLockOff --> CapsLockOn : EvCapsLockPressed\n        CapsLockOn --> CapsLockOff : EvCapsLockPressed\n        --\n        [*] --> ScrollLockOff\n        ScrollLockOff --> ScrollLockOn : EvScrollLockPressed\n        ScrollLockOn --> ScrollLockOff : EvScrollLockPressed\n    }\n",
          "error expected (already-a-state guard fires on `Active` before the `--` divider is reached)"),

@@ -21,6 +21,8 @@ fn arb_source() -> impl Strategy<Value = String> {
         Just("}".to_string()),
         Just("note left of A: n".to_string()),
         Just("note right of B: n".to_string()),
+        Just("note left of A".to_string()),
+        Just("end note".to_string()),
         Just("bareId".to_string()),
         Just("s2 : a description".to_string()),
         Just("[*] --> Still:::notMoving".to_string()),

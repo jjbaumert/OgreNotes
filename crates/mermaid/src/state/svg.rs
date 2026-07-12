@@ -266,6 +266,18 @@ mod tests {
     }
 
     #[test]
+    fn multiline_note_block_renders_multiple_lines() {
+        let svg = render_state(
+            "stateDiagram-v2\nA --> B\nnote left of A\nfirst line\nsecond line\nend note",
+        )
+        .unwrap();
+        assert!(svg.contains("first line"));
+        assert!(svg.contains("second line"));
+        // Both body lines render as separate <tspan>s within the note.
+        assert!(svg.matches("<tspan").count() >= 2, "expected multi-line note tspans: {svg}");
+    }
+
+    #[test]
     fn labels_escaped() {
         let svg = render_state("stateDiagram-v2\nstate \"<script>x</script>\" as s\ns --> t").unwrap();
         assert!(!svg.contains("<script>"));
