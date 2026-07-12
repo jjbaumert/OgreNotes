@@ -116,6 +116,33 @@ struct Parser {
     block: Option<(usize, usize)>,
 }
 
+/// Rewrite Mermaid generic syntax `~Type~` to `<Type>` in a member string.
+/// A single leading visibility marker (`+ - # ~`) is peeled off first so its
+/// `~` is never mistaken for a generic opener (`~List~int~ x` → `~List<int> x`).
+fn generics_to_angle(s: &str) -> String {
+    let (vis, rest) = match s.chars().next() {
+        Some(c @ ('+' | '-' | '#' | '~')) => (&s[..c.len_utf8()], &s[c.len_utf8()..]),
+        _ => ("", s),
+    };
+    let mut out = String::from(vis);
+    let mut cur = rest;
+    while let Some(open) = cur.find('~') {
+        match cur[open + 1..].find('~') {
+            Some(rel) => {
+                let close = open + 1 + rel;
+                out.push_str(&cur[..open]);
+                out.push('<');
+                out.push_str(&cur[open + 1..close]);
+                out.push('>');
+                cur = &cur[close + 1..];
+            }
+            None => break,
+        }
+    }
+    out.push_str(cur);
+    out
+}
+
 pub(crate) fn parse(source: &str) -> Result<ClassGraph, ParseError> {
     let mut p = Parser {
         g: ClassGraph { classes: vec![], relations: vec![] },
@@ -172,6 +199,19 @@ impl Parser {
         if stmt.contains(":::") {
             return Err(self.err("CSS class shorthand `:::` is not supported"));
         }
+        // Standalone annotation: `<<interface>> ClassName` sets that class's
+        // annotation. (The `<<...>>`-on-its-own-line form inside a class block
+        // is handled by `apply_member`.)
+        if let Some(rest) = stmt.strip_prefix("<<") {
+            if let Some(end) = rest.find(">>") {
+                let annot = rest[..end].trim().to_string();
+                let id = rest[end + 2..].trim();
+                self.validate_id(id)?;
+                let idx = self.ensure_class(id)?;
+                self.g.classes[idx].annotation = Some(annot);
+                return Ok(());
+            }
+        }
         let first = stmt.split_whitespace().next().unwrap_or("");
         match first {
             "namespace" | "click" | "callback" | "style" | "cssClass" | "link" | "note"
@@ -198,10 +238,21 @@ impl Parser {
         let id = rest[..id_len].to_string();
         let idx = self.ensure_class(&id)?;
         let mut after = rest[id_len..].trim_start();
+        // Generic parameter: `class Square~Shape~` → title "Square<Shape>".
+        // Relationships still reference the bare id.
+        let mut generic: Option<String> = None;
+        if let Some(g_rest) = after.strip_prefix('~') {
+            if let Some(end) = g_rest.find('~') {
+                generic = Some(g_rest[..end].trim().to_string());
+                after = g_rest[end + 1..].trim_start();
+            }
+        }
         if after.starts_with('[') {
             let (label, tail) = self.parse_class_label(after)?;
             self.g.classes[idx].display = Some(label);
             after = tail;
+        } else if let Some(g) = &generic {
+            self.g.classes[idx].display = Some(format!("{id}<{g}>"));
         }
         let after = after.trim();
         if after.is_empty() {
@@ -353,9 +404,9 @@ impl Parser {
         if let Some(inner) = t.strip_prefix("<<").and_then(|s| s.strip_suffix(">>")) {
             cls.annotation = Some(inner.trim().to_string());
         } else if t.contains('(') {
-            cls.methods.push(t.to_string());
+            cls.methods.push(generics_to_angle(t));
         } else {
-            cls.attributes.push(t.to_string());
+            cls.attributes.push(generics_to_angle(t));
         }
     }
 
@@ -594,9 +645,31 @@ mod tests {
     }
 
     #[test]
-    fn generics_stored_verbatim() {
+    fn generics_rendered_with_angle_brackets() {
+        // Deliberate parity change: Mermaid renders `~T~` generics as `<T>`.
+        // (Previously kept verbatim; see `generics_to_angle`.) The leading
+        // visibility marker's own context is preserved.
         let g = p("classDiagram\nclass Box {\n+items List~T~\n}");
-        assert_eq!(g.classes[0].attributes, vec!["+items List~T~"]);
+        assert_eq!(g.classes[0].attributes, vec!["+items List<T>"]);
+        // A class-id generic decorates the title, id stays bare.
+        let g2 = p("classDiagram\nclass Square~Shape~\nSquare : +area() double");
+        assert_eq!(g2.classes[0].id, "Square");
+        assert_eq!(g2.classes[0].display.as_deref(), Some("Square<Shape>"));
+        // Nested generic after a visibility marker isn't mis-split.
+        let g3 = p("classDiagram\nclass M {\n+data Map~String, int~\n}");
+        assert_eq!(g3.classes[0].attributes, vec!["+data Map<String, int>"]);
+    }
+
+    #[test]
+    fn standalone_annotation_sets_class_annotation() {
+        // `<<enumeration>> Color` (annotation as its own statement, outside a
+        // class block) must set the class annotation, same as the inline form.
+        let g = p("classDiagram\nclass Color\n<<enumeration>> Color\nColor : RED");
+        assert_eq!(g.classes[0].annotation.as_deref(), Some("enumeration"));
+        // Works even when the class is created implicitly by the annotation.
+        let g2 = p("classDiagram\n<<interface>> Shape");
+        assert_eq!(g2.classes[0].id, "Shape");
+        assert_eq!(g2.classes[0].annotation.as_deref(), Some("interface"));
     }
 
     #[test]
