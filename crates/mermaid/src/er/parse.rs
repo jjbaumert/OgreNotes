@@ -260,6 +260,7 @@ impl Parser {
             "classDef" => return self.parse_class_def(stmt),
             "class" => return self.parse_class_assign(stmt),
             "style" => return self.parse_style(stmt),
+            "linkStyle" => return self.parse_link_style(stmt),
             _ => {}
         }
         let (name, quoted, after) = self.take_entity_name(stmt)?;
@@ -330,6 +331,34 @@ impl Parser {
         Ok(())
     }
 
+    /// `linkStyle <index[,index...]|default> prop:val,...` — styles one or
+    /// more relations, addressed by declaration index.
+    fn parse_link_style(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("linkStyle").unwrap().trim();
+        let Some((sel, styles)) = rest.split_once(char::is_whitespace) else {
+            return Err(self.err("linkStyle needs an index and styles"));
+        };
+        let s = crate::style::sanitize_style(styles);
+        if s.is_empty() {
+            return Ok(());
+        }
+        let edges = &mut self.g.relations;
+        if sel.trim() == "default" {
+            for e in edges.iter_mut() {
+                e.style = Some(s.clone());
+            }
+        } else {
+            for tok in sel.split(',') {
+                if let Ok(i) = tok.trim().parse::<usize>() {
+                    if let Some(e) = edges.get_mut(i) {
+                        e.style = Some(s.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// After an entity name (+ optional alias), the remainder is either
     /// empty (bare declaration) or `{` opening an attribute block; any
     /// other trailing text is an error.
@@ -371,7 +400,15 @@ impl Parser {
         self.validate_entity_token(right)?;
         let from = self.ensure_entity(&left.text)?;
         let to = self.ensure_entity(&right.text)?;
-        self.push_relation(ErRelation { from, to, card_from, card_to, identifying, label })
+        self.push_relation(ErRelation {
+            from,
+            to,
+            card_from,
+            card_to,
+            identifying,
+            label,
+            style: None,
+        })
     }
 
     /// The tokens between the two endpoints: either one compact symbol

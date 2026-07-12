@@ -188,6 +188,7 @@ impl Parser {
             "classDef" => return self.parse_class_def(stmt),
             "class" => return self.parse_class_assign(stmt),
             "style" => return self.parse_style(stmt),
+            "linkStyle" => return self.parse_link_style(stmt),
             _ if stmt.starts_with("accTitle") || stmt.starts_with("accDescr") => {
                 let kw = if stmt.starts_with("accTitle") { "accTitle" } else { "accDescr" };
                 return Err(self.err(format!("`{kw}` statements are not supported")));
@@ -290,6 +291,34 @@ impl Parser {
         let s = crate::style::sanitize_style(styles);
         if !s.is_empty() {
             self.g.nodes[idx].style = Some(s);
+        }
+        Ok(())
+    }
+
+    /// `linkStyle <index[,index...]|default> prop:val,...` — styles one or
+    /// more transitions, addressed by declaration index.
+    fn parse_link_style(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("linkStyle").unwrap().trim();
+        let Some((sel, styles)) = rest.split_once(char::is_whitespace) else {
+            return Err(self.err("linkStyle needs an index and styles"));
+        };
+        let s = crate::style::sanitize_style(styles);
+        if s.is_empty() {
+            return Ok(());
+        }
+        let edges = &mut self.g.transitions;
+        if sel.trim() == "default" {
+            for e in edges.iter_mut() {
+                e.style = Some(s.clone());
+            }
+        } else {
+            for tok in sel.split(',') {
+                if let Ok(i) = tok.trim().parse::<usize>() {
+                    if let Some(e) = edges.get_mut(i) {
+                        e.style = Some(s.clone());
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -612,7 +641,7 @@ impl Parser {
         to: usize,
         label: Option<String>,
     ) -> Result<(), ParseError> {
-        self.g.transitions.push(Transition { from, to, label });
+        self.g.transitions.push(Transition { from, to, label, style: None });
         if self.g.transitions.len() > crate::layout::MAX_EDGES {
             return Err(self.err(format!(
                 "diagram too large: too many transitions (max {})",

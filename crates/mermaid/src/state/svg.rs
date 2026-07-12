@@ -119,9 +119,11 @@ pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
         // Boxgraph diagrams lay out top-to-bottom, so edges curve along
         // the vertical flow axis.
         let d = crate::curved_path(&ep.points, true);
-        out.push_str(&format!(
-            r#"<path d="{d}" stroke="currentColor" fill="none" marker-end="url(#mmd-arrow)"/>"#
-        ));
+        let mut attrs = String::from(r#"stroke="currentColor" fill="none" marker-end="url(#mmd-arrow)""#);
+        if let Some(style) = &t.style {
+            attrs.push_str(&format!(r#" style="{}""#, escape_xml(style)));
+        }
+        out.push_str(&format!(r#"<path d="{d}" {attrs}/>"#));
 
         if let (Some(label), Some((lx, ly))) = (&t.label, ep.label_at) {
             let (tw, th) = measure::text_size(label);
@@ -324,6 +326,12 @@ mod tests {
         assert!(svg.contains("fill:#0f0;color:#000"), "styled state: {svg}");
         let plain = crate::render("stateDiagram-v2\n[*] --> S").svg.unwrap();
         assert!(!plain.contains("<g style="), "unstyled must not wrap: {plain}");
+    }
+
+    #[test]
+    fn linkstyle_colours_edge() {
+        let svg = crate::render("stateDiagram-v2\nA --> B\nlinkStyle 0 stroke:#f00").svg.unwrap();
+        assert!(svg.contains("stroke:#f00"), "edge style: {svg}");
     }
 
     // Test helpers (module-level in `mod tests`):

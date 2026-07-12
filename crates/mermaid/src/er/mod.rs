@@ -41,6 +41,7 @@ pub(crate) struct ErRelation {
     pub card_to: Cardinality,
     pub identifying: bool, // -- solid vs .. dashed
     pub label: String,     // required by grammar
+    pub style: Option<String>, // sanitized `linkStyle` override
 }
 
 #[derive(Debug, Clone)]

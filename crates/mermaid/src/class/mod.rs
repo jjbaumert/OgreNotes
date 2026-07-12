@@ -40,6 +40,7 @@ pub(crate) struct Relation {
     pub m_from: Option<String>, // multiplicity near `from`
     pub m_to: Option<String>,
     pub label: Option<String>,
+    pub style: Option<String>, // sanitized `linkStyle` override
 }
 
 #[derive(Debug, Clone)]

@@ -32,6 +32,7 @@ pub(crate) struct Transition {
     pub from: usize,
     pub to: usize,
     pub label: Option<String>,
+    pub style: Option<String>, // sanitized `linkStyle` override
 }
 
 #[derive(Debug, Clone)]

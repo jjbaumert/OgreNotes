@@ -59,6 +59,9 @@ pub(crate) fn emit(g: &ErGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
         if !r.identifying {
             attrs.push_str(r#" stroke-dasharray="4 3""#);
         }
+        if let Some(style) = &r.style {
+            attrs.push_str(&format!(r#" style="{}""#, escape_xml(style)));
+        }
         out.push_str(&format!(r#"<path d="{d}" {attrs}/>"#));
 
         if let Some((lx, ly)) = ep.label_at {
@@ -244,6 +247,12 @@ mod tests {
         assert!(svg.contains("fill:#f80;color:#000"), "styled entity: {svg}");
         let plain = render_er("erDiagram\nCAR").unwrap();
         assert!(!plain.contains("<g style="), "unstyled must not wrap: {plain}");
+    }
+
+    #[test]
+    fn linkstyle_colours_edge() {
+        let svg = crate::render("erDiagram\nA ||--o{ B : has\nlinkStyle 0 stroke:#f00").svg.unwrap();
+        assert!(svg.contains("stroke:#f00"), "edge style: {svg}");
     }
 
     #[test]

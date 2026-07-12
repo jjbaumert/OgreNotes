@@ -96,6 +96,9 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
         if r.back_arrow {
             attrs.push_str(r#" marker-start="url(#mmd-open)""#);
         }
+        if let Some(style) = &r.style {
+            attrs.push_str(&format!(r#" style="{}""#, escape_xml(style)));
+        }
         out.push_str(&format!(r#"<path d="{d}" {attrs}/>"#));
 
         if let (Some(label), Some((lx, ly))) = (&r.label, ep.label_at) {
@@ -297,6 +300,12 @@ mod tests {
         // unstyled diagram unchanged: no stray style= on the rect.
         let plain = crate::render("classDiagram\nclass B").svg.unwrap();
         assert!(!plain.contains("<g style="), "unstyled must not wrap: {plain}");
+    }
+
+    #[test]
+    fn linkstyle_colours_edge() {
+        let svg = crate::render("classDiagram\nA --> B\nlinkStyle 0 stroke:#f00").svg.unwrap();
+        assert!(svg.contains("stroke:#f00"), "edge style: {svg}");
     }
 
     #[test]
