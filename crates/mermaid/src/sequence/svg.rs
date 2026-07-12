@@ -216,7 +216,9 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
             ));
         }
 
-        let anchor = if self_msg { "start" } else { "middle" };
+        // Self-message labels are centered on the lifeline (layout anchors
+        // them at `fx`), same as regular messages.
+        let anchor = "middle";
         let lines = measure::lines(text);
         let n_lines = lines.len();
         out.push_str(&format!(

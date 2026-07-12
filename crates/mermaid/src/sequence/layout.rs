@@ -143,13 +143,20 @@ fn pass1_columns(d: &SeqDiagram) -> (Vec<f64>, Vec<f64>, f64, f64) {
                     let need = text_size(text).0 + 24.0;
                     widen_gap(&mut col_x, *from, *to, need);
                 } else {
+                    // Self-message: the label is centered on the lifeline
+                    // (see pass2), so reserve half its width on each side —
+                    // the right side also has to clear the loop-back stub.
                     let p = *from;
                     if p < col_x.len() {
-                        let need_right = SELF_STUB + text_size(text).0 + 12.0;
+                        let half = (text_size(text).0 / 2.0 + 6.0).max(SELF_STUB + ACT_W);
                         if p + 1 >= col_x.len() {
-                            overhang_right = overhang_right.max(need_right);
+                            overhang_right = overhang_right.max(half);
                         } else if let Some(&next_w) = box_w.get(p + 1) {
-                            widen_gap(&mut col_x, p, p + 1, need_right + next_w / 2.0);
+                            widen_gap(&mut col_x, p, p + 1, half + next_w / 2.0);
+                        }
+                        if p > 0 {
+                            let prev_w = box_w.get(p - 1).copied().unwrap_or(0.0);
+                            widen_gap(&mut col_x, p - 1, p, half + prev_w / 2.0);
                         }
                     }
                 }
@@ -265,8 +272,11 @@ fn pass2_rows(
                 let row_h = base_row_h + if self_msg { SELF_EXTRA } else { 0.0 };
                 let line_y = cursor + base_row_h - 6.0;
                 let text_anchor = if self_msg {
+                    // Center the label on the lifeline, above the loop-back
+                    // stub (Mermaid-style) rather than trailing off to the
+                    // right of it.
                     let fx = col_x.get(*from).copied().unwrap_or(0.0);
-                    (fx + ACT_W + SELF_STUB + 6.0, cursor + text_h / 2.0 + 6.0)
+                    (fx, cursor + text_h / 2.0 + 6.0)
                 } else {
                     let fx = col_x.get(*from).copied().unwrap_or(0.0);
                     let tx = col_x.get(*to).copied().unwrap_or(fx);
@@ -282,8 +292,12 @@ fn pass2_rows(
                 let tw = if text.is_empty() { 0.0 } else { text_size(text).0 };
                 let fx = col_x.get(*from).copied().unwrap_or(0.0);
                 if self_msg {
+                    // Symmetric footprint around the lifeline: the centered
+                    // label (half its width each side) plus room for the
+                    // loop-back stub.
                     let hw = box_w.get(*from).copied().unwrap_or(0.0) / 2.0;
-                    extend_frame(&mut frame_stack, fx - hw, fx + ACT_W + SELF_STUB + 6.0 + tw + 4.0);
+                    let half = (tw / 2.0 + 6.0).max(SELF_STUB + ACT_W).max(hw);
+                    extend_frame(&mut frame_stack, fx - half, fx + half);
                 } else {
                     let tx = col_x.get(*to).copied().unwrap_or(fx);
                     let mid = (fx + tx) / 2.0;
@@ -531,6 +545,33 @@ mod tests {
         let dn = normal.messages[1].y - normal.messages[0].y;
         let ds = selfy.messages[1].y - selfy.messages[0].y;
         assert!(ds > dn);
+    }
+
+    #[test]
+    fn self_message_label_centered_on_lifeline() {
+        // A wide self-message label must center on its own lifeline (like
+        // Mermaid) instead of trailing off to the right of the loop stub,
+        // and the enclosing frame must straddle the lifeline roughly
+        // symmetrically. Regression for the loop/label off-center report.
+        let l = lay(
+            "sequenceDiagram\nparticipant A\nparticipant B\nloop check\nB->>B: a fairly wide self label\nend",
+        );
+        let bx = l.col_x[1];
+        // label anchored exactly on the lifeline
+        assert!(
+            (l.messages[0].text_anchor.0 - bx).abs() < 1e-6,
+            "self label not centered: anchor {} vs lifeline {bx}",
+            l.messages[0].text_anchor.0
+        );
+        // loop frame straddles the lifeline on both sides, near-symmetric
+        let f = &l.frames[0];
+        let left = bx - f.rect.x;
+        let right = (f.rect.x + f.rect.w) - bx;
+        assert!(left > 0.0 && right > 0.0, "frame does not straddle lifeline: L {left} R {right}");
+        assert!(
+            (left - right).abs() < 25.0,
+            "loop frame not centered on lifeline: L {left} R {right}"
+        );
     }
 
     #[test]
