@@ -16,6 +16,7 @@ pub(crate) enum CommitType {
     Normal,
     Reverse,
     Highlight,
+    CherryPick,
 }
 
 #[derive(Debug, Clone)]
@@ -174,7 +175,32 @@ pub(crate) fn parse(source: &str) -> Result<GitGraph, ParseError> {
                 tip.insert(current.clone(), Some(ci));
             }
             "cherry-pick" => {
-                return Err(err("`cherry-pick` is not supported", line_no));
+                let pick = option(args, "id")
+                    .ok_or_else(|| err("`cherry-pick` needs an `id:`", line_no))?;
+                if !commits.iter().any(|c| c.id.as_deref() == Some(pick.as_str())) {
+                    return Err(err(
+                        format!("cherry-pick references unknown commit `{pick}`"),
+                        line_no,
+                    ));
+                }
+                if commits.len() >= MAX_COMMITS {
+                    return Err(err(
+                        format!("git graph too large: more than {MAX_COMMITS} commits"),
+                        line_no,
+                    ));
+                }
+                let parents: Vec<usize> = tip[&current].into_iter().collect();
+                let ci = commits.len();
+                commits.push(Commit {
+                    id: Some(pick), // label the pick with the source commit id
+                    lane: lane_of[&current],
+                    seq,
+                    parents,
+                    tag: option(args, "tag"),
+                    ctype: CommitType::CherryPick,
+                });
+                seq += 1;
+                tip.insert(current.clone(), Some(ci));
             }
             other => {
                 return Err(err(format!("unsupported git graph statement {other:?}"), line_no));
@@ -264,6 +290,15 @@ pub(crate) fn render_svg(g: &GitGraph) -> String {
                     r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{DOT_R}" fill="{color}"/>"#
                 ));
             }
+            CommitType::CherryPick => {
+                // Filled dot with a small cross, so a cherry-pick reads
+                // distinctly from a normal commit.
+                let a = DOT_R * 0.55;
+                svg.push_str(&format!(
+                    r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{DOT_R}" fill="{color}"/><path d="M {:.1} {:.1} L {:.1} {:.1} M {:.1} {:.1} L {:.1} {:.1}" stroke="var(--surface, #fff)" stroke-width="1.5"/>"#,
+                    cx - a, cy, cx + a, cy, cx, cy - a, cx, cy + a,
+                ));
+            }
         }
         if let Some(tag) = &c.tag {
             svg.push_str(&format!(
@@ -345,6 +380,28 @@ mod tests {
         let g = p("gitGraph\ncommit tag: \"id: 5\"");
         assert_eq!(g.commits[0].tag.as_deref(), Some("id: 5"));
         assert!(g.commits[0].id.is_none());
+    }
+
+    #[test]
+    fn cherry_pick_commits_onto_current_branch() {
+        let g = parse(
+            "gitGraph\ncommit id: \"A\"\nbranch dev\ncommit id: \"B\"\ncheckout main\ncherry-pick id: \"B\"",
+        )
+        .unwrap();
+        assert_eq!(g.commits.len(), 3);
+        let cp = g.commits.last().unwrap();
+        assert_eq!(cp.ctype, CommitType::CherryPick);
+        assert_eq!(cp.id.as_deref(), Some("B")); // labeled with the picked id
+        assert_eq!(cp.lane, 0); // lands on the current branch (main)
+        // renders without error
+        assert!(crate::render(
+            "gitGraph\ncommit id: \"A\"\nbranch dev\ncommit id: \"B\"\ncheckout main\ncherry-pick id: \"B\""
+        )
+        .svg
+        .is_some());
+        // a missing `id:` and an unknown id both error loudly
+        assert!(parse("gitGraph\ncommit\ncherry-pick").is_err());
+        assert!(parse("gitGraph\ncommit\ncherry-pick id: \"nope\"").is_err());
     }
 
     #[test]
