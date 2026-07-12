@@ -21,7 +21,12 @@ fn arb_source() -> impl Strategy<Value = String> {
         Just("}".to_string()),
         Just("note left of A: n".to_string()),
         Just("note right of B: n".to_string()),
-        "[a-zA-Z0-9_\\-: ]{0,24}",
+        Just("bareId".to_string()),
+        Just("s2 : a description".to_string()),
+        Just("[*] --> Still:::notMoving".to_string()),
+        Just("a --> b %% trailing comment".to_string()),
+        Just("note right of __start_0: boo".to_string()),
+        "[a-zA-Z0-9_:%<>\\- ]{0,24}",
     ];
     proptest::collection::vec(stmt, 0..40)
         .prop_map(|v| format!("stateDiagram-v2\n{}", v.join("\n")))
