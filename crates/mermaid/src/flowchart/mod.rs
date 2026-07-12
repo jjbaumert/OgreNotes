@@ -73,6 +73,9 @@ pub(crate) struct FlowSubgraph {
     pub id: String,
     pub title: String,
     pub parent: Option<usize>,
+    /// `direction` statement inside the subgraph; `None` inherits the
+    /// enclosing direction.
+    pub direction: Option<crate::layout::Direction>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +124,7 @@ pub(crate) fn render_flowchart(source: &str) -> Result<String, crate::ParseError
         .map(|s| crate::layout::LCluster {
             parent: s.parent,
             title: crate::measure::text_size(&s.title),
+            direction: s.direction,
         })
         .collect();
     let input = crate::layout::LayoutInput {

@@ -42,7 +42,7 @@ pub(crate) fn layout_boxgraph(
             .collect(),
         clusters: clusters
             .iter()
-            .map(|c| LCluster { parent: c.parent, title: c.title })
+            .map(|c| LCluster { parent: c.parent, title: c.title, direction: None })
             .collect(),
         direction,
     };

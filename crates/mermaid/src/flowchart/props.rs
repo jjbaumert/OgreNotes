@@ -30,6 +30,8 @@ fn arb_source() -> impl Strategy<Value = String> {
         Just("A-->|lbl|B".to_string()),
         Just("A[[sub]] --> B{d}".to_string()),
         Just("subgraph s".to_string()),
+        Just("direction LR".to_string()),
+        Just("direction TB".to_string()),
         Just("end".to_string()),
         Just("classDef default fill:#f9f".to_string()),
         Just("C:::default".to_string()),

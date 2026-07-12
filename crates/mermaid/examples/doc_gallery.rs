@@ -77,7 +77,7 @@ fn main() {
         // ── Subgraphs ────────────────────────────────────────────
         ("subgraph_titled", "flowchart TD\n    subgraph sgID[A Subgraph]\n        A-->B\n    end", "match"),
         ("subgraph_edge_to_id", "flowchart TD\n    subgraph sgID[A Subgraph]\n        A-->B\n    end\n    sgID-->C\n    C-->D", "LOUD ERROR: edge-to-subgraph routing deferred (was a silent phantom node 'sgID')"),
-        ("subgraph_direction", "flowchart TD\n    subgraph sgID[A Subgraph]\n        direction LR\n        A-->B\n    end", "error (direction-in-subgraph out of scope)"),
+        ("subgraph_direction", "flowchart TD\n    subgraph sgID[A Subgraph]\n        direction LR\n        A-->B\n    end", "match: subgraph flows LR (A left of B) inside the TD graph"),
         // ── Interaction / styling ────────────────────────────────
         ("click_callback", "flowchart TD\n    A-->B\n    click A callback \"Tooltip text\"", "error (out of scope: click)"),
         ("comments", "flowchart TD\n    A[Auslan]\n    %%this is a comment\n    A-->B[\"Christmas\"]", "match"),

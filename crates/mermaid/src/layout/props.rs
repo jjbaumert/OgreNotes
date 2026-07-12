@@ -30,7 +30,7 @@ fn arb_input() -> impl Strategy<Value = LayoutInput> {
                     .map(|(f, t)| LEdge { from: f, to: t, label: None })
                     .collect(),
                 clusters: (0..cluster_count)
-                    .map(|_| LCluster { parent: None, title: (30.0, 14.0) })
+                    .map(|_| LCluster { parent: None, title: (30.0, 14.0), direction: None })
                     .collect(),
                 direction: match dir {
                     0 => Direction::TB,

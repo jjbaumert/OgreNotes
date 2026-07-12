@@ -39,6 +39,10 @@ pub(crate) struct LCluster {
     pub parent: Option<usize>,
     /// Title strip size the renderer needs above the content box.
     pub title: (f64, f64),
+    /// This cluster's own layout direction (`direction` statement inside
+    /// the subgraph). `None` inherits the nearest ancestor's direction,
+    /// falling back to the graph direction.
+    pub direction: Option<Direction>,
 }
 
 #[derive(Debug, Clone)]
@@ -339,8 +343,8 @@ mod tests {
             nodes: vec![],
             edges: vec![],
             clusters: vec![
-                LCluster { parent: Some(1), title: (0.0, 0.0) },
-                LCluster { parent: Some(0), title: (0.0, 0.0) },
+                LCluster { parent: Some(1), title: (0.0, 0.0), direction: None },
+                LCluster { parent: Some(0), title: (0.0, 0.0), direction: None },
             ],
             direction: Direction::TB,
         };
