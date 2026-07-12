@@ -102,32 +102,38 @@ fn main() {
             .unwrap_or_else(|e| die(&format!("failed to read {path}: {e}"))),
     };
 
+    let bg = bg.unwrap_or_else(|| if dark { BG_DARK.into() } else { BG_LIGHT.into() });
+
     let rendered = ogrenotes_mermaid::render(&source);
-    let svg = match rendered.svg {
-        Some(svg) => svg,
+    // Faithful to the app: a successful render themes the SVG; a parse error
+    // renders the app's error state (banner + source) as an image so a failed
+    // diagram is *visible* in a batch instead of silently yielding nothing —
+    // and it's also flagged on stderr with a non-zero exit.
+    let (image, parse_error) = match rendered.svg {
+        Some(svg) => (theme(&svg, dark, &bg), None),
         None => {
-            let msg = rendered
-                .error
-                .map(|e| format!("{e:?}"))
-                .unwrap_or_else(|| "render produced no SVG".into());
-            die(&format!("{} diagram did not render: {msg}", rendered.kind.label()));
+            let msg = match rendered.error {
+                Some(e) => match e.line {
+                    Some(n) => format!("{} (line {n})", e.message),
+                    None => e.message,
+                },
+                None => "renderer produced no SVG".to_string(),
+            };
+            (error_card(rendered.kind.label(), &msg, &source, dark, &bg), Some(msg))
         }
     };
 
-    let bg = bg.unwrap_or_else(|| if dark { BG_DARK.into() } else { BG_LIGHT.into() });
-    let themed = theme(&svg, dark, &bg);
-
     match out.as_deref() {
-        None => {
-            print!("{themed}");
-        }
-        Some(path) if path.to_ascii_lowercase().ends_with(".png") => {
-            rasterize(&themed, path);
-        }
-        Some(path) => {
-            std::fs::write(path, &themed)
-                .unwrap_or_else(|e| die(&format!("failed to write {path}: {e}")));
-        }
+        None => print!("{image}"),
+        Some(path) if path.to_ascii_lowercase().ends_with(".png") => rasterize(&image, path),
+        Some(path) => std::fs::write(path, &image)
+            .unwrap_or_else(|e| die(&format!("failed to write {path}: {e}"))),
+    }
+
+    if let Some(msg) = parse_error {
+        let where_ = input.as_deref().filter(|s| *s != "-").unwrap_or("stdin");
+        eprintln!("mermaid_cli: PARSE ERROR [{where_}] — {msg}");
+        std::process::exit(1);
     }
 }
 
@@ -148,6 +154,59 @@ fn theme(svg: &str, dark: bool, bg: &str) -> String {
         }
     }
     out
+}
+
+/// Render the app's parse-error state — a red banner plus the raw source —
+/// as an SVG card. Mirrors `frontend/src/editor/blocks/mermaid.rs`, which
+/// shows a `.mermaid-error` message and a `<pre>` of the source on failure.
+/// This keeps a failed diagram visible in a batch comparison instead of
+/// producing no artifact at all.
+fn error_card(kind: &str, message: &str, source: &str, dark: bool, bg: &str) -> String {
+    let text = if dark { TEXT_DARK } else { TEXT_LIGHT };
+    let danger = if dark { "#E87060" } else { "#CC3333" }; // --color-danger
+    let muted = if dark { "#B0B0B0" } else { "#6B6B6B" }; // --color-text-secondary
+    let title = format!("Parse error — {kind} diagram");
+    let src_lines: Vec<&str> = source.lines().collect();
+    let cols = src_lines
+        .iter()
+        .map(|l| l.chars().count())
+        .chain([title.chars().count(), message.chars().count()])
+        .max()
+        .unwrap_or(0);
+    let pad = 20.0_f64;
+    let line_h = 18.0_f64;
+    let w = (cols as f64 * 7.9 + pad * 2.0).max(420.0);
+    let h = pad * 2.0 + 24.0 + 26.0 + src_lines.len().max(1) as f64 * line_h;
+    let mut out = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:14px">"#
+    );
+    if bg != "none" {
+        out.push_str(&format!(r#"<rect x="0" y="0" width="100%" height="100%" fill="{bg}"/>"#));
+    }
+    let mut y = pad + 14.0;
+    out.push_str(&format!(
+        r#"<text x="{pad:.0}" y="{y:.0}" font-weight="bold" fill="{danger}">{}</text>"#,
+        escape_xml(&title)
+    ));
+    y += 24.0;
+    out.push_str(&format!(
+        r#"<text x="{pad:.0}" y="{y:.0}" fill="{text}">{}</text>"#,
+        escape_xml(message)
+    ));
+    y += 28.0;
+    for line in &src_lines {
+        out.push_str(&format!(
+            r#"<text x="{pad:.0}" y="{y:.0}" font-family="monospace" font-size="13" xml:space="preserve" fill="{muted}">{}</text>"#,
+            escape_xml(line)
+        ));
+        y += line_h;
+    }
+    out.push_str("</svg>");
+    out
+}
+
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 /// Pipe the SVG to ImageMagick (`magick`, falling back to `convert`) to write a
