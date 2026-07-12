@@ -110,26 +110,9 @@ pub(crate) fn emit(g: &ErGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
             y
         ));
 
-        // Per-entity column widths: max field width (+12 gap) over this
-        // entity's attribute rows.
-        let type_col_w = e
-            .attributes
-            .iter()
-            .map(|a| measure::text_size(&a.ty).0)
-            .fold(0.0_f64, f64::max)
-            + 12.0;
-        let name_col_w = e
-            .attributes
-            .iter()
-            .map(|a| measure::text_size(&a.name).0)
-            .fold(0.0_f64, f64::max)
-            + 12.0;
-        let key_col_w = e
-            .attributes
-            .iter()
-            .map(|a| measure::text_size(&a.keys.join(", ")).0)
-            .fold(0.0_f64, f64::max)
-            + 12.0;
+        // Per-entity column widths — shared with the box sizing in `mod.rs`
+        // (via `attr_columns`) so the columns always fit inside the box.
+        let (type_col_w, name_col_w, key_col_w, _comment_col_w) = super::attr_columns(e);
 
         for a in &e.attributes {
             y += row_h;
@@ -211,6 +194,38 @@ mod tests {
     #[test]
     fn parse_error_propagates() {
         assert!(render_er("erDiagram\nA {\nint code XX\n}").is_err());
+    }
+
+    #[test]
+    fn wide_comment_stays_inside_entity_box() {
+        // Regression: the box was sized by per-row field sums while columns
+        // were laid out at per-column maxes, so a wide attribute comment
+        // overflowed and clipped. The comment's right edge must now sit
+        // inside the entity box.
+        let comment = "a fairly long trailing comment";
+        let svg =
+            render_er(&format!("erDiagram\n  CAR {{\n    string model FK \"{comment}\"\n  }}"))
+                .unwrap();
+        // Isolate the entity box rect and read its x + width.
+        let rect = svg
+            .match_indices("<rect")
+            .map(|(i, _)| &svg[i..i + svg[i..].find("/>").unwrap() + 2])
+            .find(|r| r.contains("var(--mermaid-node-fill"))
+            .expect("entity rect");
+        let attr = |el: &str, k: &str| -> f64 {
+            let at = el.find(&format!(" {k}=\"")).unwrap() + k.len() + 3;
+            el[at..].split('"').next().unwrap().parse().unwrap()
+        };
+        let box_right = attr(rect, "x") + attr(rect, "width");
+        // The comment text's x offset.
+        let ci = svg.find(comment).unwrap();
+        let ts = svg[..ci].rfind("<text").unwrap();
+        let comment_x = attr(&svg[ts..ci], "x");
+        let comment_right = comment_x + crate::measure::text_size(comment).0;
+        assert!(
+            comment_right <= box_right + 1.0,
+            "comment ends at {comment_right} but box ends at {box_right}"
+        );
     }
 
     #[test]
