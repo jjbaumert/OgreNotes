@@ -47,18 +47,9 @@ pub(crate) fn emit(g: &ErGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
     // solid-stroked, per their own `stroke` on the <marker> element).
     for ep in &l.edge_paths {
         let r = &g.relations[ep.edge];
-        let d: String = ep
-            .points
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                if i == 0 {
-                    format!("M {:.1} {:.1}", p.0, p.1)
-                } else {
-                    format!(" L {:.1} {:.1}", p.0, p.1)
-                }
-            })
-            .collect();
+        // Boxgraph diagrams lay out top-to-bottom, so edges curve along
+        // the vertical flow axis.
+        let d = crate::curved_path(&ep.points, true);
 
         let mut attrs = format!(
             r#"stroke="currentColor" fill="none" marker-start="url(#{})" marker-end="url(#{})""#,

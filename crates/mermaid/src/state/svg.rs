@@ -116,18 +116,9 @@ pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
     // 4. edges (+ label mask rects + label texts)
     for ep in &l.edge_paths {
         let t = &g.transitions[ep.edge];
-        let d: String = ep
-            .points
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                if i == 0 {
-                    format!("M {:.1} {:.1}", p.0, p.1)
-                } else {
-                    format!(" L {:.1} {:.1}", p.0, p.1)
-                }
-            })
-            .collect();
+        // Boxgraph diagrams lay out top-to-bottom, so edges curve along
+        // the vertical flow axis.
+        let d = crate::curved_path(&ep.points, true);
         out.push_str(&format!(
             r#"<path d="{d}" stroke="currentColor" fill="none" marker-end="url(#mmd-arrow)"/>"#
         ));

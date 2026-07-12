@@ -9,7 +9,7 @@
 use crate::escape_xml;
 use crate::flowchart::{shapes, EdgeKind, FlowGraph, FlowNode, Head};
 use crate::measure;
-use crate::layout::Layout;
+use crate::layout::{Direction, Layout};
 
 /// Resolves a node's style attr from its classes against the graph's
 /// `class_defs`: first class (in the node's declared order) that has a
@@ -71,18 +71,8 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
         if e.kind == EdgeKind::Invisible {
             continue; // participates in layout; draws nothing
         }
-        let d: String = ep
-            .points
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                if i == 0 {
-                    format!("M {:.1} {:.1}", p.0, p.1)
-                } else {
-                    format!(" L {:.1} {:.1}", p.0, p.1)
-                }
-            })
-            .collect();
+        let vertical = matches!(g.direction, Direction::TB | Direction::BT);
+        let d = crate::curved_path(&ep.points, vertical);
         // Line style from the kind family; heads from the edge ends.
         let line_attrs = match e.kind {
             EdgeKind::Arrow | EdgeKind::Open | EdgeKind::Invisible => "",
@@ -172,6 +162,26 @@ mod tests {
         assert!(svg.contains("mmd-arrow"));
         assert!(svg.contains("yes"));
         assert!(svg.contains("<polygon")); // the diamond
+    }
+
+    #[test]
+    fn edges_render_as_smooth_curves() {
+        // Edge paths use cubic Béziers (`C`), not straight `L` segments.
+        // Scope to the body after `</defs>` so the marker definitions
+        // (which use `M`/`L`) aren't mistaken for edges; edges are the
+        // arrowed paths (`marker-end`).
+        let svg = render_flowchart("graph TD\nA-->B-->C").unwrap();
+        let body = svg.split_once("</defs>").map(|(_, b)| b).unwrap_or(&svg);
+        let edges: Vec<&str> = body
+            .split("<path d=\"")
+            .skip(1)
+            .filter(|s| s.contains("marker-end"))
+            .collect();
+        assert_eq!(edges.len(), 2, "two edges expected");
+        for p in &edges {
+            let d = &p[..p.find('"').unwrap_or(p.len())];
+            assert!(d.contains(" C "), "edge not curved: {d}");
+        }
     }
 
     #[test]
