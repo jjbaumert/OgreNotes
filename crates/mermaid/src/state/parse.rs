@@ -330,6 +330,9 @@ impl Parser {
         {
             return Err(self.err(format!("invalid state id {id_part:?}")));
         }
+        if id_part.starts_with("__") {
+            return Err(self.err("cannot attach a note to a synthetic state id"));
+        }
         let idx = self.ensure_node(id_part)?;
         self.g.notes.push(StateNote { state: idx, right, text: text.trim().to_string() });
         Ok(())
@@ -704,5 +707,16 @@ mod tests {
     fn single_percent_in_label_survives() {
         let g = p("stateDiagram-v2\na --> b: 50% done");
         assert_eq!(g.transitions[0].label.as_deref(), Some("50% done"));
+    }
+
+    #[test]
+    fn note_on_synthetic_id_errors() {
+        // `__start_0`/`__end_0` are the synthesizer's reserved ids;
+        // targeting one used to mint a phantom normal node (filed on
+        // #32). A user state deliberately named `__x` also errors —
+        // acceptable per the spec.
+        let e = parse("stateDiagram-v2\n[*] --> A\nnote right of __start_0: boo").unwrap_err();
+        assert_eq!(e.line, Some(3));
+        assert!(e.message.contains("synthetic"), "got: {}", e.message);
     }
 }
