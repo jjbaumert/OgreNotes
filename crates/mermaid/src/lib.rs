@@ -12,6 +12,7 @@
 //! (state/class/ER).
 
 mod pie;
+mod gantt;
 mod layout;
 pub(crate) mod measure;
 pub(crate) mod flowchart;
@@ -35,6 +36,7 @@ pub enum DiagramKind {
     State,
     Class,
     Er,
+    Gantt,
     Unknown,
 }
 
@@ -48,6 +50,7 @@ impl DiagramKind {
             DiagramKind::State => "state",
             DiagramKind::Class => "class",
             DiagramKind::Er => "entity-relationship",
+            DiagramKind::Gantt => "gantt",
             DiagramKind::Unknown => "unknown",
         }
     }
@@ -132,6 +135,7 @@ pub fn detect_kind(source: &str) -> DiagramKind {
         "stateDiagram" | "stateDiagram-v2" => DiagramKind::State,
         "classDiagram" | "classDiagram-v2" => DiagramKind::Class,
         "erDiagram" => DiagramKind::Er,
+        "gantt" => DiagramKind::Gantt,
         _ => DiagramKind::Unknown,
     }
 }
@@ -227,6 +231,10 @@ pub fn render(source: &str) -> RenderOutput {
             Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
             Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
         },
+        DiagramKind::Gantt => match gantt::parse(source) {
+            Ok(g) => RenderOutput { kind, svg: Some(gantt::render_svg(&g)), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
         DiagramKind::Unknown => RenderOutput {
             kind,
             svg: None,
@@ -271,6 +279,7 @@ mod tests {
         assert_eq!(detect_kind("classDiagram"), DiagramKind::Class);
         assert_eq!(detect_kind("classDiagram-v2"), DiagramKind::Class);
         assert_eq!(detect_kind("erDiagram"), DiagramKind::Er);
+        assert_eq!(detect_kind("gantt"), DiagramKind::Gantt);
         assert_eq!(detect_kind("nonsense here"), DiagramKind::Unknown);
     }
 
