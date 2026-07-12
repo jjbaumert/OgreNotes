@@ -29,6 +29,8 @@ pub(crate) struct Entity {
     /// `id` is still what relationships reference.
     pub display: Option<String>,
     pub attributes: Vec<ErAttribute>,
+    pub classes: Vec<String>,
+    pub style: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,12 +41,14 @@ pub(crate) struct ErRelation {
     pub card_to: Cardinality,
     pub identifying: bool, // -- solid vs .. dashed
     pub label: String,     // required by grammar
+    pub style: Option<String>, // sanitized `linkStyle` override
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ErGraph {
     pub entities: Vec<Entity>,
     pub relations: Vec<ErRelation>,
+    pub class_defs: Vec<crate::style::ClassDef>,
 }
 
 /// Per-column pixel widths — `(type, name, key, comment)` — of an entity's

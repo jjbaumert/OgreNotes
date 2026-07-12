@@ -23,6 +23,8 @@ pub(crate) struct StateNode {
     pub display: String,
     pub kind: StateKind,
     pub composite: Option<usize>, // index into composites
+    pub classes: Vec<String>,
+    pub style: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +32,7 @@ pub(crate) struct Transition {
     pub from: usize,
     pub to: usize,
     pub label: Option<String>,
+    pub style: Option<String>, // sanitized `linkStyle` override
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +55,7 @@ pub(crate) struct StateGraph {
     pub transitions: Vec<Transition>,
     pub notes: Vec<StateNote>,
     pub composites: Vec<Composite>,
+    pub class_defs: Vec<crate::style::ClassDef>,
 }
 
 /// Full state-diagram pipeline: parse -> size each node by kind -> lay

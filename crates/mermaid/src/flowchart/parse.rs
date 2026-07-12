@@ -622,42 +622,14 @@ impl Parser {
         Ok(EdgeOp { kind, from_head, to_head, label: Some(label) })
     }
 
-    /// The style allowlist is the CSS-injection boundary: only these
-    /// properties, and only benign value characters, survive into the
-    /// emitted `style` attribute. Everything else is dropped silently —
-    /// styling is cosmetic and mermaid's style vocabulary is huge, so
-    /// erroring here would be hostile to real-world diagrams.
-    const STYLE_PROPS: &[&str] = &[
-        "fill", "stroke", "stroke-width", "stroke-dasharray",
-        "color", "font-weight", "font-style", "opacity",
-    ];
-
-    /// Sanitizes a comma-separated `prop:value` list against the
-    /// allowlist, returning `prop:value;`-joined survivors (possibly
-    /// empty). The CSS-injection boundary shared by `classDef`, `style`,
-    /// and `linkStyle`.
-    fn sanitize_style(styles: &str) -> String {
-        let mut kept = Vec::new();
-        for pair in styles.split(',') {
-            let Some((prop, value)) = pair.split_once(':') else { continue };
-            let (prop, value) = (prop.trim(), value.trim());
-            let value_ok =
-                value.chars().all(|c| c.is_ascii_alphanumeric() || " #.,%-".contains(c));
-            if Self::STYLE_PROPS.contains(&prop) && value_ok && !value.is_empty() {
-                kept.push(format!("{prop}:{value}"));
-            }
-        }
-        kept.join(";")
-    }
-
     fn parse_class_def(&mut self, stmt: &str) -> Result<(), ParseError> {
         let rest = stmt.strip_prefix("classDef").unwrap().trim();
         let Some((name, styles)) = rest.split_once(char::is_whitespace) else {
             return Err(self.err("classDef needs a name and styles"));
         };
-        self.g.class_defs.push(crate::flowchart::ClassDef {
+        self.g.class_defs.push(crate::style::ClassDef {
             name: name.to_string(),
-            style: Self::sanitize_style(styles),
+            style: crate::style::sanitize_style(styles),
         });
         Ok(())
     }
@@ -673,7 +645,7 @@ impl Parser {
         let Some(&idx) = self.ids.get(id) else {
             return Err(self.err(format!("style refers to unknown node `{id}`")));
         };
-        let style = Self::sanitize_style(styles);
+        let style = crate::style::sanitize_style(styles);
         if !style.is_empty() {
             self.g.nodes[idx].style = Some(style);
         }
@@ -687,7 +659,7 @@ impl Parser {
         let Some((targets, styles)) = rest.split_once(char::is_whitespace) else {
             return Err(self.err("linkStyle needs edge indices and styles"));
         };
-        let style = Self::sanitize_style(styles);
+        let style = crate::style::sanitize_style(styles);
         if targets.trim() == "default" {
             self.g.default_link_style = Some(style);
             return Ok(());

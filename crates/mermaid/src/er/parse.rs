@@ -147,7 +147,7 @@ struct Parser {
 
 pub(crate) fn parse(source: &str) -> Result<ErGraph, ParseError> {
     let mut p = Parser {
-        g: ErGraph { entities: vec![], relations: vec![] },
+        g: ErGraph { entities: vec![], relations: vec![], class_defs: vec![] },
         ids: HashMap::new(),
         line: 0,
         block: None,
@@ -241,6 +241,30 @@ impl Parser {
     /// opens an attribute block, `ENTITY` / `ENTITY [alias]` bare declare
     /// an entity, everything else is a relationship.
     fn parse_statement(&mut self, stmt: &str) -> Result<(), ParseError> {
+        // Standalone `ENTITY:::className` — attach a style class. Checked
+        // before the keyword dispatch so `:::` never gets mistaken for
+        // anything else, and before the entity-name scan so hyphens/etc.
+        // inside `id` don't need special-casing here.
+        if let Some((id, cls)) = stmt.split_once(":::") {
+            let id = id.trim();
+            let cls = cls.trim();
+            if !id.is_empty() && !cls.is_empty() && !cls.contains(char::is_whitespace)
+                && cls.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                self.validate_id(id)?;
+                let idx = self.ensure_entity(id)?;
+                self.g.entities[idx].classes.push(cls.to_string());
+                return Ok(());
+            }
+        }
+        let first = stmt.split_whitespace().next().unwrap_or("");
+        match first {
+            "classDef" => return self.parse_class_def(stmt),
+            "class" => return self.parse_class_assign(stmt),
+            "style" => return self.parse_style(stmt),
+            "linkStyle" => return self.parse_link_style(stmt),
+            _ => {}
+        }
         let (name, quoted, after) = self.take_entity_name(stmt)?;
         if !quoted {
             self.validate_id(&name)?;
@@ -263,6 +287,80 @@ impl Parser {
             return Ok(());
         }
         self.parse_relationship(stmt)
+    }
+
+    /// `classDef name prop:val,...`
+    fn parse_class_def(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("classDef").unwrap().trim();
+        let Some((name, styles)) = rest.split_once(char::is_whitespace) else {
+            return Err(self.err("classDef needs a name and styles"));
+        };
+        self.g.class_defs.push(crate::style::ClassDef {
+            name: name.trim().to_string(),
+            style: crate::style::sanitize_style(styles),
+        });
+        Ok(())
+    }
+
+    /// `class A,B className` — attach a style class to one or more
+    /// entities.
+    fn parse_class_assign(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("class").unwrap().trim();
+        let Some((ids, name)) = rest.rsplit_once(char::is_whitespace) else {
+            return Err(self.err("class needs an entity list and a class name"));
+        };
+        let name = name.trim();
+        for id in ids.trim().trim_matches('"').split(',') {
+            let id = id.trim();
+            self.validate_id(id)?;
+            let idx = self.ensure_entity(id)?;
+            self.g.entities[idx].classes.push(name.to_string());
+        }
+        Ok(())
+    }
+
+    /// `style <id> prop:val,...`
+    fn parse_style(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("style").unwrap().trim();
+        let Some((id, styles)) = rest.split_once(char::is_whitespace) else {
+            return Err(self.err("style needs an entity id and styles"));
+        };
+        let id = id.trim();
+        self.validate_id(id)?;
+        let idx = self.ensure_entity(id)?;
+        let s = crate::style::sanitize_style(styles);
+        if !s.is_empty() {
+            self.g.entities[idx].style = Some(s);
+        }
+        Ok(())
+    }
+
+    /// `linkStyle <index[,index...]|default> prop:val,...` — styles one or
+    /// more relations, addressed by declaration index.
+    fn parse_link_style(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("linkStyle").unwrap().trim();
+        let Some((sel, styles)) = rest.split_once(char::is_whitespace) else {
+            return Err(self.err("linkStyle needs an index and styles"));
+        };
+        let s = crate::style::sanitize_style(styles);
+        if s.is_empty() {
+            return Ok(());
+        }
+        let edges = &mut self.g.relations;
+        if sel.trim() == "default" {
+            for e in edges.iter_mut() {
+                e.style = Some(s.clone());
+            }
+        } else {
+            for tok in sel.split(',') {
+                if let Ok(i) = tok.trim().parse::<usize>() {
+                    if let Some(e) = edges.get_mut(i) {
+                        e.style = Some(s.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// After an entity name (+ optional alias), the remainder is either
@@ -306,7 +404,15 @@ impl Parser {
         self.validate_entity_token(right)?;
         let from = self.ensure_entity(&left.text)?;
         let to = self.ensure_entity(&right.text)?;
-        self.push_relation(ErRelation { from, to, card_from, card_to, identifying, label })
+        self.push_relation(ErRelation {
+            from,
+            to,
+            card_from,
+            card_to,
+            identifying,
+            label,
+            style: None,
+        })
     }
 
     /// The tokens between the two endpoints: either one compact symbol
@@ -437,7 +543,13 @@ impl Parser {
             return Ok(i);
         }
         let idx = self.g.entities.len();
-        self.g.entities.push(Entity { id: id.to_string(), display: None, attributes: vec![] });
+        self.g.entities.push(Entity {
+            id: id.to_string(),
+            display: None,
+            attributes: vec![],
+            classes: vec![],
+            style: None,
+        });
         self.ids.insert(id.to_string(), idx);
         if self.g.entities.len() > crate::layout::MAX_NODES {
             return Err(self.err(format!(
@@ -615,6 +727,22 @@ mod tests {
     fn unclosed_block_errors_at_opening() {
         let e = parse("erDiagram\nA {\nstring x").unwrap_err();
         assert_eq!(e.line, Some(2));
+    }
+
+    #[test]
+    fn er_styling_parses() {
+        let g = parse("erDiagram\nclassDef warm fill:#f80\nCAR\nCAR:::warm\nstyle CAR fill:#333").unwrap();
+        let car = g.entities.iter().find(|e| e.id == "CAR").unwrap();
+        assert_eq!(car.classes, vec!["warm".to_string()]);
+        assert_eq!(car.style.as_deref(), Some("fill:#333"));
+        assert_eq!(g.class_defs.iter().find(|d| d.name == "warm").unwrap().style, "fill:#f80");
+    }
+
+    #[test]
+    fn style_with_garbage_id_errors() {
+        // Regression: `style` must not silently create a phantom entity
+        // when the "id" token is actually a relationship fragment.
+        assert!(parse("erDiagram\nstyle A||--o{B fill:#333").is_err());
     }
 
     #[test]

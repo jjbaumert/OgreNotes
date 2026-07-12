@@ -17,6 +17,7 @@ mod gitgraph;
 mod mindmap;
 mod layout;
 pub(crate) mod measure;
+pub(crate) mod style;
 pub(crate) mod flowchart;
 pub(crate) mod sequence;
 pub(crate) mod boxgraph;

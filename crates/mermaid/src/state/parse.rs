@@ -84,7 +84,13 @@ fn split_statements(line: &str) -> Vec<&str> {
 
 pub(crate) fn parse(source: &str) -> Result<StateGraph, ParseError> {
     let mut p = Parser {
-        g: StateGraph { nodes: vec![], transitions: vec![], notes: vec![], composites: vec![] },
+        g: StateGraph {
+            nodes: vec![],
+            transitions: vec![],
+            notes: vec![],
+            composites: vec![],
+            class_defs: vec![],
+        },
         ids: HashMap::new(),
         composite_ids: HashMap::new(),
         stack: Vec::new(),
@@ -163,13 +169,27 @@ impl Parser {
         if stmt == "--" {
             return Err(self.err("`--` (concurrency) is not supported"));
         }
+        // `State:::className` (standalone) attaches a style class.
+        if let Some((id, cls)) = stmt.split_once(":::") {
+            let id = id.trim();
+            let cls = cls.trim();
+            if !id.is_empty() && !cls.is_empty() && !cls.contains(char::is_whitespace)
+                && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && cls.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                let idx = self.ensure_node(id)?;
+                self.g.nodes[idx].classes.push(cls.to_string());
+                return Ok(());
+            }
+        }
         let first = stmt.split_whitespace().next().unwrap_or("");
         match first {
             "state" => return self.parse_state_decl(stmt),
             "direction" => return Err(self.err("`direction` statements are not supported")),
-            "classDef" | "class" => {
-                return Err(self.err(format!("`{first}` statements are not supported")));
-            }
+            "classDef" => return self.parse_class_def(stmt),
+            "class" => return self.parse_class_assign(stmt),
+            "style" => return self.parse_style(stmt),
+            "linkStyle" => return self.parse_link_style(stmt),
             _ if stmt.starts_with("accTitle") || stmt.starts_with("accDescr") => {
                 let kw = if stmt.starts_with("accTitle") { "accTitle" } else { "accDescr" };
                 return Err(self.err(format!("`{kw}` statements are not supported")));
@@ -233,6 +253,79 @@ impl Parser {
             }
         }
         Ok(true)
+    }
+
+    /// `classDef name prop:val,...`
+    fn parse_class_def(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("classDef").unwrap().trim();
+        let Some((name, styles)) = rest.split_once(char::is_whitespace) else {
+            return Err(self.err("classDef needs a name and styles"));
+        };
+        self.g.class_defs.push(crate::style::ClassDef {
+            name: name.trim().to_string(),
+            style: crate::style::sanitize_style(styles),
+        });
+        Ok(())
+    }
+
+    /// `class id[,id...] className`
+    fn parse_class_assign(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("class").unwrap().trim();
+        let Some((ids, name)) = rest.rsplit_once(char::is_whitespace) else {
+            return Err(self.err("class needs a state list and a class name"));
+        };
+        let name = name.trim();
+        for id in ids.trim().trim_matches('"').split(',') {
+            let idx = self.ensure_node(id.trim())?;
+            self.g.nodes[idx].classes.push(name.to_string());
+        }
+        Ok(())
+    }
+
+    /// `style id prop:val,...`
+    fn parse_style(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("style").unwrap().trim();
+        let Some((id, styles)) = rest.split_once(char::is_whitespace) else {
+            return Err(self.err("style needs a state id and styles"));
+        };
+        let id = id.trim();
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(self.err("style refers to unknown/invalid id"));
+        }
+        let idx = self.ensure_node(id)?;
+        let s = crate::style::sanitize_style(styles);
+        if !s.is_empty() {
+            self.g.nodes[idx].style = Some(s);
+        }
+        Ok(())
+    }
+
+    /// `linkStyle <index[,index...]|default> prop:val,...` — styles one or
+    /// more transitions, addressed by declaration index.
+    fn parse_link_style(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("linkStyle").unwrap().trim();
+        let Some((sel, styles)) = rest.split_once(char::is_whitespace) else {
+            return Err(self.err("linkStyle needs an index and styles"));
+        };
+        let s = crate::style::sanitize_style(styles);
+        if s.is_empty() {
+            return Ok(());
+        }
+        let edges = &mut self.g.transitions;
+        if sel.trim() == "default" {
+            for e in edges.iter_mut() {
+                e.style = Some(s.clone());
+            }
+        } else {
+            for tok in sel.split(',') {
+                if let Ok(i) = tok.trim().parse::<usize>() {
+                    if let Some(e) = edges.get_mut(i) {
+                        e.style = Some(s.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `state "Display" as ID` / `state ID {` / `state ID <<stereotype>>`
@@ -424,19 +517,15 @@ impl Parser {
     fn parse_transition(&mut self, stmt: &str) -> Result<(), ParseError> {
         let mut rest = stmt;
         let from = self.parse_endpoint(&mut rest, EndpointRole::Source)?;
+        self.consume_class_suffix(&mut rest, from)?;
         let r = rest.trim_start();
         let Some(after_arrow) = r.strip_prefix("-->") else {
             return Err(self.err(format!("expected a transition (e.g. `-->`), found {r:?}")));
         };
         rest = after_arrow;
         let to = self.parse_endpoint(&mut rest, EndpointRole::Target)?;
+        self.consume_class_suffix(&mut rest, to)?;
         let tail = rest.trim_start();
-        // `X:::class` — the label branch below would eat the first colon
-        // and render an edge labeled `::class` (silent misparse, issue
-        // #47). Styling application is out of scope; error naming it.
-        if tail.starts_with(":::") {
-            return Err(self.err("`:::` class styling is not supported"));
-        }
         let label = match tail.strip_prefix(':') {
             Some(t) => Some(t.trim().to_string()),
             None if tail.is_empty() => None,
@@ -487,6 +576,22 @@ impl Parser {
         self.ensure_node(id)
     }
 
+    /// Strip and apply an optional `:::className` suffix immediately
+    /// following a transition endpoint (`rest` starts right after the
+    /// endpoint was scanned). A no-op when no `:::` is present.
+    fn consume_class_suffix(&mut self, rest: &mut &str, node_idx: usize) -> Result<(), ParseError> {
+        let r = rest.trim_start();
+        if let Some(after) = r.strip_prefix(":::") {
+            let n = after.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+            if n == 0 {
+                return Err(self.err("expected a class name after `:::`"));
+            }
+            self.g.nodes[node_idx].classes.push(after[..n].to_string());
+            *rest = &after[n..];
+        }
+        Ok(())
+    }
+
     /// Fresh synthetic `Start`/`End` node for one `[*]` occurrence,
     /// scoped to the currently-open composite (if any).
     fn make_star_node(&mut self, role: EndpointRole) -> Result<usize, ParseError> {
@@ -523,6 +628,8 @@ impl Parser {
             display,
             kind,
             composite: self.stack.last().map(|&(i, _)| i),
+            classes: vec![],
+            style: None,
         });
         if self.g.nodes.len() > crate::layout::MAX_NODES {
             return Err(self.err(format!(
@@ -539,7 +646,7 @@ impl Parser {
         to: usize,
         label: Option<String>,
     ) -> Result<(), ParseError> {
-        self.g.transitions.push(Transition { from, to, label });
+        self.g.transitions.push(Transition { from, to, label, style: None });
         if self.g.transitions.len() > crate::layout::MAX_EDGES {
             return Err(self.err(format!(
                 "diagram too large: too many transitions (max {})",
@@ -704,20 +811,36 @@ mod tests {
     // (docs/superpowers/specs/2026-07-11-mermaid-state-polish-design.md)
 
     #[test]
-    fn triple_colon_target_errors_naming_the_operator() {
-        // THE silent-misparse regression: the docs' own example used to
-        // render an edge labeled `::notMoving`.
-        let e = parse("stateDiagram-v2\n[*] --> Still:::notMoving").unwrap_err();
-        assert_eq!(e.line, Some(2));
-        assert!(e.message.contains(":::"), "got: {}", e.message);
+    fn triple_colon_target_attaches_class() {
+        // Was THE silent-misparse regression (used to render an edge
+        // labeled `::notMoving`, then later a loud error); Task 3 makes
+        // it the documented styling shorthand.
+        let g = p("stateDiagram-v2\n[*] --> Still:::notMoving");
+        let still = g.nodes.iter().find(|n| n.id == "Still").unwrap();
+        assert_eq!(still.classes, vec!["notMoving".to_string()]);
     }
 
     #[test]
-    fn triple_colon_source_still_errors() {
-        // Source-side was already loud (the arrow check finds `:::`);
-        // pin it so the two sides stay consistent.
-        let e = parse("stateDiagram-v2\nStill:::notMoving --> [*]").unwrap_err();
-        assert_eq!(e.line, Some(2));
+    fn triple_colon_source_attaches_class() {
+        // Source-side `:::` attaches the class the same way the target
+        // side does.
+        let g = p("stateDiagram-v2\nStill:::notMoving --> [*]");
+        let still = g.nodes.iter().find(|n| n.id == "Still").unwrap();
+        assert_eq!(still.classes, vec!["notMoving".to_string()]);
+    }
+
+    #[test]
+    fn spaceless_arrow_with_class_suffix_is_a_transition() {
+        // Regression: `A-->B:::c` must be a transition (2 nodes + 1 edge)
+        // with class `c` on B — not swallowed as one node id "A-->B".
+        let g = p("stateDiagram-v2\nA-->B:::c");
+        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.transitions.len(), 1);
+        let b = g.nodes.iter().find(|n| n.id == "B").expect("node B exists");
+        assert_eq!(b.classes, vec!["c".to_string()]);
+        // Standalone form still attaches.
+        let g2 = p("stateDiagram-v2\n[*] --> S\nS:::hot");
+        assert_eq!(g2.nodes.iter().find(|n| n.id == "S").unwrap().classes, vec!["hot".to_string()]);
     }
 
     #[test]
@@ -727,15 +850,13 @@ mod tests {
     }
 
     #[test]
-    fn styling_and_acc_statements_error_named() {
-        // These fell through to the transition parser and produced
-        // misleading `expected a transition` messages.
-        for stmt in [
-            "classDef notMoving fill:white",
-            "class Moving, Crash movement",
-            "accTitle: My title",
-            "accDescr: My description",
-        ] {
+    fn acc_statements_error_named() {
+        // `classDef`/`class` moved out of this list: Task 3 turns them
+        // into supported styling statements (see `state_styling_parses`
+        // and `class_assign_to_multiple_ids` below). `accTitle`/`accDescr`
+        // remain out of scope and still fall through to the transition
+        // parser with a misleading-message guard, so pin the named error.
+        for stmt in ["accTitle: My title", "accDescr: My description"] {
             let src = format!("stateDiagram-v2\na --> b\n{stmt}");
             let e = parse(&src).unwrap_err();
             assert_eq!(e.line, Some(3), "for {stmt}");
@@ -863,9 +984,37 @@ mod tests {
     }
 
     #[test]
+    fn class_assign_applies_to_multiple_ids() {
+        let g = p("stateDiagram-v2\na --> b\nclass a, b movement");
+        assert_eq!(g.nodes.iter().find(|n| n.id == "a").unwrap().classes, vec!["movement".to_string()]);
+        assert_eq!(g.nodes.iter().find(|n| n.id == "b").unwrap().classes, vec!["movement".to_string()]);
+    }
+
+    #[test]
     fn single_underscore_note_target_is_valid() {
         // Only the double-underscore synthetic prefix is reserved.
         let g = p("stateDiagram-v2\n_x --> y\nnote right of _x: fine");
         assert_eq!(g.notes.len(), 1);
+    }
+
+    // ── Styling (Task 3) ──────────────────────────────────────────────
+
+    #[test]
+    fn state_styling_parses() {
+        let g = p("stateDiagram-v2\nclassDef mov fill:#0f0\n[*] --> Still\nStill:::mov\nstyle Still fill:#00f");
+        let still = g.nodes.iter().find(|n| n.id == "Still").unwrap();
+        assert_eq!(still.classes, vec!["mov".to_string()]);
+        assert_eq!(still.style.as_deref(), Some("fill:#00f"));
+        assert_eq!(g.class_defs.iter().find(|d| d.name == "mov").unwrap().style, "fill:#0f0");
+    }
+
+    #[test]
+    fn spaceless_arrow_on_class_side_is_a_transition() {
+        // Regression: `A:::c-->B` must be a transition (2 nodes + 1 edge),
+        // class `c` on A — not swallowed with class "c-->B".
+        let g = p("stateDiagram-v2\nA:::c-->B");
+        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.transitions.len(), 1);
+        assert_eq!(g.nodes.iter().find(|n| n.id == "A").unwrap().classes, vec!["c".to_string()]);
     }
 }

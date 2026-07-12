@@ -59,6 +59,9 @@ pub(crate) fn emit(g: &ErGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
         if !r.identifying {
             attrs.push_str(r#" stroke-dasharray="4 3""#);
         }
+        if let Some(style) = &r.style {
+            attrs.push_str(&format!(r#" style="{}""#, escape_xml(style)));
+        }
         out.push_str(&format!(r#"<path d="{d}" {attrs}/>"#));
 
         if let Some((lx, ly)) = ep.label_at {
@@ -89,8 +92,17 @@ pub(crate) fn emit(g: &ErGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
         let (bw, bh) = sizes[i];
         let box_left = cx - bw / 2.0;
         let box_top = cy - bh / 2.0;
+        let resolved = crate::style::resolve(&e.classes, e.style.as_deref(), &g.class_defs);
+        match &resolved {
+            Some(s) => out.push_str(&format!(r#"<g style="{}">"#, escape_xml(s))),
+            None => out.push_str("<g>"),
+        }
+        let box_style = match &resolved {
+            Some(s) => format!(r#" style="{}""#, escape_xml(s)),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="var(--mermaid-node-fill, #ececff)" stroke="currentColor"/>"#,
+            r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="var(--mermaid-node-fill, #ececff)" stroke="currentColor"{box_style}/>"#,
             box_left, box_top, bw, bh
         ));
 
@@ -147,6 +159,7 @@ pub(crate) fn emit(g: &ErGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
                 ));
             }
         }
+        out.push_str("</g>");
     }
 
     out.push_str("</svg>");
@@ -226,6 +239,20 @@ mod tests {
             comment_right <= box_right + 1.0,
             "comment ends at {comment_right} but box ends at {box_right}"
         );
+    }
+
+    #[test]
+    fn er_style_applied() {
+        let svg = render_er("erDiagram\nclassDef warm fill:#f80\nCAR\nCAR:::warm").unwrap();
+        assert!(svg.contains("fill:#f80;color:#000"), "styled entity: {svg}");
+        let plain = render_er("erDiagram\nCAR").unwrap();
+        assert!(!plain.contains("<g style="), "unstyled must not wrap: {plain}");
+    }
+
+    #[test]
+    fn linkstyle_colours_edge() {
+        let svg = crate::render("erDiagram\nA ||--o{ B : has\nlinkStyle 0 stroke:#f00").svg.unwrap();
+        assert!(svg.contains("stroke:#f00"), "edge style: {svg}");
     }
 
     #[test]

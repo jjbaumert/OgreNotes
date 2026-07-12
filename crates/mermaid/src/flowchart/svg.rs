@@ -7,23 +7,9 @@
 //! normative attribute lists this file implements verbatim.
 
 use crate::escape_xml;
-use crate::flowchart::{shapes, EdgeKind, FlowGraph, FlowNode, Head};
+use crate::flowchart::{shapes, EdgeKind, FlowGraph, Head};
 use crate::measure;
 use crate::layout::{Direction, Layout};
-
-/// Resolves a node's style attr from its classes against the graph's
-/// `class_defs`: first class (in the node's declared order) that has a
-/// matching, non-empty `ClassDef.style` wins.
-fn node_style<'a>(g: &'a FlowGraph, n: &FlowNode) -> Option<&'a str> {
-    for cls in &n.classes {
-        if let Some(def) = g.class_defs.iter().find(|d| &d.name == cls) {
-            if !def.style.is_empty() {
-                return Some(&def.style);
-            }
-        }
-    }
-    None
-}
 
 pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
     let (w, h) = l.size;
@@ -126,12 +112,7 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
         let (nw, nh) = shapes::size_for(n.shape, tw, th);
 
         // Inline `style <id>` layers on top of any class style.
-        let combined = match (node_style(g, n), n.style.as_deref()) {
-            (Some(c), Some(inline)) => Some(format!("{c};{inline}")),
-            (Some(c), None) => Some(c.to_string()),
-            (None, Some(inline)) => Some(inline.to_string()),
-            (None, None) => None,
-        };
+        let combined = crate::style::resolve(&n.classes, n.style.as_deref(), &g.class_defs);
         match &combined {
             Some(style) => out.push_str(&format!(r#"<g style="{}">"#, escape_xml(style))),
             None => out.push_str("<g>"),
@@ -188,7 +169,7 @@ mod tests {
             "graph TD\nA[Hot]-->B[Cold]\nstyle A fill:#f00,stroke:#900\nlinkStyle 0 stroke:green",
         )
         .unwrap();
-        assert!(svg.contains("fill:#f00;stroke:#900"), "node style: {svg}");
+        assert!(svg.contains("fill:#f00;stroke:#900;color:#fff"), "node style: {svg}");
         assert!(svg.contains("stroke:green"), "link style: {svg}");
     }
 
@@ -222,7 +203,7 @@ mod tests {
     #[test]
     fn class_def_styles_node_group() {
         let svg = render_flowchart("graph TD\nclassDef hot fill:#f00\nA[Hi]:::hot").unwrap();
-        assert!(svg.contains("style=\"fill:#f00\""));
+        assert!(svg.contains("style=\"fill:#f00;color:#fff\""));
     }
 
     #[test]
@@ -331,9 +312,9 @@ mod tests {
         // Each of the two unclassed nodes carries the style twice: on the
         // `<g>` (so `color:` reaches the label) AND on the shape element
         // (so `fill`/`stroke` actually override the shape's own attrs).
-        assert_eq!(svg.matches("style=\"fill:#f9f\"").count(), 4, "{svg}");
+        assert_eq!(svg.matches("style=\"fill:#f9f;color:#000\"").count(), 4, "{svg}");
         // The shape element itself must carry it (the group alone can't
         // override the shape's `fill` presentation attribute).
-        assert!(svg.contains("stroke-width=\"1\" style=\"fill:#f9f\""), "style on shape: {svg}");
+        assert!(svg.contains("stroke-width=\"1\" style=\"fill:#f9f;color:#000\""), "style on shape: {svg}");
     }
 }
