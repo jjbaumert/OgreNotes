@@ -20,16 +20,14 @@ pub(crate) const SELF_EXTRA: f64 = 16.0;
 pub(crate) const SELF_STUB: f64 = 30.0;
 pub(crate) const NOTE_PAD: f64 = 8.0;
 pub(crate) const FRAME_HEAD: f64 = 26.0;
-pub(crate) const FRAME_INSET: f64 = 8.0;
 pub(crate) const FRAME_BOTTOM_PAD: f64 = 10.0;
 pub(crate) const DIVIDER_H: f64 = 22.0;
 pub(crate) const ACT_W: f64 = 10.0;
 pub(crate) const ACT_OFFSET: f64 = 6.0;
-/// Floor for a fragment frame's width. Deeply-nested frames with no (or
-/// narrow) participants can otherwise compute a non-positive width
-/// (`canvas_w - PAD - 2*inset`), which would violate the
-/// `f.rect.w > 0.0` invariant `sequence/props.rs` asserts on every
-/// successful layout. Keeping a small positive floor keeps frames
+/// Floor for a fragment frame's width. A fragment with no (or a single
+/// zero-width) content item would otherwise compute a non-positive width,
+/// violating the `f.rect.w > 0.0` invariant `sequence/props.rs` asserts on
+/// every successful layout. Keeping a small positive floor keeps frames
 /// visible instead of collapsing to a sliver.
 pub(crate) const FRAME_MIN_W: f64 = 8.0;
 
@@ -194,6 +192,31 @@ fn pass1_columns(d: &SeqDiagram) -> (Vec<f64>, Vec<f64>, f64, f64) {
     (col_x, box_w, head_h, overhang_right)
 }
 
+/// An open fragment on the stack while pass 2 walks the events. `x_min`/
+/// `x_max` accumulate the horizontal extent of everything drawn inside the
+/// fragment, so the frame can be sized to its content (like Mermaid) rather
+/// than spanning the whole canvas.
+struct OpenFrame {
+    kind: FragmentKind,
+    label: String,
+    top: f64,
+    depth: usize,
+    dividers: Vec<(f64, String)>,
+    x_min: f64,
+    x_max: f64,
+}
+
+/// Widen the innermost open fragment (if any) to include `[lo, hi]`.
+fn extend_frame(stack: &mut [OpenFrame], lo: f64, hi: f64) {
+    if let Some(f) = stack.last_mut() {
+        f.x_min = f.x_min.min(lo);
+        f.x_max = f.x_max.max(hi);
+    }
+}
+
+/// Horizontal padding between a fragment's content and its frame border.
+const FRAME_PAD: f64 = 10.0;
+
 /// Pass 2: a single top-to-bottom cursor walk placing messages, notes,
 /// activation spans, and fragment frames.
 #[allow(clippy::too_many_arguments)]
@@ -202,16 +225,13 @@ fn pass2_rows(
     col_x: &[f64],
     box_w: &[f64],
     body_top: f64,
-    canvas_w: f64,
 ) -> (Vec<MsgLayout>, Vec<NoteLayout>, Vec<ActRect>, Vec<FrameRect>, f64) {
     let mut cursor = body_top;
     // `autonum` is the next number to assign (None = numbering disabled);
     // `autonum_step` is the increment applied after each numbered message.
     let mut autonum: Option<u32> = None;
     let mut autonum_step: u32 = 1;
-    // (kind, label, top, depth-at-open, dividers)
-    #[allow(clippy::type_complexity)]
-    let mut frame_stack: Vec<(FragmentKind, String, f64, usize, Vec<(f64, String)>)> = Vec::new();
+    let mut frame_stack: Vec<OpenFrame> = Vec::new();
     // one open-span stack per participant: (depth, y0)
     let mut act_stacks: Vec<Vec<(usize, f64)>> = vec![Vec::new(); d.participants.len()];
 
@@ -257,6 +277,18 @@ fn pass2_rows(
                     autonum = Some(n.saturating_add(autonum_step));
                 }
                 messages.push(MsgLayout { event: idx, y: line_y, text_anchor, number });
+
+                // Grow any enclosing fragment to include this message.
+                let tw = if text.is_empty() { 0.0 } else { text_size(text).0 };
+                let fx = col_x.get(*from).copied().unwrap_or(0.0);
+                if self_msg {
+                    let hw = box_w.get(*from).copied().unwrap_or(0.0) / 2.0;
+                    extend_frame(&mut frame_stack, fx - hw, fx + ACT_W + SELF_STUB + 6.0 + tw + 4.0);
+                } else {
+                    let tx = col_x.get(*to).copied().unwrap_or(fx);
+                    let mid = (fx + tx) / 2.0;
+                    extend_frame(&mut frame_stack, fx.min(tx).min(mid - tw / 2.0), fx.max(tx).max(mid + tw / 2.0));
+                }
 
                 if *activate_target {
                     if let Some(stack) = act_stacks.get_mut(*to) {
@@ -305,30 +337,59 @@ fn pass2_rows(
                     event: idx,
                     rect: crate::layout::Rect { x, y: cursor, w, h: note_h },
                 });
+                extend_frame(&mut frame_stack, x, x + w);
                 cursor += note_h + ROW_GAP;
             }
             Event::FragmentOpen { kind, label } => {
                 let depth = frame_stack.len();
-                frame_stack.push((*kind, label.clone(), cursor, depth, Vec::new()));
+                frame_stack.push(OpenFrame {
+                    kind: *kind,
+                    label: label.clone(),
+                    top: cursor,
+                    depth,
+                    dividers: Vec::new(),
+                    x_min: f64::INFINITY,
+                    x_max: f64::NEG_INFINITY,
+                });
                 cursor += FRAME_HEAD;
             }
             Event::FragmentDivider { label } => {
                 if let Some(top) = frame_stack.last_mut() {
-                    top.4.push((cursor + 4.0, label.clone()));
+                    top.dividers.push((cursor + 4.0, label.clone()));
                 }
                 cursor += DIVIDER_H;
             }
             Event::FragmentClose => {
-                if let Some((kind, label, top, depth, dividers)) = frame_stack.pop() {
-                    let inset = depth as f64 * FRAME_INSET;
+                if let Some(fr) = frame_stack.pop() {
+                    // Size the frame to its content extent (Mermaid-style),
+                    // not the whole canvas. An empty fragment falls back to a
+                    // small box; the width is floored so the `loop [label]`
+                    // header still fits.
+                    let (mut xmin, mut xmax) = (fr.x_min, fr.x_max);
+                    if xmin > xmax {
+                        xmin = PAD;
+                        xmax = PAD + FRAME_MIN_W;
+                    }
+                    let label_w = text_size(fr.kind.keyword()).0 + text_size(&fr.label).0 + 28.0;
+                    let left = xmin - FRAME_PAD;
+                    let right = (xmax + FRAME_PAD).max(left + label_w);
                     let rect = crate::layout::Rect {
-                        x: PAD / 2.0 + inset,
-                        y: top,
-                        w: (canvas_w - PAD - 2.0 * inset).max(FRAME_MIN_W),
-                        h: cursor + 6.0 - top,
+                        x: left,
+                        y: fr.top,
+                        w: (right - left).max(FRAME_MIN_W),
+                        h: cursor + 6.0 - fr.top,
                     };
                     cursor += FRAME_BOTTOM_PAD;
-                    frames.push(FrameRect { kind, label, rect, depth, dividers });
+                    // Propagate this frame's extent to its parent so an outer
+                    // fragment always contains its nested ones.
+                    extend_frame(&mut frame_stack, left, right);
+                    frames.push(FrameRect {
+                        kind: fr.kind,
+                        label: fr.label,
+                        rect,
+                        depth: fr.depth,
+                        dividers: fr.dividers,
+                    });
                 }
             }
             Event::Activate { p } => {
@@ -336,6 +397,8 @@ fn pass2_rows(
                     let depth = stack.len();
                     stack.push((depth, cursor));
                 }
+                let px = col_x.get(*p).copied().unwrap_or(0.0);
+                extend_frame(&mut frame_stack, px - ACT_W, px + ACT_W);
             }
             Event::Deactivate { p } => {
                 if let Some(stack) = act_stacks.get_mut(*p) {
@@ -367,7 +430,7 @@ pub(crate) fn run(d: &SeqDiagram) -> SeqLayout {
     };
     let body_top = PAD + head_h + 14.0;
     let (messages, notes, activations, frames, body_bottom) =
-        pass2_rows(d, &col_x, &box_w, body_top, width);
+        pass2_rows(d, &col_x, &box_w, body_top);
 
     SeqLayout {
         col_x,
@@ -397,6 +460,34 @@ mod tests {
         let l = lay("sequenceDiagram\nA->>B: x\nB->>C: y");
         assert!(l.col_x[0] < l.col_x[1] && l.col_x[1] < l.col_x[2]);
         assert!(l.col_x[1] - l.col_x[0] >= COL_GAP_MIN - 1e-6);
+    }
+
+    #[test]
+    fn fragment_frame_hugs_its_content_not_the_canvas() {
+        // Loop involves only C (a self-message), with A and B off to the
+        // left. The frame must NOT span the full canvas or reach back to A.
+        let l = lay("sequenceDiagram\nA->>B: hi\nB->>C: go\nloop check\nC->>C: think\nend");
+        assert_eq!(l.frames.len(), 1);
+        let f = &l.frames[0];
+        assert!(f.rect.w > 0.0);
+        assert!(
+            f.rect.w < l.size.0 * 0.7,
+            "loop frame {} too wide for canvas {}",
+            f.rect.w,
+            l.size.0
+        );
+        // Its left edge sits right of A and B (which aren't in the loop).
+        assert!(f.rect.x > l.col_x[1], "frame reaches back past B: {:?}", f.rect.x);
+    }
+
+    #[test]
+    fn fragment_frame_spans_the_participants_it_touches() {
+        // A loop with an A<->C exchange must span from A to C.
+        let l = lay("sequenceDiagram\nA->>B: x\nloop r\nA->>C: p\nC-->>A: q\nend");
+        let f = &l.frames[0];
+        // Left edge left of A's centre, right edge right of C's centre.
+        assert!(f.rect.x < l.col_x[0], "frame should include A");
+        assert!(f.rect.x + f.rect.w > l.col_x[2], "frame should include C");
     }
 
     #[test]
