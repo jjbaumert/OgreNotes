@@ -5,8 +5,8 @@
 //! back to raw source. Supports pie charts, flowcharts (graph/flowchart),
 //! sequence diagrams, state diagrams (stateDiagram/stateDiagram-v2),
 //! class diagrams, entity-relationship (ER) diagrams, gantt charts,
-//! git graphs (gitGraph), mindmaps, timelines, and user journeys. Any
-//! other/unrecognized kind is
+//! git graphs (gitGraph), mindmaps, timelines, user journeys, quadrant
+//! charts, and xy charts. Any other/unrecognized kind is
 //! `DiagramKind::Unknown` and always errors. See
 //! docs/superpowers/specs/2026-07-08-mermaid-support-design.md (index)
 //! and docs/superpowers/specs/2026-07-10-mermaid-slice4-state-class-er-design.md
@@ -18,6 +18,8 @@ mod gitgraph;
 mod mindmap;
 mod timeline;
 mod journey;
+mod quadrant;
+mod xychart;
 mod layout;
 pub(crate) mod measure;
 pub(crate) mod style;
@@ -47,6 +49,8 @@ pub enum DiagramKind {
     Mindmap,
     Timeline,
     Journey,
+    Quadrant,
+    XyChart,
     Unknown,
 }
 
@@ -65,6 +69,8 @@ impl DiagramKind {
             DiagramKind::Mindmap => "mindmap",
             DiagramKind::Timeline => "timeline",
             DiagramKind::Journey => "user-journey",
+            DiagramKind::Quadrant => "quadrant-chart",
+            DiagramKind::XyChart => "xy-chart",
             DiagramKind::Unknown => "unknown",
         }
     }
@@ -156,6 +162,8 @@ pub fn detect_kind(source: &str) -> DiagramKind {
         "mindmap" => DiagramKind::Mindmap,
         "timeline" => DiagramKind::Timeline,
         "journey" => DiagramKind::Journey,
+        "quadrantChart" => DiagramKind::Quadrant,
+        "xychart-beta" => DiagramKind::XyChart,
         _ => DiagramKind::Unknown,
     }
 }
@@ -269,6 +277,14 @@ pub fn render(source: &str) -> RenderOutput {
         },
         DiagramKind::Journey => match journey::parse(source) {
             Ok(j) => RenderOutput { kind, svg: Some(journey::render_svg(&j)), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
+        DiagramKind::Quadrant => match quadrant::parse(source) {
+            Ok(q) => RenderOutput { kind, svg: Some(quadrant::render_svg(&q)), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
+        DiagramKind::XyChart => match xychart::parse(source) {
+            Ok(x) => RenderOutput { kind, svg: Some(xychart::render_svg(&x)), error: None },
             Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
         },
         DiagramKind::Unknown => RenderOutput {
