@@ -26,6 +26,8 @@ pub(crate) struct ClassBox {
     pub annotation: Option<String>, // <<interface>> etc.
     pub attributes: Vec<String>,    // raw member text, verbatim
     pub methods: Vec<String>,
+    pub classes: Vec<String>, // cssClass/`:::`-assigned classDef names, in order
+    pub style: Option<String>, // sanitized inline `style` override
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +46,7 @@ pub(crate) struct Relation {
 pub(crate) struct ClassGraph {
     pub classes: Vec<ClassBox>,
     pub relations: Vec<Relation>,
+    pub class_defs: Vec<crate::style::ClassDef>,
 }
 
 /// Full class-diagram pipeline: parse -> size each class's compartment

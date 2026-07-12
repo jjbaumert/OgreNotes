@@ -145,7 +145,7 @@ fn generics_to_angle(s: &str) -> String {
 
 pub(crate) fn parse(source: &str) -> Result<ClassGraph, ParseError> {
     let mut p = Parser {
-        g: ClassGraph { classes: vec![], relations: vec![] },
+        g: ClassGraph { classes: vec![], relations: vec![], class_defs: vec![] },
         ids: HashMap::new(),
         line: 0,
         block: None,
@@ -192,13 +192,6 @@ impl Parser {
     }
 
     fn parse_statement(&mut self, stmt: &str) -> Result<(), ParseError> {
-        // `:::` is the CSS-class shorthand (`Node:::className`). We don't
-        // support styling; reject it explicitly so it can never slip
-        // through the `:` label split and be silently stored as a bogus
-        // member.
-        if stmt.contains(":::") {
-            return Err(self.err("CSS class shorthand `:::` is not supported"));
-        }
         // Standalone annotation: `<<interface>> ClassName` sets that class's
         // annotation. (The `<<...>>`-on-its-own-line form inside a class block
         // is handled by `apply_member`.)
@@ -214,14 +207,87 @@ impl Parser {
         }
         let first = stmt.split_whitespace().next().unwrap_or("");
         match first {
-            "namespace" | "click" | "callback" | "style" | "cssClass" | "link" | "note"
-            | "classDef" | "direction" => {
+            "namespace" | "click" | "callback" | "link" | "note" | "direction" => {
                 return Err(self.err(format!("`{first}` statements are not supported")));
             }
-            "class" => return self.parse_class_stmt(stmt),
+            "classDef" => return self.parse_class_def(stmt),
+            "style" => return self.parse_style(stmt),
+            "class" | "cssClass" => {
+                if let Some(res) = self.try_class_assign(stmt) {
+                    return res;
+                }
+                // fall through: `class Foo { … }` declaration handled below
+            }
             _ => {}
         }
+        if first == "class" {
+            return self.parse_class_stmt(stmt);
+        }
         self.parse_member_or_relationship(stmt)
+    }
+
+    /// `classDef name prop:val,...`
+    fn parse_class_def(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("classDef").unwrap().trim();
+        let Some((name, styles)) = rest.split_once(char::is_whitespace) else {
+            return Err(self.err("classDef needs a name and styles"));
+        };
+        self.g.class_defs.push(crate::style::ClassDef {
+            name: name.trim().to_string(),
+            style: crate::style::sanitize_style(styles),
+        });
+        Ok(())
+    }
+
+    /// `style <id> prop:val,...`
+    fn parse_style(&mut self, stmt: &str) -> Result<(), ParseError> {
+        let rest = stmt.strip_prefix("style").unwrap().trim();
+        let Some((id, styles)) = rest.split_once(char::is_whitespace) else {
+            return Err(self.err("style needs a class id and styles"));
+        };
+        let idx = self.ensure_class(id.trim())?;
+        let s = crate::style::sanitize_style(styles);
+        if !s.is_empty() {
+            self.g.classes[idx].style = Some(s);
+        }
+        Ok(())
+    }
+
+    /// `class A,B styleName` / `cssClass "A,B" styleName`. Returns `None`
+    /// when `stmt` is instead a `class Foo`/`class Foo {` declaration.
+    fn try_class_assign(&mut self, stmt: &str) -> Option<Result<(), ParseError>> {
+        let kw = if stmt.starts_with("cssClass") { "cssClass" } else { "class" };
+        let rest = stmt.strip_prefix(kw).unwrap().trim();
+        // A `["Label"]` declaration can contain whitespace inside the
+        // quoted label (`class A["Nice Label"]`), which would otherwise
+        // fool the rsplit below into treating the label's second word as
+        // an assignment style name. Brackets never appear in a valid
+        // assignment (ids are bare/quoted alnum lists, the trailing name
+        // is a bare identifier), so bail out to the declaration path.
+        if rest.contains('[') {
+            return None;
+        }
+        // Declaration form (single id, optional `{` / `["label"]`): not an
+        // assignment. Assignment needs a trailing style name after a space.
+        let (ids, name) = rest.rsplit_once(char::is_whitespace)?;
+        let name = name.trim();
+        if name.is_empty() || name == "{" || name.starts_with('[') {
+            return None;
+        }
+        // ids may be quoted (`cssClass "A,B"`); strip quotes.
+        let ids = ids.trim().trim_matches('"');
+        for id in ids.split(',') {
+            let id = id.trim();
+            if let Err(e) = self.validate_id(id) {
+                return Some(Err(e));
+            }
+            let idx = match self.ensure_class(id) {
+                Ok(i) => i,
+                Err(e) => return Some(Err(e)),
+            };
+            self.g.classes[idx].classes.push(name.to_string());
+        }
+        Some(Ok(()))
     }
 
     /// `class Name` / `class Name {` / `class Name["Label"]` (+ optional
@@ -238,6 +304,15 @@ impl Parser {
         let id = rest[..id_len].to_string();
         let idx = self.ensure_class(&id)?;
         let mut after = rest[id_len..].trim_start();
+        // `class A:::styleName` — attach a style class to the node.
+        if let Some(colon) = after.strip_prefix(":::") {
+            let n = colon.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+            if n == 0 {
+                return Err(self.err("expected a class name after `:::`"));
+            }
+            self.g.classes[idx].classes.push(colon[..n].to_string());
+            after = colon[n..].trim_start();
+        }
         // Generic parameter: `class Square~Shape~` → title "Square<Shape>".
         // Relationships still reference the bare id.
         let mut generic: Option<String> = None;
@@ -310,6 +385,18 @@ impl Parser {
     /// operator, otherwise (requires the colon) the dotted-member form
     /// `Name : member`.
     fn parse_member_or_relationship(&mut self, stmt: &str) -> Result<(), ParseError> {
+        // Standalone `A:::styleName` — no `:` label, no relationship
+        // operator, just an id plus a style-class shorthand.
+        if let Some((id, cls)) = stmt.split_once(":::") {
+            let id = id.trim();
+            let cls = cls.trim();
+            if !id.is_empty() && !cls.is_empty() && !cls.contains(char::is_whitespace) {
+                self.validate_id(id)?;
+                let idx = self.ensure_class(id)?;
+                self.g.classes[idx].classes.push(cls.to_string());
+                return Ok(());
+            }
+        }
         // Split the label FIRST, on the ORIGINAL statement, so a label's
         // text can never be mistaken for an operator token during the
         // scan below.
@@ -423,6 +510,8 @@ impl Parser {
             annotation: None,
             attributes: vec![],
             methods: vec![],
+            classes: vec![],
+            style: None,
         });
         self.ids.insert(id.to_string(), idx);
         if self.g.classes.len() > crate::layout::MAX_NODES {
@@ -563,9 +652,11 @@ mod tests {
 
     #[test]
     fn out_of_scope_statements_error_named() {
+        // `style` and `cssClass` moved out of this list: this task turns
+        // them into supported styling statements (see
+        // `class_styling_parses_and_resolves` / `css_shorthand_now_supported`).
         for stmt in ["namespace N {", "click A call x()", "callback A \"cb\"",
-                     "style A fill:#f00", "cssClass \"A\" cls", "link A \"url\"",
-                     "note for A \"text\""] {
+                     "link A \"url\"", "note for A \"text\""] {
             let src = format!("classDiagram\nclass A\n{stmt}");
             let e = parse(&src).unwrap_err();
             assert_eq!(e.line, Some(3), "for {stmt}");
@@ -575,22 +666,24 @@ mod tests {
     }
 
     #[test]
-    fn css_shorthand_rejected_not_misparsed() {
-        // Regression: `A:::styleName` used to silently split on `:` and
-        // store `::styleName` as a bogus attribute. It must error instead.
-        let e = parse("classDiagram\nclass A\nA:::styleName").unwrap_err();
-        assert_eq!(e.line, Some(3));
-        assert!(e.message.contains(":::"), "{}", e.message);
+    fn css_shorthand_now_supported() {
+        // Was `css_shorthand_rejected_not_misparsed`: `A:::styleName` used to
+        // be explicitly rejected so it could never be silently mis-split on
+        // `:` and stored as a bogus `::styleName` attribute. This task turns
+        // `:::` into a supported style-class shorthand: it must attach the
+        // class, not error, and (still) never leak into `attributes`.
+        let g = p("classDiagram\nclass A\nA:::styleName");
+        assert_eq!(g.classes[0].classes, vec!["styleName".to_string()]);
+        assert!(g.classes[0].attributes.is_empty());
     }
 
     #[test]
-    fn classdef_and_direction_rejected_named() {
-        for stmt in ["classDef default fill:#f9f", "direction LR"] {
-            let e = parse(&format!("classDiagram\nclass A\n{stmt}")).unwrap_err();
-            assert_eq!(e.line, Some(3), "for {stmt}");
-            let kw = stmt.split_whitespace().next().unwrap();
-            assert!(e.message.contains(kw), "names {kw}: {}", e.message);
-        }
+    fn direction_rejected_named() {
+        // `classDef` moved out of this list: this task turns it into a
+        // supported styling statement (see `class_styling_parses_and_resolves`).
+        let e = parse("classDiagram\nclass A\ndirection LR").unwrap_err();
+        assert_eq!(e.line, Some(3));
+        assert!(e.message.contains("direction"), "{}", e.message);
     }
 
     #[test]
@@ -675,6 +768,16 @@ mod tests {
     #[test]
     fn multibyte_no_panic() {
         let _ = parse("classDiagram\nclass Émile\nA\u{2003}--> B : héllo 🎉");
+    }
+
+    #[test]
+    fn class_styling_parses_and_resolves() {
+        let g = p("classDiagram\nclassDef hot fill:#f00\nclass A\nA:::hot\nclass B\nstyle B fill:#0f0");
+        let a = g.classes.iter().find(|c| c.id == "A").unwrap();
+        assert_eq!(a.classes, vec!["hot".to_string()]);
+        let b = g.classes.iter().find(|c| c.id == "B").unwrap();
+        assert_eq!(b.style.as_deref(), Some("fill:#0f0"));
+        assert_eq!(g.class_defs.iter().find(|d| d.name == "hot").unwrap().style, "fill:#f00");
     }
 
     #[test]

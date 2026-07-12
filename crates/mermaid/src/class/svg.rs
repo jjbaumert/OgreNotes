@@ -141,8 +141,17 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
         let (bw, bh) = sizes[i];
         let box_left = cx - bw / 2.0;
         let box_top = cy - bh / 2.0;
+        let resolved = crate::style::resolve(&c.classes, c.style.as_deref(), &g.class_defs);
+        match &resolved {
+            Some(s) => out.push_str(&format!(r#"<g style="{}">"#, escape_xml(s))),
+            None => out.push_str("<g>"),
+        }
+        let box_style = match &resolved {
+            Some(s) => format!(r#" style="{}""#, escape_xml(s)),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="var(--mermaid-node-fill, #ececff)" stroke="currentColor" rx="4"/>"#,
+            r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="var(--mermaid-node-fill, #ececff)" stroke="currentColor" rx="4"{box_style}/>"#,
             box_left, box_top, bw, bh
         ));
 
@@ -207,6 +216,7 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
                 ));
             }
         }
+        out.push_str("</g>");
     }
 
     out.push_str("</svg>");
@@ -277,6 +287,16 @@ mod tests {
         assert!(svg.contains("Account Holder"));
         // The label replaces the raw id in the title row.
         assert!(!svg.contains(">A<"));
+    }
+
+    #[test]
+    fn class_style_applied_to_box() {
+        let svg = crate::render("classDiagram\nclassDef hot fill:#f00\nclass A\nA:::hot").svg.unwrap();
+        // resolved style on the box rect + group wrapper for text color.
+        assert!(svg.contains("fill:#f00;color:#fff"), "styled box: {svg}");
+        // unstyled diagram unchanged: no stray style= on the rect.
+        let plain = crate::render("classDiagram\nclass B").svg.unwrap();
+        assert!(!plain.contains("<g style="), "unstyled must not wrap: {plain}");
     }
 
     #[test]
