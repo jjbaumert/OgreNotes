@@ -169,6 +169,12 @@ impl From<ogrenotes_storage::repo::RepoError> for ApiError {
                 }
             }
             ogrenotes_storage::repo::RepoError::S3(_) => ApiError::Internal(err.to_string()),
+            // A guarded write found nothing to update — the row was
+            // deleted concurrently between the caller's read and this
+            // write (e.g. `ThreadRepo::update_message` racing a message
+            // delete). Surface as a clean 404 rather than a 500/409: the
+            // resource genuinely isn't there anymore.
+            ogrenotes_storage::repo::RepoError::NotFound(msg) => ApiError::NotFound(msg.clone()),
             // InvalidArgument signals a caller-side programmer
             // error — the repo refused to write because the
             // arguments would corrupt downstream semantics. Surface

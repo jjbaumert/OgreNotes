@@ -8,7 +8,7 @@ use aws_sdk_dynamodb::types::AttributeValue;
 
 use super::{get_n, get_s, RepoError};
 use crate::dynamo::DynamoClient;
-use crate::models::thread::{Message, Reaction, ReadReceipt, Thread, ThreadStatus, ThreadType};
+use crate::models::thread::{Mention, Message, MessagePart, Reaction, ReadReceipt, Thread, ThreadStatus, ThreadType};
 
 pub struct ThreadRepo {
     db: DynamoClient,
@@ -522,6 +522,110 @@ impl ThreadRepo {
             .delete_item(&pk, sk)
             .await
             .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Edit an existing message: overwrite `content`, set `updated_at`, and
+    /// replace the rich `parts`/`mentions` — removing those attributes when
+    /// the edit carries none, so a message that used to be rich doesn't keep
+    /// stale segments that no longer match the new text. `attachments` are
+    /// intentionally left untouched (editing the text shouldn't drop a file
+    /// the author attached). The SK is unchanged, so message ordering and
+    /// the `created_at` embedded in it are preserved.
+    ///
+    /// Guarded by `attribute_exists(PK)`. The caller (`edit_message`) reads
+    /// the message via `list_messages` for the author check, then writes
+    /// here by SK; if the message is deleted concurrently between those two
+    /// steps, a bare `UpdateItem` would otherwise CREATE a zombie row
+    /// containing only `content`/`updated_at` (+ maybe `parts`/`mentions`)
+    /// and missing `message_id`/`user_id`/`created_at`. `message_from_item`
+    /// requires those fields, so every subsequent `list_messages` on the
+    /// thread would then 500. The condition makes the write a no-op-or-error
+    /// against a deleted row instead: on `ConditionalCheckFailedException`
+    /// this returns `RepoError::NotFound` rather than swallowing the race as
+    /// success.
+    pub async fn update_message(
+        &self,
+        thread_id: &str,
+        sk: &str,
+        content: &str,
+        parts: &[MessagePart],
+        mentions: &[Mention],
+        updated_at: i64,
+    ) -> Result<(), RepoError> {
+        let pk = format!("THREAD#{thread_id}");
+
+        // `content` is aliased via #content out of caution (reserved-word
+        // safety); `updated_at` is written raw elsewhere (bump_updated_at),
+        // so it needs no alias.
+        let mut set_clauses = vec![
+            "#content = :content".to_string(),
+            "updated_at = :updated_at".to_string(),
+        ];
+        let mut remove_clauses: Vec<&str> = Vec::new();
+
+        let mut values = HashMap::new();
+        values.insert(":content".to_string(), AttributeValue::S(content.to_string()));
+        values.insert(":updated_at".to_string(), AttributeValue::N(updated_at.to_string()));
+
+        if parts.is_empty() {
+            remove_clauses.push("parts");
+        } else {
+            let json = serde_json::to_string(parts)
+                .map_err(|e| RepoError::MissingField(format!("parts: {e}")))?;
+            values.insert(":parts".to_string(), AttributeValue::S(json));
+            set_clauses.push("parts = :parts".to_string());
+        }
+        if mentions.is_empty() {
+            remove_clauses.push("mentions");
+        } else {
+            let json = serde_json::to_string(mentions)
+                .map_err(|e| RepoError::MissingField(format!("mentions: {e}")))?;
+            values.insert(":mentions".to_string(), AttributeValue::S(json));
+            set_clauses.push("mentions = :mentions".to_string());
+        }
+
+        let mut expr = format!("SET {}", set_clauses.join(", "));
+        if !remove_clauses.is_empty() {
+            expr.push_str(&format!(" REMOVE {}", remove_clauses.join(", ")));
+        }
+
+        let mut names = HashMap::new();
+        names.insert("#content".to_string(), "content".to_string());
+
+        let mut builder = self
+            .db
+            .inner()
+            .update_item()
+            .table_name(self.db.table_name())
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S(sk.to_string()))
+            .update_expression(&expr)
+            .condition_expression("attribute_exists(PK)");
+
+        for (k, v) in values {
+            builder = builder.expression_attribute_values(k, v);
+        }
+        for (k, v) in names {
+            builder = builder.expression_attribute_names(k, v);
+        }
+
+        match builder.send().await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let svc = e.into_service_error();
+                if svc.is_conditional_check_failed_exception() {
+                    // The message row is gone — deleted concurrently between
+                    // the caller's author-check read and this write. Do NOT
+                    // treat this as success; the caller needs to know the
+                    // write did not happen.
+                    Err(RepoError::NotFound(format!(
+                        "message not found: thread={thread_id}"
+                    )))
+                } else {
+                    Err(RepoError::Dynamo(svc.to_string()))
+                }
+            }
+        }
     }
 
     // ─── Reactions ──────────────────────────────────────────────

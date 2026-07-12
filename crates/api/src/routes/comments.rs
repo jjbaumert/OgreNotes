@@ -67,7 +67,7 @@ pub fn thread_router() -> Router<AppState> {
         .route("/{thread_id}", delete(delete_thread_handler))
         .route("/{thread_id}/messages", get(list_messages))
         .route("/{thread_id}/messages", post(add_message))
-        .route("/{thread_id}/messages/{message_id}", delete(delete_message))
+        .route("/{thread_id}/messages/{message_id}", delete(delete_message).patch(edit_message))
         .route(
             "/{thread_id}/messages/{message_id}/reactions",
             post(add_reaction),
@@ -126,6 +126,19 @@ struct AddMessageRequest {
     attachments: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EditMessageRequest {
+    content: String,
+    /// Optional rich-text segments, mirroring `AddMessageRequest`. The
+    /// current web client sends plain `content` only, so these default to
+    /// empty and the stored rich fields are cleared on edit.
+    #[serde(default)]
+    parts: Vec<MessagePart>,
+    #[serde(default)]
+    mentions: Vec<Mention>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThreadResponse {
@@ -164,6 +177,10 @@ struct MessageResponse {
     user_name: String,
     content: String,
     created_at: i64,
+    /// Present only when the message has been edited. Drives the frontend's
+    /// "edited" marker; omitted (not null) for never-edited messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<i64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     reactions: Vec<ReactionResponse>,
     /// Rich-text segments. Empty for legacy plain-text messages.
@@ -677,6 +694,7 @@ async fn list_messages(
             user_name: name,
             content: m.content,
             created_at: m.created_at,
+            updated_at: m.updated_at,
             reactions: msg_reactions,
             parts: m.parts,
             mentions: m.mentions,
@@ -900,6 +918,82 @@ async fn delete_message(
     }
 
     state.thread_repo.delete_message(&thread_id, &msg.sk()).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// PATCH /threads/:thread_id/messages/:message_id — edit a message.
+///
+/// Author-only, comments-only. Mirrors `delete_message`'s auth check and
+/// adds a thread-type gate: chat/DM messages are not editable here. Sets
+/// `updated_at` (drives the client's "edited" marker) but never bumps
+/// `thread.updated_at` — an edit is not new activity — and fires no
+/// notifications.
+async fn edit_message(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path((thread_id, message_id)): Path<(String, String)>,
+    axum::Json(body): axum::Json<EditMessageRequest>,
+) -> Result<StatusCode, ApiError> {
+    enforce_comments_rate_limit(&state, &user_id).await?;
+
+    let thread = state
+        .thread_repo
+        .get_thread(&thread_id)
+        .await?
+        .ok_or(ApiError::NotFound("Thread not found".to_string()))?;
+
+    // Comments only — chat/DM messages are not editable via this path.
+    // Checked before doc-access so we never call check_comment_access with
+    // a chat thread's empty doc_id.
+    if !matches!(thread.thread_type, ThreadType::Inline | ThreadType::Document) {
+        return Err(ApiError::Forbidden);
+    }
+
+    // Require Comment access on the parent doc (also 404s on a trashed doc).
+    let _meta = super::documents::check_comment_access(&state, &thread.doc_id, &user_id).await?;
+
+    if body.content.trim().is_empty() {
+        return Err(ApiError::BadRequest("Message cannot be empty".to_string()));
+    }
+
+    // Find the message and verify the caller authored it.
+    let messages = state.thread_repo.list_messages(&thread_id).await?;
+    let msg = messages
+        .iter()
+        .find(|m| m.message_id == message_id)
+        .ok_or(ApiError::NotFound("Message not found".to_string()))?;
+
+    if msg.user_id != user_id {
+        return Err(ApiError::Forbidden);
+    }
+
+    let now = now_usec();
+    state
+        .thread_repo
+        .update_message(&thread_id, &msg.sk(), &body.content, &body.parts, &body.mentions, now)
+        .await?;
+
+    // Tell peers viewing this doc to refresh the thread so the edited text
+    // and marker appear without a manual reload.
+    let edited = Message {
+        thread_id: thread_id.clone(),
+        message_id: msg.message_id.clone(),
+        user_id: msg.user_id.clone(),
+        content: body.content.clone(),
+        created_at: msg.created_at,
+        updated_at: Some(now),
+        parts: body.parts.clone(),
+        mentions: body.mentions.clone(),
+        attachments: msg.attachments.clone(),
+    };
+    fanout_comment_event(
+        &state,
+        &thread.doc_id,
+        CommentEventPayload::MessageEdited {
+            message: CommentEventMessage::from(&edited),
+        },
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1238,6 +1332,9 @@ enum CommentEventPayload {
         status: ThreadStatus,
     },
     MessageAdded {
+        message: CommentEventMessage,
+    },
+    MessageEdited {
         message: CommentEventMessage,
     },
 }

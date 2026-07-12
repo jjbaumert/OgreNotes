@@ -42,6 +42,9 @@ pub struct MessageItem {
     #[serde(default)]
     pub user_name: String,
     pub content: String,
+    /// Present only when the message was edited; drives the "edited" marker.
+    #[serde(default)]
+    pub updated_at: Option<i64>,
     pub created_at: i64,
 }
 
@@ -97,6 +100,18 @@ pub async fn add_message(
 ) -> Result<(), ApiClientError> {
     api_post_empty(
         &format!("/threads/{thread_id}/messages"),
+        &serde_json::json!({ "content": content }),
+    )
+    .await
+}
+
+pub async fn edit_message(
+    thread_id: &str,
+    message_id: &str,
+    content: &str,
+) -> Result<(), ApiClientError> {
+    api_patch(
+        &format!("/threads/{thread_id}/messages/{message_id}"),
         &serde_json::json!({ "content": content }),
     )
     .await

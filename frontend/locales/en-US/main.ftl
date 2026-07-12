@@ -216,6 +216,9 @@ comment-aria-prev = Previous comment
 comment-aria-next = Next comment
 comment-placeholder-new = Add a comment about this section
 comment-placeholder-reply = Type a message…
+comment-edited = edited
+comment-edit = Edit
+comment-save = Save
 
 # ─── Conversation pane (side panel) ─────────────────────────────
 

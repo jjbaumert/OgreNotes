@@ -53,6 +53,18 @@ pub fn CommentPopup(
     let (messages, set_messages) = signal::<Vec<PopupMessage>>(Vec::new());
     let (new_comment_text, set_new_comment_text) = signal(String::new());
     let (reply_text, set_reply_text) = signal(String::new());
+    let (editing_id, set_editing_id) = signal::<Option<String>>(None);
+    let (edit_text, set_edit_text) = signal(String::new());
+    // Author id for gating the Edit affordance. Stable for the session, so
+    // read once; the server also enforces author-only, this is UX only.
+    // Held in a `StoredValue` (Copy) rather than a plain `String` because it
+    // flows through several nested `move` reactive closures below (the mode
+    // match, the message-list render, per-message edit buttons) — each of
+    // which must implement `Fn` and gets (re)constructed on every reactive
+    // re-run, so a plain owned `String` would be moved out on the first run.
+    let current_uid: StoredValue<String> = StoredValue::new(
+        crate::api::client::get_auth().map(|a| a.user_id).unwrap_or_default()
+    );
     let (loading, set_loading) = signal(false);
     let (mode, set_mode) = signal(PopupMode::New);
     let messages_ref = NodeRef::<leptos::html::Div>::new();
@@ -104,13 +116,7 @@ pub fn CommentPopup(
         leptos::task::spawn_local(async move {
             match comments::list_messages(&tid).await {
                 Ok(resp) => {
-                    set_messages.set(
-                        resp.messages.into_iter().map(|m| PopupMessage {
-                            user_name: if m.user_name.is_empty() { m.user_id } else { m.user_name },
-                            content: m.content,
-                            created_at: m.created_at,
-                        }).collect()
-                    );
+                    set_messages.set(resp.messages.into_iter().map(to_popup).collect());
                 }
                 Err(_) => {}
             }
@@ -149,13 +155,7 @@ pub fn CommentPopup(
         leptos::task::spawn_local(async move {
             if comments::add_message(&tid, &text).await.is_ok() {
                 if let Ok(resp) = comments::list_messages(&tid).await {
-                    set_messages.set(
-                        resp.messages.into_iter().map(|m| PopupMessage {
-                            user_name: if m.user_name.is_empty() { m.user_id } else { m.user_name },
-                            content: m.content,
-                            created_at: m.created_at,
-                        }).collect()
-                    );
+                    set_messages.set(resp.messages.into_iter().map(to_popup).collect());
                 }
             }
         });
@@ -255,17 +255,98 @@ pub fn CommentPopup(
                                     <Show when=move || loading.get()>
                                         <div class="comment-popup-loading">{crate::t!("common-loading")}</div>
                                     </Show>
-                                    {move || messages.get().into_iter().map(|m| {
-                                        view! {
-                                            <div class="comment-popup-msg">
-                                                <div class="comment-popup-msg-header">
-                                                    <span class="comment-popup-author">{m.user_name}</span>
-                                                    <span class="comment-popup-time">{format_relative(m.created_at)}</span>
-                                                </div>
-                                                <div class="comment-popup-text">{m.content}</div>
-                                            </div>
-                                        }
-                                    }).collect::<Vec<_>>()}
+                                    {move || {
+                                        let current_uid = current_uid.get_value();
+                                        let editing = editing_id.get();
+                                        messages.get().into_iter().map(|m| {
+                                            let is_author = m.user_id == current_uid;
+                                            let is_editing = editing.as_deref() == Some(m.message_id.as_str());
+                                            let mid = m.message_id.clone();
+
+                                            if is_editing {
+                                                let save = {
+                                                    let mid = mid.clone();
+                                                    move || {
+                                                        let text = edit_text.get_untracked();
+                                                        if text.trim().is_empty() { return; }
+                                                        let PopupMode::Thread(tid) = mode.get_untracked() else { return };
+                                                        let mid = mid.clone();
+                                                        set_editing_id.set(None);
+                                                        leptos::task::spawn_local(async move {
+                                                            if comments::edit_message(&tid, &mid, &text).await.is_ok() {
+                                                                if let Ok(resp) = comments::list_messages(&tid).await {
+                                                                    set_messages.set(resp.messages.into_iter().map(to_popup).collect());
+                                                                }
+                                                            }
+                                                        });
+                                                    }
+                                                };
+                                                let save_click = save.clone();
+                                                view! {
+                                                    <div class="comment-popup-msg">
+                                                        <div class="comment-popup-msg-header">
+                                                            <span class="comment-popup-author">{m.user_name.clone()}</span>
+                                                        </div>
+                                                        <textarea
+                                                            class="comment-popup-textarea"
+                                                            prop:value=move || edit_text.get()
+                                                            on:input=move |e| set_edit_text.set(event_target_value(&e))
+                                                            on:keydown={
+                                                                let save = save.clone();
+                                                                move |e: web_sys::KeyboardEvent| {
+                                                                    if e.key() == "Enter" && !e.shift_key() {
+                                                                        e.prevent_default();
+                                                                        save();
+                                                                    }
+                                                                }
+                                                            }
+                                                        ></textarea>
+                                                        <div class="comment-edit-actions">
+                                                            <button
+                                                                class="comment-popup-send"
+                                                                on:click=move |_| save_click()
+                                                            >{crate::t!("comment-save")}</button>
+                                                            <button
+                                                                class="comment-edit-cancel"
+                                                                on:click=move |_| set_editing_id.set(None)
+                                                            >{crate::t!("common-cancel")}</button>
+                                                        </div>
+                                                    </div>
+                                                }.into_any()
+                                            } else {
+                                                let edit_btn = is_author.then(|| {
+                                                    let mid = mid.clone();
+                                                    let content = m.content.clone();
+                                                    view! {
+                                                        <button
+                                                            class="comment-edit-btn"
+                                                            on:click=move |_| {
+                                                                set_edit_text.set(content.clone());
+                                                                set_editing_id.set(Some(mid.clone()));
+                                                            }
+                                                        >{crate::t!("comment-edit")}</button>
+                                                    }
+                                                });
+                                                let edited_marker = m.updated_at.map(|ts| view! {
+                                                    <span
+                                                        class="comment-popup-edited"
+                                                        title=crate::i18n::format_date(ts, crate::i18n::DateStyle::Long)
+                                                    >{crate::t!("comment-edited")}</span>
+                                                });
+                                                view! {
+                                                    <div class="comment-popup-msg">
+                                                        <div class="comment-popup-msg-header">
+                                                            <span class="comment-popup-author">{m.user_name.clone()}</span>
+                                                            <span class="comment-popup-time">{format_relative(m.created_at)}</span>
+                                                            {edited_marker}
+                                                        </div>
+                                                        <div class="comment-popup-text">{m.content.clone()}</div>
+                                                        {edit_btn}
+                                                    </div>
+                                                }.into_any()
+                                            }
+                                        }).collect::<Vec<_>>()
+                                    }}
                                 </div>
                             }.into_any()
                         }
@@ -318,8 +399,25 @@ pub fn CommentPopup(
 
 #[derive(Clone)]
 struct PopupMessage {
+    message_id: String,
+    user_id: String,
     user_name: String,
     content: String,
     created_at: i64,
+    updated_at: Option<i64>,
+}
+
+/// Map a wire `MessageItem` into the popup's view model. Centralizes the
+/// user_name fallback + field copy shared by the initial load, reply, and
+/// edit reload paths.
+fn to_popup(m: comments::MessageItem) -> PopupMessage {
+    PopupMessage {
+        message_id: m.message_id,
+        user_id: m.user_id.clone(),
+        user_name: if m.user_name.is_empty() { m.user_id } else { m.user_name },
+        content: m.content,
+        created_at: m.created_at,
+        updated_at: m.updated_at,
+    }
 }
 
