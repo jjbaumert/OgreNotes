@@ -337,7 +337,11 @@ pub fn CommentPopup(
                                                     <div class="comment-popup-msg">
                                                         <div class="comment-popup-msg-header">
                                                             <span class="comment-popup-author">{m.user_name.clone()}</span>
-                                                            <span class="comment-popup-time">{format_relative(m.created_at)}</span>
+                                                            // Show the edit time once edited (messages stay
+                                                            // ordered by created_at — only the displayed time
+                                                            // reflects the edit). The "edited" marker still
+                                                            // distinguishes an edited message from a fresh one.
+                                                            <span class="comment-popup-time">{format_relative(m.updated_at.unwrap_or(m.created_at))}</span>
                                                             {edited_marker}
                                                         </div>
                                                         <div class="comment-popup-text">{m.content.clone()}</div>
