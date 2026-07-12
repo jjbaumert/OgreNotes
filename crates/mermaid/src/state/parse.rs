@@ -96,6 +96,13 @@ impl Parser {
         match first {
             "state" => return self.parse_state_decl(stmt),
             "direction" => return Err(self.err("`direction` statements are not supported")),
+            "classDef" | "class" => {
+                return Err(self.err(format!("`{first}` statements are not supported")));
+            }
+            _ if stmt.starts_with("accTitle") || stmt.starts_with("accDescr") => {
+                let kw = if stmt.starts_with("accTitle") { "accTitle" } else { "accDescr" };
+                return Err(self.err(format!("`{kw}` statements are not supported")));
+            }
             "}" if stmt == "}" => return self.parse_composite_close(),
             _ if first.eq_ignore_ascii_case("note") => return self.parse_note(stmt),
             _ => {}
@@ -537,5 +544,31 @@ mod tests {
     fn ordinary_labels_unaffected_by_colon_guard() {
         let g = p("stateDiagram-v2\na --> b: go: now");
         assert_eq!(g.transitions[0].label.as_deref(), Some("go: now"));
+    }
+
+    #[test]
+    fn styling_and_acc_statements_error_named() {
+        // These fell through to the transition parser and produced
+        // misleading `expected a transition` messages.
+        for stmt in [
+            "classDef notMoving fill:white",
+            "class Moving, Crash movement",
+            "accTitle: My title",
+            "accDescr: My description",
+        ] {
+            let src = format!("stateDiagram-v2\na --> b\n{stmt}");
+            let e = parse(&src).unwrap_err();
+            assert_eq!(e.line, Some(3), "for {stmt}");
+            let kw = stmt.split([' ', ':']).next().unwrap();
+            assert!(e.message.contains(kw), "message names {kw}: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn keyword_prefixed_ids_still_parse() {
+        // `first` is a whole-token match: ids that merely start with a
+        // keyword are not captured by the named-error arms.
+        let g = p("stateDiagram-v2\nclassA --> stateB");
+        assert_eq!(g.nodes.len(), 2);
     }
 }
