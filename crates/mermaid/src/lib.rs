@@ -30,6 +30,7 @@ mod radar;
 mod treemap;
 mod sankey;
 mod c4;
+mod architecture;
 mod layout;
 pub(crate) mod measure;
 pub(crate) mod style;
@@ -69,6 +70,7 @@ pub enum DiagramKind {
     Treemap,
     Sankey,
     C4,
+    Architecture,
     Unknown,
 }
 
@@ -97,6 +99,7 @@ impl DiagramKind {
             DiagramKind::Treemap => "treemap",
             DiagramKind::Sankey => "sankey",
             DiagramKind::C4 => "c4",
+            DiagramKind::Architecture => "architecture",
             DiagramKind::Unknown => "unknown",
         }
     }
@@ -200,6 +203,7 @@ pub fn detect_kind(source: &str) -> DiagramKind {
         "C4Context" | "C4Container" | "C4Component" | "C4Dynamic" | "C4Deployment" => {
             DiagramKind::C4
         }
+        "architecture" | "architecture-beta" => DiagramKind::Architecture,
         _ => DiagramKind::Unknown,
     }
 }
@@ -351,6 +355,10 @@ pub fn render(source: &str) -> RenderOutput {
         },
         DiagramKind::C4 => match c4::parse(source).and_then(|g| c4::render_svg(&g)) {
             Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
+        DiagramKind::Architecture => match architecture::parse(source) {
+            Ok(ar) => RenderOutput { kind, svg: Some(architecture::render_svg(&ar)), error: None },
             Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
         },
         DiagramKind::Block => match block::parse(source) {
