@@ -7,7 +7,8 @@
 //! class diagrams, entity-relationship (ER) diagrams, gantt charts,
 //! git graphs (gitGraph), mindmaps, timelines, user journeys, quadrant
 //! charts, xy charts, kanban boards,
-//! and packet diagrams. Any other/unrecognized kind is
+//! packet diagrams, requirement diagrams,
+//! and block diagrams. Any other/unrecognized kind is
 //! `DiagramKind::Unknown` and always errors. See
 //! docs/superpowers/specs/2026-07-08-mermaid-support-design.md (index)
 //! and docs/superpowers/specs/2026-07-10-mermaid-slice4-state-class-er-design.md
@@ -23,6 +24,8 @@ mod quadrant;
 mod xychart;
 mod kanban;
 mod packet;
+mod requirement;
+mod block;
 mod layout;
 pub(crate) mod measure;
 pub(crate) mod style;
@@ -56,6 +59,8 @@ pub enum DiagramKind {
     XyChart,
     Kanban,
     Packet,
+    Requirement,
+    Block,
     Unknown,
 }
 
@@ -78,6 +83,8 @@ impl DiagramKind {
             DiagramKind::XyChart => "xy-chart",
             DiagramKind::Kanban => "kanban",
             DiagramKind::Packet => "packet",
+            DiagramKind::Requirement => "requirement",
+            DiagramKind::Block => "block",
             DiagramKind::Unknown => "unknown",
         }
     }
@@ -173,6 +180,8 @@ pub fn detect_kind(source: &str) -> DiagramKind {
         "xychart-beta" => DiagramKind::XyChart,
         "kanban" => DiagramKind::Kanban,
         "packet" | "packet-beta" => DiagramKind::Packet,
+        "requirementDiagram" => DiagramKind::Requirement,
+        "block" | "block-beta" => DiagramKind::Block,
         _ => DiagramKind::Unknown,
     }
 }
@@ -302,6 +311,16 @@ pub fn render(source: &str) -> RenderOutput {
         },
         DiagramKind::Packet => match packet::parse(source) {
             Ok(pk) => RenderOutput { kind, svg: Some(packet::render_svg(&pk)), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
+        DiagramKind::Requirement => {
+            match requirement::parse(source).and_then(|g| requirement::render_svg(&g)) {
+                Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
+                Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            }
+        }
+        DiagramKind::Block => match block::parse(source) {
+            Ok(b) => RenderOutput { kind, svg: Some(block::render_svg(&b)), error: None },
             Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
         },
         DiagramKind::Unknown => RenderOutput {
