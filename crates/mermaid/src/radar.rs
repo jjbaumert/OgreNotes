@@ -246,6 +246,6 @@ mod tests {
         let svg = render_svg(&parse("radar-beta\n title T\n axis A, B, C\n curve x[\"X\"]{1, 2, 3}").unwrap());
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
         assert!(svg.contains(">T<") && svg.contains(">A<"));
-        assert!(svg.matches("<polygon").count() >= RINGS + 1); // rings + curve
+        assert!(svg.matches("<polygon").count() > RINGS); // rings + curve
     }
 }

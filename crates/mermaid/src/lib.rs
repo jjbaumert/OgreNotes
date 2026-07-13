@@ -28,6 +28,7 @@ mod requirement;
 mod block;
 mod radar;
 mod treemap;
+mod sankey;
 mod layout;
 pub(crate) mod measure;
 pub(crate) mod style;
@@ -65,6 +66,7 @@ pub enum DiagramKind {
     Block,
     Radar,
     Treemap,
+    Sankey,
     Unknown,
 }
 
@@ -91,6 +93,7 @@ impl DiagramKind {
             DiagramKind::Block => "block",
             DiagramKind::Radar => "radar",
             DiagramKind::Treemap => "treemap",
+            DiagramKind::Sankey => "sankey",
             DiagramKind::Unknown => "unknown",
         }
     }
@@ -190,6 +193,7 @@ pub fn detect_kind(source: &str) -> DiagramKind {
         "block" | "block-beta" => DiagramKind::Block,
         "radar-beta" => DiagramKind::Radar,
         "treemap" | "treemap-beta" => DiagramKind::Treemap,
+        "sankey" | "sankey-beta" => DiagramKind::Sankey,
         _ => DiagramKind::Unknown,
     }
 }
@@ -333,6 +337,10 @@ pub fn render(source: &str) -> RenderOutput {
         },
         DiagramKind::Treemap => match treemap::parse(source) {
             Ok(tm) => RenderOutput { kind, svg: Some(treemap::render_svg(&tm)), error: None },
+            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+        },
+        DiagramKind::Sankey => match sankey::parse(source) {
+            Ok(sk) => RenderOutput { kind, svg: Some(sankey::render_svg(&sk)), error: None },
             Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
         },
         DiagramKind::Block => match block::parse(source) {
