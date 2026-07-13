@@ -131,21 +131,21 @@ pub fn MenuBar(
                 <Show when=move || open_menu.get() == Some("document")>
                     <div class="menu-bar-backdrop" on:click=move |_| close()></div>
                     <div class="menu-bar-dropdown">
-                        {menu_action("New", "", move || {
+                        {menu_action(crate::t!("menubar-doc-new"), "", move || {
                             on_doc_action.run(DocAction::NewDocument); close();
                         })}
                         <div class="menu-bar-sep"></div>
-                        {menu_action("Share\u{2026}", "", move || {
+                        {menu_action(crate::t!("menubar-doc-share"), "", move || {
                             on_doc_action.run(DocAction::Share); close();
                         })}
-                        {menu_action("Copy Link", "", move || {
+                        {menu_action(crate::t!("menubar-doc-copy-link"), "", move || {
                             on_doc_action.run(DocAction::CopyLink); close();
                         })}
-                        {menu_action("Move to Folder\u{2026}", "", move || {
+                        {menu_action(crate::t!("menubar-doc-move-folder"), "", move || {
                             on_doc_action.run(DocAction::MoveToFolder); close();
                         })}
                         <div class="menu-bar-sep"></div>
-                        {menu_action("Duplicate\u{2026}", "", move || {
+                        {menu_action(crate::t!("menubar-doc-duplicate"), "", move || {
                             on_doc_action.run(DocAction::DuplicateDocument); close();
                         })}
                         // #142: Mark / Unmark template — single item whose label
@@ -166,40 +166,40 @@ pub fn MenuBar(
                                 crate::t!("menubar-mark-template")
                             }}</span>
                         </button>
-                        {menu_action("New from Template\u{2026}", "", move || {
+                        {menu_action(crate::t!("menubar-doc-new-template"), "", move || {
                             on_doc_action.run(DocAction::NewFromTemplate); close();
                         })}
-                        {menu_action_sub("Export", move || {
+                        {menu_action_sub(crate::t!("menubar-doc-export"), move || {
                             // Submenu would go here; for now show export options inline
                         })}
-                        {menu_action("  HTML", "", move || {
+                        {menu_action(format!("  {}", crate::t!("menubar-doc-export-html")), "", move || {
                             on_doc_action.run(DocAction::ExportHtml); close();
                         })}
-                        {menu_action("  Markdown (copy)", "", move || {
+                        {menu_action(format!("  {}", crate::t!("menubar-doc-export-markdown")), "", move || {
                             on_doc_action.run(DocAction::ExportMarkdown); close();
                         })}
-                        {menu_action("  CSV", "", move || {
+                        {menu_action(format!("  {}", crate::t!("menubar-doc-export-csv")), "", move || {
                             on_doc_action.run(DocAction::ExportCsv); close();
                         })}
-                        {menu_action("  Excel (.xlsx)", "", move || {
+                        {menu_action(format!("  {}", crate::t!("menubar-doc-export-excel")), "", move || {
                             on_doc_action.run(DocAction::ExportXlsx); close();
                         })}
                         <div class="menu-bar-sep"></div>
-                        {menu_action("Print\u{2026}", "Ctrl+P", move || {
+                        {menu_action(crate::t!("menubar-doc-print"), "Ctrl+P", move || {
                             on_doc_action.run(DocAction::Print); close();
                         })}
                         <div class="menu-bar-sep"></div>
-                        {menu_action("Document History\u{2026}", "Ctrl+Shift+H", move || {
+                        {menu_action(crate::t!("menubar-doc-history"), "Ctrl+Shift+H", move || {
                             on_doc_action.run(DocAction::DocumentHistory); close();
                         })}
-                        {menu_action("Document Details\u{2026}", "", move || {
+                        {menu_action(crate::t!("menubar-doc-details"), "", move || {
                             on_doc_action.run(DocAction::DocumentDetails); close();
                         })}
                         <div class="menu-bar-sep"></div>
-                        {menu_action("Rename Document\u{2026}", "", move || {
+                        {menu_action(crate::t!("menubar-doc-rename"), "", move || {
                             on_doc_action.run(DocAction::RenameDocument); close();
                         })}
-                        {menu_action("Delete Document\u{2026}", "", move || {
+                        {menu_action(crate::t!("menubar-doc-delete"), "", move || {
                             on_doc_action.run(DocAction::DeleteDocument); close();
                         })}
                     </div>
@@ -216,28 +216,28 @@ pub fn MenuBar(
                 <Show when=move || open_menu.get() == Some("edit")>
                     <div class="menu-bar-backdrop" on:click=move |_| close()></div>
                     <div class="menu-bar-dropdown">
-                        {menu_action("Undo", "Ctrl+Z", move || {
+                        {menu_action(crate::t!("menubar-edit-undo"), "Ctrl+Z", move || {
                             on_command.run(ToolbarCommand::Undo); close();
                         })}
-                        {menu_action("Redo", "Ctrl+Shift+Z", move || {
+                        {menu_action(crate::t!("menubar-edit-redo"), "Ctrl+Shift+Z", move || {
                             on_command.run(ToolbarCommand::Redo); close();
                         })}
                         <div class="menu-bar-sep"></div>
-                        {menu_action("Cut", "Ctrl+X", move || {
+                        {menu_action(crate::t!("menu-cut"), "Ctrl+X", move || {
                             // Handled natively by the browser.
                             close();
                         })}
-                        {menu_action("Copy", "Ctrl+C", move || {
+                        {menu_action(crate::t!("menu-copy"), "Ctrl+C", move || {
                             close();
                         })}
-                        {menu_action("Paste", "Ctrl+V", move || {
+                        {menu_action(crate::t!("menu-paste"), "Ctrl+V", move || {
                             close();
                         })}
                         <div class="menu-bar-sep"></div>
-                        {menu_action("Find and Replace", "Ctrl+F", move || {
+                        {menu_action(crate::t!("menubar-edit-find"), "Ctrl+F", move || {
                             on_doc_action.run(DocAction::OpenFindReplace); close();
                         })}
-                        {menu_action("Copy Anchor Link", "Ctrl+Shift+A", move || {
+                        {menu_action(crate::t!("menubar-edit-copy-anchor"), "Ctrl+Shift+A", move || {
                             on_doc_action.run(DocAction::CopyLink); close();
                         })}
                     </div>
@@ -254,34 +254,34 @@ pub fn MenuBar(
                 <Show when=move || open_menu.get() == Some("view")>
                     <div class="menu-bar-backdrop" on:click=move |_| close()></div>
                     <div class="menu-bar-dropdown">
-                        {menu_toggle("Show Comments", comments_visible, move || {
+                        {menu_toggle(crate::t!("menubar-view-comments"), comments_visible, move || {
                             on_doc_action.run(DocAction::ToggleComments); close();
                         })}
-                        {menu_toggle("Show Conversation", conversation_visible, move || {
+                        {menu_toggle(crate::t!("menubar-view-conversation"), conversation_visible, move || {
                             on_doc_action.run(DocAction::ToggleConversation); close();
                         })}
-                        {menu_toggle("Show Cursors", cursors_visible, move || {
+                        {menu_toggle(crate::t!("menubar-view-cursors"), cursors_visible, move || {
                             on_doc_action.run(DocAction::ToggleCursors); close();
                         })}
-                        {menu_toggle("Focus Mode", focus_mode, move || {
+                        {menu_toggle(crate::t!("menubar-view-focus"), focus_mode, move || {
                             on_doc_action.run(DocAction::ToggleFocusMode); close();
                         })}
-                        {menu_toggle("Show Line Numbers", line_numbers_visible, move || {
+                        {menu_toggle(crate::t!("menubar-view-line-numbers"), line_numbers_visible, move || {
                             on_doc_action.run(DocAction::ToggleLineNumbers); close();
                         })}
-                        {menu_toggle("Show Page Breaks", page_breaks_visible, move || {
+                        {menu_toggle(crate::t!("menubar-view-page-breaks"), page_breaks_visible, move || {
                             on_doc_action.run(DocAction::TogglePageBreaks); close();
                         })}
                         <div class="menu-bar-sep"></div>
-                        {menu_toggle("Show Outline", outline_visible, move || {
+                        {menu_toggle(crate::t!("menubar-view-outline"), outline_visible, move || {
                             on_doc_action.run(DocAction::ToggleOutline); close();
                         })}
-                        {menu_action("Keep Outline Expanded", "Ctrl+Shift+O", move || {
+                        {menu_action(crate::t!("menubar-view-outline-expanded"), "Ctrl+Shift+O", move || {
                             // TODO: separate "keep expanded" preference
                             close();
                         })}
                         <div class="menu-bar-sep"></div>
-                        {menu_action("Document History\u{2026}", "Ctrl+Shift+H", move || {
+                        {menu_action(crate::t!("menubar-doc-history"), "Ctrl+Shift+H", move || {
                             on_doc_action.run(DocAction::DocumentHistory); close();
                         })}
                     </div>
@@ -344,85 +344,85 @@ pub fn MenuBar(
                 <Show when=move || open_menu.get() == Some("format")>
                     <div class="menu-bar-backdrop" on:click=move |_| close()></div>
                     <div class="menu-bar-dropdown">
-                        {menu_icon_action("B", "Bold", "Ctrl+B", move || {
+                        {menu_icon_action("B", crate::t!("menu-bold"), "Ctrl+B", move || {
                             on_command.run(ToolbarCommand::ToggleBold); close();
                         })}
-                        {menu_icon_action("I", "Italic", "Ctrl+I", move || {
+                        {menu_icon_action("I", crate::t!("menu-italic"), "Ctrl+I", move || {
                             on_command.run(ToolbarCommand::ToggleItalic); close();
                         })}
-                        {menu_icon_action("U", "Underline", "Ctrl+U", move || {
+                        {menu_icon_action("U", crate::t!("menu-underline"), "Ctrl+U", move || {
                             on_command.run(ToolbarCommand::ToggleUnderline); close();
                         })}
-                        {menu_icon_action("S\u{0336}", "Strikethrough", "Ctrl+Shift+X", move || {
+                        {menu_icon_action("S\u{0336}", crate::t!("menu-strikethrough"), "Ctrl+Shift+X", move || {
                             on_command.run(ToolbarCommand::ToggleStrike); close();
                         })}
-                        {menu_icon_action("x\u{2082}", "Subscript", "Ctrl+,", move || {
+                        {menu_icon_action("x\u{2082}", crate::t!("menubar-format-subscript"), "Ctrl+,", move || {
                             on_command.run(ToolbarCommand::ToggleSubscript); close();
                         })}
-                        {menu_icon_action("x\u{00B2}", "Superscript", "Ctrl+.", move || {
+                        {menu_icon_action("x\u{00B2}", crate::t!("menubar-format-superscript"), "Ctrl+.", move || {
                             on_command.run(ToolbarCommand::ToggleSuperscript); close();
                         })}
-                        {menu_icon_action("A", "Text Color", "", move || {
+                        {menu_icon_action("A", crate::t!("menubar-format-text-color"), "", move || {
                             // Opens color picker from toolbar — close menu.
                             close();
                         })}
-                        {menu_icon_action("\u{270F}", "Highlight", "", move || {
+                        {menu_icon_action("\u{270F}", crate::t!("menubar-format-highlight"), "", move || {
                             close();
                         })}
-                        {menu_icon_action("</>", "Code", "Ctrl+Shift+K", move || {
+                        {menu_icon_action("</>", crate::t!("menu-code"), "Ctrl+Shift+K", move || {
                             on_command.run(ToolbarCommand::ToggleCode); close();
                         })}
                         <div class="menu-bar-sep"></div>
-                        {menu_action_sub("Paragraph Style", move || {})}
-                        {menu_action("  Paragraph", "", move || {
+                        {menu_action_sub(crate::t!("menubar-format-paragraph-style"), move || {})}
+                        {menu_action(format!("  {}", crate::t!("toolbar-block-paragraph")), "", move || {
                             on_command.run(ToolbarCommand::SetParagraph); close();
                         })}
-                        {menu_action("  Heading 1", "", move || {
+                        {menu_action(format!("  {}", crate::t!("toolbar-block-heading-1")), "", move || {
                             on_command.run(ToolbarCommand::SetHeading(1)); close();
                         })}
-                        {menu_action("  Heading 2", "", move || {
+                        {menu_action(format!("  {}", crate::t!("toolbar-block-heading-2")), "", move || {
                             on_command.run(ToolbarCommand::SetHeading(2)); close();
                         })}
-                        {menu_action("  Heading 3", "", move || {
+                        {menu_action(format!("  {}", crate::t!("toolbar-block-heading-3")), "", move || {
                             on_command.run(ToolbarCommand::SetHeading(3)); close();
                         })}
-                        {menu_action("  Code Block", "", move || {
+                        {menu_action(format!("  {}", crate::t!("toolbar-block-code-block")), "", move || {
                             on_command.run(ToolbarCommand::SetCodeBlock); close();
                         })}
-                        {menu_action("  Quote", "", move || {
+                        {menu_action(format!("  {}", crate::t!("node-blockquote")), "", move || {
                             on_command.run(ToolbarCommand::ToggleBlockquote); close();
                         })}
                         <div class="menu-bar-sep"></div>
-                        {menu_action_sub("Alignment", move || {})}
-                        {menu_action("  Left", "", move || {
+                        {menu_action_sub(crate::t!("menu-alignment"), move || {})}
+                        {menu_action(format!("  {}", crate::t!("menu-align-left")), "", move || {
                             on_command.run(ToolbarCommand::SetAlignment("left".to_string())); close();
                         })}
-                        {menu_action("  Center", "", move || {
+                        {menu_action(format!("  {}", crate::t!("menu-align-center")), "", move || {
                             on_command.run(ToolbarCommand::SetAlignment("center".to_string())); close();
                         })}
-                        {menu_action("  Right", "", move || {
+                        {menu_action(format!("  {}", crate::t!("menu-align-right")), "", move || {
                             on_command.run(ToolbarCommand::SetAlignment("right".to_string())); close();
                         })}
                         <div class="menu-bar-sep"></div>
-                        {menu_action_sub("List", move || {})}
-                        {menu_action("  Bulleted List", "", move || {
+                        {menu_action_sub(crate::t!("menubar-format-list"), move || {})}
+                        {menu_action(format!("  {}", crate::t!("toolbar-block-bulleted-list")), "", move || {
                             on_command.run(ToolbarCommand::ToggleBulletList); close();
                         })}
-                        {menu_action("  Numbered List", "", move || {
+                        {menu_action(format!("  {}", crate::t!("toolbar-block-numbered-list")), "", move || {
                             on_command.run(ToolbarCommand::ToggleOrderedList); close();
                         })}
-                        {menu_action("  Checklist", "", move || {
+                        {menu_action(format!("  {}", crate::t!("toolbar-block-checklist")), "", move || {
                             on_command.run(ToolbarCommand::ToggleTaskList); close();
                         })}
                         <div class="menu-bar-sep"></div>
-                        {menu_action("Clear Formatting", "Ctrl+\\", move || {
+                        {menu_action(crate::t!("menubar-format-clear"), "Ctrl+\\", move || {
                             on_command.run(ToolbarCommand::ClearFormatting); close();
                         })}
                         // #140: owner-only edit lock. Hidden for non-owners so
                         // only someone who can actually toggle it sees it.
                         <Show when=move || can_manage_lock.get()>
                             <div class="menu-bar-sep"></div>
-                            {menu_toggle("Lock Edits", locked, move || {
+                            {menu_toggle(crate::t!("menubar-format-lock"), locked, move || {
                                 on_doc_action.run(DocAction::ToggleLockEdits); close();
                             })}
                         </Show>
@@ -451,10 +451,11 @@ fn menu_action(
 
 /// Menu item with a checkmark toggle.
 fn menu_toggle(
-    label: &'static str,
+    label: impl Into<String>,
     active: ReadSignal<bool>,
     on_click: impl Fn() + 'static,
 ) -> impl IntoView {
+    let label: String = label.into();
     view! {
         <button class="menu-bar-action" on:click=move |_| on_click()>
             <span class="menu-bar-action-check">
@@ -471,10 +472,11 @@ fn menu_toggle(
 /// Menu item with an icon on the left (as in a typical Format menu).
 fn menu_icon_action(
     icon: &'static str,
-    label: &'static str,
+    label: impl Into<String>,
     shortcut: &'static str,
     on_click: impl Fn() + 'static,
 ) -> impl IntoView {
+    let label: String = label.into();
     view! {
         <button class="menu-bar-action" on:click=move |_| on_click()>
             <span class="menu-bar-action-icon">{icon}</span>
@@ -487,9 +489,10 @@ fn menu_icon_action(
 }
 
 fn menu_action_sub(
-    label: &'static str,
+    label: impl Into<String>,
     _on_hover: impl Fn() + 'static,
 ) -> impl IntoView {
+    let label: String = label.into();
     view! {
         <div class="menu-bar-action menu-bar-action-disabled">
             <span class="menu-bar-action-label">{label}</span>
