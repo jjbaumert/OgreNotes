@@ -5,6 +5,18 @@
   padding: 0;
 }
 
+/* Form controls (button/input/select/textarea) don't inherit font-family
+ * from their container by default — browsers give them a UA font. Without
+ * this reset they ignore --font-ui, so the dyslexia toggle (which overrides
+ * --font-ui/--font-doc-body/--font-mono) left every button, menu item, and
+ * text input in the default face. Inheriting ties them to the surrounding
+ * text token in both normal and dyslexic mode. Low specificity, so a
+ * control that needs a specific face (e.g. code inputs on --font-mono)
+ * still overrides it. */
+button, input, select, textarea, optgroup {
+  font-family: inherit;
+}
+
 html, body {
   height: 100%;
   font-family: var(--font-ui);
