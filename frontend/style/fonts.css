@@ -30,3 +30,15 @@
   font-display: swap;
   src: url("/fonts/OpenDyslexic-BoldItalic.woff2") format("woff2");
 }
+
+/* OpenDyslexic Mono — the fixed-width sibling, for code blocks / inline
+ * code / shortcuts under [data-dyslexic]. Only a Regular weight ships in
+ * the upstream family; bold code synthesizes. Keeps columns aligned while
+ * still being dyslexia-friendly. Same OFL license (static/fonts/OFL.txt). */
+@font-face {
+  font-family: "OpenDyslexic Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/OpenDyslexicMono-Regular.woff2") format("woff2");
+}
