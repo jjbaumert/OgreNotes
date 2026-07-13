@@ -145,7 +145,7 @@ pub fn EditorContextMenu(
                     disabled=move || selection_empty.get()
                     on:click=move |_| dispatch(EditorContextCommand::Cut)
                 >
-                    <span class="editor-ctx-label">"Cut"</span>
+                    <span class="editor-ctx-label">{crate::t!("menu-cut")}</span>
                     <span class="editor-ctx-shortcut">"Ctrl+X"</span>
                 </button>
                 <button
@@ -153,14 +153,14 @@ pub fn EditorContextMenu(
                     disabled=move || selection_empty.get()
                     on:click=move |_| dispatch(EditorContextCommand::Copy)
                 >
-                    <span class="editor-ctx-label">"Copy"</span>
+                    <span class="editor-ctx-label">{crate::t!("menu-copy")}</span>
                     <span class="editor-ctx-shortcut">"Ctrl+C"</span>
                 </button>
                 <button
                     class="editor-ctx-item"
                     on:click=move |_| dispatch(EditorContextCommand::Paste)
                 >
-                    <span class="editor-ctx-label">"Paste"</span>
+                    <span class="editor-ctx-label">{crate::t!("menu-paste")}</span>
                     <span class="editor-ctx-shortcut">"Ctrl+V"</span>
                 </button>
 
@@ -171,7 +171,7 @@ pub fn EditorContextMenu(
                     disabled=move || selection_empty.get()
                     on:click=move |_| dispatch(EditorContextCommand::Comment)
                 >
-                    <span class="editor-ctx-label">"Comment"</span>
+                    <span class="editor-ctx-label">{crate::t!("menu-comment")}</span>
                     <span class="editor-ctx-shortcut">"\u{1F4AC}"</span>
                 </button>
 
@@ -188,7 +188,7 @@ pub fn EditorContextMenu(
                             e.stop_propagation();
                         }
                     >
-                        <span class="editor-ctx-label">"Paragraph style"</span>
+                        <span class="editor-ctx-label">{crate::t!("editorctx-paragraph-style")}</span>
                         <span class="editor-ctx-submenu-arrow">"\u{25B6}"</span>
                     </button>
                     <div class="editor-ctx-submenu">
@@ -196,57 +196,57 @@ pub fn EditorContextMenu(
                             class="editor-ctx-item"
                             on:click=move |_| dispatch(EditorContextCommand::SetParagraph)
                         >
-                            <span class="editor-ctx-label">"Paragraph"</span>
+                            <span class="editor-ctx-label">{crate::t!("toolbar-block-paragraph")}</span>
                         </button>
                         <button
                             class="editor-ctx-item"
                             on:click=move |_| dispatch(EditorContextCommand::SetHeading1)
                         >
-                            <span class="editor-ctx-label">"Heading 1"</span>
+                            <span class="editor-ctx-label">{crate::t!("toolbar-block-heading-1")}</span>
                         </button>
                         <button
                             class="editor-ctx-item"
                             on:click=move |_| dispatch(EditorContextCommand::SetHeading2)
                         >
-                            <span class="editor-ctx-label">"Heading 2"</span>
+                            <span class="editor-ctx-label">{crate::t!("toolbar-block-heading-2")}</span>
                         </button>
                         <button
                             class="editor-ctx-item"
                             on:click=move |_| dispatch(EditorContextCommand::SetHeading3)
                         >
-                            <span class="editor-ctx-label">"Heading 3"</span>
+                            <span class="editor-ctx-label">{crate::t!("toolbar-block-heading-3")}</span>
                         </button>
                         <div class="editor-ctx-sep"></div>
                         <button
                             class="editor-ctx-item"
                             on:click=move |_| dispatch(EditorContextCommand::ToggleBulletList)
                         >
-                            <span class="editor-ctx-label">"Bullet list"</span>
+                            <span class="editor-ctx-label">{crate::t!("node-bullet-list")}</span>
                         </button>
                         <button
                             class="editor-ctx-item"
                             on:click=move |_| dispatch(EditorContextCommand::ToggleOrderedList)
                         >
-                            <span class="editor-ctx-label">"Numbered list"</span>
+                            <span class="editor-ctx-label">{crate::t!("node-ordered-list")}</span>
                         </button>
                         <button
                             class="editor-ctx-item"
                             on:click=move |_| dispatch(EditorContextCommand::ToggleTaskList)
                         >
-                            <span class="editor-ctx-label">"Task list"</span>
+                            <span class="editor-ctx-label">{crate::t!("node-task-list")}</span>
                         </button>
                         <div class="editor-ctx-sep"></div>
                         <button
                             class="editor-ctx-item"
                             on:click=move |_| dispatch(EditorContextCommand::ToggleBlockquote)
                         >
-                            <span class="editor-ctx-label">"Blockquote"</span>
+                            <span class="editor-ctx-label">{crate::t!("toolbar-block-blockquote")}</span>
                         </button>
                         <button
                             class="editor-ctx-item"
                             on:click=move |_| dispatch(EditorContextCommand::SetCodeBlock)
                         >
-                            <span class="editor-ctx-label">"Code block"</span>
+                            <span class="editor-ctx-label">{crate::t!("node-code-block")}</span>
                         </button>
                     </div>
                 </div>
@@ -259,7 +259,7 @@ pub fn EditorContextMenu(
                             e.stop_propagation();
                         }
                     >
-                        <span class="editor-ctx-label">"Alignment"</span>
+                        <span class="editor-ctx-label">{crate::t!("menu-alignment")}</span>
                         <span class="editor-ctx-submenu-arrow">"\u{25B6}"</span>
                     </button>
                     <div class="editor-ctx-submenu">
@@ -267,19 +267,19 @@ pub fn EditorContextMenu(
                             class="editor-ctx-item"
                             on:click=move |_| dispatch(EditorContextCommand::AlignLeft)
                         >
-                            <span class="editor-ctx-label">"Left"</span>
+                            <span class="editor-ctx-label">{crate::t!("menu-align-left")}</span>
                         </button>
                         <button
                             class="editor-ctx-item"
                             on:click=move |_| dispatch(EditorContextCommand::AlignCenter)
                         >
-                            <span class="editor-ctx-label">"Center"</span>
+                            <span class="editor-ctx-label">{crate::t!("menu-align-center")}</span>
                         </button>
                         <button
                             class="editor-ctx-item"
                             on:click=move |_| dispatch(EditorContextCommand::AlignRight)
                         >
-                            <span class="editor-ctx-label">"Right"</span>
+                            <span class="editor-ctx-label">{crate::t!("menu-align-right")}</span>
                         </button>
                     </div>
                 </div>
@@ -290,35 +290,35 @@ pub fn EditorContextMenu(
                     class="editor-ctx-item"
                     on:click=move |_| dispatch(EditorContextCommand::ToggleBold)
                 >
-                    <span class="editor-ctx-label">"Bold"</span>
+                    <span class="editor-ctx-label">{crate::t!("menu-bold")}</span>
                     <span class="editor-ctx-shortcut">"Ctrl+B"</span>
                 </button>
                 <button
                     class="editor-ctx-item"
                     on:click=move |_| dispatch(EditorContextCommand::ToggleItalic)
                 >
-                    <span class="editor-ctx-label">"Italic"</span>
+                    <span class="editor-ctx-label">{crate::t!("menu-italic")}</span>
                     <span class="editor-ctx-shortcut">"Ctrl+I"</span>
                 </button>
                 <button
                     class="editor-ctx-item"
                     on:click=move |_| dispatch(EditorContextCommand::ToggleUnderline)
                 >
-                    <span class="editor-ctx-label">"Underline"</span>
+                    <span class="editor-ctx-label">{crate::t!("menu-underline")}</span>
                     <span class="editor-ctx-shortcut">"Ctrl+U"</span>
                 </button>
                 <button
                     class="editor-ctx-item"
                     on:click=move |_| dispatch(EditorContextCommand::ToggleStrike)
                 >
-                    <span class="editor-ctx-label">"Strikethrough"</span>
+                    <span class="editor-ctx-label">{crate::t!("menu-strikethrough")}</span>
                     <span class="editor-ctx-shortcut">""</span>
                 </button>
                 <button
                     class="editor-ctx-item"
                     on:click=move |_| dispatch(EditorContextCommand::ToggleCode)
                 >
-                    <span class="editor-ctx-label">"Code"</span>
+                    <span class="editor-ctx-label">{crate::t!("menu-code")}</span>
                     <span class="editor-ctx-shortcut">""</span>
                 </button>
 
@@ -328,7 +328,7 @@ pub fn EditorContextMenu(
                     class="editor-ctx-item"
                     on:click=move |_| dispatch(EditorContextCommand::InsertLink)
                 >
-                    <span class="editor-ctx-label">"Insert link\u{2026}"</span>
+                    <span class="editor-ctx-label">{crate::t!("editorctx-insert-link")}</span>
                     <span class="editor-ctx-shortcut">"Ctrl+K"</span>
                 </button>
             </div>
