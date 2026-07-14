@@ -30,7 +30,8 @@ use crate::api::client;
 use crate::components::menu::{AnchoredMenu, MenuEntry};
 
 /// Slim `/users/me` decode — the avatar URL plus the (already
-/// expiry-filtered) status. Name/email come from the synchronous auth
+/// expiry-filtered) status, and the admin flag that gates the
+/// admin-console links. Name/email come from the synchronous auth
 /// state; this fetch upgrades the initials placeholder to a real photo
 /// and surfaces the status pill.
 #[derive(Deserialize)]
@@ -39,6 +40,8 @@ struct MeAvatar {
     avatar_url: Option<String>,
     #[serde(default)]
     status: Option<StatusView>,
+    #[serde(default)]
+    is_admin: bool,
 }
 
 #[derive(Deserialize, Clone)]
@@ -54,6 +57,7 @@ pub fn AccountMenu() -> impl IntoView {
     let (open, set_open) = signal(false);
     let (avatar_url, set_avatar_url) = signal::<Option<String>>(None);
     let (status, set_status) = signal::<Option<StatusView>>(None);
+    let (is_admin, set_is_admin) = signal(false);
 
     // Identity from the in-memory auth state — present on every
     // authenticated page, no fetch required.
@@ -62,13 +66,16 @@ pub fn AccountMenu() -> impl IntoView {
     let email = auth.map(|a| a.email).unwrap_or_default();
     let initials = initials_of(&name);
 
-    // Upgrade to the stored avatar image + surface the status.
+    // Upgrade to the stored avatar image + surface the status and the
+    // admin flag (which gates the admin-console links below — the
+    // /admin/* routes exist but had no entry point in the UI).
     leptos::task::spawn_local(async move {
         if let Ok(me) = client::api_get::<MeAvatar>("/users/me").await {
             if let Some(url) = me.avatar_url.filter(|u| !u.is_empty()) {
                 set_avatar_url.set(Some(url));
             }
             set_status.set(me.status);
+            set_is_admin.set(me.is_admin);
         }
     });
 
@@ -90,13 +97,47 @@ pub fn AccountMenu() -> impl IntoView {
         });
     };
 
+    // Quick theme switch — flat rows rather than a fly-out submenu:
+    // the sidebar's `overflow-y: auto` would clip a panel extending
+    // past its edge. Persisted the same way the settings page does.
+    let set_theme = |target: Option<crate::theme::ExplicitTheme>| {
+        move || {
+            leptos::task::spawn_local(async move {
+                if let Err(e) = crate::theme::change_theme(target).await {
+                    web_sys::console::warn_1(
+                        &format!("theme persistence failed: {e:?}").into(),
+                    );
+                }
+            });
+        }
+    };
+
     let entries = Callback::new(move |()| {
-        vec![
+        use crate::theme::ExplicitTheme;
+        let mut items = vec![
             MenuEntry::action(crate::t!("account-menu-profile"), go("/settings#profile")),
             MenuEntry::action(crate::t!("account-menu-settings"), go("/settings#appearance")),
             MenuEntry::action(crate::t!("account-menu-shortcuts"), go("/settings#help")),
-            MenuEntry::action(crate::t!("sidebar-sign-out"), sign_out).danger(),
-        ]
+            MenuEntry::Separator,
+            MenuEntry::action(crate::t!("theme-system"), set_theme(None))
+                .with_icon("\u{1F5A5}"),
+            MenuEntry::action(crate::t!("theme-light"), set_theme(Some(ExplicitTheme::Light)))
+                .with_icon("\u{2600}"),
+            MenuEntry::action(crate::t!("theme-dark"), set_theme(Some(ExplicitTheme::Dark)))
+                .with_icon("\u{1F319}"),
+        ];
+        if is_admin.get() {
+            items.push(MenuEntry::Separator);
+            items.push(MenuEntry::action(crate::t!("admin-users-title"), go("/admin/users")));
+            items.push(MenuEntry::action(
+                crate::t!("admin-metrics-title"),
+                go("/admin/metrics"),
+            ));
+            items.push(MenuEntry::action(crate::t!("admin-audit-title"), go("/admin/audit")));
+        }
+        items.push(MenuEntry::Separator);
+        items.push(MenuEntry::action(crate::t!("sidebar-sign-out"), sign_out).danger());
+        items
     });
 
     let trigger_name = name.clone();

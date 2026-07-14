@@ -20,7 +20,6 @@
 use leptos::prelude::*;
 
 use crate::api::client;
-use crate::components::locale_selector::LocaleSelector;
 
 /// Slim `/users/me` decode — the fields this form edits or shows.
 #[derive(serde::Deserialize)]
@@ -190,12 +189,8 @@ pub fn ProfileSettings() -> impl IntoView {
                 </span>
             </div>
 
-            <div class="settings-field">
-                <span class="settings-field-label">
-                    {crate::t!("settings-appearance-language")}
-                </span>
-                <LocaleSelector />
-            </div>
+            // The language selector moved to the Appearance tab
+            // (settings.rs) where its i18n key always said it lived.
 
             <div class="settings-field">
                 <label class="settings-field-label" for="byok-key">
