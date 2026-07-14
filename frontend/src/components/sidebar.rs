@@ -185,6 +185,87 @@ pub fn Sidebar(
         }
     };
 
+    // Mobile drawer hygiene: close the drawer when a sidebar entry
+    // navigates or opens a dialog — otherwise it stays parked over the
+    // new page. No-op on desktop (drawer_open only matters ≤640px).
+    let close_drawer = move || {
+        if let Some(ctx) = shell {
+            ctx.drawer_open.set(false);
+        }
+    };
+
+    // ── "+ New" (sidebar header) ──────────────────────────────
+    // Creation used to live only on the home page's action bar; this
+    // makes it reachable from any page. Same create-then-navigate
+    // flow as home.rs.
+    let new_menu: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
+    let new_menu_entries = Callback::new(move |()| {
+        let mut items = vec![
+            MenuEntry::action(crate::t!("sidebar-new-document"), move || {
+                close_drawer();
+                leptos::task::spawn_local(async move {
+                    match documents::create_document("Untitled", None).await {
+                        Ok(doc) => crate::commands::nav_bridge::go(&format!("/d/{}", doc.id)),
+                        Err(e) => web_sys::console::error_1(
+                            &format!("Failed to create document: {e}").into(),
+                        ),
+                    }
+                });
+            }),
+            MenuEntry::action(crate::t!("sidebar-new-spreadsheet"), move || {
+                close_drawer();
+                leptos::task::spawn_local(async move {
+                    match documents::create_spreadsheet("Untitled Spreadsheet", None).await {
+                        Ok(doc) => crate::commands::nav_bridge::go(&format!("/d/{}", doc.id)),
+                        Err(e) => web_sys::console::error_1(
+                            &format!("Failed to create spreadsheet: {e}").into(),
+                        ),
+                    }
+                });
+            }),
+        ];
+        if let Some(cb) = on_templates {
+            items.push(MenuEntry::Separator);
+            items.push(MenuEntry::action(crate::t!("menubar-doc-new-template"), move || {
+                close_drawer();
+                cb.run(());
+            }));
+        }
+        items
+    });
+
+    // ── Swipe-to-close for the mobile drawer ──────────────────
+    // A horizontal swipe toward the drawer's hidden edge (inline-start:
+    // left in LTR, right in RTL) closes it — matching the slide-in
+    // animation's direction.
+    let swipe_start: StoredValue<Option<(f64, f64)>> = StoredValue::new(None);
+    let on_nav_touchstart = move |ev: web_sys::TouchEvent| {
+        swipe_start.set_value(crate::touch::first_touch_xy(&ev));
+    };
+    let on_nav_touchend = move |ev: web_sys::TouchEvent| {
+        let Some((sx, sy)) = swipe_start.get_value() else { return };
+        swipe_start.set_value(None);
+        let Some(touch) = ev.changed_touches().get(0) else { return };
+        let (ex, ey) = (touch.client_x() as f64, touch.client_y() as f64);
+        let Some(dir) = crate::touch::swipe_direction(sx, sy, ex, ey, 50.0) else { return };
+        let drawer_open = is_open.map(|s| s.get_untracked()).unwrap_or(false);
+        if !drawer_open {
+            return;
+        }
+        let rtl = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.document_element())
+            .map(|el| el.get_attribute("dir").as_deref() == Some("rtl"))
+            .unwrap_or(false);
+        let closes = matches!(
+            (dir, rtl),
+            (crate::touch::SwipeDir::Left, false) | (crate::touch::SwipeDir::Right, true)
+        );
+        if closes {
+            close_drawer();
+        }
+    };
+
     let doc_menu_entries = Callback::new(move |()| {
         let Some(target) = doc_menu.get() else {
             return Vec::new();
@@ -259,11 +340,25 @@ pub fn Sidebar(
             class:collapsed=collapsed
             class:is-open=is_open_class
             aria-label=crate::t!("sidebar-aria-main-nav")
+            on:touchstart=on_nav_touchstart
+            on:touchend=on_nav_touchend
         >
             <div class="sidebar-header">
                 <span class="sidebar-logo">
                     {move || if collapsed.get() { "O" } else { "OgreNotes" }}
                 </span>
+                <button
+                    class="toolbar-btn"
+                    style="color: white;"
+                    style:display=move || if collapsed.get() { "none" } else { "inline-flex" }
+                    aria-haspopup="menu"
+                    aria-label=crate::t!("sidebar-new-aria")
+                    title=crate::t!("sidebar-new-aria")
+                    on:click=move |ev: web_sys::MouseEvent| {
+                        let (x, y) = button_anchor(&ev);
+                        new_menu.set(Some((x, y)));
+                    }
+                >"+"</button>
                 <button
                     class="toolbar-btn"
                     on:click=toggle
@@ -385,6 +480,7 @@ pub fn Sidebar(
                 <div
                     class="sidebar-item"
                     on:click=move |_| {
+                        close_drawer();
                         if let Some(cb) = on_home {
                             cb.run(());
                         } else if let Some(window) = web_sys::window() {
@@ -398,7 +494,7 @@ pub fn Sidebar(
                 {move || on_search.map(|cb| view! {
                     <div
                         class="sidebar-item"
-                        on:click=move |_| cb.run(())
+                        on:click=move |_| { close_drawer(); cb.run(()); }
                         style="cursor: pointer;"
                     >
                         <span>{format!("\u{1F50D} {}", crate::t!("sidebar-search"))}</span>
@@ -410,7 +506,7 @@ pub fn Sidebar(
                 {move || on_ask.map(|cb| view! {
                     <div
                         class="sidebar-item"
-                        on:click=move |_| cb.run(())
+                        on:click=move |_| { close_drawer(); cb.run(()); }
                         style="cursor: pointer;"
                     >
                         <span>{format!("\u{2728} {}", crate::t!("sidebar-ask"))}</span>
@@ -422,7 +518,7 @@ pub fn Sidebar(
                 {move || on_templates.map(|cb| view! {
                     <div
                         class="sidebar-item"
-                        on:click=move |_| cb.run(())
+                        on:click=move |_| { close_drawer(); cb.run(()); }
                         style="cursor: pointer;"
                     >
                         <span>{format!("\u{1F4CB} {}", crate::t!("sidebar-templates"))}</span>
@@ -460,6 +556,7 @@ pub fn Sidebar(
                                         if ev.button() == 0 && !ev.ctrl_key() && !ev.meta_key()
                                             && !ev.shift_key() && !ev.alt_key() {
                                             ev.prevent_default();
+                                            close_drawer();
                                             crate::commands::nav_bridge::go(&nav_href);
                                         }
                                     }
@@ -520,6 +617,7 @@ pub fn Sidebar(
                                                 if ev.button() == 0 && !ev.ctrl_key() && !ev.meta_key()
                                                     && !ev.shift_key() && !ev.alt_key() {
                                                     ev.prevent_default();
+                                                    close_drawer();
                                                     crate::commands::nav_bridge::go(&nav_href);
                                                 }
                                             }
@@ -583,6 +681,15 @@ pub fn Sidebar(
                 // replaces the standalone sign-out row that lived here.
                 <AccountMenu />
             </div>
+
+            // ── "+ New" menu (header) ──
+            <ContextMenu
+                visible=Signal::derive(move || new_menu.get().is_some())
+                x=Signal::derive(move || new_menu.get().map(|(x, _)| x).unwrap_or_default())
+                y=Signal::derive(move || new_menu.get().map(|(_, y)| y).unwrap_or_default())
+                entries=new_menu_entries
+                on_close=Callback::new(move |()| new_menu.set(None))
+            />
 
             // ── Row-menu chrome: shared context menu + dialogs ──
             <ContextMenu

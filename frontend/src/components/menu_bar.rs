@@ -49,7 +49,7 @@ pub enum DocAction {
 
 /// Top-level menu order — drives ArrowLeft/ArrowRight rotation
 /// between open menus (the shared primitive's `on_switch` hook).
-const MENU_ORDER: [&str; 5] = ["document", "edit", "view", "insert", "format"];
+const MENU_ORDER: [&str; 6] = ["document", "edit", "view", "insert", "format", "help"];
 
 /// The Document menu's entries. Shared between the desktop menu bar
 /// and the mobile `⋯` document-actions button in the doc header
@@ -360,6 +360,15 @@ pub fn MenuBar(
         entries
     });
 
+    // Help: the keyboard-shortcut reference lived only at
+    // /settings#help with no discoverable entry point near the
+    // editor; a conventional Help menu fixes that.
+    let help_entries = Callback::new(move |()| {
+        vec![MenuEntry::action(crate::t!("account-menu-shortcuts"), || {
+            crate::commands::nav_bridge::go("/settings#help");
+        })]
+    });
+
     // One trigger + anchored dropdown per top-level menu.
     let menu = move |name: &'static str,
                      label: String,
@@ -389,6 +398,7 @@ pub fn MenuBar(
             {menu("view", crate::t!("menubar-view"), view_entries)}
             {menu("insert", crate::t!("menubar-insert"), insert_entries)}
             {menu("format", crate::t!("menubar-format"), format_entries)}
+            {menu("help", crate::t!("menubar-help"), help_entries)}
         </div>
     }
 }

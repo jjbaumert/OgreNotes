@@ -2613,6 +2613,7 @@ html, body {
 .at-menu {
   position: fixed;
   width: 280px;
+  max-width: calc(100vw - 16px);
   max-height: 300px;
   background: var(--color-bg);
   border: 1px solid var(--color-border);
@@ -3038,6 +3039,7 @@ html, body {
  * on opposite sides (title left, action right) with hover feedback. */
 .template-picker-dialog {
   width: 480px;
+  max-width: calc(100vw - 16px);
 }
 .template-picker-body {
   padding: var(--space-xs) 0;
@@ -4743,7 +4745,9 @@ tr:hover .folder-row-actions,
  * for the overlay so backdrop click + Escape behavior match the
  * rest of the app's dialogs. */
 .calendar-modal {
-  min-width: 380px;
+  /* min() keeps the modal on-screen on narrow phones (a hard 380px
+     min-width beat the 92vw max-width on a 375px viewport). */
+  min-width: min(380px, calc(100vw - 16px));
   max-width: 92vw;
   background: var(--color-bg, white);
   border: 1px solid var(--color-border);
