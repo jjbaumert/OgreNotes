@@ -266,7 +266,7 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
             for d in &e.descr {
                 widest = widest.max(measure::text_size(d).0);
             }
-            let w = (widest + 28.0).max(120.0).min(240.0);
+            let w = (widest + 28.0).clamp(120.0, 240.0);
             let head = if e.shape == Shape::Person { 14.0 } else { 0.0 };
             let h = (2 + e.descr.len()) as f64 * LINE_H + 20.0 + head;
             sizes.push((w, h));

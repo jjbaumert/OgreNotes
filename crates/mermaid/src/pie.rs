@@ -93,9 +93,12 @@ pub(crate) fn parse(source: &str) -> Result<Pie, ParseError> {
     Ok(Pie { title, show_data, slices })
 }
 
+// Pastel categorical palette approximating Mermaid's default pie sections, so
+// dark slice/percentage labels stay readable on top (Mermaid slices are pale
+// with dark text, not saturated fills).
 const PALETTE: &[&str] = &[
-    "#2D5F2D", "#5C3D2E", "#4A90D9", "#D9534F",
-    "#F0AD4E", "#5CB85C", "#9B59B6", "#E67E22",
+    "#ECECFF", "#FFFFDE", "#FCC5C5", "#C6E5D9", "#C7CEEA",
+    "#FFE0B3", "#D9C2F0", "#B5E3D8", "#F5C6D6", "#D6E5A3",
 ];
 const W: f64 = 420.0;
 const H: f64 = 300.0;
@@ -140,6 +143,8 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
     for (i, (label, value)) in pie.slices.iter().enumerate() {
         let frac = if shown(*value) && shown_total > 0.0 { value / shown_total } else { 0.0 };
         let fill = PALETTE[i % PALETTE.len()];
+        // Percentage of the whole (Mermaid labels every wedge with its share).
+        let pct = if total > 0.0 { (value / total * 100.0).round() as i64 } else { 0 };
         if frac >= 1.0 {
             // A full-sweep arc's start/end points coincide (especially
             // after `{:.2}` rounding), so the `A` command degenerates to
@@ -147,6 +152,7 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
             svg.push_str(&format!(
                 r#"<circle cx="{CX}" cy="{CY}" r="{R}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1"/>"#
             ));
+            svg.push_str(&slice_label(CX, CY, pct));
         } else if frac > 0.0 {
             let sweep = frac * std::f64::consts::TAU;
             let (x0, y0) = (CX + R * angle.cos(), CY + R * angle.sin());
@@ -156,6 +162,10 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
             svg.push_str(&format!(
                 r#"<path d="M {CX} {CY} L {x0:.2} {y0:.2} A {R} {R} 0 {large_arc} 1 {x1:.2} {y1:.2} Z" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1"/>"#
             ));
+            // Label at the wedge centroid (mid-angle, ~0.6 of the radius).
+            let mid = angle + sweep / 2.0;
+            let (lx, ly) = (CX + 0.6 * R * mid.cos(), CY + 0.6 * R * mid.sin());
+            svg.push_str(&slice_label(lx, ly, pct));
             angle = end;
         }
 
@@ -178,6 +188,13 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
 
     svg.push_str("</svg>");
     svg
+}
+
+/// A centered percentage label for a wedge, in the theme text color.
+fn slice_label(x: f64, y: f64, pct: i64) -> String {
+    format!(
+        r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" dominant-baseline="middle" fill="currentColor" style="font-size:13px">{pct}%</text>"#
+    )
 }
 
 /// Format a value without a trailing `.0` for whole numbers.
@@ -254,6 +271,24 @@ mod tests {
         assert_eq!(svg.matches("<path").count(), 3, "one wedge per slice");
         // theme-aware text
         assert!(svg.contains("currentColor"));
+    }
+
+    #[test]
+    fn wedges_get_percentage_labels() {
+        // Three slices of the total 4 → 25% / 25% / 50%. Every drawn wedge
+        // carries a percentage label (Mermaid parity).
+        let p = parse("pie\n\"A\" : 1\n\"B\" : 1\n\"C\" : 2").unwrap();
+        let svg = render_svg(&p);
+        assert!(svg.contains(">25%<"), "quarter slices labeled 25%: {svg}");
+        assert!(svg.contains(">50%<"), "half slice labeled 50%: {svg}");
+        assert_eq!(svg.matches('%').count(), 3, "one percentage label per drawn wedge");
+    }
+
+    #[test]
+    fn full_disc_slice_gets_100_percent_label() {
+        let p = parse("pie\n\"A\" : 5").unwrap();
+        let svg = render_svg(&p);
+        assert!(svg.contains(">100%<"), "single slice labeled 100%: {svg}");
     }
 
     #[test]
@@ -438,18 +473,21 @@ mod tests {
 
     #[test]
     fn more_slices_than_palette_entries_render_with_cycled_fills() {
+        // Use more slices than the palette has entries so cycling wraps.
+        let n = PALETTE.len() + 2;
         let src = std::iter::once("pie".to_string())
-            .chain((0..10).map(|i| format!("\"S{i}\" : 1")))
+            .chain((0..n).map(|i| format!("\"S{i}\" : 1")))
             .collect::<Vec<_>>()
             .join("\n");
         let p = parse(&src).unwrap();
         let svg = render_svg(&p);
-        assert_eq!(svg.matches("<text x=\"320\"").count(), 10, "one legend row per slice");
-        // Slice 8 wraps around to the first palette color.
+        assert_eq!(svg.matches("<text x=\"320\"").count(), n, "one legend row per slice");
+        // Slice `PALETTE.len()` wraps around to the first palette color, so
+        // palette[0] is used by two slices (wedge fill + legend swatch each).
         assert_eq!(
             svg.matches(PALETTE[0]).count(),
             4,
-            "slices 0 and 8 each use palette[0] for wedge fill + legend swatch"
+            "slices 0 and PALETTE.len() each use palette[0] for wedge fill + legend swatch"
         );
     }
 }

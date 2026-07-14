@@ -23,6 +23,22 @@ use crate::state::{StateGraph, StateKind, StateNote};
 /// `flowchart::svg::emit`'s node-label block exactly (multi-line labels
 /// via `measure::lines`, first line offset to vertically center the
 /// block).
+/// Horizontal bow applied to each edge in a parallel/opposing group so they
+/// don't collapse onto one line.
+const PARALLEL_BOW: f64 = 22.0;
+
+/// A vertical-flow edge curve bowed horizontally by `dx` at its midpoint, so
+/// opposing edges between the same node pair separate into two arcs.
+fn bowed_path(points: &[(f64, f64)], dx: f64) -> String {
+    if points.len() < 2 || dx == 0.0 {
+        return crate::curved_path(points, true);
+    }
+    let start = points[0];
+    let end = *points.last().unwrap();
+    let mid = ((start.0 + end.0) / 2.0 + dx, (start.1 + end.1) / 2.0);
+    crate::curved_path(&[start, mid, end], true)
+}
+
 fn emit_label(out: &mut String, label: &str, cx: f64, cy: f64) {
     let lines = measure::lines(label);
     let n_lines = lines.len();
@@ -114,11 +130,30 @@ pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
     }
 
     // 4. edges (+ label mask rects + label texts)
-    for ep in &l.edge_paths {
+    // Group transitions that share the same unordered endpoint pair so
+    // opposing/parallel edges (e.g. A-->B and B-->A) bow to opposite sides
+    // instead of overlapping into one double-headed line.
+    let mut parallel: std::collections::HashMap<(usize, usize), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, ep) in l.edge_paths.iter().enumerate() {
+        let t = &g.transitions[ep.edge];
+        if t.from != t.to {
+            parallel.entry((t.from.min(t.to), t.from.max(t.to))).or_default().push(i);
+        }
+    }
+    for (i, ep) in l.edge_paths.iter().enumerate() {
         let t = &g.transitions[ep.edge];
         // Boxgraph diagrams lay out top-to-bottom, so edges curve along
         // the vertical flow axis.
-        let d = crate::curved_path(&ep.points, true);
+        let d = match parallel.get(&(t.from.min(t.to), t.from.max(t.to))) {
+            Some(grp) if grp.len() > 1 => {
+                let pos = grp.iter().position(|&x| x == i).unwrap_or(0);
+                // Symmetric horizontal spread: e.g. a pair bows to ±PARALLEL_BOW.
+                let off = (pos as f64 - (grp.len() as f64 - 1.0) / 2.0) * PARALLEL_BOW;
+                bowed_path(&ep.points, off)
+            }
+            _ => crate::curved_path(&ep.points, true),
+        };
         let mut attrs = String::from(r#"stroke="currentColor" fill="none" marker-end="url(#mmd-arrow)""#);
         if let Some(style) = &t.style {
             attrs.push_str(&format!(r#" style="{}""#, escape_xml(style)));
@@ -247,6 +282,24 @@ mod tests {
         assert!(svg.contains("mmd-arrow"));
         // start = filled circle, end = ring (2+ circles total)
         assert!(svg.matches("<circle").count() >= 3);
+    }
+
+    #[test]
+    fn opposing_transitions_bow_to_separate_arcs() {
+        // A-->B and B-->A must render as two DISTINCT curved paths (bowed to
+        // opposite sides), not one overlapping double-headed line.
+        let svg = render_state("stateDiagram-v2\nA --> B\nB --> A").unwrap();
+        let paths: Vec<&str> = svg.matches("<path d=\"").collect();
+        assert!(paths.len() >= 2, "expected two edge paths: {svg}");
+        // Extract the two edge `d` attributes and confirm they differ.
+        let ds: Vec<&str> = svg
+            .split("<path d=\"")
+            .skip(1)
+            .map(|s| s.split('"').next().unwrap_or(""))
+            .filter(|d| d.contains('C') || d.contains('L')) // edge curves, not marker defs
+            .collect();
+        assert!(ds.len() >= 2, "two edge curves: {ds:?}");
+        assert_ne!(ds[0], ds[1], "opposing edges must not share the same geometry");
     }
 
     #[test]
