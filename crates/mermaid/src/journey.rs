@@ -13,9 +13,42 @@ const PAD: f64 = 20.0;
 const COL_W: f64 = 120.0;
 const SECTION_H: f64 = 28.0;
 const PLOT_H: f64 = 200.0;
-const DOT_R: f64 = 9.0;
+const DOT_R: f64 = 13.0;
 const MAX_TASKS: usize = 400;
 const MAX_SCORE: f64 = 5.0;
+
+/// Per-actor colors, cycled (Mermaid colors journey points by actor).
+const PALETTE: &[&str] =
+    &["#3b82f6", "#ef4444", "#22c55e", "#a855f7", "#f59e0b", "#14b8a6", "#ec4899", "#64748b"];
+
+/// A satisfaction face inside a score dot: eyes + a mouth that smiles (score
+/// 4-5), stays flat (3), or frowns (0-2), like Mermaid's journey emoji.
+fn face(cx: f64, cy: f64, r: f64, score: u8) -> String {
+    let eye_dx = r * 0.32;
+    let eye_dy = r * 0.22;
+    let eye_r = r * 0.11;
+    let mut s = format!(
+        r#"<circle cx="{:.1}" cy="{:.1}" r="{eye_r:.1}" fill="currentColor"/><circle cx="{:.1}" cy="{:.1}" r="{eye_r:.1}" fill="currentColor"/>"#,
+        cx - eye_dx, cy - eye_dy, cx + eye_dx, cy - eye_dy,
+    );
+    let mw = r * 0.45;
+    let my = cy + r * 0.28;
+    let mouth = if score >= 4 {
+        // smile: control point below the endpoints
+        format!(r#"<path d="M {:.1} {:.1} Q {cx:.1} {:.1} {:.1} {:.1}" fill="none" stroke="currentColor" stroke-width="1.3"/>"#,
+            cx - mw, my - r * 0.12, my + r * 0.28, cx + mw, my - r * 0.12)
+    } else if score <= 2 {
+        // frown: control point above the endpoints
+        format!(r#"<path d="M {:.1} {:.1} Q {cx:.1} {:.1} {:.1} {:.1}" fill="none" stroke="currentColor" stroke-width="1.3"/>"#,
+            cx - mw, my + r * 0.18, my - r * 0.22, cx + mw, my + r * 0.18)
+    } else {
+        // neutral: a flat line
+        format!(r#"<line x1="{:.1}" y1="{my:.1}" x2="{:.1}" y2="{my:.1}" stroke="currentColor" stroke-width="1.3"/>"#,
+            cx - mw, cx + mw)
+    };
+    s.push_str(&mouth);
+    s
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Task {
@@ -103,6 +136,18 @@ fn err(message: impl Into<String>, line: usize) -> ParseError {
 pub(crate) fn render_svg(j: &Journey) -> String {
     let n = j.tasks.len();
     let total_w = (2.0 * PAD + n.max(1) as f64 * COL_W).max(2.0 * PAD + COL_W);
+    // Unique actors in first-seen order, each mapped to a palette color.
+    let mut actors: Vec<String> = Vec::new();
+    for t in &j.tasks {
+        for a in &t.actors {
+            if !actors.contains(a) {
+                actors.push(a.clone());
+            }
+        }
+    }
+    let actor_color = |name: &str| -> &'static str {
+        actors.iter().position(|a| a == name).map(|i| PALETTE[i % PALETTE.len()]).unwrap_or("#888")
+    };
     let center = |i: usize| PAD + i as f64 * COL_W + COL_W / 2.0;
     // score → y (5 at top of the plot, 0 at the bottom).
     let plot_top_ref = |plot_top: f64, score: u8| plot_top + (1.0 - score as f64 / MAX_SCORE) * PLOT_H;
@@ -167,31 +212,47 @@ pub(crate) fn render_svg(j: &Journey) -> String {
     for (i, t) in j.tasks.iter().enumerate() {
         let cx = center(i);
         let cy = plot_top_ref(plot_top, t.score);
+        // Dot border tinted by the task's first actor; a satisfaction face
+        // inside replaces the bare score number.
+        let stroke = t.actors.first().map(|a| actor_color(a)).unwrap_or("#888");
         body.push_str(&format!(
-            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{DOT_R}" fill="var(--mermaid-node-fill, #ececff)" stroke="currentColor"/>"#
+            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{DOT_R}" fill="var(--mermaid-node-fill, #ececff)" stroke="{stroke}" stroke-width="2"/>"#
         ));
-        // score inside the dot.
-        body.push_str(&format!(
-            r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-size="11" fill="currentColor">{}</text>"#,
-            cy + 4.0,
-            t.score
-        ));
-        // task name below the plot, actors under that.
+        body.push_str(&face(cx, cy, DOT_R, t.score));
+        // task name below the plot, actors (each in its own color) under that.
         let name_y = plot_top + PLOT_H + 22.0;
         body.push_str(&format!(
             r#"<text x="{cx:.1}" y="{name_y:.1}" text-anchor="middle" font-weight="600" fill="currentColor">{}</text>"#,
             escape_xml(&t.name)
         ));
-        if !t.actors.is_empty() {
+        for (k, a) in t.actors.iter().enumerate() {
             body.push_str(&format!(
-                r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-size="12" fill="var(--color-text-secondary, #888)">{}</text>"#,
-                name_y + 18.0,
-                escape_xml(&t.actors.join(", "))
+                r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-size="12" fill="{}">{}</text>"#,
+                name_y + 18.0 + k as f64 * 15.0,
+                actor_color(a),
+                escape_xml(a)
             ));
         }
     }
 
-    let total_h = plot_top + PLOT_H + 22.0 + 18.0 + PAD;
+    // Actor legend along the bottom.
+    let max_actor_rows = j.tasks.iter().map(|t| t.actors.len()).max().unwrap_or(0);
+    let legend_y = plot_top + PLOT_H + 40.0 + max_actor_rows as f64 * 15.0;
+    let mut lx = PAD;
+    for a in &actors {
+        body.push_str(&format!(
+            r#"<rect x="{lx:.1}" y="{:.1}" width="11" height="11" fill="{}"/><text x="{:.1}" y="{:.1}" font-size="12" fill="currentColor">{}</text>"#,
+            legend_y - 10.0,
+            actor_color(a),
+            lx + 16.0,
+            legend_y,
+            escape_xml(a)
+        ));
+        lx += 30.0 + crate::measure::text_size(a).0;
+    }
+
+    let legend_h = if actors.is_empty() { 0.0 } else { 24.0 };
+    let total_h = legend_y + legend_h + PAD;
     let mut out = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total_w:.0} {total_h:.0}" width="{total_w:.0}" height="{total_h:.0}" style="font-family:sans-serif;font-size:14px">"#
     );
@@ -240,6 +301,20 @@ mod tests {
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
         assert!(svg.contains("<polyline")); // the journey curve
         assert!(svg.contains("<circle")); // task dots
-        assert!(svg.contains(">Make tea<") && svg.contains(">Me, Cat<") && svg.contains(">T<"));
+        assert!(svg.contains(">Make tea<") && svg.contains(">T<"));
+        // Actors are now rendered per-actor (colored) + a legend, not joined.
+        assert!(svg.contains(">Me<") && svg.contains(">Cat<"), "per-actor labels: {svg}");
+    }
+
+    #[test]
+    fn scores_render_as_faces_and_actors_are_colored() {
+        let svg = render_svg(
+            &parse("journey\n title T\n Happy: 5: Me\n Sad: 0: Cat").unwrap(),
+        );
+        // A smile (score 5) and a frown (score 0) both draw a mouth <path>;
+        // the neutral case would be a <line>. Faces replace the bare numbers.
+        assert!(svg.matches("<path").count() >= 2, "smile + frown mouths: {svg}");
+        // Each actor gets a distinct palette color (not the old gray #888).
+        assert!(svg.contains(PALETTE[0]) && svg.contains(PALETTE[1]), "actor colors: {svg}");
     }
 }

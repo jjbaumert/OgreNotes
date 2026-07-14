@@ -48,6 +48,27 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
+/// Inverse of `days_from_civil` (Hinnant's `civil_from_days`): a day number
+/// back to `(year, month, day)`.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// A compact `MM-DD` axis label for a day number.
+fn fmt_axis_date(day: f64) -> String {
+    let (_, m, d) = civil_from_days(day.round() as i64);
+    format!("{m:02}-{d:02}")
+}
+
 /// `YYYY-MM-DD` -> day number, or `None` if it isn't a valid such date.
 fn parse_date(s: &str) -> Option<f64> {
     let parts: Vec<&str> = s.split('-').collect();
@@ -244,6 +265,7 @@ const CHART_W: f64 = 620.0;
 const ROW_H: f64 = 28.0;
 const BAR_H: f64 = 18.0;
 const TOP: f64 = 40.0;
+const AXIS_H: f64 = 22.0;
 
 fn status_fill(s: Status) -> &'static str {
     match s {
@@ -262,8 +284,11 @@ pub(crate) fn render_svg(g: &Gantt) -> String {
     let x_of = |day: f64| LEFT + (day - min) * px;
 
     let n = g.tasks.len();
+    // Row grid sits below a date-axis header strip.
+    let top = TOP + AXIS_H;
+    let chart_bottom = top + n as f64 * ROW_H;
     let w = LEFT + CHART_W + 24.0;
-    let h = TOP + n as f64 * ROW_H + 16.0;
+    let h = chart_bottom + 16.0;
     let mut svg = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:12px">"#
     );
@@ -276,6 +301,23 @@ pub(crate) fn render_svg(g: &Gantt) -> String {
         ));
     }
 
+    // Date axis: ~6 evenly spaced day ticks, each a light gridline through the
+    // rows with a compact date label above the grid.
+    let step = (span / 6.0).ceil().max(1.0);
+    let mut day = min;
+    while day <= max + 0.5 {
+        let tx = x_of(day);
+        svg.push_str(&format!(
+            r#"<line x1="{tx:.1}" y1="{top:.1}" x2="{tx:.1}" y2="{chart_bottom:.1}" stroke="currentColor" opacity="0.15"/>"#
+        ));
+        svg.push_str(&format!(
+            r#"<text x="{tx:.1}" y="{:.1}" text-anchor="middle" fill="currentColor" style="font-size:11px" opacity="0.75">{}</text>"#,
+            top - 6.0,
+            fmt_axis_date(day),
+        ));
+        day += step;
+    }
+
     // Section background bands (alternating) + section name at the band's
     // top-left. A band spans the contiguous run of rows in one section.
     let mut row = 0usize;
@@ -285,7 +327,7 @@ pub(crate) fn render_svg(g: &Gantt) -> String {
         while end_row + 1 < n && g.tasks[end_row + 1].section == sec {
             end_row += 1;
         }
-        let band_y = TOP + row as f64 * ROW_H;
+        let band_y = top + row as f64 * ROW_H;
         let band_h = (end_row - row + 1) as f64 * ROW_H;
         if sec % 2 == 1 {
             svg.push_str(&format!(
@@ -308,7 +350,7 @@ pub(crate) fn render_svg(g: &Gantt) -> String {
 
     // Task rows: bar (or milestone diamond) + right-aligned name in the gutter.
     for (i, t) in g.tasks.iter().enumerate() {
-        let y = TOP + i as f64 * ROW_H;
+        let y = top + i as f64 * ROW_H;
         let cy = y + ROW_H / 2.0;
         let bx = x_of(t.start);
         let fill = status_fill(t.status);
@@ -356,6 +398,17 @@ mod tests {
     fn header_required() {
         assert!(parse("A : 2024-01-01, 1d").is_err());
         assert!(parse("gantt\nsection S\nA : 2024-01-01, 1d").is_ok());
+    }
+
+    #[test]
+    fn renders_a_date_axis_with_gridlines() {
+        let svg = render_svg(&p(
+            "gantt\ndateFormat YYYY-MM-DD\nsection S\nA task :a1, 2024-01-01, 30d\nB task :after a1, 20d",
+        ));
+        // The span start is labeled and a vertical gridline is drawn for it.
+        assert!(svg.contains(">01-01<"), "axis start date label: {svg}");
+        assert!(svg.contains("<line"), "axis gridlines drawn: {svg}");
+        assert_eq!(fmt_axis_date(days_from_civil(2024, 2, 15) as f64), "02-15");
     }
 
     #[test]

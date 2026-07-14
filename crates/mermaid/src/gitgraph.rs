@@ -231,6 +231,17 @@ fn lane_color(lane: usize) -> &'static str {
     LANE_COLORS[lane % LANE_COLORS.len()]
 }
 
+/// A deterministic short hash-like id for a commit that wasn't given an
+/// explicit `id:`, mirroring Mermaid's generated commit hashes. Stable across
+/// runs (the crate contract forbids nondeterministic output).
+fn auto_id(seq: usize) -> String {
+    // Cheap integer scramble → 7 hex chars, so ids look hash-like but stable.
+    let mut h = (seq as u64).wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    format!("{:07x}", h & 0xFFF_FFFF)
+}
+
 pub(crate) fn render_svg(g: &GitGraph) -> String {
     let max_seq = g.commits.iter().map(|c| c.seq).max().unwrap_or(0);
     let n_lanes = g.branches.len();
@@ -273,6 +284,8 @@ pub(crate) fn render_svg(g: &GitGraph) -> String {
     for c in &g.commits {
         let (cx, cy) = (x_of(c.seq), y_of(c.lane));
         let color = lane_color(c.lane);
+        // A commit with two+ parents is a merge; Mermaid rings it distinctly.
+        let is_merge = c.parents.len() >= 2;
         match c.ctype {
             CommitType::Highlight => {
                 svg.push_str(&format!(
@@ -300,6 +313,14 @@ pub(crate) fn render_svg(g: &GitGraph) -> String {
                 ));
             }
         }
+        // Merge commits get an outer ring so they read distinctly from a
+        // normal commit on the same lane.
+        if is_merge {
+            svg.push_str(&format!(
+                r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{:.1}" fill="none" stroke="{color}" stroke-width="1.5"/>"#,
+                DOT_R + 3.0
+            ));
+        }
         if let Some(tag) = &c.tag {
             svg.push_str(&format!(
                 r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="currentColor" style="font-weight:600">{}</text>"#,
@@ -307,13 +328,14 @@ pub(crate) fn render_svg(g: &GitGraph) -> String {
                 escape_xml(tag),
             ));
         }
-        if let Some(id) = &c.id {
-            svg.push_str(&format!(
-                r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="currentColor" style="font-size:10px">{}</text>"#,
-                cy + DOT_R + 12.0,
-                escape_xml(id),
-            ));
-        }
+        // Every commit carries an id label below its dot (Mermaid shows a short
+        // generated hash); an explicit `id:` wins, else a deterministic one.
+        let label = c.id.clone().unwrap_or_else(|| auto_id(c.seq));
+        svg.push_str(&format!(
+            r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="currentColor" style="font-size:10px">{}</text>"#,
+            cy + DOT_R + 12.0,
+            escape_xml(&label),
+        ));
     }
 
     svg.push_str("</svg>");
@@ -350,6 +372,18 @@ mod tests {
         assert_eq!(g.commits[2].parents, vec![1]);
         // seqs advance left to right.
         assert_eq!((g.commits[0].seq, g.commits[2].seq), (0, 2));
+    }
+
+    #[test]
+    fn every_commit_gets_an_id_label_and_merges_are_ringed() {
+        // Auto ids: two plain commits render two id labels even without `id:`.
+        let plain = render_svg(&p("gitGraph\ncommit\ncommit"));
+        assert_eq!(plain.matches("font-size:10px").count(), 2, "one auto id per commit");
+        assert_ne!(auto_id(0), auto_id(1), "auto ids differ per commit");
+        // A merge commit gets an extra unfilled ring circle.
+        let merged =
+            render_svg(&p("gitGraph\ncommit\nbranch dev\ncommit\ncheckout main\nmerge dev"));
+        assert!(merged.contains(r#"fill="none""#), "merge commit ringed: {merged}");
     }
 
     #[test]

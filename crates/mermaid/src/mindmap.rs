@@ -158,17 +158,29 @@ pub(crate) fn render_svg(m: &Mindmap) -> String {
     assign_slots(&m.nodes, 0, &mut next, &mut slots);
 
     // Per-node box size from its label; column left edge from its depth.
+    // Circle/double-circle nodes (e.g. `root((mindmap))`) must be sized to
+    // circumscribe their text — a rectangle-sized box would clip the label —
+    // so they use the shape-aware sizing; other shapes keep the row height.
     let sizes: Vec<(f64, f64)> = m
         .nodes
         .iter()
         .map(|node| {
-            let (tw, _) = measure::text_size(&node.label);
-            ((tw + 28.0).max(48.0), NODE_H)
+            let (tw, th) = measure::text_size(&node.label);
+            match node.shape {
+                ShapeKind::Circle | ShapeKind::DoubleCircle => shapes::size_for(node.shape, tw, th),
+                _ => ((tw + 28.0).max(48.0), NODE_H),
+            }
         })
         .collect();
     let col_left = |depth: usize| MARGIN + depth as f64 * X_GAP;
     let cx = |i: usize| col_left(m.nodes[i].depth) + sizes[i].0 / 2.0;
-    let cy = |i: usize| MARGIN + NODE_H / 2.0 + slots[i] * Y_GAP;
+    let cy_raw = |i: usize| MARGIN + NODE_H / 2.0 + slots[i] * Y_GAP;
+
+    // A node taller than the row height (a big root circle) can reach above the
+    // top margin; shift everything down so the highest node clears the margin.
+    let y_top = (0..n).map(|i| cy_raw(i) - sizes[i].1 / 2.0).fold(f64::INFINITY, f64::min);
+    let y_shift = (MARGIN - y_top).max(0.0);
+    let cy = |i: usize| cy_raw(i) + y_shift;
 
     // Canvas width = the furthest right edge over ALL nodes (a wide label
     // on a shallow node can reach past the deepest column), plus a margin.
@@ -176,7 +188,9 @@ pub(crate) fn render_svg(m: &Mindmap) -> String {
         .map(|i| col_left(m.nodes[i].depth) + sizes[i].0)
         .fold(0.0_f64, f64::max)
         + MARGIN;
-    let h = MARGIN + NODE_H + next.max(1.0) * Y_GAP;
+    // Height from the lowest node extent (tall circles included), not just rows.
+    let h = (0..n).map(|i| cy(i) + sizes[i].1 / 2.0).fold(0.0_f64, f64::max) + MARGIN;
+    let _ = next; // row count no longer bounds the height directly
 
     let mut svg = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:13px">"#
@@ -250,6 +264,24 @@ mod tests {
         let tools = g.nodes[0].children[2];
         assert_eq!(g.nodes[tools].label, "Tools");
         assert_eq!(g.nodes[tools].children.len(), 2);
+    }
+
+    #[test]
+    fn root_circle_is_sized_to_fit_its_label() {
+        // Regression: a `((wide label))` root used to render in a tiny circle
+        // whose radius came from the fixed row height, so the text overflowed.
+        // The circle must now circumscribe the label.
+        let svg = render_svg(&p("mindmap\n  root((Understanding))\n    A\n    B"));
+        let label_w = measure::text_size("Understanding").0;
+        // Pull the first <circle r="..."> radius out of the SVG.
+        let r: f64 = svg
+            .split(r#"<circle"#)
+            .nth(1)
+            .and_then(|s| s.split(r#"r="#).nth(1))
+            .and_then(|s| s.trim_start_matches('"').split('"').next())
+            .and_then(|s| s.parse().ok())
+            .expect("a circle with a radius");
+        assert!(2.0 * r >= label_w, "circle diameter {} must cover label width {label_w}", 2.0 * r);
     }
 
     #[test]
