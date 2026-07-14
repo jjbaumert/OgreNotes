@@ -38,6 +38,9 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
 TABLE_NAME="${PREFIX}ogrenote"
 BUCKET_NAME="${PREFIX}ogrenote"
+# Log-group ARN prefix. The stack's app groups are deterministically named
+# /ecs/${PREFIX}ogrenote-{api,worker} (#50); the policy below grants
+# ${LOG_GROUP}* so it covers all of them (and their log streams).
 LOG_GROUP="/ecs/${PREFIX}ogrenote"
 CLUSTER_NAME="${PREFIX}ogrenote"
 SERVICE_NAME="${PREFIX}ogrenote-api"
@@ -127,8 +130,8 @@ POLICY_DOC=$(cat <<POLICY
                 "logs:StartLiveTail"
             ],
             "Resource": [
-                "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${LOG_GROUP}",
-                "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${LOG_GROUP}:*"
+                "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${LOG_GROUP}*",
+                "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${LOG_GROUP}*:*"
             ]
         },
         {
@@ -295,7 +298,7 @@ echo ""
 echo "  Profile:     ${PROFILE_NAME}"
 echo "  IAM user:    ${IAM_USER}"
 echo "  Scope:       table=${TABLE_NAME}, bucket=${BUCKET_NAME},"
-echo "               log-group=${LOG_GROUP},"
+echo "               log-group=${LOG_GROUP}*,"
 echo "               ecs=${CLUSTER_NAME}/${SERVICE_NAME}"
 echo ""
 echo "  The aws-diagnostic subagent will export AWS_PROFILE=${PROFILE_NAME}"
