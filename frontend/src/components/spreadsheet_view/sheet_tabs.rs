@@ -13,12 +13,15 @@
 //! `&'static Mutex`, and `persist` is a `Copy` closure built by
 //! `SpreadsheetView`).
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Mutex;
 
 use leptos::prelude::*;
 
 use crate::components::menu::{ContextMenu, MenuEntry};
 use crate::spreadsheet::eval::SpreadsheetEngine;
+use crate::touch::{LONG_PRESS_MS, LongPressTracker, TOUCH_MOVE_THRESHOLD_PX, first_touch_xy};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_sheet_tab_bar(
@@ -33,10 +36,27 @@ pub(super) fn render_sheet_tab_bar(
     delete_sheet: impl Fn(usize) + Copy + Send + Sync + 'static,
 ) -> impl IntoView {
     // Local context-menu state. `Some((idx, x, y))` shows the menu at
-    // (x, y) for sheet `idx`; `None` hides it. Right-click on a tab
-    // sets it; the shared menu chrome clears it on item click,
-    // backdrop click, or Escape.
+    // (x, y) for sheet `idx`; `None` hides it. Right-click or a
+    // long-press on a tab sets it; the shared menu chrome clears it on
+    // item click, backdrop click, or Escape.
     let (tab_menu, set_tab_menu) = signal::<Option<(usize, f64, f64)>>(None);
+
+    // Long-press on a tab opens the same menu — Delete has no other
+    // touch-reachable path (dblclick covers Rename). One tracker is
+    // shared across tabs; each tab's touchstart records which tab and
+    // where, and the tracker's timer callback reads it back. Both are
+    // `!Send` (Rc), so they live in LocalStorage stores and the view
+    // closures capture only the `Copy + Send` handles.
+    let pending_tab: StoredValue<Rc<RefCell<Option<(usize, f64, f64)>>>, LocalStorage> =
+        StoredValue::new_local(Rc::new(RefCell::new(None)));
+    let tab_tracker: StoredValue<Rc<LongPressTracker>, LocalStorage> = StoredValue::new_local(
+        LongPressTracker::new(LONG_PRESS_MS, TOUCH_MOVE_THRESHOLD_PX, move || {
+            let target = pending_tab.with_value(|p| *p.borrow());
+            if let Some((i, x, y)) = target {
+                set_tab_menu.set(Some((i, x, y)));
+            }
+        }),
+    );
 
     let rename_sheet = move |idx: usize| {
         if let Some(window) = web_sys::window() {
@@ -102,6 +122,17 @@ pub(super) fn render_sheet_tab_bar(
                                 set_tab_menu.set(Some((i, e.client_x() as f64, e.client_y() as f64)));
                             }
                             on:dblclick=move |_| rename_sheet(i)
+                            on:touchstart=move |ev: web_sys::TouchEvent| {
+                                if let Some((x, y)) = first_touch_xy(&ev) {
+                                    pending_tab.with_value(|p| *p.borrow_mut() = Some((i, x, y)));
+                                }
+                                tab_tracker.with_value(|t| t.on_start(&ev));
+                            }
+                            on:touchmove=move |ev: web_sys::TouchEvent| {
+                                tab_tracker.with_value(|t| t.on_move(&ev));
+                            }
+                            on:touchend=move |_| tab_tracker.with_value(|t| t.on_end())
+                            on:touchcancel=move |_| tab_tracker.with_value(|t| t.on_end())
                         >{name_display}</button>
                     }
                 }).collect::<Vec<_>>()

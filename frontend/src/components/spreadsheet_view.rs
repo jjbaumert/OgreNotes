@@ -4860,6 +4860,35 @@ pub fn SpreadsheetView(
                 }.into_any()
             }}
 
+            // Touch devices: a persistent floating `⋮` opens the cell
+            // context menu for the active cell/selection. Long-press is
+            // taken by range-selection anchoring and the contextmenu
+            // event is suppressed during touch, so without this button
+            // the menu's actions (insert/delete rows, freeze, hide,
+            // validation, named ranges, …) are unreachable on touch.
+            {is_touch_primary().then(|| view! {
+                <button
+                    class="ss-touch-menu-btn"
+                    aria-haspopup="menu"
+                    aria-label=crate::t!("ss-touch-menu-aria")
+                    on:click=move |e: web_sys::MouseEvent| {
+                        e.stop_propagation();
+                        let (bx, by) = e
+                            .current_target()
+                            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                            .map(|el| {
+                                let r = el.get_bounding_client_rect();
+                                (r.left(), r.top())
+                            })
+                            .unwrap_or((e.client_x() as f64, e.client_y() as f64));
+                        let (mx, my) = clamp_menu_position(bx, by);
+                        set_ctx_menu_x.set(mx);
+                        set_ctx_menu_y.set(my);
+                        set_ctx_menu_visible.set(true);
+                    }
+                >"\u{22EE}"</button>
+            })}
+
             // ─── Context Menu ──────────────────────────────
             {render_context_menu(ContextMenuDeps {
                 engine,

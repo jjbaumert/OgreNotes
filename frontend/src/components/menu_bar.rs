@@ -51,6 +51,55 @@ pub enum DocAction {
 /// between open menus (the shared primitive's `on_switch` hook).
 const MENU_ORDER: [&str; 5] = ["document", "edit", "view", "insert", "format"];
 
+/// The Document menu's entries. Shared between the desktop menu bar
+/// and the mobile `⋯` document-actions button in the doc header
+/// (`pages/document.rs`) — the menu bar is hidden at the phone
+/// breakpoint, and this is where its document-level actions surface
+/// instead.
+pub fn document_menu_entries(
+    on_doc_action: Callback<DocAction>,
+    is_template: ReadSignal<bool>,
+) -> Vec<MenuEntry> {
+    let doc = move |label: String, action: DocAction| {
+        MenuEntry::action(label, move || on_doc_action.run(action.clone()))
+    };
+    vec![
+        doc(crate::t!("menubar-doc-new"), DocAction::NewDocument),
+        MenuEntry::Separator,
+        doc(crate::t!("menubar-doc-share"), DocAction::Share),
+        doc(crate::t!("menubar-doc-copy-link"), DocAction::CopyLink),
+        doc(crate::t!("menubar-doc-move-folder"), DocAction::MoveToFolder),
+        MenuEntry::Separator,
+        doc(crate::t!("menubar-doc-duplicate"), DocAction::DuplicateDocument),
+        // #142: Mark / Unmark template — single item whose label
+        // flips with the current is_template state.
+        if is_template.get() {
+            doc(crate::t!("menubar-unmark-template"), DocAction::UnmarkTemplate)
+        } else {
+            doc(crate::t!("menubar-mark-template"), DocAction::MarkAsTemplate)
+        },
+        doc(crate::t!("menubar-doc-new-template"), DocAction::NewFromTemplate),
+        MenuEntry::submenu(
+            crate::t!("menubar-doc-export"),
+            vec![
+                doc(crate::t!("menubar-doc-export-html"), DocAction::ExportHtml),
+                doc(crate::t!("menubar-doc-export-markdown"), DocAction::ExportMarkdown),
+                doc(crate::t!("menubar-doc-export-csv"), DocAction::ExportCsv),
+                doc(crate::t!("menubar-doc-export-excel"), DocAction::ExportXlsx),
+            ],
+        ),
+        MenuEntry::Separator,
+        doc(crate::t!("menubar-doc-print"), DocAction::Print).with_shortcut("Ctrl+P"),
+        MenuEntry::Separator,
+        doc(crate::t!("menubar-doc-history"), DocAction::DocumentHistory)
+            .with_shortcut("Ctrl+Shift+H"),
+        doc(crate::t!("menubar-doc-details"), DocAction::DocumentDetails),
+        MenuEntry::Separator,
+        doc(crate::t!("menubar-doc-rename"), DocAction::RenameDocument),
+        doc(crate::t!("menubar-doc-delete"), DocAction::DeleteDocument),
+    ]
+}
+
 /// Classic menu bar (Document | Edit | View | Insert | Format).
 ///
 /// Dropdown chrome (backdrop, Escape, keyboard navigation, real
@@ -151,43 +200,8 @@ pub fn MenuBar(
         MenuEntry::action(label, move || on_command.run(command.clone()))
     };
 
-    let document_entries = Callback::new(move |()| {
-        vec![
-            doc(crate::t!("menubar-doc-new"), DocAction::NewDocument),
-            MenuEntry::Separator,
-            doc(crate::t!("menubar-doc-share"), DocAction::Share),
-            doc(crate::t!("menubar-doc-copy-link"), DocAction::CopyLink),
-            doc(crate::t!("menubar-doc-move-folder"), DocAction::MoveToFolder),
-            MenuEntry::Separator,
-            doc(crate::t!("menubar-doc-duplicate"), DocAction::DuplicateDocument),
-            // #142: Mark / Unmark template — single item whose label
-            // flips with the current is_template state.
-            if is_template.get() {
-                doc(crate::t!("menubar-unmark-template"), DocAction::UnmarkTemplate)
-            } else {
-                doc(crate::t!("menubar-mark-template"), DocAction::MarkAsTemplate)
-            },
-            doc(crate::t!("menubar-doc-new-template"), DocAction::NewFromTemplate),
-            MenuEntry::submenu(
-                crate::t!("menubar-doc-export"),
-                vec![
-                    doc(crate::t!("menubar-doc-export-html"), DocAction::ExportHtml),
-                    doc(crate::t!("menubar-doc-export-markdown"), DocAction::ExportMarkdown),
-                    doc(crate::t!("menubar-doc-export-csv"), DocAction::ExportCsv),
-                    doc(crate::t!("menubar-doc-export-excel"), DocAction::ExportXlsx),
-                ],
-            ),
-            MenuEntry::Separator,
-            doc(crate::t!("menubar-doc-print"), DocAction::Print).with_shortcut("Ctrl+P"),
-            MenuEntry::Separator,
-            doc(crate::t!("menubar-doc-history"), DocAction::DocumentHistory)
-                .with_shortcut("Ctrl+Shift+H"),
-            doc(crate::t!("menubar-doc-details"), DocAction::DocumentDetails),
-            MenuEntry::Separator,
-            doc(crate::t!("menubar-doc-rename"), DocAction::RenameDocument),
-            doc(crate::t!("menubar-doc-delete"), DocAction::DeleteDocument),
-        ]
-    });
+    let document_entries =
+        Callback::new(move |()| document_menu_entries(on_doc_action, is_template));
 
     let edit_entries = Callback::new(move |()| {
         vec![

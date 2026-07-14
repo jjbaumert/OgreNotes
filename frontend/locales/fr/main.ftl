@@ -457,6 +457,7 @@ ss-status-max = Max : { $value }
 
 # Sheet tabs
 ss-rename-sheet-prompt = Renommer la feuille :
+ss-touch-menu-aria = Actions de cellule
 ss-ctx-rename = Renommer
 ss-ctx-delete = Supprimer
 

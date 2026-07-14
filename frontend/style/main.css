@@ -426,6 +426,25 @@ html, body {
   inset-inline-start: auto;
   inset-inline-end: 100%;
 }
+/* Touch devices: rows grow to comfortable tap targets (the desktop
+   28px rows are too dense for fingers). */
+@media (hover: none) {
+  .ui-menu-item {
+    padding: 11px 14px;
+  }
+}
+
+/* Phone-only `⋯` document-actions button in the doc header — the menu
+   bar is hidden at the ≤640px breakpoint (responsive.css) and its
+   document-level actions surface here instead. */
+.mobile-doc-actions {
+  display: none;
+  position: relative;
+}
+.mobile-doc-menu {
+  inset-inline-start: auto;
+  inset-inline-end: 0;
+}
 
 /* Toolbar */
 /* Menu bar (Document | Edit | View | Insert | Format) */

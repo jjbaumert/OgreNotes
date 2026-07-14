@@ -24,7 +24,8 @@ use crate::components::cursor_overlay::CursorOverlay;
 use crate::components::document_details::DocumentDetailsDialog;
 use crate::components::editor_gutter::EditorGutterOverlay;
 use crate::components::history_viewer::HistoryViewer;
-use crate::components::menu_bar::{DocAction, MenuBar};
+use crate::components::menu::AnchoredMenu;
+use crate::components::menu_bar::{DocAction, MenuBar, document_menu_entries};
 use crate::components::document_outline::DocumentOutline;
 use crate::components::editor_component::{EditorComponent, EditorProps};
 use crate::components::notification_bell::NotificationBell;
@@ -293,6 +294,9 @@ pub fn DocumentPage() -> impl IntoView {
     // #146: folder picker for "Move to Folder" (distinct from the trash
     // restore picker above).
     let (move_picker_visible, set_move_picker_visible) = signal(false);
+    // Phone-only `⋯` document-actions menu in the header (the menu bar
+    // is hidden at the ≤640px breakpoint).
+    let mobile_doc_menu_open = RwSignal::new(false);
     // #149: multi-folder membership — the folders this doc is in (loaded from
     // GET /documents/:id/folders) and the picker for adding another.
     let doc_folders: RwSignal<Vec<documents::DocFolder>> = RwSignal::new(Vec::new());
@@ -2920,6 +2924,29 @@ pub fn DocumentPage() -> impl IntoView {
                             aria-label=crate::t!("document-share-tooltip")
                             on:click=move |_| set_share_visible.set(true)
                         >"\u{1F4E4}"</button>
+                        // Phone breakpoint: the menu bar is hidden ≤640px
+                        // (responsive.css), so its document-level actions
+                        // surface here instead — a `⋯` button opening the
+                        // same Document menu. Formatting is already covered
+                        // on mobile by the bottom toolbar + overflow panel.
+                        <div class="mobile-doc-actions">
+                            <button
+                                class="toolbar-btn"
+                                aria-haspopup="menu"
+                                aria-label=crate::t!("sidebar-doc-actions-aria")
+                                aria-expanded=move || mobile_doc_menu_open.get().to_string()
+                                on:click=move |_| mobile_doc_menu_open.update(|o| *o = !*o)
+                            >"\u{22EF}"</button>
+                            <AnchoredMenu
+                                open=mobile_doc_menu_open
+                                entries=Callback::new(move |()| document_menu_entries(
+                                    on_doc_action,
+                                    is_template,
+                                ))
+                                on_close=Callback::new(move |()| mobile_doc_menu_open.set(false))
+                                class="mobile-doc-menu"
+                            />
+                        </div>
                     </div>
                 </div>
 

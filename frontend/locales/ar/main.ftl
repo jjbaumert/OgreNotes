@@ -462,6 +462,7 @@ ss-status-max = الأعلى: { $value }
 
 # Sheet tabs
 ss-rename-sheet-prompt = إعادة تسمية الورقة:
+ss-touch-menu-aria = إجراءات الخلية
 ss-ctx-rename = إعادة تسمية
 ss-ctx-delete = حذف
 
