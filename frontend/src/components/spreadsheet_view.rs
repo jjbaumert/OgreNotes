@@ -1059,10 +1059,10 @@ pub(super) fn parse_ss_block_id(s: &str) -> Option<(String, usize, usize)> {
 /// Clamp a context-menu's preferred (left, top) so the menu stays
 /// inside the viewport. Uses conservative menu-size estimates and
 /// flips the menu up / left when the natural placement would push
-/// it past the right or bottom edge. The CSS `.ss-ctx-menu` also
-/// caps `max-height` with `overflow-y: auto`, so a menu that's
-/// taller than the viewport stays scrollable in addition to being
-/// re-anchored upward.
+/// it past the right or bottom edge. The shared menu chrome
+/// (`components::menu`) clamps again from its own size estimate, so
+/// this trigger-side clamp is a harmless first pass that keeps the
+/// stored (x, y) sane for anything else that reads it.
 pub(super) fn clamp_menu_position(x: f64, y: f64) -> (f64, f64) {
     let window = web_sys::window();
     let vw = window.as_ref()

@@ -151,6 +151,18 @@ fn entry_at<'a>(
     panel.get(active?)
 }
 
+/// Run an item's action and close the menu — deferred by one task so
+/// the `<Show>` teardown never happens while the clicked button's own
+/// event dispatch is still on the stack (the "closure invoked
+/// recursively or after being dropped" panic class; see
+/// `a11y::defer`).
+fn activate_and_close(on_activate: Callback<()>, on_close: Callback<()>) {
+    crate::a11y::defer(move || {
+        on_activate.run(());
+        on_close.run(());
+    });
+}
+
 /// The submenu-enter arrow is logical: it points *into* the fly-out,
 /// which opens on the inline-end side (left in RTL).
 fn is_rtl() -> bool {
@@ -183,7 +195,7 @@ fn handle_menu_key(
     let st = state.get_untracked();
     let mut handled = true;
     match key.as_str() {
-        "Escape" => on_close.run(()),
+        "Escape" => crate::a11y::defer_close(on_close),
         "ArrowDown" => state.set(core::nav_move(&shape, &st, 1)),
         "ArrowUp" => state.set(core::nav_move(&shape, &st, -1)),
         "Home" => state.set(core::nav_home(&shape, &st)),
@@ -191,9 +203,7 @@ fn handle_menu_key(
         "Enter" | " " => match entry_at(&entries, &st.path, st.active) {
             Some(MenuEntry::Action { disabled: false, on_activate, .. })
             | Some(MenuEntry::Toggle { on_activate, .. }) => {
-                let on_activate = *on_activate;
-                on_activate.run(());
-                on_close.run(());
+                activate_and_close(*on_activate, on_close);
             }
             Some(MenuEntry::Submenu { .. }) => state.set(core::nav_enter_submenu(&shape, &st)),
             _ => handled = false,
@@ -233,21 +243,23 @@ fn handle_menu_key(
 /// cleanup. The `web_sys::Closure` is `!Send`, so it lives in a
 /// `LocalStorage` store — the Effect itself only captures `Send`
 /// handles.
+type KeydownClosure = Closure<dyn Fn(web_sys::Event)>;
+
 fn install_menu_keys(
     enabled: Signal<bool>,
     handler: impl Fn(&web_sys::KeyboardEvent) + Clone + Send + Sync + 'static,
 ) {
-    let registered: StoredValue<Option<Closure<dyn Fn(web_sys::Event)>>, LocalStorage> =
+    let registered: StoredValue<Option<KeydownClosure>, LocalStorage> =
         StoredValue::new_local(None);
     let remove = move || {
-        if let Some(closure) = registered.try_update_value(|r| r.take()).flatten() {
-            if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                let _ = doc.remove_event_listener_with_callback_and_bool(
-                    "keydown",
-                    closure.as_ref().unchecked_ref(),
-                    true,
-                );
-            }
+        if let Some(closure) = registered.try_update_value(|r| r.take()).flatten()
+            && let Some(doc) = web_sys::window().and_then(|w| w.document())
+        {
+            let _ = doc.remove_event_listener_with_callback_and_bool(
+                "keydown",
+                closure.as_ref().unchecked_ref(),
+                true,
+            );
         }
     };
     Effect::new(move |_| {
@@ -305,8 +317,7 @@ fn render_panel(
                         })
                         on:click=move |_| {
                             if !disabled {
-                                on_activate.run(());
-                                on_close.run(());
+                                activate_and_close(on_activate, on_close);
                             }
                         }
                     >
@@ -328,10 +339,7 @@ fn render_panel(
                             s.path.truncate(depth);
                             s.active = Some(i);
                         })
-                        on:click=move |_| {
-                            on_activate.run(());
-                            on_close.run(());
-                        }
+                        on:click=move |_| activate_and_close(on_activate, on_close)
                     >
                         <span class="ui-menu-check">
                             {move || if checked.get() { "\u{2713}" } else { "" }}
@@ -358,20 +366,19 @@ fn render_panel(
                                 s.path.push(i);
                                 s.active = None;
                             })
-                            // Click toggles the fly-out — the path by
-                            // which touch (no hover) and mouse users
-                            // who click-first reach submenus.
+                            // Click OPENS the fly-out (idempotent, never
+                            // toggles shut): pointer clicks arrive right
+                            // after our own mouseenter already opened it,
+                            // and touch taps fire a synthetic mouseenter
+                            // first too — a toggle here would snap the
+                            // fly-out closed on the very gesture meant to
+                            // open it. Closing is Escape / ArrowLeft /
+                            // hovering a sibling / the backdrop.
                             on:click=move |e: web_sys::MouseEvent| {
                                 e.stop_propagation();
                                 state.update(|s| {
-                                    if s.path.get(depth) == Some(&i) {
-                                        s.path.truncate(depth);
-                                        s.active = Some(i);
-                                    } else {
-                                        s.path.truncate(depth);
-                                        s.path.push(i);
-                                        s.active = None;
-                                    }
+                                    s.path.truncate(depth);
+                                    s.path.push(i);
                                 });
                             }
                         >
@@ -439,11 +446,14 @@ pub fn ContextMenu(
                     if preserve_focus {
                         e.prevent_default();
                     }
-                    on_close.run(());
+                    crate::a11y::defer_close(on_close);
                 }
                 on:contextmenu=move |e: web_sys::MouseEvent| {
                     // Right-clicking the backdrop dismisses; re-opening
                     // at the new position is the owning surface's job.
+                    // Synchronous (not deferred) so a surface handler
+                    // that re-opens the menu on the same bubbled event
+                    // isn't undone by a later deferred close.
                     e.prevent_default();
                     on_close.run(());
                 }
@@ -507,7 +517,7 @@ pub fn AnchoredMenu(
                     if preserve_focus {
                         e.prevent_default();
                     }
-                    on_close.run(());
+                    crate::a11y::defer_close(on_close);
                 }
             ></div>
             <div

@@ -125,15 +125,15 @@ pub fn nav_enter_submenu(nodes: &[NavNode], state: &MenuNavState) -> MenuNavStat
     let Some(panel) = panel_at(nodes, &state.path) else {
         return state.clone();
     };
-    if let Some(i) = state.active {
-        if let Some(NavNode::Parent { disabled: false, children }) = panel.get(i) {
-            let mut path = state.path.clone();
-            path.push(i);
-            return MenuNavState {
-                path,
-                active: first_selectable(children),
-            };
-        }
+    if let Some(i) = state.active
+        && let Some(NavNode::Parent { disabled: false, children }) = panel.get(i)
+    {
+        let mut path = state.path.clone();
+        path.push(i);
+        return MenuNavState {
+            path,
+            active: first_selectable(children),
+        };
     }
     state.clone()
 }

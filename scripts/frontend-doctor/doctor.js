@@ -905,21 +905,31 @@ async function scenarioAdminConsole(ctx, collector) {
 // `ok=false` on any missing piece.
 // Open a grouped cell-context-menu submenu and click one of its leaf
 // items. The 2026-06 context-menu compaction nests advanced actions
-// (freeze, pivot/chart insert, validation, named ranges, …) under hover
-// fly-outs: a `.ss-ctx-parent` button reveals its `.ss-ctx-submenu` on
-// hover, then the leaf becomes clickable. `parentRe` matches the parent
-// label (e.g. /insert/i, /hide \/ unhide/i); `leafRe` matches the leaf
-// button (e.g. /insert pivot table/i, /freeze rows above/i). The menu
-// must already be open (`.ss-ctx-menu` present).
+// (freeze, pivot/chart insert, validation, named ranges, …) under
+// fly-outs; since the 2026-07 shared-menu-primitive migration the chrome
+// is `components::menu` (`.ui-menu*` classes) and a submenu parent is a
+// `.ui-menu-item` with `aria-haspopup="menu"` that opens its `.ui-menu-sub`
+// on hover OR click. `parentRe` matches the parent label (e.g. /insert/i,
+// /hide \/ unhide/i); `leafRe` matches the leaf button (e.g.
+// /insert pivot table/i, /freeze rows above/i). The menu must already be
+// open (`.ui-menu` present).
 async function clickCtxMenuItem(page, parentRe, leafRe) {
   await page
-    .locator(".ss-ctx-parent")
+    .locator('.ui-menu-item[aria-haspopup="menu"]')
     .filter({ hasText: parentRe })
     .first()
     .hover();
-  const leaf = page.getByRole("button", { name: leafRe });
-  await leaf.first().waitFor({ state: "visible", timeout: 3000 });
-  await leaf.first().click();
+  const leaf = uiMenuItem(page, leafRe);
+  await leaf.waitFor({ state: "visible", timeout: 3000 });
+  await leaf.click();
+}
+
+// Menu items carry ARIA menu roles (`menuitem` / `menuitemcheckbox`)
+// since the shared-menu-primitive migration, so they no longer match
+// getByRole("button"). Address them by the shared item class + label,
+// which covers both roles.
+function uiMenuItem(page, nameRe) {
+  return page.locator(".ui-menu-item").filter({ hasText: nameRe }).first();
 }
 
 async function scenarioSpreadsheetFeatures(ctx, collector) {
@@ -1041,7 +1051,7 @@ async function scenarioSpreadsheetFeatures(ctx, collector) {
       .locator("td.spreadsheet-cell")
       .first();
     await a2Cell.click({ button: "right" });
-    await page.waitForSelector(".ss-ctx-menu", { timeout: 3000 });
+    await page.waitForSelector(".ui-menu", { timeout: 3000 });
     steps.contextMenuOpens = true;
     // "Freeze rows above" lives under the "Hide / Unhide" submenu after
     // the 2026-06 context-menu compaction.
@@ -1410,11 +1420,12 @@ async function scenarioSettingsAppearance(ctx, collector) {
 // ─── menu-switch scenario ───────────────────────────────────────
 //
 // Regression for the menu-bar backdrop-intercept bug: with a menu open, its
-// full-screen `.menu-bar-backdrop` used to cover the other menu names, so
-// clicking one only CLOSED the current menu (the click hit the backdrop) —
-// you had to click twice to open the next. The fix stacks `.menu-bar-item`
-// above the backdrop so a single click switches menus. This asserts that
-// clicking a second menu name while one is open switches in one click.
+// full-screen backdrop (`.ui-menu-backdrop` since the shared-primitive
+// migration) used to cover the other menu names, so clicking one only
+// CLOSED the current menu (the click hit the backdrop) — you had to click
+// twice to open the next. The fix stacks `.menu-bar-item` above the
+// backdrop so a single click switches menus. This asserts that clicking a
+// second menu name while one is open switches in one click.
 async function scenarioMenuSwitch(ctx, collector) {
   const { baseUrlA, baseUrl, emailA, outDir } = ctx;
   const target = baseUrlA || baseUrl;
@@ -1453,7 +1464,7 @@ async function scenarioMenuSwitch(ctx, collector) {
       .textContent()
       .then((t) => (t || "").trim())
       .catch(() => "");
-  const dropdownCount = () => page.locator(".menu-bar-dropdown").count();
+  const dropdownCount = () => page.locator(".menu-bar .ui-menu").count();
 
   // Poll for the expected state instead of asserting at a fixed delay: a
   // single click should switch the menu, but under a loaded CI runner the
@@ -1560,7 +1571,7 @@ async function scenarioDocActions(ctx, collector) {
 
   const openDocMenu = async () => {
     await page.getByRole("button", { name: "Document", exact: true }).click();
-    await page.waitForSelector(".menu-bar-dropdown", { timeout: 3000 });
+    await page.waitForSelector(".menu-bar .ui-menu", { timeout: 3000 });
   };
 
   const steps = {};
@@ -1577,14 +1588,14 @@ async function scenarioDocActions(ctx, collector) {
 
     // ── Rename ──
     await openDocMenu();
-    await page.getByRole("button", { name: /Rename Document/ }).click();
+    await uiMenuItem(page, /Rename Document/).click();
     await page.waitForTimeout(300);
     steps.renameUpdatesTitle =
       (await page.locator(".doc-title-editable").inputValue()) === NEW_TITLE;
 
     // ── Duplicate (via the dialog) ──
     await openDocMenu();
-    await page.getByRole("button", { name: /Duplicate/ }).click();
+    await uiMenuItem(page, /Duplicate/).click();
     // The dialog opens with the name pre-filled from the current doc name.
     await page.waitForSelector("#duplicate-name", { timeout: 5000 });
     steps.duplicateDialogPrefillsName =
@@ -1787,8 +1798,8 @@ async function scenarioFindReplace(ctx, collector) {
 
     // Open via the Edit menu's "Find and Replace" item.
     await page.getByRole("button", { name: "Edit", exact: true }).click();
-    await page.waitForSelector(".menu-bar-dropdown", { timeout: 3000 });
-    await page.getByRole("button", { name: /Find and Replace/i }).click();
+    await page.waitForSelector(".menu-bar .ui-menu", { timeout: 3000 });
+    await uiMenuItem(page, /Find and Replace/i).click();
     steps.barOpensFromMenu = await waitFor(barVisible);
 
     // Close it, then re-open via Ctrl+F to verify the keyboard binding.
@@ -1887,7 +1898,7 @@ async function scenarioLineNumbers(ctx, collector) {
   };
   const openView = async () => {
     await page.getByRole("button", { name: "View", exact: true }).click();
-    await page.waitForSelector(".menu-bar-dropdown", { timeout: 3000 });
+    await page.waitForSelector(".menu-bar .ui-menu", { timeout: 3000 });
   };
 
   const steps = {};
@@ -1912,7 +1923,7 @@ async function scenarioLineNumbers(ctx, collector) {
 
     // Turn on Show Line Numbers.
     await openView();
-    await page.getByRole("button", { name: /Show Line Numbers/i }).click();
+    await uiMenuItem(page, /Show Line Numbers/i).click();
     steps.numbersAppear = await waitFor(async () => (await numCount()) > 0);
 
     // Per-visual-line: a wrapped paragraph yields more numbers than blocks.
@@ -1929,7 +1940,7 @@ async function scenarioLineNumbers(ctx, collector) {
 
     // Show Page Breaks must NOT paint a full-width rule on the content.
     await openView();
-    await page.getByRole("button", { name: /Show Page Breaks/i }).click();
+    await uiMenuItem(page, /Show Page Breaks/i).click();
     await page.waitForTimeout(300);
     const bg = await page.$eval(
       ".editor-content",
@@ -1939,7 +1950,7 @@ async function scenarioLineNumbers(ctx, collector) {
 
     // Toggling line numbers back off removes them.
     await openView();
-    await page.getByRole("button", { name: /Show Line Numbers/i }).click();
+    await uiMenuItem(page, /Show Line Numbers/i).click();
     steps.togglesOff = await waitFor(async () => (await numCount()) === 0);
   } catch (e) {
     collector.stepError = `${e.message}`;
@@ -2008,8 +2019,8 @@ async function scenarioDocumentDetails(ctx, collector) {
 
     // Document menu → Document Details…
     await page.getByRole("button", { name: "Document", exact: true }).click();
-    await page.waitForSelector(".menu-bar-dropdown", { timeout: 3000 });
-    await page.getByRole("button", { name: /Document Details/i }).click();
+    await page.waitForSelector(".menu-bar .ui-menu", { timeout: 3000 });
+    await uiMenuItem(page, /Document Details/i).click();
     steps.panelOpens = await waitFor(() =>
       page.locator(".doc-details-dialog").isVisible()
     );
@@ -2284,7 +2295,7 @@ async function scenarioPivotEditor(ctx, collector) {
     // The pivot-insert action is nested under the "Insert" submenu after
     // the 2026-06 context-menu compaction.
     await a1.click({ button: "right" });
-    await page.waitForSelector(".ss-ctx-menu", { timeout: 3000 });
+    await page.waitForSelector(".ui-menu", { timeout: 3000 });
     steps.contextMenuOpens = true;
     await clickCtxMenuItem(page, /insert/i, /insert pivot table/i);
 
@@ -3296,7 +3307,7 @@ async function scenarioDeleteDocument(ctx, collector) {
 
     // Open the Document menu, then "Delete Document…".
     await page.getByRole("button", { name: /^document$/i }).first().click();
-    await page.getByRole("button", { name: /delete document/i }).first().click();
+    await uiMenuItem(page, /delete document/i).click();
 
     // The destructive confirm dialog appears.
     await page.waitForSelector(".confirm-dialog", { timeout: 4000 });
@@ -3410,7 +3421,7 @@ async function scenarioCommentPopup(ctx, collector) {
     // Right-click cell A1 → Comment ▸ → Add Comment, which pre-creates a
     // thread and opens the shared CommentPopup in thread mode.
     await page.locator('[data-row="0"][data-col="0"]').first().click({ button: "right" });
-    await page.waitForSelector(".ss-ctx-menu", { timeout: 3000 });
+    await page.waitForSelector(".ui-menu", { timeout: 3000 });
     await clickCtxMenuItem(page, /comment/i, /add comment/i);
     await page.waitForSelector(".comment-popup", { timeout: 5000 });
     steps.popupShown = true;
@@ -3468,7 +3479,7 @@ async function scenarioSpreadsheetFreeze(ctx, collector) {
       .locator("td.spreadsheet-cell")
       .first();
     await a3Cell.click({ button: "right" });
-    await page.waitForSelector(".ss-ctx-menu", { timeout: 3000 });
+    await page.waitForSelector(".ui-menu", { timeout: 3000 });
     steps.contextMenuOpens = true;
 
     // "Freeze rows above" is nested under the "Hide / Unhide" submenu
@@ -3554,12 +3565,12 @@ async function scenarioSpreadsheetSheetTabs(ctx, collector) {
       ".ss-sheet-tabs .ss-sheet-tab:not(.ss-sheet-add)",
     ).nth(1);
     await secondTab.click({ button: "right" });
-    await page.waitForSelector(".ss-ctx-menu", { timeout: 3000 });
+    await page.waitForSelector(".ui-menu", { timeout: 3000 });
     steps.tabContextMenuOpened = true;
 
     // Sanity-check the clamp (#68): menu's left/top must be inside the
     // viewport. We read the inline style and the viewport size.
-    const menuMetrics = await page.locator(".ss-ctx-menu").first()
+    const menuMetrics = await page.locator(".ui-menu").first()
       .evaluate((el) => {
         const rect = el.getBoundingClientRect();
         return {
@@ -3578,7 +3589,7 @@ async function scenarioSpreadsheetSheetTabs(ctx, collector) {
       menuMetrics.bottom <= menuMetrics.vh + 1;
 
     // Click Delete in the menu.
-    await page.getByRole("button", { name: /^delete$/i }).first().click();
+    await uiMenuItem(page, /^delete$/i).click();
     await page.waitForTimeout(300);
     const tabsAfterDelete = await page.locator(
       ".ss-sheet-tabs .ss-sheet-tab:not(.ss-sheet-add)",
