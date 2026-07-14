@@ -35,10 +35,18 @@ jobs:
         id: claude-review
         uses: anthropics/claude-code-action@v1
         with:
-          # Either credential works; the public repo (post 2026-07-07
-          # re-publish) has ANTHROPIC_API_KEY set. Keep both inputs so
-          # whichever secret exists is picked up.
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Authenticate with the API key — the only credential this repo
+          # has set (`gh secret list` shows ANTHROPIC_API_KEY only).
+          #
+          # Do NOT also pass claude_code_oauth_token: the CLAUDE_CODE_OAUTH_TOKEN
+          # secret is unset, so `${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}` resolves
+          # to an empty string. Passing an empty OAuth token makes Claude Code
+          # attempt subscription (OAuth) auth with an empty bearer and reject the
+          # very first turn — is_error:true at ~200ms and $0 cost — even though
+          # ANTHROPIC_API_KEY is valid (that was the failure on every PR before
+          # this change). If you switch to a Claude subscription, add the
+          # CLAUDE_CODE_OAUTH_TOKEN secret and pass it here *instead of*
+          # anthropic_api_key, not alongside it.
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
