@@ -13,5 +13,9 @@ pub mod editor;
 // expansion resolves against whichever crate the caller sits
 // in, so it needs `i18n` at the lib crate root too.
 pub mod i18n;
+// Pure keyboard-navigation model for the shared menu primitive
+// (components/menu in the binary). Lib-visible so `cargo test --lib`
+// (the CI tier-1 command) runs its unit tests.
+pub mod menu_nav;
 pub mod observability;
 pub mod touch;

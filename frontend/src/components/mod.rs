@@ -29,6 +29,7 @@ pub mod folder_picker;
 pub mod formula_keyboard;
 pub mod history_viewer;
 pub mod locale_selector;
+pub mod menu;
 pub mod menu_bar;
 pub mod mermaid_modal;
 pub mod notification_bell;
