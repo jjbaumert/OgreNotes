@@ -641,6 +641,33 @@ fn read_only_permits_frame(ws_access: WsAccess, msg_type: MessageType) -> bool {
     )
 }
 
+/// #58/T-2: per-user rate limit for WS frames that hit the persist path
+/// (`Update` / `SyncStep2`). Returns `true` when the caller has exceeded
+/// `rate_limit_ws_messages_per_min` and the frame must not be applied.
+/// `ws_upgrade` bounds connection establishment; this bounds per-message
+/// writes once a socket is open. A legit client debounces outgoing updates
+/// (~16ms), so the generous default never clips real editing while it caps a
+/// client flooding the persist path at socket speed. Fails open on a Redis
+/// error, matching `rate_limit::enforce`.
+async fn ws_message_rate_limited(state: &AppState, user_id: &str) -> bool {
+    if crate::middleware::rate_limit::enforce(
+        &state.redis,
+        "ws_message",
+        user_id,
+        state.config.rate_limit_ws_messages_per_min,
+        60,
+    )
+    .await
+    .is_err()
+    {
+        counter::inc(MetricKey::new("ws.rate_limited_total", &[]));
+        tracing::warn!(%user_id, "ws message rate limit exceeded; closing connection");
+        true
+    } else {
+        false
+    }
+}
+
 async fn handle_ws(
     socket: WebSocket,
     room: Arc<Room>,
@@ -818,6 +845,11 @@ async fn handle_ws(
                                         &[("type", "sync2")],
                                     ));
                                     tracing::debug!(client_id, "dropping SyncStep2 from read-only session (#111)");
+                                } else if ws_message_rate_limited(&state_for_recv, &user_id_for_recv).await {
+                                    // #58/T-2: over the per-user persist rate —
+                                    // close (break) so the client reconnects and
+                                    // resyncs cleanly instead of losing frames.
+                                    break;
                                 } else {
                                     tracing::debug!(client_id, payload_len = payload.len(), "received SyncStep2 (applying, no broadcast)");
                                     if let Err(e) = room_for_recv
@@ -858,6 +890,13 @@ async fn handle_ws(
                                     ));
                                     tracing::debug!(client_id, "dropping Update from read-only session (#111)");
                                     continue;
+                                }
+                                // #58/T-2: bound the per-user persist rate.
+                                // Close (break) on breach rather than drop —
+                                // a dropped Update silently desyncs the
+                                // client's CRDT; a close forces a clean resync.
+                                if ws_message_rate_limited(&state_for_recv, &user_id_for_recv).await {
+                                    break;
                                 }
                                 tracing::debug!(client_id, payload_len = payload.len(), "received Update");
                                 let apply_start = std::time::Instant::now();
