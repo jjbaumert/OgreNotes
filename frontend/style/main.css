@@ -453,7 +453,7 @@ html, body {
 }
 .menu-bar-item {
   /* Stack the menu-name buttons ABOVE an open menu's full-screen
-     `.menu-bar-backdrop` (z-index 99) and dropdown (100). Without this the
+     `.ui-menu-backdrop` (z-index 99) and panel (100). Without this the
      backdrop covers the other menu names, so clicking one only closes the
      current menu (hits the backdrop) instead of switching to it — you'd
      have to click twice. With the buttons on top, a single click reaches
@@ -474,89 +474,6 @@ html, body {
   background: var(--color-mist);
   color: var(--color-text);
 }
-.menu-bar-backdrop {
-  position: fixed;
-  top: 0; left: 0; right: 0; bottom: 0;
-  z-index: 99;
-}
-.menu-bar-dropdown {
-  position: absolute;
-  top: 100%;
-  inset-inline-start: 0;
-  z-index: 100;
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  padding: 4px 0;
-  min-width: 200px;
-  box-shadow: 0 4px 16px rgba(0,0,0,0.18);
-}
-.menu-bar-action {
-  display: flex;
-  align-items: center;
-  width: 100%;
-  padding: 5px 12px;
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  font-size: 13px;
-  color: var(--color-text);
-  text-align: start;
-}
-.menu-bar-action:hover {
-  background: var(--color-mist);
-}
-.menu-bar-action-label {
-  flex: 1;
-}
-.menu-bar-action-shortcut {
-  font-size: 11px;
-  color: var(--color-text-secondary);
-  font-family: var(--font-mono);
-  margin-inline-start: 16px;
-}
-.menu-bar-action-icon {
-  width: 22px;
-  text-align: center;
-  font-weight: 700;
-  color: var(--color-text-secondary);
-  flex-shrink: 0;
-  font-size: 13px;
-}
-.menu-bar-action-arrow {
-  color: var(--color-text-secondary);
-  font-size: 10px;
-  margin-inline-start: auto;
-}
-.menu-bar-action-disabled {
-  opacity: 0.4;
-  cursor: default;
-  display: flex;
-  align-items: center;
-  width: 100%;
-  padding: 5px 12px;
-  border: none;
-  background: transparent;
-  font-size: 13px;
-  color: var(--color-text);
-  text-align: start;
-}
-.menu-bar-action-check {
-  width: 18px;
-  text-align: center;
-  color: var(--color-primary);
-  font-weight: 700;
-  flex-shrink: 0;
-}
-.menu-bar-action-label-toggle {
-  color: var(--color-primary);
-}
-.menu-bar-sep {
-  height: 1px;
-  background: var(--color-border);
-  margin: 4px 8px;
-}
-
 .toolbar {
   /* See .menu-bar — same stacking-context fix. */
   position: relative;
