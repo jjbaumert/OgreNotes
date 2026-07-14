@@ -666,3 +666,57 @@ async fn put_notification_prefs_updates_email_pref() {
 
     app.cleanup().await;
 }
+
+/// #36: `get_by_email` resolves via the `EMAIL#<lc>` pointer written on
+/// create — case-insensitively — instead of scanning the table, and
+/// `backfill_email_pointers` (re-)writes pointers for existing profiles
+/// idempotently.
+#[tokio::test]
+async fn get_by_email_resolves_via_pointer_and_backfills() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (alice_id, _) = app.create_user("alice.pointer@test.com").await;
+
+    // Pointer path: a mixed-case lookup still resolves the created user.
+    let found = app
+        .state
+        .user_repo
+        .get_by_email("Alice.Pointer@TEST.com")
+        .await
+        .unwrap();
+    assert_eq!(
+        found.map(|u| u.user_id),
+        Some(alice_id.clone()),
+        "pointer lookup must resolve the user case-insensitively"
+    );
+
+    // Unknown email → None (pointer miss, then scan miss).
+    let missing = app
+        .state
+        .user_repo
+        .get_by_email("nobody@nowhere.test")
+        .await
+        .unwrap();
+    assert!(missing.is_none(), "unknown email must return None");
+
+    // Backfill covers the created profile and is idempotent.
+    let (scanned, written) = app.state.user_repo.backfill_email_pointers().await.unwrap();
+    assert!(
+        scanned >= 1 && written >= 1,
+        "backfill must (re)write at least the created user's pointer, got scanned={scanned} written={written}"
+    );
+    let again = app
+        .state
+        .user_repo
+        .get_by_email("alice.pointer@test.com")
+        .await
+        .unwrap();
+    assert_eq!(
+        again.map(|u| u.user_id),
+        Some(alice_id),
+        "still resolvable after a backfill re-run"
+    );
+
+    app.cleanup().await;
+}

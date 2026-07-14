@@ -26,6 +26,35 @@ impl UserRepo {
         self.db
             .put_item_conditional(item, "attribute_not_exists(PK)")
             .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+
+        // Email→user pointer so `get_by_email` is a `GetItem`, not a
+        // full-table `Scan` (#36). Best-effort: the PROFILE row above is the
+        // source of truth and `get_by_email` falls back to a scan on a
+        // pointer miss, so a failed pointer here must not fail create
+        // (the #49 lesson). Email is immutable — SCIM forbids changing
+        // userName — so the pointer never needs updating after create.
+        if let Err(e) = self.put_email_pointer(&user.email, &user.user_id).await {
+            tracing::warn!(
+                user_id = %user.user_id,
+                error = %e,
+                "failed to write email pointer on create; get_by_email falls \
+                 back to a scan until backfill_email_pointers runs"
+            );
+        }
+        Ok(())
+    }
+
+    /// Write (idempotent) the `EMAIL#<lowercased> → user_id` pointer (#36).
+    async fn put_email_pointer(&self, email: &str, user_id: &str) -> Result<(), RepoError> {
+        let email_lc = email.trim().to_lowercase();
+        let mut item = HashMap::new();
+        item.insert("PK".to_string(), AttributeValue::S(email_pointer_pk(&email_lc)));
+        item.insert("SK".to_string(), AttributeValue::S(EMAIL_POINTER_SK.to_string()));
+        item.insert("user_id".to_string(), AttributeValue::S(user_id.to_string()));
+        self.db
+            .put_item(item)
+            .await
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
@@ -128,6 +157,31 @@ impl UserRepo {
     /// `find_or_create_user`.
     pub async fn get_by_email(&self, email: &str) -> Result<Option<User>, RepoError> {
         let email_lc = email.trim().to_lowercase();
+
+        // Fast path (#36): resolve the `EMAIL#<lc>` pointer with a single
+        // GetItem, then load the user by id. Falls through to the legacy
+        // scan when the pointer is absent (users created before #36, until
+        // `backfill_email_pointers` runs) or stale (points at a since-deleted
+        // user).
+        if let Some(item) = self
+            .db
+            .get_item(&email_pointer_pk(&email_lc), EMAIL_POINTER_SK)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?
+        {
+            if let Ok(user_id) = get_s(&item, "user_id") {
+                if let Some(user) = self.get_by_id(&user_id).await? {
+                    return Ok(Some(user));
+                }
+            }
+        }
+
+        self.get_by_email_scan(&email_lc).await
+    }
+
+    /// Legacy full-table `Scan` for `get_by_email`, retained as the pointer
+    /// fallback (#36). `email_lc` must already be trimmed + lowercased.
+    async fn get_by_email_scan(&self, email_lc: &str) -> Result<Option<User>, RepoError> {
         let mut last_key: Option<HashMap<String, AttributeValue>> = None;
         loop {
             let mut builder = self
@@ -137,7 +191,7 @@ impl UserRepo {
                 .table_name(self.db.table_name())
                 .filter_expression("SK = :sk AND email = :email")
                 .expression_attribute_values(":sk", AttributeValue::S("PROFILE".to_string()))
-                .expression_attribute_values(":email", AttributeValue::S(email_lc.clone()));
+                .expression_attribute_values(":email", AttributeValue::S(email_lc.to_string()));
             if let Some(key) = last_key.take() {
                 builder = builder.set_exclusive_start_key(Some(key));
             }
@@ -157,6 +211,48 @@ impl UserRepo {
                 None => return Ok(None),
             }
         }
+    }
+
+    /// One-time migration (#36): write an `EMAIL#<lc> → user_id` pointer for
+    /// every existing PROFILE row so `get_by_email` stops scanning.
+    /// Idempotent (pointers are put-overwrites) — safe to re-run. Returns
+    /// `(profiles_scanned, pointers_written)`.
+    pub async fn backfill_email_pointers(&self) -> Result<(usize, usize), RepoError> {
+        let mut scanned = 0usize;
+        let mut written = 0usize;
+        let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+        loop {
+            let mut builder = self
+                .db
+                .inner()
+                .scan()
+                .table_name(self.db.table_name())
+                .filter_expression("SK = :sk")
+                .expression_attribute_values(":sk", AttributeValue::S("PROFILE".to_string()));
+            if let Some(start) = start_key.take() {
+                builder = builder.set_exclusive_start_key(Some(start));
+            }
+            let result = builder
+                .send()
+                .await
+                .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+
+            for item in result.items.unwrap_or_default() {
+                let (Ok(email), Ok(user_id)) = (get_s(&item, "email"), get_s(&item, "user_id"))
+                else {
+                    continue;
+                };
+                scanned += 1;
+                self.put_email_pointer(&email, &user_id).await?;
+                written += 1;
+            }
+
+            match result.last_evaluated_key {
+                Some(key) => start_key = Some(key),
+                None => break,
+            }
+        }
+        Ok((scanned, written))
     }
 
     /// Look up a user by their SCIM `externalId` / SAML NameID via
@@ -724,6 +820,16 @@ impl UserRepo {
             }
         }
     }
+}
+
+/// Sort key for the email→user pointer item (#36).
+const EMAIL_POINTER_SK: &str = "POINTER";
+
+/// Partition key for the `EMAIL#<lowercased> → user_id` pointer item (#36).
+/// The caller lowercases + trims the email first, matching the old scan's
+/// `email` comparison so lookups stay case-insensitive.
+fn email_pointer_pk(email_lc: &str) -> String {
+    format!("EMAIL#{email_lc}")
 }
 
 fn user_to_item(user: &User) -> HashMap<String, AttributeValue> {
