@@ -14,6 +14,12 @@ const AXIS_GAP: f64 = 22.0; // room for axis labels
 const DOT_R: f64 = 5.0;
 const MAX_POINTS: usize = 400;
 
+/// Subtle per-quadrant background tints (TR, TL, BL, BR), Mermaid-style.
+const QUAD_TINT: [&str; 4] = ["#eef4ff", "#fff7e8", "#fdeef6", "#eefaf1"];
+/// Categorical fill palette for the plotted points, cycled.
+const POINT_PALETTE: &[&str] =
+    &["#3b82f6", "#ef4444", "#22c55e", "#a855f7", "#f59e0b", "#14b8a6", "#ec4899", "#64748b"];
+
 #[derive(Debug, Clone)]
 pub(crate) struct QuadrantChart {
     pub title: Option<String>,
@@ -124,9 +130,23 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
     let px = |x: f64| l + x * side;
     let py = |y: f64| top + (1.0 - y) * side;
 
+    // Per-quadrant pastel tints (Mermaid shades each cell distinctly), drawn
+    // behind the border/cross. Order matches quadrant-1..4: TR, TL, BL, BR.
+    let half = side / 2.0;
+    let cells = [
+        (cx0, top, QUAD_TINT[0]),  // 1 top-right
+        (l, top, QUAD_TINT[1]),    // 2 top-left
+        (l, cy0, QUAD_TINT[2]),    // 3 bottom-left
+        (cx0, cy0, QUAD_TINT[3]),  // 4 bottom-right
+    ];
+    for (qx, qy, tint) in cells {
+        body.push_str(&format!(
+            r#"<rect x="{qx:.1}" y="{qy:.1}" width="{half:.1}" height="{half:.1}" fill="{tint}"/>"#
+        ));
+    }
     // plot border + center cross.
     body.push_str(&format!(
-        r#"<rect x="{l:.1}" y="{top:.1}" width="{side:.1}" height="{side:.1}" fill="var(--mermaid-cluster-fill, #7773)" stroke="currentColor"/>"#
+        r#"<rect x="{l:.1}" y="{top:.1}" width="{side:.1}" height="{side:.1}" fill="none" stroke="currentColor"/>"#
     ));
     body.push_str(&format!(
         r#"<line x1="{cx0:.1}" y1="{top:.1}" x2="{cx0:.1}" y2="{:.1}" stroke="currentColor"/><line x1="{l:.1}" y1="{cy0:.1}" x2="{:.1}" y2="{cy0:.1}" stroke="currentColor"/>"#,
@@ -182,11 +202,13 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
         ));
     }
 
-    // data points.
-    for (name, x, y) in &c.points {
+    // data points: filled, cycled through a categorical palette (Mermaid
+    // colors each point) with a thin light outline for contrast on the tints.
+    for (i, (name, x, y)) in c.points.iter().enumerate() {
         let (dx, dy) = (px(*x), py(*y));
+        let fill = POINT_PALETTE[i % POINT_PALETTE.len()];
         body.push_str(&format!(
-            r#"<circle cx="{dx:.1}" cy="{dy:.1}" r="{DOT_R}" fill="var(--mermaid-node-fill, #ececff)" stroke="currentColor"/>"#
+            r#"<circle cx="{dx:.1}" cy="{dy:.1}" r="{DOT_R}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1"/>"#
         ));
         body.push_str(&format!(
             r#"<text x="{:.1}" y="{:.1}" font-size="12" fill="currentColor">{}</text>"#,
@@ -248,5 +270,19 @@ mod tests {
         assert!(svg.contains(">T<") && svg.contains(">Q1<") && svg.contains(">A<"));
         assert!(svg.matches("<line").count() >= 2); // the center cross
         assert!(svg.contains("<circle")); // the point
+    }
+
+    #[test]
+    fn quadrants_are_tinted_and_points_filled() {
+        let svg = render_svg(
+            &parse("quadrantChart\n A: [0.8, 0.8]\n B: [0.2, 0.2]").unwrap(),
+        );
+        // Each of the four quadrant tints appears as a cell fill.
+        for tint in QUAD_TINT {
+            assert!(svg.contains(tint), "missing quadrant tint {tint}: {svg}");
+        }
+        // Points are filled with the palette (not the old hollow node-fill).
+        assert!(svg.contains(POINT_PALETTE[0]), "first point uses palette fill: {svg}");
+        assert!(!svg.contains("var(--mermaid-node-fill"), "points no longer hollow: {svg}");
     }
 }
