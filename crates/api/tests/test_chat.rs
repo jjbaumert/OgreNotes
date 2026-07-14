@@ -204,6 +204,51 @@ async fn test_invited_member_sees_chat_in_own_list() {
     app.cleanup().await;
 }
 
+/// #49: `create_thread` writes a membership edge for *every* member the
+/// loop iterates (not just the first) and still returns success. Two
+/// non-creator members must both find the chat in their own lists —
+/// exercising the multi-member path the best-effort edge loop walks.
+#[tokio::test]
+async fn test_create_group_chat_indexes_every_member() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (_, token_a) = app.create_user("alice@test.com").await;
+    let (bob_id, token_b) = app.create_user("bob@test.com").await;
+    let (carol_id, token_c) = app.create_user("carol@test.com").await;
+
+    let body = serde_json::json!({
+        "chatType": "chat",
+        "title": "Team",
+        "memberIds": [bob_id, carol_id]
+    });
+    let (status, created) = app
+        .json_request(Method::POST, "/api/v1/chats", Some(&token_a), Some(body))
+        .await;
+    assert_eq!(status, 201);
+    let chat_id = created["id"].as_str().unwrap().to_string();
+
+    // Every non-creator member must see the chat via their own edge.
+    for (who, token) in [("bob", &token_b), ("carol", &token_c)] {
+        let (status, json) = app
+            .json_request(Method::GET, "/api/v1/chats", Some(token), None)
+            .await;
+        assert_eq!(status, 200);
+        let ids: Vec<&str> = json["chats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&chat_id.as_str()),
+            "member {who} must see the chat via its membership edge; got {ids:?}"
+        );
+    }
+
+    app.cleanup().await;
+}
+
 /// #34: adding a member writes their edge (the chat appears in their
 /// list) and removing them deletes it (it disappears) — end to end
 /// through the `/members` endpoints.
