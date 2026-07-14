@@ -201,11 +201,10 @@ pub fn ChatPanel() -> impl IntoView {
                         </div>
                     </Show>
 
-                    <Show when=move || selected_chat.get().is_none()>
-                        <button class="sidebar-action-btn" on:click=move |_| {
-                            // TODO: Open new chat dialog
-                        }>{crate::t!("chat-new")}</button>
-                    </Show>
+                    // "+ New Chat" was a dead TODO stub (its click
+                    // handler was empty) — removed until the new-chat
+                    // dialog exists. Chats are currently created from
+                    // the sharing/DM flows.
                 </div>
             </Show>
         </div>

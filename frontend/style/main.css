@@ -313,6 +313,139 @@ html, body {
   height: 100%;
 }
 
+/* ─── Shared menu primitive (components/menu) ────────────────────
+   One chrome for every dropdown/context menu: menu bar, editor and
+   spreadsheet right-click menus, sheet tabs, account menu. Backdrop
+   at z-index 99 / panel at 100 — the same stacking contract the
+   per-surface menus used, so `.menu-bar-item` (101) still floats
+   above an open menu's backdrop for hover-switching. */
+.ui-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 99;
+}
+.ui-menu {
+  position: fixed;
+  z-index: 100;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 4px 0;
+  min-width: 200px;
+  max-width: min(320px, calc(100vw - 8px));
+  /* Submenu fly-outs extend past the panel edge; an `overflow-y: auto`
+     here would force overflow-x to auto too and clip them. */
+  overflow: visible;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+}
+.ui-menu-anchored {
+  position: absolute;
+  top: 100%;
+  inset-inline-start: 0;
+}
+.ui-menu-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 5px 12px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--color-text);
+  text-align: start;
+  white-space: nowrap;
+}
+/* Highlight is driven by the nav state (hover and keyboard both set
+   it), not :hover — so arrow keys and mouse produce one visual. */
+.ui-menu-item.active {
+  background: var(--color-mist);
+}
+.ui-menu-item:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.ui-menu-item:disabled.active {
+  background: transparent;
+}
+.ui-menu-item-danger {
+  color: var(--color-text-error);
+}
+.ui-menu-check {
+  width: 18px;
+  text-align: center;
+  color: var(--color-primary);
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.ui-menu-icon {
+  width: 22px;
+  text-align: center;
+  font-weight: 700;
+  color: var(--color-text-secondary);
+  flex-shrink: 0;
+  font-size: 13px;
+}
+.ui-menu-label {
+  flex: 1;
+}
+.ui-menu-item[aria-checked="true"] .ui-menu-label {
+  color: var(--color-primary);
+}
+.ui-menu-shortcut {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+  margin-inline-start: 16px;
+}
+.ui-menu-arrow {
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  margin-inline-start: auto;
+  padding-inline-start: 12px;
+}
+.ui-menu-sep {
+  height: 1px;
+  background: var(--color-border);
+  margin: 4px 8px;
+}
+.ui-menu-subwrap {
+  position: relative;
+}
+.ui-menu-sub {
+  position: absolute;
+  inset-inline-start: 100%;
+  top: -5px; /* align the fly-out's first item with its parent row */
+  max-height: calc(100vh - 20px);
+  overflow-y: auto;
+}
+/* Near the viewport's right edge the container flags the menu so
+   fly-outs cascade leftward instead of clipping (every depth). */
+.ui-menu-flip-x .ui-menu-sub {
+  inset-inline-start: auto;
+  inset-inline-end: 100%;
+}
+/* Touch devices: rows grow to comfortable tap targets (the desktop
+   28px rows are too dense for fingers). */
+@media (hover: none) {
+  .ui-menu-item {
+    padding: 11px 14px;
+  }
+}
+
+/* Phone-only `⋯` document-actions button in the doc header — the menu
+   bar is hidden at the ≤640px breakpoint (responsive.css) and its
+   document-level actions surface here instead. */
+.mobile-doc-actions {
+  display: none;
+  position: relative;
+}
+.mobile-doc-menu {
+  inset-inline-start: auto;
+  inset-inline-end: 0;
+}
+
 /* Toolbar */
 /* Menu bar (Document | Edit | View | Insert | Format) */
 .menu-bar {
@@ -339,7 +472,7 @@ html, body {
 }
 .menu-bar-item {
   /* Stack the menu-name buttons ABOVE an open menu's full-screen
-     `.menu-bar-backdrop` (z-index 99) and dropdown (100). Without this the
+     `.ui-menu-backdrop` (z-index 99) and panel (100). Without this the
      backdrop covers the other menu names, so clicking one only closes the
      current menu (hits the backdrop) instead of switching to it — you'd
      have to click twice. With the buttons on top, a single click reaches
@@ -360,89 +493,6 @@ html, body {
   background: var(--color-mist);
   color: var(--color-text);
 }
-.menu-bar-backdrop {
-  position: fixed;
-  top: 0; left: 0; right: 0; bottom: 0;
-  z-index: 99;
-}
-.menu-bar-dropdown {
-  position: absolute;
-  top: 100%;
-  inset-inline-start: 0;
-  z-index: 100;
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  padding: 4px 0;
-  min-width: 200px;
-  box-shadow: 0 4px 16px rgba(0,0,0,0.18);
-}
-.menu-bar-action {
-  display: flex;
-  align-items: center;
-  width: 100%;
-  padding: 5px 12px;
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  font-size: 13px;
-  color: var(--color-text);
-  text-align: start;
-}
-.menu-bar-action:hover {
-  background: var(--color-mist);
-}
-.menu-bar-action-label {
-  flex: 1;
-}
-.menu-bar-action-shortcut {
-  font-size: 11px;
-  color: var(--color-text-secondary);
-  font-family: var(--font-mono);
-  margin-inline-start: 16px;
-}
-.menu-bar-action-icon {
-  width: 22px;
-  text-align: center;
-  font-weight: 700;
-  color: var(--color-text-secondary);
-  flex-shrink: 0;
-  font-size: 13px;
-}
-.menu-bar-action-arrow {
-  color: var(--color-text-secondary);
-  font-size: 10px;
-  margin-inline-start: auto;
-}
-.menu-bar-action-disabled {
-  opacity: 0.4;
-  cursor: default;
-  display: flex;
-  align-items: center;
-  width: 100%;
-  padding: 5px 12px;
-  border: none;
-  background: transparent;
-  font-size: 13px;
-  color: var(--color-text);
-  text-align: start;
-}
-.menu-bar-action-check {
-  width: 18px;
-  text-align: center;
-  color: var(--color-primary);
-  font-weight: 700;
-  flex-shrink: 0;
-}
-.menu-bar-action-label-toggle {
-  color: var(--color-primary);
-}
-.menu-bar-sep {
-  height: 1px;
-  background: var(--color-border);
-  margin: 4px 8px;
-}
-
 .toolbar {
   /* See .menu-bar — same stacking-context fix. */
   position: relative;
@@ -1186,120 +1236,6 @@ html, body {
   background: rgba(255, 255, 255, 0.15);
 }
 
-/* Editor right-click context menu. Mirrors the spreadsheet's
- * `.ss-ctx-menu` chrome so the two surfaces feel consistent. */
-.editor-ctx-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 99;
-  /* Transparent — purpose is to catch the dismiss-click, not to dim
-     the page behind the menu. */
-  background: transparent;
-}
-
-.editor-ctx-menu {
-  position: fixed;
-  z-index: 100;
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  padding: 4px 0;
-  min-width: 220px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
-  color: var(--color-text);
-  /* `overflow: visible` (the default) is REQUIRED so the
-   * `.editor-ctx-submenu` panel (positioned at `left: 100%` of the
-   * parent row) renders outside the menu's right edge. Setting
-   * `overflow-y: auto` here would force CSS to also clip the
-   * x-axis — the submenu would still mount, but it would be
-   * cropped to zero width and the user would see only the parent
-   * row's hover background brightening. The menu is short enough
-   * that omitting a scroll container is the right tradeoff. */
-}
-
-.editor-ctx-item {
-  display: flex;
-  width: 100%;
-  padding: 6px 12px;
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  font-size: 13px;
-  color: var(--color-text);
-  text-align: left;
-  align-items: center;
-  gap: 12px;
-}
-
-.editor-ctx-item:hover:not(:disabled) {
-  background: var(--color-mist);
-}
-
-.editor-ctx-item:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-
-.editor-ctx-label {
-  flex: 1;
-}
-
-.editor-ctx-shortcut {
-  color: var(--color-text-secondary);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-}
-
-.editor-ctx-sep {
-  height: 1px;
-  background: var(--color-border);
-  margin: 4px 8px;
-}
-
-/* Submenu — opens to the right on hover of the parent item. The
- * wrapper provides the positioning context; the submenu itself
- * mirrors `.editor-ctx-menu` chrome so the two levels feel
- * indistinguishable. */
-.editor-ctx-submenu-wrap {
-  position: relative;
-}
-
-.editor-ctx-item-has-submenu {
-  cursor: default;
-}
-
-.editor-ctx-submenu-arrow {
-  color: var(--color-text-secondary);
-  font-size: 10px;
-}
-
-.editor-ctx-submenu {
-  position: absolute;
-  left: 100%;
-  top: -5px;
-  display: none;
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  padding: 4px 0;
-  min-width: 180px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
-  color: var(--color-text);
-  z-index: 101;
-}
-
-.editor-ctx-submenu-wrap:hover > .editor-ctx-submenu,
-.editor-ctx-submenu-wrap:focus-within > .editor-ctx-submenu {
-  display: block;
-}
-
-/* Highlight the parent row while the submenu is visible so the
- * connection between row and panel reads at a glance. */
-.editor-ctx-submenu-wrap:hover > .editor-ctx-item-has-submenu,
-.editor-ctx-submenu-wrap:focus-within > .editor-ctx-item-has-submenu {
-  background: var(--color-mist);
-}
-
 /* Comment highlight — overlays commented text with warm background */
 .comment-highlight {
   position: fixed;
@@ -1852,6 +1788,38 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  flex: 1;
+}
+
+/* Per-row `⋯` actions button — hidden until the row is hovered or
+   holds focus; always visible on touch devices, where there is no
+   hover to reveal it (same rule as .folder-row-actions). */
+.sidebar-doc-actions {
+  margin-inline-start: auto;
+  flex-shrink: 0;
+  opacity: 0;
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  line-height: 1;
+}
+.sidebar-favorite-item:hover .sidebar-doc-actions,
+.sidebar-favorite-item:focus-within .sidebar-doc-actions {
+  opacity: 1;
+}
+.sidebar-doc-actions:hover {
+  background: var(--color-mist);
+  color: var(--color-text);
+}
+@media (hover: none) {
+  .sidebar-doc-actions {
+    opacity: 1;
+    padding: 8px 10px;
+  }
 }
 
 /* #134: header focus/expand toggle. Takes the auto right-margin so it and
@@ -2645,6 +2613,7 @@ html, body {
 .at-menu {
   position: fixed;
   width: 280px;
+  max-width: calc(100vw - 16px);
   max-height: 300px;
   background: var(--color-bg);
   border: 1px solid var(--color-border);
@@ -3070,6 +3039,7 @@ html, body {
  * on opposite sides (title left, action right) with hover feedback. */
 .template-picker-dialog {
   width: 480px;
+  max-width: calc(100vw - 16px);
 }
 .template-picker-body {
   padding: var(--space-xs) 0;
@@ -4775,7 +4745,9 @@ tr:hover .folder-row-actions,
  * for the overlay so backdrop click + Escape behavior match the
  * rest of the app's dialogs. */
 .calendar-modal {
-  min-width: 380px;
+  /* min() keeps the modal on-screen on narrow phones (a hard 380px
+     min-width beat the 92vw max-width on a 375px viewport). */
+  min-width: min(380px, calc(100vw - 16px));
   max-width: 92vw;
   background: var(--color-bg, white);
   border: 1px solid var(--color-border);
@@ -5802,20 +5774,13 @@ tr:hover .folder-row-actions,
   font-size: 12px;
   color: var(--color-on-brand-anchor-muted);
 }
-.account-menu-dropdown {
-  position: absolute;
+/* Placement override for the shared menu panel: the account menu
+   opens UPWARD from the sidebar footer and spans the trigger width. */
+.account-menu-drop {
+  top: auto;
   bottom: calc(100% + 4px);
-  left: 0;
-  right: 0;
-  z-index: 100;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 4px;
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  inset-inline: 0;
+  min-width: 0;
 }
 .account-menu-identity {
   display: flex;
@@ -5840,25 +5805,6 @@ tr:hover .folder-row-actions,
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.account-menu-item {
-  display: block;
-  width: 100%;
-  text-align: start;
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  padding: var(--space-sm);
-  border-radius: var(--radius-sm);
-  font-size: 13px;
-  color: var(--color-text);
-}
-.account-menu-item:hover {
-  background: var(--color-mist);
-}
-.account-menu-item-danger {
-  color: var(--color-text-error);
-}
-
 /* ─── Settings — profile form (account-menu step 4) ─────────────
  * Text inputs + the read-only email row + the save action row.
  * Reuses the .settings-field column layout from step 2. */

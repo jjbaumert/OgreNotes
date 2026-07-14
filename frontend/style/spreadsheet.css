@@ -704,109 +704,9 @@
   z-index: 4;
 }
 
-/* Context menu */
-.ss-ctx-backdrop {
-  position: fixed;
-  top: 0; left: 0; right: 0; bottom: 0;
-  z-index: 99;
-}
-
-.ss-ctx-menu {
-  position: fixed;
-  z-index: 100;
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  padding: 4px 0;
-  min-width: 180px;
-  /* The top level is now a compact ~9-item list (advanced actions
-     live in hover submenus), so it fits in the viewport and does not
-     need its own scroll. Crucially, overflow must stay visible: an
-     `overflow-y: auto` here would force `overflow-x` to auto too and
-     clip the submenu fly-outs that extend past the right edge. The
-     view layer still clamps left/top to keep the box on-screen. */
-  overflow: visible;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
-}
-
-.ss-ctx-item {
-  display: block;
-  width: 100%;
-  padding: 4px 14px;
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  font-size: 13px;
-  line-height: 1.4;
-  color: var(--color-text);
-  text-align: left;
-  white-space: nowrap;
-}
-
-.ss-ctx-item:hover {
-  background: var(--color-mist);
-}
-
-.ss-ctx-sep {
-  height: 1px;
-  background: var(--color-border);
-  margin: 4px 8px;
-}
-
-/* ── Submenus ──────────────────────────────────────────────────
-   A parent row carries a trailing ▸ and reveals its fly-out on hover.
-   The fly-out is absolutely positioned to the right of its parent. */
-.ss-ctx-sub {
-  position: relative;
-}
-
-.ss-ctx-parent {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 24px;
-}
-
-.ss-ctx-arrow {
-  opacity: 0.55;
-  font-size: 11px;
-  line-height: 1;
-}
-
-.ss-ctx-submenu {
-  display: none;
-  position: absolute;
-  left: 100%;
-  top: -5px; /* align the fly-out's first item with its parent row */
-  min-width: 180px;
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  padding: 4px 0;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
-  /* A single submenu can still be tall (e.g. Format); bound it to the
-     viewport with its own scroll. Sub-submenus open to the right of
-     their own parent row, so this scroll doesn't clip them. */
-  max-height: calc(100vh - 20px);
-  overflow-y: auto;
-}
-
-.ss-ctx-sub:hover > .ss-ctx-submenu {
-  display: block;
-}
-
-/* Near the right edge the view layer flags the menu so submenus open
-   leftward instead of overflowing off-screen. Applies to every nesting
-   level, so a flipped Format ▸ and its Conditional Formatting ▸ both
-   cascade to the left. */
-.ss-ctx-flip-x .ss-ctx-submenu {
-  left: auto;
-  right: 100%;
-}
-
-.ss-ctx-sub:hover > .ss-ctx-parent {
-  background: var(--color-mist);
-}
+/* Context menu chrome comes from the shared `components/menu`
+   primitive (`.ui-menu*` in main.css). Only the filter popup below
+   keeps a spreadsheet-specific panel. */
 
 /* Cell edit wrapper for autocomplete positioning */
 .spreadsheet-cell-edit-wrapper {
@@ -1035,6 +935,32 @@
   cursor: pointer;
   white-space: nowrap;
   color: var(--color-text-secondary);
+  /* Long-press opens the tab menu on touch — suppress the OS
+     text-selection callout that would fight the gesture. */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: manipulation;
+}
+
+/* Touch devices: floating cell-actions button (bottom inline-end,
+   clear of the sheet tabs and the mobile bottom toolbar). Rendered
+   only when (hover: none) matches, so no desktop rule is needed. */
+.ss-touch-menu-btn {
+  position: fixed;
+  inset-inline-end: 16px;
+  bottom: 104px;
+  z-index: 60;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
 }
 
 .ss-sheet-tab.active {

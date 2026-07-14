@@ -39,10 +39,6 @@ common-restore-here = Hier wiederherstellen
 # ─── Sidebar ────────────────────────────────────────────────────
 
 sidebar-section-navigation = Navigation
-sidebar-section-recent = Zuletzt
-sidebar-section-pinned = Angeheftet
-sidebar-empty-recent = Keine zuletzt verwendeten Einträge
-sidebar-empty-pinned = Keine angehefteten Einträge
 # Favorites (#144)
 document-favorite = Zu Favoriten hinzufügen
 # Expand / full screen (#145)
@@ -51,6 +47,12 @@ document-expand-exit = Vollbild beenden
 document-unfavorite = Aus Favoriten entfernen
 sidebar-section-favorites = Favoriten
 sidebar-empty-favorites = Noch keine Favoriten
+sidebar-doc-open-new-tab = In neuem Tab öffnen
+sidebar-doc-actions-aria = Dokumentaktionen
+sidebar-new-aria = Neu erstellen
+sidebar-new-document = Neues Dokument
+sidebar-new-spreadsheet = Neue Tabelle
+menubar-help = Hilfe
 sidebar-home = Start
 sidebar-search = Suche
 sidebar-sign-out = Abmelden
@@ -77,7 +79,6 @@ notifications-empty = Keine Benachrichtigungen
 chat-section-title = Chats
 chat-empty = Noch keine Chats
 chat-back = ← Zurück zu den Chats
-chat-new = + Neuer Chat
 chat-message-placeholder = Nachricht eingeben…
 
 # ─── Document outline ───────────────────────────────────────────
@@ -455,6 +456,7 @@ ss-status-max = Max: { $value }
 
 # Sheet tabs
 ss-rename-sheet-prompt = Blatt umbenennen:
+ss-touch-menu-aria = Zellenaktionen
 ss-ctx-rename = Umbenennen
 ss-ctx-delete = Löschen
 
@@ -874,7 +876,6 @@ menubar-doc-delete = Dokument löschen…
 menubar-edit-undo = Rückgängig
 menubar-edit-redo = Wiederholen
 menubar-edit-find = Suchen und Ersetzen
-menubar-edit-copy-anchor = Ankerlink kopieren
 menubar-view-comments = Kommentare anzeigen
 menubar-view-conversation = Konversation anzeigen
 menubar-view-cursors = Cursor anzeigen
@@ -882,11 +883,8 @@ menubar-view-focus = Fokusmodus
 menubar-view-line-numbers = Zeilennummern anzeigen
 menubar-view-page-breaks = Seitenumbrüche anzeigen
 menubar-view-outline = Gliederung anzeigen
-menubar-view-outline-expanded = Gliederung erweitert lassen
 menubar-format-subscript = Tiefgestellt
 menubar-format-superscript = Hochgestellt
-menubar-format-text-color = Textfarbe
-menubar-format-highlight = Hervorheben
 menubar-format-paragraph-style = Absatzstil
 menubar-format-list = Liste
 menubar-format-clear = Formatierung entfernen

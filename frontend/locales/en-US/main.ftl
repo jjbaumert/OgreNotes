@@ -56,10 +56,6 @@ common-restore-here = Restore here
 # ─── Sidebar ────────────────────────────────────────────────────
 
 sidebar-section-navigation = Navigation
-sidebar-section-recent = Recent
-sidebar-section-pinned = Pinned
-sidebar-empty-recent = No recent items
-sidebar-empty-pinned = No pinned items
 # Favorites (#144)
 document-favorite = Add to favorites
 # Expand / full screen (#145)
@@ -77,6 +73,12 @@ collection-new-prompt = Name this collection
 sidebar-section-favorites = Favorites
 sidebar-empty-favorites = No favorites yet
 sidebar-empty-collection = Empty collection
+sidebar-doc-open-new-tab = Open in New Tab
+sidebar-doc-actions-aria = Document actions
+sidebar-new-aria = Create new
+sidebar-new-document = New Document
+sidebar-new-spreadsheet = New Spreadsheet
+menubar-help = Help
 sidebar-home = Home
 sidebar-search = Search
 sidebar-templates = Templates
@@ -138,7 +140,6 @@ notifications-empty = No notifications
 chat-section-title = Chats
 chat-empty = No chats yet
 chat-back = ← Back to chats
-chat-new = + New Chat
 chat-message-placeholder = Type a message…
 
 # ─── Document outline pane ──────────────────────────────────────
@@ -543,6 +544,7 @@ ss-status-max = Max: { $value }
 
 # Sheet tabs
 ss-rename-sheet-prompt = Rename sheet:
+ss-touch-menu-aria = Cell actions
 ss-ctx-rename = Rename
 ss-ctx-delete = Delete
 
@@ -1085,7 +1087,6 @@ menubar-doc-delete = Delete Document…
 menubar-edit-undo = Undo
 menubar-edit-redo = Redo
 menubar-edit-find = Find and Replace
-menubar-edit-copy-anchor = Copy Anchor Link
 menubar-view-comments = Show Comments
 menubar-view-conversation = Show Conversation
 menubar-view-cursors = Show Cursors
@@ -1093,11 +1094,8 @@ menubar-view-focus = Focus Mode
 menubar-view-line-numbers = Show Line Numbers
 menubar-view-page-breaks = Show Page Breaks
 menubar-view-outline = Show Outline
-menubar-view-outline-expanded = Keep Outline Expanded
 menubar-format-subscript = Subscript
 menubar-format-superscript = Superscript
-menubar-format-text-color = Text Color
-menubar-format-highlight = Highlight
 menubar-format-paragraph-style = Paragraph Style
 menubar-format-list = List
 menubar-format-clear = Clear Formatting

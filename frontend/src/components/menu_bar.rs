@@ -2,6 +2,7 @@
 
 use leptos::prelude::*;
 
+use super::menu::{AnchoredMenu, MenuEntry};
 use super::toolbar::ToolbarCommand;
 
 /// Document-level actions dispatched from the menu bar.
@@ -46,7 +47,67 @@ pub enum DocAction {
     NewFromTemplate,
 }
 
+/// Top-level menu order — drives ArrowLeft/ArrowRight rotation
+/// between open menus (the shared primitive's `on_switch` hook).
+const MENU_ORDER: [&str; 6] = ["document", "edit", "view", "insert", "format", "help"];
+
+/// The Document menu's entries. Shared between the desktop menu bar
+/// and the mobile `⋯` document-actions button in the doc header
+/// (`pages/document.rs`) — the menu bar is hidden at the phone
+/// breakpoint, and this is where its document-level actions surface
+/// instead.
+pub fn document_menu_entries(
+    on_doc_action: Callback<DocAction>,
+    is_template: ReadSignal<bool>,
+) -> Vec<MenuEntry> {
+    let doc = move |label: String, action: DocAction| {
+        MenuEntry::action(label, move || on_doc_action.run(action.clone()))
+    };
+    vec![
+        doc(crate::t!("menubar-doc-new"), DocAction::NewDocument),
+        MenuEntry::Separator,
+        doc(crate::t!("menubar-doc-share"), DocAction::Share),
+        doc(crate::t!("menubar-doc-copy-link"), DocAction::CopyLink),
+        doc(crate::t!("menubar-doc-move-folder"), DocAction::MoveToFolder),
+        MenuEntry::Separator,
+        doc(crate::t!("menubar-doc-duplicate"), DocAction::DuplicateDocument),
+        // #142: Mark / Unmark template — single item whose label
+        // flips with the current is_template state.
+        if is_template.get() {
+            doc(crate::t!("menubar-unmark-template"), DocAction::UnmarkTemplate)
+        } else {
+            doc(crate::t!("menubar-mark-template"), DocAction::MarkAsTemplate)
+        },
+        doc(crate::t!("menubar-doc-new-template"), DocAction::NewFromTemplate),
+        MenuEntry::submenu(
+            crate::t!("menubar-doc-export"),
+            vec![
+                doc(crate::t!("menubar-doc-export-html"), DocAction::ExportHtml),
+                doc(crate::t!("menubar-doc-export-markdown"), DocAction::ExportMarkdown),
+                doc(crate::t!("menubar-doc-export-csv"), DocAction::ExportCsv),
+                doc(crate::t!("menubar-doc-export-excel"), DocAction::ExportXlsx),
+            ],
+        ),
+        MenuEntry::Separator,
+        doc(crate::t!("menubar-doc-print"), DocAction::Print).with_shortcut("Ctrl+P"),
+        MenuEntry::Separator,
+        doc(crate::t!("menubar-doc-history"), DocAction::DocumentHistory)
+            .with_shortcut("Ctrl+Shift+H"),
+        doc(crate::t!("menubar-doc-details"), DocAction::DocumentDetails),
+        MenuEntry::Separator,
+        doc(crate::t!("menubar-doc-rename"), DocAction::RenameDocument),
+        doc(crate::t!("menubar-doc-delete"), DocAction::DeleteDocument),
+    ]
+}
+
 /// Classic menu bar (Document | Edit | View | Insert | Format).
+///
+/// Dropdown chrome (backdrop, Escape, keyboard navigation, real
+/// submenus for Export / Paragraph Style / Alignment / List) comes
+/// from `components::menu`. This component keeps the bar-specific
+/// interaction rules: click opens/toggles, hovering a sibling name
+/// while a menu is open switches to it, and a hover-opened menu is
+/// *committed* (not toggled shut) by the follow-up click.
 #[component]
 pub fn MenuBar(
     on_command: Callback<ToolbarCommand>,
@@ -83,10 +144,10 @@ pub fn MenuBar(
     // switching (the menu-switch doctor regression).
     let (hover_opened, set_hover_opened) = signal(false);
 
-    let close = move || {
+    let close = Callback::new(move |()| {
         set_open_menu.set(None);
         set_hover_opened.set(false);
-    };
+    });
 
     // Click a top-level menu name. Opens it (switching from any other), or
     // closes it when it's already open — unless a hover just opened it, in
@@ -115,388 +176,229 @@ pub fn MenuBar(
         }
     };
 
+    // ArrowLeft/ArrowRight at a dropdown's root panel rotates between
+    // the top-level menus, wrapping at the ends (menubar keyboard
+    // convention).
+    let switch = Callback::new(move |dir: i32| {
+        let Some(cur) = open_menu.get_untracked() else { return };
+        let Some(pos) = MENU_ORDER.iter().position(|n| *n == cur) else { return };
+        let next = (pos as i32 + dir).rem_euclid(MENU_ORDER.len() as i32) as usize;
+        set_open_menu.set(Some(MENU_ORDER[next]));
+        set_hover_opened.set(false);
+    });
+
     let on_mousedown = |ev: web_sys::MouseEvent| {
         ev.prevent_default();
     };
 
+    // Entry-builder helpers. `doc`/`cmd` dispatch and let the shared
+    // chrome close the menu after activation.
+    let doc = move |label: String, action: DocAction| {
+        MenuEntry::action(label, move || on_doc_action.run(action.clone()))
+    };
+    let cmd = move |label: String, command: ToolbarCommand| {
+        MenuEntry::action(label, move || on_command.run(command.clone()))
+    };
+
+    let document_entries =
+        Callback::new(move |()| document_menu_entries(on_doc_action, is_template));
+
+    // Cut/Copy/Paste and "Copy Anchor Link" are deliberately absent:
+    // the clipboard rows were no-ops that only closed the menu (the
+    // browser shortcuts and the editor's right-click menu do the real
+    // work), and Copy Anchor Link dispatched the identical CopyLink
+    // action the Document menu already offers.
+    let edit_entries = Callback::new(move |()| {
+        vec![
+            cmd(crate::t!("menubar-edit-undo"), ToolbarCommand::Undo).with_shortcut("Ctrl+Z"),
+            cmd(crate::t!("menubar-edit-redo"), ToolbarCommand::Redo)
+                .with_shortcut("Ctrl+Shift+Z"),
+            MenuEntry::Separator,
+            doc(crate::t!("menubar-edit-find"), DocAction::OpenFindReplace)
+                .with_shortcut("Ctrl+F"),
+        ]
+    });
+
+    let view_entries = Callback::new(move |()| {
+        let toggle = move |label: String, active: ReadSignal<bool>, action: DocAction| {
+            MenuEntry::toggle(label, active, move || on_doc_action.run(action.clone()))
+        };
+        vec![
+            toggle(crate::t!("menubar-view-comments"), comments_visible, DocAction::ToggleComments),
+            toggle(
+                crate::t!("menubar-view-conversation"),
+                conversation_visible,
+                DocAction::ToggleConversation,
+            ),
+            toggle(crate::t!("menubar-view-cursors"), cursors_visible, DocAction::ToggleCursors),
+            toggle(crate::t!("menubar-view-focus"), focus_mode, DocAction::ToggleFocusMode),
+            toggle(
+                crate::t!("menubar-view-line-numbers"),
+                line_numbers_visible,
+                DocAction::ToggleLineNumbers,
+            ),
+            toggle(
+                crate::t!("menubar-view-page-breaks"),
+                page_breaks_visible,
+                DocAction::TogglePageBreaks,
+            ),
+            MenuEntry::Separator,
+            toggle(crate::t!("menubar-view-outline"), outline_visible, DocAction::ToggleOutline),
+            // "Keep Outline Expanded" (a TODO no-op) and a duplicate
+            // "Document History" row were removed — History lives in
+            // the Document menu.
+        ]
+    });
+
+    let insert_entries = Callback::new(move |()| {
+        // #148 v2 slice 4 — catalog swap. Link remains hard-coded
+        // because it takes a URL prompt at click time, not a zero-arg
+        // dispatch; every other entry rides the shared catalog so a
+        // new insertable added to `INSERT_CATALOG` shows up here for
+        // free.
+        let mut entries = vec![
+            cmd(
+                crate::t!("menubar-insert-link"),
+                ToolbarCommand::ToggleLink(String::new()),
+            )
+            .with_shortcut("Ctrl+K"),
+        ];
+        entries.extend(
+            crate::inserts::catalog_for(crate::inserts::InsertSurface::Menubar)
+                .into_iter()
+                .map(|item| {
+                    cmd(crate::i18n::translate(item.label_key(), None), item.command())
+                        .with_icon(item.icon())
+                }),
+        );
+        entries
+    });
+
+    let format_entries = Callback::new(move |()| {
+        let mut entries = vec![
+            cmd(crate::t!("menu-bold"), ToolbarCommand::ToggleBold)
+                .with_icon("B")
+                .with_shortcut("Ctrl+B"),
+            cmd(crate::t!("menu-italic"), ToolbarCommand::ToggleItalic)
+                .with_icon("I")
+                .with_shortcut("Ctrl+I"),
+            cmd(crate::t!("menu-underline"), ToolbarCommand::ToggleUnderline)
+                .with_icon("U")
+                .with_shortcut("Ctrl+U"),
+            cmd(crate::t!("menu-strikethrough"), ToolbarCommand::ToggleStrike)
+                .with_icon("S\u{0336}")
+                .with_shortcut("Ctrl+Shift+X"),
+            cmd(crate::t!("menubar-format-subscript"), ToolbarCommand::ToggleSubscript)
+                .with_icon("x\u{2082}")
+                .with_shortcut("Ctrl+,"),
+            cmd(crate::t!("menubar-format-superscript"), ToolbarCommand::ToggleSuperscript)
+                .with_icon("x\u{00B2}")
+                .with_shortcut("Ctrl+."),
+            // Text Color / Highlight rows were no-op stubs — the real
+            // pickers live in the toolbar and can't be triggered from
+            // here without opening them there anyway.
+            cmd(crate::t!("menu-code"), ToolbarCommand::ToggleCode)
+                .with_icon("</>")
+                .with_shortcut("Ctrl+Shift+K"),
+            MenuEntry::Separator,
+            MenuEntry::submenu(
+                crate::t!("menubar-format-paragraph-style"),
+                vec![
+                    cmd(crate::t!("toolbar-block-paragraph"), ToolbarCommand::SetParagraph),
+                    cmd(crate::t!("toolbar-block-heading-1"), ToolbarCommand::SetHeading(1)),
+                    cmd(crate::t!("toolbar-block-heading-2"), ToolbarCommand::SetHeading(2)),
+                    cmd(crate::t!("toolbar-block-heading-3"), ToolbarCommand::SetHeading(3)),
+                    cmd(crate::t!("toolbar-block-code-block"), ToolbarCommand::SetCodeBlock),
+                    cmd(crate::t!("node-blockquote"), ToolbarCommand::ToggleBlockquote),
+                ],
+            ),
+            MenuEntry::submenu(
+                crate::t!("menu-alignment"),
+                vec![
+                    cmd(
+                        crate::t!("menu-align-left"),
+                        ToolbarCommand::SetAlignment("left".to_string()),
+                    ),
+                    cmd(
+                        crate::t!("menu-align-center"),
+                        ToolbarCommand::SetAlignment("center".to_string()),
+                    ),
+                    cmd(
+                        crate::t!("menu-align-right"),
+                        ToolbarCommand::SetAlignment("right".to_string()),
+                    ),
+                ],
+            ),
+            MenuEntry::submenu(
+                crate::t!("menubar-format-list"),
+                vec![
+                    cmd(
+                        crate::t!("toolbar-block-bulleted-list"),
+                        ToolbarCommand::ToggleBulletList,
+                    ),
+                    cmd(
+                        crate::t!("toolbar-block-numbered-list"),
+                        ToolbarCommand::ToggleOrderedList,
+                    ),
+                    cmd(crate::t!("toolbar-block-checklist"), ToolbarCommand::ToggleTaskList),
+                ],
+            ),
+            MenuEntry::Separator,
+            cmd(crate::t!("menubar-format-clear"), ToolbarCommand::ClearFormatting)
+                .with_shortcut("Ctrl+\\"),
+        ];
+        // #140: owner-only edit lock. Hidden for non-owners so only
+        // someone who can actually toggle it sees it.
+        if can_manage_lock.get() {
+            entries.push(MenuEntry::Separator);
+            entries.push(MenuEntry::toggle(
+                crate::t!("menubar-format-lock"),
+                locked,
+                move || on_doc_action.run(DocAction::ToggleLockEdits),
+            ));
+        }
+        entries
+    });
+
+    // Help: the keyboard-shortcut reference lived only at
+    // /settings#help with no discoverable entry point near the
+    // editor; a conventional Help menu fixes that.
+    let help_entries = Callback::new(move |()| {
+        vec![MenuEntry::action(crate::t!("account-menu-shortcuts"), || {
+            crate::commands::nav_bridge::go("/settings#help");
+        })]
+    });
+
+    // One trigger + anchored dropdown per top-level menu.
+    let menu = move |name: &'static str,
+                     label: String,
+                     entries: Callback<(), Vec<MenuEntry>>| {
+        view! {
+            <div class="menu-bar-item-wrapper">
+                <button class="menu-bar-item"
+                    class:open=move || open_menu.get() == Some(name)
+                    on:click=move |_| toggle_menu(name)
+                    on:mouseenter=move |_| hover_menu(name)
+                >{label}</button>
+                <AnchoredMenu
+                    open=Signal::derive(move || open_menu.get() == Some(name))
+                    entries=entries
+                    on_close=close
+                    preserve_focus=true
+                    on_switch=switch
+                />
+            </div>
+        }
+    };
+
     view! {
         <div class="menu-bar" on:mousedown=on_mousedown>
-            // ─── Document ───
-            <div class="menu-bar-item-wrapper">
-                <button class="menu-bar-item"
-                    class:open=move || open_menu.get() == Some("document")
-                    on:click=move |_| toggle_menu("document")
-                    on:mouseenter=move |_| hover_menu("document")
-                >{crate::t!("menubar-document")}</button>
-                <Show when=move || open_menu.get() == Some("document")>
-                    <div class="menu-bar-backdrop" on:click=move |_| close()></div>
-                    <div class="menu-bar-dropdown">
-                        {menu_action(crate::t!("menubar-doc-new"), "", move || {
-                            on_doc_action.run(DocAction::NewDocument); close();
-                        })}
-                        <div class="menu-bar-sep"></div>
-                        {menu_action(crate::t!("menubar-doc-share"), "", move || {
-                            on_doc_action.run(DocAction::Share); close();
-                        })}
-                        {menu_action(crate::t!("menubar-doc-copy-link"), "", move || {
-                            on_doc_action.run(DocAction::CopyLink); close();
-                        })}
-                        {menu_action(crate::t!("menubar-doc-move-folder"), "", move || {
-                            on_doc_action.run(DocAction::MoveToFolder); close();
-                        })}
-                        <div class="menu-bar-sep"></div>
-                        {menu_action(crate::t!("menubar-doc-duplicate"), "", move || {
-                            on_doc_action.run(DocAction::DuplicateDocument); close();
-                        })}
-                        // #142: Mark / Unmark template — single item whose label
-                        // flips with the current is_template state. Inlined
-                        // (not via menu_action) because menu_action takes a
-                        // &'static str label.
-                        <button class="menu-bar-action" on:click=move |_| {
-                            let action = if is_template.get_untracked() {
-                                DocAction::UnmarkTemplate
-                            } else {
-                                DocAction::MarkAsTemplate
-                            };
-                            on_doc_action.run(action); close();
-                        }>
-                            <span class="menu-bar-action-label">{move || if is_template.get() {
-                                crate::t!("menubar-unmark-template")
-                            } else {
-                                crate::t!("menubar-mark-template")
-                            }}</span>
-                        </button>
-                        {menu_action(crate::t!("menubar-doc-new-template"), "", move || {
-                            on_doc_action.run(DocAction::NewFromTemplate); close();
-                        })}
-                        {menu_action_sub(crate::t!("menubar-doc-export"), move || {
-                            // Submenu would go here; for now show export options inline
-                        })}
-                        {menu_action(format!("  {}", crate::t!("menubar-doc-export-html")), "", move || {
-                            on_doc_action.run(DocAction::ExportHtml); close();
-                        })}
-                        {menu_action(format!("  {}", crate::t!("menubar-doc-export-markdown")), "", move || {
-                            on_doc_action.run(DocAction::ExportMarkdown); close();
-                        })}
-                        {menu_action(format!("  {}", crate::t!("menubar-doc-export-csv")), "", move || {
-                            on_doc_action.run(DocAction::ExportCsv); close();
-                        })}
-                        {menu_action(format!("  {}", crate::t!("menubar-doc-export-excel")), "", move || {
-                            on_doc_action.run(DocAction::ExportXlsx); close();
-                        })}
-                        <div class="menu-bar-sep"></div>
-                        {menu_action(crate::t!("menubar-doc-print"), "Ctrl+P", move || {
-                            on_doc_action.run(DocAction::Print); close();
-                        })}
-                        <div class="menu-bar-sep"></div>
-                        {menu_action(crate::t!("menubar-doc-history"), "Ctrl+Shift+H", move || {
-                            on_doc_action.run(DocAction::DocumentHistory); close();
-                        })}
-                        {menu_action(crate::t!("menubar-doc-details"), "", move || {
-                            on_doc_action.run(DocAction::DocumentDetails); close();
-                        })}
-                        <div class="menu-bar-sep"></div>
-                        {menu_action(crate::t!("menubar-doc-rename"), "", move || {
-                            on_doc_action.run(DocAction::RenameDocument); close();
-                        })}
-                        {menu_action(crate::t!("menubar-doc-delete"), "", move || {
-                            on_doc_action.run(DocAction::DeleteDocument); close();
-                        })}
-                    </div>
-                </Show>
-            </div>
-
-            // ─── Edit ───
-            <div class="menu-bar-item-wrapper">
-                <button class="menu-bar-item"
-                    class:open=move || open_menu.get() == Some("edit")
-                    on:click=move |_| toggle_menu("edit")
-                    on:mouseenter=move |_| hover_menu("edit")
-                >{crate::t!("menubar-edit")}</button>
-                <Show when=move || open_menu.get() == Some("edit")>
-                    <div class="menu-bar-backdrop" on:click=move |_| close()></div>
-                    <div class="menu-bar-dropdown">
-                        {menu_action(crate::t!("menubar-edit-undo"), "Ctrl+Z", move || {
-                            on_command.run(ToolbarCommand::Undo); close();
-                        })}
-                        {menu_action(crate::t!("menubar-edit-redo"), "Ctrl+Shift+Z", move || {
-                            on_command.run(ToolbarCommand::Redo); close();
-                        })}
-                        <div class="menu-bar-sep"></div>
-                        {menu_action(crate::t!("menu-cut"), "Ctrl+X", move || {
-                            // Handled natively by the browser.
-                            close();
-                        })}
-                        {menu_action(crate::t!("menu-copy"), "Ctrl+C", move || {
-                            close();
-                        })}
-                        {menu_action(crate::t!("menu-paste"), "Ctrl+V", move || {
-                            close();
-                        })}
-                        <div class="menu-bar-sep"></div>
-                        {menu_action(crate::t!("menubar-edit-find"), "Ctrl+F", move || {
-                            on_doc_action.run(DocAction::OpenFindReplace); close();
-                        })}
-                        {menu_action(crate::t!("menubar-edit-copy-anchor"), "Ctrl+Shift+A", move || {
-                            on_doc_action.run(DocAction::CopyLink); close();
-                        })}
-                    </div>
-                </Show>
-            </div>
-
-            // ─── View ───
-            <div class="menu-bar-item-wrapper">
-                <button class="menu-bar-item"
-                    class:open=move || open_menu.get() == Some("view")
-                    on:click=move |_| toggle_menu("view")
-                    on:mouseenter=move |_| hover_menu("view")
-                >{crate::t!("menubar-view")}</button>
-                <Show when=move || open_menu.get() == Some("view")>
-                    <div class="menu-bar-backdrop" on:click=move |_| close()></div>
-                    <div class="menu-bar-dropdown">
-                        {menu_toggle(crate::t!("menubar-view-comments"), comments_visible, move || {
-                            on_doc_action.run(DocAction::ToggleComments); close();
-                        })}
-                        {menu_toggle(crate::t!("menubar-view-conversation"), conversation_visible, move || {
-                            on_doc_action.run(DocAction::ToggleConversation); close();
-                        })}
-                        {menu_toggle(crate::t!("menubar-view-cursors"), cursors_visible, move || {
-                            on_doc_action.run(DocAction::ToggleCursors); close();
-                        })}
-                        {menu_toggle(crate::t!("menubar-view-focus"), focus_mode, move || {
-                            on_doc_action.run(DocAction::ToggleFocusMode); close();
-                        })}
-                        {menu_toggle(crate::t!("menubar-view-line-numbers"), line_numbers_visible, move || {
-                            on_doc_action.run(DocAction::ToggleLineNumbers); close();
-                        })}
-                        {menu_toggle(crate::t!("menubar-view-page-breaks"), page_breaks_visible, move || {
-                            on_doc_action.run(DocAction::TogglePageBreaks); close();
-                        })}
-                        <div class="menu-bar-sep"></div>
-                        {menu_toggle(crate::t!("menubar-view-outline"), outline_visible, move || {
-                            on_doc_action.run(DocAction::ToggleOutline); close();
-                        })}
-                        {menu_action(crate::t!("menubar-view-outline-expanded"), "Ctrl+Shift+O", move || {
-                            // TODO: separate "keep expanded" preference
-                            close();
-                        })}
-                        <div class="menu-bar-sep"></div>
-                        {menu_action(crate::t!("menubar-doc-history"), "Ctrl+Shift+H", move || {
-                            on_doc_action.run(DocAction::DocumentHistory); close();
-                        })}
-                    </div>
-                </Show>
-            </div>
-
-            // ─── Insert ───
-            <div class="menu-bar-item-wrapper">
-                <button class="menu-bar-item"
-                    class:open=move || open_menu.get() == Some("insert")
-                    on:click=move |_| toggle_menu("insert")
-                    on:mouseenter=move |_| hover_menu("insert")
-                >{crate::t!("menubar-insert")}</button>
-                <Show when=move || open_menu.get() == Some("insert")>
-                    <div class="menu-bar-backdrop" on:click=move |_| close()></div>
-                    <div class="menu-bar-dropdown">
-                        // #148 v2 slice 4 — catalog swap. Link
-                        // remains hard-coded because it takes a URL
-                        // prompt at click time, not a zero-arg
-                        // dispatch; every other entry rides the
-                        // shared catalog so a new insertable added
-                        // to `INSERT_CATALOG` shows up here for
-                        // free.
-                        {menu_action(crate::t!("menubar-insert-link"), "Ctrl+K", move || {
-                            on_command.run(ToolbarCommand::ToggleLink(String::new()));
-                            close();
-                        })}
-                        {crate::inserts::catalog_for(crate::inserts::InsertSurface::Menubar)
-                            .into_iter()
-                            .map(|item| {
-                                let icon = item.icon();
-                                let label = format!(
-                                    "{icon} {}",
-                                    crate::i18n::translate(item.label_key(), None),
-                                );
-                                let cmd = item.command();
-                                view! {
-                                    <button class="menu-bar-action"
-                                        on:click=move |_| {
-                                            on_command.run(cmd.clone());
-                                            close();
-                                        }
-                                    >
-                                        <span class="menu-bar-action-label">{label}</span>
-                                    </button>
-                                }
-                            })
-                            .collect_view()}
-                    </div>
-                </Show>
-            </div>
-
-            // ─── Format ───
-            <div class="menu-bar-item-wrapper">
-                <button class="menu-bar-item"
-                    class:open=move || open_menu.get() == Some("format")
-                    on:click=move |_| toggle_menu("format")
-                    on:mouseenter=move |_| hover_menu("format")
-                >{crate::t!("menubar-format")}</button>
-                <Show when=move || open_menu.get() == Some("format")>
-                    <div class="menu-bar-backdrop" on:click=move |_| close()></div>
-                    <div class="menu-bar-dropdown">
-                        {menu_icon_action("B", crate::t!("menu-bold"), "Ctrl+B", move || {
-                            on_command.run(ToolbarCommand::ToggleBold); close();
-                        })}
-                        {menu_icon_action("I", crate::t!("menu-italic"), "Ctrl+I", move || {
-                            on_command.run(ToolbarCommand::ToggleItalic); close();
-                        })}
-                        {menu_icon_action("U", crate::t!("menu-underline"), "Ctrl+U", move || {
-                            on_command.run(ToolbarCommand::ToggleUnderline); close();
-                        })}
-                        {menu_icon_action("S\u{0336}", crate::t!("menu-strikethrough"), "Ctrl+Shift+X", move || {
-                            on_command.run(ToolbarCommand::ToggleStrike); close();
-                        })}
-                        {menu_icon_action("x\u{2082}", crate::t!("menubar-format-subscript"), "Ctrl+,", move || {
-                            on_command.run(ToolbarCommand::ToggleSubscript); close();
-                        })}
-                        {menu_icon_action("x\u{00B2}", crate::t!("menubar-format-superscript"), "Ctrl+.", move || {
-                            on_command.run(ToolbarCommand::ToggleSuperscript); close();
-                        })}
-                        {menu_icon_action("A", crate::t!("menubar-format-text-color"), "", move || {
-                            // Opens color picker from toolbar — close menu.
-                            close();
-                        })}
-                        {menu_icon_action("\u{270F}", crate::t!("menubar-format-highlight"), "", move || {
-                            close();
-                        })}
-                        {menu_icon_action("</>", crate::t!("menu-code"), "Ctrl+Shift+K", move || {
-                            on_command.run(ToolbarCommand::ToggleCode); close();
-                        })}
-                        <div class="menu-bar-sep"></div>
-                        {menu_action_sub(crate::t!("menubar-format-paragraph-style"), move || {})}
-                        {menu_action(format!("  {}", crate::t!("toolbar-block-paragraph")), "", move || {
-                            on_command.run(ToolbarCommand::SetParagraph); close();
-                        })}
-                        {menu_action(format!("  {}", crate::t!("toolbar-block-heading-1")), "", move || {
-                            on_command.run(ToolbarCommand::SetHeading(1)); close();
-                        })}
-                        {menu_action(format!("  {}", crate::t!("toolbar-block-heading-2")), "", move || {
-                            on_command.run(ToolbarCommand::SetHeading(2)); close();
-                        })}
-                        {menu_action(format!("  {}", crate::t!("toolbar-block-heading-3")), "", move || {
-                            on_command.run(ToolbarCommand::SetHeading(3)); close();
-                        })}
-                        {menu_action(format!("  {}", crate::t!("toolbar-block-code-block")), "", move || {
-                            on_command.run(ToolbarCommand::SetCodeBlock); close();
-                        })}
-                        {menu_action(format!("  {}", crate::t!("node-blockquote")), "", move || {
-                            on_command.run(ToolbarCommand::ToggleBlockquote); close();
-                        })}
-                        <div class="menu-bar-sep"></div>
-                        {menu_action_sub(crate::t!("menu-alignment"), move || {})}
-                        {menu_action(format!("  {}", crate::t!("menu-align-left")), "", move || {
-                            on_command.run(ToolbarCommand::SetAlignment("left".to_string())); close();
-                        })}
-                        {menu_action(format!("  {}", crate::t!("menu-align-center")), "", move || {
-                            on_command.run(ToolbarCommand::SetAlignment("center".to_string())); close();
-                        })}
-                        {menu_action(format!("  {}", crate::t!("menu-align-right")), "", move || {
-                            on_command.run(ToolbarCommand::SetAlignment("right".to_string())); close();
-                        })}
-                        <div class="menu-bar-sep"></div>
-                        {menu_action_sub(crate::t!("menubar-format-list"), move || {})}
-                        {menu_action(format!("  {}", crate::t!("toolbar-block-bulleted-list")), "", move || {
-                            on_command.run(ToolbarCommand::ToggleBulletList); close();
-                        })}
-                        {menu_action(format!("  {}", crate::t!("toolbar-block-numbered-list")), "", move || {
-                            on_command.run(ToolbarCommand::ToggleOrderedList); close();
-                        })}
-                        {menu_action(format!("  {}", crate::t!("toolbar-block-checklist")), "", move || {
-                            on_command.run(ToolbarCommand::ToggleTaskList); close();
-                        })}
-                        <div class="menu-bar-sep"></div>
-                        {menu_action(crate::t!("menubar-format-clear"), "Ctrl+\\", move || {
-                            on_command.run(ToolbarCommand::ClearFormatting); close();
-                        })}
-                        // #140: owner-only edit lock. Hidden for non-owners so
-                        // only someone who can actually toggle it sees it.
-                        <Show when=move || can_manage_lock.get()>
-                            <div class="menu-bar-sep"></div>
-                            {menu_toggle(crate::t!("menubar-format-lock"), locked, move || {
-                                on_doc_action.run(DocAction::ToggleLockEdits); close();
-                            })}
-                        </Show>
-                    </div>
-                </Show>
-            </div>
-        </div>
-    }
-}
-
-fn menu_action(
-    label: impl Into<String>,
-    shortcut: &'static str,
-    on_click: impl Fn() + 'static,
-) -> impl IntoView {
-    let label: String = label.into();
-    view! {
-        <button class="menu-bar-action" on:click=move |_| on_click()>
-            <span class="menu-bar-action-label">{label}</span>
-            <Show when=move || !shortcut.is_empty()>
-                <span class="menu-bar-action-shortcut">{shortcut}</span>
-            </Show>
-        </button>
-    }
-}
-
-/// Menu item with a checkmark toggle.
-fn menu_toggle(
-    label: impl Into<String>,
-    active: ReadSignal<bool>,
-    on_click: impl Fn() + 'static,
-) -> impl IntoView {
-    let label: String = label.into();
-    view! {
-        <button class="menu-bar-action" on:click=move |_| on_click()>
-            <span class="menu-bar-action-check">
-                {move || if active.get() { "\u{2713}" } else { "" }}
-            </span>
-            <span
-                class="menu-bar-action-label"
-                class:menu-bar-action-label-toggle=move || active.get()
-            >{label}</span>
-        </button>
-    }
-}
-
-/// Menu item with an icon on the left (as in a typical Format menu).
-fn menu_icon_action(
-    icon: &'static str,
-    label: impl Into<String>,
-    shortcut: &'static str,
-    on_click: impl Fn() + 'static,
-) -> impl IntoView {
-    let label: String = label.into();
-    view! {
-        <button class="menu-bar-action" on:click=move |_| on_click()>
-            <span class="menu-bar-action-icon">{icon}</span>
-            <span class="menu-bar-action-label">{label}</span>
-            <Show when=move || !shortcut.is_empty()>
-                <span class="menu-bar-action-shortcut">{shortcut}</span>
-            </Show>
-        </button>
-    }
-}
-
-fn menu_action_sub(
-    label: impl Into<String>,
-    _on_hover: impl Fn() + 'static,
-) -> impl IntoView {
-    let label: String = label.into();
-    view! {
-        <div class="menu-bar-action menu-bar-action-disabled">
-            <span class="menu-bar-action-label">{label}</span>
-            <span class="menu-bar-action-arrow">"\u{25B8}"</span>
+            {menu("document", crate::t!("menubar-document"), document_entries)}
+            {menu("edit", crate::t!("menubar-edit"), edit_entries)}
+            {menu("view", crate::t!("menubar-view"), view_entries)}
+            {menu("insert", crate::t!("menubar-insert"), insert_entries)}
+            {menu("format", crate::t!("menubar-format"), format_entries)}
+            {menu("help", crate::t!("menubar-help"), help_entries)}
         </div>
     }
 }

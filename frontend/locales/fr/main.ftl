@@ -39,10 +39,6 @@ common-restore-here = Restaurer ici
 # ─── Sidebar ────────────────────────────────────────────────────
 
 sidebar-section-navigation = Navigation
-sidebar-section-recent = Récents
-sidebar-section-pinned = Épinglés
-sidebar-empty-recent = Aucun élément récent
-sidebar-empty-pinned = Aucun élément épinglé
 # Favorites (#144)
 document-favorite = Ajouter aux favoris
 # Expand / full screen (#145)
@@ -51,6 +47,12 @@ document-expand-exit = Quitter le plein écran
 document-unfavorite = Retirer des favoris
 sidebar-section-favorites = Favoris
 sidebar-empty-favorites = Aucun favori
+sidebar-doc-open-new-tab = Ouvrir dans un nouvel onglet
+sidebar-doc-actions-aria = Actions du document
+sidebar-new-aria = Créer
+sidebar-new-document = Nouveau document
+sidebar-new-spreadsheet = Nouvelle feuille de calcul
+menubar-help = Aide
 sidebar-home = Accueil
 sidebar-search = Rechercher
 sidebar-sign-out = Se déconnecter
@@ -77,7 +79,6 @@ notifications-empty = Aucune notification
 chat-section-title = Discussions
 chat-empty = Pas encore de discussions
 chat-back = ← Retour aux discussions
-chat-new = + Nouvelle discussion
 chat-message-placeholder = Saisissez un message…
 
 # ─── Document outline ───────────────────────────────────────────
@@ -455,6 +456,7 @@ ss-status-max = Max : { $value }
 
 # Sheet tabs
 ss-rename-sheet-prompt = Renommer la feuille :
+ss-touch-menu-aria = Actions de cellule
 ss-ctx-rename = Renommer
 ss-ctx-delete = Supprimer
 
@@ -874,7 +876,6 @@ menubar-doc-delete = Supprimer le document…
 menubar-edit-undo = Annuler
 menubar-edit-redo = Rétablir
 menubar-edit-find = Rechercher et remplacer
-menubar-edit-copy-anchor = Copier le lien d’ancrage
 menubar-view-comments = Afficher les commentaires
 menubar-view-conversation = Afficher la conversation
 menubar-view-cursors = Afficher les curseurs
@@ -882,11 +883,8 @@ menubar-view-focus = Mode focus
 menubar-view-line-numbers = Afficher les numéros de ligne
 menubar-view-page-breaks = Afficher les sauts de page
 menubar-view-outline = Afficher le plan
-menubar-view-outline-expanded = Garder le plan développé
 menubar-format-subscript = Indice
 menubar-format-superscript = Exposant
-menubar-format-text-color = Couleur du texte
-menubar-format-highlight = Surligner
 menubar-format-paragraph-style = Style de paragraphe
 menubar-format-list = Liste
 menubar-format-clear = Effacer la mise en forme

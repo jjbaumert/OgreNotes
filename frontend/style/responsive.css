@@ -112,6 +112,17 @@
     justify-content: center;
   }
 
+  /* Phone: hide the classic menu bar (28px rows are untappable and
+   * its formatting actions live in the bottom toolbar + overflow).
+   * Its document-level actions surface via the header's `⋯` button
+   * instead (.mobile-doc-actions, pages/document.rs). */
+  .menu-bar {
+    display: none;
+  }
+  .mobile-doc-actions {
+    display: block;
+  }
+
   /* Conserve doc-header real estate on narrow screens — drop the user
    * name; the avatar / notification bell + the share icon remain. */
   .doc-header-actions .user-name {
@@ -285,6 +296,13 @@
     background: var(--color-surface);
     border-top: 1px solid var(--color-border);
     overflow: visible;
+  }
+
+  /* The fixed toolbar floats OVER the layout — pad the spreadsheet so
+   * its bottom sheet-tab bar clears it (the tabs were unreachable
+   * underneath: taps landed on toolbar buttons instead). */
+  .spreadsheet-wrapper {
+    padding-bottom: calc(var(--mobile-toolbar-height) + env(safe-area-inset-bottom));
   }
 
   /* Mobile-only: the secondary toolbar groups collapse into a floating

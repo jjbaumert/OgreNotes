@@ -1059,10 +1059,10 @@ pub(super) fn parse_ss_block_id(s: &str) -> Option<(String, usize, usize)> {
 /// Clamp a context-menu's preferred (left, top) so the menu stays
 /// inside the viewport. Uses conservative menu-size estimates and
 /// flips the menu up / left when the natural placement would push
-/// it past the right or bottom edge. The CSS `.ss-ctx-menu` also
-/// caps `max-height` with `overflow-y: auto`, so a menu that's
-/// taller than the viewport stays scrollable in addition to being
-/// re-anchored upward.
+/// it past the right or bottom edge. The shared menu chrome
+/// (`components::menu`) clamps again from its own size estimate, so
+/// this trigger-side clamp is a harmless first pass that keeps the
+/// stored (x, y) sane for anything else that reads it.
 pub(super) fn clamp_menu_position(x: f64, y: f64) -> (f64, f64) {
     let window = web_sys::window();
     let vw = window.as_ref()
@@ -4859,6 +4859,35 @@ pub fn SpreadsheetView(
                     </div>
                 }.into_any()
             }}
+
+            // Touch devices: a persistent floating `⋮` opens the cell
+            // context menu for the active cell/selection. Long-press is
+            // taken by range-selection anchoring and the contextmenu
+            // event is suppressed during touch, so without this button
+            // the menu's actions (insert/delete rows, freeze, hide,
+            // validation, named ranges, …) are unreachable on touch.
+            {is_touch_primary().then(|| view! {
+                <button
+                    class="ss-touch-menu-btn"
+                    aria-haspopup="menu"
+                    aria-label=crate::t!("ss-touch-menu-aria")
+                    on:click=move |e: web_sys::MouseEvent| {
+                        e.stop_propagation();
+                        let (bx, by) = e
+                            .current_target()
+                            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                            .map(|el| {
+                                let r = el.get_bounding_client_rect();
+                                (r.left(), r.top())
+                            })
+                            .unwrap_or((e.client_x() as f64, e.client_y() as f64));
+                        let (mx, my) = clamp_menu_position(bx, by);
+                        set_ctx_menu_x.set(mx);
+                        set_ctx_menu_y.set(my);
+                        set_ctx_menu_visible.set(true);
+                    }
+                >"\u{22EE}"</button>
+            })}
 
             // ─── Context Menu ──────────────────────────────
             {render_context_menu(ContextMenuDeps {

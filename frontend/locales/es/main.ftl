@@ -39,10 +39,6 @@ common-restore-here = Restaurar aquí
 # ─── Sidebar ────────────────────────────────────────────────────
 
 sidebar-section-navigation = Navegación
-sidebar-section-recent = Recientes
-sidebar-section-pinned = Fijados
-sidebar-empty-recent = No hay elementos recientes
-sidebar-empty-pinned = No hay elementos fijados
 # Favorites (#144)
 document-favorite = Añadir a favoritos
 # Expand / full screen (#145)
@@ -51,6 +47,12 @@ document-expand-exit = Salir de pantalla completa
 document-unfavorite = Quitar de favoritos
 sidebar-section-favorites = Favoritos
 sidebar-empty-favorites = Aún no hay favoritos
+sidebar-doc-open-new-tab = Abrir en una pestaña nueva
+sidebar-doc-actions-aria = Acciones del documento
+sidebar-new-aria = Crear nuevo
+sidebar-new-document = Nuevo documento
+sidebar-new-spreadsheet = Nueva hoja de cálculo
+menubar-help = Ayuda
 sidebar-home = Inicio
 sidebar-search = Buscar
 sidebar-sign-out = Cerrar sesión
@@ -77,7 +79,6 @@ notifications-empty = No hay notificaciones
 chat-section-title = Chats
 chat-empty = Aún no hay chats
 chat-back = ← Volver a los chats
-chat-new = + Nuevo chat
 chat-message-placeholder = Escribe un mensaje…
 
 # ─── Document outline ───────────────────────────────────────────
@@ -455,6 +456,7 @@ ss-status-max = Máx.: { $value }
 
 # Sheet tabs
 ss-rename-sheet-prompt = Renombrar hoja:
+ss-touch-menu-aria = Acciones de celda
 ss-ctx-rename = Renombrar
 ss-ctx-delete = Eliminar
 
@@ -874,7 +876,6 @@ menubar-doc-delete = Eliminar documento…
 menubar-edit-undo = Deshacer
 menubar-edit-redo = Rehacer
 menubar-edit-find = Buscar y reemplazar
-menubar-edit-copy-anchor = Copiar enlace de anclaje
 menubar-view-comments = Mostrar comentarios
 menubar-view-conversation = Mostrar conversación
 menubar-view-cursors = Mostrar cursores
@@ -882,11 +883,8 @@ menubar-view-focus = Modo concentración
 menubar-view-line-numbers = Mostrar números de línea
 menubar-view-page-breaks = Mostrar saltos de página
 menubar-view-outline = Mostrar esquema
-menubar-view-outline-expanded = Mantener esquema expandido
 menubar-format-subscript = Subíndice
 menubar-format-superscript = Superíndice
-menubar-format-text-color = Color de texto
-menubar-format-highlight = Resaltar
 menubar-format-paragraph-style = Estilo de párrafo
 menubar-format-list = Lista
 menubar-format-clear = Borrar formato

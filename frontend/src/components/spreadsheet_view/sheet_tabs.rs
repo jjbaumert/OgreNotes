@@ -5,18 +5,23 @@
 //! Renders one button per sheet plus an "+" button that creates a new
 //! empty sheet. Tabs activate on single-click and rename on double-click
 //! via a native browser prompt. Right-click opens a small context menu
-//! with Rename / Delete actions; Delete dispatches through the
-//! `delete_sheet` callback the parent owns. All state lives in the
+//! (shared `components::menu` chrome — Escape, keyboard nav, viewport
+//! clamping) with Rename / Delete actions; Delete dispatches through
+//! the `delete_sheet` callback the parent owns. All state lives in the
 //! caller; this function takes the relevant signals + the persist
 //! closure by value (Leptos signals are `Copy`, the engine is a
 //! `&'static Mutex`, and `persist` is a `Copy` closure built by
 //! `SpreadsheetView`).
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Mutex;
 
 use leptos::prelude::*;
 
+use crate::components::menu::{ContextMenu, MenuEntry};
 use crate::spreadsheet::eval::SpreadsheetEngine;
+use crate::touch::{LONG_PRESS_MS, LongPressTracker, TOUCH_MOVE_THRESHOLD_PX, first_touch_xy};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_sheet_tab_bar(
@@ -31,9 +36,65 @@ pub(super) fn render_sheet_tab_bar(
     delete_sheet: impl Fn(usize) + Copy + Send + Sync + 'static,
 ) -> impl IntoView {
     // Local context-menu state. `Some((idx, x, y))` shows the menu at
-    // (x, y) for sheet `idx`; `None` hides it. Right-click on a tab
-    // sets it; clicking a menu item or the backdrop clears it.
+    // (x, y) for sheet `idx`; `None` hides it. Right-click or a
+    // long-press on a tab sets it; the shared menu chrome clears it on
+    // item click, backdrop click, or Escape.
     let (tab_menu, set_tab_menu) = signal::<Option<(usize, f64, f64)>>(None);
+
+    // Long-press on a tab opens the same menu — Delete has no other
+    // touch-reachable path (dblclick covers Rename). One tracker is
+    // shared across tabs; each tab's touchstart records which tab and
+    // where, and the tracker's timer callback reads it back. Both are
+    // `!Send` (Rc), so they live in LocalStorage stores and the view
+    // closures capture only the `Copy + Send` handles.
+    let pending_tab: StoredValue<Rc<RefCell<Option<(usize, f64, f64)>>>, LocalStorage> =
+        StoredValue::new_local(Rc::new(RefCell::new(None)));
+    let tab_tracker: StoredValue<Rc<LongPressTracker>, LocalStorage> = StoredValue::new_local(
+        LongPressTracker::new(LONG_PRESS_MS, TOUCH_MOVE_THRESHOLD_PX, move || {
+            let target = pending_tab.with_value(|p| *p.borrow());
+            if let Some((i, x, y)) = target {
+                set_tab_menu.set(Some((i, x, y)));
+            }
+        }),
+    );
+
+    let rename_sheet = move |idx: usize| {
+        if let Some(window) = web_sys::window() {
+            let current = sheet_names
+                .get_untracked()
+                .get(idx)
+                .cloned()
+                .unwrap_or_default();
+            if let Ok(Some(new_name)) = window
+                .prompt_with_message_and_default(&crate::t!("ss-rename-sheet-prompt"), &current)
+            {
+                if !new_name.trim().is_empty() {
+                    set_sheet_names.update(|names| {
+                        if idx < names.len() {
+                            names[idx] = new_name.trim().to_string();
+                        }
+                    });
+                    persist();
+                }
+            }
+        }
+    };
+
+    let menu_entries = Callback::new(move |()| {
+        let Some((idx, _, _)) = tab_menu.get() else {
+            return Vec::new();
+        };
+        // Refuse to delete when this is the only sheet — the doc must
+        // keep at least one table.
+        let can_delete = sheet_names.get().len() > 1;
+        vec![
+            MenuEntry::action(crate::t!("ss-ctx-rename"), move || rename_sheet(idx)),
+            MenuEntry::action(crate::t!("ss-ctx-delete"), move || delete_sheet(idx))
+                .disabled_when(!can_delete)
+                .danger(),
+        ]
+    });
+
     view! {
         <div class="ss-sheet-tabs">
             {move || {
@@ -42,7 +103,6 @@ pub(super) fn render_sheet_tab_bar(
                 names.iter().enumerate().map(|(i, name)| {
                     let is_active = i == active;
                     let name_display = name.clone();
-                    let name_for_rename = name.clone();
                     view! {
                         <button
                             class="ss-sheet-tab"
@@ -55,31 +115,24 @@ pub(super) fn render_sheet_tab_bar(
                             }
                             on:contextmenu=move |e: web_sys::MouseEvent| {
                                 e.prevent_default();
-                                // Sheet tabs sit at the bottom of the
-                                // viewport, so the menu would extend
-                                // off-screen without clamping. The
-                                // shared `clamp_menu_position` flips
-                                // it upward when needed.
-                                let (mx, my) = super::clamp_menu_position(
-                                    e.client_x() as f64,
-                                    e.client_y() as f64,
-                                );
-                                set_tab_menu.set(Some((i, mx, my)));
+                                // Raw click coordinates — the shared menu
+                                // clamps itself to the viewport, which
+                                // matters here: the tabs sit at the very
+                                // bottom, so the menu always flips up.
+                                set_tab_menu.set(Some((i, e.client_x() as f64, e.client_y() as f64)));
                             }
-                            on:dblclick=move |_| {
-                                if let Some(window) = web_sys::window() {
-                                    if let Ok(Some(new_name)) = window.prompt_with_message_and_default(
-                                        &crate::t!("ss-rename-sheet-prompt"), &name_for_rename,
-                                    ) {
-                                        if !new_name.trim().is_empty() {
-                                            set_sheet_names.update(|names| {
-                                                if i < names.len() { names[i] = new_name.trim().to_string(); }
-                                            });
-                                            persist();
-                                        }
-                                    }
+                            on:dblclick=move |_| rename_sheet(i)
+                            on:touchstart=move |ev: web_sys::TouchEvent| {
+                                if let Some((x, y)) = first_touch_xy(&ev) {
+                                    pending_tab.with_value(|p| *p.borrow_mut() = Some((i, x, y)));
                                 }
+                                tab_tracker.with_value(|t| t.on_start(&ev));
                             }
+                            on:touchmove=move |ev: web_sys::TouchEvent| {
+                                tab_tracker.with_value(|t| t.on_move(&ev));
+                            }
+                            on:touchend=move |_| tab_tracker.with_value(|t| t.on_end())
+                            on:touchcancel=move |_| tab_tracker.with_value(|t| t.on_end())
                         >{name_display}</button>
                     }
                 }).collect::<Vec<_>>()
@@ -94,52 +147,13 @@ pub(super) fn render_sheet_tab_bar(
             }>"+"</button>
 
             // ─── Tab context menu (right-click → Rename / Delete) ──
-            {move || {
-                let Some((idx, x, y)) = tab_menu.get() else {
-                    return view! { <span></span> }.into_any();
-                };
-                let names_len = sheet_names.get().len();
-                // Refuse to delete when this is the only sheet — the
-                // doc must keep at least one table.
-                let can_delete = names_len > 1;
-                let menu_style = format!("left:{}px;top:{}px;", x, y);
-                view! {
-                    <>
-                        <div class="ss-ctx-backdrop"
-                            on:mousedown=move |_| set_tab_menu.set(None)>
-                        </div>
-                        <div class="ss-ctx-menu" style=menu_style>
-                            <button class="ss-ctx-item"
-                                on:click=move |_| {
-                                    set_tab_menu.set(None);
-                                    if let Some(window) = web_sys::window() {
-                                        let current = sheet_names.get_untracked()
-                                            .get(idx).cloned().unwrap_or_default();
-                                        if let Ok(Some(new_name)) = window.prompt_with_message_and_default(
-                                            &crate::t!("ss-rename-sheet-prompt"), &current,
-                                        ) {
-                                            if !new_name.trim().is_empty() {
-                                                set_sheet_names.update(|names| {
-                                                    if idx < names.len() {
-                                                        names[idx] = new_name.trim().to_string();
-                                                    }
-                                                });
-                                                persist();
-                                            }
-                                        }
-                                    }
-                                }>{crate::t!("ss-ctx-rename")}</button>
-                            <button class="ss-ctx-item"
-                                prop:disabled=!can_delete
-                                on:click=move |_| {
-                                    set_tab_menu.set(None);
-                                    if !can_delete { return; }
-                                    delete_sheet(idx);
-                                }>{crate::t!("ss-ctx-delete")}</button>
-                        </div>
-                    </>
-                }.into_any()
-            }}
+            <ContextMenu
+                visible=Signal::derive(move || tab_menu.get().is_some())
+                x=Signal::derive(move || tab_menu.get().map(|(_, x, _)| x).unwrap_or_default())
+                y=Signal::derive(move || tab_menu.get().map(|(_, _, y)| y).unwrap_or_default())
+                entries=menu_entries
+                on_close=Callback::new(move |()| set_tab_menu.set(None))
+            />
         </div>
     }
 }

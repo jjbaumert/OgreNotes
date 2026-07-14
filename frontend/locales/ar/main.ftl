@@ -44,10 +44,6 @@ common-restore-here = استعادة هنا
 # ─── Sidebar ────────────────────────────────────────────────────
 
 sidebar-section-navigation = التنقل
-sidebar-section-recent = الأخيرة
-sidebar-section-pinned = المثبتة
-sidebar-empty-recent = لا توجد عناصر حديثة
-sidebar-empty-pinned = لا توجد عناصر مثبتة
 # Favorites (#144)
 document-favorite = إضافة إلى المفضلة
 # Expand / full screen (#145)
@@ -56,6 +52,12 @@ document-expand-exit = الخروج من ملء الشاشة
 document-unfavorite = إزالة من المفضلة
 sidebar-section-favorites = المفضلة
 sidebar-empty-favorites = لا توجد عناصر مفضلة بعد
+sidebar-doc-open-new-tab = فتح في علامة تبويب جديدة
+sidebar-doc-actions-aria = إجراءات المستند
+sidebar-new-aria = إنشاء جديد
+sidebar-new-document = مستند جديد
+sidebar-new-spreadsheet = جدول بيانات جديد
+menubar-help = مساعدة
 sidebar-home = الرئيسية
 sidebar-search = بحث
 sidebar-sign-out = تسجيل الخروج
@@ -82,7 +84,6 @@ notifications-empty = لا توجد إشعارات
 chat-section-title = المحادثات
 chat-empty = لا توجد محادثات بعد
 chat-back = ← العودة إلى المحادثات
-chat-new = + محادثة جديدة
 chat-message-placeholder = اكتب رسالة…
 
 # ─── Document outline ───────────────────────────────────────────
@@ -460,6 +461,7 @@ ss-status-max = الأعلى: { $value }
 
 # Sheet tabs
 ss-rename-sheet-prompt = إعادة تسمية الورقة:
+ss-touch-menu-aria = إجراءات الخلية
 ss-ctx-rename = إعادة تسمية
 ss-ctx-delete = حذف
 
@@ -877,7 +879,6 @@ menubar-doc-delete = حذف المستند…
 menubar-edit-undo = تراجع
 menubar-edit-redo = إعادة
 menubar-edit-find = بحث واستبدال
-menubar-edit-copy-anchor = نسخ رابط الإرساء
 menubar-view-comments = إظهار التعليقات
 menubar-view-conversation = إظهار المحادثة
 menubar-view-cursors = إظهار المؤشرات
@@ -885,11 +886,8 @@ menubar-view-focus = وضع التركيز
 menubar-view-line-numbers = إظهار أرقام الأسطر
 menubar-view-page-breaks = إظهار فواصل الصفحات
 menubar-view-outline = إظهار المخطط
-menubar-view-outline-expanded = إبقاء المخطط موسّعًا
 menubar-format-subscript = منخفض
 menubar-format-superscript = مرتفع
-menubar-format-text-color = لون النص
-menubar-format-highlight = تمييز
 menubar-format-paragraph-style = نمط الفقرة
 menubar-format-list = قائمة
 menubar-format-clear = مسح التنسيق
