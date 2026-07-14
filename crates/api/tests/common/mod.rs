@@ -356,6 +356,7 @@ impl TestApp {
             rate_limit_content_write_per_min: 5,
             rate_limit_user_search_per_min: 3,
             rate_limit_ws_upgrade_per_min: 5,
+            rate_limit_ws_messages_per_min: 6000,
             rate_limit_dev_login_per_min: 1000,
             rate_limit_rum_per_min: 100,
             rate_limit_client_telemetry_per_min: 100,

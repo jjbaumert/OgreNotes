@@ -198,6 +198,16 @@ pub struct AppConfig {
     /// open is rare in steady state; this bounds reconnect-storm
     /// damage from a compromised token.
     pub rate_limit_ws_upgrade_per_min: u64,
+    /// Per-user cap on WebSocket frames that hit the persist path
+    /// (`Update` / `SyncStep2`) per minute (#58/T-2). `ws_upgrade` limits
+    /// connection establishment; this limits per-message writes once open.
+    /// A legit client debounces outgoing updates (~16ms → ~60 frames/s max),
+    /// so a generous default leaves editing untouched while bounding a
+    /// client that bypasses the debounce and floods the persist path at
+    /// socket speed. On breach the connection is closed (the client
+    /// reconnects and resyncs) rather than the frame dropped — a dropped
+    /// `Update` would silently desync its CRDT.
+    pub rate_limit_ws_messages_per_min: u64,
     /// Per-IP cap on `/auth/dev-login` requests per minute. Replaces
     /// the M-E2-era bespoke DashMap limiter so dev-login uses the
     /// same Redis-backed module as every other gate. Tagged with the
@@ -549,6 +559,9 @@ impl AppConfig {
             rate_limit_ws_upgrade_per_min: env_or("RATE_LIMIT_WS_UPGRADE_PER_MIN", "30")
                 .parse()
                 .unwrap_or_else(|_| panic!("RATE_LIMIT_WS_UPGRADE_PER_MIN must be a positive integer")),
+            rate_limit_ws_messages_per_min: env_or("RATE_LIMIT_WS_MESSAGES_PER_MIN", "6000")
+                .parse()
+                .unwrap_or_else(|_| panic!("RATE_LIMIT_WS_MESSAGES_PER_MIN must be a positive integer")),
             rate_limit_client_telemetry_per_min: env_or("RATE_LIMIT_CLIENT_TELEMETRY_PER_MIN", "12")
                 .parse()
                 .unwrap_or_else(|_| panic!("RATE_LIMIT_CLIENT_TELEMETRY_PER_MIN must be a positive integer")),
@@ -756,6 +769,7 @@ mod tests {
             rate_limit_content_write_per_min: 60,
             rate_limit_user_search_per_min: 60,
             rate_limit_ws_upgrade_per_min: 30,
+            rate_limit_ws_messages_per_min: 6000,
             rate_limit_client_telemetry_per_min: 12,
             rate_limit_rum_per_min: 60,
             rate_limit_import_per_min: 10,
@@ -967,6 +981,7 @@ mod tests {
             rate_limit_content_write_per_min: 60,
             rate_limit_user_search_per_min: 60,
             rate_limit_ws_upgrade_per_min: 30,
+            rate_limit_ws_messages_per_min: 6000,
             rate_limit_client_telemetry_per_min: 12,
             rate_limit_rum_per_min: 60,
             rate_limit_import_per_min: 10,

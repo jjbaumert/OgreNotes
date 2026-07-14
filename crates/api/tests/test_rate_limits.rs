@@ -566,3 +566,57 @@ async fn saml_acs_rate_limit_returns_429_per_source_ip() {
 
     app.cleanup().await;
 }
+
+/// #58/T-2: the per-user WS message limiter (scope `ws_message`) denies
+/// once a user exceeds the budget in the window. This is the mechanism the
+/// `ws.rs` recv loop calls (`ws_message_rate_limited`) before persisting an
+/// `Update`/`SyncStep2`, closing the socket on breach so a client can't
+/// flood the persist path at socket speed.
+///
+/// The in-loop gate itself needs a real TCP WebSocket, which the oneshot
+/// test transport can't provide (see the note on ws_upgrade handler tests
+/// in test_ws.rs), so we exercise the `enforce` path that backs it directly
+/// with a low budget.
+#[tokio::test]
+async fn ws_message_rate_limit_denies_after_budget() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    // Unique per run: `check` is a fixed-window INCR whose Redis key
+    // (`ratelimit:ws_message:<user>:<bucket>`) survives to the bucket
+    // boundary. A hardcoded identifier would let a re-run within the same
+    // 60s bucket start already over budget (shared local Redis), so derive
+    // a fresh identifier each run.
+    let user = format!(
+        "ws-msg-rl-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let user = user.as_str();
+    let limit = 3u64;
+
+    common::align_rate_limit_window().await;
+    for i in 0..limit {
+        assert!(
+            ogrenotes_api::middleware::rate_limit::enforce(
+                &app.state.redis, "ws_message", user, limit, 60
+            )
+            .await
+            .is_ok(),
+            "frame {i} under budget must be allowed"
+        );
+    }
+    // The next frame is over budget — the recv loop closes the socket here.
+    assert!(
+        ogrenotes_api::middleware::rate_limit::enforce(
+            &app.state.redis, "ws_message", user, limit, 60
+        )
+        .await
+        .is_err(),
+        "frame over the per-user WS message budget must be denied"
+    );
+
+    app.cleanup().await;
+}
