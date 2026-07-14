@@ -39,10 +39,6 @@ common-restore-here = Ripristina qui
 # ─── Sidebar ────────────────────────────────────────────────────
 
 sidebar-section-navigation = Navigazione
-sidebar-section-recent = Recenti
-sidebar-section-pinned = In evidenza
-sidebar-empty-recent = Nessun elemento recente
-sidebar-empty-pinned = Nessun elemento in evidenza
 # Favorites (#144)
 document-favorite = Aggiungi ai preferiti
 # Expand / full screen (#145)
@@ -79,7 +75,6 @@ notifications-empty = Nessuna notifica
 chat-section-title = Chat
 chat-empty = Nessuna chat ancora
 chat-back = ← Torna alle chat
-chat-new = + Nuova chat
 chat-message-placeholder = Scrivi un messaggio…
 
 # ─── Document outline ───────────────────────────────────────────
@@ -877,7 +872,6 @@ menubar-doc-delete = Elimina documento…
 menubar-edit-undo = Annulla
 menubar-edit-redo = Ripeti
 menubar-edit-find = Trova e sostituisci
-menubar-edit-copy-anchor = Copia link àncora
 menubar-view-comments = Mostra commenti
 menubar-view-conversation = Mostra conversazione
 menubar-view-cursors = Mostra cursori
@@ -885,11 +879,8 @@ menubar-view-focus = Modalità focus
 menubar-view-line-numbers = Mostra numeri di riga
 menubar-view-page-breaks = Mostra interruzioni di pagina
 menubar-view-outline = Mostra struttura
-menubar-view-outline-expanded = Mantieni struttura espansa
 menubar-format-subscript = Pedice
 menubar-format-superscript = Apice
-menubar-format-text-color = Colore testo
-menubar-format-highlight = Evidenzia
 menubar-format-paragraph-style = Stile paragrafo
 menubar-format-list = Elenco
 menubar-format-clear = Cancella formattazione

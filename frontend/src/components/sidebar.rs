@@ -430,12 +430,9 @@ pub fn Sidebar(
                 })}
             </div>
 
-            <div class="sidebar-section" style:display=move || if collapsed.get() { "none" } else { "block" }>
-                <div class="sidebar-section-title">{crate::t!("sidebar-section-recent")}</div>
-                <div class="sidebar-item sidebar-item-muted">
-                    {crate::t!("sidebar-empty-recent")}
-                </div>
-            </div>
+            // The "Recent" section that used to sit here was a
+            // hardcoded, permanently-empty placeholder — removed until
+            // a real recents source exists.
 
             <div class="sidebar-section" style:display=move || if collapsed.get() { "none" } else { "block" }>
                 <div class="sidebar-section-title">{crate::t!("sidebar-section-favorites")}</div>

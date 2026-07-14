@@ -203,21 +203,19 @@ pub fn MenuBar(
     let document_entries =
         Callback::new(move |()| document_menu_entries(on_doc_action, is_template));
 
+    // Cut/Copy/Paste and "Copy Anchor Link" are deliberately absent:
+    // the clipboard rows were no-ops that only closed the menu (the
+    // browser shortcuts and the editor's right-click menu do the real
+    // work), and Copy Anchor Link dispatched the identical CopyLink
+    // action the Document menu already offers.
     let edit_entries = Callback::new(move |()| {
         vec![
             cmd(crate::t!("menubar-edit-undo"), ToolbarCommand::Undo).with_shortcut("Ctrl+Z"),
             cmd(crate::t!("menubar-edit-redo"), ToolbarCommand::Redo)
                 .with_shortcut("Ctrl+Shift+Z"),
             MenuEntry::Separator,
-            // Handled natively by the browser.
-            MenuEntry::action(crate::t!("menu-cut"), || {}).with_shortcut("Ctrl+X"),
-            MenuEntry::action(crate::t!("menu-copy"), || {}).with_shortcut("Ctrl+C"),
-            MenuEntry::action(crate::t!("menu-paste"), || {}).with_shortcut("Ctrl+V"),
-            MenuEntry::Separator,
             doc(crate::t!("menubar-edit-find"), DocAction::OpenFindReplace)
                 .with_shortcut("Ctrl+F"),
-            doc(crate::t!("menubar-edit-copy-anchor"), DocAction::CopyLink)
-                .with_shortcut("Ctrl+Shift+A"),
         ]
     });
 
@@ -246,12 +244,9 @@ pub fn MenuBar(
             ),
             MenuEntry::Separator,
             toggle(crate::t!("menubar-view-outline"), outline_visible, DocAction::ToggleOutline),
-            // TODO: separate "keep expanded" preference
-            MenuEntry::action(crate::t!("menubar-view-outline-expanded"), || {})
-                .with_shortcut("Ctrl+Shift+O"),
-            MenuEntry::Separator,
-            doc(crate::t!("menubar-doc-history"), DocAction::DocumentHistory)
-                .with_shortcut("Ctrl+Shift+H"),
+            // "Keep Outline Expanded" (a TODO no-op) and a duplicate
+            // "Document History" row were removed — History lives in
+            // the Document menu.
         ]
     });
 
@@ -299,10 +294,9 @@ pub fn MenuBar(
             cmd(crate::t!("menubar-format-superscript"), ToolbarCommand::ToggleSuperscript)
                 .with_icon("x\u{00B2}")
                 .with_shortcut("Ctrl+."),
-            // Opens color picker from toolbar — close menu.
-            MenuEntry::action(crate::t!("menubar-format-text-color"), || {}).with_icon("A"),
-            MenuEntry::action(crate::t!("menubar-format-highlight"), || {})
-                .with_icon("\u{270F}"),
+            // Text Color / Highlight rows were no-op stubs — the real
+            // pickers live in the toolbar and can't be triggered from
+            // here without opening them there anyway.
             cmd(crate::t!("menu-code"), ToolbarCommand::ToggleCode)
                 .with_icon("</>")
                 .with_shortcut("Ctrl+Shift+K"),
