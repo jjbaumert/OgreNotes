@@ -313,6 +313,120 @@ html, body {
   height: 100%;
 }
 
+/* ─── Shared menu primitive (components/menu) ────────────────────
+   One chrome for every dropdown/context menu: menu bar, editor and
+   spreadsheet right-click menus, sheet tabs, account menu. Backdrop
+   at z-index 99 / panel at 100 — the same stacking contract the
+   per-surface menus used, so `.menu-bar-item` (101) still floats
+   above an open menu's backdrop for hover-switching. */
+.ui-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 99;
+}
+.ui-menu {
+  position: fixed;
+  z-index: 100;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 4px 0;
+  min-width: 200px;
+  max-width: min(320px, calc(100vw - 8px));
+  /* Submenu fly-outs extend past the panel edge; `overflow: auto`
+     would clip them (see the note on the old .ss-ctx-menu). */
+  overflow: visible;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+}
+.ui-menu-anchored {
+  position: absolute;
+  top: 100%;
+  inset-inline-start: 0;
+}
+.ui-menu-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 5px 12px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--color-text);
+  text-align: start;
+  white-space: nowrap;
+}
+/* Highlight is driven by the nav state (hover and keyboard both set
+   it), not :hover — so arrow keys and mouse produce one visual. */
+.ui-menu-item.active {
+  background: var(--color-mist);
+}
+.ui-menu-item:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.ui-menu-item:disabled.active {
+  background: transparent;
+}
+.ui-menu-item-danger {
+  color: var(--color-danger, #c0392b);
+}
+.ui-menu-check {
+  width: 18px;
+  text-align: center;
+  color: var(--color-primary);
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.ui-menu-icon {
+  width: 22px;
+  text-align: center;
+  font-weight: 700;
+  color: var(--color-text-secondary);
+  flex-shrink: 0;
+  font-size: 13px;
+}
+.ui-menu-label {
+  flex: 1;
+}
+.ui-menu-item[aria-checked="true"] .ui-menu-label {
+  color: var(--color-primary);
+}
+.ui-menu-shortcut {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+  margin-inline-start: 16px;
+}
+.ui-menu-arrow {
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  margin-inline-start: auto;
+  padding-inline-start: 12px;
+}
+.ui-menu-sep {
+  height: 1px;
+  background: var(--color-border);
+  margin: 4px 8px;
+}
+.ui-menu-subwrap {
+  position: relative;
+}
+.ui-menu-sub {
+  position: absolute;
+  inset-inline-start: 100%;
+  top: -5px; /* align the fly-out's first item with its parent row */
+  max-height: calc(100vh - 20px);
+  overflow-y: auto;
+}
+/* Near the viewport's right edge the container flags the menu so
+   fly-outs cascade leftward instead of clipping (every depth). */
+.ui-menu-flip-x .ui-menu-sub {
+  inset-inline-start: auto;
+  inset-inline-end: 100%;
+}
+
 /* Toolbar */
 /* Menu bar (Document | Edit | View | Insert | Format) */
 .menu-bar {
