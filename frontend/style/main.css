@@ -370,7 +370,7 @@ html, body {
   background: transparent;
 }
 .ui-menu-item-danger {
-  color: var(--color-danger, #c0392b);
+  color: var(--color-text-error);
 }
 .ui-menu-check {
   width: 18px;
@@ -5802,20 +5802,13 @@ tr:hover .folder-row-actions,
   font-size: 12px;
   color: var(--color-on-brand-anchor-muted);
 }
-.account-menu-dropdown {
-  position: absolute;
+/* Placement override for the shared menu panel: the account menu
+   opens UPWARD from the sidebar footer and spans the trigger width. */
+.account-menu-drop {
+  top: auto;
   bottom: calc(100% + 4px);
-  left: 0;
-  right: 0;
-  z-index: 100;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 4px;
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  inset-inline: 0;
+  min-width: 0;
 }
 .account-menu-identity {
   display: flex;
@@ -5840,25 +5833,6 @@ tr:hover .folder-row-actions,
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.account-menu-item {
-  display: block;
-  width: 100%;
-  text-align: start;
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  padding: var(--space-sm);
-  border-radius: var(--radius-sm);
-  font-size: 13px;
-  color: var(--color-text);
-}
-.account-menu-item:hover {
-  background: var(--color-mist);
-}
-.account-menu-item-danger {
-  color: var(--color-text-error);
-}
-
 /* ─── Settings — profile form (account-menu step 4) ─────────────
  * Text inputs + the read-only email row + the save action row.
  * Reuses the .settings-field column layout from step 2. */

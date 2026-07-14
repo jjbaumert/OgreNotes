@@ -7,9 +7,11 @@
 //! identity (name + email), a link to the Profile section, a link to
 //! Settings, and Sign out.
 //!
-//! Open/close uses the same simple toggle + `<Show>` pattern as
-//! `notification_bell.rs` (no outside-click backdrop) — the menu's
-//! items all navigate away, and re-clicking the trigger closes it.
+//! Chrome comes from the shared `components::menu` primitive
+//! (`AnchoredMenu`), which supplies the outside-click backdrop,
+//! Escape close, and keyboard navigation the original hand-rolled
+//! dropdown lacked. The identity block rides in the menu's `header`
+//! slot.
 //!
 //! The avatar prefers the stored `avatar_url` (OAuth users get a real
 //! photo) and falls back to initials derived from the display name,
@@ -20,10 +22,12 @@
 //! `/settings#help`, which renders the platform-aware shortcut keys
 //! and the build version via `help_panel()` in `pages/settings.rs`.
 
+use leptos::children::ViewFn;
 use leptos::prelude::*;
 use serde::Deserialize;
 
 use crate::api::client;
+use crate::components::menu::{AnchoredMenu, MenuEntry};
 
 /// Slim `/users/me` decode — the avatar URL plus the (already
 /// expiry-filtered) status. Name/email come from the synchronous auth
@@ -71,14 +75,13 @@ pub fn AccountMenu() -> impl IntoView {
     // #152: navigate to a settings anchor client-side (no full reload) via the
     // shell-installed nav bridge. The settings page reads the location hash
     // reactively, so a same-page tab change still lands; a full load is the
-    // fallback if the bridge isn't installed.
-    let go = move |anchor: &'static str| {
-        set_open.set(false);
-        crate::commands::nav_bridge::go(anchor);
+    // fallback if the bridge isn't installed. (The menu closes itself after
+    // any item activation.)
+    let go = |anchor: &'static str| {
+        move || crate::commands::nav_bridge::go(anchor)
     };
 
-    let sign_out = move |_| {
-        set_open.set(false);
+    let sign_out = move || {
         leptos::task::spawn_local(async move {
             client::logout().await;
             if let Some(window) = web_sys::window() {
@@ -87,8 +90,29 @@ pub fn AccountMenu() -> impl IntoView {
         });
     };
 
+    let entries = Callback::new(move |()| {
+        vec![
+            MenuEntry::action(crate::t!("account-menu-profile"), go("/settings#profile")),
+            MenuEntry::action(crate::t!("account-menu-settings"), go("/settings#appearance")),
+            MenuEntry::action(crate::t!("account-menu-shortcuts"), go("/settings#help")),
+            MenuEntry::action(crate::t!("sidebar-sign-out"), sign_out).danger(),
+        ]
+    });
+
     let trigger_name = name.clone();
     let initials_for_avatar = initials.clone();
+    let header_name = name.clone();
+    let header_email = email.clone();
+    let header = ViewFn::from(move || {
+        let name = header_name.clone();
+        let email = header_email.clone();
+        view! {
+            <div class="account-menu-identity">
+                <span class="account-menu-identity-name">{name}</span>
+                <span class="account-menu-identity-email">{email}</span>
+            </div>
+        }
+    });
 
     view! {
         <div class="account-menu">
@@ -127,42 +151,13 @@ pub fn AccountMenu() -> impl IntoView {
                 <span class="account-menu-chevron" aria-hidden="true">"\u{25BE}"</span>
             </button>
 
-            <Show when=move || open.get()>
-                <div class="account-menu-dropdown" role="menu">
-                    <div class="account-menu-identity">
-                        <span class="account-menu-identity-name">{name.clone()}</span>
-                        <span class="account-menu-identity-email">{email.clone()}</span>
-                    </div>
-                    <button
-                        class="account-menu-item"
-                        role="menuitem"
-                        on:click=move |_| go("/settings#profile")
-                    >
-                        {crate::t!("account-menu-profile")}
-                    </button>
-                    <button
-                        class="account-menu-item"
-                        role="menuitem"
-                        on:click=move |_| go("/settings#appearance")
-                    >
-                        {crate::t!("account-menu-settings")}
-                    </button>
-                    <button
-                        class="account-menu-item"
-                        role="menuitem"
-                        on:click=move |_| go("/settings#help")
-                    >
-                        {crate::t!("account-menu-shortcuts")}
-                    </button>
-                    <button
-                        class="account-menu-item account-menu-item-danger"
-                        role="menuitem"
-                        on:click=sign_out
-                    >
-                        {crate::t!("sidebar-sign-out")}
-                    </button>
-                </div>
-            </Show>
+            <AnchoredMenu
+                open=open
+                entries=entries
+                on_close=Callback::new(move |()| set_open.set(false))
+                class="account-menu-drop"
+                header=header
+            />
         </div>
     }
 }
