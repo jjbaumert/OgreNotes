@@ -7,6 +7,11 @@
 //! show/hide every row matching the value via `hidden_rows`. "Show All"
 //! resets the hidden-rows set. Clicking the backdrop or any item
 //! dismisses the popup by setting `filter_col` back to `None`.
+//!
+//! Not a `components::menu` menu — the value list is stateful (checked
+//! glyphs, custom-filter prompt) and the popup anchors to the filter
+//! button via its own `.ss-filter-popup` CSS. It borrows the shared
+//! `.ui-menu-*` item/backdrop/separator chrome for visual consistency.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -42,14 +47,14 @@ pub(super) fn render_filter_dropdown(
         let current_hidden = hidden_rows.get();
 
         view! {
-            <div class="ss-ctx-backdrop" on:click=move |_| set_filter_col.set(None)></div>
+            <div class="ui-menu-backdrop" on:click=move |_| set_filter_col.set(None)></div>
             <div class="ss-filter-popup">
                 <div class="ss-filter-header">{crate::t!("ss-filter-header", col = col_to_letters(col))}</div>
-                <button class="ss-ctx-item" on:click=move |_| {
+                <button class="ui-menu-item" on:click=move |_| {
                     set_hidden_rows.set(HashSet::new());
                     set_filter_col.set(None);
                 }>{crate::t!("ss-filter-show-all")}</button>
-                <button class="ss-ctx-item" on:click=move |_| {
+                <button class="ui-menu-item" on:click=move |_| {
                     if let Some(window) = web_sys::window() {
                         if let Ok(Some(input)) = window.prompt_with_message(
                             &crate::t!("ss-filter-custom-prompt"),
@@ -82,7 +87,7 @@ pub(super) fn render_filter_dropdown(
                     }
                     set_filter_col.set(None);
                 }>{crate::t!("ss-filter-custom-button")}</button>
-                <div class="ss-ctx-sep"></div>
+                <div class="ui-menu-sep"></div>
                 {unique_vals.into_iter().map(|val| {
                     let val_for_check = val.clone();
                     let val_for_label = val.clone();
@@ -96,7 +101,7 @@ pub(super) fn render_filter_dropdown(
                         })
                     };
                     view! {
-                        <button class="ss-ctx-item" on:click=move |_| {
+                        <button class="ui-menu-item" on:click=move |_| {
                             let eng = engine.lock().unwrap();
                             let rows = grid_rows.get_untracked();
                             set_hidden_rows.update(|hidden| {

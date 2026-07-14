@@ -333,8 +333,8 @@ html, body {
   padding: 4px 0;
   min-width: 200px;
   max-width: min(320px, calc(100vw - 8px));
-  /* Submenu fly-outs extend past the panel edge; `overflow: auto`
-     would clip them (see the note on the old .ss-ctx-menu). */
+  /* Submenu fly-outs extend past the panel edge; an `overflow-y: auto`
+     here would force overflow-x to auto too and clip them. */
   overflow: visible;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
 }
