@@ -782,23 +782,35 @@ pub(crate) async fn fetch_folder_grants(
     meta: &DocumentMeta,
     user_id: &str,
 ) -> Vec<FolderGrant> {
-    let mut grants = Vec::new();
-    for folder_id in meta.folder_id.iter().chain(meta.additional_folder_ids.iter()) {
-        let Some(folder) = state.folder_repo.get(folder_id).await.ok().flatten() else {
-            continue;
-        };
-        let inherit_mode = folder.inherit_mode.clone();
-        let member = if matches!(
-            inherit_mode,
-            ogrenotes_storage::models::InheritMode::Restricted
-        ) {
-            None
-        } else {
-            state.folder_repo.get_member(folder_id, user_id).await.ok().flatten()
-        };
-        grants.push(FolderGrant { inherit_mode, member });
-    }
-    grants
+    // Fetch every containing folder's grant concurrently (#39). A doc in N
+    // folders previously did N sequential round-trips on the access path
+    // (each a `get` plus a conditional `get_member`); now the per-folder
+    // work runs in parallel. `join_all` preserves input order, so the grant
+    // ordering is identical to the old sequential loop. The two reads within
+    // a single folder stay sequential — `get_member` is only issued once
+    // `get` reveals the folder isn't `Restricted`.
+    let per_folder = meta
+        .folder_id
+        .iter()
+        .chain(meta.additional_folder_ids.iter())
+        .map(|folder_id| async move {
+            let folder = state.folder_repo.get(folder_id).await.ok().flatten()?;
+            let inherit_mode = folder.inherit_mode.clone();
+            let member = if matches!(
+                inherit_mode,
+                ogrenotes_storage::models::InheritMode::Restricted
+            ) {
+                None
+            } else {
+                state.folder_repo.get_member(folder_id, user_id).await.ok().flatten()
+            };
+            Some(FolderGrant { inherit_mode, member })
+        });
+    futures_util::future::join_all(per_folder)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// Variant of `check_doc_access` that returns successfully for soft-deleted
