@@ -11,6 +11,25 @@ use crate::flowchart::{shapes, EdgeKind, FlowGraph, Head};
 use crate::measure;
 use crate::layout::{Direction, Layout};
 
+/// Horizontal (or vertical, in LR/RL flow) bow between paired edges so
+/// opposing/parallel edges don't overlap.
+const PARALLEL_BOW: f64 = 20.0;
+
+/// A curve between two endpoints bowed off its midpoint (perpendicular to the
+/// flow axis) so parallel edges between the same node pair separate.
+fn bowed_path(points: &[(f64, f64)], off: f64, vertical: bool) -> String {
+    if points.len() < 2 || off == 0.0 {
+        return crate::curved_path(points, vertical);
+    }
+    let start = points[0];
+    let end = *points.last().unwrap();
+    let mx = (start.0 + end.0) / 2.0;
+    let my = (start.1 + end.1) / 2.0;
+    // In top-down flow bow horizontally; in left-right flow bow vertically.
+    let mid = if vertical { (mx + off, my) } else { (mx, my + off) };
+    crate::curved_path(&[start, mid, end], vertical)
+}
+
 pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
     let (w, h) = l.size;
     let mut out = format!(
@@ -52,13 +71,34 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
     }
 
     // 4. edges (+ label mask rects + label texts)
-    for ep in &l.edge_paths {
+    // Detect node pairs joined by more than one edge (parallel or opposing,
+    // e.g. a `B-->D` / `D-->B` feedback loop) so we can bow them apart instead
+    // of stacking them into one overlapping line.
+    let mut multi: std::collections::HashMap<(usize, usize), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, ep) in l.edge_paths.iter().enumerate() {
+        let e = &g.edges[ep.edge];
+        if e.from != e.to {
+            multi.entry((e.from.min(e.to), e.from.max(e.to))).or_default().push(i);
+        }
+    }
+    for (i, ep) in l.edge_paths.iter().enumerate() {
         let e = &g.edges[ep.edge];
         if e.kind == EdgeKind::Invisible {
             continue; // participates in layout; draws nothing
         }
         let vertical = matches!(g.direction, Direction::TB | Direction::BT);
-        let d = crate::curved_path(&ep.points, vertical);
+        // Bow apart only genuine multi-edges between the same pair, and only
+        // when the routing is simple (<= 3 points) — long routed edges keep
+        // their waypoints untouched to avoid regressing complex layouts.
+        let d = match multi.get(&(e.from.min(e.to), e.from.max(e.to))) {
+            Some(grp) if grp.len() > 1 && ep.points.len() <= 3 => {
+                let pos = grp.iter().position(|&x| x == i).unwrap_or(0);
+                let off = (pos as f64 - (grp.len() as f64 - 1.0) / 2.0) * PARALLEL_BOW;
+                bowed_path(&ep.points, off, vertical)
+            }
+            _ => crate::curved_path(&ep.points, vertical),
+        };
         // Line style from the kind family; heads from the edge ends.
         let line_attrs = match e.kind {
             EdgeKind::Arrow | EdgeKind::Open | EdgeKind::Invisible => "",

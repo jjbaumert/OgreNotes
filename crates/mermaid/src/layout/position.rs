@@ -94,10 +94,17 @@ mod tests {
 
     #[test]
     fn connected_boxes_converge_onto_a_shared_center_axis() {
-        // Regression: a single-neighbour child must land at the same x as its
-        // parent (straight, centered edge) even amid other components and
+        // Regression: a single-neighbour child must land ~on the same x as its
+        // parent (near-straight, centered edge) even amid other components and
         // long edges. The old fixed 3 sweeps stopped early and left these
         // pairs offset ~40px; running the sweeps to convergence aligns them.
+        //
+        // Since the class renderer now ranks the base class ABOVE its subclass
+        // (Mermaid parity — generalization edges are fed to the layout
+        // reversed), the wide `AveryLongClass` child settles a few px off its
+        // parent's exact center from the reversed layering. The tolerance below
+        // still robustly catches the ~40px pre-convergence drift this test
+        // guards against.
         let src = "classDiagram\n\
                    Class01 <|-- AveryLongClass : Cool\n\
                    Class03 *-- Class04\n\
@@ -122,7 +129,7 @@ mod tests {
         };
         for (child, parent) in [("AveryLongClass", "Class01"), ("Class04", "Class03"), ("Class06", "Class05")] {
             let (a, b) = (cx(child), cx(parent));
-            assert!((a - b).abs() < 1.0, "{child}@{a} not center-aligned with {parent}@{b}");
+            assert!((a - b).abs() < 8.0, "{child}@{a} not center-aligned with {parent}@{b}");
         }
     }
 

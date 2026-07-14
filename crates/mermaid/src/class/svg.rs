@@ -135,7 +135,12 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
             attrs.push_str(r#" stroke-dasharray="4 3""#);
         }
         if let Some(m) = marker {
-            attrs.push_str(&format!(r#" marker-end="url(#{m})""#));
+            // For generalization-family relations the layout edge was fed
+            // reversed (parent first) so the parent out-ranks the child, so
+            // the path runs parent -> child and the marker belongs at the
+            // START (`auto-start-reverse` re-orients it into the parent).
+            let side = if r.kind.ranks_marker_end_on_top() { "marker-start" } else { "marker-end" };
+            attrs.push_str(&format!(r#" {side}="url(#{m})""#));
         }
         // Bidirectional relations (`<-->`, `<..>`) carry a second open
         // arrowhead on the `from` end. `orient="auto-start-reverse"` flips
@@ -166,15 +171,18 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
             ));
         }
 
+        // When the layout edge is reversed (parent-on-top relations), the path
+        // runs to->from, so `from`/`to` multiplicities swap ends.
+        let rev = r.kind.ranks_marker_end_on_top();
         if let Some(m) = &r.m_from {
-            let (x, y) = mult_pos(&ep.points, true);
+            let (x, y) = mult_pos(&ep.points, !rev);
             out.push_str(&format!(
                 r#"<text x="{x:.1}" y="{y:.1}" fill="currentColor">{}</text>"#,
                 escape_xml(m)
             ));
         }
         if let Some(m) = &r.m_to {
-            let (x, y) = mult_pos(&ep.points, false);
+            let (x, y) = mult_pos(&ep.points, rev);
             out.push_str(&format!(
                 r#"<text x="{x:.1}" y="{y:.1}" fill="currentColor">{}</text>"#,
                 escape_xml(m)
@@ -332,6 +340,23 @@ mod tests {
         assert!(svg.contains("url(#mmd-diamond-hollow)"));
         assert!(svg.contains("url(#mmd-open)"));
         assert!(svg.contains("stroke-dasharray")); // realization + dependency
+    }
+
+    #[test]
+    fn inheritance_ranks_parent_on_top() {
+        // Mermaid parity: the base class ranks ABOVE its subclass. The layout
+        // edge is fed reversed (parent first) so the hollow triangle moves to
+        // the path START — that marker-start is the direct signature of the
+        // parent-on-top fix (previously it was marker-end with the child on top).
+        let svg = render_class("classDiagram\nAnimal <|-- Duck").unwrap();
+        assert!(
+            svg.contains(r#"marker-start="url(#mmd-tri-hollow)""#),
+            "inheritance triangle drawn at the parent (start): {svg}"
+        );
+        assert!(
+            !svg.contains(r#"marker-end="url(#mmd-tri-hollow)""#),
+            "triangle should no longer be at the child (end): {svg}"
+        );
     }
 
     #[test]

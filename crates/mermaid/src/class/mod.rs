@@ -17,6 +17,19 @@ pub(crate) enum RelKind {
     DashedLink,  // ..     no marker, dashed (the dashed peer of `--`)
 }
 
+impl RelKind {
+    /// Whether the marker (`to`) end is the base class / interface that Mermaid
+    /// ranks ABOVE its subclass — i.e. generalization: inheritance and
+    /// realization. For these the layout edge is fed reversed (parent first) so
+    /// it out-ranks its child, and the hollow triangle is drawn at the path
+    /// start instead of the end. Composition/aggregation also put the "whole"
+    /// on top in Mermaid, but reversing them perturbs the x-convergence of the
+    /// shared layout engine, so that's deliberately left for a follow-up.
+    pub(crate) fn ranks_marker_end_on_top(self) -> bool {
+        matches!(self, RelKind::Inheritance | RelKind::Realization)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ClassBox {
     pub id: String,
@@ -104,13 +117,20 @@ pub(crate) fn render_class(source: &str) -> Result<String, crate::ParseError> {
     let edges: Vec<crate::boxgraph::BoxEdge> = g
         .relations
         .iter()
-        .map(|r| crate::boxgraph::BoxEdge {
-            from: r.from,
-            to: r.to,
-            label: r.label.as_deref().map(|l| {
-                let (w, h) = crate::measure::text_size(l);
-                (w + 8.0, h + 4.0)
-            }),
+        .map(|r| {
+            // Rank the parent/whole above its child for generalization-family
+            // relations by feeding the layout edge reversed (marker end first);
+            // svg::emit compensates by drawing the arrowhead at the path start.
+            let (from, to) =
+                if r.kind.ranks_marker_end_on_top() { (r.to, r.from) } else { (r.from, r.to) };
+            crate::boxgraph::BoxEdge {
+                from,
+                to,
+                label: r.label.as_deref().map(|l| {
+                    let (w, h) = crate::measure::text_size(l);
+                    (w + 8.0, h + 4.0)
+                }),
+            }
         })
         .collect();
 
