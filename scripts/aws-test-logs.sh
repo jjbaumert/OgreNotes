@@ -24,7 +24,10 @@ for var in AWS_REGION STACK_PREFIX; do
     fi
 done
 
-LOG_GROUP="/ecs/${STACK_PREFIX}ogrenote"
+# The api container's deterministic log group (#50). Extra args ("$@") are
+# forwarded to `aws logs tail` (e.g. --since 1h). For worker logs, point at
+# /ecs/${STACK_PREFIX}ogrenote-worker.
+LOG_GROUP="/ecs/${STACK_PREFIX}ogrenote-api"
 REGION="${AWS_REGION}"
 DIAG_PROFILE="${STACK_PREFIX}ogrenote-diag"
 

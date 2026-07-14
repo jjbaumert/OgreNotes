@@ -1,6 +1,6 @@
 import * as path from 'path';
 import { Construct } from 'constructs';
-import { Duration, Stack } from 'aws-cdk-lib';
+import { Duration, RemovalPolicy, Stack } from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ecsPatterns from 'aws-cdk-lib/aws-ecs-patterns';
@@ -268,7 +268,18 @@ export class ComputeConstruct extends Construct {
         secrets,
         logDriver: ecs.LogDrivers.awsLogs({
           streamPrefix: 'api',
-          logRetention: logs.RetentionDays.TWO_WEEKS,
+          // Explicit, deterministic log-group name (#50). An auto-named
+          // group carries a hashed suffix that changes on every task-def
+          // replacement, leaving orphaned groups the scoped diagnostic
+          // read-only IAM policy (and aws-test-logs.sh) can never match by
+          // a stable ARN. A fixed name makes both target it reliably.
+          // RETAIN (the LogGroup default) matches the table/bucket policy —
+          // teardown leaves it for manual cleanup rather than losing logs.
+          logGroup: new logs.LogGroup(this, 'ApiLogGroup', {
+            logGroupName: `/ecs/${prefix}ogrenote-api`,
+            retention: logs.RetentionDays.TWO_WEEKS,
+            removalPolicy: RemovalPolicy.RETAIN,
+          }),
         }),
       },
     });
@@ -377,7 +388,12 @@ export class ComputeConstruct extends Construct {
       secrets,
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'worker',
-        logRetention: logs.RetentionDays.TWO_WEEKS,
+        // Deterministic name, same rationale as the api log group (#50).
+        logGroup: new logs.LogGroup(this, 'WorkerLogGroup', {
+          logGroupName: `/ecs/${prefix}ogrenote-worker`,
+          retention: logs.RetentionDays.TWO_WEEKS,
+          removalPolicy: RemovalPolicy.RETAIN,
+        }),
       }),
     });
     const workerService = new ecs.FargateService(this, 'Worker', {
