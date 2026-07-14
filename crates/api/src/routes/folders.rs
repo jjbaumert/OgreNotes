@@ -333,6 +333,11 @@ async fn update_folder(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
+    // #37: drop the cached inherit_mode so a Restrict/inherit change takes
+    // effect on the next REST access check instead of lingering for the TTL.
+    // Unconditional (a rename is a harmless cache miss).
+    state.folder_inherit_cache.invalidate(&id);
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -362,6 +367,10 @@ async fn delete_folder(
         .delete(&id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // #37: drop any cached inherit_mode for the now-deleted folder so a
+    // later access check re-reads authoritatively (a `get` miss → no grant).
+    state.folder_inherit_cache.invalidate(&id);
 
     Ok(StatusCode::NO_CONTENT)
 }

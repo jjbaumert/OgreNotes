@@ -62,7 +62,7 @@ async fn create_ws_token(
     // the token (server-authored) so the room can reject writes from a
     // read-only session without trusting the client.
     use ogrenotes_storage::models::AccessLevel;
-    let meta = crate::routes::documents::check_doc_access(
+    let meta = crate::routes::documents::check_doc_access_uncached(
         &state, &doc_id, &user_id, AccessLevel::View,
     ).await?;
     let access = if meta.locked {
@@ -72,7 +72,7 @@ async fn create_ws_token(
         // drops `Update`/`SyncStep2` on this session, so a captured token can
         // never escalate to a write. Sibling of the `put_content` REST guard.
         ogrenotes_collab::redis_pubsub::WsAccess::ReadOnly
-    } else if crate::routes::documents::check_doc_access(
+    } else if crate::routes::documents::check_doc_access_uncached(
         &state, &doc_id, &user_id, AccessLevel::Edit,
     )
     .await
@@ -444,7 +444,7 @@ async fn ws_upgrade(
     // keeps its captured authority until it reconnects (documented limitation,
     // matching the #111 token model).
     let ws_access = if ws_access == WsAccess::ReadWrite {
-        let meta = crate::routes::documents::check_doc_access(
+        let meta = crate::routes::documents::check_doc_access_uncached(
             &state, &doc_id, &user_id,
             ogrenotes_storage::models::AccessLevel::View,
         ).await?;
@@ -484,7 +484,7 @@ async fn ws_upgrade(
                 // in `handle_ws`, which drops CRDT updates from a read-only
                 // session. Foreign-doc subscription differs — it has no
                 // per-doc token and re-checks View on every call.
-                let meta = crate::routes::documents::check_doc_access(
+                let meta = crate::routes::documents::check_doc_access_uncached(
                     &state, &doc_id, &user_id,
                     ogrenotes_storage::models::AccessLevel::View,
                 ).await?;
@@ -600,7 +600,9 @@ async fn ensure_foreign_room_loaded(
     doc_id: &str,
     user_id: &str,
 ) -> Result<Arc<Room>, ApiError> {
-    use crate::routes::documents::check_doc_access;
+    // #37: WS path — use the uncached (authoritative) access check so a
+    // stale folder-grant cache can't admit a just-revoked user to a live room.
+    use crate::routes::documents::check_doc_access_uncached as check_doc_access;
     use ogrenotes_storage::models::AccessLevel;
 
     if let Some(existing) = state.room_registry.get(doc_id) {

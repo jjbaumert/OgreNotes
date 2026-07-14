@@ -8,6 +8,7 @@ pub mod compaction;
 pub mod digest;
 pub mod edit_activity;
 pub mod embed_allowlist;
+pub mod folder_inherit_cache;
 pub mod error;
 pub mod middleware;
 pub mod observability;

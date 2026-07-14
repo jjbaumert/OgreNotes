@@ -8,6 +8,7 @@ use crate::redis_session::RedisSessionStore;
 use ogrenotes_common::metrics::RollingUsers;
 use crate::claude::ClaudeMessages;
 use crate::edit_activity::EditActivityDebouncer;
+use crate::folder_inherit_cache::FolderInheritCache;
 use crate::middleware::activity::ActivityTracker;
 use ogrenotes_embeddings::EmbeddingPipeline;
 use ogrenotes_notify::{EmailCapRepo, EmailService, NoopSender, SmtpSender};
@@ -81,6 +82,10 @@ pub struct AppState {
     pub email_service: Arc<EmailService>,
     pub activity_tracker: Arc<ActivityTracker>,
     pub edit_activity_debouncer: Arc<EditActivityDebouncer>,
+    /// #37: short-TTL cache of folder `inherit_mode` for the REST access
+    /// path. The WS-connect check bypasses it (authoritative). Invalidated
+    /// on folder update/delete in `routes/folders.rs`.
+    pub folder_inherit_cache: Arc<FolderInheritCache>,
 }
 
 impl AppState {
@@ -212,6 +217,7 @@ impl AppState {
             email_service,
             activity_tracker,
             edit_activity_debouncer: Arc::new(EditActivityDebouncer::new()),
+            folder_inherit_cache: Arc::new(FolderInheritCache::new()),
         }
     }
 }

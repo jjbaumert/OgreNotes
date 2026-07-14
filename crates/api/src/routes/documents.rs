@@ -647,6 +647,31 @@ pub(crate) async fn check_doc_access(
     Ok(meta)
 }
 
+/// #37: authoritative (uncached) counterpart to [`check_doc_access`] for the
+/// WebSocket-connect path. The WS check bakes the session's write authority
+/// into a server-authored token that lives for the whole connection, so it
+/// must NOT trust the short-TTL folder-`inherit_mode` cache — a just-revoked
+/// user could otherwise open a fresh editing session. REST reads use the
+/// cached [`check_doc_access`].
+pub(crate) async fn check_doc_access_uncached(
+    state: &AppState,
+    doc_id: &str,
+    user_id: &str,
+    required: ogrenotes_storage::models::AccessLevel,
+) -> Result<DocumentMeta, ApiError> {
+    let meta = state
+        .doc_repo
+        .get(doc_id)
+        .await?
+        .ok_or(ApiError::NotFound("Document not found".to_string()))?;
+    let (meta, is_trashed) =
+        check_doc_access_from_meta_impl(state, meta, user_id, required, false).await?;
+    if is_trashed {
+        return Err(ApiError::NotFound("Document not found".to_string()));
+    }
+    Ok(meta)
+}
+
 /// The four possible outcomes of an access-control check, decoupled from
 /// the HTTP error layer so the decision logic can be unit-tested without
 /// any I/O. `check_doc_access_allow_deleted` translates these to
@@ -781,21 +806,43 @@ pub(crate) async fn fetch_folder_grants(
     state: &AppState,
     meta: &DocumentMeta,
     user_id: &str,
+    use_cache: bool,
 ) -> Vec<FolderGrant> {
     // Fetch every containing folder's grant concurrently (#39). A doc in N
     // folders previously did N sequential round-trips on the access path
     // (each a `get` plus a conditional `get_member`); now the per-folder
     // work runs in parallel. `join_all` preserves input order, so the grant
-    // ordering is identical to the old sequential loop. The two reads within
-    // a single folder stay sequential — `get_member` is only issued once
-    // `get` reveals the folder isn't `Restricted`.
+    // ordering is identical to the old sequential loop.
+    //
+    // #37: on the REST path (`use_cache`), the folder-global `inherit_mode`
+    // is served from a short-TTL cache, skipping the `folder_repo.get`
+    // `GetItem`. The WS-connect check passes `use_cache=false` and always
+    // reads authoritatively (a stale grant would bake wrong write authority
+    // into a live session). The per-user `get_member` is never cached.
     let per_folder = meta
         .folder_id
         .iter()
         .chain(meta.additional_folder_ids.iter())
         .map(|folder_id| async move {
-            let folder = state.folder_repo.get(folder_id).await.ok().flatten()?;
-            let inherit_mode = folder.inherit_mode.clone();
+            let inherit_mode = match use_cache
+                .then(|| state.folder_inherit_cache.get(folder_id))
+                .flatten()
+            {
+                Some(mode) => mode,
+                None => {
+                    // Cache miss (or WS path): read the folder authoritatively.
+                    // A missing folder yields no grant (fail-safe), unchanged.
+                    // Populate the cache only on the REST path; a folder
+                    // deleted since caching is covered by invalidate-on-delete.
+                    let folder = state.folder_repo.get(folder_id).await.ok().flatten()?;
+                    if use_cache {
+                        state
+                            .folder_inherit_cache
+                            .insert(folder_id, folder.inherit_mode.clone());
+                    }
+                    folder.inherit_mode
+                }
+            };
             let member = if matches!(
                 inherit_mode,
                 ogrenotes_storage::models::InheritMode::Restricted
@@ -844,11 +891,29 @@ pub(crate) async fn check_doc_access_allow_deleted(
 /// loaded the meta for another reason (e.g. `copy_document`'s samples
 /// bypass) — avoids the second `doc_repo.get` the id-based variant does
 /// internally.
+///
+/// This is the REST entry: folder `inherit_mode` is resolved through the
+/// short-TTL cache (#37). The WS-connect path uses
+/// [`check_doc_access_uncached`], which reads authoritatively.
 pub(crate) async fn check_doc_access_from_meta_allow_deleted(
     state: &AppState,
     meta: DocumentMeta,
     user_id: &str,
     required: ogrenotes_storage::models::AccessLevel,
+) -> Result<(DocumentMeta, bool), ApiError> {
+    check_doc_access_from_meta_impl(state, meta, user_id, required, true).await
+}
+
+/// Shared body for the meta-based access check. `use_cache` gates the #37
+/// folder-`inherit_mode` cache: `true` for cheap high-frequency REST reads,
+/// `false` for the WS-connect check where a stale grant would bake the wrong
+/// write authority into a long-lived live session.
+async fn check_doc_access_from_meta_impl(
+    state: &AppState,
+    meta: DocumentMeta,
+    user_id: &str,
+    required: ogrenotes_storage::models::AccessLevel,
+    use_cache: bool,
 ) -> Result<(DocumentMeta, bool), ApiError> {
     // Short-circuit on the trash + owner branches before issuing any
     // membership fetches.
@@ -874,7 +939,7 @@ pub(crate) async fn check_doc_access_from_meta_allow_deleted(
 
     // 3. Folder membership — unioned across every folder the doc is in
     // (#149). Restricted folders contribute no grant.
-    let folder_grants = fetch_folder_grants(state, &meta, user_id).await;
+    let folder_grants = fetch_folder_grants(state, &meta, user_id, use_cache).await;
 
     // 4. Link sharing — only fetch the workspace-member row when the doc
     // actually has link sharing enabled, to avoid one DDB read per
@@ -990,7 +1055,10 @@ pub(crate) async fn has_durable_access(
         .flatten();
     // #149: union over every folder the doc is in (Restricted ones grant
     // nothing). Bounded fan-out by folder count.
-    let folder_grants = fetch_folder_grants(state, meta, user_id).await;
+    // Authoritative (uncached): has_durable_access is not the hot REST path
+    // the #37 cache targets, and staying authoritative here is the
+    // conservative choice for a durable-access decision.
+    let folder_grants = fetch_folder_grants(state, meta, user_id, false).await;
     // Replay the decision WITHOUT the link branch (workspace_member = None):
     // Allowed ⟺ the caller has a non-link grant of at least View.
     let decision = evaluate_doc_access(
