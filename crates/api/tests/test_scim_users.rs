@@ -973,3 +973,64 @@ async fn scim_list_users_pagination_window() {
 
     app.cleanup().await;
 }
+
+/// #38: SCIM list hydrates every member through the batched `get_by_ids`
+/// path. Two JIT-provisioned users must both appear with populated
+/// attributes — exercising a multi-key BatchGetItem (not just the row
+/// count the pagination test checks).
+#[tokio::test]
+async fn scim_list_hydrates_all_members_via_batch() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let (_, ws_id, bearer) =
+        setup_workspace_with_scim_token(&app, "scim-batch@test.com").await;
+
+    let mut created_ids = Vec::new();
+    for (ext, email, given) in [
+        ("okta-batch-1", "batch-one@example.com", "One"),
+        ("okta-batch-2", "batch-two@example.com", "Two"),
+    ] {
+        let body = serde_json::json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "externalId": ext,
+            "userName": email,
+            "name": { "givenName": given, "familyName": "Batch" },
+            "displayName": format!("{given} Batch"),
+            "active": true,
+            "emails": [{ "value": email, "type": "work", "primary": true }]
+        });
+        let (status, created) = scim_request(
+            &app,
+            Method::POST,
+            &format!("/api/v1/scim/v2/workspaces/{ws_id}/Users"),
+            Some(&bearer),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, 201);
+        created_ids.push(created["id"].as_str().unwrap().to_string());
+    }
+
+    let (status, list) = scim_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/scim/v2/workspaces/{ws_id}/Users"),
+        Some(&bearer),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let resources = list["Resources"].as_array().unwrap();
+    for id in &created_ids {
+        let r = resources
+            .iter()
+            .find(|r| r["id"].as_str() == Some(id.as_str()))
+            .unwrap_or_else(|| panic!("member {id} must be hydrated in the batched list"));
+        assert!(
+            r["userName"].as_str().is_some_and(|s| !s.is_empty()),
+            "member {id} userName must be hydrated from the batch fetch, got {r}"
+        );
+    }
+
+    app.cleanup().await;
+}
