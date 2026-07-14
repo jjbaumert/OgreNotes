@@ -35,10 +35,10 @@ pub(crate) fn emit(g: &ErGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
     );
     out.push_str(concat!(
         r#"<defs>"#,
-        r#"<marker id="mmd-er-one" viewBox="0 0 14 14" markerWidth="12" markerHeight="12" refX="13" refY="7" orient="auto-start-reverse" stroke="currentColor" fill="none" stroke-width="1.2"><path d="M 9 2 V 12 M 12 2 V 12"/></marker>"#,
-        r#"<marker id="mmd-er-zeroone" viewBox="0 0 14 14" markerWidth="12" markerHeight="12" refX="13" refY="7" orient="auto-start-reverse" stroke="currentColor" fill="none" stroke-width="1.2"><path d="M 12 2 V 12"/><circle cx="6" cy="7" r="3"/></marker>"#,
-        r#"<marker id="mmd-er-many" viewBox="0 0 14 14" markerWidth="12" markerHeight="12" refX="13" refY="7" orient="auto-start-reverse" stroke="currentColor" fill="none" stroke-width="1.2"><path d="M 13 2 L 6 7 L 13 12 M 4 2 V 12"/></marker>"#,
-        r#"<marker id="mmd-er-zeromany" viewBox="0 0 14 14" markerWidth="12" markerHeight="12" refX="13" refY="7" orient="auto-start-reverse" stroke="currentColor" fill="none" stroke-width="1.2"><path d="M 13 2 L 6 7 L 13 12"/><circle cx="3.5" cy="7" r="3"/></marker>"#,
+        r#"<marker id="mmd-er-one" viewBox="0 0 14 14" markerWidth="18" markerHeight="18" refX="13" refY="7" orient="auto-start-reverse" stroke="currentColor" fill="none" stroke-width="1.2"><path d="M 9 2 V 12 M 12 2 V 12"/></marker>"#,
+        r#"<marker id="mmd-er-zeroone" viewBox="0 0 14 14" markerWidth="18" markerHeight="18" refX="13" refY="7" orient="auto-start-reverse" stroke="currentColor" fill="none" stroke-width="1.2"><path d="M 12 2 V 12"/><circle cx="6" cy="7" r="3"/></marker>"#,
+        r#"<marker id="mmd-er-many" viewBox="0 0 14 14" markerWidth="18" markerHeight="18" refX="13" refY="7" orient="auto-start-reverse" stroke="currentColor" fill="none" stroke-width="1.2"><path d="M 13 2 L 6 7 L 13 12 M 4 2 V 12"/></marker>"#,
+        r#"<marker id="mmd-er-zeromany" viewBox="0 0 14 14" markerWidth="18" markerHeight="18" refX="13" refY="7" orient="auto-start-reverse" stroke="currentColor" fill="none" stroke-width="1.2"><path d="M 13 2 L 6 7 L 13 12"/><circle cx="3.5" cy="7" r="3"/></marker>"#,
         r#"</defs>"#,
     ));
 
@@ -114,13 +114,18 @@ pub(crate) fn emit(g: &ErGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
             y - 6.0,
             escape_xml(e.display.as_deref().unwrap_or(&e.id))
         ));
-        out.push_str(&format!(
-            r#"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="currentColor"/>"#,
-            box_left,
-            y,
-            box_left + bw,
-            y
-        ));
+        // Only draw the title/attribute separator when there ARE attributes;
+        // an attribute-less entity renders as a plain title box (Mermaid parity)
+        // rather than a title over an empty compartment.
+        if !e.attributes.is_empty() {
+            out.push_str(&format!(
+                r#"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="currentColor"/>"#,
+                box_left,
+                y,
+                box_left + bw,
+                y
+            ));
+        }
 
         // Per-entity column widths — shared with the box sizing in `mod.rs`
         // (via `attr_columns`) so the columns always fit inside the box.
@@ -179,6 +184,16 @@ mod tests {
         assert!(svg.contains("url(#mmd-er-one)"));
         assert!(svg.contains("url(#mmd-er-zeromany)"));
         assert!(svg.contains(">PK<") || svg.contains("PK</"));
+    }
+
+    #[test]
+    fn attributeless_entity_has_no_separator_line() {
+        // B has no attributes → it renders as a plain title box (no title/attr
+        // separator). Only A (which has one attribute) draws a separator, so
+        // there is exactly one top-level <line> (relations are <path>s).
+        let svg = render_er("erDiagram\nA ||--|| B : r\nA {\nstring x\n}").unwrap();
+        assert!(svg.contains(">B<"), "B renders: {svg}");
+        assert_eq!(svg.matches("<line").count(), 1, "only the attributed entity has a separator: {svg}");
     }
 
     #[test]

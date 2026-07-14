@@ -179,12 +179,27 @@ pub(crate) fn render_svg(d: &BlockDiagram) -> String {
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total_w:.0} {total_h:.0}" width="{total_w:.0}" height="{total_h:.0}" style="font-family:sans-serif;font-size:14px"><defs><marker id="mmd-blk-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker></defs>"#
     );
 
-    // arrows first (behind blocks).
+    // The point where the center→center segment exits block `b`'s border,
+    // heading toward `(tx, ty)`. Clipping both endpoints to the borders keeps
+    // the arrow (and its head) in the visible gap between adjacent cells rather
+    // than hidden behind the target block.
+    let border = |b: &Block, tx: f64, ty: f64| -> (f64, f64) {
+        let (cx, cy) = center(b);
+        let w = b.span as f64 * cell_w + (b.span as f64 - 1.0) * GAP;
+        let (hw, hh) = (w / 2.0, CELL_H / 2.0);
+        let (dx, dy) = (tx - cx, ty - cy);
+        let s = (hw / dx.abs().max(1e-6)).min(hh / dy.abs().max(1e-6));
+        (cx + dx * s, cy + dy * s)
+    };
+
+    // arrows (drawn border-to-border so the head lands on the target edge).
     for a in &d.arrows {
-        let (x1, y1) = center(&d.blocks[a.from]);
-        let (x2, y2) = center(&d.blocks[a.to]);
+        let (fcx, fcy) = center(&d.blocks[a.from]);
+        let (tcx, tcy) = center(&d.blocks[a.to]);
+        let (x1, y1) = border(&d.blocks[a.from], tcx, tcy);
+        let (x2, y2) = border(&d.blocks[a.to], fcx, fcy);
         out.push_str(&format!(
-            r#"<line x1="{x1:.1}" y1="{y1:.1}" x2="{x2:.1}" y2="{y2:.1}" stroke="currentColor" marker-end="url(#mmd-blk-arrow)"/>"#
+            r#"<line x1="{x1:.1}" y1="{y1:.1}" x2="{x2:.1}" y2="{y2:.1}" stroke="currentColor" stroke-width="1.5" marker-end="url(#mmd-blk-arrow)"/>"#
         ));
         if let Some(lbl) = &a.label {
             out.push_str(&format!(
@@ -259,5 +274,20 @@ mod tests {
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
         assert!(svg.contains(">a<") && svg.contains(">b<"));
         assert!(svg.contains("<line") && svg.contains("marker-end"));
+    }
+
+    #[test]
+    fn arrow_is_clipped_to_the_gap_not_center_to_center() {
+        // The arrow between two adjacent blocks must span only the inter-cell
+        // gap (border to border), so its head is visible — not run center to
+        // center hidden behind the blocks. The visible x-span is therefore far
+        // less than a cell width.
+        let svg = render_svg(&parse("block-beta\n columns 2\n a b\n a --> b").unwrap());
+        let line = svg.split("<line").nth(1).expect("an arrow line");
+        let get = |k: &str| -> f64 {
+            line.split(&format!("{k}=\"")).nth(1).unwrap().split('"').next().unwrap().parse().unwrap()
+        };
+        let span = (get("x2") - get("x1")).abs();
+        assert!(span > 0.0 && span < MIN_CELL_W, "arrow spans only the gap, got {span}px");
     }
 }
