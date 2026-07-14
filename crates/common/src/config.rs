@@ -446,12 +446,12 @@ impl AppConfig {
             embedding_dimensions: env_or("EMBEDDING_DIMENSIONS", "1024")
                 .parse()
                 .expect("EMBEDDING_DIMENSIONS must be a valid u32"),
-            // Same empty-vs-absent treatment for the Anthropic key; the
-            // deploy script may set it to "" on a stack that hasn't
-            // wired the SSM secret yet (piece C).
-            anthropic_api_key: env::var("ANTHROPIC_API_KEY")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            // Empty-vs-absent treatment (the deploy script may set it to
+            // "" on a stack that hasn't wired the SSM secret yet, piece
+            // C) plus whitespace trimming — a trailing newline on the
+            // secret otherwise reaches Anthropic verbatim as x-api-key
+            // and 401s (#91). See `normalize_opt`.
+            anthropic_api_key: normalize_opt(env::var("ANTHROPIC_API_KEY").ok()),
             anthropic_model: env_or("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
             admin_emails: env::var("ADMIN_EMAILS")
                 .unwrap_or_default()
@@ -646,6 +646,20 @@ fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// Normalize an optional string read from the environment: trim
+/// surrounding whitespace and treat empty (or whitespace-only) as
+/// absent.
+///
+/// Trimming matters for secrets injected via CI. A value set with a
+/// trailing newline — the classic `echo "$KEY" | gh secret set` (echo
+/// appends `\n`) — would otherwise reach the Anthropic client verbatim
+/// and be sent as `x-api-key: sk-ant-…\n`, which the API rejects with
+/// `401 "invalid x-api-key"` (#91). Kept separate from the env read so
+/// the normalization is unit-testable without touching process env.
+fn normalize_opt(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// Minimum JWT_SECRET length for HS256 (NIST 256-bit recommendation).
 /// jsonwebtoken re-checks this when encoding, but failing at config load
 /// catches it at startup instead of on the first login.
@@ -712,6 +726,30 @@ fn validate_frontend_origin(origin: &str, dev_mode: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_opt_trims_whitespace_and_treats_blank_as_absent() {
+        // #91: a secret set with a trailing newline (echo | gh secret set)
+        // must not reach the Anthropic client verbatim — trim it.
+        assert_eq!(
+            normalize_opt(Some("sk-ant-abc\n".to_string())),
+            Some("sk-ant-abc".to_string())
+        );
+        assert_eq!(
+            normalize_opt(Some("  sk-ant-abc  ".to_string())),
+            Some("sk-ant-abc".to_string())
+        );
+        // A clean value is unchanged.
+        assert_eq!(
+            normalize_opt(Some("sk-ant-abc".to_string())),
+            Some("sk-ant-abc".to_string())
+        );
+        // Empty, whitespace-only, and missing all collapse to None so
+        // downstream `Option::is_some()` guards read as "not configured".
+        assert_eq!(normalize_opt(Some(String::new())), None);
+        assert_eq!(normalize_opt(Some("  \n\t ".to_string())), None);
+        assert_eq!(normalize_opt(None), None);
+    }
 
     #[test]
     fn debug_redacts_secrets() {
