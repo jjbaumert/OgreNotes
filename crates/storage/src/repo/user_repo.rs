@@ -44,6 +44,79 @@ impl UserRepo {
         }
     }
 
+    /// Batch-fetch users by id in one chunked `BatchGetItem` round-trip
+    /// instead of N sequential `get_by_id` calls (#38). Returns a map keyed
+    /// by `user_id`; an id whose PROFILE row is missing is simply absent
+    /// (same as `get_by_id` → `None`). Duplicate ids are de-duplicated.
+    /// Chunks to the 100-key `BatchGetItem` limit and retries any
+    /// `UnprocessedKeys` DynamoDB returns under load.
+    ///
+    /// This is a latency win (fewer round-trips), not a cost win — N
+    /// cross-partition single-item gets bill ~the same RCU either way.
+    pub async fn get_by_ids(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashMap<String, User>, RepoError> {
+        use aws_sdk_dynamodb::types::KeysAndAttributes;
+
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<&String> = user_ids
+            .iter()
+            .filter(|id| seen.insert((*id).as_str()))
+            .collect();
+
+        let table = self.db.table_name().to_string();
+        let mut out: HashMap<String, User> = HashMap::with_capacity(unique.len());
+
+        for chunk in unique.chunks(100) {
+            let mut kaa = KeysAndAttributes::builder();
+            for id in chunk {
+                let mut key = HashMap::new();
+                key.insert("PK".to_string(), AttributeValue::S(format!("USER#{id}")));
+                key.insert("SK".to_string(), AttributeValue::S(User::sk().to_string()));
+                kaa = kaa.keys(key);
+            }
+            let kaa = kaa
+                .build()
+                .map_err(|e| RepoError::Dynamo(format!("batch_get keys: {e}")))?;
+
+            let mut request_items: HashMap<String, KeysAndAttributes> = HashMap::new();
+            request_items.insert(table.clone(), kaa);
+
+            // Retry UnprocessedKeys (DynamoDB throttles a batch by omitting
+            // keys, not erroring). Bounded so a persistent throttle can't spin.
+            let mut attempt = 0u32;
+            loop {
+                let resp = self
+                    .db
+                    .inner()
+                    .batch_get_item()
+                    .set_request_items(Some(request_items))
+                    .send()
+                    .await
+                    .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+
+                if let Some(mut responses) = resp.responses {
+                    if let Some(items) = responses.remove(&table) {
+                        for item in items {
+                            let user = user_from_item(&item)?;
+                            out.insert(user.user_id.clone(), user);
+                        }
+                    }
+                }
+
+                match resp.unprocessed_keys {
+                    Some(unprocessed) if !unprocessed.is_empty() && attempt < 5 => {
+                        attempt += 1;
+                        request_items = unprocessed;
+                    }
+                    _ => break,
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Get a user by email (scans USER#/PROFILE items).
     ///
     /// A DynamoDB scan returns at most 1MB per call; matching items past that

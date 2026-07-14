@@ -148,15 +148,23 @@ async fn list_users(
         }
     };
 
+    // Batch-hydrate every member's User row in one chunked BatchGetItem
+    // rather than an N+1 `get_by_id` loop (#38). A membership row whose
+    // User is missing is simply absent from the map and skipped below,
+    // preserving the previous per-member skip behavior.
+    let member_ids: Vec<String> = members.iter().map(|m| m.user_id.clone()).collect();
+    let users = match state.user_repo.get_by_ids(&member_ids).await {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(error = %e, ws_id, "SCIM list_users: batch user fetch failed");
+            return scim_storage_err();
+        }
+    };
+
     let mut resources: Vec<ScimUser> = Vec::new();
     for m in &members {
-        let user = match state.user_repo.get_by_id(&m.user_id).await {
-            Ok(Some(u)) => u,
-            Ok(None) => continue, // membership row references a missing User; skip
-            Err(e) => {
-                tracing::warn!(error = %e, user_id = %m.user_id, "SCIM list_users: user fetch failed");
-                continue;
-            }
+        let Some(user) = users.get(&m.user_id) else {
+            continue; // membership row references a missing User; skip
         };
         // Apply filter post-fetch. A future GSI-backed lookup could
         // skip the membership scan for the eq-on-externalId path,
@@ -175,7 +183,7 @@ async fn list_users(
             }
         }
         let location = user_location(&state, &ws_id, &user.user_id);
-        resources.push(user_to_scim(&user, Some(location)));
+        resources.push(user_to_scim(user, Some(location)));
     }
 
     let total = resources.len();
