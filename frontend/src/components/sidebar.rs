@@ -1,10 +1,17 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
+
 use crate::api::client;
+use crate::api::documents;
 use crate::theme::{self, ExplicitTheme};
 use super::account_menu::AccountMenu;
+use super::app_shell::ShellCtx;
 use super::chat_panel::ChatPanel;
+use super::confirm_dialog::ConfirmDialog;
+use super::folder_picker::FolderPickerDialog;
+use super::menu::{ContextMenu, MenuEntry};
 
 /// Flip between explicit Light and Dark for the collapsed icon-strip
 /// toggle. Reads the current rendered theme from `data-theme` on the
@@ -56,6 +63,44 @@ fn write_collapsed(collapsed: bool) {
     if let Some(storage) = local_storage() {
         let _ = storage.set_item(SIDEBAR_COLLAPSED_KEY, if collapsed { "1" } else { "0" });
     }
+}
+
+/// The document a row context menu (right-click or its `⋯` button) is
+/// currently open for, plus where to place the menu.
+#[derive(Clone)]
+struct DocMenuTarget {
+    id: String,
+    x: f64,
+    y: f64,
+}
+
+/// Copy the canonical `/d/:id` URL (stable opaque doc id — same rule
+/// as the document page's Copy Link, #101) to the clipboard via
+/// `navigator.clipboard.writeText`, without eval/Function.
+fn copy_doc_link(id: &str) {
+    let Some(window) = web_sys::window() else { return };
+    let Ok(origin) = window.location().origin() else { return };
+    let href = format!("{origin}/d/{id}");
+    let write_text = js_sys::Reflect::get(&window.navigator(), &"clipboard".into())
+        .and_then(|clip| js_sys::Reflect::get(&clip, &"writeText".into()))
+        .and_then(|func| func.dyn_into::<js_sys::Function>());
+    if let Ok(write_text) = write_text {
+        let clip = js_sys::Reflect::get(&window.navigator(), &"clipboard".into())
+            .unwrap_or(wasm_bindgen::JsValue::NULL);
+        let _ = write_text.call1(&clip, &href.into());
+    }
+}
+
+/// Anchor point for a menu opened from a row's `⋯` button: just under
+/// the button's bottom-start corner (falls back to the click point).
+fn button_anchor(ev: &web_sys::MouseEvent) -> (f64, f64) {
+    ev.current_target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        .map(|el| {
+            let r = el.get_bounding_client_rect();
+            (r.left(), r.bottom() + 2.0)
+        })
+        .unwrap_or((ev.client_x() as f64, ev.client_y() as f64))
 }
 
 #[component]
@@ -117,6 +162,79 @@ pub fn Sidebar(
                 collections.set(list);
             }
         });
+    });
+
+    // ── Per-document row menu (right-click / `⋯`) ─────────────
+    // One shared ContextMenu + move/delete dialogs for every favorite
+    // and collection row. Refreshes ride the shell's dirty ticks — the
+    // same signals this component receives as its refresh props — so
+    // a mutation here updates every listening surface.
+    let doc_menu: RwSignal<Option<DocMenuTarget>> = RwSignal::new(None);
+    let move_target: RwSignal<Option<DocMenuTarget>> = RwSignal::new(None);
+    let delete_target: RwSignal<Option<DocMenuTarget>> = RwSignal::new(None);
+    let shell = use_context::<ShellCtx>();
+    let bump_favorites = move || {
+        if let Some(ctx) = shell {
+            ctx.favorites_dirty.update(|n| *n = n.wrapping_add(1));
+        }
+    };
+    let bump_all = move || {
+        if let Some(ctx) = shell {
+            ctx.favorites_dirty.update(|n| *n = n.wrapping_add(1));
+            ctx.collections_dirty.update(|n| *n = n.wrapping_add(1));
+        }
+    };
+
+    let doc_menu_entries = Callback::new(move |()| {
+        let Some(target) = doc_menu.get() else {
+            return Vec::new();
+        };
+        let is_favorite = favorites.get().iter().any(|f| f.id == target.id);
+        let id_open = target.id.clone();
+        let id_favorite = target.id.clone();
+        let id_link = target.id.clone();
+        let target_move = target.clone();
+        let target_delete = target.clone();
+        vec![
+            MenuEntry::action(crate::t!("sidebar-doc-open-new-tab"), move || {
+                if let Some(window) = web_sys::window() {
+                    let _ = window
+                        .open_with_url_and_target(&format!("/d/{id_open}"), "_blank");
+                }
+            }),
+            MenuEntry::action(
+                if is_favorite {
+                    crate::t!("favorite-menu-remove")
+                } else {
+                    crate::t!("favorite-menu-add")
+                },
+                move || {
+                    let id = id_favorite.clone();
+                    leptos::task::spawn_local(async move {
+                        let res = if is_favorite {
+                            documents::remove_favorite(&id).await
+                        } else {
+                            documents::add_favorite(&id).await
+                        };
+                        if res.is_ok() {
+                            bump_favorites();
+                        }
+                    });
+                },
+            ),
+            MenuEntry::action(crate::t!("menubar-doc-copy-link"), move || {
+                copy_doc_link(&id_link);
+            }),
+            MenuEntry::Separator,
+            MenuEntry::action(crate::t!("menubar-doc-move-folder"), move || {
+                move_target.set(Some(target_move.clone()));
+            }),
+            MenuEntry::Separator,
+            MenuEntry::action(crate::t!("document-trash-dialog-confirm"), move || {
+                delete_target.set(Some(target_delete.clone()));
+            })
+            .danger(),
+        ]
     });
 
     let toggle = move |_| set_collapsed.update(|c| *c = !*c);
@@ -337,6 +455,8 @@ pub fn Sidebar(
                             // left-click for client-side nav — no full reload.
                             let nav_href = href.clone();
                             let label = f.title.clone();
+                            let ctx_id = f.id.clone();
+                            let btn_id = f.id.clone();
                             view! {
                                 <a class="sidebar-item sidebar-favorite-item" href=href title=f.title
                                     on:click=move |ev: web_sys::MouseEvent| {
@@ -346,9 +466,29 @@ pub fn Sidebar(
                                             crate::commands::nav_bridge::go(&nav_href);
                                         }
                                     }
+                                    on:contextmenu=move |ev: web_sys::MouseEvent| {
+                                        ev.prevent_default();
+                                        doc_menu.set(Some(DocMenuTarget {
+                                            id: ctx_id.clone(),
+                                            x: ev.client_x() as f64,
+                                            y: ev.client_y() as f64,
+                                        }));
+                                    }
                                 >
                                     <span class="sidebar-favorite-star">"\u{2605}"</span>
                                     <span class="sidebar-favorite-title">{label}</span>
+                                    <button class="sidebar-doc-actions"
+                                        aria-haspopup="menu"
+                                        aria-label=crate::t!("sidebar-doc-actions-aria")
+                                        on:click=move |ev: web_sys::MouseEvent| {
+                                            ev.prevent_default();
+                                            ev.stop_propagation();
+                                            let (x, y) = button_anchor(&ev);
+                                            doc_menu.set(Some(DocMenuTarget {
+                                                id: btn_id.clone(), x, y,
+                                            }));
+                                        }
+                                    >"\u{22EF}"</button>
                                 </a>
                             }
                         }).collect::<Vec<_>>().into_any()
@@ -375,6 +515,8 @@ pub fn Sidebar(
                                     let href = format!("/d/{}", d.id);
                                     let nav_href = href.clone(); // #152: client-side left-click
                                     let label = d.title.clone();
+                                    let ctx_id = d.id.clone();
+                                    let btn_id = d.id.clone();
                                     view! {
                                         <a class="sidebar-item sidebar-favorite-item" href=href title=d.title
                                             on:click=move |ev: web_sys::MouseEvent| {
@@ -384,8 +526,28 @@ pub fn Sidebar(
                                                     crate::commands::nav_bridge::go(&nav_href);
                                                 }
                                             }
+                                            on:contextmenu=move |ev: web_sys::MouseEvent| {
+                                                ev.prevent_default();
+                                                doc_menu.set(Some(DocMenuTarget {
+                                                    id: ctx_id.clone(),
+                                                    x: ev.client_x() as f64,
+                                                    y: ev.client_y() as f64,
+                                                }));
+                                            }
                                         >
                                             <span class="sidebar-favorite-title">{label}</span>
+                                            <button class="sidebar-doc-actions"
+                                                aria-haspopup="menu"
+                                                aria-label=crate::t!("sidebar-doc-actions-aria")
+                                                on:click=move |ev: web_sys::MouseEvent| {
+                                                    ev.prevent_default();
+                                                    ev.stop_propagation();
+                                                    let (x, y) = button_anchor(&ev);
+                                                    doc_menu.set(Some(DocMenuTarget {
+                                                        id: btn_id.clone(), x, y,
+                                                    }));
+                                                }
+                                            >"\u{22EF}"</button>
                                         </a>
                                     }
                                 }).collect::<Vec<_>>().into_any()
@@ -424,6 +586,63 @@ pub fn Sidebar(
                 // replaces the standalone sign-out row that lived here.
                 <AccountMenu />
             </div>
+
+            // ── Row-menu chrome: shared context menu + dialogs ──
+            <ContextMenu
+                visible=Signal::derive(move || doc_menu.get().is_some())
+                x=Signal::derive(move || doc_menu.get().map(|t| t.x).unwrap_or_default())
+                y=Signal::derive(move || doc_menu.get().map(|t| t.y).unwrap_or_default())
+                entries=doc_menu_entries
+                on_close=Callback::new(move |()| doc_menu.set(None))
+            />
+            <FolderPickerDialog
+                visible=Signal::derive(move || move_target.get().is_some())
+                title=crate::t!("document-move-folder-title")
+                confirm_label=crate::t!("document-move-here")
+                on_close=Callback::new(move |()| move_target.set(None))
+                on_pick=Callback::new(move |folder_id: String| {
+                    let Some(target) = move_target.get_untracked() else { return };
+                    move_target.set(None);
+                    leptos::task::spawn_local(async move {
+                        match documents::bulk_move(vec![target.id], &folder_id).await {
+                            Ok(_) => bump_all(),
+                            Err(e) => {
+                                web_sys::console::error_1(&format!("Move failed: {e}").into());
+                            }
+                        }
+                    });
+                })
+            />
+            <ConfirmDialog
+                visible=Signal::derive(move || delete_target.get().is_some())
+                title=crate::t!("document-trash-dialog-title")
+                message=crate::t!("document-trash-dialog-message")
+                confirm_label=crate::t!("document-trash-dialog-confirm")
+                destructive=true
+                on_cancel=Callback::new(move |_| delete_target.set(None))
+                on_confirm=Callback::new(move |_| {
+                    let Some(target) = delete_target.get_untracked() else { return };
+                    delete_target.set(None);
+                    leptos::task::spawn_local(async move {
+                        if documents::delete_document(&target.id).await.is_ok() {
+                            // Trashing the doc that's open right now: leave the
+                            // page the same way the document page's own Delete
+                            // does (full reload to a fresh home listing).
+                            let viewing = web_sys::window()
+                                .and_then(|w| w.location().pathname().ok())
+                                .map(|p| p.contains(&target.id))
+                                .unwrap_or(false);
+                            if viewing {
+                                if let Some(window) = web_sys::window() {
+                                    let _ = window.location().set_href("/");
+                                }
+                            } else {
+                                bump_all();
+                            }
+                        }
+                    });
+                })
+            />
         </nav>
     }
 }

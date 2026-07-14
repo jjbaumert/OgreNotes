@@ -1769,6 +1769,38 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  flex: 1;
+}
+
+/* Per-row `⋯` actions button — hidden until the row is hovered or
+   holds focus; always visible on touch devices, where there is no
+   hover to reveal it (same rule as .folder-row-actions). */
+.sidebar-doc-actions {
+  margin-inline-start: auto;
+  flex-shrink: 0;
+  opacity: 0;
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  line-height: 1;
+}
+.sidebar-favorite-item:hover .sidebar-doc-actions,
+.sidebar-favorite-item:focus-within .sidebar-doc-actions {
+  opacity: 1;
+}
+.sidebar-doc-actions:hover {
+  background: var(--color-mist);
+  color: var(--color-text);
+}
+@media (hover: none) {
+  .sidebar-doc-actions {
+    opacity: 1;
+    padding: 8px 10px;
+  }
 }
 
 /* #134: header focus/expand toggle. Takes the auto right-margin so it and
