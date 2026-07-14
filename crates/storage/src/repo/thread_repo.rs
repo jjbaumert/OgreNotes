@@ -74,8 +74,28 @@ impl ThreadRepo {
         // Chat/DM threads carry members; emit a reverse edge per member so
         // `list_user_chats` is a Query, not a table Scan (issue #34).
         // Comment threads have no members, so this is a no-op for them.
+        //
+        // Best-effort, NOT fail-loud (issue #49): the METADATA row was
+        // already committed by the `put_item` above. Propagating an edge
+        // failure here with `?` would return an error for a chat that
+        // actually exists — the caller returns 500, and a client retry
+        // creates a *duplicate* chat while the original sits half-indexed.
+        // Instead we log and continue; a missing edge self-heals via
+        // `backfill_chat_edges` or the next membership change (the same
+        // self-heal posture `delete_thread` and `list_user_chats` already
+        // rely on). Membership is unbounded and DynamoDB caps
+        // `TransactWriteItems` at 100, so a single atomic write isn't an
+        // option here.
         for member in &thread.member_ids {
-            self.put_chat_edge(member, &thread.thread_id).await?;
+            if let Err(e) = self.put_chat_edge(member, &thread.thread_id).await {
+                tracing::warn!(
+                    thread_id = %thread.thread_id,
+                    user_id = %member,
+                    error = %e,
+                    "put_chat_edge failed during create_thread; edge will self-heal \
+                     via backfill or next membership change"
+                );
+            }
         }
         Ok(())
     }
