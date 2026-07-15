@@ -159,6 +159,12 @@ pub enum ConnectionState {
 /// Callback for when the document is updated by a remote collaborator.
 pub type OnRemoteUpdate = Box<dyn Fn(Node)>;
 
+/// #92: provides the editor's CURRENT model on demand, so the recv path
+/// can fold not-yet-sent local keystrokes into the ydoc before applying
+/// a remote update. Registered by the page after client construction;
+/// returns None when no editor state is available (e.g. mid-teardown).
+pub type LocalDocProvider = Box<dyn Fn() -> Option<Node>>;
+
 /// Remote user's cursor/selection state for presence rendering.
 /// Uses block-relative positions for cross-client portability.
 #[derive(Debug, Clone)]
@@ -302,6 +308,40 @@ fn flush_pending_updates_to_socket(
     }
 }
 
+/// #92: fold the editor's current model into the ydoc BEFORE a remote
+/// update is applied. A keystroke lives only in the editor model for up
+/// to the send debounce; a remote update landing inside that window
+/// would otherwise rebuild the view from a ydoc that has never seen the
+/// keystroke — silently dropping it (the "first keystrokes after mount"
+/// bug). Folding first turns the subsequent apply into a true CRDT
+/// merge. Ordering matters: folding AFTER the apply treats remote
+/// content the stale model has never seen as local deletions — see the
+/// `fold_after_remote_apply_deletes_peer_content` tripwire test in
+/// yrs_bridge.
+///
+/// No-op without a provider (page registered none) or a baseline (a
+/// full-doc fold is exactly the unsafe overwrite we're avoiding; the
+/// baseline is initialized at construction so this shouldn't occur).
+/// The yrs observer captures the fold's bytes into `pending_updates`,
+/// so folded keystrokes also reach the server via the flush paths.
+fn fold_local_before_remote(
+    ydoc: &Rc<RefCell<yrs::Doc>>,
+    provider: &Rc<RefCell<Option<LocalDocProvider>>>,
+    last_synced: &Rc<RefCell<Option<Node>>>,
+) {
+    let Some(model) = provider.borrow().as_ref().and_then(|p| p()) else {
+        return;
+    };
+    let Some(baseline) = last_synced.borrow().clone() else {
+        return;
+    };
+    let normalized = {
+        let ydoc = ydoc.borrow();
+        yrs_bridge::sync_model_to_ydoc_diffed(&ydoc, &model, Some(&baseline))
+    };
+    *last_synced.borrow_mut() = Some(normalized);
+}
+
 /// Handle MSG_SYNC_STEP1: server sent its state vector — respond with our diff + our SV.
 fn handle_sync_step1(
     payload: &[u8],
@@ -344,30 +384,69 @@ fn schedule_remote_callback(
     on_remote: &Rc<RefCell<Option<OnRemoteUpdate>>>,
     timer: &Rc<RefCell<Option<gloo_timers::callback::Timeout>>>,
     last_synced: &Rc<RefCell<Option<Node>>>,
+    provider: &Rc<RefCell<Option<LocalDocProvider>>>,
+    pending_updates: &Rc<RefCell<Vec<Vec<u8>>>>,
+    ws_ref: &Rc<RefCell<Option<WebSocket>>>,
+    state: &Rc<RefCell<ConnectionState>>,
 ) {
     let ydoc_ref = ydoc.clone();
     let on_remote_ref = on_remote.clone();
     let last_synced_ref = last_synced.clone();
+    let provider_ref = provider.clone();
+    let pending_ref = pending_updates.clone();
+    let ws_ref = ws_ref.clone();
+    let state_ref = state.clone();
     *timer.borrow_mut() = Some(gloo_timers::callback::Timeout::new(
         WS_RECV_DEBOUNCE_MS,
         move || {
             let doc = {
                 let ydoc = ydoc_ref.borrow();
-                yrs_bridge::read_doc_from_ydoc(&ydoc).ok()
-            };
-            if let Some(doc) = doc {
-                // #121: the ydoc just changed under us — rebase the
-                // diff-sync baseline on its post-merge content so the
-                // next local sync's skip decisions stay aligned with
-                // what the ydoc actually holds. `read_doc_from_ydoc`
-                // already returns a normalized doc — the same form
-                // sync_model_to_ydoc_diffed caches on the local path —
-                // so store it directly (re-normalizing would be O(doc)
-                // waste and a drift hazard if the two paths diverged).
-                *last_synced_ref.borrow_mut() = Some(doc.clone());
-                if let Some(callback) = on_remote_ref.borrow().as_ref() {
-                    callback(doc);
+                let Ok(mut doc) = yrs_bridge::read_doc_from_ydoc(&ydoc) else {
+                    return;
+                };
+                // #92 (swap-window half): keystrokes typed between the
+                // frame's apply and THIS debounced read exist only in the
+                // editor model — the swap below would clobber them. Fold
+                // them in first, but only when the model and the
+                // post-merge ydoc agree on top-level structure: with the
+                // lists equal, reconciliation is per-block (blocks the
+                // user didn't touch are skipped by the equality check and
+                // keep their remote content). When a remote STRUCTURAL
+                // change landed, folding a model that predates it would
+                // delete the new block (the tripwire test) — skip, accept
+                // the legacy swap for that rare concurrent case.
+                let folded = (|| {
+                    let model = provider_ref.borrow().as_ref().and_then(|p| p())?;
+                    let baseline = last_synced_ref.borrow().clone()?;
+                    if model == baseline {
+                        return None; // nothing pending — plain swap
+                    }
+                    if !yrs_bridge::same_top_level_block_ids(&model, &doc) {
+                        return None; // remote structural change — unsafe
+                    }
+                    yrs_bridge::sync_model_to_ydoc_diffed(&ydoc, &model, Some(&baseline));
+                    yrs_bridge::read_doc_from_ydoc(&ydoc).ok()
+                })();
+                if let Some(refolded) = folded {
+                    doc = refolded;
                 }
+                doc
+            };
+            // The fold's bytes (if any) must reach the server as well.
+            if *state_ref.borrow() == ConnectionState::Synced {
+                flush_pending_updates_to_socket(&pending_ref, &ws_ref);
+            }
+            // #121: the ydoc just changed under us — rebase the
+            // diff-sync baseline on its post-merge content so the
+            // next local sync's skip decisions stay aligned with
+            // what the ydoc actually holds. `read_doc_from_ydoc`
+            // already returns a normalized doc — the same form
+            // sync_model_to_ydoc_diffed caches on the local path —
+            // so store it directly (re-normalizing would be O(doc)
+            // waste and a drift hazard if the two paths diverged).
+            *last_synced_ref.borrow_mut() = Some(doc.clone());
+            if let Some(callback) = on_remote_ref.borrow().as_ref() {
+                callback(doc);
             }
         },
     ));
@@ -453,6 +532,10 @@ pub struct CollabClient {
     /// `OnLiveAppError`. Absent → the frame is still logged to
     /// the console but no user-facing toast fires.
     on_liveapp_error: Rc<RefCell<Option<OnLiveAppError>>>,
+    /// #92: on-demand access to the editor's current model, used to fold
+    /// keystrokes still inside the send-debounce window into the ydoc
+    /// before a remote update is applied (merge, don't clobber).
+    local_doc_provider: Rc<RefCell<Option<LocalDocProvider>>>,
     /// Remote user awareness states.
     remote_cursors: Rc<RefCell<std::collections::HashMap<String, RemoteCursor>>>,
     /// Stored closures (prevent GC).
@@ -511,6 +594,15 @@ impl CollabClient {
             }
         }).expect("observe_update_v1 should not fail on a fresh Doc");
 
+        // #92/#121: the diff-sync baseline starts as the content the editor
+        // mounted with — read back from the just-initialized ydoc — rather
+        // than None. With a None baseline the first fold/send does a
+        // full-doc sync, which (per sync_model_to_ydoc_diffed's contract)
+        // can overwrite content a concurrent remote update contributed.
+        let last_synced_doc = Rc::new(RefCell::new(
+            yrs_bridge::read_doc_from_ydoc(&ydoc).ok(),
+        ));
+
         Self {
             ws: Rc::new(RefCell::new(None)),
             state: Rc::new(RefCell::new(ConnectionState::Disconnected)),
@@ -524,7 +616,8 @@ impl CollabClient {
             remote_cursors: Rc::new(RefCell::new(std::collections::HashMap::new())),
             _closures: Rc::new(RefCell::new(Vec::new())),
             pending_updates,
-            last_synced_doc: Rc::new(RefCell::new(None)),
+            last_synced_doc,
+            local_doc_provider: Rc::new(RefCell::new(None)),
             is_applying_remote,
             _update_sub: update_sub,
             last_activity_at: Rc::new(Cell::new(0.0)),
@@ -550,6 +643,12 @@ impl CollabClient {
     }
 
     /// Set the callback for remote document updates.
+    /// #92: register the editor-model provider used to fold unsent local
+    /// keystrokes into the ydoc before each remote update is applied.
+    pub fn set_local_doc_provider(&self, provider: LocalDocProvider) {
+        *self.local_doc_provider.borrow_mut() = Some(provider);
+    }
+
     pub fn set_on_remote_update(&self, callback: OnRemoteUpdate) {
         *self.on_remote_update.borrow_mut() = Some(callback);
     }
@@ -702,6 +801,7 @@ impl CollabClient {
             let pending_recv_timer: Rc<RefCell<Option<gloo_timers::callback::Timeout>>> =
                 Rc::new(RefCell::new(None));
             let last_synced_doc = Rc::clone(&self.last_synced_doc);
+            let local_doc_provider = Rc::clone(&self.local_doc_provider);
 
             wrap_event(move |event: web_sys::Event| {
                 let Some(data) = extract_binary_payload(&event) else { return };
@@ -721,6 +821,10 @@ impl CollabClient {
                 match msg_type {
                     MSG_SYNC_STEP1 => handle_sync_step1(payload, &ydoc, &ws_ref),
                     MSG_SYNC_STEP2 => {
+                        // #92: merge, don't clobber — fold keystrokes still
+                        // inside the send-debounce window into the ydoc
+                        // before applying the server's state.
+                        fold_local_before_remote(&ydoc, &local_doc_provider, &last_synced_doc);
                         apply_remote_update(payload, &ydoc, &is_remote);
                         *state.borrow_mut() = ConnectionState::Synced;
                         flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -730,7 +834,16 @@ impl CollabClient {
                         // and sync); without this the view stays stale until
                         // the next MSG_UPDATE. yrs apply already ran above, so
                         // a no-op diff just re-renders the same content.
-                        schedule_remote_callback(&ydoc, &on_remote, &pending_recv_timer, &last_synced_doc);
+                        schedule_remote_callback(
+                            &ydoc,
+                            &on_remote,
+                            &pending_recv_timer,
+                            &last_synced_doc,
+                            &local_doc_provider,
+                            &pending_updates,
+                            &ws_ref,
+                            &state,
+                        );
                         // Flush anything the user typed during the
                         // initial-sync handshake. yrs apply is
                         // idempotent, so even if part of this buffer
@@ -739,8 +852,27 @@ impl CollabClient {
                         flush_pending_updates_to_socket(&pending_updates, &ws_ref);
                     }
                     MSG_UPDATE => {
+                        // #92: same fold-before-apply as SyncStep2 — a peer
+                        // update landing mid-debounce must merge with, not
+                        // clobber, the keystrokes being typed.
+                        fold_local_before_remote(&ydoc, &local_doc_provider, &last_synced_doc);
                         apply_remote_update(payload, &ydoc, &is_remote);
-                        schedule_remote_callback(&ydoc, &on_remote, &pending_recv_timer, &last_synced_doc);
+                        schedule_remote_callback(
+                            &ydoc,
+                            &on_remote,
+                            &pending_recv_timer,
+                            &last_synced_doc,
+                            &local_doc_provider,
+                            &pending_updates,
+                            &ws_ref,
+                            &state,
+                        );
+                        // The fold's bytes must reach the server too;
+                        // post-sync nothing else drains the buffer until
+                        // the next local edit.
+                        if *state.borrow() == ConnectionState::Synced {
+                            flush_pending_updates_to_socket(&pending_updates, &ws_ref);
+                        }
                     }
                     MSG_AWARENESS => {
                         // Only process remote cursors after our own document is synced.

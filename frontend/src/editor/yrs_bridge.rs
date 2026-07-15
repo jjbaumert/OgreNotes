@@ -231,6 +231,40 @@ pub fn sync_model_to_ydoc_diffed(
     normalized
 }
 
+
+/// #92: whether two docs have the identical ordered list of top-level
+/// blockIds. This is the safety predicate for folding a possibly-stale
+/// editor model into a ydoc that just applied a remote update:
+/// `sync_children` treats the model's child list as authoritative, so a
+/// fold while the lists differ would delete a remotely-added block (see
+/// the `fold_after_remote_apply_deletes_peer_content` tripwire). When
+/// the lists match, reconciliation can only touch per-block subtrees —
+/// blocks the user hasn't edited are skipped by the equality check and
+/// remote content inside them survives.
+pub fn same_top_level_block_ids(a: &Node, b: &Node) -> bool {
+    fn ids(doc: &Node) -> Option<Vec<&str>> {
+        match doc {
+            Node::Element { content, .. } => Some(
+                content
+                    .children
+                    .iter()
+                    .map(|c| match c {
+                        Node::Element { attrs, .. } => {
+                            attrs.get("blockId").map(|s| s.as_str()).unwrap_or("")
+                        }
+                        Node::Text { .. } => "",
+                    })
+                    .collect(),
+            ),
+            Node::Text { .. } => None,
+        }
+    }
+    match (ids(a), ids(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Sync a list of model children into a yrs container.
 /// Uses blockId-based matching to minimize yrs operations.
 fn sync_children<C: XmlFragment>(
@@ -3815,5 +3849,283 @@ mod tests {
             }
             Node::Text { .. } => None,
         }
+    }
+
+    /// Collect all text content of a doc, in order. Assertion helper for
+    /// the #92 merge tests.
+    fn collect_text(node: &Node, out: &mut String) {
+        match node {
+            Node::Text { text, .. } => out.push_str(text),
+            Node::Element { content, .. } => {
+                for child in &content.children {
+                    collect_text(child, out);
+                }
+            }
+        }
+    }
+
+    fn doc_text(node: &Node) -> String {
+        let mut s = String::new();
+        collect_text(node, &mut s);
+        s
+    }
+
+    /// #92 (editor drops first keystrokes): keystrokes that exist only in
+    /// the editor model — typed inside the send-debounce window, not yet
+    /// folded into the ydoc — must survive a remote update that rebuilds
+    /// the view from the ydoc. The recv path folds the current editor
+    /// model into the ydoc BEFORE reading it back, turning the wholesale
+    /// swap into a CRDT merge. This test replays the exact race:
+    /// REST-initialized client ydoc, unsynced local keystrokes, initial
+    /// SyncStep2 carrying a peer edit.
+    #[test]
+    fn merge_preserves_unsynced_keystrokes_across_remote_swap() {
+        // REST-loaded initial content: one paragraph "Hello".
+        let initial = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::Paragraph,
+                [("blockId".into(), "b1".into())].into(),
+                Fragment::from(vec![Node::text("Hello")]),
+            )]),
+        );
+        let initial_bytes = doc_to_ydoc_bytes(&initial);
+
+        // Client ydoc — as CollabClient::new builds it — and the baseline
+        // the editor has actually seen (the initial content).
+        let client_ydoc = Doc::new();
+        {
+            let mut txn = client_ydoc.transact_mut();
+            txn.apply_update(Update::decode_v1(&initial_bytes).unwrap())
+                .unwrap();
+        }
+        let baseline = read_doc_from_ydoc(&client_ydoc).unwrap();
+
+        // User types "al" at the head of the paragraph. This lives only in
+        // the editor model — the debounced send has NOT folded it into the
+        // ydoc yet.
+        let typed = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::Paragraph,
+                [("blockId".into(), "b1".into())].into(),
+                Fragment::from(vec![Node::text("alHello")]),
+            )]),
+        );
+
+        // Meanwhile the server (same lineage) gained a peer edit: a second
+        // paragraph. Its full state arrives as the initial SyncStep2 and is
+        // applied into the client ydoc, exactly like apply_remote_update.
+        let server_ydoc = Doc::new();
+        {
+            let mut txn = server_ydoc.transact_mut();
+            txn.apply_update(Update::decode_v1(&initial_bytes).unwrap())
+                .unwrap();
+        }
+        let server_model = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_attrs(
+                    NodeType::Paragraph,
+                    [("blockId".into(), "b1".into())].into(),
+                    Fragment::from(vec![Node::text("Hello")]),
+                ),
+                Node::element_with_attrs(
+                    NodeType::Paragraph,
+                    [("blockId".into(), "b2".into())].into(),
+                    Fragment::from(vec![Node::text("Peer")]),
+                ),
+            ]),
+        );
+        sync_model_to_ydoc_diffed(&server_ydoc, &server_model, Some(&initial));
+        let server_state = server_ydoc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+
+        // The fix: FOLD the editor model into the ydoc first (diffed
+        // against its own baseline — the diff is exactly the local
+        // keystrokes), THEN apply the remote update and read the yrs
+        // merge. This is the order the ws_client recv path uses.
+        let normalized = sync_model_to_ydoc_diffed(&client_ydoc, &typed, Some(&baseline));
+        assert!(
+            doc_text(&normalized).contains("alHello"),
+            "fold baseline sanity"
+        );
+        {
+            let mut txn = client_ydoc.transact_mut();
+            txn.apply_update(Update::decode_v1(&server_state).unwrap())
+                .unwrap();
+        }
+        let merged = read_doc_from_ydoc(&client_ydoc).unwrap();
+        let text = doc_text(&merged);
+        assert!(
+            text.contains("alHello"),
+            "typed keystrokes must survive the swap, got {text:?}"
+        );
+        assert!(
+            text.contains("Peer"),
+            "the peer's remote edit must also survive the merge, got {text:?}"
+        );
+    }
+
+    /// Companion tripwire to the test above: the fold MUST happen before
+    /// the remote update is applied. In the reverse order the model's
+    /// child-list reconciliation treats the peer's paragraph (which the
+    /// stale editor model has never seen) as a local deletion and removes
+    /// it. If a refactor changes the recv path's ordering, this documents
+    /// what breaks.
+    #[test]
+    fn fold_after_remote_apply_deletes_peer_content() {
+        let initial = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::Paragraph,
+                [("blockId".into(), "b1".into())].into(),
+                Fragment::from(vec![Node::text("Hello")]),
+            )]),
+        );
+        let initial_bytes = doc_to_ydoc_bytes(&initial);
+
+        let client_ydoc = Doc::new();
+        {
+            let mut txn = client_ydoc.transact_mut();
+            txn.apply_update(Update::decode_v1(&initial_bytes).unwrap())
+                .unwrap();
+        }
+        let baseline = read_doc_from_ydoc(&client_ydoc).unwrap();
+
+        let typed = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::Paragraph,
+                [("blockId".into(), "b1".into())].into(),
+                Fragment::from(vec![Node::text("alHello")]),
+            )]),
+        );
+
+        let server_ydoc = Doc::new();
+        {
+            let mut txn = server_ydoc.transact_mut();
+            txn.apply_update(Update::decode_v1(&initial_bytes).unwrap())
+                .unwrap();
+        }
+        let server_model = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_attrs(
+                    NodeType::Paragraph,
+                    [("blockId".into(), "b1".into())].into(),
+                    Fragment::from(vec![Node::text("Hello")]),
+                ),
+                Node::element_with_attrs(
+                    NodeType::Paragraph,
+                    [("blockId".into(), "b2".into())].into(),
+                    Fragment::from(vec![Node::text("Peer")]),
+                ),
+            ]),
+        );
+        sync_model_to_ydoc_diffed(&server_ydoc, &server_model, Some(&initial));
+        let server_state = server_ydoc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+
+        // Wrong order: remote applied first, stale model folded after.
+        {
+            let mut txn = client_ydoc.transact_mut();
+            txn.apply_update(Update::decode_v1(&server_state).unwrap())
+                .unwrap();
+        }
+        sync_model_to_ydoc_diffed(&client_ydoc, &typed, Some(&baseline));
+        let text = doc_text(&read_doc_from_ydoc(&client_ydoc).unwrap());
+        assert!(
+            !text.contains("Peer"),
+            "documented hazard: apply-then-fold deletes the peer edit \
+             (if this starts passing, the recv-path ordering constraint \
+             may have been lifted — re-examine ws_client): {text:?}"
+        );
+    }
+
+    /// #92 (swap-window half): keystrokes typed between a remote apply and
+    /// the debounced swap-read exist only in the editor model. The recv
+    /// timer folds them into the ydoc before swapping — but only when the
+    /// model and the post-merge ydoc agree on top-level structure
+    /// (`same_top_level_block_ids`), which is what makes the fold safe:
+    /// per-block reconciliation can't delete a block. This exercises both
+    /// branches of that guard.
+    #[test]
+    fn swap_window_fold_is_guarded_by_structure() {
+        let para = |id: &str, text: &str| {
+            Node::element_with_attrs(
+                NodeType::Paragraph,
+                [("blockId".into(), id.into())].into(),
+                Fragment::from(vec![Node::text(text)]),
+            )
+        };
+        let initial = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![para("b1", "Hello")]),
+        );
+        let initial_bytes = doc_to_ydoc_bytes(&initial);
+
+        // ── Guard-positive: remote made no structural change. ──
+        let ydoc = Doc::new();
+        {
+            let mut txn = ydoc.transact_mut();
+            txn.apply_update(Update::decode_v1(&initial_bytes).unwrap()).unwrap();
+        }
+        let baseline = read_doc_from_ydoc(&ydoc).unwrap();
+        // Remote frame applied (here: an idempotent re-send of the same
+        // state, like the second handshake SyncStep2)…
+        {
+            let mut txn = ydoc.transact_mut();
+            txn.apply_update(Update::decode_v1(&initial_bytes).unwrap()).unwrap();
+        }
+        // …while the user typed "al" (model-only).
+        let typed = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![para("b1", "alHello")]),
+        );
+        let swap_state = read_doc_from_ydoc(&ydoc).unwrap();
+        assert!(
+            same_top_level_block_ids(&typed, &swap_state),
+            "no structural divergence → fold is safe"
+        );
+        sync_model_to_ydoc_diffed(&ydoc, &typed, Some(&baseline));
+        let merged = read_doc_from_ydoc(&ydoc).unwrap();
+        assert!(
+            doc_text(&merged).contains("alHello"),
+            "swap-window keystrokes must be folded before the swap, got {:?}",
+            doc_text(&merged)
+        );
+
+        // ── Guard-negative: remote added a block; fold must be skipped. ──
+        let ydoc2 = Doc::new();
+        {
+            let mut txn = ydoc2.transact_mut();
+            txn.apply_update(Update::decode_v1(&initial_bytes).unwrap()).unwrap();
+        }
+        let server = Doc::new();
+        {
+            let mut txn = server.transact_mut();
+            txn.apply_update(Update::decode_v1(&initial_bytes).unwrap()).unwrap();
+        }
+        let server_model = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![para("b1", "Hello"), para("b2", "Peer")]),
+        );
+        sync_model_to_ydoc_diffed(&server, &server_model, Some(&initial));
+        let server_state = server
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        {
+            let mut txn = ydoc2.transact_mut();
+            txn.apply_update(Update::decode_v1(&server_state).unwrap()).unwrap();
+        }
+        let swap_state2 = read_doc_from_ydoc(&ydoc2).unwrap();
+        assert!(
+            !same_top_level_block_ids(&typed, &swap_state2),
+            "remote structural change → the guard must refuse the fold \
+             (folding would delete the peer's block, per the tripwire test)"
+        );
     }
 }

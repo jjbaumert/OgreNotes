@@ -5944,6 +5944,140 @@ async function scenarioSustainedTypeReload(ctx, collector) {
   }
 }
 
+// ─── First-keystrokes scenario (#92) ────────────────────────────────
+// Regression for the mount-time input race: characters typed after
+// `.editor-content[data-editor-ready]` but before the initial WS
+// SyncStep2 settles were dropped and/or reordered in the LIVE view —
+// the sync-triggered swap rebuilt the editor from a ydoc that had never
+// seen them. The fix folds the live editor model into the ydoc before
+// every remote apply (merge, not clobber) and removes the is_synced()
+// gate so `send_update` can buffer pre-sync edits.
+//
+// `pre-sync-edit-preserved` cannot catch this: it only asserts the
+// sentinel survives a RELOAD, and the REST autosave (PUT /content)
+// fires during the hold and persists the text even when the live view
+// clobbered it. This scenario reuses the same deterministic
+// SyncStep2-hold trick but asserts the LIVE editor text, exactly —
+// dropped chars and reordering both fail the equality check — and only
+// then the post-reload persistence.
+async function scenarioFirstKeystrokes(ctx, collector) {
+  const { baseUrlA, baseUrl, emailA, outDir } = ctx;
+  const target = baseUrlA || baseUrl;
+  const tokens = await devLogin(
+    target, emailA || "doctor-firstkeys@ogrenotes.example.com",
+  );
+  const doc = await createDocViaApi(
+    target,
+    tokens.accessToken,
+    `doctor-firstkeys-${Date.now()}`,
+    "document",
+  );
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    ...DOCTOR_CONTEXT_DEFAULTS,
+    recordHar: { path: join(outDir, "tab-a.har"), mode: "full" },
+  });
+  await seedAuth(context, tokens);
+
+  // Hold the first server→page SyncStep2 so the client stays in the
+  // Connected-not-Synced window while we type — the deterministic
+  // version of "start typing the instant the editor renders".
+  const PRE_SYNC_HOLD_MS = 3000;
+  const SYNC_STEP2 = 0x02;
+  await context.routeWebSocket(/\/api\/v1\/documents\/.*\/ws/, (ws) => {
+    const server = ws.connectToServer();
+    let firstSyncStep2Released = false;
+    server.onMessage((message) => {
+      const bytes =
+        message instanceof Buffer
+          ? message
+          : Buffer.from(message instanceof ArrayBuffer ? new Uint8Array(message) : message);
+      if (!firstSyncStep2Released && bytes.length > 0 && bytes[0] === SYNC_STEP2) {
+        firstSyncStep2Released = true;
+        setTimeout(() => {
+          ws.send(message);
+        }, PRE_SYNC_HOLD_MS);
+        return;
+      }
+      ws.send(message);
+    });
+  });
+
+  const page = await context.newPage();
+  instrument(context, page, "tab-a", collector);
+
+  const PHRASE = "alpha one alpha two alpha three";
+  const steps = {};
+  collector.scenario = {
+    name: "first-keystrokes",
+    target,
+    docId: doc.id,
+    phrase: PHRASE,
+    holdMs: PRE_SYNC_HOLD_MS,
+    steps,
+  };
+
+  try {
+    await page.goto(`${target}/d/${doc.id}`, {
+      waitUntil: "domcontentloaded",
+      timeout: 30000,
+    });
+    // Wait ONLY for readiness — SyncStep2 is being held, so typing here
+    // lands squarely in the mount/sync race window.
+    await page.waitForSelector(".editor-content[data-editor-ready]", {
+      timeout: 15000,
+    });
+    const ed = page.locator(".editor-content");
+    await ed.click();
+    await page.keyboard.type(PHRASE, { delay: 15 });
+    steps.typedDuringHandshake = true;
+
+    // Release + settle: the held SyncStep2 lands, the recv path folds /
+    // swaps, the pending buffer flushes.
+    await page.waitForTimeout(PRE_SYNC_HOLD_MS + 2000);
+
+    // The #92 assertion: the LIVE view kept every keystroke, in order.
+    const live = ((await ed.textContent()) || "").trim();
+    collector.scenario.live = live;
+    steps.liveTextExact = live === PHRASE;
+    if (!steps.liveTextExact) {
+      throw new Error(
+        `live editor text lost/reordered keystrokes after initial sync: ` +
+          `expected ${JSON.stringify(PHRASE)}, got ${JSON.stringify(live)}`,
+      );
+    }
+
+    // And the same text persisted (round-trip through the server).
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.waitForSelector(".editor-content[data-editor-ready]", {
+      timeout: 15000,
+    });
+    await page.waitForTimeout(1500);
+    const persisted = ((await ed.textContent()) || "").trim();
+    collector.scenario.persisted = persisted;
+    steps.persistedTextExact = persisted === PHRASE;
+    if (!steps.persistedTextExact) {
+      throw new Error(
+        `persisted text diverged after reload: expected ` +
+          `${JSON.stringify(PHRASE)}, got ${JSON.stringify(persisted)}`,
+      );
+    }
+    collector.scenario.ok = true;
+  } catch (e) {
+    collector.stepError = `${e.message}`;
+    throw e;
+  } finally {
+    const tab = collector["tab-a"] || { errors: [] };
+    steps.noPageErrors = (tab.errors || []).length === 0;
+    await page
+      .screenshot({ path: join(outDir, "tab-a.png"), fullPage: false })
+      .catch(() => {});
+    await context.close();
+    await browser.close();
+  }
+}
+
 // ─── Menu → Export download scenario ───────────────────────────────
 // Repros the 2026-05-28 bug class where Document → Markdown / HTML /
 // CSV / Excel opened the export URL in a fresh tab via window.open,
@@ -6154,6 +6288,8 @@ async function main() {
       await scenarioPreSyncEditPreserved(ctx, collector);
     } else if (scenario === "sustained-type-reload") {
       await scenarioSustainedTypeReload(ctx, collector);
+    } else if (scenario === "first-keystrokes") {
+      await scenarioFirstKeystrokes(ctx, collector);
     } else if (scenario === "history-pane") {
       await scenarioHistoryPane(ctx, collector);
     } else if (scenario === "delete-document") {
