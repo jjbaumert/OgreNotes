@@ -2303,3 +2303,92 @@ async fn test_edit_message_rich_fields_set_and_strip() {
 
     app.cleanup().await;
 }
+
+/// #38: thread/message listings hydrate display names through the batched
+/// `resolve_display_names` (one BatchGetItem) instead of a per-author
+/// get_by_id loop. Two distinct authors must both come back with their
+/// real display names — and a deleted/missing author falls back to the
+/// raw user id (the same policy the per-id path had).
+#[tokio::test]
+async fn test_list_messages_hydrates_multiple_author_names() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (_, token_a) = app
+        .create_user_with_name("alice-names@test.com", "Alice Names")
+        .await;
+    let (bob_id, token_b) = app
+        .create_user_with_name("bob-names@test.com", "Bob Names")
+        .await;
+    let folder_id = app.create_folder(&token_a, "Shared", None).await;
+    let doc_id = app.create_doc(&token_a, "Doc", Some(&folder_id)).await;
+    let body = serde_json::json!({ "userId": bob_id, "accessLevel": "COMMENT" });
+    let (status, _) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/folders/{folder_id}/members"),
+            Some(&token_a),
+            Some(body),
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    // Alice opens a thread; Bob replies.
+    let body = serde_json::json!({ "threadType": "document", "message": "from alice" });
+    let (_, tj) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/documents/{doc_id}/threads"),
+            Some(&token_a),
+            Some(body),
+        )
+        .await;
+    let thread_id = tj["threadId"].as_str().unwrap().to_string();
+    app.json_request(
+        Method::POST,
+        &format!("/api/v1/threads/{thread_id}/messages"),
+        Some(&token_b),
+        Some(serde_json::json!({ "content": "from bob" })),
+    )
+    .await;
+
+    // Both authors' names hydrate through the batch.
+    let (_, msgs) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/threads/{thread_id}/messages"),
+            Some(&token_a),
+            None,
+        )
+        .await;
+    let names: Vec<&str> = msgs["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["userName"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Alice Names", "Bob Names"],
+        "both authors' display names must hydrate via the batch"
+    );
+
+    // Thread listing hydrates the creator's name the same way.
+    let (_, threads) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/documents/{doc_id}/threads"),
+            Some(&token_a),
+            None,
+        )
+        .await;
+    let t = threads["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["threadId"].as_str() == Some(&thread_id))
+        .unwrap();
+    assert_eq!(t["createdByName"].as_str().unwrap(), "Alice Names");
+
+    app.cleanup().await;
+}

@@ -118,12 +118,16 @@ async fn list_members(
     }
 
     let members = state.folder_repo.list_members(&folder_id).await?;
+    // One BatchGetItem for every member's name+email (#38) — previously a
+    // sequential get_by_id per member. Missing rows keep the old fallback.
+    let member_ids: Vec<String> = members.iter().map(|m| m.user_id.clone()).collect();
+    let users = state.user_repo.get_by_ids(&member_ids).await.unwrap_or_default();
     let mut response_members = Vec::new();
     for m in members {
-        let (name, email) = match state.user_repo.get_by_id(&m.user_id).await {
-            Ok(Some(user)) => (user.name, user.email),
-            _ => (m.user_id.clone(), String::new()),
-        };
+        let (name, email) = users
+            .get(&m.user_id)
+            .map(|u| (u.name.clone(), u.email.clone()))
+            .unwrap_or_else(|| (m.user_id.clone(), String::new()));
         response_members.push(MemberResponse {
             user_id: m.user_id,
             name,
@@ -406,12 +410,15 @@ async fn list_doc_members(
     ).await?;
 
     let members = state.doc_repo.list_doc_members(&doc_id).await?;
+    // Batch member hydration (#38), same fallback as before.
+    let member_ids: Vec<String> = members.iter().map(|m| m.user_id.clone()).collect();
+    let users = state.user_repo.get_by_ids(&member_ids).await.unwrap_or_default();
     let mut responses = Vec::new();
     for m in members {
-        let (name, email) = match state.user_repo.get_by_id(&m.user_id).await {
-            Ok(Some(user)) => (user.name, user.email),
-            _ => (m.user_id.clone(), String::new()),
-        };
+        let (name, email) = users
+            .get(&m.user_id)
+            .map(|u| (u.name.clone(), u.email.clone()))
+            .unwrap_or_else(|| (m.user_id.clone(), String::new()));
         responses.push(MemberResponse {
             user_id: m.user_id,
             name,
