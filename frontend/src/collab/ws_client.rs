@@ -1281,6 +1281,142 @@ mod tests {
         assert_eq!(restored.text_content(), "Hello world");
     }
 
+    /// Fixture: a doc with one identified paragraph. Used with
+    /// `peer_added_update` by the two frame-race regression tests below.
+    fn ided_doc(text: &str) -> Node {
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::Paragraph,
+                [("blockId".into(), "b1".into())].into(),
+                Fragment::from(vec![Node::text(text)]),
+            )]),
+        )
+    }
+
+    /// Encode a server-side update in which a peer appended block b2
+    /// ("Peer") to `initial`.
+    fn peer_added_update(initial: &Node, initial_bytes: &[u8]) -> Vec<u8> {
+        let with_peer_block = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_attrs(
+                    NodeType::Paragraph,
+                    [("blockId".into(), "b1".into())].into(),
+                    Fragment::from(vec![Node::text("Hello")]),
+                ),
+                Node::element_with_attrs(
+                    NodeType::Paragraph,
+                    [("blockId".into(), "b2".into())].into(),
+                    Fragment::from(vec![Node::text("Peer")]),
+                ),
+            ]),
+        );
+        let server_ydoc = yrs::Doc::new();
+        {
+            let mut txn = server_ydoc.transact_mut();
+            txn.apply_update(yrs::Update::decode_v1(initial_bytes).unwrap())
+                .unwrap();
+        }
+        yrs_bridge::sync_model_to_ydoc_diffed(&server_ydoc, &with_peer_block, Some(initial));
+        server_ydoc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default())
+    }
+
+    /// #92 follow-up (recv-side frame burst): two incoming WS frames land
+    /// before the editor model catches up with the first one's structural
+    /// change. Frame 1 (already applied to the ydoc) adds block b2; frame
+    /// 2's handler-level fold runs with a model that still predates it.
+    /// The baseline-scoped `remove_unmatched` must keep b2 — pre-fix, the
+    /// fold deleted it and the deletion propagated to every peer.
+    #[test]
+    fn fold_local_before_remote_keeps_block_added_by_earlier_frame_in_burst() {
+        let initial = ided_doc("Hello");
+        let initial_bytes = yrs_bridge::doc_to_ydoc_bytes(&initial);
+        let client = CollabClient::new("doc1".into(), Some(&initial_bytes));
+
+        let baseline = client.last_synced_doc.borrow().clone().unwrap();
+        assert_eq!(baseline.text_content(), "Hello");
+
+        let stale_model = initial.clone();
+        *client.local_doc_provider.borrow_mut() =
+            Some(Box::new(move || Some(stale_model.clone())));
+
+        let frame1 = peer_added_update(&initial, &initial_bytes);
+        apply_remote_update(&frame1, &client.ydoc, &client.is_applying_remote);
+        {
+            let ydoc = client.ydoc.borrow();
+            assert!(yrs_bridge::read_doc_from_ydoc(&ydoc)
+                .unwrap()
+                .text_content()
+                .contains("Peer"));
+        }
+
+        // Frame 2's pre-apply fold, with the stale model.
+        fold_local_before_remote(
+            &client.ydoc,
+            &client.local_doc_provider,
+            &client.last_synced_doc,
+        );
+
+        let ydoc = client.ydoc.borrow();
+        let doc = yrs_bridge::read_doc_from_ydoc(&ydoc).unwrap();
+        assert!(
+            doc.text_content().contains("Peer"),
+            "fold must not delete a block a stale model doesn't know \
+             about yet, got {:?}",
+            doc.text_content()
+        );
+    }
+
+    /// #92 follow-up (send-side race): after a remote update lands,
+    /// `last_synced_doc` is only rebased when the recv-debounce timer
+    /// fires. A local `send_update` firing in that window with a model
+    /// that (like the baseline) predates the remote structural change
+    /// must not delete the peer's new block — the pre-existing cousin of
+    /// the recv-side burst hazard.
+    #[test]
+    fn send_update_keeps_peer_block_when_baseline_not_yet_rebased() {
+        let initial = ided_doc("Hello");
+        let initial_bytes = yrs_bridge::doc_to_ydoc_bytes(&initial);
+        let client = CollabClient::new("doc1".into(), Some(&initial_bytes));
+        *client.state.borrow_mut() = ConnectionState::Synced;
+
+        let frame = peer_added_update(&initial, &initial_bytes);
+        apply_remote_update(&frame, &client.ydoc, &client.is_applying_remote);
+        {
+            let ydoc = client.ydoc.borrow();
+            assert!(yrs_bridge::read_doc_from_ydoc(&ydoc)
+                .unwrap()
+                .text_content()
+                .contains("Peer"));
+        }
+        assert!(
+            !client
+                .last_synced_doc
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .text_content()
+                .contains("Peer"),
+            "precondition: the baseline has not been rebased yet"
+        );
+
+        // A local send fires with a model that predates the remote frame
+        // (the editor hasn't re-rendered from the swap yet).
+        client.send_update(&initial);
+
+        let ydoc = client.ydoc.borrow();
+        let doc = yrs_bridge::read_doc_from_ydoc(&ydoc).unwrap();
+        assert!(
+            doc.text_content().contains("Peer"),
+            "send_update must not delete a peer block the local model \
+             hasn't caught up with yet, got {:?}",
+            doc.text_content()
+        );
+    }
+
     // ── RemoteApplyGuard ──
 
     #[test]

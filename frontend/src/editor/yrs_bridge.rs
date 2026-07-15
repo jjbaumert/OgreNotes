@@ -273,7 +273,7 @@ fn sync_children<C: XmlFragment>(
     new_children: &[Node],
     old_children: Option<&[Node]>,
 ) {
-    let (actions, matched) = match_children(txn, container, new_children);
+    let (actions, matched, yrs_blocks) = match_children(txn, container, new_children);
 
     // Diagnostic counters for the "every keystroke produces a 60 KB
     // rewrite" pathology — see crate::observability docstrings on
@@ -290,17 +290,19 @@ fn sync_children<C: XmlFragment>(
         matched_count as u64,
     );
 
-    remove_unmatched(txn, container, &matched);
+    remove_unmatched(txn, container, &matched, &yrs_blocks, old_children);
     apply_actions(txn, container, &actions, &matched, old_children);
 }
 
 /// Match model children to existing yrs blocks by blockId (or tag for leaf atoms).
-/// Returns a list of SyncActions and a bitmask of which yrs blocks were matched.
+/// Returns the SyncActions, a bitmask of which yrs blocks were matched, and
+/// the per-block identity info (`remove_unmatched` needs the blockIds to
+/// scope deletions against the caller's baseline).
 fn match_children<'a, C: XmlFragment>(
     txn: &yrs::TransactionMut<'_>,
     container: &C,
     new_children: &'a [Node],
-) -> (Vec<SyncAction<'a>>, Vec<bool>) {
+) -> (Vec<SyncAction<'a>>, Vec<bool>, Vec<YrsBlockInfo>) {
     let yrs_len = container.len(txn);
     let mut yrs_blocks: Vec<YrsBlockInfo> = Vec::with_capacity(yrs_len as usize);
     for i in 0..yrs_len {
@@ -328,7 +330,7 @@ fn match_children<'a, C: XmlFragment>(
         }
     }
 
-    (actions, matched)
+    (actions, matched, yrs_blocks)
 }
 
 /// Try to find a matching yrs block for a model node.
@@ -446,15 +448,43 @@ fn find_match(
 
 /// Remove yrs blocks that weren't matched to any model node.
 /// Iterates in reverse to keep indices stable during removal.
+/// Baseline-scoped (#92 follow-up): when the caller supplies
+/// `old_children` (its own last-known view of this container), an
+/// unmatched live block is only deleted if the caller's baseline *also*
+/// referenced its blockId. An unmatched block absent from BOTH the new
+/// model and the baseline is one the caller never had the chance to
+/// observe — most commonly a concurrent remote update applied to this
+/// container after the baseline was captured (two WS frames landing
+/// back-to-back before the swap timer fires, or a local send racing a
+/// remote apply). Treating "the model doesn't mention it" as
+/// authoritative for deletion in that case would destroy the peer's
+/// content — the model literally could not have listed a block it has
+/// never seen — and the observer would propagate the deletion to every
+/// client. A block present in the baseline but dropped from the model
+/// is a deliberate LOCAL deletion and still syncs. Blocks without a
+/// real blockId (pre-migration legacy containers matched via
+/// `find_match`'s strategy-3 fallback) keep the prior
+/// unconditional-delete behavior — they aren't identifiable against a
+/// baseline by blockId, and refusing would deadlock the healing path.
 fn remove_unmatched<C: XmlFragment>(
     txn: &mut yrs::TransactionMut<'_>,
     container: &C,
     matched: &[bool],
+    yrs_blocks: &[YrsBlockInfo],
+    old_children: Option<&[Node]>,
 ) {
+    let old_ids: Option<std::collections::HashSet<&str>> =
+        old_children.map(|old| old.iter().filter_map(|n| n.block_id()).collect());
     for i in (0..matched.len()).rev() {
-        if !matched[i] {
-            container.remove(txn, i as u32);
+        if matched[i] {
+            continue;
         }
+        if let (Some(old_ids), Some(bid)) = (&old_ids, yrs_blocks[i].block_id.as_deref()) {
+            if !old_ids.contains(bid) {
+                continue; // unknown to the caller's baseline — keep it
+            }
+        }
+        container.remove(txn, i as u32);
     }
 }
 
@@ -3968,14 +3998,18 @@ mod tests {
         );
     }
 
-    /// Companion tripwire to the test above: the fold MUST happen before
-    /// the remote update is applied. In the reverse order the model's
-    /// child-list reconciliation treats the peer's paragraph (which the
-    /// stale editor model has never seen) as a local deletion and removes
-    /// it. If a refactor changes the recv path's ordering, this documents
-    /// what breaks.
+    /// Companion to the test above. Historically the fold HAD to happen
+    /// before the remote update was applied: in the reverse order,
+    /// `remove_unmatched` treated the peer's paragraph (which the stale
+    /// editor model had never seen) as a local deletion and removed it —
+    /// this test originally pinned that hazard. `remove_unmatched` is now
+    /// baseline-scoped (it only deletes an unmatched live block whose
+    /// blockId the caller's baseline knew), so BOTH orderings preserve
+    /// the peer's content and the recv path's fold/apply ordering is no
+    /// longer load-bearing for safety (it still matters for merging the
+    /// local edits themselves — see the test above).
     #[test]
-    fn fold_after_remote_apply_deletes_peer_content() {
+    fn fold_after_remote_apply_preserves_peer_content() {
         let initial = Node::element_with_content(
             NodeType::Doc,
             Fragment::from(vec![Node::element_with_attrs(
@@ -4038,10 +4072,14 @@ mod tests {
         sync_model_to_ydoc_diffed(&client_ydoc, &typed, Some(&baseline));
         let text = doc_text(&read_doc_from_ydoc(&client_ydoc).unwrap());
         assert!(
-            !text.contains("Peer"),
-            "documented hazard: apply-then-fold deletes the peer edit \
-             (if this starts passing, the recv-path ordering constraint \
-             may have been lifted — re-examine ws_client): {text:?}"
+            text.contains("Peer"),
+            "baseline-scoped remove_unmatched must keep the peer's block \
+             even when a stale model is folded AFTER the remote apply \
+             (the block's id is unknown to the fold's baseline): {text:?}"
+        );
+        assert!(
+            text.contains("alHello"),
+            "the local keystrokes must also be in the merge: {text:?}"
         );
     }
 
