@@ -24,6 +24,10 @@ name: Playwright (frontend-doctor scenarios)
 #   - comment-live-sync     — peer's REST-driven reply lands in another
 #                             tab's open CommentPopup without manual
 #                             reload.
+#   - pre-sync-edit-preserved / first-keystrokes — #92 input races:
+#                             keystrokes typed during the WS handshake /
+#                             the instant the editor reports ready must
+#                             survive the initial sync, exactly.
 
 on:
   schedule:
@@ -603,6 +607,35 @@ jobs:
             --scenario sustained-type-reload \
             --base-url http://127.0.0.1:3000 \
             --out ../../artifacts/doctor/sustained-type-reload
+
+      # #92: typing-during-handshake guard (deterministic — holds the
+      # first SyncStep2 via routeWebSocket). Written for the 07147fa fix
+      # arc but never wired into CI; the is_synced() gate on the
+      # debounced sender silently regressed it. See
+      # scenarioPreSyncEditPreserved in doctor.js.
+      - name: Run pre-sync-edit-preserved scenario (#92)
+        id: pre-sync-edit-preserved
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario pre-sync-edit-preserved \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/pre-sync-edit-preserved
+
+      # #92: natural-timing mount race — types the instant
+      # [data-editor-ready] lands and asserts the EXACT text (drops and
+      # reorders both fail), live and after reload, across several
+      # fresh docs. See scenarioFirstKeystrokes in doctor.js.
+      - name: Run first-keystrokes scenario (#92)
+        id: first-keystrokes
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario first-keystrokes \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/first-keystrokes
 
       # Firefox-only: the #90 history-pane close panic is Gecko-specific
       # (clean in Chromium). Guards against regression of the deferred

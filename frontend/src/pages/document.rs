@@ -831,6 +831,18 @@ pub fn DocumentPage() -> impl IntoView {
                 set_remote_state_ws.set(Some(state));
             }));
 
+            // #92: let the client fold keystrokes still inside the send
+            // debounce into the ydoc before each remote update is applied
+            // — otherwise the swap above rebuilds the view from a ydoc
+            // that never saw them and they vanish (worst at mount, when
+            // the initial SyncStep2 races the first keystrokes).
+            client.set_local_doc_provider(Box::new(move || {
+                editor_state
+                    .try_get_untracked()
+                    .flatten()
+                    .map(|s| s.doc)
+            }));
+
             // Set up awareness callback for remote cursor presence.
             client.set_on_awareness_update(Box::new(move |cursors| {
                 set_remote_cursors.set(cursors);
@@ -1088,15 +1100,32 @@ pub fn DocumentPage() -> impl IntoView {
         // Debounce: set a timer. If another change arrives before the timeout,
         // the previous timer is dropped (cancelled) and a new one is set.
         let collab = collab_for_send.clone();
-        let doc = state.doc.clone();
         let timer_ref = pending_send_timer.clone();
         *timer_ref.borrow_mut() = Some(gloo_timers::callback::Timeout::new(
             crate::collab::ws_client::WS_SEND_DEBOUNCE_MS,
             move || {
                 if let Some(ref client) = *collab.borrow() {
-                    if client.is_synced() {
-                        client.send_update(&doc);
-                    }
+                    // #92 — two deliberate choices here:
+                    //
+                    // 1. No `is_synced()` gate. `send_update` already
+                    //    handles the pre-sync case correctly (folds into
+                    //    the ydoc + buffers; the SyncStep2 handler
+                    //    flushes). Gating here made keystrokes typed
+                    //    before the initial sync invisible to the CRDT —
+                    //    the swap then dropped them (the "first
+                    //    keystrokes after mount" bug).
+                    //
+                    // 2. Read the CURRENT editor state at fire time, not
+                    //    a snapshot captured at scheduling. If a remote
+                    //    swap lands inside the debounce window, the
+                    //    snapshot is stale, and diffing it against the
+                    //    post-merge baseline would revert the peer's
+                    //    content (child-list reconciliation reads
+                    //    "missing" as "deleted").
+                    let Some(current) = editor_state.try_get_untracked().flatten() else {
+                        return;
+                    };
+                    client.send_update(&current.doc);
                 }
             },
         ));
