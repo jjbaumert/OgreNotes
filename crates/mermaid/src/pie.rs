@@ -93,87 +93,115 @@ pub(crate) fn parse(source: &str) -> Result<Pie, ParseError> {
     Ok(Pie { title, show_data, slices })
 }
 
-// Pastel categorical palette approximating Mermaid's default pie sections, so
-// dark slice/percentage labels stay readable on top (Mermaid slices are pale
-// with dark text, not saturated fills).
+/// Mermaid's default-theme pie section palette (`pie1`..`pie12`), in order.
+/// SVG accepts `hsl(...)` fills directly, so the theme values are used verbatim.
 const PALETTE: &[&str] = &[
-    "#ECECFF", "#FFFFDE", "#FCC5C5", "#C6E5D9", "#C7CEEA",
-    "#FFE0B3", "#D9C2F0", "#B5E3D8", "#F5C6D6", "#D6E5A3",
+    "#ECECFF",
+    "#ffffde",
+    "hsl(80, 100%, 56.2745098039%)",
+    "hsl(240, 100%, 86.2745098039%)",
+    "hsl(60, 100%, 86.2745098039%)",
+    "hsl(80, 100%, 86.2745098039%)",
+    "hsl(120, 100%, 86.2745098039%)",
+    "hsl(300, 100%, 86.2745098039%)",
+    "hsl(0, 100%, 86.2745098039%)",
+    "hsl(150, 100%, 86.2745098039%)",
+    "hsl(0, 100%, 86.2745098039%)",
+    "hsl(210, 100%, 86.2745098039%)",
 ];
-const W: f64 = 420.0;
-const H: f64 = 300.0;
-const CX: f64 = 150.0;
-const CY: f64 = 160.0;
-const R: f64 = 110.0;
+const MARGIN: f64 = 40.0;
+const SIZE: f64 = 450.0; // square viewport (mermaid: height = pieWidth = 450)
+const CX: f64 = SIZE / 2.0; // pie group translated to (pieWidth/2, height/2)
+const CY: f64 = SIZE / 2.0;
+const R: f64 = SIZE / 2.0 - MARGIN; // 185
+const TEXT_POS: f64 = 0.75; // pie.textPosition: label radius = R * 0.75
+const LEGEND_H: f64 = 22.0; // legendRectSize(18) + legendSpacing(4)
+const LEGEND_X: f64 = CX + 12.0 * 18.0; // horizontal = 12 * legendRectSize = 216
 
-/// Render the pie as a self-contained SVG string. Slice fills come from
-/// `PALETTE`; all text uses `currentColor` so it tracks the app theme.
+/// Render the pie as a self-contained SVG string, matching mermaid.js@11's
+/// `pieRenderer` constants: 450×450 viewport, radius 185, 2px black slice +
+/// outer strokes, `pieOpacity` 0.7, labels at 0.75·R, center-anchored legend.
 pub(crate) fn render_svg(pie: &Pie) -> String {
     let total: f64 = pie.slices.iter().map(|(_, v)| *v).sum();
-    // Mermaid parity: a wedge is only drawn when its value is at least 1%
-    // of the total (`(value / total) * 100 >= 1`); the kept wedges are
-    // then re-normalized to fill the full circle (d3.pie recomputes angles
-    // from the *kept* sum). The legend still lists every slice, so `shown`
-    // gates the wedge only, never the legend row. `total > 0.0` guards the
-    // all-zero case (where the ratio would be `0/0`).
+    // A wedge is only drawn when it's at least 1% of the total; kept wedges
+    // re-normalize to fill the circle. The legend still lists every slice.
     let shown = |v: f64| total > 0.0 && v >= total * 0.01;
     let shown_total: f64 = pie.slices.iter().map(|&(_, v)| v).filter(|&v| shown(v)).sum();
+    let n = pie.slices.len();
     let mut svg = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" style="font-family:sans-serif;font-size:12px">"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {SIZE:.0} {SIZE:.0}" width="{SIZE:.0}" height="{SIZE:.0}" style="max-width:{SIZE:.0}px;width:100%;font-family:sans-serif">"#
     );
 
+    // Title: centered over the pie, 25px, normal weight; y = -(height-50)/2.
     if let Some(title) = &pie.title {
         svg.push_str(&format!(
-            r#"<text x="{cx}" y="24" text-anchor="middle" fill="currentColor" style="font-size:15px;font-weight:600">{t}</text>"#,
-            cx = CX,
+            r#"<text x="{CX}" y="{ty:.0}" text-anchor="middle" fill="currentColor" style="font-size:25px">{t}</text>"#,
+            ty = CY - (SIZE - 50.0) / 2.0,
             t = escape_xml(title),
         ));
     }
 
-    // No visible wedges (all-zero total, or every slice below the 1%
-    // threshold): draw an empty outlined circle so the chart area isn't
-    // blank.
+    // All-zero (or all-sub-1%): an empty outlined circle so the area isn't blank.
     if shown_total == 0.0 {
         svg.push_str(&format!(
-            r#"<circle cx="{CX}" cy="{CY}" r="{R}" fill="none" stroke="currentColor" stroke-width="1"/>"#
+            r#"<circle cx="{CX}" cy="{CY}" r="{R}" fill="none" stroke="black" stroke-width="2"/>"#
         ));
     }
 
-    let mut angle = -std::f64::consts::FRAC_PI_2; // start at 12 o'clock
-    for (i, (label, value)) in pie.slices.iter().enumerate() {
-        let frac = if shown(*value) && shown_total > 0.0 { value / shown_total } else { 0.0 };
+    // Slices are laid out in DESCENDING value order (d3.pie default sort), but
+    // each keeps its SOURCE-order palette color. The legend (below) stays in
+    // source order — the two can legitimately disagree.
+    let mut order: Vec<usize> = (0..n).filter(|&i| shown(pie.slices[i].1)).collect();
+    order.sort_by(|&a, &b| {
+        pie.slices[b].1.partial_cmp(&pie.slices[a].1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut angle = -std::f64::consts::FRAC_PI_2; // 12 o'clock
+    for &i in &order {
+        let value = pie.slices[i].1;
+        let frac = value / shown_total;
         let fill = PALETTE[i % PALETTE.len()];
-        // Percentage of the whole (Mermaid labels every wedge with its share).
-        let pct = if total > 0.0 { (value / total * 100.0).round() as i64 } else { 0 };
+        let pct = (value / total * 100.0).round() as i64;
+        let slice_attrs = format!(r#"fill="{fill}" fill-opacity="0.7" stroke="black" stroke-width="2""#);
         if frac >= 1.0 {
-            // A full-sweep arc's start/end points coincide (especially
-            // after `{:.2}` rounding), so the `A` command degenerates to
-            // an invisible zero-length path. Emit a full disc instead.
+            // A lone full wedge: a zero-length arc is invisible, so draw a disc.
             svg.push_str(&format!(
-                r#"<circle cx="{CX}" cy="{CY}" r="{R}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1"/>"#
+                r#"<circle cx="{CX}" cy="{CY}" r="{R}" {slice_attrs}/>"#
             ));
             svg.push_str(&slice_label(CX, CY, pct));
-        } else if frac > 0.0 {
+        } else {
             let sweep = frac * std::f64::consts::TAU;
             let (x0, y0) = (CX + R * angle.cos(), CY + R * angle.sin());
             let end = angle + sweep;
             let (x1, y1) = (CX + R * end.cos(), CY + R * end.sin());
             let large_arc = if sweep > std::f64::consts::PI { 1 } else { 0 };
             svg.push_str(&format!(
-                r#"<path d="M {CX} {CY} L {x0:.2} {y0:.2} A {R} {R} 0 {large_arc} 1 {x1:.2} {y1:.2} Z" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1"/>"#
+                r#"<path d="M {CX} {CY} L {x0:.2} {y0:.2} A {R} {R} 0 {large_arc} 1 {x1:.2} {y1:.2} Z" {slice_attrs}/>"#
             ));
-            // Label at the wedge centroid (mid-angle, ~0.6 of the radius).
+            // Label on a dedicated arc of radius R·textPosition (both radii
+            // equal), so labels sit further out and thin wedges overflow.
             let mid = angle + sweep / 2.0;
-            let (lx, ly) = (CX + 0.6 * R * mid.cos(), CY + 0.6 * R * mid.sin());
+            let (lx, ly) = (CX + TEXT_POS * R * mid.cos(), CY + TEXT_POS * R * mid.sin());
             svg.push_str(&slice_label(lx, ly, pct));
             angle = end;
         }
+    }
 
-        // Legend row.
-        let ly = 60.0 + i as f64 * 22.0;
+    // Distinct outer rim on top of the slices.
+    if shown_total > 0.0 {
         svg.push_str(&format!(
-            r#"<rect x="300" y="{ry:.0}" width="14" height="14" fill="{fill}"/>"#,
-            ry = ly - 11.0,
+            r#"<circle cx="{CX}" cy="{CY}" r="{R}" fill="none" stroke="black" stroke-width="2"/>"#
+        ));
+    }
+
+    // Legend, source order, anchored to the pie center: swatch 18×18 at
+    // (CX+216, CY + i·22 - 11n); text offset by (22, 14).
+    let offset = LEGEND_H * n as f64 / 2.0;
+    for (i, (label, value)) in pie.slices.iter().enumerate() {
+        let fill = PALETTE[i % PALETTE.len()];
+        let sy = CY + i as f64 * LEGEND_H - offset;
+        svg.push_str(&format!(
+            r#"<rect x="{LEGEND_X}" y="{sy:.1}" width="18" height="18" fill="{fill}"/>"#
         ));
         let legend = if pie.show_data {
             format!("{label} ({})", trim_num(*value))
@@ -181,8 +209,10 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
             label.clone()
         };
         svg.push_str(&format!(
-            r#"<text x="320" y="{ly:.0}" fill="currentColor">{}</text>"#,
+            r#"<text x="{lx}" y="{ly:.1}" fill="currentColor" style="font-size:17px">{}</text>"#,
             escape_xml(&legend),
+            lx = LEGEND_X + 22.0,
+            ly = sy + 14.0,
         ));
     }
 
@@ -190,10 +220,10 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
     svg
 }
 
-/// A centered percentage label for a wedge, in the theme text color.
+/// A centered percentage label for a wedge (17px, theme text color).
 fn slice_label(x: f64, y: f64, pct: i64) -> String {
     format!(
-        r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" dominant-baseline="middle" fill="currentColor" style="font-size:13px">{pct}%</text>"#
+        r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" dominant-baseline="middle" fill="currentColor" style="font-size:17px">{pct}%</text>"#
     )
 }
 
@@ -281,7 +311,37 @@ mod tests {
         let svg = render_svg(&p);
         assert!(svg.contains(">25%<"), "quarter slices labeled 25%: {svg}");
         assert!(svg.contains(">50%<"), "half slice labeled 50%: {svg}");
-        assert_eq!(svg.matches('%').count(), 3, "one percentage label per drawn wedge");
+        // Count label endings (`hsl(...)` fills also contain `%`).
+        assert_eq!(svg.matches("%</text>").count(), 3, "one percentage label per drawn wedge");
+    }
+
+    #[test]
+    fn slices_descending_but_legend_source_order() {
+        // Defect 7: d3.pie lays slices out in descending value order, while the
+        // legend follows source order — these can disagree.
+        let p = parse("pie title Ordering check\n\"Small\" : 15\n\"Large\" : 386\n\"Medium\" : 85")
+            .unwrap();
+        let svg = render_svg(&p);
+        // Slices drawn largest→smallest: 79% (Large) then 17% (Medium) then 3% (Small).
+        let (p79, p17, p3) =
+            (svg.find(">79%<").unwrap(), svg.find(">17%<").unwrap(), svg.find(">3%<").unwrap());
+        assert!(p79 < p17 && p17 < p3, "slices not in descending value order");
+        // Legend in SOURCE order: Small, Large, Medium.
+        let (sm, lg, md) =
+            (svg.find(">Small<").unwrap(), svg.find(">Large<").unwrap(), svg.find(">Medium<").unwrap());
+        assert!(sm < lg && lg < md, "legend not in source order");
+    }
+
+    #[test]
+    fn slice_has_black_stroke_and_outer_circle() {
+        // Defect 2: 2px black slice strokes + a distinct fill:none outer rim.
+        let svg = render_svg(&parse("pie\n\"A\" : 3\n\"B\" : 1").unwrap());
+        assert!(svg.contains(r#"stroke="black" stroke-width="2""#), "slice stroke: {svg}");
+        assert!(svg.contains(r#"fill-opacity="0.7""#), "pie opacity: {svg}");
+        assert!(
+            svg.contains(r#"r="185" fill="none" stroke="black" stroke-width="2""#),
+            "outer rim circle: {svg}"
+        );
     }
 
     #[test]
@@ -329,7 +389,7 @@ mod tests {
         assert!(svg.contains("<circle"), "expected a full-disc <circle>, got: {svg}");
         // Legend still lists all three slices even though only one has a
         // visible wedge.
-        assert_eq!(svg.matches("<text x=\"320\"").count(), 3);
+        assert_eq!(svg.matches("<text x=\"463\"").count(), 3);
     }
 
     #[test]
@@ -347,7 +407,7 @@ mod tests {
         let p = parse("pie\n\"A\" : 60\n\"B\" : 39.5\n\"C\" : 0.5").unwrap();
         let svg = render_svg(&p);
         assert_eq!(svg.matches("<path").count(), 2, "sub-1% slice C gets no wedge");
-        assert_eq!(svg.matches("<text x=\"320\"").count(), 3, "all three slices in the legend");
+        assert_eq!(svg.matches("<text x=\"463\"").count(), 3, "all three slices in the legend");
     }
 
     #[test]
@@ -367,7 +427,7 @@ mod tests {
         let svg = render_svg(&p);
         assert!(svg.contains("<circle"), "Big re-normalizes to a full disc: {svg}");
         assert_eq!(svg.matches("<path").count(), 0, "no partial arc when one wedge fills the circle");
-        assert_eq!(svg.matches("<text x=\"320\"").count(), 2, "both slices still in the legend");
+        assert_eq!(svg.matches("<text x=\"463\"").count(), 2, "both slices still in the legend");
     }
 
     #[test]
@@ -391,7 +451,7 @@ mod tests {
             vec![("A".to_string(), 1.0), ("A".to_string(), 2.0)]
         );
         let svg = render_svg(&p);
-        assert_eq!(svg.matches("<text x=\"320\"").count(), 2, "both duplicates get a legend row");
+        assert_eq!(svg.matches("<text x=\"463\"").count(), 2, "both duplicates get a legend row");
     }
 
     #[test]
@@ -481,7 +541,7 @@ mod tests {
             .join("\n");
         let p = parse(&src).unwrap();
         let svg = render_svg(&p);
-        assert_eq!(svg.matches("<text x=\"320\"").count(), n, "one legend row per slice");
+        assert_eq!(svg.matches("<text x=\"463\"").count(), n, "one legend row per slice");
         // Slice `PALETTE.len()` wraps around to the first palette color, so
         // palette[0] is used by two slices (wedge fill + legend swatch each).
         assert_eq!(
