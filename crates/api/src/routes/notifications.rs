@@ -103,25 +103,20 @@ async fn list_notifications(
 ) -> Result<axum::Json<NotificationListResponse>, ApiError> {
     let notifications = state.notification_repo.list(&user_id, 50).await?;
 
-    // Resolve actor display names and document titles, caching repeats
-    // within this page so a burst from one actor / on one doc costs a
-    // single lookup each.
-    let mut actor_names: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    // Actor names resolve through one BatchGetItem (#38) — previously a
+    // sequential get_by_id per unique actor. Missing rows / a failed
+    // batch fall back to the raw actor_id. Document titles keep the
+    // per-page cache: they come from doc_repo, which has no batch path.
+    let actor_ids: Vec<String> = notifications.iter().map(|n| n.actor_id.clone()).collect();
+    let actor_users = state.user_repo.get_by_ids(&actor_ids).await.unwrap_or_default();
     let mut doc_titles: std::collections::HashMap<String, Option<String>> =
         std::collections::HashMap::new();
     let mut responses = Vec::with_capacity(notifications.len());
     for n in notifications {
-        let actor_name = if let Some(cached) = actor_names.get(&n.actor_id) {
-            cached.clone()
-        } else {
-            let name = match state.user_repo.get_by_id(&n.actor_id).await {
-                Ok(Some(user)) => user.name,
-                _ => n.actor_id.clone(),
-            };
-            actor_names.insert(n.actor_id.clone(), name.clone());
-            name
-        };
+        let actor_name = actor_users
+            .get(&n.actor_id)
+            .map(|u| u.name.clone())
+            .unwrap_or_else(|| n.actor_id.clone());
 
         // Best-effort document title (truncated). Cached per doc_id; None
         // when there's no doc or the lookup fails — the title is purely

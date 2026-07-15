@@ -73,19 +73,17 @@ async fn list_activity(
     let limit = params.limit.min(200); // cap at 200
     let activities = state.activity_repo.list(&doc_id, limit).await?;
 
-    let mut user_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // One BatchGetItem for every actor's name (#38) — previously a
+    // sequential get_by_id per unique actor. Missing rows / a failed
+    // batch fall back to the raw actor_id, as before.
+    let actor_ids: Vec<String> = activities.iter().map(|a| a.actor_id.clone()).collect();
+    let users = state.user_repo.get_by_ids(&actor_ids).await.unwrap_or_default();
     let mut responses = Vec::with_capacity(activities.len());
     for a in activities {
-        let name = if let Some(cached) = user_names.get(&a.actor_id) {
-            cached.clone()
-        } else {
-            let name = match state.user_repo.get_by_id(&a.actor_id).await {
-                Ok(Some(user)) => user.name,
-                _ => a.actor_id.clone(),
-            };
-            user_names.insert(a.actor_id.clone(), name.clone());
-            name
-        };
+        let name = users
+            .get(&a.actor_id)
+            .map(|u| u.name.clone())
+            .unwrap_or_else(|| a.actor_id.clone());
 
         let event_type = serde_json::to_string(&a.event_type)
             .unwrap_or_default()

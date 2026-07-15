@@ -981,15 +981,12 @@ async fn build_group(
         }
     };
 
+    // Batch member-name hydration (#38); a missing row keeps display=None.
+    let member_ids: Vec<String> = members_rows.iter().map(|r| r.user_id.clone()).collect();
+    let users = state.user_repo.get_by_ids(&member_ids).await.unwrap_or_default();
     let mut members: Vec<GroupMember> = Vec::with_capacity(members_rows.len());
     for row in &members_rows {
-        let display = state
-            .user_repo
-            .get_by_id(&row.user_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|u| u.name);
+        let display = users.get(&row.user_id).map(|u| u.name.clone());
         members.push(GroupMember {
             value: row.user_id.clone(),
             display,

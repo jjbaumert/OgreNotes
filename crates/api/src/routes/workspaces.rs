@@ -222,12 +222,15 @@ async fn list_members(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
+    // Batch member hydration (#38), same fallback as before.
+    let member_ids: Vec<String> = members.iter().map(|m| m.user_id.clone()).collect();
+    let users = state.user_repo.get_by_ids(&member_ids).await.unwrap_or_default();
     let mut responses = Vec::new();
     for m in members {
-        let (name, email) = match state.user_repo.get_by_id(&m.user_id).await {
-            Ok(Some(user)) => (user.name, user.email),
-            _ => (m.user_id.clone(), String::new()),
-        };
+        let (name, email) = users
+            .get(&m.user_id)
+            .map(|u| (u.name.clone(), u.email.clone()))
+            .unwrap_or_else(|| (m.user_id.clone(), String::new()));
         responses.push(MemberResponse {
             user_id: m.user_id,
             name,

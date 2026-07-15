@@ -34,6 +34,29 @@ async fn resolve_display_name(state: &AppState, user_id: &str) -> String {
     }
 }
 
+/// Batch counterpart of [`resolve_display_name`] (#38): one chunked
+/// `BatchGetItem` for the whole id set instead of a sequential
+/// `get_by_id` per unique id. Same rendering policy — a missing row or
+/// a failed batch falls back to the raw `user_id`. Returns a map with
+/// an entry for every requested id, so callers can `get` without a
+/// fallback branch of their own.
+async fn resolve_display_names(
+    state: &AppState,
+    user_ids: impl IntoIterator<Item = String>,
+) -> std::collections::HashMap<String, String> {
+    let ids: Vec<String> = user_ids.into_iter().collect();
+    let users = state.user_repo.get_by_ids(&ids).await.unwrap_or_default();
+    ids.into_iter()
+        .map(|id| {
+            let name = users
+                .get(&id)
+                .map(|u| u.name.clone())
+                .unwrap_or_else(|| id.clone());
+            (id, name)
+        })
+        .collect()
+}
+
 /// Per-user comment-write rate limit (M-E7 item 10). Shared
 /// between `create_thread` and `add_message` so the budget caps
 /// total comment activity, not per-endpoint slices that could be
@@ -281,17 +304,19 @@ async fn list_threads(
 
     let threads = state.thread_repo.list_threads_for_doc(&doc_id).await?;
 
-    // Look up user names for thread creators and first message previews.
-    let mut user_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // Look up user names for thread creators in one batch (#38) —
+    // previously a sequential get_by_id per unique creator.
+    let user_names = resolve_display_names(
+        &state,
+        threads.iter().map(|t| t.created_by.clone()),
+    )
+    .await;
     let mut responses = Vec::with_capacity(threads.len());
     for t in threads {
-        let name = if let Some(cached) = user_names.get(&t.created_by) {
-            cached.clone()
-        } else {
-            let name = resolve_display_name(&state, &t.created_by).await;
-            user_names.insert(t.created_by.clone(), name.clone());
-            name
-        };
+        let name = user_names
+            .get(&t.created_by)
+            .cloned()
+            .unwrap_or_else(|| t.created_by.clone());
 
         // Fetch first message preview (best-effort; None on error).
         let first_message = state
@@ -677,16 +702,19 @@ async fn list_messages(
             });
     }
 
-    let mut user_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // One batch for every message author's name (#38) — previously a
+    // sequential get_by_id per unique author.
+    let user_names = resolve_display_names(
+        &state,
+        messages.iter().map(|m| m.user_id.clone()),
+    )
+    .await;
     let mut msg_responses = Vec::with_capacity(messages.len());
     for m in messages {
-        let name = if let Some(cached) = user_names.get(&m.user_id) {
-            cached.clone()
-        } else {
-            let name = resolve_display_name(&state, &m.user_id).await;
-            user_names.insert(m.user_id.clone(), name.clone());
-            name
-        };
+        let name = user_names
+            .get(&m.user_id)
+            .cloned()
+            .unwrap_or_else(|| m.user_id.clone());
         let msg_reactions = reactions_by_msg.remove(&m.message_id).unwrap_or_default();
         msg_responses.push(MessageResponse {
             message_id: m.message_id,
