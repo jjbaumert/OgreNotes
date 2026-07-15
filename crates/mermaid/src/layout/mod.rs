@@ -86,7 +86,7 @@ pub(crate) const MAX_NODES: usize = 400;
 pub(crate) const MAX_EDGES: usize = 1000;
 /// Minimum horizontal gap between sibling nodes and vertical gap
 /// between ranks, in SVG units.
-pub(crate) const NODE_GAP_X: f64 = 40.0;
+pub(crate) const NODE_GAP_X: f64 = 50.0;
 pub(crate) const RANK_GAP_Y: f64 = 50.0;
 
 pub(crate) fn validate(input: &LayoutInput) -> Result<(), String> {

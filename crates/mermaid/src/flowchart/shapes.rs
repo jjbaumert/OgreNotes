@@ -20,7 +20,15 @@ pub(crate) fn size_for(shape: ShapeKind, tw: f64, th: f64) -> (f64, f64) {
             let d = tw.max(th) + 36.0;
             (d, d)
         }
-        ShapeKind::Diamond => (tw * 1.7 + 24.0, th * 2.2 + 12.0),
+        ShapeKind::Diamond => {
+            // Mermaid sizes a decision node as a 45°-rotated square: one side
+            // value drives BOTH axes so the bounding box is always square,
+            // regardless of the label's aspect. `s = (labelW + pad) + (labelH +
+            // pad)` also guarantees the label inscribes (an axis-aligned rect
+            // fits a rhombus when labelW + labelH <= s).
+            let s = (tw + DIAMOND_PAD) + (th + DIAMOND_PAD);
+            (s, s)
+        }
         ShapeKind::Hexagon => (tw + 48.0, th + 16.0),
         ShapeKind::Parallelogram | ShapeKind::ParallelogramRev => (tw + 44.0, th + 16.0),
         ShapeKind::Trapezoid | ShapeKind::TrapezoidRev => (tw + 52.0, th + 16.0),
@@ -30,6 +38,8 @@ pub(crate) fn size_for(shape: ShapeKind, tw: f64, th: f64) -> (f64, f64) {
 }
 
 const FILL: &str = "var(--mermaid-node-fill, #ececff)";
+/// Per-side padding for a decision (diamond) node — Mermaid's flowchart default.
+const DIAMOND_PAD: f64 = 15.0;
 
 /// `style`, when present, is emitted as an inline `style="…"` ON the shape
 /// element(s). This matters: the shape carries `fill`/`stroke`
