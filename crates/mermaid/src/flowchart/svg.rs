@@ -14,6 +14,9 @@ use crate::layout::{Direction, Layout};
 /// Horizontal (or vertical, in LR/RL flow) bow between paired edges so
 /// opposing/parallel edges don't overlap.
 const PARALLEL_BOW: f64 = 20.0;
+/// Tangential spread applied to a diamond's edge anchors when two edges share
+/// the same neighbour, so a decision loop's out/back edges don't collide.
+const DIAMOND_PORT_SPREAD: f64 = 14.0;
 
 /// A curve between two endpoints bowed off its midpoint (perpendicular to the
 /// flow axis) so parallel edges between the same node pair separate.
@@ -37,7 +40,7 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
     );
     out.push_str(concat!(
         "<defs>",
-        r#"<marker id="mmd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>"#,
+        r#"<marker id="mmd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>"#,
         r#"<marker id="mmd-circle" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><circle cx="5" cy="5" r="3.5" fill="currentColor"/></marker>"#,
         r#"<marker id="mmd-cross" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 1 1 L 9 9 M 9 1 L 1 9" stroke="currentColor" stroke-width="1.5" fill="none"/></marker>"#,
         "</defs>",
@@ -70,6 +73,31 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
         ));
     }
 
+    // Per-node geometry (center + half-extents + shape) for shape-aware edge
+    // anchoring. The layout clips edges to each node's bounding BOX; for a
+    // diamond that snaps branch/return edges to the bottom vertex, so we
+    // re-anchor diamond endpoints to the appropriate face midpoint instead.
+    let geom: Vec<(f64, f64, f64, f64, crate::flowchart::ShapeKind)> = g
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let (tw, th) = measure::text_size(&n.label);
+            let (nw, nh) = shapes::size_for(n.shape, tw, th);
+            let (cx, cy) = l.node_centers[i];
+            (cx, cy, nw / 2.0, nh / 2.0, n.shape)
+        })
+        .collect();
+    // Intersection of the ray from a diamond's center toward `(tx, ty)` with
+    // its rhombus outline (|x|/hw + |y|/hh = 1). A near-vertical edge lands on
+    // the top/bottom vertex; a diagonal branch lands on a lower face — matching
+    // Mermaid's polygon clip instead of snapping to the bounding-box vertex.
+    let diamond_clip = |gi: &(f64, f64, f64, f64, crate::flowchart::ShapeKind), tx: f64, ty: f64| {
+        let (dx, dy) = (tx - gi.0, ty - gi.1);
+        let t = 1.0 / (dx.abs() / gi.2 + dy.abs() / gi.3).max(1e-6);
+        (gi.0 + dx * t, gi.1 + dy * t)
+    };
+
     // 4. edges (+ label mask rects + label texts)
     // Detect node pairs joined by more than one edge (parallel or opposing,
     // e.g. a `B-->D` / `D-->B` feedback loop) so we can bow them apart instead
@@ -88,16 +116,43 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
             continue; // participates in layout; draws nothing
         }
         let vertical = matches!(g.direction, Direction::TB | Direction::BT);
+        // Re-anchor endpoints that land on a diamond to the correct face
+        // midpoint (branch edges leave the two lower faces symmetrically rather
+        // than piling onto the bottom vertex).
+        // Opposing/parallel edges to the same neighbour get a tangential spread
+        // on the diamond so they attach at distinct points (not one shared
+        // vertex) — this, with the bow below, separates a B-->D / D-->B loop.
+        let spread = match multi.get(&(e.from.min(e.to), e.from.max(e.to))) {
+            Some(grp) if grp.len() > 1 => {
+                let pos = grp.iter().position(|&x| x == i).unwrap_or(0);
+                (pos as f64 - (grp.len() as f64 - 1.0) / 2.0) * DIAMOND_PORT_SPREAD
+            }
+            _ => 0.0,
+        };
+        let mut pts = ep.points.clone();
+        if pts.len() >= 2 {
+            let (tc_x, tc_y) = (geom[e.to].0, geom[e.to].1);
+            if geom[e.from].4 == crate::flowchart::ShapeKind::Diamond {
+                let (ax, ay) = diamond_clip(&geom[e.from], tc_x, tc_y);
+                pts[0] = (ax + spread, ay);
+            }
+            let last = pts.len() - 1;
+            let (sc_x, sc_y) = (geom[e.from].0, geom[e.from].1);
+            if geom[e.to].4 == crate::flowchart::ShapeKind::Diamond {
+                let (ax, ay) = diamond_clip(&geom[e.to], sc_x, sc_y);
+                pts[last] = (ax + spread, ay);
+            }
+        }
         // Bow apart only genuine multi-edges between the same pair, and only
         // when the routing is simple (<= 3 points) — long routed edges keep
         // their waypoints untouched to avoid regressing complex layouts.
         let d = match multi.get(&(e.from.min(e.to), e.from.max(e.to))) {
-            Some(grp) if grp.len() > 1 && ep.points.len() <= 3 => {
+            Some(grp) if grp.len() > 1 && pts.len() <= 3 => {
                 let pos = grp.iter().position(|&x| x == i).unwrap_or(0);
                 let off = (pos as f64 - (grp.len() as f64 - 1.0) / 2.0) * PARALLEL_BOW;
-                bowed_path(&ep.points, off, vertical)
+                bowed_path(&pts, off, vertical)
             }
-            _ => crate::curved_path(&ep.points, vertical),
+            _ => crate::curved_path(&pts, vertical),
         };
         // Line style from the kind family; heads from the edge ends.
         let line_attrs = match e.kind {
@@ -201,6 +256,40 @@ mod tests {
         assert!(svg.contains("mmd-arrow"));
         assert!(svg.contains("yes"));
         assert!(svg.contains("<polygon")); // the diamond
+    }
+
+    #[test]
+    fn decision_diamond_is_square() {
+        // Defect 1: the rhombus bounding box must be square regardless of label
+        // aspect (Mermaid sizes it as a rotated square).
+        let svg = render_flowchart("graph TD\nB{Is it working?} --> C[x]").unwrap();
+        let poly = svg.split("<polygon points=\"").nth(1).unwrap().split('"').next().unwrap();
+        let xs: Vec<f64> = poly.split([' ', ',']).step_by(2).map(|s| s.parse().unwrap()).collect();
+        let ys: Vec<f64> =
+            poly.split([' ', ',']).skip(1).step_by(2).map(|s| s.parse().unwrap()).collect();
+        let w = xs.iter().cloned().fold(f64::MIN, f64::max) - xs.iter().cloned().fold(f64::MAX, f64::min);
+        let h = ys.iter().cloned().fold(f64::MIN, f64::max) - ys.iter().cloned().fold(f64::MAX, f64::min);
+        assert!((w - h).abs() / w < 0.02, "diamond not square: {w} x {h}");
+    }
+
+    #[test]
+    fn decision_branch_edges_leave_distinct_faces() {
+        // Defect 4/3: the two branch edges from a decision node (and a back
+        // edge) must not share one attachment point on the diamond.
+        let svg =
+            render_flowchart("graph TD\nB{q} -->|Yes| C[Ship]\nB -->|No| D[Debug]\nD --> B").unwrap();
+        // Collect the start point of every edge path (`<path d="M x y ...`).
+        let starts: Vec<(String, String)> = svg
+            .split("<path d=\"M ")
+            .skip(1)
+            .map(|s| {
+                let mut it = s.split_whitespace();
+                (it.next().unwrap().to_string(), it.next().unwrap().to_string())
+            })
+            .collect();
+        // The two branch starts (Yes, No) must differ — they leave opposite faces.
+        assert!(starts.len() >= 3, "expected edge paths: {starts:?}");
+        assert_ne!(starts[1], starts[2], "Yes/No branches share an anchor: {starts:?}");
     }
 
     #[test]
