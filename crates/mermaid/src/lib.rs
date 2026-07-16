@@ -765,7 +765,7 @@ mod prop_tests {
             prop_assert!(out.error.is_none(), "unexpected error: {:?}", out.error);
             let svg = out.svg.expect("well-formed pie must render");
             prop_assert_eq!(
-                svg.matches("<text x=\"320\"").count(),
+                svg.matches("<text x=\"463\"").count(),
                 slices.len(),
                 "one legend row per slice"
             );
