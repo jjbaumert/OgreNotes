@@ -77,6 +77,17 @@ fn note_rect(l: &Layout, sizes: &[(f64, f64)], note: &StateNote) -> (f64, f64, f
     (x, cy - bh / 2.0, bw, bh)
 }
 
+/// Mask-rect geometry `(x, y, w, h)` of one edge label centered at `at` —
+/// shared by the canvas-extent pre-pass and the emission loop so the two
+/// cannot drift. Edge labels are frequently wider than the narrow state
+/// column, so a midpoint near the left/right edge pushes the rect
+/// off-canvas unless its extent is unioned into the viewBox.
+fn edge_label_rect(label: &str, at: (f64, f64)) -> (f64, f64, f64, f64) {
+    let (tw, th) = measure::text_size(label);
+    let (mw, mh) = (tw + 4.0, th + 4.0);
+    (at.0 - mw / 2.0, at.1 - mh / 2.0, mw, mh)
+}
+
 pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
     let (lw, lh) = l.size;
     // Notes are a post-layout overlay; union their rects into the
@@ -89,6 +100,19 @@ pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
         min_y = min_y.min(y - 4.0);
         max_x = max_x.max(x + bw + 4.0);
         max_y = max_y.max(y + bh + 4.0);
+    }
+    // Edge labels are the other post-layout overlay that can spill past
+    // the laid-out bounds (their mask rects are wider than the state
+    // column). Union them the same way so a label near an edge stays
+    // fully visible.
+    for ep in &l.edge_paths {
+        if let (Some(label), Some(at)) = (&g.transitions[ep.edge].label, ep.label_at) {
+            let (x, y, mw, mh) = edge_label_rect(label, at);
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x + mw);
+            max_y = max_y.max(y + mh);
+        }
     }
     let (dx, dy) = (-min_x, -min_y); // ≥ 0 by construction (mins start at 0)
     let (w, h) = (max_x - min_x, max_y - min_y);
@@ -175,14 +199,9 @@ pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
         out.push_str(&format!(r#"<path d="{d}" {attrs}/>"#));
 
         if let (Some(label), Some((lx, ly))) = (&t.label, ep.label_at) {
-            let (tw, th) = measure::text_size(label);
-            let (mw, mh) = (tw + 4.0, th + 4.0);
+            let (rx, ry, mw, mh) = edge_label_rect(label, (lx, ly));
             out.push_str(&format!(
-                r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="var(--surface, #fff)"/>"#,
-                lx - mw / 2.0,
-                ly - mh / 2.0,
-                mw,
-                mh
+                r#"<rect x="{rx:.1}" y="{ry:.1}" width="{mw:.1}" height="{mh:.1}" fill="var(--surface, #fff)"/>"#
             ));
             out.push_str(&format!(
                 r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
@@ -447,6 +466,29 @@ mod tests {
         assert!(svg.contains("stroke:#f00"), "edge style: {svg}");
     }
 
+    #[test]
+    fn edge_labels_stay_within_the_canvas() {
+        // Regression (#47): edge-label mask rects are wider than the
+        // narrow state column, so a label whose midpoint sits near an edge
+        // used to spill off-canvas (clipped). Their extents are now
+        // unioned into the viewBox like notes. Both an inter-node label
+        // and a self-loop label reproduced the overflow before the fix.
+        for src in [
+            "stateDiagram-v2\n[*] --> A: start now\nA --> B: a very long transition label here\nB --> [*]: finish",
+            "stateDiagram-v2\nA --> A: self loop with a long label",
+        ] {
+            let svg = render_state(src).unwrap();
+            let (w, h) = view_size(&svg);
+            let (dx, dy) = (translate_dx(&svg), translate_dy(&svg));
+            for (x, y, bw, bh) in label_rects(&svg) {
+                assert!(x + dx >= -0.5, "label off-canvas left ({}) in {svg}", x + dx);
+                assert!(y + dy >= -0.5, "label off-canvas top ({}) in {svg}", y + dy);
+                assert!(x + dx + bw <= w + 0.5, "label off-canvas right in {svg}");
+                assert!(y + dy + bh <= h + 0.5, "label off-canvas bottom in {svg}");
+            }
+        }
+    }
+
     // Test helpers (module-level in `mod tests`):
     fn view_size(svg: &str) -> (f64, f64) {
         let vb: Vec<f64> = svg.split("viewBox=\"").nth(1).unwrap()
@@ -478,5 +520,31 @@ mod tests {
             .and_then(|s| s.split(',').next())
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.0)
+    }
+
+    /// dy of the single translate wrapper, or 0.0 when absent.
+    fn translate_dy(svg: &str) -> f64 {
+        svg.split("<g transform=\"translate(").nth(1)
+            .and_then(|s| s.split(',').nth(1))
+            .and_then(|s| s.split(')').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// (x, y, width, height) of every edge-label mask rect (surface fill).
+    fn label_rects(svg: &str) -> Vec<(f64, f64, f64, f64)> {
+        let mut out = Vec::new();
+        let mut rest = svg;
+        while let Some(fi) = rest.find("var(--surface") {
+            let rect_start = rest[..fi].rfind("<rect").unwrap();
+            let rect = &rest[rect_start..fi];
+            let attr = |name: &str| -> f64 {
+                let j = rect.find(&format!("{name}=\"")).unwrap() + name.len() + 2;
+                rect[j..].split('"').next().unwrap().parse().unwrap()
+            };
+            out.push((attr("x"), attr("y"), attr("width"), attr("height")));
+            rest = &rest[fi + 1..];
+        }
+        out
     }
 }
