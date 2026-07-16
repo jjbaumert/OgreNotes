@@ -20,12 +20,12 @@ Your servers need to be **sticky per document session** (not per user) — meani
                           └────────┬────────┘
                                    │
                           ┌────────▼────────┐
-                          │   API Gateway   │  (HTTP routes: auth, doc CRUD, search, ask)
+                          │   (no API GW)   │  (all HTTP + WS routes go through the ALB)
                           └────────┬────────┘
                                    │
                     ┌──────────────▼──────────────┐
                     │         ALB                  │
-                    │  (WebSocket + stickiness)    │
+                    │  (HTTP + WebSocket, sticky)  │
                     └──┬──────────────────────┬───┘
                        │                      │
               ┌────────▼───┐          ┌───────▼────┐
@@ -70,11 +70,11 @@ Lambda cannot hold a WebSocket connection — it times out at 15 minutes maximum
 - Simple horizontal scaling
 - Task-level IAM roles (clean credentials for DynamoDB/S3/ElastiCache/Bedrock)
 
-Start with 2–3 tasks minimum for availability. Scale on **ALB active connection count** rather than CPU — your workload is I/O bound, not compute bound.
+The deployed api service runs a fixed `desiredCount: 1` with no autoscaling policy (single-writer simplicity on the test stack; scale the desired count manually or add an ALB-connection-count target-tracking policy when you need availability). The only service that autoscales today is the background **worker**, on CPU target-tracking at 70% — its jobs (DOCX/PDF conversion) are CPU-bound. A connection-count policy would suit the api's I/O-bound WebSocket workload better than CPU if/when you enable it.
 
-### API Gateway for HTTP (not WebSocket)
+### No API Gateway — ALB fronts everything
 
-Use API Gateway for your REST/HTTP surface — auth, document creation, user management, search, AI assistant, etc. Let ALB handle only WebSocket traffic. This keeps your Axum server focused and lets you put WAF rules on API Gateway cheaply.
+The deployed stack does not use API Gateway. A single `ApplicationLoadBalancedFargateService` (`infra/lib/compute.ts`) fronts both the REST/HTTP surface (auth, document CRUD, user management, search, AI assistant) and WebSocket traffic on the same Axum server and port (3000). If you later want managed WAF/throttling on the REST surface, an API Gateway or a WAF web-ACL on the ALB can be added — but it is not part of the current build.
 
 ### ElastiCache (Redis) — Cluster Mode Off
 
@@ -133,16 +133,17 @@ Put everything except the ALB inside a **VPC**:
 
 ```
 VPC 10.0.0.0/16
-  Public subnets  (10.0.1.0/24, 10.0.2.0/24)   — ALB only
-  Private subnets (10.0.10.0/24, 10.0.11.0/24)  — ECS tasks, ElastiCache, Qdrant
-  No public IPs on ECS tasks
+  Public subnets only (one /24 per AZ, 2 AZs)   — ALB *and* all ECS tasks
+  No NAT gateway (natGateways: 0) — deliberate cost tradeoff
+  ECS tasks (api, qdrant, worker) get public IPs (assignPublicIp: true);
+    isolation is enforced by security groups, not private subnets
 ```
 
 ECS tasks reach DynamoDB and S3 via **VPC endpoints** (no traffic leaves AWS backbone, lower latency, no NAT Gateway costs for that traffic).
 
-ElastiCache and Qdrant sit in private subnets, reachable only from the ECS Axum task security group.
+Qdrant and the ElastiCache Redis sit in the same public subnets but are reachable only from the ECS task security group (security-group ingress: Redis ← ecs :6379, Qdrant ← ecs :6333/:6334). There are no private subnets.
 
-**Outbound internet access:** The Anthropic Claude API (`api.anthropic.com`) requires outbound HTTPS. If the AI assistant is enabled, ECS tasks need a NAT Gateway (~$32/month) or a NAT instance for outbound traffic. If the AI assistant is disabled (no `ANTHROPIC_API_KEY`), no NAT is needed — DynamoDB, S3, and Bedrock all use VPC endpoints.
+**Outbound internet access:** tasks reach the Anthropic Claude API (`api.anthropic.com`) directly over the internet gateway via their public IPs — there is no NAT gateway (a deliberate cost tradeoff). DynamoDB and S3 still ride gateway VPC endpoints to keep that traffic off the IGW.
 
 ---
 
@@ -171,14 +172,19 @@ Your ECS task role needs:
 },
 {
   "Effect": "Allow",
-  "Action": ["bedrock:InvokeModel"],
-  "Resource": "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:0"
+  "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+  "Resource": [
+    "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:0",
+    "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v1",
+    "arn:aws:bedrock:*::foundation-model/cohere.embed-english-v3",
+    "arn:aws:bedrock:*::foundation-model/cohere.embed-multilingual-v3"
+  ]
 }
 ```
 
 No access keys anywhere. Task role credentials are rotated automatically.
 
-The Bedrock permission is only needed if vector search is enabled. Scope it down to the specific model ARN.
+The Bedrock permission is only needed if vector search is enabled. It's scoped to the four embedding-model ARNs the app can select (`infra/lib/compute.ts`), not a wildcard.
 
 ---
 
@@ -220,30 +226,27 @@ Set these up before you have users, not after.
 **Custom metrics you'll actually want:**
 
 ```
-# Core document operations
-doc.active_connections           (per doc ID)
-doc.update_apply_latency_ms
+# Core document / WebSocket operations
+ws.active_connections            (gauge)
+ws.update_apply_latency_ms
 doc.cold_load_duration_ms
-redis.publish_failures
-dynamo.write_failures
+redis.publish_failures_total
+dynamo.write_failures_total
 
 # Search
 search.keyword_latency_ms
 search.semantic_latency_ms
 search.hybrid_latency_ms
 
-# Embeddings
-embedding.index_latency_ms
-embedding.index_failures
-qdrant.connection_failures
-
 # AI assistant
 ask.agent_rounds                 (histogram: how many tool rounds per query)
 ask.total_latency_ms
-ask.claude_api_errors
+ask.claude_api_errors_total
 ```
 
-Emit these as CloudWatch custom metrics from your Axum code. Set alarms on `dynamo.write_failures > 0` because a failed DynamoDB write is a data loss risk. Also alarm on `qdrant.connection_failures > 5/min` to detect Qdrant task crashes.
+Counter metrics carry a `_total` suffix; the `embedding.*` and `qdrant.*` metrics in earlier drafts are not emitted by the current code and have been dropped.
+
+Emit these as CloudWatch custom metrics from your Axum code. Set alarms on `dynamo.write_failures_total > 0` because a failed DynamoDB write is a data loss risk. (There is no dedicated `qdrant.*` failure metric today; Qdrant task health is observed via ECS service events and `search.errors_total{stage=vector}`.)
 
 **X-Ray** — optional, but add the `aws-xray-sdk` early. Tracing WebSocket sessions across ECS → DynamoDB → S3 is much harder to add retroactively.
 

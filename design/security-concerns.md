@@ -4,8 +4,8 @@
 
 ## Authentication & Session Management
 - **Token security** — access tokens should be short-lived (15–60 min) with refresh tokens stored in `HttpOnly`, `Secure`, `SameSite=Strict` cookies. Never store tokens in `localStorage` — they're accessible to any JavaScript running on the page.
-- **WebSocket auth** — WebSocket connections don't send cookies automatically in all clients. Pass a short-lived, single-use token as a query parameter on the upgrade request, validated immediately and discarded. Never accept a long-lived token on a WebSocket URL.
-- **SSO/OIDC** — use PKCE flow (no client secret in the browser). Validate issuer, audience, and expiry on every token.
+- **WebSocket auth** — WebSocket connections don't send cookies automatically in all clients. Pass a short-lived, single-use token in the `Sec-WebSocket-Protocol` header (subprotocol prefix `ogrenotes-ws-token.`) so it stays out of the URL — and thus out of browser history and access logs; the server validates and atomically consumes it (Redis GETDEL) on the upgrade. A `?token=` query parameter remains only as a legacy fallback for older clients. Never accept a long-lived token on a WebSocket URL.
+- **SSO/OIDC** — the client secret never reaches the browser; the authorization-code exchange always happens server-side. PKCE is used where the provider supports it — Google adds a `code_challenge`/`code_verifier` (`ogrenotes_auth::oauth::generate_pkce`), while GitHub does not support PKCE and runs a classic secret-only server-side exchange. Validate issuer, audience, and expiry on every token.
 
 ---
 
@@ -55,7 +55,7 @@
 ---
 
 ## Operational Security
-- **Audit logging** — log document access, permission changes, and sharing events to an append-only store. This is a compliance requirement in most enterprise contexts.
+- **Audit logging** — log identity events, permission changes, sharing events, and destructive document actions. OgreNotes splits these across two tables: `AdminAudit` (admin-console mutations) is retained permanently and treated as append-only; `SecurityAudit` (login, MFA, SAML, SCIM, share grant/revoke, doc-delete) is retained for a bounded window (90 days by default) and then hard-deleted by the `audit_retention` worker (`crates/api/src/audit_retention.rs::sweep` → `SecurityAuditRepo::delete_older_than_for_user`, which issues real `DeleteItem`s). SecurityAudit is retention-bounded, not WORM — don't rely on it for long-term forensics. Audit logging is a compliance requirement in most enterprise contexts.
 - **Dependency supply chain** — audit third-party dependencies in CI. Flag known vulnerabilities before they reach production.
 - **Secrets rotation** — design for signing key rotation from day one. It is painful and risky to retrofit.
 - **DDoS / abuse** — WebSocket connections are more expensive to maintain than HTTP requests. Enforce connection limits per user and per IP at the load balancer before traffic reaches your application layer.
