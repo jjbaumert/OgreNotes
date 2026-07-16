@@ -16,6 +16,15 @@ const ROW_GAP: f64 = 14.0;
 const SECTION_H: f64 = 28.0;
 const MIN_COL_W: f64 = 90.0;
 const MAX_PERIODS: usize = 400;
+const AXIS_GAP: f64 = 24.0; // vertical room between the period row, axis, and events
+/// Per-period pastel palette (Mermaid tints each period and its events).
+const PERIOD_COLORS: &[&str] =
+    &["#8a8ae0", "#e8e85a", "#a8e05a", "#c99be0", "#5ad1e0", "#e0a85a", "#5ae0a8", "#e05ad1"];
+const DASH_COLOR: &str = "#999999"; // dashed dropline color
+
+fn period_color(i: usize) -> &'static str {
+    PERIOD_COLORS[i % PERIOD_COLORS.len()]
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Period {
@@ -157,56 +166,70 @@ pub(crate) fn render_svg(t: &Timeline) -> String {
         y += SECTION_H + ROW_GAP;
     }
 
-    // Period row: a horizontal timeline line + a labeled box per period.
+    // Period row: a colored box per period (Mermaid tints each period).
     let period_top = y;
-    let line_y = period_top + BOX_H / 2.0;
-    if col_w.len() > 1 {
-        body.push_str(&format!(
-            r#"<line x1="{:.1}" y1="{line_y:.1}" x2="{:.1}" y2="{line_y:.1}" stroke="currentColor" stroke-width="2"/>"#,
-            center(0),
-            center(col_w.len() - 1)
-        ));
-    }
-    for (i, p) in t.periods.iter().enumerate() {
-        box_with_label(&mut body, lefts[i], period_top, col_w[i], BOX_H, &p.time, true);
-    }
     y += BOX_H;
 
-    // Events: stacked below each period, connected top-to-bottom.
-    let mut max_bottom = y;
-    for (i, p) in t.periods.iter().enumerate() {
-        let mut ey = period_top + BOX_H;
-        for ev in &p.events {
-            let top = ey + ROW_GAP;
-            body.push_str(&format!(
-                r#"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{top:.1}" stroke="currentColor"/>"#,
-                center(i),
-                ey,
-                center(i)
-            ));
-            box_with_label(&mut body, lefts[i], top, col_w[i], BOX_H, ev, false);
-            ey = top + BOX_H;
+    // Axis + event geometry. Events sit BELOW a horizontal time axis; dashed
+    // droplines connect each period down through the axis and past its events.
+    let axis_y = y + AXIS_GAP;
+    let events_top = axis_y + AXIS_GAP;
+    let ev_gap = 8.0;
+    let mut events_bottom = events_top;
+    let mut ev_layout: Vec<Vec<f64>> = Vec::with_capacity(t.periods.len());
+    for p in &t.periods {
+        let mut tops = Vec::with_capacity(p.events.len());
+        let mut ey = events_top;
+        for _ in &p.events {
+            tops.push(ey);
+            ey += BOX_H + ev_gap;
         }
-        max_bottom = max_bottom.max(ey);
+        events_bottom = events_bottom.max(ey - ev_gap);
+        ev_layout.push(tops);
+    }
+    let drop_bottom = events_bottom + 18.0;
+
+    // Dashed droplines (under everything).
+    for i in 0..t.periods.len() {
+        let c = center(i);
+        body.push_str(&format!(
+            r#"<line x1="{c:.1}" y1="{:.1}" x2="{c:.1}" y2="{drop_bottom:.1}" stroke="{DASH_COLOR}" stroke-width="1" stroke-dasharray="3 3"/>"#,
+            period_top + BOX_H,
+        ));
+    }
+    // Time axis arrow.
+    body.push_str(&format!(
+        r#"<line x1="{:.1}" y1="{axis_y:.1}" x2="{:.1}" y2="{axis_y:.1}" stroke="currentColor" stroke-width="2.5" marker-end="url(#tl-arrow)"/>"#,
+        PAD,
+        total_w - PAD / 2.0,
+    ));
+    // Period boxes (colored) on top of the droplines.
+    for (i, p) in t.periods.iter().enumerate() {
+        colored_box(&mut body, (lefts[i], period_top, col_w[i], BOX_H), &p.time, period_color(i), 1.0, true);
+    }
+    // Event boxes, tinted with their period's color.
+    for (i, p) in t.periods.iter().enumerate() {
+        for (ev, &top) in p.events.iter().zip(&ev_layout[i]) {
+            colored_box(&mut body, (lefts[i], top, col_w[i], BOX_H), ev, period_color(i), 0.5, false);
+        }
     }
 
-    let total_h = max_bottom + PAD;
+    let total_h = drop_bottom + PAD;
     let mut out = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total_w:.0} {total_h:.0}" width="{total_w:.0}" height="{total_h:.0}" style="font-family:sans-serif;font-size:14px">"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total_w:.0} {total_h:.0}" width="{total_w:.0}" height="{total_h:.0}" style="font-family:sans-serif;font-size:14px"><defs><marker id="tl-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker></defs>"#
     );
     out.push_str(&body);
     out.push_str("</svg>");
     out
 }
 
-/// A rounded box filling `[left, left+w]` at `top`, with centered text.
-/// `strong` boxes (period labels) use the node fill + bold text; event
-/// boxes use the lighter surface fill.
-fn box_with_label(out: &mut String, left: f64, top: f64, w: f64, h: f64, text: &str, strong: bool) {
-    let fill = if strong { "var(--mermaid-node-fill, #ececff)" } else { "var(--surface, #fff)" };
-    let weight = if strong { r#" font-weight="600""# } else { "" };
+/// A rounded box `(left, top, w, h)` tinted `fill` at `opacity`, with centered
+/// (optionally bold) dark text.
+fn colored_box(out: &mut String, rect: (f64, f64, f64, f64), text: &str, fill: &str, opacity: f64, bold: bool) {
+    let (left, top, w, h) = rect;
+    let weight = if bold { r#" font-weight="600""# } else { "" };
     out.push_str(&format!(
-        r#"<rect x="{left:.1}" y="{top:.1}" width="{w:.1}" height="{h:.1}" fill="{fill}" stroke="currentColor" rx="4"/>"#
+        r#"<rect x="{left:.1}" y="{top:.1}" width="{w:.1}" height="{h:.1}" fill="{fill}" fill-opacity="{opacity}" stroke="{fill}" rx="4"/>"#
     ));
     out.push_str(&format!(
         r#"<text x="{:.1}" y="{:.1}" text-anchor="middle"{weight} fill="currentColor">{}</text>"#,
@@ -261,6 +284,20 @@ mod tests {
         assert!(svg.contains(">T<")); // title
         assert!(svg.contains(">S<")); // section band label
         assert!(svg.contains(">2002<") && svg.contains(">LinkedIn<") && svg.contains(">Twitter<"));
+    }
+
+    #[test]
+    fn periods_colored_with_axis_and_droplines() {
+        let svg = render_svg(
+            &parse("timeline\n title T\n 2002 : LinkedIn\n 2004 : Facebook : Google").unwrap(),
+        );
+        // Section coloring: the two periods use distinct palette colors.
+        assert!(svg.contains(PERIOD_COLORS[0]) && svg.contains(PERIOD_COLORS[1]), "period colors: {svg}");
+        // An event inherits its period's color at reduced opacity.
+        assert!(svg.contains(r#"fill-opacity="0.5""#), "tinted events: {svg}");
+        // Time-axis arrow + dashed droplines.
+        assert!(svg.contains("marker-end=\"url(#tl-arrow)\""), "axis arrow: {svg}");
+        assert!(svg.contains(r#"stroke-dasharray="3 3""#), "droplines: {svg}");
     }
 
     #[test]
