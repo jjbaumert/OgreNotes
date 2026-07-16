@@ -71,7 +71,9 @@ pub(crate) fn render_state(source: &str) -> Result<String, crate::ParseError> {
         let size = match n.kind {
             StateKind::Normal => {
                 let (tw, th) = crate::measure::text_size(&n.display);
-                ((tw + 24.0).max(60.0), (th + 16.0).max(36.0))
+                // Mermaid's state.padding is 8, applied uniformly (was tw+24
+                // with a 60px min-width — a horizontal-only inflation).
+                ((tw + 16.0).max(36.0), (th + 16.0).max(36.0))
             }
             StateKind::Start | StateKind::End => (18.0, 18.0),
             // Reuse the flowchart diamond footprint formula so choice

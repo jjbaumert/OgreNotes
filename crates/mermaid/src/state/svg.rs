@@ -26,6 +26,9 @@ use crate::state::{StateGraph, StateKind, StateNote};
 /// Horizontal bow applied to each edge in a parallel/opposing group so they
 /// don't collapse onto one line.
 const PARALLEL_BOW: f64 = 22.0;
+/// Horizontal offset of each anti-parallel edge's boundary anchor along the
+/// node face, so the two attach at distinct points (not one shared center).
+const ANCHOR_SPREAD: f64 = 12.0;
 
 /// A vertical-flow edge curve bowed horizontally by `dx` at its midpoint, so
 /// opposing edges between the same node pair separate into two arcs.
@@ -92,7 +95,7 @@ pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
     let mut out = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:14px">"#
     );
-    out.push_str(r#"<defs><marker id="mmd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker></defs>"#);
+    out.push_str(r#"<defs><marker id="mmd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker></defs>"#);
     // One wrapper re-homes everything when a note overflowed left/top;
     // per-element coordinates stay untouched.
     let wrapped = dx > 0.0 || dy > 0.0;
@@ -148,9 +151,20 @@ pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
         let d = match parallel.get(&(t.from.min(t.to), t.from.max(t.to))) {
             Some(grp) if grp.len() > 1 => {
                 let pos = grp.iter().position(|&x| x == i).unwrap_or(0);
-                // Symmetric horizontal spread: e.g. a pair bows to ±PARALLEL_BOW.
-                let off = (pos as f64 - (grp.len() as f64 - 1.0) / 2.0) * PARALLEL_BOW;
-                bowed_path(&ep.points, off)
+                let center = (grp.len() as f64 - 1.0) / 2.0;
+                // Each anti-parallel edge gets DISTINCT boundary anchors (its
+                // endpoints shifted along the node face) AND a mid-path bow, so
+                // the two are separate along their whole length — no collinear
+                // stub at either end (Mermaid parity).
+                let anchor = (pos as f64 - center) * ANCHOR_SPREAD;
+                let mut pts = ep.points.clone();
+                if pts.len() >= 2 {
+                    let last = pts.len() - 1;
+                    pts[0].0 += anchor;
+                    pts[last].0 += anchor;
+                }
+                let off = (pos as f64 - center) * PARALLEL_BOW;
+                bowed_path(&pts, off)
             }
             _ => crate::curved_path(&ep.points, true),
         };
@@ -188,12 +202,12 @@ pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
         match n.kind {
             StateKind::Start => {
                 out.push_str(&format!(
-                    r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="8" fill="currentColor"/>"#
+                    r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="7" fill="currentColor"/>"#
                 ));
             }
             StateKind::End => {
                 out.push_str(&format!(
-                    r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="9" fill="none" stroke="currentColor"/>"#
+                    r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="7" fill="none" stroke="currentColor"/>"#
                 ));
                 out.push_str(&format!(
                     r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="5" fill="currentColor"/>"#
@@ -300,6 +314,23 @@ mod tests {
             .collect();
         assert!(ds.len() >= 2, "two edge curves: {ds:?}");
         assert_ne!(ds[0], ds[1], "opposing edges must not share the same geometry");
+        // Distinct BOUNDARY anchors: the two edges' start points (`M x y`) differ.
+        let starts: Vec<&str> =
+            ds.iter().map(|d| d.trim_start_matches("M ").split_whitespace().next().unwrap()).collect();
+        assert_ne!(starts[0], starts[1], "anti-parallel edges share a start anchor: {ds:?}");
+        // Both carry an arrowhead at their target.
+        assert_eq!(svg.matches("marker-end=").count(), 2, "both edges arrowheaded: {svg}");
+    }
+
+    #[test]
+    fn theme_and_marker_sizes_match_mermaid() {
+        let svg = render_state("stateDiagram-v2\n[*] --> S\nS --> [*]").unwrap();
+        // D4: node border is Mermaid's nodeBorder (#9370DB via the shared var).
+        assert!(svg.contains("var(--mermaid-node-border, #9370DB)"), "purple border: {svg}");
+        // D6: enlarged arrow marker. D5: start r=7, end r=7 outer / r=5 inner.
+        assert!(svg.contains(r#"markerWidth="12""#), "arrow marker enlarged: {svg}");
+        assert!(svg.contains(r#"r="7" fill="currentColor""#), "start circle r=7: {svg}");
+        assert!(svg.contains(r#"r="7" fill="none""#), "end outer circle r=7: {svg}");
     }
 
     #[test]

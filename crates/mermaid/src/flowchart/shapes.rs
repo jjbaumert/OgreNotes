@@ -38,6 +38,9 @@ pub(crate) fn size_for(shape: ShapeKind, tw: f64, th: f64) -> (f64, f64) {
 }
 
 const FILL: &str = "var(--mermaid-node-fill, #ececff)";
+/// Mermaid's `nodeBorder` (default theme). Shared by every `shapes::emit`
+/// consumer (flowchart, stateDiagram-v2, mindmap).
+const BORDER: &str = "var(--mermaid-node-border, #9370DB)";
 /// Per-side padding for a decision (diamond) node — Mermaid's flowchart default.
 const DIAMOND_PAD: f64 = 15.0;
 
@@ -57,7 +60,7 @@ pub(crate) fn emit(shape: ShapeKind, cx: f64, cy: f64, w: f64, h: f64, style: Op
         Some(s) if !s.is_empty() => format!(r#" style="{}""#, escape_xml(s)),
         _ => String::new(),
     };
-    let common = format!(r#"fill="{FILL}" stroke="currentColor" stroke-width="1"{style_attr}"#);
+    let common = format!(r#"fill="{FILL}" stroke="{BORDER}" stroke-width="1"{style_attr}"#);
     match shape {
         ShapeKind::Rect => format!(
             r#"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" {common}/>"#
@@ -233,7 +236,12 @@ mod tests {
                     || svg.contains("<ellipse"),
                 "{s:?} emitted no geometry: {svg}"
             );
-            assert!(svg.contains("currentColor"), "{s:?} not theme-aware");
+            // Theme-aware via `currentColor` (inner lines) or the fill/border
+            // CSS vars (the node border is now `var(--mermaid-node-border,…)`).
+            assert!(
+                svg.contains("currentColor") || svg.contains("var(--mermaid"),
+                "{s:?} not theme-aware"
+            );
             assert!(!svg.contains("NaN"), "{s:?} produced NaN");
         }
     }
