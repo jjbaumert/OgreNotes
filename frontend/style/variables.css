@@ -58,3 +58,31 @@
   --radius-md: 6px;
   --radius-lg: 8px;
 }
+
+/* Document typography themes (#59 T-12, branding.md §Typography). A
+ * user-selectable per-account preference: theme.rs writes
+ * [data-doc-theme="<id>"] on the document element (mirroring
+ * [data-dyslexic]), and these blocks re-point the --font-doc-* vars that
+ * document surfaces read. "default" (Inter) needs no block — it is the
+ * :root value above. @font-face for each family lives in fonts.css.
+ *
+ * Precedence: the dyslexic a11y override ([data-dyslexic="true"] in
+ * main.css, which loads AFTER this file) must win over any doc theme at
+ * equal specificity — accessibility outranks aesthetics. Keep these rules
+ * in variables.css (early) so that ordering holds. */
+[data-doc-theme="editorial"] {
+  --font-doc-heading: 'Playfair Display', Georgia, serif;
+  --font-doc-body: 'Source Serif 4', Georgia, serif;
+}
+[data-doc-theme="handwritten"] {
+  --font-doc-heading: 'Caveat', 'Segoe Script', cursive;
+  --font-doc-body: 'Nunito', system-ui, sans-serif;
+}
+[data-doc-theme="technical"] {
+  --font-doc-heading: 'JetBrains Mono', ui-monospace, monospace;
+  --font-doc-body: 'JetBrains Mono', ui-monospace, monospace;
+}
+[data-doc-theme="classic"] {
+  --font-doc-heading: 'Merriweather', Georgia, serif;
+  --font-doc-body: 'Merriweather', Georgia, serif;
+}

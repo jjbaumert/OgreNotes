@@ -25,6 +25,7 @@ use crate::components::profile_settings::ProfileSettings;
 use crate::components::search_dialog::SearchDialog;
 use crate::components::status_editor::StatusEditor;
 use crate::components::locale_selector::LocaleSelector;
+use crate::components::doc_theme_selector::DocThemeSelector;
 use crate::components::theme_selector::ThemeSelector;
 
 /// Stable section ids. These are the URL-fragment values
@@ -178,6 +179,12 @@ fn panel_body(tab: &str) -> AnyView {
                     {crate::t!("settings-appearance-theme")}
                 </span>
                 <ThemeSelector />
+            </div>
+            <div class="settings-field">
+                <span class="settings-field-label">
+                    {crate::t!("settings-appearance-doc-theme")}
+                </span>
+                <DocThemeSelector />
             </div>
             // Language lives here (not in Profile): its i18n key has
             // always been `settings-appearance-language`, and the

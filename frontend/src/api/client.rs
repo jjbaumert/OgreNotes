@@ -204,6 +204,9 @@ pub struct UiPrefsDto {
     pub dyslexic_font: Option<bool>,
     #[serde(default)]
     pub reduce_motion: Option<bool>,
+    /// Document typography theme id (#59 T-12); `None` / "default" ⇒ Inter.
+    #[serde(default)]
+    pub doc_theme: Option<String>,
 }
 
 /// The body shape the server returns on a 202 from `/auth/dev-login`

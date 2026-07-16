@@ -989,6 +989,14 @@ settings-tab-help = Help & Support
 settings-coming-soon = This section is coming soon.
 settings-appearance-theme = Theme
 settings-appearance-language = Language
+# Document typography themes (#59 T-12)
+settings-appearance-doc-theme = Document typography
+settings-doc-theme-aria = Document typography theme
+settings-doc-theme-default = Default (Inter)
+settings-doc-theme-editorial = Editorial (Playfair Display / Source Serif)
+settings-doc-theme-handwritten = Handwritten (Caveat / Nunito)
+settings-doc-theme-technical = Technical (JetBrains Mono)
+settings-doc-theme-classic = Classic (Merriweather)
 # BYOK — bring-your-own Anthropic key (#29)
 settings-byok-label = AI assistant — use your own Anthropic key
 settings-byok-hint = Stored only in this browser and sent with your AI requests; never saved on our servers. Leave blank to use the workspace key.
