@@ -925,6 +925,74 @@ async fn test_export_markdown_round_trips_text() {
     app.cleanup().await;
 }
 
+/// #59 T-6: a document's comment threads must appear in its exports.
+/// Import a doc, attach a document-level comment, then export as HTML and
+/// Markdown and assert the comment body + author + a "Comments" heading
+/// are present. Pins the promised-but-previously-missing feature end to
+/// end through the route (thread fetch → author resolution → render).
+#[tokio::test]
+async fn test_export_includes_comment_threads() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_with_name("commenter@test.com", "Commenter Cass").await.1;
+
+    let (status, json) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/documents/import",
+            Some(&token),
+            Some(serde_json::json!({
+                "format": "markdown",
+                "title": "Doc With Comments",
+                "content": "Body paragraph text.\n",
+            })),
+        )
+        .await;
+    assert_eq!(status, 201, "import should succeed: {json}");
+    let doc_id = json["id"].as_str().expect("import returns doc id").to_string();
+
+    // Attach a document-level comment thread with a message.
+    let (status, _thread) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/documents/{doc_id}/threads"),
+            Some(&token),
+            Some(serde_json::json!({
+                "threadType": "document",
+                "message": "This claim needs a source.",
+            })),
+        )
+        .await;
+    assert_eq!(status, 201, "thread creation should succeed");
+
+    for (format, is_utf8) in [("html", true), ("markdown", true)] {
+        let (status, bytes) = app
+            .bytes_request(
+                Method::GET,
+                &format!("/api/v1/documents/{doc_id}/export/{format}"),
+                Some(&token),
+                Vec::new(),
+                "application/octet-stream",
+            )
+            .await;
+        assert_eq!(status, 200, "{format} export status");
+        assert!(is_utf8);
+        let text = String::from_utf8(bytes).expect("export is utf-8");
+        assert!(text.contains("Body paragraph text"), "{format}: body present: {text}");
+        assert!(text.contains("Comments"), "{format}: comments section: {text}");
+        assert!(
+            text.contains("This claim needs a source."),
+            "{format}: comment body must be in the export: {text}",
+        );
+        assert!(
+            text.contains("Commenter Cass"),
+            "{format}: resolved author name must be in the export: {text}",
+        );
+    }
+
+    app.cleanup().await;
+}
+
 /// CSV export round-trip — import CSV via the spreadsheet-import
 /// route (already covered separately for the import direction), then
 /// export it back and assert every imported cell value reappears in
