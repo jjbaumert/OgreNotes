@@ -470,7 +470,7 @@ Key specification supports modifiers: `Mod` (Ctrl on PC, Cmd on Mac), `Ctrl`, `A
 - Strike: we bind both `Ctrl+Shift+X` and `Ctrl+Shift+S`
 - Code: we bind both `Ctrl+Shift+K` and `Ctrl+E`
 - Bullet list: we bind `Ctrl+Shift+L` instead of `Ctrl+Shift+8`
-- Highlight, text alignment, goToNextCell: not implemented in MVP
+- Text alignment, goToNextCell: not implemented in MVP (Highlight shipped — `==text==`, Ctrl+Shift+H, serializes to `<mark>`)
 - Tab/Shift-Tab: always consumed (`preventDefault`) when inside a list, even when indent/dedent is not possible
 - `Ctrl+Backspace` / `Ctrl+Delete`: word deletion (handled via `deleteWordBackward`/`deleteWordForward` beforeinput)
 - `Shift+Enter`: handled via `insertLineBreak` beforeinput, not keymap

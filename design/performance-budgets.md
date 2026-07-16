@@ -83,7 +83,7 @@ Measured by the M-P9 piece B CI job: `trunk build --release`,
 
 | Asset | Aspirational budget | Current baseline (2026-06-04) | CI gate threshold |
 |---|---|---|---|
-| `ogrenotes-frontend_bg.wasm` (gzipped) | **800 KB** | **1.36 MB** (was 2.07 MB on 2026-06-03, pre size-opt) | Fail PR if > **1.48 MB** (1,550,000 B) |
+| `ogrenotes-frontend_bg.wasm` (gzipped) | **800 KB** | **~1.66 MB** (last measured main, 2026-07-10; was 2.07 MB on 2026-06-03, pre size-opt) | Fail PR if > **1.76 MiB** (1,850,000 B) |
 | `ogrenotes-frontend.js` glue (gzipped) | 100 KB | 12 KB | Tracked, no gate |
 | Total app shell (HTML + CSS + WASM + glue, gzipped) | 1 MB | ~1.20 MB | Tracked, no gate |
 
@@ -152,6 +152,12 @@ against `main` baseline.
 | `search_snippet` (10 KB doc → snippet) | TBD | Fail PR if > 20% slower |
 | `formula_eval_chain` (100-cell dependency chain) | TBD | Fail PR if > 20% slower |
 
+Status: 4 of these 6 benches are implemented today in
+`crates/collab/benches/yrs_ops.rs` (`yrs_apply_update`, its large
+variant, `doc_serialize`, `doc_deserialize`). `search_snippet` and
+`formula_eval_chain` are specified but not yet written, and the suite is
+not yet wired into CI (see below).
+
 The 20% threshold is loose enough to absorb GitHub-Actions runner
 variance (typically ±10%) and tight enough to catch a genuine
 regression. Tighter gating waits for self-hosted bench runners.
@@ -194,16 +200,17 @@ fn emit_vital(m: Vital) {
 }
 ```
 
-- **Sampling rate** — 10% via `RUM_SAMPLE_RATE` config env; bumpable
-  per deploy without a rebuild. Sample decision is per-session, not
-  per-event, so a sampled session emits all of its vitals or none.
+- **Sampling rate** — 10%, hardcoded as `const SAMPLE_RATE = 0.10`
+  in `frontend/src/rum.rs` (no env override). Sample decision is
+  per-session, not per-event, so a sampled session emits all of its
+  vitals or none.
 - **Page kind** — `home | editor | spreadsheet | other`. Avoids
   per-doc-id cardinality on CloudWatch dimensions.
-- **What's emitted** — LCP, INP, CLS, FCP, nav-timing
-  (`domContentLoaded`, `loadEventEnd`), TTI estimate
-  (long-task-based).
-- **Beacon** — `navigator.sendBeacon()` when available so a
-  page-unload doesn't lose the final metric.
+- **What's emitted (v1)** — LCP, FCP, and nav-timing
+  (`domContentLoaded`, `loadEventEnd`) on a single beacon. INP, CLS,
+  and a TTI estimate are deferred (they need an ongoing observer).
+- **Beacon** — one `gloo_net` POST to `/api/v1/metrics/rum`, fired
+  ~1.5 s after the window `load` event (not `sendBeacon`; not on unload).
 
 ### Ingestion endpoint
 
@@ -251,7 +258,7 @@ on every PR and push to main.
 
 ```yaml
 env:
-  WASM_GZ_LIMIT: "2097152"   # 2 MiB
+  WASM_GZ_LIMIT: "1850000"   # ~1.76 MiB
 
 steps:
   - run: cd frontend && trunk build --release
@@ -282,16 +289,22 @@ PR comment annotation: shows current size + delta vs main.
 
 ### Bench regression (piece D)
 
-GitHub Actions job `bench-regression` in `.github/workflows/ci.yml`.
-Runs criterion against `main` baseline + current PR.
+Planned — **not yet implemented.** The bench harness exists
+(`crates/collab/benches/yrs_ops.rs`, run with `cargo bench --bench
+yrs_ops`) but there is no `bench-regression` job in
+`.github/workflows/ci.yml` and no `scripts/check-bench-regression.sh`
+driver yet. The intended shape is a job comparing criterion results
+against a cached `main` baseline and failing a PR when a bench is >20%
+slower:
 
 ```yaml
-- run: cargo bench --bench collab -- --save-baseline main
-- run: git checkout ${{ github.head_ref }} && cargo bench --bench collab -- --baseline main
+# planned, not yet wired:
+- run: cargo bench --bench yrs_ops -- --save-baseline main
+- run: git checkout ${{ github.head_ref }} && cargo bench --bench yrs_ops -- --baseline main
 - run: scripts/check-bench-regression.sh 20  # fails if > 20% slower
 ```
 
-Baseline cached per branch; rebuilt nightly from main.
+Baseline would be cached per branch and rebuilt nightly from main.
 
 ## Dashboard (M-P9 piece F)
 

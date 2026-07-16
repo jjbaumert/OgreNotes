@@ -94,6 +94,17 @@ metric flushes batch every 10 s so the cap is generous). Body size
 capped at 16 KiB. Drops requests that exceed the cap rather than
 queuing them — telemetry must never block user interaction.
 
+> **Status (not yet built).** This batched `/client-telemetry`
+> endpoint and its metric-name allowlist are still design, not shipped.
+> The client-telemetry analog in the codebase today is the RUM endpoint
+> `POST /api/v1/metrics/rum` (`crates/api/src/routes/metrics.rs`),
+> rate-limited at `rate_limit_rum_per_min` (default **60/min**, ≈1 req/s)
+> and with **no metric-name allowlist** — the metric names are
+> server-side constants (`rum.lcp_ms`, `rum.fcp_ms`, …); the validated
+> closed set is the `page` dimension (`validate_page`). Treat the
+> per-JWT / allowlist / `client.*`-namespace details below as the target
+> design for the batched endpoint, not current behavior.
+
 ### 2. Tiered client logging
 
 `frontend/src/editor/debug.rs` is rewritten to **always compile
@@ -510,8 +521,8 @@ The client telemetry endpoint sits at L4 (edge) and accepts
 authenticated input from untrusted clients. The trust posture:
 
 - **Authentication required.** No anonymous metric writes.
-- **Rate-limited per JWT.** Default 6 req/min (one batch every 10 s).
-  Drops exceeding requests — never queues.
+- **Rate-limited per JWT.** Default ~1 req/sec (batched every ~10 s, so
+  the cap is generous). Drops exceeding requests — never queues.
 - **Body capped at 16 KiB.** Counters and the ring-buffer log
   shipment fit comfortably.
 - **Metric names validated against an allowlist.** Clients

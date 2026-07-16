@@ -1,6 +1,8 @@
-# Spreadsheet Sparse Representation (DRAFT — issue #122)
+# Spreadsheet Sparse Representation (issue #122)
 
-**Status:** DRAFT for human review. Not yet approved; do not implement against this.
+**Status:** Stage 1 shipped (#128) — trim-only persist via
+`used_extent_for_persist` plus `gridRows`/`gridCols` view-extent attrs and the
+engine-resync skip. Stage 2 (the `ssv="2"` sparse child list) is not yet started.
 Companion to #121 (per-commit persist costs) and #122 (this design investigation).
 
 ## Problem
