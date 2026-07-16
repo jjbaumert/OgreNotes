@@ -129,99 +129,170 @@ pub(crate) fn parse(source: &str) -> Result<Mindmap, ParseError> {
     Ok(Mindmap { nodes })
 }
 
-const MARGIN: f64 = 16.0;
-const X_GAP: f64 = 180.0;
-const Y_GAP: f64 = 40.0;
-const NODE_H: f64 = 30.0;
+const MARGIN: f64 = 30.0;
+const RING: f64 = 165.0; // radius added per depth level
+const NODE_H: f64 = 28.0;
+/// Root node fill (Mermaid draws the root as a large filled dark circle).
+const ROOT_FILL: &str = "#2a2ad6";
+// Text colors kept as consts so `#` never follows `"` in a raw string literal.
+const TXT_WHITE: &str = "#fff";
+const TXT_DARK: &str = "#222";
+/// Per top-level-branch colors; the whole subtree inherits its branch's color.
+const BRANCH_COLORS: &[&str] =
+    &["#e6e64d", "#7ed321", "#9d6ef0", "#4dd0e1", "#ec4899", "#f5a623", "#4a90e2", "#b06ef0"];
 
-/// Assigns each node a vertical slot: leaves take successive slots,
-/// internal nodes centre on their children. Iterative-safe recursion
-/// (depth bounded by `MAX_NODES`).
-fn assign_slots(nodes: &[MindNode], node: usize, next_leaf: &mut f64, ys: &mut [f64]) {
-    if nodes[node].children.is_empty() {
-        ys[node] = *next_leaf;
-        *next_leaf += 1.0;
+/// Leaf count of the subtree at `node` (memoized), used for angular allocation.
+fn leaf_count(nodes: &[MindNode], node: usize, memo: &mut [f64]) -> f64 {
+    if memo[node] > 0.0 {
+        return memo[node];
+    }
+    let lc = if nodes[node].children.is_empty() {
+        1.0
     } else {
-        for &c in &nodes[node].children {
-            assign_slots(nodes, c, next_leaf, ys);
-        }
-        let first = ys[nodes[node].children[0]];
-        let last = ys[*nodes[node].children.last().unwrap()];
-        ys[node] = (first + last) / 2.0;
+        nodes[node].children.iter().map(|&c| leaf_count(nodes, c, memo)).sum()
+    };
+    memo[node] = lc;
+    lc
+}
+
+/// Radial placement: each node sits at `depth * RING` along the bisector of its
+/// angular sector; a node's children split its sector in proportion to their
+/// leaf counts. Positions are relative to the (0,0) root center.
+fn assign_radial(
+    nodes: &[MindNode],
+    node: usize,
+    a0: f64,
+    a1: f64,
+    depth: usize,
+    pos: &mut [(f64, f64)],
+    memo: &mut [f64],
+) {
+    let angle = (a0 + a1) / 2.0;
+    let r = depth as f64 * RING;
+    pos[node] = (r * angle.cos(), r * angle.sin());
+    let total: f64 = nodes[node].children.iter().map(|&c| leaf_count(nodes, c, memo)).sum();
+    let mut cur = a0;
+    for &c in &nodes[node].children {
+        let span = (a1 - a0) * leaf_count(nodes, c, memo) / total.max(1.0);
+        assign_radial(nodes, c, cur, cur + span, depth + 1, pos, memo);
+        cur += span;
     }
 }
 
 pub(crate) fn render_svg(m: &Mindmap) -> String {
+    use std::f64::consts::PI;
     let n = m.nodes.len();
-    let mut slots = vec![0.0f64; n];
-    let mut next = 0.0;
-    assign_slots(&m.nodes, 0, &mut next, &mut slots);
+    let mut memo = vec![0.0f64; n];
+    let mut pos = vec![(0.0f64, 0.0f64); n];
+    assign_radial(&m.nodes, 0, -PI, PI, 0, &mut pos, &mut memo);
 
-    // Per-node box size from its label; column left edge from its depth.
-    // Circle/double-circle nodes (e.g. `root((mindmap))`) must be sized to
-    // circumscribe their text — a rectangle-sized box would clip the label —
-    // so they use the shape-aware sizing; other shapes keep the row height.
+    // Each node's top-level branch (root-child ancestor) drives its color.
+    let mut branch = vec![usize::MAX; n];
+    for (k, &child) in m.nodes[0].children.iter().enumerate() {
+        let mut stack = vec![child];
+        while let Some(u) = stack.pop() {
+            branch[u] = k;
+            stack.extend(m.nodes[u].children.iter().copied());
+        }
+    }
+    let color_of = |i: usize| -> &'static str {
+        match branch[i] {
+            usize::MAX => ROOT_FILL,
+            k => BRANCH_COLORS[k % BRANCH_COLORS.len()],
+        }
+    };
+
+    // Per-node half-extents (root circle circumscribes its label).
     let sizes: Vec<(f64, f64)> = m
         .nodes
         .iter()
-        .map(|node| {
+        .enumerate()
+        .map(|(i, node)| {
             let (tw, th) = measure::text_size(&node.label);
-            match node.shape {
-                ShapeKind::Circle | ShapeKind::DoubleCircle => shapes::size_for(node.shape, tw, th),
-                _ => ((tw + 28.0).max(48.0), NODE_H),
+            if i == 0 {
+                shapes::size_for(ShapeKind::Circle, tw, th)
+            } else {
+                (tw + 18.0, NODE_H)
             }
         })
         .collect();
-    let col_left = |depth: usize| MARGIN + depth as f64 * X_GAP;
-    let cx = |i: usize| col_left(m.nodes[i].depth) + sizes[i].0 / 2.0;
-    let cy_raw = |i: usize| MARGIN + NODE_H / 2.0 + slots[i] * Y_GAP;
 
-    // A node taller than the row height (a big root circle) can reach above the
-    // top margin; shift everything down so the highest node clears the margin.
-    let y_top = (0..n).map(|i| cy_raw(i) - sizes[i].1 / 2.0).fold(f64::INFINITY, f64::min);
-    let y_shift = (MARGIN - y_top).max(0.0);
-    let cy = |i: usize| cy_raw(i) + y_shift;
-
-    // Canvas width = the furthest right edge over ALL nodes (a wide label
-    // on a shallow node can reach past the deepest column), plus a margin.
-    let w = (0..n)
-        .map(|i| col_left(m.nodes[i].depth) + sizes[i].0)
-        .fold(0.0_f64, f64::max)
-        + MARGIN;
-    // Height from the lowest node extent (tall circles included), not just rows.
-    let h = (0..n).map(|i| cy(i) + sizes[i].1 / 2.0).fold(0.0_f64, f64::max) + MARGIN;
-    let _ = next; // row count no longer bounds the height directly
+    // Shift relative positions into a positive canvas with a margin.
+    let (mut minx, mut miny, mut maxx, mut maxy) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for i in 0..n {
+        minx = minx.min(pos[i].0 - sizes[i].0 / 2.0);
+        miny = miny.min(pos[i].1 - sizes[i].1 / 2.0);
+        maxx = maxx.max(pos[i].0 + sizes[i].0 / 2.0);
+        maxy = maxy.max(pos[i].1 + sizes[i].1 / 2.0);
+    }
+    let (ox, oy) = (MARGIN - minx, MARGIN - miny);
+    let at = |i: usize| (pos[i].0 + ox, pos[i].1 + oy);
+    let w = maxx - minx + 2.0 * MARGIN;
+    let h = maxy - miny + 2.0 * MARGIN;
 
     let mut svg = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:13px">"#
     );
 
-    // Edges (under nodes): parent's right edge -> child's left edge,
-    // curved along the horizontal flow.
+    // Edges (under nodes): thick, branch-colored curves radiating outward.
     for (i, node) in m.nodes.iter().enumerate() {
-        let px = col_left(node.depth) + sizes[i].0;
-        let py = cy(i);
+        let (px, py) = at(i);
         for &c in &node.children {
-            let clx = col_left(m.nodes[c].depth);
-            let d = crate::curved_path(&[(px, py), (clx, cy(c))], false);
+            let (ccx, ccy) = at(c);
+            let d = crate::curved_path(&[(px, py), (ccx, ccy)], false);
             svg.push_str(&format!(
-                r#"<path d="{d}" stroke="currentColor" fill="none" opacity="0.5"/>"#
+                r#"<path d="{d}" stroke="{}" stroke-width="5" stroke-linecap="round" fill="none" opacity="0.85"/>"#,
+                color_of(c),
             ));
         }
     }
 
-    // Nodes.
+    // Nodes: root = big filled circle; level-1 = filled rounded rect; deeper
+    // leaves = text with a branch-colored underline.
     for (i, node) in m.nodes.iter().enumerate() {
-        let (nw, nh) = sizes[i];
-        svg.push_str("<g>");
-        svg.push_str(&shapes::emit(node.shape, cx(i), cy(i), nw, nh, None));
-        svg.push_str(&format!(
-            r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
-            cx(i),
-            cy(i) + 4.0,
-            escape_xml(&node.label),
-        ));
-        svg.push_str("</g>");
+        let (x, y) = at(i);
+        let (tw, _) = measure::text_size(&node.label);
+        if i == 0 {
+            let r = sizes[i].0 / 2.0;
+            svg.push_str(&format!(
+                r#"<circle cx="{x:.1}" cy="{y:.1}" r="{r:.1}" fill="{ROOT_FILL}" stroke="{ROOT_FILL}"/>"#
+            ));
+            svg.push_str(&format!(
+                r#"<text x="{x:.1}" y="{:.1}" text-anchor="middle" fill="{TXT_WHITE}" font-weight="600">{}</text>"#,
+                y + 4.0,
+                escape_xml(&node.label),
+            ));
+        } else if node.depth == 1 {
+            let (bw, bh) = (tw + 18.0, NODE_H);
+            // Honor the declared shape's corner style (`[square]` = sharp).
+            let rx = if node.shape == ShapeKind::Rect { 1.0 } else { 6.0 };
+            svg.push_str(&format!(
+                r#"<rect x="{:.1}" y="{:.1}" width="{bw:.1}" height="{bh:.1}" rx="{rx}" fill="{}"/>"#,
+                x - bw / 2.0,
+                y - bh / 2.0,
+                color_of(i),
+            ));
+            svg.push_str(&format!(
+                r#"<text x="{x:.1}" y="{:.1}" text-anchor="middle" fill="{TXT_DARK}">{}</text>"#,
+                y + 4.0,
+                escape_xml(&node.label),
+            ));
+        } else {
+            // leaf: label with a colored underline in its branch color.
+            svg.push_str(&format!(
+                r#"<text x="{x:.1}" y="{:.1}" text-anchor="middle" fill="{TXT_DARK}">{}</text>"#,
+                y + 4.0,
+                escape_xml(&node.label),
+            ));
+            svg.push_str(&format!(
+                r#"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="{}" stroke-width="2.5"/>"#,
+                x - tw / 2.0 - 2.0,
+                y + 10.0,
+                x + tw / 2.0 + 2.0,
+                y + 10.0,
+                color_of(i),
+            ));
+        }
     }
 
     svg.push_str("</svg>");
@@ -244,6 +315,21 @@ mod tests {
     fn header_required() {
         assert!(parse("root").is_err());
         assert!(parse("mindmap\n  root").is_ok());
+    }
+
+    #[test]
+    fn radial_layout_colors_branches_and_styles_nodes() {
+        let svg = render_svg(&p("mindmap\n  root((r))\n    A\n      a1\n    B\n      b1"));
+        // Root is a filled circle in ROOT_FILL.
+        assert!(svg.contains(&format!(r#"fill="{ROOT_FILL}""#)), "root fill: {svg}");
+        // The two top-level branches use distinct palette colors...
+        assert!(svg.contains(BRANCH_COLORS[0]) && svg.contains(BRANCH_COLORS[1]), "branch colors: {svg}");
+        // ...on thick edges, and leaves get an underline.
+        assert!(svg.contains(r#"stroke-width="5""#), "thick edges: {svg}");
+        assert!(svg.contains("<line"), "leaf underline: {svg}");
+        // Radial: not every node shares one x (the old tree put a column per depth).
+        let xs: Vec<&str> = svg.split("<circle cx=\"").skip(1).map(|s| s.split('"').next().unwrap()).collect();
+        assert!(!xs.is_empty());
     }
 
     #[test]
