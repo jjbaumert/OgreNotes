@@ -15,6 +15,9 @@ const HEADER_H: f64 = 34.0;
 const MIN_COL_W: f64 = 130.0;
 const MAX_CARD_W: f64 = 240.0;
 const MAX_ITEMS: usize = 1000;
+/// Per-column pastel palette (Mermaid tints each column a distinct hue).
+const COLUMN_COLORS: &[&str] =
+    &["#a8e05a", "#c99be0", "#e05ad1", "#5ad1e0", "#e0a85a", "#8a8ae0", "#5ae0a8", "#e05a5a"];
 
 #[derive(Debug, Clone)]
 pub(crate) struct Column {
@@ -99,14 +102,15 @@ fn err(message: impl Into<String>, line: usize) -> ParseError {
 }
 
 pub(crate) fn render_svg(k: &Kanban) -> String {
-    // Column widths: the wider of the header and its widest card, capped.
+    // Column widths: the wider of the header and its widest card (plus room for
+    // the left-aligned card text + accent), capped.
     let col_w: Vec<f64> = k
         .columns
         .iter()
         .map(|c| {
             let hw = measure::text_size(&c.title).0;
             let cw = c.cards.iter().map(|t| measure::text_size(t).0).fold(0.0_f64, f64::max);
-            (hw.max(cw) + 2.0 * INNER).clamp(MIN_COL_W, MAX_CARD_W)
+            (hw.max(cw) + 2.0 * INNER + 14.0).clamp(MIN_COL_W, MAX_CARD_W)
         })
         .collect();
 
@@ -121,12 +125,25 @@ pub(crate) fn render_svg(k: &Kanban) -> String {
     let mut body = String::new();
     let mut max_bottom = PAD + HEADER_H;
     let card_h = measure::LINE_H + 14.0;
+    let inset = 8.0; // card inset from the column body edges
 
     for (i, c) in k.columns.iter().enumerate() {
         let (l, w) = (lefts[i], col_w[i]);
-        // header.
+        let color = COLUMN_COLORS[i % COLUMN_COLORS.len()];
+        let n = c.cards.len();
+        // Column body height: header + inset-padded cards.
+        let body_h = if n == 0 {
+            HEADER_H + inset
+        } else {
+            HEADER_H + inset + n as f64 * (card_h + CARD_GAP) - CARD_GAP + inset
+        };
+        // Colored column container (behind), then a tinted header band.
         body.push_str(&format!(
-            r#"<rect x="{l:.1}" y="{:.1}" width="{w:.1}" height="{HEADER_H:.1}" fill="var(--mermaid-cluster-fill, #7773)" stroke="currentColor" rx="4"/>"#,
+            r#"<rect x="{l:.1}" y="{:.1}" width="{w:.1}" height="{body_h:.1}" fill="{color}" fill-opacity="0.3" stroke="{color}" rx="6"/>"#,
+            PAD
+        ));
+        body.push_str(&format!(
+            r#"<rect x="{l:.1}" y="{:.1}" width="{w:.1}" height="{HEADER_H:.1}" fill="{color}" fill-opacity="0.85" rx="6"/>"#,
             PAD
         ));
         body.push_str(&format!(
@@ -135,24 +152,28 @@ pub(crate) fn render_svg(k: &Kanban) -> String {
             PAD + HEADER_H / 2.0 + 5.0,
             escape_xml(&c.title)
         ));
-        // cards.
-        let mut cy = PAD + HEADER_H + CARD_GAP;
+        // White cards inside the column, left-aligned text with a color accent.
+        let (cx, cw) = (l + inset, w - 2.0 * inset);
+        let mut cy = PAD + HEADER_H + inset;
         for card in &c.cards {
             body.push_str(&format!(
-                r#"<rect x="{l:.1}" y="{cy:.1}" width="{w:.1}" height="{card_h:.1}" fill="var(--mermaid-node-fill, #ececff)" stroke="currentColor" rx="4"/>"#
+                r#"<rect x="{cx:.1}" y="{cy:.1}" width="{cw:.1}" height="{card_h:.1}" fill="var(--surface, #fff)" stroke="{color}" rx="3"/>"#
             ));
             body.push_str(&format!(
-                r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
-                l + w / 2.0,
+                r#"<rect x="{cx:.1}" y="{cy:.1}" width="3" height="{card_h:.1}" fill="{color}"/>"#
+            ));
+            body.push_str(&format!(
+                r#"<text x="{:.1}" y="{:.1}" fill="currentColor">{}</text>"#,
+                cx + 10.0,
                 cy + card_h / 2.0 + 5.0,
                 escape_xml(card)
             ));
             cy += card_h + CARD_GAP;
         }
-        max_bottom = max_bottom.max(cy);
+        max_bottom = max_bottom.max(PAD + body_h);
     }
 
-    let total_h = max_bottom + PAD - CARD_GAP;
+    let total_h = max_bottom + PAD;
     let mut out = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total_w:.0} {total_h:.0}" width="{total_w:.0}" height="{total_h:.0}" style="font-family:sans-serif;font-size:14px">"#
     );
@@ -196,5 +217,17 @@ mod tests {
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
         assert!(svg.contains(">Todo<") && svg.contains(">Done<"));
         assert!(svg.contains(">A<") && svg.contains(">B<") && svg.contains(">C<"));
+    }
+
+    #[test]
+    fn columns_colored_with_white_left_aligned_cards() {
+        let svg = render_svg(&parse("kanban\n Todo\n  A\n In Progress\n  B").unwrap());
+        // Two columns use distinct palette colors (container + header).
+        assert!(svg.contains(COLUMN_COLORS[0]) && svg.contains(COLUMN_COLORS[1]), "column colors: {svg}");
+        // Cards are white (the surface fill), not the old lavender node-fill.
+        assert!(svg.contains(r#"fill="var(--surface, #fff)""#), "white cards: {svg}");
+        assert!(!svg.contains("--mermaid-node-fill"), "no lavender cards: {svg}");
+        // A tinted column container behind the header (fill-opacity).
+        assert!(svg.contains(r#"fill-opacity="0.3""#), "column container: {svg}");
     }
 }
