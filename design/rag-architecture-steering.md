@@ -1,6 +1,8 @@
 # RAG Architecture Steering Document
 ## Intelligent Document Retrieval for Engineering & Planning Artifacts
 
+> ⚠️ **SUPERSEDED (as of 2026-07).** This document proposed a Python **LightRAG** stack (Neo4j / pgvector, with `hybrid`/`local`/`global`/`naive` query modes). **None of that was built.** The shipped implementation is a Rust Claude tool-calling agent loop (`crates/api/src/routes/ask.rs::run_agent_loop`) over Qdrant vectors + Tantivy BM25, with document relationships stored as a DynamoDB `REL#`/`RREL#` adjacency list — no LightRAG, Neo4j, or pgvector exist in the codebase. Read this doc only for background motivation; the authoritative design of what was actually built is **`design/rag-implementation-plan.md`**.
+
 **Version:** 1.0  
 **Status:** Draft  
 **Purpose:** Architectural guidance for implementing graph-enhanced retrieval-augmented generation (RAG) across the project document corpus
