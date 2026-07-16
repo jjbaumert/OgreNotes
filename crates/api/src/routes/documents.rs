@@ -1774,6 +1774,70 @@ async fn put_content(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Format a microseconds-since-epoch timestamp as `YYYY-MM-DD HH:MM UTC`
+/// for export rendering, or `""` when out of range.
+fn format_usec_utc(usec: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Utc
+        .timestamp_micros(usec)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_default()
+}
+
+/// Fetch a document's comment threads (inline + document-level) and flatten
+/// them into the export renderer's `ExportComment` shape (#59 T-6), oldest
+/// thread first, with author display names resolved via one BatchGetItem
+/// and timestamps formatted. Chat/DM threads are not document content and
+/// are excluded. Best-effort: a repo error yields no comments rather than
+/// failing the export (comments are supplementary to the document body).
+async fn load_export_comments(state: &AppState, doc_id: &str) -> Vec<export::ExportComment> {
+    use ogrenotes_storage::models::thread::{ThreadStatus, ThreadType};
+
+    let mut threads = match state.thread_repo.list_threads_for_doc(doc_id).await {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    threads.retain(|t| matches!(t.thread_type, ThreadType::Inline | ThreadType::Document));
+    threads.sort_by_key(|t| t.created_at);
+
+    // Collect each thread's messages, accumulating author ids for a single
+    // batch name resolution.
+    let mut per_thread = Vec::with_capacity(threads.len());
+    let mut author_ids = Vec::new();
+    for t in threads {
+        let msgs = state
+            .thread_repo
+            .list_messages(&t.thread_id)
+            .await
+            .unwrap_or_default();
+        for m in &msgs {
+            author_ids.push(m.user_id.clone());
+        }
+        per_thread.push((t, msgs));
+    }
+    let users = state.user_repo.get_by_ids(&author_ids).await.unwrap_or_default();
+
+    per_thread
+        .into_iter()
+        .map(|(t, msgs)| export::ExportComment {
+            anchor: t.block_id.clone(),
+            resolved: matches!(t.status, ThreadStatus::Resolved),
+            messages: msgs
+                .into_iter()
+                .map(|m| export::ExportCommentMessage {
+                    author: users
+                        .get(&m.user_id)
+                        .map(|u| u.name.clone())
+                        .unwrap_or(m.user_id),
+                    body: m.content,
+                    timestamp: format_usec_utc(m.created_at),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// GET /documents/:id/export/:format -- export as html or markdown.
 async fn export_document(
     State(state): State<AppState>,
@@ -1787,9 +1851,17 @@ async fn export_document(
     match format.as_str() {
         "html" | "markdown" | "md" | "csv" => {
             counter::inc(MetricKey::new("doc.export_total", &[("format", format.as_str())]));
+            // Comments ride along on the prose formats (#59 T-6); CSV is
+            // tabular data, so appending a comment section would corrupt it.
             let (content_type, content) = match format.as_str() {
-                "html" => ("text/html; charset=utf-8", export::to_html(doc.inner())),
-                "markdown" | "md" => ("text/markdown; charset=utf-8", export::to_markdown(doc.inner())),
+                "html" => {
+                    let comments = load_export_comments(&state, &id).await;
+                    ("text/html; charset=utf-8", export::to_html_with_comments(doc.inner(), &comments))
+                }
+                "markdown" | "md" => {
+                    let comments = load_export_comments(&state, &id).await;
+                    ("text/markdown; charset=utf-8", export::to_markdown_with_comments(doc.inner(), &comments))
+                }
                 "csv" => ("text/csv; charset=utf-8", export::to_csv(doc.inner())),
                 _ => unreachable!(),
             };
@@ -1807,7 +1879,8 @@ async fn export_document(
         }
         "docx" => {
             counter::inc(MetricKey::new("doc.export_total", &[("format", "docx")]));
-            let bytes = export::to_docx(doc.inner());
+            let comments = load_export_comments(&state, &id).await;
+            let bytes = export::to_docx_with_comments(doc.inner(), &comments);
             let mut headers = HeaderMap::new();
             headers.insert("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document".parse().unwrap());
             headers.insert("Content-Disposition", "attachment; filename=\"export.docx\"".parse().unwrap());
@@ -1816,7 +1889,8 @@ async fn export_document(
         #[cfg(feature = "pdf")]
         "pdf" => {
             counter::inc(MetricKey::new("doc.export_total", &[("format", "pdf")]));
-            let bytes = export::to_pdf(doc.inner());
+            let comments = load_export_comments(&state, &id).await;
+            let bytes = export::to_pdf_with_comments(doc.inner(), &comments);
             let mut headers = HeaderMap::new();
             headers.insert("Content-Type", "application/pdf".parse().unwrap());
             headers.insert("Content-Disposition", "attachment; filename=\"export.pdf\"".parse().unwrap());
@@ -2827,9 +2901,11 @@ async fn try_export_one(
     let doc = load_current_doc_state(state, doc_id)
         .await
         .map_err(|e| BulkExportError::Internal(e.to_string()))?;
+    // Comment threads travel with each doc in the bulk archive too (#59 T-6).
+    let comments = load_export_comments(state, doc_id).await;
     let body = match format {
-        BulkFormat::Markdown => export::to_markdown(doc.inner()),
-        BulkFormat::Html => export::to_html(doc.inner()),
+        BulkFormat::Markdown => export::to_markdown_with_comments(doc.inner(), &comments),
+        BulkFormat::Html => export::to_html_with_comments(doc.inner(), &comments),
     };
     Ok((meta.title, body))
 }

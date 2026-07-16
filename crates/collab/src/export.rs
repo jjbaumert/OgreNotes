@@ -8,6 +8,112 @@ use yrs::{
 
 use crate::schema::NodeType;
 
+/// A comment thread flattened for export rendering (#59 T-6). The
+/// `collab` crate stays storage- and time-agnostic: the API layer resolves
+/// author display names and formats timestamps, mapping the stored
+/// `Thread` + its `Message`s into this shape. Only real document comments
+/// (inline + document-level) are exported; chat/DM threads are not
+/// document content and are not mapped here.
+#[derive(Debug, Clone)]
+pub struct ExportComment {
+    /// Block id an inline comment anchors to; `None` for a document-level
+    /// comment.
+    pub anchor: Option<String>,
+    pub resolved: bool,
+    pub messages: Vec<ExportCommentMessage>,
+}
+
+/// One message within an exported comment thread.
+#[derive(Debug, Clone)]
+pub struct ExportCommentMessage {
+    /// Resolved author display name (or the raw id when unresolved).
+    pub author: String,
+    pub body: String,
+    /// Pre-formatted, human-readable timestamp; empty to omit.
+    pub timestamp: String,
+}
+
+/// Heading label for one comment thread, e.g. "Comment on block b7
+/// (resolved)". Reused across every export format so the phrasing can't
+/// drift between them.
+fn comment_thread_heading(c: &ExportComment) -> String {
+    let anchor = match &c.anchor {
+        Some(block_id) => format!("Comment on block {block_id}"),
+        None => "Document comment".to_string(),
+    };
+    if c.resolved {
+        format!("{anchor} (resolved)")
+    } else {
+        anchor
+    }
+}
+
+/// One flattened message line, e.g. "Alice (2026-07-13 14:22 UTC): body".
+/// The plain-text form used by the DOCX and PDF renderers.
+fn comment_message_line(m: &ExportCommentMessage) -> String {
+    if m.timestamp.is_empty() {
+        format!("{}: {}", m.author, m.body)
+    } else {
+        format!("{} ({}): {}", m.author, m.timestamp, m.body)
+    }
+}
+
+/// Append an HTML `<section>` of comment threads. No-op when empty, so
+/// `to_html` and `to_html_with_comments(_, &[])` emit byte-identical
+/// output. All author/body/timestamp/anchor text is HTML-escaped.
+fn render_comments_html(comments: &[ExportComment], out: &mut String) {
+    if comments.is_empty() {
+        return;
+    }
+    out.push_str("<section class=\"comments\"><h2>Comments</h2>");
+    for c in comments {
+        out.push_str("<div class=\"comment-thread\">");
+        out.push_str(&format!(
+            "<h3 class=\"comment-anchor\">{}</h3>",
+            html_escape(&comment_thread_heading(c))
+        ));
+        for m in &c.messages {
+            out.push_str("<div class=\"comment-message\">");
+            out.push_str(&format!(
+                "<span class=\"comment-author\">{}</span>",
+                html_escape(&m.author)
+            ));
+            if !m.timestamp.is_empty() {
+                out.push_str(&format!(
+                    " <span class=\"comment-date\">{}</span>",
+                    html_escape(&m.timestamp)
+                ));
+            }
+            out.push_str(&format!("<p>{}</p>", html_escape(&m.body)));
+            out.push_str("</div>");
+        }
+        out.push_str("</div>");
+    }
+    out.push_str("</section>");
+}
+
+/// Append a Markdown "## Comments" section. No-op when empty.
+fn render_comments_markdown(comments: &[ExportComment], out: &mut String) {
+    if comments.is_empty() {
+        return;
+    }
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("\n## Comments\n");
+    for c in comments {
+        out.push_str(&format!("\n### {}\n\n", comment_thread_heading(c)));
+        for m in &c.messages {
+            let ts = if m.timestamp.is_empty() {
+                String::new()
+            } else {
+                format!(" _{}_", m.timestamp)
+            };
+            out.push_str(&format!("- **{}**{}: {}\n", m.author, ts, m.body));
+        }
+    }
+}
+
 /// Export a yrs document to HTML.
 /// Cap on export-recursion depth. yrs doesn't stop a malicious client
 /// from writing deeply nested elements, and unbounded recursive traversal
@@ -55,25 +161,37 @@ impl Drop for DepthGuard {
 }
 
 pub fn to_html(doc: &Doc) -> String {
-    let txn = doc.transact();
-    let Some(fragment) = txn.get_xml_fragment("content") else {
-        return String::new();
-    };
+    to_html_with_comments(doc, &[])
+}
 
+/// Export a yrs document to HTML with a trailing comments section (#59
+/// T-6). `to_html(doc)` is exactly this with no comments — the section is
+/// omitted entirely when `comments` is empty, so existing output is
+/// unchanged.
+pub fn to_html_with_comments(doc: &Doc, comments: &[ExportComment]) -> String {
+    let txn = doc.transact();
     let mut html = String::new();
-    render_fragment_html(&txn, &fragment, &mut html);
+    if let Some(fragment) = txn.get_xml_fragment("content") {
+        render_fragment_html(&txn, &fragment, &mut html);
+    }
+    render_comments_html(comments, &mut html);
     html
 }
 
 /// Export a yrs document to Markdown.
 pub fn to_markdown(doc: &Doc) -> String {
-    let txn = doc.transact();
-    let Some(fragment) = txn.get_xml_fragment("content") else {
-        return String::new();
-    };
+    to_markdown_with_comments(doc, &[])
+}
 
+/// Export a yrs document to Markdown with a trailing comments section
+/// (#59 T-6). Section omitted when `comments` is empty.
+pub fn to_markdown_with_comments(doc: &Doc, comments: &[ExportComment]) -> String {
+    let txn = doc.transact();
     let mut md = String::new();
-    render_fragment_markdown(&txn, &fragment, &mut md, 0);
+    if let Some(fragment) = txn.get_xml_fragment("content") {
+        render_fragment_markdown(&txn, &fragment, &mut md, 0);
+    }
+    render_comments_markdown(comments, &mut md);
     md
 }
 
@@ -303,17 +421,25 @@ pub fn to_xlsx(doc: &Doc) -> Vec<u8> {
 /// fails (same contract as `to_xlsx`).
 #[cfg(feature = "docx")]
 pub fn to_docx(doc: &Doc) -> Vec<u8> {
+    to_docx_with_comments(doc, &[])
+}
+
+/// Export a yrs document to DOCX with a trailing comments section (#59
+/// T-6). Section omitted when `comments` is empty, so `to_docx(doc)`
+/// produces the same bytes as before.
+#[cfg(feature = "docx")]
+pub fn to_docx_with_comments(doc: &Doc, comments: &[ExportComment]) -> Vec<u8> {
     use docx_rs::{Docx, Paragraph, Run};
 
     let txn = doc.transact();
-    let Some(fragment) = txn.get_xml_fragment("content") else {
-        return Vec::new();
-    };
+    // An empty content fragment is still a valid export target when there
+    // are comments to render, so don't early-return on a missing fragment.
+    let fragment = txn.get_xml_fragment("content");
 
     let mut docx = Docx::new();
-    let len = fragment.len(&txn);
+    let len = fragment.as_ref().map(|f| f.len(&txn)).unwrap_or(0);
     for i in 0..len {
-        let Some(XmlOut::Element(el)) = fragment.get(&txn, i) else {
+        let Some(XmlOut::Element(el)) = fragment.as_ref().and_then(|f| f.get(&txn, i)) else {
             continue;
         };
         let tag = el.tag();
@@ -343,6 +469,28 @@ pub fn to_docx(doc: &Doc) -> Vec<u8> {
             _ => {
                 let text = extract_text(&txn, &el);
                 docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text(text)));
+            }
+        }
+    }
+
+    // Comments section (#59 T-6): a Heading1 "Comments", then per thread a
+    // Heading2 anchor line and one paragraph per message.
+    if !comments.is_empty() {
+        docx = docx.add_paragraph(
+            Paragraph::new()
+                .style("Heading1")
+                .add_run(Run::new().add_text("Comments")),
+        );
+        for c in comments {
+            docx = docx.add_paragraph(
+                Paragraph::new()
+                    .style("Heading2")
+                    .add_run(Run::new().add_text(comment_thread_heading(c))),
+            );
+            for m in &c.messages {
+                docx = docx.add_paragraph(
+                    Paragraph::new().add_run(Run::new().add_text(comment_message_line(m))),
+                );
             }
         }
     }
@@ -418,6 +566,15 @@ fn build_docx_table<T: ReadTxn>(txn: &T, table_el: &yrs::XmlElementRef) -> docx_
 /// for the ops we emit.
 #[cfg(feature = "pdf")]
 pub fn to_pdf(doc: &Doc) -> Vec<u8> {
+    to_pdf_with_comments(doc, &[])
+}
+
+/// Export a yrs document to PDF with a trailing comments section (#59
+/// T-6). The comments flow as additional wrapped text lines after the
+/// body; section omitted when `comments` is empty, so `to_pdf(doc)` is
+/// unchanged.
+#[cfg(feature = "pdf")]
+pub fn to_pdf_with_comments(doc: &Doc, comments: &[ExportComment]) -> Vec<u8> {
     use printpdf::{
         BuiltinFont, Mm, Op, PdfDocument, PdfFontHandle, PdfPage, PdfSaveOptions, PdfWarnMsg,
         Point, Pt, TextItem,
@@ -444,6 +601,23 @@ pub fn to_pdf(doc: &Doc) -> Vec<u8> {
         }
         lines.extend(wrap_text(para, WRAP_CHARS));
     }
+
+    // Comments section (#59 T-6): a "Comments" header, then per thread its
+    // anchor heading and one wrapped line per message.
+    if !comments.is_empty() {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("Comments".to_string());
+        for c in comments {
+            lines.push(String::new());
+            lines.extend(wrap_text(&comment_thread_heading(c), WRAP_CHARS));
+            for m in &c.messages {
+                lines.extend(wrap_text(&comment_message_line(m), WRAP_CHARS));
+            }
+        }
+    }
+
     if lines.is_empty() {
         lines.push(String::new());
     }
@@ -2647,5 +2821,118 @@ mod tests {
         let md = to_markdown_of_single_mermaid("pie\n\"A\" : 1");
         assert!(md.contains("```mermaid"));
         assert!(md.contains("\"A\" : 1"));
+    }
+
+    // ── Comment export (#59 T-6) ───────────────────────────────────
+
+    fn sample_comments() -> Vec<ExportComment> {
+        vec![
+            ExportComment {
+                anchor: Some("blk7".to_string()),
+                resolved: false,
+                messages: vec![
+                    ExportCommentMessage {
+                        author: "Alice".to_string(),
+                        body: "Needs a citation here.".to_string(),
+                        timestamp: "2026-07-13 14:22 UTC".to_string(),
+                    },
+                    ExportCommentMessage {
+                        author: "Bob".to_string(),
+                        body: "Added one.".to_string(),
+                        timestamp: "2026-07-13 15:01 UTC".to_string(),
+                    },
+                ],
+            },
+            ExportComment {
+                anchor: None,
+                resolved: true,
+                messages: vec![ExportCommentMessage {
+                    author: "Carol".to_string(),
+                    body: "Overall looks good.".to_string(),
+                    timestamp: String::new(),
+                }],
+            },
+        ]
+    }
+
+    fn one_para_doc() -> Doc {
+        doc_with(|txn, frag| {
+            let para = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &para, "Body text");
+        })
+    }
+
+    #[test]
+    fn no_comments_output_is_identical_to_plain_export() {
+        // Non-breaking guarantee: the empty-comments variant must equal
+        // the original function byte for byte.
+        let doc = one_para_doc();
+        assert_eq!(to_html_with_comments(&doc, &[]), to_html(&doc));
+        assert_eq!(to_markdown_with_comments(&doc, &[]), to_markdown(&doc));
+    }
+
+    #[test]
+    fn html_export_renders_comment_section() {
+        let doc = one_para_doc();
+        let html = to_html_with_comments(&doc, &sample_comments());
+        assert!(html.contains("Body text"), "document body still present: {html}");
+        assert!(html.contains("<h2>Comments</h2>"), "comments section: {html}");
+        assert!(html.contains("Comment on block blk7"), "inline anchor: {html}");
+        assert!(html.contains("Document comment (resolved)"), "doc-level + resolved: {html}");
+        assert!(html.contains("Alice") && html.contains("Needs a citation here."));
+        assert!(html.contains("2026-07-13 14:22 UTC"), "timestamp rendered: {html}");
+    }
+
+    #[test]
+    fn html_export_escapes_comment_content() {
+        let doc = one_para_doc();
+        let comments = vec![ExportComment {
+            anchor: None,
+            resolved: false,
+            messages: vec![ExportCommentMessage {
+                author: "<b>evil</b>".to_string(),
+                body: "<script>alert(1)</script>".to_string(),
+                timestamp: String::new(),
+            }],
+        }];
+        let html = to_html_with_comments(&doc, &comments);
+        assert!(!html.contains("<script>alert(1)</script>"), "must escape body: {html}");
+        assert!(html.contains("&lt;script&gt;"), "escaped body present: {html}");
+        assert!(!html.contains("<b>evil</b>"), "must escape author: {html}");
+    }
+
+    #[test]
+    fn markdown_export_renders_comment_section() {
+        let doc = one_para_doc();
+        let md = to_markdown_with_comments(&doc, &sample_comments());
+        assert!(md.contains("## Comments"), "section header: {md}");
+        assert!(md.contains("### Comment on block blk7"), "inline anchor heading: {md}");
+        assert!(md.contains("### Document comment (resolved)"), "doc-level heading: {md}");
+        assert!(md.contains("- **Alice** _2026-07-13 14:22 UTC_: Needs a citation here."), "got: {md}");
+        // A message with no timestamp omits the italic date.
+        assert!(md.contains("- **Carol**: Overall looks good."), "got: {md}");
+    }
+
+    #[cfg(feature = "docx")]
+    #[test]
+    fn docx_export_with_comments_is_valid_and_nonempty() {
+        let doc = one_para_doc();
+        let with = to_docx_with_comments(&doc, &sample_comments());
+        let without = to_docx(&doc);
+        assert!(!with.is_empty(), "docx bytes produced");
+        // A .docx is a ZIP — must start with the PK signature.
+        assert_eq!(&with[..2], b"PK", "valid zip container");
+        // Comments materially change the document, so the bytes differ.
+        assert_ne!(with, without, "comment paragraphs must change the docx");
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn pdf_export_with_comments_is_valid_and_nonempty() {
+        let doc = one_para_doc();
+        let with = to_pdf_with_comments(&doc, &sample_comments());
+        assert!(!with.is_empty(), "pdf bytes produced");
+        assert_eq!(&with[..5], b"%PDF-", "valid PDF header");
+        assert_ne!(with, to_pdf(&doc), "comment lines must change the pdf");
     }
 }
