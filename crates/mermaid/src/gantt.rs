@@ -63,10 +63,11 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// A compact `MM-DD` axis label for a day number.
+/// A full `YYYY-MM-DD` axis label for a day number (Mermaid's default
+/// `axisFormat`).
 fn fmt_axis_date(day: f64) -> String {
-    let (_, m, d) = civil_from_days(day.round() as i64);
-    format!("{m:02}-{d:02}")
+    let (y, m, d) = civil_from_days(day.round() as i64);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// `YYYY-MM-DD` -> day number, or `None` if it isn't a valid such date.
@@ -260,7 +261,7 @@ pub(crate) fn parse(source: &str) -> Result<Gantt, ParseError> {
     Ok(Gantt { title, sections, tasks })
 }
 
-const LEFT: f64 = 160.0;
+const LEFT: f64 = 80.0; // left margin: section labels only (task names are in-bar)
 const CHART_W: f64 = 620.0;
 const ROW_H: f64 = 28.0;
 const BAR_H: f64 = 18.0;
@@ -284,11 +285,11 @@ pub(crate) fn render_svg(g: &Gantt) -> String {
     let x_of = |day: f64| LEFT + (day - min) * px;
 
     let n = g.tasks.len();
-    // Row grid sits below a date-axis header strip.
-    let top = TOP + AXIS_H;
+    // Rows start below the title; the date axis sits BELOW the chart (Mermaid).
+    let top = TOP;
     let chart_bottom = top + n as f64 * ROW_H;
     let w = LEFT + CHART_W + 24.0;
-    let h = chart_bottom + 16.0;
+    let h = chart_bottom + AXIS_H + 12.0;
     let mut svg = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:12px">"#
     );
@@ -301,25 +302,8 @@ pub(crate) fn render_svg(g: &Gantt) -> String {
         ));
     }
 
-    // Date axis: ~6 evenly spaced day ticks, each a light gridline through the
-    // rows with a compact date label above the grid.
-    let step = (span / 6.0).ceil().max(1.0);
-    let mut day = min;
-    while day <= max + 0.5 {
-        let tx = x_of(day);
-        svg.push_str(&format!(
-            r#"<line x1="{tx:.1}" y1="{top:.1}" x2="{tx:.1}" y2="{chart_bottom:.1}" stroke="currentColor" opacity="0.15"/>"#
-        ));
-        svg.push_str(&format!(
-            r#"<text x="{tx:.1}" y="{:.1}" text-anchor="middle" fill="currentColor" style="font-size:11px" opacity="0.75">{}</text>"#,
-            top - 6.0,
-            fmt_axis_date(day),
-        ));
-        day += step;
-    }
-
-    // Section background bands (alternating) + section name at the band's
-    // top-left. A band spans the contiguous run of rows in one section.
+    // Section background bands: Mermaid tints the FIRST section and alternates
+    // (sectionBkgColor / white). A band spans the contiguous run of one section.
     let mut row = 0usize;
     while row < n {
         let sec = g.tasks[row].section;
@@ -329,18 +313,17 @@ pub(crate) fn render_svg(g: &Gantt) -> String {
         }
         let band_y = top + row as f64 * ROW_H;
         let band_h = (end_row - row + 1) as f64 * ROW_H;
-        if sec % 2 == 1 {
+        if sec.is_multiple_of(2) {
             svg.push_str(&format!(
-                r#"<rect x="0" y="{band_y:.1}" width="{w:.0}" height="{band_h:.1}" fill="var(--mermaid-gantt-band, #00000010)"/>"#
+                r#"<rect x="0" y="{band_y:.1}" width="{w:.0}" height="{band_h:.1}" fill="var(--mermaid-gantt-section, rgba(102,102,255,0.14))"/>"#
             ));
         }
         if let Some(name) = g.sections.get(sec) {
             if !name.is_empty() {
-                // Rotated into a thin far-left strip so it never collides
-                // with the (right-aligned) task names in the gutter.
                 let scy = band_y + band_h / 2.0;
                 svg.push_str(&format!(
-                    r#"<text x="12" y="{scy:.1}" text-anchor="middle" transform="rotate(-90 12 {scy:.1})" fill="currentColor" font-weight="600">{}</text>"#,
+                    r#"<text x="8" y="{:.1}" fill="currentColor" font-weight="600">{}</text>"#,
+                    scy + 4.0,
                     escape_xml(name),
                 ));
             }
@@ -348,13 +331,29 @@ pub(crate) fn render_svg(g: &Gantt) -> String {
         row = end_row + 1;
     }
 
-    // Task rows: bar (or milestone diamond) + right-aligned name in the gutter.
+    // Weekly date-axis gridlines through the chart, dates labeled BELOW it.
+    let step = 7.0; // weekly ticks, Mermaid's default cadence
+    let mut day = min;
+    while day <= max + 0.5 {
+        let tx = x_of(day);
+        svg.push_str(&format!(
+            r#"<line x1="{tx:.1}" y1="{top:.1}" x2="{tx:.1}" y2="{chart_bottom:.1}" stroke="currentColor" opacity="0.15"/>"#
+        ));
+        svg.push_str(&format!(
+            r#"<text x="{tx:.1}" y="{:.1}" text-anchor="middle" fill="currentColor" style="font-size:11px" opacity="0.75">{}</text>"#,
+            chart_bottom + 14.0,
+            fmt_axis_date(day),
+        ));
+        day += step;
+    }
+
+    // Task rows: bar (or milestone diamond) with the task name centered on it.
     for (i, t) in g.tasks.iter().enumerate() {
         let y = top + i as f64 * ROW_H;
         let cy = y + ROW_H / 2.0;
         let bx = x_of(t.start);
         let fill = status_fill(t.status);
-        if t.milestone {
+        let name_x = if t.milestone {
             let r = BAR_H / 2.0;
             svg.push_str(&format!(
                 r#"<path d="M {bx:.1} {:.1} L {:.1} {cy:.1} L {bx:.1} {:.1} L {:.1} {cy:.1} Z" fill="{fill}" stroke="currentColor"/>"#,
@@ -363,16 +362,18 @@ pub(crate) fn render_svg(g: &Gantt) -> String {
                 cy + r,
                 bx - r,
             ));
+            bx
         } else {
             let bw = ((t.end - t.start) * px).max(2.0);
             svg.push_str(&format!(
                 r#"<rect x="{bx:.1}" y="{:.1}" width="{bw:.1}" height="{BAR_H}" rx="3" fill="{fill}" stroke="currentColor" stroke-width="0.5"/>"#,
                 y + (ROW_H - BAR_H) / 2.0,
             ));
-        }
+            bx + bw / 2.0
+        };
+        // Name centered on the bar (Mermaid places the label inside the task).
         svg.push_str(&format!(
-            r#"<text x="{:.1}" y="{:.1}" text-anchor="end" fill="currentColor">{}</text>"#,
-            LEFT - 8.0,
+            r#"<text x="{name_x:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
             cy + 4.0,
             escape_xml(&t.name),
         ));
@@ -405,10 +406,10 @@ mod tests {
         let svg = render_svg(&p(
             "gantt\ndateFormat YYYY-MM-DD\nsection S\nA task :a1, 2024-01-01, 30d\nB task :after a1, 20d",
         ));
-        // The span start is labeled and a vertical gridline is drawn for it.
-        assert!(svg.contains(">01-01<"), "axis start date label: {svg}");
+        // The span start is labeled (full YYYY-MM-DD) with a vertical gridline.
+        assert!(svg.contains(">2024-01-01<"), "axis start date label: {svg}");
         assert!(svg.contains("<line"), "axis gridlines drawn: {svg}");
-        assert_eq!(fmt_axis_date(days_from_civil(2024, 2, 15) as f64), "02-15");
+        assert_eq!(fmt_axis_date(days_from_civil(2024, 2, 15) as f64), "2024-02-15");
     }
 
     #[test]
