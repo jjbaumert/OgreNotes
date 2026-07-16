@@ -71,11 +71,17 @@ Three pieces:
    — dual-mode UI. The leading-`>` prefix toggles to Action
    mode. Enter runs the first match (Action) or navigates to
    the first result (Search). Escape closes.
-3. **Editor bridge** (`frontend/src/commands/editor_bridge.rs`)
-   — thread-local `Option<Callback<ToolbarCommand>>` that the
-   document page installs on mount. Lets a non-editor context
-   (the palette) dispatch editor commands without holding a
-   reference to the editor.
+3. **Boot-time bridges** — thread-local callback slots that a
+   page/shell installs on mount, so the palette (which registers its
+   commands before the Router or the editor/dialog context exists) can
+   dispatch without holding a reference to them:
+   - **Editor bridge** (`frontend/src/commands/editor_bridge.rs`) —
+     `dispatch_editor(ToolbarCommand)`; installed by the document page.
+   - **Nav bridge** (`frontend/src/commands/nav_bridge.rs`) — `go("/…")`
+     for client-side navigation without a full reload; used by the Global
+     `navigation.*` and `help.about-palette` commands.
+   - **Ask bridge** (`frontend/src/commands/ask_bridge.rs`) — `open()`,
+     backing the Global `ask.open` command.
 
 ## Data types
 
@@ -167,7 +173,7 @@ thread_local! {
 }
 
 pub fn install(cb: Callback<ToolbarCommand>) { ... }
-pub fn dispatch(cmd: ToolbarCommand) { ... }
+pub fn dispatch_editor(cmd: ToolbarCommand) { ... }
 pub fn clear() { ... }
 ```
 
@@ -178,9 +184,9 @@ Editor commands like `editor.bold` look like:
 register(PaletteCommand {
     id: "editor.bold",
     scope: CommandScope::Editor,
-    label_key: "palette-cmd-bold",
+    label_key: "cmd-bold",
     shortcut: Some("Ctrl+B"),
-    action: Box::new(|| editor_bridge::dispatch(ToolbarCommand::ToggleBold)),
+    action: Box::new(|| editor_bridge::dispatch_editor(ToolbarCommand::ToggleBold)),
 });
 ```
 
@@ -206,76 +212,50 @@ The Enter handler in `search_dialog.rs` (added in piece D)
 runs `commands::run(first.id)` for Action mode and falls back
 to navigation for Search.
 
-## Command set (v1, ~40 entries)
+## Command set
 
-Registered by `commands::register_defaults()`. Labels are
-Fluent keys (`palette-cmd-*`); the table shows the en-US value.
+Registered by `commands::register_defaults()` in
+`frontend/src/commands/mod.rs` — that function is the source of truth.
+The set is **registry-driven**: labels are Fluent keys under the `cmd-*`
+namespace (not `palette-cmd-*`), and the Editor scope grows automatically
+— one entry is registered per live-app block in
+`editor::blocks::BLOCK_INSERTS`, so a new block appears in ⌘K with no
+palette change. Only the `Global` and `Editor` scopes currently have
+registered commands; the `Spreadsheet` and `Home` `CommandScope` variants
+exist and are honored by the scope filter but have **no commands
+registered against them yet** (the sheet/home entries below are a
+still-unbuilt aspiration, not shipped).
 
 ### Global (always visible)
 
-| id | Label | Shortcut |
-|---|---|---|
-| `global.go-home` | Go to home | — |
-| `global.new-document` | New document | — |
-| `global.new-spreadsheet` | New spreadsheet | — |
-| `global.new-folder` | New folder | — |
-| `global.search` | Search documents | Ctrl+K |
-| `global.toggle-theme` | Toggle dark mode | — |
-| `global.shortcut-help` | Show keyboard shortcuts | ? |
+| id | label_key |
+|---|---|
+| `navigation.home` | `cmd-go-home` |
+| `navigation.trash` | `cmd-open-trash` |
+| `theme.toggle-dark` | `cmd-toggle-dark-mode` |
+| `ask.open` | `cmd-ask` |
+| `auth.sign-out` | `cmd-sign-out` |
+| `help.about-palette` | `cmd-about-palette` |
+
+The nav and Ask commands dispatch through client-side bridges
+(`nav_bridge::go`, `ask_bridge::open`) so they navigate / open dialogs
+without a full page reload; see the Architecture section.
 
 ### Editor (rich-text document)
 
-| id | Label | Shortcut |
-|---|---|---|
-| `editor.bold` | Bold | Ctrl+B |
-| `editor.italic` | Italic | Ctrl+I |
-| `editor.underline` | Underline | Ctrl+U |
-| `editor.strike` | Strikethrough | — |
-| `editor.heading-1` | Heading 1 | Ctrl+Alt+1 |
-| `editor.heading-2` | Heading 2 | Ctrl+Alt+2 |
-| `editor.heading-3` | Heading 3 | Ctrl+Alt+3 |
-| `editor.bullet-list` | Bulleted list | Ctrl+Shift+L |
-| `editor.numbered-list` | Numbered list | — |
-| `editor.task-list` | Checklist | — |
-| `editor.code-block` | Code block | — |
-| `editor.blockquote` | Blockquote | — |
-| `editor.insert-link` | Insert link | Ctrl+K (when text selected) |
-| `editor.insert-image` | Insert image | — |
-| `editor.insert-embed` | Insert embed | — |
-| `editor.insert-table` | Insert table | — |
-| `editor.undo` | Undo | Ctrl+Z |
-| `editor.redo` | Redo | Ctrl+Y / Ctrl+Shift+Z |
-| `editor.share` | Share document | — |
-| `editor.export-html` | Export as HTML | — |
-| `editor.export-markdown` | Export as Markdown | — |
-| `editor.outline-toggle` | Toggle outline | Ctrl+Shift+O |
-| `editor.history-open` | View history | — |
+Static entries: `editor.bold` (Ctrl+B), `editor.italic` (Ctrl+I),
+`editor.underline` (Ctrl+U), `editor.strike`, `editor.code`,
+`editor.heading-1/-2/-3`, `editor.paragraph`, `editor.bullet-list`,
+`editor.ordered-list`, `editor.task-list`, `editor.blockquote`,
+`editor.code-block`, `editor.divider`, `editor.insert-table`,
+`editor.undo` (Ctrl+Z), `editor.redo` (Ctrl+Y). Plus one dynamic entry
+per `BLOCK_INSERTS` block (`editor.calendar`, `editor.kanban`,
+`editor.mermaid` at time of writing).
 
-### Spreadsheet (sheet-typed document)
-
-| id | Label | Shortcut |
-|---|---|---|
-| `sheet.format-currency` | Format as currency | — |
-| `sheet.format-percent` | Format as percent | — |
-| `sheet.format-date` | Format as date | — |
-| `sheet.format-clear` | Clear formatting | — |
-| `sheet.freeze-rows` | Freeze rows | — |
-| `sheet.freeze-columns` | Freeze columns | — |
-| `sheet.insert-chart` | Insert chart | — |
-| `sheet.insert-pivot` | Insert pivot table | — |
-
-### Home (file browser)
-
-| id | Label | Shortcut |
-|---|---|---|
-| `home.bulk-export` | Bulk export selected | — |
-| `home.empty-trash` | Empty trash | — |
-
-Counts: 7 Global + 23 Editor + 8 Spreadsheet + 2 Home = **40 v1
-commands**. The shortcut column is informational — the actual
-key handler lives in the relevant component (editor's
-`KeyboardEvent` listener, etc.); the palette doesn't intercept
-keystrokes other than Ctrl-K / Ctrl-Shift-P.
+All Editor commands dispatch through `editor_bridge::dispatch_editor`. The
+shortcut annotations are informational — the actual key handler lives in
+the relevant component (the editor's `KeyboardEvent` listener, etc.); the
+palette doesn't intercept keystrokes other than Ctrl-K / Ctrl-Shift-P.
 
 ## i18n
 
@@ -312,15 +292,15 @@ To add a new command:
 
 1. Pick an `id` in the `<area>.<verb>` namespace.
 2. Add the label key to `frontend/locales/en-US/main.ftl` under
-   the `palette-cmd-*` section. Add Arabic too if the label is
+   the `cmd-*` section. Add the other locales too if the label is
    short.
 3. In `commands::register_defaults()`, push the
    `PaletteCommand` with the right `CommandScope`.
 4. If the action needs to reach into the editor, route through
-   `editor_bridge::dispatch(...)`.
-5. If it's a navigation, use
-   `window().location().set_href("/...")` inside the action
-   closure.
+   `editor_bridge::dispatch_editor(...)`.
+5. If it's a navigation, use `nav_bridge::go("/...")` inside the
+   action closure — client-side navigation with no full reload
+   (not `window().location().set_href`).
 6. Run `cargo check -p ogrenotes-frontend`; no extra wiring.
 
 ## v2 carry-forwards
