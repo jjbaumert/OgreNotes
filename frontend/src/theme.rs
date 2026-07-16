@@ -63,6 +63,25 @@ pub enum ExplicitTheme {
 const THEME_KEY: &str = "ogrenotes.theme";
 const DYSLEXIC_KEY: &str = "ogrenotes.dyslexic_font";
 const REDUCE_MOTION_KEY: &str = "ogrenotes.reduce_motion";
+const DOC_THEME_KEY: &str = "ogrenotes.doc_theme";
+
+/// The document typography themes (#59 T-12, branding.md §Typography).
+/// `"default"` is Inter (the `:root` values in variables.css) and carries
+/// no `data-doc-theme` attribute; the others each map to a
+/// `[data-doc-theme="<id>"]` block that re-points `--font-doc-*`. Order is
+/// the selector's display order.
+pub const DOC_THEMES: &[&str] = &["default", "editorial", "handwritten", "technical", "classic"];
+
+/// Canonicalize a stored/selected doc-theme id: a known non-default id
+/// stays as-is; `"default"`, unknown, or empty collapses to `None` (=
+/// Inter, no attribute). Keeps a stale/garbage stored value from painting
+/// a phantom attribute.
+pub fn normalize_doc_theme(s: &str) -> Option<&'static str> {
+    DOC_THEMES
+        .iter()
+        .copied()
+        .find(|&t| t == s && t != "default")
+}
 
 fn local_storage() -> Option<web_sys::Storage> {
     web_sys::window().and_then(|w| w.local_storage().ok().flatten())
@@ -104,6 +123,8 @@ pub fn apply_cached_prefs() -> bool {
         .flatten()
         .map(|v| v == "true");
     apply_a11y_prefs(dyslexic, reduce_motion);
+    // Document typography theme — independent of the color-scheme branch.
+    apply_doc_theme(ls.get_item(DOC_THEME_KEY).ok().flatten().as_deref());
 
     let cached_theme = ls.get_item(THEME_KEY).ok().flatten();
     match cached_theme.as_deref().and_then(pref_from_str) {
@@ -244,6 +265,60 @@ pub fn apply_a11y_prefs(dyslexic_font: Option<bool>, reduce_motion: Option<bool>
     }
 }
 
+/// Apply the document typography theme (#59 T-12) to `<html>` as
+/// `data-doc-theme="<id>"`, the attribute the `[data-doc-theme=…]` blocks
+/// in variables.css key off. A known non-default id sets the attribute; a
+/// `None`/`"default"`/unknown value removes it, falling back to the
+/// `:root` Inter defaults. Pure DOM; persistence is `change_doc_theme`'s
+/// job (mirrors `apply_a11y_prefs` vs the settings writers).
+pub fn apply_doc_theme(theme: Option<&str>) {
+    let Some(root) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+    else {
+        return;
+    };
+    match theme.and_then(normalize_doc_theme) {
+        Some(id) => {
+            let _ = root.set_attribute("data-doc-theme", id);
+        }
+        None => {
+            let _ = root.remove_attribute("data-doc-theme");
+        }
+    }
+}
+
+/// Cache the document theme in localStorage so the next load can paint it
+/// pre-mount (mirrors `cache_prefs`). Best-effort; a `None` leaves the
+/// stored value untouched, matching the other cache writers.
+pub fn cache_doc_theme(theme: Option<&str>) {
+    if let (Some(ls), Some(t)) = (local_storage(), theme) {
+        let _ = ls.set_item(DOC_THEME_KEY, t);
+    }
+}
+
+/// Apply the localStorage-cached document theme to `<html>` pre-mount.
+/// Called from `apply_cached_prefs`; separate so the boot path can invoke
+/// it independently.
+pub fn apply_cached_doc_theme() {
+    if let Some(ls) = local_storage() {
+        let cached = ls.get_item(DOC_THEME_KEY).ok().flatten();
+        apply_doc_theme(cached.as_deref());
+    }
+}
+
+/// Apply + cache + persist a document typography theme selection. Like
+/// `change_theme`: the DOM flips immediately, the cache is written for the
+/// next pre-mount paint, and the PUT persists across sessions; a server
+/// error leaves the local change in place. Pass `"default"` (or `None`) to
+/// clear back to Inter.
+pub async fn change_doc_theme(theme: Option<&str>) -> Result<(), ApiClientError> {
+    let wire = theme.and_then(normalize_doc_theme).unwrap_or("default");
+    apply_doc_theme(Some(wire));
+    cache_doc_theme(Some(wire));
+    client::api_put("/users/me/prefs", &serde_json::json!({ "docTheme": wire })).await
+}
+
 /// Set `name="true"` when `on`, otherwise remove the attribute
 /// entirely (so the CSS `[name="true"]` selectors match only the
 /// enabled state and there's no lingering `="false"` to reason about).
@@ -263,6 +338,37 @@ fn apply_theme_for_media(media: &web_sys::MediaQueryList) {
     if let Some(document) = web_sys::window().and_then(|w| w.document()) {
         if let Some(root) = document.document_element() {
             let _ = root.set_attribute("data-theme", theme);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_doc_theme_maps_known_and_rejects_the_rest() {
+        // Known non-default ids pass through unchanged.
+        assert_eq!(normalize_doc_theme("editorial"), Some("editorial"));
+        assert_eq!(normalize_doc_theme("handwritten"), Some("handwritten"));
+        assert_eq!(normalize_doc_theme("technical"), Some("technical"));
+        assert_eq!(normalize_doc_theme("classic"), Some("classic"));
+        // "default" is Inter (no attribute) — collapses to None.
+        assert_eq!(normalize_doc_theme("default"), None);
+        // Unknown / stale / empty values collapse to None, never a
+        // phantom attribute.
+        assert_eq!(normalize_doc_theme("Editorial"), None); // case-sensitive
+        assert_eq!(normalize_doc_theme("bogus"), None);
+        assert_eq!(normalize_doc_theme(""), None);
+    }
+
+    #[test]
+    fn doc_themes_catalog_shape() {
+        // "default" must be first (the selector's default option) and the
+        // catalog must contain each themed id exactly once.
+        assert_eq!(DOC_THEMES.first(), Some(&"default"));
+        for id in ["editorial", "handwritten", "technical", "classic"] {
+            assert_eq!(DOC_THEMES.iter().filter(|&&t| t == id).count(), 1, "{id}");
         }
     }
 }

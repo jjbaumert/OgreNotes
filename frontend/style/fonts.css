@@ -42,3 +42,104 @@
   font-display: swap;
   src: url("/fonts/OpenDyslexicMono-Regular.woff2") format("woff2");
 }
+
+/* Document typography themes (#59 T-12, branding.md §Typography). Each
+ * family is self-hosted (SIL-OFL 1.1, static/fonts/OFL.txt) so the named
+ * themes render as designed instead of silently falling back to a system
+ * face. Only the family for the user's selected [data-doc-theme] is
+ * fetched — `font-display: swap` and the fact that the vars are only
+ * referenced by document surfaces mean the default (Inter) theme pays
+ * zero font bytes. Latin subset, Regular + Bold. */
+
+/* Editorial — Playfair Display headings / Source Serif 4 body */
+@font-face {
+  font-family: "Playfair Display";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/playfair-display-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Playfair Display";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/playfair-display-700.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Source Serif 4";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/source-serif-4-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Source Serif 4";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/source-serif-4-700.woff2") format("woff2");
+}
+
+/* Handwritten — Caveat headings / Nunito body */
+@font-face {
+  font-family: "Caveat";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/caveat-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Caveat";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/caveat-700.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Nunito";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/nunito-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Nunito";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/nunito-700.woff2") format("woff2");
+}
+
+/* Classic — Merriweather headings + body */
+@font-face {
+  font-family: "Merriweather";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/merriweather-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Merriweather";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/merriweather-700.woff2") format("woff2");
+}
+
+/* Technical — JetBrains Mono headings + body (also the app's --font-mono,
+ * previously referenced by name only; now self-hosted). */
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/jetbrains-mono-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/jetbrains-mono-700.woff2") format("woff2");
+}

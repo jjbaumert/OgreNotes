@@ -139,6 +139,12 @@ fn apply_boot_prefs(prefs: Option<&api::client::UiPrefsDto>) {
         theme::apply_explicit_theme(theme::pref_from_str(theme_str));
     }
     theme::apply_a11y_prefs(prefs.dyslexic_font, prefs.reduce_motion);
+    // Document typography theme (#59 T-12): cache for next pre-mount paint
+    // and apply now. Absent ⇒ leaves the Inter default.
+    if let Some(dt) = prefs.doc_theme.as_deref() {
+        theme::cache_doc_theme(Some(dt));
+        theme::apply_doc_theme(Some(dt));
+    }
 }
 
 /// Install the WASM panic hook. In debug builds (`cfg(debug_assertions)`)
