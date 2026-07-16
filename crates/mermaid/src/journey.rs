@@ -11,11 +11,25 @@ use crate::{escape_xml, ParseError};
 
 const PAD: f64 = 20.0;
 const COL_W: f64 = 120.0;
-const SECTION_H: f64 = 28.0;
-const PLOT_H: f64 = 200.0;
+const SECTION_H: f64 = 26.0;
+const BOX_H: f64 = 26.0; // task box height
+const AXIS_GAP: f64 = 22.0;
+const FACE_PLOT_H: f64 = 150.0; // vertical span of the score-positioned faces
+const LEFT_MARGIN: f64 = 72.0; // left gutter for the actor legend
 const DOT_R: f64 = 13.0;
 const MAX_TASKS: usize = 400;
 const MAX_SCORE: f64 = 5.0;
+/// Per-section pastel palette (Mermaid tints each section and its task boxes).
+const SECTION_COLORS: &[&str] =
+    &["#8a8ae0", "#e8e85a", "#a8e05a", "#c99be0", "#5ad1e0", "#e0a85a", "#5ae0a8", "#e05ad1"];
+const DASH_COLOR: &str = "#bbbbbb";
+
+fn section_color(sec: Option<usize>) -> &'static str {
+    match sec {
+        Some(s) => SECTION_COLORS[s % SECTION_COLORS.len()],
+        None => "#cccccc",
+    }
+}
 
 /// Per-actor colors, cycled (Mermaid colors journey points by actor).
 const PALETTE: &[&str] =
@@ -135,7 +149,7 @@ fn err(message: impl Into<String>, line: usize) -> ParseError {
 
 pub(crate) fn render_svg(j: &Journey) -> String {
     let n = j.tasks.len();
-    let total_w = (2.0 * PAD + n.max(1) as f64 * COL_W).max(2.0 * PAD + COL_W);
+    let total_w = PAD + LEFT_MARGIN + n.max(1) as f64 * COL_W + PAD;
     // Unique actors in first-seen order, each mapped to a palette color.
     let mut actors: Vec<String> = Vec::new();
     for t in &j.tasks {
@@ -148,9 +162,8 @@ pub(crate) fn render_svg(j: &Journey) -> String {
     let actor_color = |name: &str| -> &'static str {
         actors.iter().position(|a| a == name).map(|i| PALETTE[i % PALETTE.len()]).unwrap_or("#888")
     };
-    let center = |i: usize| PAD + i as f64 * COL_W + COL_W / 2.0;
-    // score → y (5 at top of the plot, 0 at the bottom).
-    let plot_top_ref = |plot_top: f64, score: u8| plot_top + (1.0 - score as f64 / MAX_SCORE) * PLOT_H;
+    let lefts = |i: usize| PAD + LEFT_MARGIN + i as f64 * COL_W;
+    let center = |i: usize| lefts(i) + COL_W / 2.0;
 
     let mut y = PAD;
     let mut body = String::new();
@@ -166,95 +179,105 @@ pub(crate) fn render_svg(j: &Journey) -> String {
         y += 14.0;
     }
 
-    // Section bands spanning contiguous same-section tasks.
-    if !j.sections.is_empty() {
-        let band_top = y;
-        let mut i = 0;
-        while i < n {
-            let sec = j.tasks[i].section;
-            let mut k = i;
-            while k + 1 < n && j.tasks[k + 1].section == sec {
-                k += 1;
-            }
-            if let Some(si) = sec {
-                let left = PAD + i as f64 * COL_W;
-                let right = PAD + (k + 1) as f64 * COL_W;
-                body.push_str(&format!(
-                    r#"<rect x="{left:.1}" y="{band_top:.1}" width="{:.1}" height="{SECTION_H:.1}" fill="var(--mermaid-cluster-fill, #7773)" rx="4"/>"#,
-                    right - left
-                ));
-                body.push_str(&format!(
-                    r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" font-weight="600" fill="currentColor">{}</text>"#,
-                    (left + right) / 2.0,
-                    band_top + SECTION_H / 2.0 + 5.0,
-                    escape_xml(&j.sections[si])
-                ));
-            }
-            i = k + 1;
+    // Layout bands: section headers -> task boxes -> axis -> score faces.
+    let section_top = y;
+    let task_top = section_top + SECTION_H + 6.0;
+    let axis_y = task_top + BOX_H + AXIS_GAP;
+    let face_top = axis_y + AXIS_GAP;
+    let face_y = |score: u8| face_top + (1.0 - score as f64 / MAX_SCORE) * FACE_PLOT_H;
+    let drop_bottom = face_top + FACE_PLOT_H + DOT_R + 8.0;
+
+    // Colored section bands spanning contiguous same-section tasks.
+    let mut i = 0;
+    while i < n {
+        let sec = j.tasks[i].section;
+        let mut k = i;
+        while k + 1 < n && j.tasks[k + 1].section == sec {
+            k += 1;
         }
-        y += SECTION_H + 10.0;
+        let (left, right) = (lefts(i), lefts(k) + COL_W);
+        body.push_str(&format!(
+            r#"<rect x="{:.1}" y="{section_top:.1}" width="{:.1}" height="{SECTION_H:.1}" fill="{}" rx="4"/>"#,
+            left + 3.0,
+            right - left - 6.0,
+            section_color(sec),
+        ));
+        if let Some(si) = sec {
+            body.push_str(&format!(
+                r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" font-weight="600" fill="currentColor">{}</text>"#,
+                (left + right) / 2.0,
+                section_top + SECTION_H / 2.0 + 5.0,
+                escape_xml(&j.sections[si])
+            ));
+        }
+        i = k + 1;
     }
 
-    // Plot area: the journey curve through the task points.
-    let plot_top = y;
-    if n > 1 {
-        let pts: Vec<String> = j
-            .tasks
-            .iter()
-            .enumerate()
-            .map(|(i, t)| format!("{:.1},{:.1}", center(i), plot_top_ref(plot_top, t.score)))
-            .collect();
+    // Dashed droplines from each task box down through the axis to its face.
+    for i in 0..n {
+        let c = center(i);
         body.push_str(&format!(
-            r#"<polyline points="{}" fill="none" stroke="currentColor" stroke-width="2"/>"#,
-            pts.join(" ")
+            r#"<line x1="{c:.1}" y1="{:.1}" x2="{c:.1}" y2="{drop_bottom:.1}" stroke="{DASH_COLOR}" stroke-width="1" stroke-dasharray="3 3"/>"#,
+            task_top + BOX_H,
         ));
     }
+    // Time axis arrow.
+    body.push_str(&format!(
+        r#"<line x1="{:.1}" y1="{axis_y:.1}" x2="{:.1}" y2="{axis_y:.1}" stroke="currentColor" stroke-width="2.5" marker-end="url(#jr-arrow)"/>"#,
+        PAD + LEFT_MARGIN - 10.0,
+        total_w - PAD / 2.0,
+    ));
+
+    // Task boxes (tinted by section) with the task name + small actor dots.
     for (i, t) in j.tasks.iter().enumerate() {
-        let cx = center(i);
-        let cy = plot_top_ref(plot_top, t.score);
-        // Dot border tinted by the task's first actor; a satisfaction face
-        // inside replaces the bare score number.
-        let stroke = t.actors.first().map(|a| actor_color(a)).unwrap_or("#888");
+        let (bx, bw) = (lefts(i) + 6.0, COL_W - 12.0);
         body.push_str(&format!(
-            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{DOT_R}" fill="var(--mermaid-node-fill, #ececff)" stroke="{stroke}" stroke-width="2"/>"#
+            r#"<rect x="{bx:.1}" y="{task_top:.1}" width="{bw:.1}" height="{BOX_H:.1}" rx="4" fill="{}" fill-opacity="0.5" stroke="{}"/>"#,
+            section_color(t.section),
+            section_color(t.section),
         ));
-        body.push_str(&face(cx, cy, DOT_R, t.score));
-        // task name below the plot, actors (each in its own color) under that.
-        let name_y = plot_top + PLOT_H + 22.0;
         body.push_str(&format!(
-            r#"<text x="{cx:.1}" y="{name_y:.1}" text-anchor="middle" font-weight="600" fill="currentColor">{}</text>"#,
+            r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="12" fill="currentColor">{}</text>"#,
+            bx + bw / 2.0,
+            task_top + BOX_H / 2.0 + 4.0,
             escape_xml(&t.name)
         ));
-        for (k, a) in t.actors.iter().enumerate() {
+        for (a_i, a) in t.actors.iter().enumerate() {
             body.push_str(&format!(
-                r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-size="12" fill="{}">{}</text>"#,
-                name_y + 18.0 + k as f64 * 15.0,
+                r#"<circle cx="{:.1}" cy="{:.1}" r="3.5" fill="{}"/>"#,
+                bx + 6.0,
+                task_top + 6.0 + a_i as f64 * 8.0,
                 actor_color(a),
-                escape_xml(a)
             ));
         }
     }
 
-    // Actor legend along the bottom.
-    let max_actor_rows = j.tasks.iter().map(|t| t.actors.len()).max().unwrap_or(0);
-    let legend_y = plot_top + PLOT_H + 40.0 + max_actor_rows as f64 * 15.0;
-    let mut lx = PAD;
-    for a in &actors {
+    // Score faces on the droplines (5 near the axis, 0 at the bottom).
+    for (i, t) in j.tasks.iter().enumerate() {
+        let (cx, cy) = (center(i), face_y(t.score));
         body.push_str(&format!(
-            r#"<rect x="{lx:.1}" y="{:.1}" width="11" height="11" fill="{}"/><text x="{:.1}" y="{:.1}" font-size="12" fill="currentColor">{}</text>"#,
-            legend_y - 10.0,
-            actor_color(a),
-            lx + 16.0,
-            legend_y,
-            escape_xml(a)
+            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{DOT_R}" fill="var(--surface, #fff)" stroke="{DASH_COLOR}"/>"#
         ));
-        lx += 30.0 + crate::measure::text_size(a).0;
+        body.push_str(&face(cx, cy, DOT_R, t.score));
     }
 
-    let legend_h = if actors.is_empty() { 0.0 } else { 24.0 };
-    let total_h = legend_y + legend_h + PAD;
+    // Actor legend in the top-left gutter.
+    for (a_i, a) in actors.iter().enumerate() {
+        let ly = section_top + 4.0 + a_i as f64 * 16.0;
+        body.push_str(&format!(
+            r#"<circle cx="{:.1}" cy="{:.1}" r="4" fill="{}"/><text x="{:.1}" y="{:.1}" font-size="12" fill="currentColor">{}</text>"#,
+            PAD + 4.0,
+            ly - 4.0,
+            actor_color(a),
+            PAD + 14.0,
+            ly,
+            escape_xml(a)
+        ));
+    }
+
+    let total_h = drop_bottom + PAD;
     let mut out = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total_w:.0} {total_h:.0}" width="{total_w:.0}" height="{total_h:.0}" style="font-family:sans-serif;font-size:14px">"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total_w:.0} {total_h:.0}" width="{total_w:.0}" height="{total_h:.0}" style="font-family:sans-serif;font-size:14px"><defs><marker id="jr-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker></defs>"#
     );
     out.push_str(&body);
     out.push_str("</svg>");
@@ -294,16 +317,20 @@ mod tests {
     }
 
     #[test]
-    fn renders_curve_with_dots_and_labels() {
+    fn renders_timeline_layout_with_sections_and_axis() {
         let svg = render_svg(
             &parse("journey\n title T\n section S\n Make tea: 5: Me\n Do work: 1: Me, Cat").unwrap(),
         );
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
-        assert!(svg.contains("<polyline")); // the journey curve
-        assert!(svg.contains("<circle")); // task dots
-        assert!(svg.contains(">Make tea<") && svg.contains(">T<"));
-        // Actors are now rendered per-actor (colored) + a legend, not joined.
-        assert!(svg.contains(">Me<") && svg.contains(">Cat<"), "per-actor labels: {svg}");
+        assert!(svg.contains(">Make tea<") && svg.contains(">T<") && svg.contains(">S<"));
+        // Timeline-style: a colored section band, an axis arrow, and dashed
+        // droplines (replacing the old satisfaction line-curve).
+        assert!(!svg.contains("<polyline"), "no more line-chart curve: {svg}");
+        assert!(svg.contains(SECTION_COLORS[0]), "colored section: {svg}");
+        assert!(svg.contains("marker-end=\"url(#jr-arrow)\""), "axis arrow: {svg}");
+        assert!(svg.contains(r#"stroke-dasharray="3 3""#), "droplines: {svg}");
+        // Actors in the top-left legend.
+        assert!(svg.contains(">Me<") && svg.contains(">Cat<"), "actor legend: {svg}");
     }
 
     #[test]
