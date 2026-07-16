@@ -559,6 +559,24 @@ fn build_tool_definitions(state: &AppState) -> Vec<Tool> {
                 "required": ["doc_id"]
             }),
         },
+        Tool {
+            name: "list_documents".to_string(),
+            description: "List the documents you own, most recently updated first, \
+                          optionally filtered by type. Use this to get an overview of \
+                          what documents exist when you don't have a specific search \
+                          term to start from."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "doc_type": {
+                        "type": "string",
+                        "enum": ["document", "spreadsheet", "chat"],
+                        "description": "Filter by document type"
+                    }
+                }
+            }),
+        },
     ];
 
     // Only offer semantic_search if the embedding pipeline is available
@@ -591,7 +609,8 @@ fn build_system_prompt() -> String {
      You help users find information across their documents by searching, reading, \
      and following document relationships.\n\n\
      When answering questions:\n\
-     1. Start by searching for relevant documents using keyword_search or semantic_search.\n\
+     1. Start by searching for relevant documents using keyword_search or semantic_search. \
+     When you have no specific term to search for, use list_documents to see what exists.\n\
      2. Read the most promising documents using get_document to get full context.\n\
      3. Follow document relationships using get_related when relevant.\n\
      4. Synthesize a clear, specific answer citing the documents you found.\n\n\
@@ -618,8 +637,48 @@ async fn execute_tool(
         "semantic_search" => execute_semantic_search(state, user_id, input).await,
         "get_document" => execute_get_document(state, user_id, input, tx).await,
         "get_related" => execute_get_related(state, user_id, input).await,
+        "list_documents" => execute_list_documents(state, user_id, input).await,
         _ => Err(format!("Unknown tool: {tool_name}")),
     }
+}
+
+/// #59 T-11: enumerate the documents the caller owns (newest first),
+/// optionally filtered by type. A capability the RAG design documents but
+/// that was never registered. Scoped to owned documents — the access-safe
+/// subset that needs no per-row re-check (an owner always has View), so
+/// unlike the search tools this one can return `query_docs_by_owner`
+/// results directly. Trashed documents are omitted; capped at
+/// `MAX_LIST_RESULTS`.
+async fn execute_list_documents(
+    state: &AppState,
+    user_id: &str,
+    input: &serde_json::Value,
+) -> Result<String, String> {
+    const MAX_LIST_RESULTS: usize = 50;
+    let doc_type_filter = input["doc_type"].as_str();
+
+    let metas = state
+        .doc_repo
+        .query_docs_by_owner(user_id)
+        .await
+        .map_err(|e| format!("Failed to list documents: {e}"))?;
+
+    let results: Vec<_> = metas
+        .into_iter()
+        .filter(|m| !m.is_deleted)
+        .filter(|m| doc_type_filter.is_none_or(|t| m.doc_type.as_str() == t))
+        .take(MAX_LIST_RESULTS)
+        .map(|m| {
+            serde_json::json!({
+                "doc_id": m.doc_id,
+                "title": m.title,
+                "doc_type": m.doc_type.as_str(),
+                "updated_at": m.updated_at,
+            })
+        })
+        .collect();
+
+    serde_json::to_string(&results).map_err(|e| e.to_string())
 }
 
 async fn execute_keyword_search(
