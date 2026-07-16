@@ -128,5 +128,5 @@ Never duplicate work an agent is already doing.
   MFA, SAML, SCIM, share-revoke, doc-delete; retained 90 days by
   the `audit_retention` worker). New write-paths that touch
   identity, sharing, or destructive document state should emit a
-  `SecurityAudit` row via `routes::mfa::record_security_event` or
-  `record_security_event_by_actor`.
+  `SecurityAudit` row via `routes::audit::record_security_event` or
+  `routes::audit::record_security_event_by_actor`.

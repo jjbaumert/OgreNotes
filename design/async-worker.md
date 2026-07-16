@@ -10,8 +10,11 @@
 
 A background job subsystem for work too slow to run inline on a request —
 primarily DOCX/PDF import/export conversion, where synchronous conversion would
-blow the request budget. Jobs are enqueued via `POST /jobs`, processed by a
-separate worker process, and polled via `GET /jobs/{id}`.
+blow the request budget. Import jobs are enqueued via `POST /documents/import-job`
+(which stages the upload to S3 and enqueues an `Import{Docx,Pdf}` job), processed
+by a separate worker process, and polled via `GET /jobs/{id}`. (A generic
+`POST /jobs` enqueue endpoint also exists but currently serves only `Noop` jobs,
+not the import path.)
 
 ## Key decisions (distilled)
 
@@ -34,4 +37,5 @@ separate worker process, and polled via `GET /jobs/{id}`.
   liveness checks, stuck-job investigation, manual `XCLAIM`, dead-letter
   recovery, retry tuning.
 - **Code:** `crates/worker` (the queue + consumer), `crates/api/src/worker_mode.rs`
-  (the `--mode=worker` entrypoint), and the `POST /jobs` / `GET /jobs/{id}` API.
+  (the `--mode=worker` entrypoint), and the `POST /documents/import-job` (enqueue)
+  / `GET /jobs/{id}` (poll) API.

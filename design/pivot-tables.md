@@ -75,8 +75,8 @@ priorities drove the architecture:
                ▼
 ┌──────────────────────────────────────────────────────────┐
 │  SpreadsheetEngine (sync, frontend)                       │
-│   pivots: HashMap<(sheet, anchor), PivotTable>            │
-│   pivot_outputs: HashMap<(sheet, anchor), Vec<Vec<…>>>    │
+│   pivots: HashMap<CellAddr, PivotTable>                  │
+│   pivot_outputs: HashMap<CellAddr, Vec<Vec<…>>>          │
 │   recompute_pivots() — called on source-range edits,      │
 │                        on pivot config edits,             │
 │                        and on cross-doc snapshot updates  │
@@ -121,10 +121,12 @@ pub struct PivotTable {
 }
 
 pub enum SourceRange {
-    Local { sheet: usize, range: RangeRef },
-    Foreign { doc_id: String, sheet_name: String, range: RangeRef },
+    Local { range_a1: String },
+    Foreign { doc_id: String, sheet_name: String, range_a1: String },
     // Foreign reuses the cross-doc references plumbing — pivot
-    // over a REFERENCERANGE is a natural extension.
+    // over a REFERENCERANGE is a natural extension. The sheet index
+    // isn't carried in the range: the engine keys pivots by anchor
+    // within its single-sheet instance (see the engine-key note below).
 }
 
 pub struct PivotGroup {
@@ -134,6 +136,7 @@ pub struct PivotGroup {
     pub label: Option<String>,            // overrides source header
     pub sort_by_value: Option<usize>,     // index into PivotTable.values
     pub kind: PivotGroupKind,             // Direct | Date(_) | NumericBin{_}
+    pub visible_values: Option<Vec<String>>, // per-axis label filter (None = all)
 }
 
 pub enum PivotGroupKind {
@@ -158,15 +161,21 @@ pub enum SummarizeFn {
 
 pub enum PivotFilterCondition {
     ValueIn(Vec<String>),                 // discrete value picker
-    Number(NumberFilter),                 // >, <, =, between
-    Text(TextFilter),                     // contains, equals, starts
+    NumberGreater(f64),
+    NumberLess(f64),
+    NumberEqual(f64),
+    NumberBetween(f64, f64),
+    TextContains(String),
+    TextEquals(String),
+    TextStartsWith(String),
     Empty, NotEmpty,
 }
 
 pub struct PivotFilterSpec {
     pub source_col: usize,
     pub condition: PivotFilterCondition,
-    pub visible_values: Option<HashSet<String>>,  // explicit allow-list
+    // Per-axis label allow-lists live on PivotGroup.visible_values
+    // (Vec<String>), not here.
 }
 
 pub enum ValueLayout { Horizontal, Vertical }
@@ -178,7 +187,7 @@ pub enum SortOrder { Asc, Desc, None }
 
 ### Evaluator
 
-`pivot.rs::eval_pivot(pt: &PivotTable, src: &Vec<Vec<CellValue>>)
+`pivot.rs::eval_pivot(pt: &PivotTable, src: &[Vec<CellValue>])
 -> Vec<Vec<CellValue>>` returns the rendered 2D grid:
 
 1. Filter source rows by `filters`.
@@ -229,12 +238,11 @@ cells only; COUNTA counts non-empty.
 
 `SpreadsheetEngine` gains:
 
-- `pivots: HashMap<(usize, (usize, usize)), PivotTable>` — keyed
-  by (sheet_idx, anchor).
-- `pivot_outputs: HashMap<(usize, (usize, usize)), Vec<Vec<CellValue>>>`
+- `pivots: HashMap<CellAddr, PivotTable>` — keyed by anchor (the
+  engine is single-sheet; no sheet index in the key).
+- `pivot_outputs: HashMap<CellAddr, Vec<Vec<CellValue>>>`
   — cached output, invalidated on edit.
-- `pub fn recompute_pivot(&mut self, sheet, anchor)` — re-evals
-  one pivot.
+- `pub fn recompute_pivot(&mut self, anchor)` — re-evals one pivot.
 - `pub fn recompute_pivots_for_source(&mut self, sheet, range)` —
   invalidates every pivot whose source overlaps `range`.
 
@@ -449,35 +457,18 @@ the sheet.
 
 ### Attribute namespace
 
-Constants in `persistence.rs`:
+The whole pivot list is persisted as a **single JSON blob** under one
+attribute, not a granular per-field attribute namespace:
 
 ```
-ATTR_PIVOT_ANCHOR
-ATTR_PIVOT_SOURCE
-ATTR_PIVOT_VALUE_LAYOUT
-ATTR_PIVOT_LAYOUT_STYLE        // "compact" | "outline" | "tabular"
-ATTR_PIVOT_GRAND_TOTALS        // "none" | "rows" | "cols" | "both"
-ATTR_PIVOT_SUBTOTALS_POSITION  // "above" | "below"
-ATTR_PIVOT_ROWS
-ATTR_PIVOT_COLS
-ATTR_PIVOT_VALUES
-ATTR_PIVOT_FILTERS
-ATTR_PG_SOURCE_COL             // PivotGroup
-ATTR_PG_SORT_ORDER
-ATTR_PG_SHOW_TOTALS
-ATTR_PG_LABEL
-ATTR_PG_SORT_BY_VALUE
-ATTR_PG_KIND                   // "direct" | "date" | "numeric_bin"
-ATTR_PG_KIND_PARAM             // granularity name ("month") or
-                               // numeric bin "width:start" (start
-                               // omitted if None)
-ATTR_PV_SOURCE_COL             // PivotValue
-ATTR_PV_SUMMARIZE_FN
-ATTR_PV_DISPLAY_NAME
-ATTR_PF_SOURCE_COL             // PivotFilter
-ATTR_PF_CONDITION
-ATTR_PF_VISIBLE_VALUES
+ATTR_PIVOTS = "pivots"   // spreadsheet_view/persistence.rs
 ```
+
+`persistence.rs` serializes the `Vec<PivotTable>` to JSON and writes it
+under `ATTR_PIVOTS` (read back on load); the field-level shape lives in
+the JSON, matching the `### Doc-tree representation` above. (Earlier
+drafts specified ~20 discrete `ATTR_PIVOT_*`/`ATTR_PG_*`/`ATTR_PV_*`/
+`ATTR_PF_*` constants — those were never built.)
 
 ## XLSX import/export
 

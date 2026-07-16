@@ -4,7 +4,7 @@
 
 **Live-App blocks** are native CRDT-persisted structured blocks a user
 drops into a document from the `/` slash menu or block-menu — Calendar,
-Kanban, Project Tracker, and future widgets in that family. Each block
+Kanban, Mermaid, and future widgets in that family. Each block
 owns its own schema, renderer, and edit affordances but is compiled
 into the OgreNotes binary rather than loaded from an external package.
 
@@ -49,24 +49,10 @@ new module implementing the trait + one line in a registry const.
 **Backend — `crates/collab/src/blocks/`:**
 
 ```rust
-pub trait LiveAppBlock: Sync {
+pub trait LiveAppBlock: Sync + 'static {
     /// Every NodeType this plugin owns. Calendar owns both
     /// `Calendar` and `CalendarEvent`.
     fn node_types(&self) -> &'static [NodeType];
-
-    fn html_export(
-        &self,
-        node_type: NodeType,
-        attrs: &HashMap<String, String>,
-        children: &[Node],
-        writer: &mut String,
-    );
-
-    fn markdown_export(
-        &self,
-        node_type: NodeType,
-        attrs: &HashMap<String, String>,
-    ) -> String;
 
     fn validate_attrs(
         &self,
@@ -75,20 +61,19 @@ pub trait LiveAppBlock: Sync {
     ) -> Result<HashMap<String, String>, BlockValidationError>;
 }
 
-pub const BLOCKS: &[&dyn LiveAppBlock] = &[
-    &calendar::CalendarBlock,
-    // Future: &kanban::KanbanBlock, &tracker::ProjectTrackerBlock,
-];
+pub const BLOCKS: &[&(dyn LiveAppBlock + 'static)] =
+    &[&calendar::CALENDAR, &kanban::KANBAN, &mermaid::MERMAID];
 ```
 
-`export.rs::write_node_html` and `markdown.rs::write_node_markdown`
-each fall through to `BLOCKS` for any NodeType owned by a live-app
-block after their existing per-type match arms exhaust.
+Live-app export (HTML/markdown) is handled inline in
+`export.rs`/`markdown.rs` per NodeType — the trait deliberately omits
+export methods (heavy render logic stays inline; see the `blocks/mod.rs`
+module doc).
 
 **Frontend — `frontend/src/editor/blocks/`:**
 
 ```rust
-pub trait LiveAppBlockView {
+pub trait LiveAppBlockView: Sync + 'static {
     fn node_types(&self) -> &'static [NodeType];
     fn render(&self, node: &Node, ctx: &RenderCtx)
         -> Result<web_sys::Element, JsValue>;
@@ -103,9 +88,10 @@ pub trait LiveAppBlockInsert {
         -> Result<(), JsValue>;
 }
 
-pub const BLOCK_VIEWS: &[&dyn LiveAppBlockView] = &[&calendar::CalendarView];
-pub const BLOCK_INSERTS: &[&dyn LiveAppBlockInsert] =
-    &[&calendar::CalendarInsert];
+pub const BLOCK_VIEWS: &[&(dyn LiveAppBlockView + 'static)] =
+    &[&calendar::CalendarView, &kanban::KanbanView, &mermaid::MermaidView];
+pub const BLOCK_INSERTS: &[&(dyn LiveAppBlockInsert + 'static)] =
+    &[&calendar::CalendarInsert, &kanban::KanbanInsert, &mermaid::MermaidInsert];
 ```
 
 `view.rs::render_node` gets a fallback arm: after the existing hand-

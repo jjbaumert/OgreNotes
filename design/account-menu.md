@@ -144,7 +144,7 @@ Same partial-merge contract as `put_ui_prefs` (absent field ⇒
 unchanged). Apply the same length caps as `sanitize_profile` in
 `routes/auth.rs` (`MAX_NAME_LEN`, `MAX_AVATAR_URL_LEN`). Editing
 identity-adjacent fields should emit a `SecurityAudit` row via
-`routes::mfa::record_security_event` per the project audit
+`routes::audit::record_security_event` per the project audit
 convention.
 
 **New — status.** Add to `User` (or a sibling record):
