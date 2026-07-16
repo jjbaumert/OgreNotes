@@ -442,6 +442,50 @@ async fn test_ask_returns_shared_doc_content() {
     app.cleanup().await;
 }
 
+/// #59 T-11: the newly-registered `list_documents` agent tool enumerates
+/// the caller's own documents end to end. Scripted Claude requests it
+/// once, then answers. The tool result the model sees must list the docs
+/// the asker owns — and must NOT include another user's document (the
+/// listing is scoped to owned docs, the access-safe subset).
+#[tokio::test]
+async fn test_ask_list_documents_lists_only_owned_docs() {
+    common::require_infra!();
+
+    let script = vec![
+        response(vec![tool_use("tu-1", "list_documents", serde_json::json!({}))]),
+        response(vec![text_block("Here are your documents.")]),
+    ];
+    let stub = Arc::new(ScriptedClaude::new(script));
+    let stub_for_state: Arc<dyn ClaudeMessages> = stub.clone();
+    let app = common::TestApp::new_with_claude(Some(stub_for_state)).await;
+
+    let (_, token_a) = app.create_user("lister@test.com").await;
+    let (_, token_b) = app.create_user("other-owner@test.com").await;
+
+    app.create_doc(&token_a, "Alpha Notes", None).await;
+    app.create_doc(&token_a, "Beta Plan", None).await;
+    // Owned by B — must never appear in A's listing.
+    app.create_doc(&token_b, "Carol Private", None).await;
+
+    let (status, _sse) = ask_collect(&app, &token_a, "What documents do I have?").await;
+    assert_eq!(status, 200, "ask should return 200 OK");
+
+    stub.assert_fully_consumed();
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 2, "round 1 + one tool-feedback round");
+
+    let result =
+        last_tool_result(&calls[1]).expect("expected list_documents tool result on round 2");
+    assert!(result.contains("Alpha Notes"), "A's doc must be listed; got: {result}");
+    assert!(result.contains("Beta Plan"), "A's doc must be listed; got: {result}");
+    assert!(
+        !result.contains("Carol Private"),
+        "another owner's doc must NOT be listed; got: {result}",
+    );
+
+    app.cleanup().await;
+}
+
 // ─── Stub self-check ────────────────────────────────────────────
 //
 // Pure unit tests that prove `assert_fully_consumed` actually catches
