@@ -232,7 +232,21 @@ pub(crate) fn render_svg(s: &Sankey) -> String {
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total_w:.0} {total_h:.0}" width="{total_w:.0}" height="{total_h:.0}" style="font-family:sans-serif;font-size:13px">"#
     );
 
-    // ribbons first (behind nodes).
+    // Gradient defs: each ribbon fades left-to-right from the source node's
+    // color to the target node's color (Mermaid parity).
+    out.push_str("<defs>");
+    for (li, l) in s.links.iter().enumerate() {
+        let x0 = placed[l.from].x + NODE_W;
+        let x1 = placed[l.to].x;
+        out.push_str(&format!(
+            r#"<linearGradient id="sk{li}" gradientUnits="userSpaceOnUse" x1="{x0:.1}" y1="0" x2="{x1:.1}" y2="0"><stop offset="0" stop-color="{}"/><stop offset="1" stop-color="{}"/></linearGradient>"#,
+            PALETTE[l.from % PALETTE.len()],
+            PALETTE[l.to % PALETTE.len()],
+        ));
+    }
+    out.push_str("</defs>");
+
+    // ribbons first (behind nodes), filled with their source->target gradient.
     for (li, l) in s.links.iter().enumerate() {
         let th = (l.value * scale).max(MIN_LINK_H);
         let sp = &placed[l.from];
@@ -240,7 +254,6 @@ pub(crate) fn render_svg(s: &Sankey) -> String {
         let x0 = sp.x + NODE_W;
         let x1 = tp.x;
         let (y0t, y1t) = (src_y[li], dst_y[li]);
-        let color = PALETTE[l.from % PALETTE.len()];
         let mx = (x0 + x1) / 2.0;
         // Filled ribbon: top edge forward (cubic), down `th`, bottom edge back.
         let d = format!(
@@ -252,7 +265,7 @@ pub(crate) fn render_svg(s: &Sankey) -> String {
             y0t + th,
         );
         out.push_str(&format!(
-            r#"<path d="{d}" fill="{color}" fill-opacity="0.4"/>"#
+            r#"<path d="{d}" fill="url(#sk{li})" fill-opacity="0.5"/>"#
         ));
     }
 
@@ -269,10 +282,17 @@ pub(crate) fn render_svg(s: &Sankey) -> String {
         let last = p.layer + 1 == n_layers;
         let (lx, anchor) =
             if last { (p.x - 5.0, "end") } else { (p.x + NODE_W + 5.0, "start") };
+        let cy = p.y + p.h / 2.0;
+        // Name on top, value beneath (Mermaid labels each node with its total).
         out.push_str(&format!(
             r#"<text x="{lx:.1}" y="{:.1}" text-anchor="{anchor}" fill="currentColor">{}</text>"#,
-            p.y + p.h / 2.0 + 4.0,
+            cy,
             escape_xml(name)
+        ));
+        out.push_str(&format!(
+            r#"<text x="{lx:.1}" y="{:.1}" text-anchor="{anchor}" fill="currentColor" style="font-size:11px" opacity="0.75">{}</text>"#,
+            cy + 14.0,
+            (throughput[i]).round() as i64,
         ));
     }
 
@@ -321,6 +341,16 @@ mod tests {
         assert!(svg.contains("<path") && svg.contains("<rect"));
         // 4 ribbons.
         assert_eq!(svg.matches("<path").count(), 4);
+    }
+
+    #[test]
+    fn ribbons_use_gradients_and_nodes_show_values() {
+        let svg = render_svg(&parse("sankey-beta\n Coal,Elec,25\n Elec,Homes,25").unwrap());
+        // A source->target linear gradient per ribbon, used as the ribbon fill.
+        assert!(svg.contains(r#"<linearGradient id="sk0""#), "gradient def: {svg}");
+        assert!(svg.contains(r#"fill="url(#sk0)""#), "ribbon gradient fill: {svg}");
+        // Each node is labeled with its value (Coal outflow 25).
+        assert!(svg.contains(">25<"), "node value label: {svg}");
     }
 
     #[test]
