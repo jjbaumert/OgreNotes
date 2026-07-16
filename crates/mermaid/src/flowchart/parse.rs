@@ -180,8 +180,8 @@ impl Parser {
             "click" => {
                 return Err(self.err(format!("`{first}` statements are not supported")));
             }
-            _ if stmt.starts_with("accTitle") || stmt.starts_with("accDescr") => {
-                let kw = if stmt.starts_with("accTitle") { "accTitle" } else { "accDescr" };
+            _ if crate::acc_directive_keyword(stmt).is_some() => {
+                let kw = crate::acc_directive_keyword(stmt).unwrap();
                 return Err(self.err(format!("`{kw}` statements are not supported")));
             }
             _ => {}

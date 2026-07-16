@@ -114,6 +114,25 @@ pub(crate) fn escape_xml(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// The `accTitle`/`accDescr` accessibility keyword a statement invokes,
+/// or `None` when it merely starts with those letters. Mermaid treats
+/// them as directives only when the keyword is immediately followed by
+/// `:` (single-line) or `{` (block form) — `accTitleNode` is a plain id,
+/// not a directive. Shared by the flowchart and state parsers so both
+/// draw the id/directive boundary the same way. Both keywords are
+/// exactly 8 ASCII bytes.
+pub(crate) fn acc_directive_keyword(stmt: &str) -> Option<&'static str> {
+    let kw = if stmt.starts_with("accTitle") {
+        "accTitle"
+    } else if stmt.starts_with("accDescr") {
+        "accDescr"
+    } else {
+        return None;
+    };
+    let rest = stmt[kw.len()..].trim_start();
+    (rest.is_empty() || rest.starts_with(':') || rest.starts_with('{')).then_some(kw)
+}
+
 /// SVG path `d` drawing a smooth curve through `points` — one cubic
 /// Bézier per segment whose control points are pulled along the layout's
 /// flow axis (`vertical` = true for TB/BT, false for LR/RL). At every

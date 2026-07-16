@@ -5,6 +5,7 @@
 //! subgraph stack (membership-on-creation, `(index, opening_line)`,
 //! EOF unclosed check).
 
+use crate::acc_directive_keyword;
 use crate::state::{Composite, StateGraph, StateKind, StateNode, StateNote, Transition};
 use crate::ParseError;
 use std::collections::HashMap;
@@ -47,13 +48,27 @@ struct Parser {
 
 /// Truncate a line at the first `%%` that begins the line or follows
 /// whitespace — mermaid comments run to end of line. A `%%` glued to
-/// non-whitespace (e.g. inside a label like `a%%b`) is left alone; a
-/// single `%` never matches. `%` is ASCII, so the byte offset from
-/// `match_indices` is a char boundary.
+/// non-whitespace (e.g. inside a label like `a%%b`) is left alone, and a
+/// `%%` **inside a double-quoted display literal** (`state "50 %% off" as
+/// s`) is text, not a comment. A single `%` never matches. `%`/`"` are
+/// ASCII, so the byte offset from `match_indices` is a char boundary.
 fn strip_trailing_comment(line: &str) -> &str {
-    for (i, _) in line.match_indices("%%") {
-        if i == 0 || line[..i].ends_with(char::is_whitespace) {
-            return &line[..i];
+    let mut in_quote = false;
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                in_quote = !in_quote;
+                i += 1;
+            }
+            b'%' if !in_quote
+                && bytes.get(i + 1) == Some(&b'%')
+                && (i == 0 || line[..i].ends_with(char::is_whitespace)) =>
+            {
+                return &line[..i];
+            }
+            _ => i += 1,
         }
     }
     line
@@ -190,8 +205,8 @@ impl Parser {
             "class" => return self.parse_class_assign(stmt),
             "style" => return self.parse_style(stmt),
             "linkStyle" => return self.parse_link_style(stmt),
-            _ if stmt.starts_with("accTitle") || stmt.starts_with("accDescr") => {
-                let kw = if stmt.starts_with("accTitle") { "accTitle" } else { "accDescr" };
+            _ if acc_directive_keyword(stmt).is_some() => {
+                let kw = acc_directive_keyword(stmt).unwrap();
                 return Err(self.err(format!("`{kw}` statements are not supported")));
             }
             "}" if stmt == "}" => return self.parse_composite_close(),
@@ -613,6 +628,13 @@ impl Parser {
     /// Look up an existing node by id, or create it (implicit
     /// creation), scoped to the currently-open composite.
     fn ensure_node(&mut self, id: &str) -> Result<usize, ParseError> {
+        // `__start_N`/`__end_N` are the `[*]` synthesizer's reserved ids
+        // (minted via `push_node`, never here). A user id that names the
+        // reserved prefix would alias/duplicate a synthetic node, so
+        // reject it loudly — same guard the note path applies.
+        if id.starts_with("__") {
+            return Err(self.err("cannot reference a synthetic state id (reserved `__` prefix)"));
+        }
         if let Some(&i) = self.ids.get(id) {
             return Ok(i);
         }
@@ -1016,5 +1038,41 @@ mod tests {
         assert_eq!(g.nodes.len(), 2);
         assert_eq!(g.transitions.len(), 1);
         assert_eq!(g.nodes.iter().find(|n| n.id == "A").unwrap().classes, vec!["c".to_string()]);
+    }
+
+    // ── #47 follow-ups: cross-parser misparse fixes ──────────────────
+
+    #[test]
+    fn acc_prefixed_id_is_not_an_acc_directive() {
+        // Regression (#47): `accTitle`/`accDescr` are directives ONLY when
+        // the keyword is followed by `:` (or `{`) — a state id that merely
+        // starts with those letters (`accTitleNode`, `accDescrX`) must
+        // parse as a normal id, not be rejected as an unsupported directive.
+        let g = p("stateDiagram-v2\naccTitleNode --> accDescrX");
+        assert_eq!(g.transitions.len(), 1);
+        assert!(g.nodes.iter().any(|n| n.id == "accTitleNode"));
+        assert!(g.nodes.iter().any(|n| n.id == "accDescrX"));
+        // The real directive still errors loudly.
+        assert!(parse("stateDiagram-v2\naccTitle: My title").is_err());
+        assert!(parse("stateDiagram-v2\naccDescr: My description").is_err());
+    }
+
+    #[test]
+    fn percent_inside_quotes_is_not_a_comment() {
+        // Regression (#47): the `%%` comment strip was quote-blind and
+        // truncated `state "50 %% off" as s` mid-string. Text inside a
+        // double-quoted display literal must survive verbatim.
+        let g = p("stateDiagram-v2\nstate \"50 %% off\" as s");
+        let s = g.nodes.iter().find(|n| n.id == "s").expect("state s exists");
+        assert_eq!(s.display, "50 %% off");
+    }
+
+    #[test]
+    fn transition_to_synthetic_id_errors() {
+        // Regression (#47): `__start_N`/`__end_N` are the synthesizer's
+        // reserved ids; a transition that names one explicitly must error
+        // (naming the reserved prefix), not silently mint a duplicate node.
+        let e = parse("stateDiagram-v2\n[*] --> A\nA --> __start_0").unwrap_err();
+        assert!(e.message.contains("synthetic"), "got: {}", e.message);
     }
 }
