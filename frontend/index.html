@@ -46,7 +46,11 @@
     <link data-trunk rel="css" href="style/tokens-light.css" />
     <link data-trunk rel="css" href="style/tokens-dark.css" />
     <link data-trunk rel="css" href="style/main.css" />
-    <link data-trunk rel="css" href="style/spreadsheet.css" />
+    <!-- #30: spreadsheet.css is loaded on demand (copied to the dist root,
+         injected by SpreadsheetView) rather than bundled into the
+         always-loaded CSS, so document-only sessions don't fetch its
+         ~35 KB. See components::spreadsheet_view::ensure_spreadsheet_css. -->
+    <link data-trunk rel="copy-file" href="style/spreadsheet.css" />
     <link data-trunk rel="css" href="style/responsive.css" />
     <link data-trunk rel="css" href="style/fonts.css" />
     <!-- data-wasm-opt-params="--all-features" is REQUIRED for the

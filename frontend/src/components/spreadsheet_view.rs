@@ -1196,6 +1196,30 @@ fn cell_rc_from_mouse_event(e: &web_sys::MouseEvent) -> Option<(usize, usize)> {
     Some((r, c))
 }
 
+/// Inject the spreadsheet stylesheet on demand (#30). It is served from
+/// the dist root (`/spreadsheet.css`, a Trunk `copy-file` rather than a
+/// bundled `rel="css"`) so it is *not* fetched on document-only page
+/// loads; the first `SpreadsheetView` to mount adds the `<link>`.
+/// Idempotent via a stable element id — repeated mounts (sheet switches,
+/// re-renders) never duplicate it.
+fn ensure_spreadsheet_css() {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    if doc.get_element_by_id("spreadsheet-css").is_some() {
+        return;
+    }
+    let Some(head) = doc.head() else {
+        return;
+    };
+    if let Ok(link) = doc.create_element("link") {
+        let _ = link.set_attribute("id", "spreadsheet-css");
+        let _ = link.set_attribute("rel", "stylesheet");
+        let _ = link.set_attribute("href", "/spreadsheet.css");
+        let _ = head.append_child(&link);
+    }
+}
+
 // ─── Component ─────────────────────────────────────────────────
 
 #[component]
@@ -1268,6 +1292,12 @@ pub fn SpreadsheetView(
     /// and opens its comment popup. See `CellFocus`.
     focus_cell: ReadSignal<Option<CellFocus>>,
 ) -> impl IntoView {
+    // #30: the spreadsheet stylesheet (~35 KB) is no longer in the
+    // always-loaded CSS bundle — it's copied to the dist root and pulled
+    // in here, the moment a sheet actually renders, so pure-document
+    // sessions never fetch it.
+    ensure_spreadsheet_css();
+
     // Active cell (cursor)
     let (active_row, set_active_row) = signal(0usize);
     let (active_col, set_active_col) = signal(0usize);
