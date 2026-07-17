@@ -200,6 +200,11 @@ export class ComputeConstruct extends Construct {
     if (config.googleClientId) {
       commonEnv.GOOGLE_CLIENT_ID = config.googleClientId;
     }
+    // Optional /ask model override (e.g. Haiku on test to cut Anthropic cost).
+    // Omitted → the app's built-in default (claude-sonnet-4-6).
+    if (config.anthropicModel) {
+      commonEnv.ANTHROPIC_MODEL = config.anthropicModel;
+    }
 
     // CPU architecture (config.cpuArch). ARM64/Graviton is ~20% cheaper; the
     // image is built for the same arch (on an x86 host an arm64 build is
