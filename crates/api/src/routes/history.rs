@@ -271,6 +271,15 @@ async fn restore_version(
         ));
     }
 
+    // A restore discards content newer than the target version. Any
+    // UPDATE# rows recorded since the prior snapshot (e.g. a live WS
+    // editing session that never went idle to compact) are NOT part of
+    // the restored bytes and would otherwise be replayed on top of them
+    // by every read path (`load_current_doc_state`, WS cold-load),
+    // silently reinstating exactly what the user reverted. Drop them —
+    // the same fix `import_file` applies for its wholesale-replace path.
+    let _ = state.doc_repo.delete_updates_before(&id, now_usec()).await;
+
     // Record activity event
     let activity_repo = state.activity_repo.clone();
     let act_doc_id = id.clone();

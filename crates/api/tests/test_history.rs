@@ -367,3 +367,98 @@ async fn test_restore_version_view_collaborator_forbidden() {
 
     app.cleanup().await;
 }
+
+/// Regression: a version restore must discard pending (uncompacted)
+/// UPDATE# rows recorded since the prior snapshot — otherwise every read
+/// path replays them on top of the restored snapshot and silently
+/// reinstates exactly what the user reverted. The prior restore test
+/// only builds versions via PUT /content (which appends NO UPDATE# rows),
+/// so it can't catch this; here we append a pending update directly, the
+/// way a live WS editing session would before compaction.
+#[tokio::test]
+async fn test_restore_version_discards_pending_updates() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let token = app.create_user_token("restore-pending@test.com").await;
+    let doc_id = app.create_doc(&token, "Restore Pending", None).await;
+
+    // v1 content.
+    let (status, _) = app
+        .bytes_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{doc_id}/content"),
+            Some(&token),
+            make_doc_bytes("Version one body"),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 204);
+    let v1 = app.state.doc_repo.get(&doc_id).await.unwrap().unwrap().snapshot_version;
+    let (_, content_v1) = app
+        .bytes_request(
+            Method::GET,
+            &format!("/api/v1/documents/{doc_id}/content"),
+            Some(&token),
+            vec![],
+            "application/octet-stream",
+        )
+        .await;
+
+    // v2 content — advances the snapshot past v1.
+    let (status, _) = app
+        .bytes_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{doc_id}/content"),
+            Some(&token),
+            make_doc_bytes("Version two body"),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    // Simulate a live WS edit that hasn't been compacted: a pending
+    // UPDATE# row on top of the current snapshot.
+    app.state
+        .doc_repo
+        .append_update(&ogrenotes_storage::models::document::DocUpdate {
+            doc_id: doc_id.clone(),
+            clock: "9999999999999".to_string(),
+            update_bytes: make_doc_bytes("PENDING SESSION EDIT"),
+            user_id: "someone".to_string(),
+            created_at: 1,
+            client_version: None,
+        })
+        .await
+        .expect("append pending update");
+
+    // Restore v1.
+    let (status, _) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/documents/{doc_id}/versions/{v1}/restore"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204, "restore should succeed");
+
+    // The restored content must equal v1 exactly. Before the fix, the
+    // still-present pending UPDATE# row replays here and the content
+    // instead contains "PENDING SESSION EDIT", failing this assertion.
+    let (_, restored) = app
+        .bytes_request(
+            Method::GET,
+            &format!("/api/v1/documents/{doc_id}/content"),
+            Some(&token),
+            vec![],
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(
+        restored, content_v1,
+        "restore must discard pending updates, not replay them on top of v1"
+    );
+
+    app.cleanup().await;
+}

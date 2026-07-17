@@ -167,6 +167,13 @@ async fn verify(
     auth: AuthUser,
     Json(req): Json<VerifyRequest>,
 ) -> Result<axum::http::StatusCode, ApiError> {
+    // The login-flow second factor (`/challenge`, `/recovery`) is throttled
+    // via the handle-scoped failure counter, but these two AUTHENTICATED
+    // endpoints had no lockout — a stolen JWT (without the authenticator)
+    // could otherwise spray the 6-digit TOTP space with unlimited parallel
+    // requests. Cap attempts per user.
+    enforce_mfa_attempt_limit(&state, &auth.user_id).await?;
+
     let user = state
         .user_repo
         .get_by_id(&auth.user_id)
@@ -221,6 +228,11 @@ async fn disarm(
     auth: AuthUser,
     Json(req): Json<DisarmRequest>,
 ) -> Result<axum::http::StatusCode, ApiError> {
+    // Same rationale as `verify`: without this a stolen JWT ALONE could
+    // brute-force the disarm code — exactly what `DisarmRequest::code`'s
+    // doc comment says the fresh-TOTP requirement is meant to prevent.
+    enforce_mfa_attempt_limit(&state, &auth.user_id).await?;
+
     let user = state
         .user_repo
         .get_by_id(&auth.user_id)
@@ -326,6 +338,27 @@ async fn record_mfa_failure_exhausted(state: &AppState, handle: &str) -> bool {
             false
         }
     }
+}
+
+/// Window for the per-user attempt cap on the two AUTHENTICATED MFA
+/// endpoints (`POST /auth/mfa/verify`, `DELETE /auth/mfa`).
+const MFA_AUTHENTICATED_ATTEMPT_WINDOW_SECS: u64 = 5 * 60;
+
+/// Cap TOTP attempts on the authenticated MFA endpoints (`verify`,
+/// `disarm`), keyed on `user_id`. The login-flow endpoints burn an
+/// opaque handle instead; these are authenticated, so there's no handle
+/// to key on — without this a stolen JWT alone could brute-force the
+/// 6-digit code with unlimited parallel requests. Reuses
+/// `mfa_challenge_max_failures` so operators tune a single budget.
+async fn enforce_mfa_attempt_limit(state: &AppState, user_id: &str) -> Result<(), ApiError> {
+    crate::middleware::rate_limit::enforce(
+        &state.redis,
+        "mfa_verify",
+        user_id,
+        state.config.mfa_challenge_max_failures as u64,
+        MFA_AUTHENTICATED_ATTEMPT_WINDOW_SECS,
+    )
+    .await
 }
 
 /// TTL applied to the failure-counter key so it expires when the

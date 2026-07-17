@@ -1349,3 +1349,42 @@ async fn recovery_with_lowercase_code_mints_session() {
 
     app.cleanup().await;
 }
+
+/// Regression: the AUTHENTICATED `/auth/mfa/verify` endpoint must cap
+/// attempts per user, so a stolen JWT (without the authenticator) can't
+/// spray the 6-digit TOTP space with unlimited parallel guesses. The
+/// login-flow endpoints were already throttled; these were not. Test
+/// config caps at mfa_challenge_max_failures = 3.
+#[tokio::test]
+async fn verify_is_rate_limited_per_user() {
+    common::require_infra!();
+    let _ = *common::MFA_KEY_INIT;
+    let app = common::TestApp::new().await;
+    let (_, token) = app.create_user("mfa-verify-throttle@test.com").await;
+    let _ = app
+        .json_request(Method::POST, "/api/v1/auth/mfa/enroll", Some(&token), None)
+        .await;
+
+    for attempt in 1..=3 {
+        let (status, _) = app
+            .json_request(
+                Method::POST,
+                "/api/v1/auth/mfa/verify",
+                Some(&token),
+                Some(serde_json::json!({ "code": "000000" })),
+            )
+            .await;
+        assert_eq!(status, 401, "attempt {attempt} should be 401 within budget");
+    }
+    let (status, _) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/auth/mfa/verify",
+            Some(&token),
+            Some(serde_json::json!({ "code": "000000" })),
+        )
+        .await;
+    assert_eq!(status, 429, "4th attempt must be throttled");
+
+    app.cleanup().await;
+}

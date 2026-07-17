@@ -36,6 +36,7 @@ use std::time::Duration;
 
 use fred::clients::RedisClient;
 use fred::prelude::*;
+use futures_util::future::FutureExt;
 use ogrenotes_common::config::AppConfig;
 use ogrenotes_storage::dynamo::DynamoClient;
 use ogrenotes_storage::repo::doc_repo::DocRepo;
@@ -242,7 +243,28 @@ async fn reaper_loop(
 pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &WorkerCtx) {
     let job_id = claimed.envelope.job_id.clone();
     let attempt = claimed.envelope.attempt;
-    let result = execute(ctx, &claimed.envelope.payload).await;
+    // Isolate the handler behind catch_unwind: a panic in any job kind
+    // (e.g. a malformed-PDF panic in a parser dependency — see the
+    // `catch_unwind` in import_pdf.rs for why this class is real) must
+    // NOT unwind out of the consumer/reaper loop. Losing the reaper in
+    // particular disables stale-job recovery for the entire worker fleet,
+    // not just the poison job. A panic is treated as an ordinary job
+    // failure so the retry/dead-letter machinery still applies.
+    let result = match std::panic::AssertUnwindSafe(execute(ctx, &claimed.envelope.payload))
+        .catch_unwind()
+        .await
+    {
+        Ok(r) => r,
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            tracing::error!(job_id, attempt, panic = %msg, "job execution panicked");
+            Err(format!("job execution panicked: {msg}"))
+        }
+    };
     match result {
         Ok(payload) => match queue.ack(&claimed, payload).await {
             Ok(()) => {

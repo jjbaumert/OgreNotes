@@ -167,8 +167,25 @@ struct LoginParams {
 /// handler (piece D) can recover the workspace context.
 async fn login_redirect(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<LoginParams>,
 ) -> Result<Response, ApiError> {
+    // Per-source-IP rate limit. This endpoint is unauthenticated by
+    // necessity and, on every hit, writes a Redis AuthnRequest row and
+    // emits an outbound redirect for a caller-supplied workspace — the
+    // same DoS shape the `acs` handler and the OAuth `/auth/login` path
+    // already guard against, but the earlier hardening pass missed this
+    // sibling. Reuses the auth-login budget.
+    let ip = crate::middleware::rate_limit::ip_identifier(&headers);
+    crate::middleware::rate_limit::enforce(
+        &state.redis,
+        "auth_login",
+        &ip,
+        state.config.rate_limit_auth_login_per_min,
+        60,
+    )
+    .await?;
+
     let config = state
         .workspace_saml_config_repo
         .get(&params.workspace)
