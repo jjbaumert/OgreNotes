@@ -3692,8 +3692,13 @@ async function scenarioSpreadsheetRemoteCursor(ctx, collector) {
       await pageB.waitForSelector(".ss-remote-cell-label", { timeout: 8000 });
       const badgeCount = await pageB.locator(".ss-remote-cell-label").count();
       steps.tabBSeesRemoteCell = badgeCount >= 1;
-    } catch {
+    } catch (e) {
       steps.tabBSeesRemoteCell = false;
+      // Record why the wait failed — a genuine 8s timeout (peer never
+      // rendered the badge) reads very differently from a transient
+      // execution-context/navigation error. Without this the failure is
+      // opaque; a 2026-07-17 CI flake here left no evidence of which it was.
+      steps.tabBSeesRemoteCellError = e?.message || String(e);
     }
   } catch (e) {
     collector.stepError = `${e.message}\n${e.stack || ""}`;
