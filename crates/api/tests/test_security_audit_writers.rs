@@ -761,3 +761,83 @@ async fn doc_lock_toggle_writes_audit_row() {
 
     app.cleanup().await;
 }
+
+/// Regression: workspace identity mutations must emit a durable
+/// SecurityAudit row (keyed on the workspace, actor = admin) so they
+/// surface in GET /admin/audit — previously they were tracing-only and
+/// invisible to the audit query. Covers the MFA-required policy toggle.
+#[tokio::test]
+async fn set_mfa_required_writes_audit_row() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (admin_id, admin_token) = app.create_user("ws-mfa-admin@test.com").await;
+    let (_, ws_json) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(&admin_token),
+            Some(serde_json::json!({ "name": "Audited WS" })),
+        )
+        .await;
+    let ws_id = ws_json["id"].as_str().unwrap().to_string();
+
+    let (status, _) = app
+        .json_request(
+            Method::PUT,
+            &format!("/api/v1/workspaces/{ws_id}/mfa-required"),
+            Some(&admin_token),
+            Some(serde_json::json!({ "required": true })),
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    // Audit row is keyed on the workspace id (the subject), actor = admin.
+    let row = wait_for_audit_row(&app, &ws_id, |a| {
+        matches!(a, SecurityAuditAction::WorkspaceMfaRequiredChanged { required: true })
+    })
+    .await;
+    assert_eq!(row.actor_id, admin_id, "actor must be the admin who toggled it");
+    assert_eq!(row.user_id, ws_id, "row must be keyed on the workspace");
+}
+
+/// Companion: minting a SCIM provisioning token is an identity-surface
+/// mutation and must be audited (the handle, never the secret).
+#[tokio::test]
+async fn create_scim_token_writes_audit_row() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (admin_id, admin_token) = app.create_user("ws-scim-admin@test.com").await;
+    let (_, ws_json) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(&admin_token),
+            Some(serde_json::json!({ "name": "SCIM WS" })),
+        )
+        .await;
+    let ws_id = ws_json["id"].as_str().unwrap().to_string();
+
+    let (status, tok_json) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws_id}/scim-tokens"),
+            Some(&admin_token),
+            Some(serde_json::json!({ "name": "Okta connector" })),
+        )
+        .await;
+    assert_eq!(status, 201, "mint token: {tok_json}");
+    let token_id = tok_json["tokenId"].as_str().unwrap().to_string();
+
+    let row = wait_for_audit_row(&app, &ws_id, |a| {
+        matches!(a, SecurityAuditAction::WorkspaceScimTokenIssued { token_id: t } if t == &token_id)
+    })
+    .await;
+    assert_eq!(row.actor_id, admin_id);
+    // The audited handle must be the opaque token id, never the secret.
+    let secret = tok_json["token"].as_str().unwrap();
+    if let SecurityAuditAction::WorkspaceScimTokenIssued { token_id: t } = &row.action {
+        assert_ne!(t, secret, "audit must store the handle, not the secret");
+    }
+}
