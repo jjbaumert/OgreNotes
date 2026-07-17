@@ -192,6 +192,25 @@ pub enum SecurityAuditAction {
         node_type: String,
         block_id: String,
     },
+    /// A workspace admin changed or removed the workspace's SAML IdP
+    /// configuration — the highest-impact identity mutation in the
+    /// workspace surface, since the IdP controls who the workspace trusts
+    /// for future authentication (a swap is a full auth-takeover vector).
+    /// `user_id` PK is the workspace id (the subject — no single natural
+    /// user); `actor_id` is the admin who made the change.
+    /// `idp_entity_id = None` means the config was removed.
+    WorkspaceSamlConfigChanged { idp_entity_id: Option<String> },
+    /// A workspace admin toggled the workspace-wide MFA-required policy.
+    /// `required` is the resulting state. Keyed on the workspace id.
+    WorkspaceMfaRequiredChanged { required: bool },
+    /// A workspace admin minted a SCIM provisioning bearer token.
+    /// `token_id` is the opaque handle (never the secret). Distinct from
+    /// `ScimTokenUsed` (a token *authenticating*) — this is the credential
+    /// being *created*. Keyed on the workspace id.
+    WorkspaceScimTokenIssued { token_id: String },
+    /// A workspace admin revoked (disabled) a SCIM provisioning token.
+    /// `token_id` is the opaque handle. Keyed on the workspace id.
+    WorkspaceScimTokenRevoked { token_id: String },
 }
 
 impl SecurityAuditAction {
@@ -225,6 +244,10 @@ impl SecurityAuditAction {
             Self::TemplateGalleryDeleted { .. } => "templateGalleryDeleted",
             Self::LiveAppAttrsRepaired { .. } => "liveAppAttrsRepaired",
             Self::LiveAppNodeDeleted { .. } => "liveAppNodeDeleted",
+            Self::WorkspaceSamlConfigChanged { .. } => "workspaceSamlConfigChanged",
+            Self::WorkspaceMfaRequiredChanged { .. } => "workspaceMfaRequiredChanged",
+            Self::WorkspaceScimTokenIssued { .. } => "workspaceScimTokenIssued",
+            Self::WorkspaceScimTokenRevoked { .. } => "workspaceScimTokenRevoked",
         }
     }
 
@@ -289,6 +312,18 @@ impl SecurityAuditAction {
                     "nodeType": node_type,
                     "blockId": block_id,
                 })
+            }
+            Self::WorkspaceSamlConfigChanged { idp_entity_id } => {
+                json!({ "idpEntityId": idp_entity_id })
+            }
+            Self::WorkspaceMfaRequiredChanged { required } => {
+                json!({ "required": required })
+            }
+            Self::WorkspaceScimTokenIssued { token_id } => {
+                json!({ "tokenId": token_id })
+            }
+            Self::WorkspaceScimTokenRevoked { token_id } => {
+                json!({ "tokenId": token_id })
             }
         }
     }
@@ -425,6 +460,24 @@ impl SecurityAuditAction {
                 doc_id: get_str("docId", Some("doc_id"))?,
                 node_type: get_str("nodeType", Some("node_type"))?,
                 block_id: get_str("blockId", Some("block_id"))?,
+            }),
+            "workspaceSamlConfigChanged" => Ok(Self::WorkspaceSamlConfigChanged {
+                // Absent / null => removed (None); a present string is the
+                // configured IdP entity id.
+                idp_entity_id: detail
+                    .get("idpEntityId")
+                    .or_else(|| detail.get("idp_entity_id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            }),
+            "workspaceMfaRequiredChanged" => Ok(Self::WorkspaceMfaRequiredChanged {
+                required: get_bool("required")?,
+            }),
+            "workspaceScimTokenIssued" => Ok(Self::WorkspaceScimTokenIssued {
+                token_id: get_str("tokenId", Some("token_id"))?,
+            }),
+            "workspaceScimTokenRevoked" => Ok(Self::WorkspaceScimTokenRevoked {
+                token_id: get_str("tokenId", Some("token_id"))?,
             }),
             other => Err(format!("unknown security audit action: {other}")),
         }
@@ -645,6 +698,34 @@ mod tests {
         let back = SecurityAuditAction::from_storage(action.as_str(), &detail)
             .expect("round-trip");
         assert_eq!(back, action);
+    }
+
+    #[test]
+    fn workspace_identity_actions_round_trip_through_storage() {
+        // The five workspace identity mutations (SAML config put/delete,
+        // MFA-required, SCIM token issue/revoke) must survive the tag +
+        // detail round-trip so they read back out of `GET /admin/audit`.
+        let cases = [
+            SecurityAuditAction::WorkspaceSamlConfigChanged {
+                idp_entity_id: Some("https://idp.example.com/entity".to_string()),
+            },
+            // Removal case: None must round-trip (absent detail => None).
+            SecurityAuditAction::WorkspaceSamlConfigChanged { idp_entity_id: None },
+            SecurityAuditAction::WorkspaceMfaRequiredChanged { required: true },
+            SecurityAuditAction::WorkspaceMfaRequiredChanged { required: false },
+            SecurityAuditAction::WorkspaceScimTokenIssued {
+                token_id: "scimtok-1".to_string(),
+            },
+            SecurityAuditAction::WorkspaceScimTokenRevoked {
+                token_id: "scimtok-1".to_string(),
+            },
+        ];
+        for original in cases {
+            let detail = original.detail_json();
+            let back = SecurityAuditAction::from_storage(original.as_str(), &detail)
+                .unwrap_or_else(|e| panic!("roundtrip failed for {original:?}: {e}"));
+            assert_eq!(back, original, "roundtrip mismatch on {original:?}");
+        }
     }
 
     #[test]

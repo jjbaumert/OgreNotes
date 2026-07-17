@@ -2066,13 +2066,33 @@ async fn bulk_restore(
     // walking the doc list. A bad folder id fails the whole batch
     // up-front (a 400, not per-id) — keeps the failure mode
     // unambiguous for the multi-select UI.
-    let _ = super::folders::check_folder_access(
+    let target = super::folders::check_folder_access(
         &state,
         &req.target_folder_id,
         &user_id,
         AccessLevel::Edit,
     )
     .await?;
+
+    // Same guard the single-doc `restore_document` enforces: a restore must
+    // not park a live (un-trashed) doc inside a System folder such as the
+    // caller's own Trash — that would render as a "live" item in the trash
+    // view. Home/Private are the only System folders a doc may legitimately
+    // land in.
+    let user = state
+        .user_repo
+        .get_by_id(&user_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::Internal("User not found".to_string()))?;
+    if matches!(target.folder_type, FolderType::System)
+        && target.folder_id != user.home_folder_id
+        && target.folder_id != user.private_folder_id
+    {
+        return Err(ApiError::BadRequest(
+            "Cannot restore into a system folder".to_string(),
+        ));
+    }
 
     let mut results: Vec<BulkOpResultEntry> = Vec::with_capacity(req.doc_ids.len());
     let mut succeeded: usize = 0;
@@ -2958,7 +2978,18 @@ async fn request_upload_url(
     Path(id): Path<String>,
     Json(req): Json<UploadRequest>,
 ) -> Result<Json<UploadResponse>, ApiError> {
-    let _meta = get_verified_doc(&state, &id, &user_id).await?;
+    // Uploading a blob is a WRITE into the document's blob namespace, so it
+    // requires Edit — not the View level `get_verified_doc` grants. A
+    // view-only sharer must not be able to stage content (or spend the
+    // owner's S3 budget) into a doc they can only read. Matches the
+    // `POST /documents/:id/blobs = EDIT` contract in mvp-detailed-design.md.
+    let _meta = check_doc_access(
+        &state,
+        &id,
+        &user_id,
+        ogrenotes_storage::models::AccessLevel::Edit,
+    )
+    .await?;
 
     if !is_allowed_content_type(&req.content_type) {
         return Err(ApiError::BadRequest(format!(

@@ -375,6 +375,17 @@ async fn set_mfa_required(
         required = req.required,
         "workspace_mfa_required_changed"
     );
+    // Durable SecurityAudit row (keyed on the workspace, actor = admin) so
+    // this workspace-wide identity-policy change surfaces in
+    // GET /admin/audit, not just CloudWatch.
+    crate::routes::audit::record_security_event_by_actor(
+        &state,
+        &id,
+        &user_id,
+        ogrenotes_storage::models::security_audit::SecurityAuditAction::WorkspaceMfaRequiredChanged {
+            required: req.required,
+        },
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -545,6 +556,17 @@ async fn put_saml_config(
         idp_entity_id = %config.idp_entity_id,
         "workspace_saml_config_changed"
     );
+    // Highest-impact workspace identity mutation — the IdP controls who
+    // the workspace trusts for future logins. Durable audit row so an IdP
+    // swap can't be invisible in GET /admin/audit.
+    crate::routes::audit::record_security_event_by_actor(
+        &state,
+        &id,
+        &user_id,
+        ogrenotes_storage::models::security_audit::SecurityAuditAction::WorkspaceSamlConfigChanged {
+            idp_entity_id: Some(config.idp_entity_id.clone()),
+        },
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -561,6 +583,15 @@ async fn delete_saml_config(
         workspace_id = %id,
         actor_id = %user_id,
         "workspace_saml_config_removed"
+    );
+    // Removal is auditable for the same reason as a change (`None` idp).
+    crate::routes::audit::record_security_event_by_actor(
+        &state,
+        &id,
+        &user_id,
+        ogrenotes_storage::models::security_audit::SecurityAuditAction::WorkspaceSamlConfigChanged {
+            idp_entity_id: None,
+        },
     );
     Ok(StatusCode::NO_CONTENT)
 }
@@ -654,6 +685,17 @@ async fn create_scim_token(
         actor_id = %user_id,
         "workspace_scim_token_created"
     );
+    // Minting a SCIM provisioning credential is an identity-surface
+    // mutation — record the handle (never the secret) so issuance has a
+    // durable trail, distinct from ScimTokenUsed (a token authenticating).
+    crate::routes::audit::record_security_event_by_actor(
+        &state,
+        &id,
+        &user_id,
+        ogrenotes_storage::models::security_audit::SecurityAuditAction::WorkspaceScimTokenIssued {
+            token_id: minted.token_id.clone(),
+        },
+    );
 
     Ok((
         StatusCode::CREATED,
@@ -717,6 +759,14 @@ async fn revoke_scim_token(
         token_id = %token_id,
         actor_id = %user_id,
         "workspace_scim_token_revoked"
+    );
+    crate::routes::audit::record_security_event_by_actor(
+        &state,
+        &id,
+        &user_id,
+        ogrenotes_storage::models::security_audit::SecurityAuditAction::WorkspaceScimTokenRevoked {
+            token_id: token_id.clone(),
+        },
     );
     Ok(StatusCode::NO_CONTENT)
 }

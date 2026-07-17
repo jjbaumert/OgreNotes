@@ -154,6 +154,7 @@ fn scope_label(scope: &str) -> &'static str {
         "sharing" => "sharing",
         "admin_mut" => "admin_mut",
         "scim_request" => "scim_request",
+        "mfa_verify" => "mfa_verify",
         "comments" => "comments",
         "content_write" => "content_write",
         "import" => "import",

@@ -58,9 +58,9 @@ async fn resolve_display_names(
 }
 
 /// Per-user comment-write rate limit (M-E7 item 10). Shared
-/// between `create_thread` and `add_message` so the budget caps
-/// total comment activity, not per-endpoint slices that could be
-/// gamed by cycling between them.
+/// between `create_thread`, `add_message`, and `edit_message` so the
+/// budget caps total comment activity, not per-endpoint slices that
+/// could be gamed by cycling between them.
 async fn enforce_comments_rate_limit(state: &AppState, user_id: &str) -> Result<(), ApiError> {
     crate::middleware::rate_limit::enforce(
         &state.redis,
