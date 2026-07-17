@@ -29,16 +29,82 @@ pub enum ClaudeError {
 
 // ─── Request types ─────────────────────────────────────────────
 
+/// An ephemeral prompt-cache breakpoint. Anthropic bills a cached prefix at
+/// ~0.1x on a read and ~1.25x on the write, so caching pays off after the
+/// second request that shares the prefix. The `/ask` agent loop always
+/// qualifies: it makes up to `MAX_TOOL_ROUNDS + 1` calls per question, each
+/// re-sending the same tools + system prompt and a growing message history
+/// (which accumulates up to `MAX_DOCUMENT_CHARS` of document content).
+#[derive(Serialize, Clone, Copy)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+impl CacheControl {
+    const EPHEMERAL: CacheControl = CacheControl { kind: "ephemeral" };
+}
+
+/// The system prompt serialized as a one-element text-block array so it can
+/// carry a cache breakpoint. Render order is tools → system → messages, so a
+/// breakpoint here caches the whole tools+system prefix — shared by every
+/// `/ask` call, giving cross-request reuse within the cache TTL. A prefix
+/// below the model's minimum cacheable size simply isn't cached (no write,
+/// no premium), so this is never a cost regression.
+#[derive(Serialize)]
+struct SystemBlock<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+    cache_control: CacheControl,
+}
+
 #[derive(Serialize)]
 struct MessagesRequest<'a> {
     model: &'a str,
     max_tokens: u32,
-    system: &'a str,
+    system: [SystemBlock<'a>; 1],
     messages: &'a [Message],
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<&'a Tool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    /// Top-level auto-cache: the API places a breakpoint on the last cacheable
+    /// block — the tail of the growing message history — so each agent-loop
+    /// round reads the prior round's accumulated tool results and document
+    /// content from cache instead of re-billing them. Only set for the
+    /// tool-calling loop (`tools` non-empty). A single-shot Direct call
+    /// (`@summarize`/`@translate`/…) passes no tools and is never followed by
+    /// a request that shares its history, so caching it would only pay the
+    /// write premium with no later read. (The rare max-rounds synthesis
+    /// fallback also passes no tools and thus forgoes the history-read hit.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+/// Build the wire request, wiring in the prompt-cache breakpoints. Extracted
+/// from `messages` so the caching behavior is unit-testable without an HTTP
+/// round trip.
+fn build_messages_request<'a>(
+    model: &'a str,
+    max_tokens: u32,
+    system: &'a str,
+    messages: &'a [Message],
+    tools: &'a [Tool],
+) -> MessagesRequest<'a> {
+    MessagesRequest {
+        model,
+        max_tokens,
+        system: [SystemBlock {
+            kind: "text",
+            text: system,
+            cache_control: CacheControl::EPHEMERAL,
+        }],
+        messages,
+        tools: tools.iter().collect(),
+        stream: None,
+        cache_control: (!tools.is_empty()).then_some(CacheControl::EPHEMERAL),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,15 +231,7 @@ impl ClaudeClient {
         tools: &[Tool],
         max_tokens: u32,
     ) -> Result<MessagesResponse, ClaudeError> {
-        let tool_refs: Vec<&Tool> = tools.iter().collect();
-        let body = MessagesRequest {
-            model: &self.model,
-            max_tokens,
-            system,
-            messages,
-            tools: tool_refs,
-            stream: None,
-        };
+        let body = build_messages_request(&self.model, max_tokens, system, messages, tools);
 
         let resp = self
             .http
@@ -297,6 +355,51 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("tool_result"));
         assert!(json.contains("toolu_01"));
+    }
+
+    #[test]
+    fn agent_loop_request_sets_cache_breakpoints() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: MessageContent::Text("hello".to_string()),
+        }];
+        let tools = vec![Tool {
+            name: "keyword_search".to_string(),
+            description: "Search".to_string(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        }];
+        let body =
+            build_messages_request("claude-haiku-4-5", 4096, "system prompt", &messages, &tools);
+        let v = serde_json::to_value(&body).unwrap();
+
+        // System is a text-block array whose block carries an ephemeral
+        // breakpoint — caches the tools+system prefix.
+        assert_eq!(v["system"][0]["type"], "text");
+        assert_eq!(v["system"][0]["text"], "system prompt");
+        assert_eq!(v["system"][0]["cache_control"]["type"], "ephemeral");
+
+        // Top-level breakpoint present for the tool loop → the API caches the
+        // growing message-history prefix round to round.
+        assert_eq!(v["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn direct_call_caches_system_but_not_history() {
+        // Direct mode (@summarize etc.) passes no tools and makes a single
+        // call, so caching the message tail would only pay the write premium
+        // with no later read. The system prefix is still cached.
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: MessageContent::Text("summarize this".to_string()),
+        }];
+        let body = build_messages_request("claude-haiku-4-5", 4096, "system", &messages, &[]);
+        let v = serde_json::to_value(&body).unwrap();
+
+        assert_eq!(v["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(
+            v.get("cache_control").is_none(),
+            "no top-level cache breakpoint for single-shot Direct calls"
+        );
     }
 
     #[test]

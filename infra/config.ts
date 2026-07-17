@@ -101,6 +101,15 @@ export interface EnvConfig {
    */
   aiEnabled: boolean;
 
+  /**
+   * Override the Claude model the /ask agent loop uses. Omit → the app
+   * default (claude-sonnet-4-6). Set to a cheaper model (e.g.
+   * claude-haiku-4-5, ~3× cheaper per token) on non-prod stacks where the
+   * point is exercising the /ask plumbing, not answer quality. Only takes
+   * effect when aiEnabled is true. Sets ANTHROPIC_MODEL on the task.
+   */
+  anthropicModel?: string;
+
   /** Cloud Map private DNS namespace for service discovery (Qdrant). */
   cloudMapNamespace: string;
 }
@@ -170,7 +179,11 @@ export const environments: Record<string, EnvConfig> = {
     // once a request-triggered wake path exists. Windows kept for reference:
     //   { up: 'cron(30 16 ? * TUE *)', down: 'cron(30 0 ? * WED *)' },
     //   { up: 'cron(30 16 ? * FRI *)', down: 'cron(30 0 ? * MON *)' },
-    aiEnabled: false,
+    aiEnabled: true,
+    // Test exercises the /ask plumbing, not answer quality — run it on Haiku
+    // (~3× cheaper per token than the app's claude-sonnet-4-6 default) to keep
+    // Anthropic testing charges down. Prod keeps the default (Sonnet).
+    anthropicModel: 'claude-haiku-4-5',
     cloudMapNamespace: 'ogrenote.local',
   },
   prod: {
