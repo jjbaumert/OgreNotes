@@ -124,6 +124,7 @@ pub(crate) fn route_edges(
 
 #[cfg(test)]
 mod tests {
+    use super::clip_to_box;
     use crate::layout::{run, Direction, LEdge, LNode, LayoutInput};
 
     fn node() -> LNode {
@@ -131,6 +132,177 @@ mod tests {
     }
     fn e(from: usize, to: usize) -> LEdge {
         LEdge { from, to, label: None }
+    }
+    fn labeled(from: usize, to: usize) -> LEdge {
+        LEdge { from, to, label: Some((24.0, 12.0)) }
+    }
+    fn close(a: (f64, f64), b: (f64, f64)) -> bool {
+        (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6
+    }
+
+    // ── clip_to_box (pure geometry) ─────────────────────────────
+
+    #[test]
+    fn clip_axis_aligned_hits_the_facing_border() {
+        let c = (10.0, 20.0);
+        let half = (5.0, 3.0);
+        // Straight right → right border, same y.
+        assert!(close(clip_to_box(c, half, (100.0, 20.0)), (15.0, 20.0)));
+        // Straight up → top border, same x.
+        assert!(close(clip_to_box(c, half, (10.0, -50.0)), (10.0, 17.0)));
+        // Straight down → bottom border.
+        assert!(close(clip_to_box(c, half, (10.0, 90.0)), (10.0, 23.0)));
+        // Straight left → left border.
+        assert!(close(clip_to_box(c, half, (-80.0, 20.0)), (5.0, 20.0)));
+    }
+
+    #[test]
+    fn clip_diagonal_is_limited_by_the_nearer_axis() {
+        // 45° ray from a wide-flat box: the y half-extent (3) binds before
+        // the x half-extent (5), so the exit point is (c + 3, c + 3).
+        let got = clip_to_box((0.0, 0.0), (5.0, 3.0), (100.0, 100.0));
+        assert!(close(got, (3.0, 3.0)), "got {got:?}");
+        // Steep ray toward a tall-thin box: x binds first.
+        let got = clip_to_box((0.0, 0.0), (2.0, 50.0), (10.0, 10.0));
+        assert!(close(got, (2.0, 2.0)), "got {got:?}");
+    }
+
+    #[test]
+    fn clip_degenerate_inputs_stay_finite() {
+        // toward == center → center (no direction to clip along).
+        assert!(close(clip_to_box((7.0, 8.0), (5.0, 3.0), (7.0, 8.0)), (7.0, 8.0)));
+        // toward strictly inside the box → t clamps to 1, returns toward
+        // itself (the segment never reaches the border).
+        assert!(close(clip_to_box((0.0, 0.0), (5.0, 3.0), (1.0, 1.0)), (1.0, 1.0)));
+        // Zero-size box → collapses to the center.
+        assert!(close(clip_to_box((4.0, 4.0), (0.0, 0.0), (9.0, 9.0)), (4.0, 4.0)));
+    }
+
+    // ── route_edges (via the full pipeline, TB = rank space) ────
+
+    #[test]
+    fn reversed_cycle_edge_is_emitted_in_true_direction() {
+        // A <-> B: acyclic reverses exactly one edge; the emitted path must
+        // still run true-source → true-target, with the flag set.
+        let input = LayoutInput {
+            nodes: vec![node(), node()],
+            edges: vec![e(0, 1), e(1, 0)],
+            clusters: vec![],
+            direction: Direction::TB,
+        };
+        let l = run(&input).unwrap();
+        assert_eq!(l.edge_paths.len(), 2);
+        let dist = |p: (f64, f64), q: (f64, f64)| (p.0 - q.0).hypot(p.1 - q.1);
+        for p in &l.edge_paths {
+            let (from, to) = (input.edges[p.edge].from, input.edges[p.edge].to);
+            let start = p.points[0];
+            let end = *p.points.last().unwrap();
+            assert!(
+                dist(start, l.node_centers[from]) < dist(start, l.node_centers[to]),
+                "edge {} starts nearer its target than its source",
+                p.edge
+            );
+            assert!(
+                dist(end, l.node_centers[to]) < dist(end, l.node_centers[from]),
+                "edge {} ends nearer its source than its target",
+                p.edge
+            );
+        }
+        assert_eq!(
+            l.edge_paths.iter().filter(|p| p.reversed).count(),
+            1,
+            "exactly one edge of a 2-cycle is reversed"
+        );
+    }
+
+    #[test]
+    fn self_loop_stubs_off_the_right_edge_and_sorts_into_edge_order() {
+        // Self-loop listed FIRST so the deterministic sort (not emission
+        // order — self-loops are appended after chains) is what's pinned.
+        let input = LayoutInput {
+            nodes: vec![node(), node()],
+            edges: vec![labeled(0, 0), e(0, 1)],
+            clusters: vec![],
+            direction: Direction::TB,
+        };
+        let l = run(&input).unwrap();
+        assert_eq!(l.edge_paths.len(), 2);
+        assert_eq!(l.edge_paths[0].edge, 0, "paths must come back in original edge order");
+        assert_eq!(l.edge_paths[1].edge, 1);
+
+        let (cx, cy) = l.node_centers[0];
+        let (hw, hh) = (20.0, 10.0); // node() is 40×20
+        let stub = &l.edge_paths[0];
+        assert_eq!(stub.points.len(), 4, "self-loop is a 4-point stub");
+        assert!(close(stub.points[0], (cx + hw, cy - hh * 0.5)), "stub leaves the right border");
+        assert!(close(stub.points[3], (cx + hw, cy + hh * 0.5)), "stub re-enters the right border");
+        assert!(
+            stub.points.iter().all(|p| p.0 >= cx + hw - 1e-9),
+            "stub stays right of the node"
+        );
+        let label = stub.label_at.expect("labeled self-loop places a label");
+        assert!(label.0 > cx + hw, "self-loop label sits beyond the stub");
+        assert!(!stub.reversed);
+    }
+
+    #[test]
+    fn single_span_label_sits_at_the_segment_midpoint() {
+        let input = LayoutInput {
+            nodes: vec![node(), node()],
+            edges: vec![labeled(0, 1)],
+            clusters: vec![],
+            direction: Direction::TB,
+        };
+        let l = run(&input).unwrap();
+        let p = &l.edge_paths[0];
+        let a = p.points[0];
+        let b = *p.points.last().unwrap();
+        let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        assert!(close(p.label_at.expect("label placed"), mid));
+    }
+
+    #[test]
+    fn multi_rank_label_sits_at_the_dummy_waypoint() {
+        // A->B, B->C put C two ranks below A; the labeled A->C edge then
+        // routes through one dummy waypoint, which hosts the label.
+        let input = LayoutInput {
+            nodes: vec![node(), node(), node()],
+            edges: vec![e(0, 1), e(1, 2), labeled(0, 2)],
+            clusters: vec![],
+            direction: Direction::TB,
+        };
+        let l = run(&input).unwrap();
+        let long = l.edge_paths.iter().find(|p| p.edge == 2).unwrap();
+        assert_eq!(long.points.len(), 3, "one dummy waypoint between the endpoints");
+        assert!(
+            close(long.label_at.expect("label placed"), long.points[1]),
+            "label rides the dummy waypoint, not an endpoint"
+        );
+    }
+
+    #[test]
+    fn every_endpoint_lies_on_its_node_border() {
+        // Both the centred (single-edge side) and clipped (multi-edge side)
+        // branches must land exactly on the endpoint node's bounding box.
+        let input = LayoutInput {
+            nodes: vec![node(), node(), node(), node()],
+            edges: vec![e(0, 1), e(0, 2), e(1, 3), e(2, 3)],
+            clusters: vec![],
+            direction: Direction::TB,
+        };
+        let l = run(&input).unwrap();
+        let on_border = |p: (f64, f64), n: usize| {
+            let (cx, cy) = l.node_centers[n];
+            let (dx, dy) = ((p.0 - cx).abs(), (p.1 - cy).abs());
+            let (hw, hh) = (20.0, 10.0);
+            ((dx - hw).abs() < 1e-6 && dy <= hh + 1e-6)
+                || ((dy - hh).abs() < 1e-6 && dx <= hw + 1e-6)
+        };
+        for p in &l.edge_paths {
+            let (from, to) = (input.edges[p.edge].from, input.edges[p.edge].to);
+            assert!(on_border(p.points[0], from), "edge {} start off-border", p.edge);
+            assert!(on_border(*p.points.last().unwrap(), to), "edge {} end off-border", p.edge);
+        }
     }
 
     #[test]
