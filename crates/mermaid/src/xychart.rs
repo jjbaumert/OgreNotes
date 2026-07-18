@@ -12,6 +12,14 @@ const PAD: f64 = 20.0;
 const PLOT_W: f64 = 460.0;
 const PLOT_H: f64 = 300.0;
 const Y_AXIS_W: f64 = 56.0; // room for y ticks + label
+
+/// Mermaid's default-theme xyChart series palette
+/// (`xyChart.plotColorPalette` in theme-default.js), in order. Series are
+/// colored by declaration order, cycling when there are more than ten.
+const PLOT_PALETTE: &[&str] = &[
+    "#ECECFF", "#8493A6", "#FFC3A0", "#DCDDE1", "#B8E994",
+    "#D1A36F", "#C3CDE6", "#FFB6C1", "#496078", "#F8F3E3",
+];
 const X_AXIS_H: f64 = 28.0;
 const MAX_SERIES: usize = 16;
 const MAX_POINTS: usize = 1000;
@@ -232,28 +240,36 @@ pub(crate) fn render_svg(c: &XYChart) -> String {
         ));
     }
 
-    // series: bars first (grouped), then lines on top.
-    let bar_series: Vec<&Series> = c.series.iter().filter(|s| s.kind == SeriesKind::Bar).collect();
+    // series: bars first (grouped), then lines on top. Each series takes its
+    // color from PLOT_PALETTE by DECLARATION order (mermaid semantics), so a
+    // `bar` + `line` pair renders lavender bars with a slate line regardless
+    // of which kind draws first.
+    let series_color = |si: usize| PLOT_PALETTE[si % PLOT_PALETTE.len()];
+    let bar_series: Vec<(usize, &Series)> =
+        c.series.iter().enumerate().filter(|(_, s)| s.kind == SeriesKind::Bar).collect();
     let group_w = PLOT_W / n as f64 * 0.7;
     let bw = if bar_series.is_empty() { 0.0 } else { group_w / bar_series.len() as f64 };
-    for (bi, s) in bar_series.iter().enumerate() {
+    for (bi, (si, s)) in bar_series.iter().enumerate() {
         for (i, &v) in s.values.iter().enumerate() {
             let cx = vx(i as f64) - group_w / 2.0 + bi as f64 * bw;
             let v = cv(v);
             let y = vy(v).min(vy(ymin));
             let h = (vy(ymin) - vy(v)).abs();
+            // Mermaid bars are borderless palette fills.
             body.push_str(&format!(
-                r#"<rect x="{cx:.1}" y="{y:.1}" width="{bw:.1}" height="{h:.1}" fill="var(--mermaid-node-fill, #ececff)" stroke="currentColor"/>"#
+                r#"<rect x="{cx:.1}" y="{y:.1}" width="{bw:.1}" height="{h:.1}" fill="{}"/>"#,
+                series_color(*si)
             ));
         }
     }
-    for s in c.series.iter().filter(|s| s.kind == SeriesKind::Line) {
+    for (si, s) in c.series.iter().enumerate().filter(|(_, s)| s.kind == SeriesKind::Line) {
         let pts: Vec<String> =
             s.values.iter().enumerate().map(|(i, &v)| format!("{:.1},{:.1}", vx(i as f64), vy(cv(v)))).collect();
         if !pts.is_empty() {
             body.push_str(&format!(
-                r#"<polyline points="{}" fill="none" stroke="currentColor" stroke-width="2"/>"#,
-                pts.join(" ")
+                r#"<polyline points="{}" fill="none" stroke="{}" stroke-width="2"/>"#,
+                pts.join(" "),
+                series_color(si)
             ));
         }
     }
@@ -321,5 +337,24 @@ mod tests {
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
         assert!(svg.contains(">T<") && svg.contains(">a<") && svg.contains(">Y<"));
         assert!(svg.contains("<rect") && svg.contains("<polyline"));
+    }
+
+    #[test]
+    fn series_take_palette_colors_by_declaration_order() {
+        // Mermaid semantics: bar declared first → plotColorPalette[0]
+        // (lavender, borderless), line second → plotColorPalette[1] (slate).
+        let svg = render_svg(
+            &parse("xychart-beta\n bar [2, 5]\n line [3, 6]").unwrap(),
+        );
+        assert!(svg.contains(r##"fill="#ECECFF"/>"##), "bar takes palette[0], no border: {svg}");
+        assert!(svg.contains(r##"stroke="#8493A6""##), "line takes palette[1]: {svg}");
+
+        // Declaration order flipped → colors follow the declarations, not
+        // the kind: the line is now lavender, the bars slate.
+        let svg = render_svg(
+            &parse("xychart-beta\n line [3, 6]\n bar [2, 5]").unwrap(),
+        );
+        assert!(svg.contains(r##"stroke="#ECECFF""##), "first-declared line takes palette[0]: {svg}");
+        assert!(svg.contains(r##"fill="#8493A6"/>"##), "second-declared bar takes palette[1]: {svg}");
     }
 }
