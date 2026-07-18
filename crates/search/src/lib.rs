@@ -39,6 +39,29 @@ impl SearchError {
     }
 }
 
+/// Parse raw user query text behind a panic boundary.
+///
+/// Tantivy's `QueryParser::parse_query` PANICS (asserts, rather than
+/// returning `Err`) on some grammar corners — e.g. `+ *` hits "Exist
+/// query without a field isn't allowed" in `user_input_ast.rs`. The
+/// text here is raw search-box input, so a panic is a remotely
+/// triggerable crash of the calling task; convert any parser panic to
+/// the same `QueryParse` error a malformed query already produces.
+/// Found by the tests/props.rs fuzz; keep every `parse_query` call
+/// site behind this helper.
+fn parse_user_query(
+    parser: &QueryParser,
+    text: &str,
+) -> Result<Box<dyn tantivy::query::Query>, SearchError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.parse_query(text)))
+        .unwrap_or_else(|_| {
+            Err(tantivy::query::QueryParserError::SyntaxError(format!(
+                "unsupported query syntax: {text:?}"
+            )))
+        })
+        .map_err(SearchError::from)
+}
+
 // ─── Schema handles ────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -258,11 +281,11 @@ impl SearchIndex {
         // Build the text query across title (boosted) and body
         let mut parser = QueryParser::for_index(searcher.index(), vec![f.title, f.body]);
         parser.set_field_boost(f.title, 2.0);
-        let text_query = parser.parse_query(&query.text)?;
+        let text_query = parse_user_query(&parser, &query.text)?;
 
         // Keep a reference to the text query for snippet generation (before
         // it is moved into the BooleanQuery clauses).
-        let text_query_ref = parser.parse_query(&query.text)?;
+        let text_query_ref = parse_user_query(&parser, &query.text)?;
 
         // Combine text query with optional filters
         let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![];
@@ -325,7 +348,7 @@ impl SearchIndex {
 
         let mut parser = QueryParser::for_index(searcher.index(), vec![f.title, f.body]);
         parser.set_field_boost(f.title, 2.0);
-        let text_query = parser.parse_query(&query.text)?;
+        let text_query = parse_user_query(&parser, &query.text)?;
 
         let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![];
         clauses.push((Occur::Must, text_query));
@@ -818,6 +841,34 @@ mod tests {
             matches!(err, SearchError::QueryParse(_)),
             "expected QueryParse from count, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn test_panicking_parser_inputs_return_parse_error() {
+        // Tantivy's parser ASSERTS (panics) rather than erroring on some
+        // grammar corners — `+ *` hits "Exist query without a field isn't
+        // allowed" in tantivy-query-grammar's user_input_ast. Found by the
+        // tests/props.rs fuzz; the parse_user_query panic boundary must
+        // convert these to QueryParse errors for search() AND count().
+        let idx = SearchIndex::open_in_memory().unwrap();
+        idx.index_document(&sample_doc("d1", "Hello", "world"))
+            .unwrap();
+
+        for text in ["+ *", "*", "- *"] {
+            let err = match idx.search(&q(text)) {
+                Ok(_) => continue, // acceptable: input parses harmlessly
+                Err(e) => e,
+            };
+            assert!(
+                matches!(err, SearchError::QueryParse(_)),
+                "expected QueryParse for {text:?}, got: {err:?}"
+            );
+            let err = idx.count(&q(text)).unwrap_err();
+            assert!(
+                matches!(err, SearchError::QueryParse(_)),
+                "expected QueryParse from count for {text:?}, got: {err:?}"
+            );
+        }
     }
 
     #[test]
