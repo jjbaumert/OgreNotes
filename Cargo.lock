@@ -3845,6 +3845,7 @@ dependencies = [
 name = "ogrenotes-search"
 version = "0.1.2"
 dependencies = [
+ "proptest",
  "serde",
  "serde_json",
  "tantivy",
