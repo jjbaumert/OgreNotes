@@ -299,7 +299,16 @@ pub(crate) fn render_svg(g: &GitGraph) -> String {
     let x_of = |seq: usize| LABEL_W + 20.0 + seq as f64 * COMMIT_GAP;
     let y_of = |lane: usize| TOP + lane as f64 * LANE_GAP;
     let w = x_of(max_seq) + 60.0;
-    let h = y_of(n_lanes.saturating_sub(1)) + 40.0;
+    // Bottom margin must fit the rotated id labels, which are END-anchored
+    // just below their dot and trail down-left at 45° — the vertical drop is
+    // label_width/√2 (plus glyph extent), measured at the 11px label size.
+    let label_drop = g
+        .commits
+        .iter()
+        .map(|c| crate::measure::text_size(&commit_id(c)).0 * (11.0 / crate::measure::FONT_PX))
+        .fold(0.0, f64::max)
+        / std::f64::consts::SQRT_2;
+    let h = y_of(n_lanes.saturating_sub(1)) + DOT_R + 10.0 + label_drop + 14.0;
 
     let mut svg = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:12px">"#
@@ -405,9 +414,12 @@ pub(crate) fn render_svg(g: &GitGraph) -> String {
             continue;
         }
         // D3: commit id labels are rotated -45deg about their anchor point.
-        let ly = cy + DOT_R + 14.0;
+        // Upstream anchors the END of the text just below the dot so the
+        // label trails away down-left; a start-anchored label at the same
+        // point would instead run up-right *through* the dot and lane line.
+        let ly = cy + DOT_R + 10.0;
         svg.push_str(&format!(
-            r#"<text x="{cx:.1}" y="{ly:.1}" text-anchor="start" transform="rotate(-45 {cx:.1} {ly:.1})" fill="currentColor" style="font-size:11px">{}</text>"#,
+            r#"<text x="{cx:.1}" y="{ly:.1}" text-anchor="end" transform="rotate(-45 {cx:.1} {ly:.1})" fill="currentColor" style="font-size:11px">{}</text>"#,
             escape_xml(&commit_id(c)),
         ));
     }
@@ -558,6 +570,21 @@ mod tests {
         let svg = render_svg(&g);
         assert!(!svg.contains("<x>"));
         assert!(svg.contains("&lt;x&gt;"));
+    }
+
+    #[test]
+    fn commit_id_label_ends_at_the_dot() {
+        // The rotated id label is END-anchored just below its dot so the
+        // text trails down-left (upstream behavior); a start anchor would
+        // run the text up-right through the dot and lane line.
+        let g = p("gitGraph\ncommit id: \"abc\"");
+        let svg = render_svg(&g);
+        let label = svg
+            .split("<text")
+            .find(|t| t.contains("abc"))
+            .expect("id label present");
+        assert!(label.contains(r#"text-anchor="end""#), "label must be end-anchored: {label}");
+        assert!(label.contains("rotate(-45"), "label must stay rotated: {label}");
     }
 
     #[test]
