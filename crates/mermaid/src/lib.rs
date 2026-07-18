@@ -40,6 +40,8 @@ pub(crate) mod boxgraph;
 pub(crate) mod state;
 pub(crate) mod class;
 pub(crate) mod er;
+#[cfg(test)]
+mod props;
 
 /// Max diagram source length (chars). Shared cap: the single source of
 /// truth for both the `crates/collab` write-gate validator

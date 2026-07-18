@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1a692798a00243c7c0247457aeacbe3cddc73cb7bb17fa929aa097f93af000f7 # shrinks to src = "xychart-beta\n bar [1e308, 1e308]\n y-axis \"y\" 0 --> 100"
+cc 208229e595f735583cf9cfd816a641128bdba1e230f5f9b46767f6c533e12568 # shrinks to src = "treemap-beta\n \"section\"\n     \"deep\": 1e308\n     \"deep\": 1e308\n \"section\""

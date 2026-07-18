@@ -64,7 +64,9 @@ pub(crate) fn parse(source: &str) -> Result<Radar, ParseError> {
                 return Err(err("radar has too many axes", line_no));
             }
         } else if let Some(m) = line.strip_prefix("max ") {
-            max = m.trim().parse().ok();
+            // `"1e999"`/`"inf"` parse as f64 infinity — treat non-finite
+            // like non-numeric (ignored) so scale math stays finite.
+            max = m.trim().parse().ok().filter(|v: &f64| v.is_finite());
         } else if let Some(c) = line.strip_prefix("curve ") {
             let (label, values) = parse_curve(c)
                 .ok_or_else(|| err("curve needs `name{v, v, …}`", line_no))?;
@@ -112,7 +114,9 @@ fn parse_curve(s: &str) -> Option<(String, Vec<f64>)> {
     let label = label_of(s[..brace].trim());
     let values: Vec<f64> = s[brace + 1..end]
         .split(',')
-        .map(|v| v.trim().parse::<f64>().ok())
+        // Non-finite values ("1e999", "inf", "NaN") corrupt the v/max
+        // scale into NaN polygon points — reject them like non-numerics.
+        .map(|v| v.trim().parse::<f64>().ok().filter(|v| v.is_finite()))
         .collect::<Option<_>>()?;
     Some((label, values))
 }

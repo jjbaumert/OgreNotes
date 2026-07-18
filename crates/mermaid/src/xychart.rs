@@ -111,7 +111,12 @@ fn parse_list_str(s: &str) -> Vec<String> {
 /// `[1, 2, 3]` → floats, or `None` if any item isn't numeric.
 fn parse_list_num(s: &str) -> Option<Vec<f64>> {
     let inner = s.trim().strip_prefix('[')?.strip_suffix(']')?;
-    inner.split(',').map(|x| x.trim().parse::<f64>().ok()).collect()
+    inner
+        .split(',')
+        // Non-finite values ("1e999", "inf", "NaN") turn the axis scale
+        // into NaN coordinates — reject them like non-numerics.
+        .map(|x| x.trim().parse::<f64>().ok().filter(|v| v.is_finite()))
+        .collect()
 }
 
 /// `"label" min --> max`, `"label"`, or `min --> max` — any part optional.
@@ -126,7 +131,10 @@ fn parse_y_axis(s: &str) -> (Option<String>, Option<(f64, f64)>) {
         (None, s)
     };
     let range = rest.split_once("-->").and_then(|(a, b)| {
-        Some((a.trim().parse::<f64>().ok()?, b.trim().parse::<f64>().ok()?))
+        Some((
+            a.trim().parse::<f64>().ok().filter(|v| v.is_finite())?,
+            b.trim().parse::<f64>().ok().filter(|v| v.is_finite())?,
+        ))
     });
     (label, range)
 }
@@ -142,7 +150,7 @@ pub(crate) fn render_svg(c: &XYChart) -> String {
         .max(c.series.iter().map(|s| s.values.len()).max().unwrap_or(0))
         .max(1);
     // y-range: explicit, else [min(0, data_min), data_max].
-    let (ymin, ymax) = c.y_range.unwrap_or_else(|| {
+    let (ymin_raw, ymax_raw) = c.y_range.unwrap_or_else(|| {
         let mut lo = 0.0_f64;
         let mut hi = 1.0_f64;
         for s in &c.series {
@@ -153,7 +161,16 @@ pub(crate) fn render_svg(c: &XYChart) -> String {
         }
         (lo, hi)
     });
+    // Normalize an inverted explicit range (`10 --> -10`): sorting keeps
+    // `span` honest instead of collapsing it to the 1e-9 floor, and makes
+    // the value clamp below well-defined.
+    let (ymin, ymax) = if ymin_raw <= ymax_raw { (ymin_raw, ymax_raw) } else { (ymax_raw, ymin_raw) };
     let span = (ymax - ymin).max(1e-9);
+    // Pin data to the axis range. Values far outside an explicit range
+    // (e.g. 1e308 against `0 --> 100`) would otherwise overflow the pixel
+    // scale to ±inf; clamped, they draw at the plot edge like any other
+    // out-of-range point.
+    let cv = move |v: f64| v.clamp(ymin, ymax);
 
     let plot_left = PAD + Y_AXIS_W;
     let mut plot_top = PAD;
@@ -222,6 +239,7 @@ pub(crate) fn render_svg(c: &XYChart) -> String {
     for (bi, s) in bar_series.iter().enumerate() {
         for (i, &v) in s.values.iter().enumerate() {
             let cx = vx(i as f64) - group_w / 2.0 + bi as f64 * bw;
+            let v = cv(v);
             let y = vy(v).min(vy(ymin));
             let h = (vy(ymin) - vy(v)).abs();
             body.push_str(&format!(
@@ -231,7 +249,7 @@ pub(crate) fn render_svg(c: &XYChart) -> String {
     }
     for s in c.series.iter().filter(|s| s.kind == SeriesKind::Line) {
         let pts: Vec<String> =
-            s.values.iter().enumerate().map(|(i, &v)| format!("{:.1},{:.1}", vx(i as f64), vy(v))).collect();
+            s.values.iter().enumerate().map(|(i, &v)| format!("{:.1},{:.1}", vx(i as f64), vy(cv(v)))).collect();
         if !pts.is_empty() {
             body.push_str(&format!(
                 r#"<polyline points="{}" fill="none" stroke="currentColor" stroke-width="2"/>"#,
