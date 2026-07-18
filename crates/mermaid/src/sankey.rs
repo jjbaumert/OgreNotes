@@ -19,7 +19,8 @@ const MAX_LINKS: usize = 4000;
 /// ≤MAX_LINKS links stay far below f64::MAX (4000 × 1e12 = 4e15).
 const MAX_LINK_VALUE: f64 = 1e12;
 
-/// Per-node colors, cycled by node index (ribbons inherit their source color).
+/// Per-node colors, cycled by node index (ribbons blend source→target via
+/// per-link linear gradients — see the `<defs>` emission in `render_svg`).
 const PALETTE: &[&str] = &[
     "#3b82f6", "#ef4444", "#22c55e", "#a855f7", "#f59e0b", "#14b8a6", "#ec4899", "#64748b",
     "#0ea5e9", "#84cc16",

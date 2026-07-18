@@ -163,6 +163,18 @@ pub(crate) fn render_svg(r: &Radar) -> String {
             pts.join(" ")
         ));
     }
+    // Ring value ticks: mermaid labels each ring with its axis value up the
+    // first (top) spoke, so the concentric grid has a readable scale.
+    for ring in 1..=RINGS {
+        let frac = ring as f64 / RINGS as f64;
+        let v = r.max * frac;
+        let txt = if v.fract() == 0.0 { format!("{v:.0}") } else { format!("{v:.1}") };
+        body.push_str(&format!(
+            r#"<text x="{:.1}" y="{:.1}" font-size="10" fill="currentColor" opacity="0.55">{txt}</text>"#,
+            cx + 4.0,
+            cy - frac * RADIUS + 4.0,
+        ));
+    }
     // axis spokes + labels.
     for i in 0..n {
         let (ex, ey) = point(i, 1.0);
@@ -251,5 +263,15 @@ mod tests {
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
         assert!(svg.contains(">T<") && svg.contains(">A<"));
         assert!(svg.matches("<polygon").count() > RINGS); // rings + curve
+    }
+
+    #[test]
+    fn rings_carry_value_tick_labels() {
+        // With max 100 and 4 rings, the top spoke is labeled 25/50/75/100.
+        let svg =
+            render_svg(&parse("radar-beta\n axis A, B, C\n curve x{10, 20, 30}\n max 100").unwrap());
+        for v in ["25", "50", "75", "100"] {
+            assert!(svg.contains(&format!(">{v}</text>")), "missing ring tick {v}: {svg}");
+        }
     }
 }

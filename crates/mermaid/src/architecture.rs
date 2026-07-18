@@ -368,40 +368,96 @@ fn port_point((cx, cy): (f64, f64), side: Side) -> (f64, f64) {
 }
 
 /// A handful of built-in icon glyphs; anything else becomes a rounded box.
+/// Each known name gets a distinct multi-color glyph approximating the
+/// iconify icons mermaid renders (cloud, globe, rack, cylinder, drive) —
+/// fixed colors, same pattern as the diagram palettes elsewhere.
 fn draw_icon(out: &mut String, icon: &str, x: f64, y: f64, s: f64) {
-    let fill = "var(--mermaid-node-fill, #ececff)";
+    const BLUE: &str = "#2563eb";
+    const BLUE_LIGHT: &str = "#dbeafe";
+    const BLUE_MID: &str = "#bfdbfe";
+    const SLATE: &str = "#475569";
+    const SLATE_LIGHT: &str = "#e2e8f0";
+    const GREY: &str = "#94a3b8";
+    const GREEN: &str = "#22c55e";
+    const AMBER: &str = "#f59e0b";
     match icon {
-        "database" | "disk" => {
+        "database" => {
             let ry = 6.0;
             out.push_str(&format!(
-                r#"<path d="M {x:.1} {:.1} L {x:.1} {:.1} A {:.1} {ry} 0 0 0 {:.1} {:.1} L {:.1} {:.1} A {:.1} {ry} 0 0 0 {x:.1} {:.1} Z" fill="{fill}" stroke="currentColor"/>"#,
+                r#"<path d="M {x:.1} {:.1} L {x:.1} {:.1} A {:.1} {ry} 0 0 0 {:.1} {:.1} L {:.1} {:.1} A {:.1} {ry} 0 0 0 {x:.1} {:.1} Z" fill="{BLUE_LIGHT}" stroke="{BLUE}" stroke-width="1.5"/>"#,
                 y + ry, y + s - ry, s / 2.0, x + s, y + s - ry, x + s, y + ry, s / 2.0, y + ry,
             ));
             out.push_str(&format!(
-                r#"<ellipse cx="{:.1}" cy="{:.1}" rx="{:.1}" ry="{ry}" fill="{fill}" stroke="currentColor"/>"#,
+                r#"<ellipse cx="{:.1}" cy="{:.1}" rx="{:.1}" ry="{ry}" fill="{BLUE_MID}" stroke="{BLUE}" stroke-width="1.5"/>"#,
                 x + s / 2.0,
                 y + ry,
                 s / 2.0
             ));
         }
-        "cloud" | "internet" => {
+        "disk" => {
+            // Drive: slate case, platter spindle, amber activity LED.
             out.push_str(&format!(
-                r#"<circle cx="{:.1}" cy="{:.1}" r="{:.1}" fill="{fill}" stroke="currentColor"/>"#,
-                x + s / 2.0,
-                y + s / 2.0,
-                s / 2.0
+                r#"<rect x="{x:.1}" y="{:.1}" width="{s:.1}" height="{:.1}" fill="{SLATE_LIGHT}" stroke="{SLATE}" stroke-width="1.5" rx="4"/>"#,
+                y + s * 0.08,
+                s * 0.84,
+            ));
+            out.push_str(&format!(
+                r#"<circle cx="{:.1}" cy="{:.1}" r="{:.1}" fill="{GREY}" stroke="{SLATE}"/><circle cx="{:.1}" cy="{:.1}" r="{:.1}" fill="{SLATE}"/>"#,
+                x + s * 0.42, y + s * 0.5, s * 0.2,
+                x + s * 0.42, y + s * 0.5, s * 0.06,
+            ));
+            out.push_str(&format!(
+                r#"<circle cx="{:.1}" cy="{:.1}" r="2.5" fill="{AMBER}"/>"#,
+                x + s * 0.82,
+                y + s * 0.78,
             ));
         }
-        "server" | "disk1" => {
+        "cloud" => {
+            // Material-style cloud silhouette, scaled from a 24x24 grid.
+            let k = s / 24.0;
             out.push_str(&format!(
-                r#"<rect x="{x:.1}" y="{y:.1}" width="{s:.1}" height="{s:.1}" fill="{fill}" stroke="currentColor" rx="3"/><line x1="{x:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="currentColor" opacity="0.5"/><line x1="{x:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="currentColor" opacity="0.5"/>"#,
+                r#"<g transform="translate({x:.1} {y:.1}) scale({k:.3})"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z" fill="{BLUE_LIGHT}" stroke="{BLUE}" stroke-width="1.5"/></g>"#
+            ));
+        }
+        "internet" => {
+            // Globe: circle + equator + meridian ellipse + latitude chords.
+            let (cx, cy, r) = (x + s / 2.0, y + s / 2.0, s * 0.44);
+            out.push_str(&format!(
+                r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r:.1}" fill="{BLUE_LIGHT}" stroke="{BLUE}" stroke-width="1.5"/>"#
+            ));
+            out.push_str(&format!(
+                r#"<ellipse cx="{cx:.1}" cy="{cy:.1}" rx="{:.1}" ry="{r:.1}" fill="none" stroke="{BLUE}" opacity="0.7"/>"#,
+                r * 0.45
+            ));
+            let lat = r * 0.5;
+            let half = (r * r - lat * lat).sqrt();
+            out.push_str(&format!(
+                r#"<line x1="{:.1}" y1="{cy:.1}" x2="{:.1}" y2="{cy:.1}" stroke="{BLUE}" opacity="0.7"/><line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="{BLUE}" opacity="0.5"/><line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="{BLUE}" opacity="0.5"/>"#,
+                cx - r, cx + r,
+                cx - half, cy - lat, cx + half, cy - lat,
+                cx - half, cy + lat, cx + half, cy + lat,
+            ));
+        }
+        "server" => {
+            // Rack: slate chassis, unit dividers, green status LEDs + vents.
+            out.push_str(&format!(
+                r#"<rect x="{x:.1}" y="{y:.1}" width="{s:.1}" height="{s:.1}" fill="{SLATE_LIGHT}" stroke="{SLATE}" stroke-width="1.5" rx="3"/><line x1="{x:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="{SLATE}" opacity="0.6"/><line x1="{x:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="{SLATE}" opacity="0.6"/>"#,
                 y + s / 3.0, x + s, y + s / 3.0,
                 y + 2.0 * s / 3.0, x + s, y + 2.0 * s / 3.0,
             ));
+            for u in 0..3 {
+                let uy = y + (u as f64 + 0.5) * s / 3.0;
+                out.push_str(&format!(
+                    r#"<circle cx="{:.1}" cy="{uy:.1}" r="2.2" fill="{GREEN}"/><line x1="{:.1}" y1="{uy:.1}" x2="{:.1}" y2="{uy:.1}" stroke="{SLATE}" opacity="0.5"/>"#,
+                    x + s * 0.18,
+                    x + s * 0.45,
+                    x + s * 0.82,
+                ));
+            }
         }
         _ => {
             out.push_str(&format!(
-                r#"<rect x="{x:.1}" y="{y:.1}" width="{s:.1}" height="{s:.1}" fill="{fill}" stroke="currentColor" rx="4"/>"#
+                r#"<rect x="{x:.1}" y="{y:.1}" width="{s:.1}" height="{s:.1}" fill="var(--mermaid-node-fill, #ececff)" stroke="currentColor" rx="4"/>"#
             ));
         }
     }
@@ -455,6 +511,25 @@ mod tests {
     fn errors() {
         assert!(parse("group a(x)[A]").is_err()); // no header
         assert!(parse("architecture-beta").is_err()); // no nodes
+    }
+
+    #[test]
+    fn icons_are_distinct_multicolor_glyphs() {
+        // Each known icon renders its own glyph, not a shared shape: cloud a
+        // silhouette path, internet a globe (circle + meridian ellipse),
+        // server a rack with green LEDs, database a blue cylinder, disk a
+        // drive with spindle + amber LED.
+        let svg = render_svg(
+            &parse(
+                "architecture-beta\n service a(cloud)[A]\n service b(internet)[B]\n service c(server)[C]\n service d(database)[D]\n service e(disk)[E]",
+            )
+            .unwrap(),
+        );
+        assert!(svg.contains("M19.35 10.04"), "cloud silhouette path: {svg}");
+        assert!(svg.contains("<ellipse") && svg.contains(r#"opacity="0.7""#), "globe meridian: {svg}");
+        assert!(svg.contains("#22c55e"), "server status LEDs: {svg}");
+        assert!(svg.contains("#bfdbfe"), "database cylinder top: {svg}");
+        assert!(svg.contains("#f59e0b"), "disk activity LED: {svg}");
     }
 
     #[test]

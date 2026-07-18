@@ -243,6 +243,15 @@ pub(crate) fn render_svg(g: &ReqGraph) -> Result<String, ParseError> {
             y - 4.0,
             escape_xml(&n.subtitle)
         ));
+        // Mermaid separates the «type»/name header compartment from the
+        // field body with a full-width horizontal rule.
+        if !n.body.is_empty() {
+            let ry = y + 2.0;
+            out.push_str(&format!(
+                r#"<line x1="{bx:.1}" y1="{ry:.1}" x2="{:.1}" y2="{ry:.1}" stroke="currentColor"/>"#,
+                bx + bw
+            ));
+        }
         for b in &n.body {
             y += line_h;
             out.push_str(&format!(
@@ -304,5 +313,25 @@ mod tests {
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
         assert!(svg.contains(">r1<") && svg.contains(">e1<"));
         assert!(svg.contains("«satisfies»") && svg.contains("«requirement»"));
+    }
+
+    #[test]
+    fn compartment_rule_only_when_fields_exist() {
+        // Boxes with body fields get a full-width divider under the name
+        // header (mermaid's compartment rule); field-less boxes don't.
+        let with_fields = render_svg(
+            &parse("requirementDiagram\n requirement r1 {\n id: 1\n }\n element e1 {\n }\n e1 - satisfies -> r1").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            with_fields.matches("<line x1=").count(),
+            1,
+            "exactly one divider (r1 has fields, e1 doesn't): {with_fields}"
+        );
+        let no_fields = render_svg(
+            &parse("requirementDiagram\n requirement r1 {\n }\n element e1 {\n }\n e1 - satisfies -> r1").unwrap(),
+        )
+        .unwrap();
+        assert!(!no_fields.contains("<line x1="), "no divider without fields: {no_fields}");
     }
 }
