@@ -10,8 +10,17 @@ use proptest::prelude::*;
 
 fn assert_partition(src: &str) {
     for lang in Language::ALL {
-        let joined: String = highlight(src, lang).iter().map(|t| t.text).collect();
+        let tokens = highlight(src, lang);
+        let joined: String = tokens.iter().map(|t| t.text).collect();
         assert_eq!(joined, src, "partition violated for {lang:?} on {src:?}");
+        // A zero-length token satisfies the concatenation check trivially
+        // but desyncs the editor's caret walk (one DOM node per token —
+        // see frontend/src/editor/view.rs). The full contract is
+        // "non-empty partition".
+        assert!(
+            tokens.iter().all(|t| !t.text.is_empty()),
+            "empty token emitted for {lang:?} on {src:?}"
+        );
     }
 }
 

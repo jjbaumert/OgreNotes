@@ -315,4 +315,16 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn labels_are_nonempty_and_unique() {
+        // The selector chip shows label(); a duplicate would make two
+        // languages indistinguishable in the picker.
+        let mut seen = std::collections::HashSet::new();
+        for lang in Language::ALL {
+            let label = lang.label();
+            assert!(!label.is_empty(), "{lang:?} has an empty label");
+            assert!(seen.insert(label), "duplicate label {label:?}");
+        }
+    }
 }
