@@ -226,6 +226,14 @@ impl JobQueue {
         Ok(Self { client, stream, group })
     }
 
+    /// The main work stream key this queue reads/writes. The
+    /// dead-letter stream is `{stream_name}:dlq` — operators use
+    /// this to locate the DLQ for XCLAIM recovery (see the module
+    /// docs' dead-letter runbook).
+    pub fn stream_name(&self) -> &str {
+        &self.stream
+    }
+
     /// Enqueue a job. Returns the stable [`JobId`] (nanoid). Writes
     /// the side-channel status hash to `Pending` before returning
     /// so an immediate poll sees the work.
