@@ -14,6 +14,10 @@ const COL_GAP: f64 = 160.0; // horizontal spacing between layers
 const V_GAP: f64 = 12.0; // vertical gap between stacked nodes in a column
 const MIN_LINK_H: f64 = 1.0;
 const MAX_LINKS: usize = 4000;
+/// Cap on a single link's value. Band heights are proportions, so capping
+/// loses nothing visually; it guarantees per-node throughput sums over
+/// ≤MAX_LINKS links stay far below f64::MAX (4000 × 1e12 = 4e15).
+const MAX_LINK_VALUE: f64 = 1e12;
 
 /// Per-node colors, cycled by node index (ribbons inherit their source color).
 const PALETTE: &[&str] = &[
@@ -69,9 +73,19 @@ pub(crate) fn parse(source: &str) -> Result<Sankey, ParseError> {
             return Err(err(format!("sankey row needs `source,target,value`, got {line:?}"), line_no));
         }
         let (src, tgt) = (fields[0].trim(), fields[1].trim());
-        let value: f64 = fields[2].trim().parse().map_err(|_| {
-            err(format!("sankey value must be numeric, got {:?}", fields[2].trim()), line_no)
-        })?;
+        // Non-finite parses ("1e999", "inf", "NaN") take the same error as
+        // non-numerics; the cap keeps per-node throughput sums finite (two
+        // 1e308 links on one node would otherwise sum to inf and turn the
+        // band scale into NaN).
+        let value: f64 = fields[2]
+            .trim()
+            .parse()
+            .ok()
+            .filter(|v: &f64| v.is_finite())
+            .map(|v: f64| v.min(MAX_LINK_VALUE))
+            .ok_or_else(|| {
+                err(format!("sankey value must be numeric, got {:?}", fields[2].trim()), line_no)
+            })?;
         if src.is_empty() || tgt.is_empty() {
             return Err(err("sankey row has an empty source or target", line_no));
         }

@@ -14,6 +14,10 @@ const HEADER_H: f64 = 18.0;
 const TITLE_H: f64 = 30.0;
 const MAX_NODES: usize = 2000;
 const MAX_DEPTH: usize = 32;
+/// Cap on a single leaf's value. Areas are proportions, so capping loses
+/// nothing visually; it guarantees `weight()` sums over ≤MAX_NODES leaves
+/// stay far below f64::MAX (2000 × 1e12 = 2e15).
+const MAX_LEAF_VALUE: f64 = 1e12;
 
 /// Depth-cycled fill palette (outer→inner tint by depth).
 const PALETTE: &[&str] =
@@ -119,13 +123,21 @@ fn indent_of(raw: &str) -> usize {
 
 /// `"name": value`, `"name"`, `id["name"]: value`, or a bare token.
 fn parse_node(s: &str) -> Option<(String, Option<f64>)> {
-    let (head, value) = match s.rsplit_once(':') {
-        // Only treat the trailing `: n` as a value when `n` parses as a number
-        // (a colon inside a quoted name stays part of the name).
-        Some((h, v)) if v.trim().parse::<f64>().is_ok() => {
-            (h.trim(), Some(v.trim().parse::<f64>().unwrap()))
-        }
-        _ => (s, None),
+    let (head, value) = match s
+        .rsplit_once(':')
+        // Only treat the trailing `: n` as a value when `n` parses as a
+        // FINITE number (a colon inside a quoted name stays part of the
+        // name, and "1e999"/"inf"/"NaN" are treated like any other
+        // non-number). Cap the magnitude so `weight()` sums over siblings
+        // can never overflow to inf — two 1e308 leaves summed otherwise
+        // poison the squarify scale into NaN rectangles. Negative areas
+        // are meaningless in a treemap; floor at 0.
+        .and_then(|(h, v)| {
+            let v = v.trim().parse::<f64>().ok().filter(|v| v.is_finite())?;
+            Some((h, v.clamp(0.0, MAX_LEAF_VALUE)))
+        }) {
+        Some((h, v)) => (h.trim(), Some(v)),
+        None => (s, None),
     };
     let name = extract_name(head);
     if name.is_empty() {
