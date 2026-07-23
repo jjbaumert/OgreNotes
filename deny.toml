@@ -35,6 +35,10 @@ ignore = [
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained (via AWS SDK); no fix available" },
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained (deep transitive); no safe upgrade" },
 
+    # smallstr unmaintained, arrives via yrs (the Yjs/CRDT engine — core to
+    # collab, not replaceable). All versions affected; no safe upgrade exists.
+    { id = "RUSTSEC-2026-0215", reason = "smallstr unmaintained (deep transitive via yrs); no safe upgrade available" },
+
     # lopdf stack-overflow on deeply-nested PDF parse (load_mem & friends).
     # The exploitable path is PARSING untrusted uploads — that's pdf-extract
     # (our PDF reader), now on patched lopdf 0.42 (pdf-extract 0.10 -> 0.12).
