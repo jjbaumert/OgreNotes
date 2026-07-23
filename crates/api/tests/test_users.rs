@@ -441,6 +441,36 @@ async fn ui_prefs_round_trip_and_merge() {
     app.cleanup().await;
 }
 
+/// Phase 5 editor-width toggle (frontend Task 3 consumes this):
+/// `editorWidth` round-trips through the PUT-merge and `GET /users/me`
+/// the same way `theme`/`locale` do.
+#[tokio::test]
+async fn ui_prefs_editor_width_round_trip() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let (_, token) = app.create_user("prefs-editor-width@test.com").await;
+
+    // PUT editorWidth = wide
+    let (status, body) = app
+        .json_request(
+            Method::PUT,
+            "/api/v1/users/me/prefs",
+            Some(&token),
+            Some(serde_json::json!({ "editorWidth": "wide" })),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["editorWidth"], "wide", "PUT echoes merged result");
+
+    // GET /users/me and assert it round-tripped
+    let (_, me) = app
+        .json_request(Method::GET, "/api/v1/users/me", Some(&token), None)
+        .await;
+    assert_eq!(me["uiPrefs"]["editorWidth"], "wide");
+
+    app.cleanup().await;
+}
+
 /// Defends the M-P1 piece B follow-up fix: bool fields in UiPrefs
 /// (`dyslexicFont`, `reduceMotion`) were previously plain `bool`,
 /// which the JSON layer defaulted to `false` on any partial PUT

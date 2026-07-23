@@ -77,6 +77,17 @@ pub enum ThemePref {
     Dark,
 }
 
+/// Editor content max-width preference. Lowercase on the wire.
+/// Absent ⇒ Medium (the 1080px baseline).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EditorWidth {
+    Narrow,
+    #[default]
+    Medium,
+    Wide,
+}
+
 /// #148 — AI-assistant access policy on the User row. Replaces the
 /// prior `ask_enabled: bool` gate with a three-state model so the
 /// operator can enable ask without also handing the user an escape
@@ -152,6 +163,10 @@ pub struct UiPrefs {
     /// to `navigator.language` then en-US. Wired in M-P2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locale: Option<String>,
+    /// Editor content max-width. `None` ⇒ Medium (the 1080px
+    /// baseline). Wired by the Phase 5 editor-width toggle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_width: Option<EditorWidth>,
 }
 
 /// A user's self-set status (account-menu step 5) — e.g.

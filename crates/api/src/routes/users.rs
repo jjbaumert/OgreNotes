@@ -392,6 +392,9 @@ async fn put_ui_prefs(
     if patch.reduce_motion.is_some() {
         merged.reduce_motion = patch.reduce_motion;
     }
+    if patch.editor_width.is_some() {
+        merged.editor_width = patch.editor_width;
+    }
 
     let now = ogrenotes_common::time::now_usec();
     state

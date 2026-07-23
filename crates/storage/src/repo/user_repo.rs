@@ -1187,7 +1187,9 @@ mod tests {
         // attribute written by user_to_item must decode back
         // identically. Catches an encode/decode drift on any single
         // field even without a focused test for it.
-        use crate::models::user::{AskPolicy, EncryptedString, ThemePref, UiPrefs, UserStatus};
+        use crate::models::user::{
+            AskPolicy, EditorWidth, EncryptedString, ThemePref, UiPrefs, UserStatus,
+        };
         let mut user = sample_user();
         user.avatar_url = Some("https://example.com/a.png".to_string());
         user.provider = AuthProvider::Github;
@@ -1210,6 +1212,7 @@ mod tests {
             dyslexic_font: Some(true),
             reduce_motion: None,
             locale: Some("en-US".to_string()),
+            editor_width: Some(EditorWidth::Wide),
         });
         user.status = Some(UserStatus {
             text: "afk".to_string(),
