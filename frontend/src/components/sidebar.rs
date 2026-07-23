@@ -483,6 +483,7 @@ pub fn Sidebar(
             class:collapsed=collapsed
             class:is-open=is_open_class
             class:no-anim=resizing
+            class:chat-expanded=chat_expand
             aria-label=crate::t!("sidebar-aria-main-nav")
             on:touchstart=on_nav_touchstart
             on:touchend=on_nav_touchend
