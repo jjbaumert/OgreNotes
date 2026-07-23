@@ -24,6 +24,7 @@ pub mod duplicate_dialog;
 pub mod editor_component;
 pub mod editor_context_menu;
 pub mod editor_gutter;
+pub mod editor_width_toggle;
 pub mod file_browser;
 pub mod find_replace_bar;
 pub mod folder_picker;
