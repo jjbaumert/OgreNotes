@@ -36,10 +36,13 @@
 
 /* ─── Tablet (≤ 1024px) ─────────────────────────────────────────────────── */
 @media (max-width: 1024px) {
-  /* Sidebar starts collapsed on tablet to reclaim canvas width */
-  .sidebar {
-    width: var(--sidebar-collapsed);
-  }
+  /* Sidebar width in the 641–1024px "rail" band is owned by the
+   * `.sidebar.collapsed` class, which the sidebar component now forces on
+   * via a matchMedia signal (see `use_rail_signal`). Driving width here
+   * with a bare `width:` used to shrink the bar to 48px WITHOUT switching
+   * its content to the icon strip — leaving clipped text. Removed so the
+   * class-driven collapse (width + icon strip together) is the single
+   * source of truth. */
 
   /* Conversation pane hides on tablet by default; surfaces via toggle */
   .conversation-pane {
