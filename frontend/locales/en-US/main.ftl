@@ -879,6 +879,12 @@ sync-saving-tooltip = Sending your latest changes to the server…
 sync-offline-tooltip = You're disconnected. Reconnect to keep collaborating.
 sync-offline-pending-tooltip = You're disconnected. {$count} change(s) haven't reached the server yet.
 
+# Editor width toggle (S/M/L)
+editor-width-group = Editor width
+editor-width-narrow = Narrow width
+editor-width-medium = Medium width
+editor-width-wide = Wide width
+
 # ─── Command palette (Phase 5 M-P4 piece A) ─────────────────────
 # Reached via `>` prefix in the Ctrl+K search dialog. v1 ships
 # Global-scope commands only; piece B adds Editor / Spreadsheet
