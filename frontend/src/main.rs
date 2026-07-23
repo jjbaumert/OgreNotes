@@ -18,6 +18,7 @@ pub mod observability;
 mod pages;
 mod rum;
 mod spreadsheet;
+mod editor_width;
 mod theme;
 mod touch;
 
@@ -144,6 +145,11 @@ fn apply_boot_prefs(prefs: Option<&api::client::UiPrefsDto>) {
     if let Some(dt) = prefs.doc_theme.as_deref() {
         theme::cache_doc_theme(Some(dt));
         theme::apply_doc_theme(Some(dt));
+    }
+    // Editor width (S/M/L): cache so the document page reads it pre-mount.
+    // No DOM apply here — the editor isn't mounted at boot.
+    if let Some(w) = prefs.editor_width.as_deref() {
+        crate::editor_width::cache_editor_width(crate::editor_width::WidthMode::from_wire(w));
     }
 }
 
