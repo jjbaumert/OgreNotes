@@ -894,3 +894,9 @@ menubar-format-clear = مسح التنسيق
 menubar-format-lock = قفل التعديلات
 editorctx-paragraph-style = نمط الفقرة
 editorctx-insert-link = إدراج رابط…
+
+# Editor width toggle (S/M/L)
+editor-width-group = عرض المحرر
+editor-width-narrow = عرض ضيق
+editor-width-medium = عرض متوسط
+editor-width-wide = عرض واسع

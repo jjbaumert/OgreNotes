@@ -2398,6 +2398,40 @@ html, body {
   margin-inline-start: auto;
 }
 
+/* Editor content-width segmented control (S/M/L). Follows the
+ * theme-selector-btn pattern (.selected uses --color-primary /
+ * --color-on-primary) rather than the undefined --accent-color /
+ * --border-color tokens some legacy rules nearby still reference. */
+.editor-width-modes {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.editor-width-mode-btn {
+  min-width: 26px;
+  padding: 3px 7px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+
+.editor-width-mode-btn:hover {
+  background: var(--color-bg-hover);
+}
+
+.editor-width-mode-btn.selected {
+  background: var(--color-primary);
+  color: var(--color-on-primary);
+}
+
 .user-name {
   font-size: 14px;
   color: var(--text-secondary, #666);

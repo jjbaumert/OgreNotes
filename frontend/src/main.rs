@@ -18,6 +18,7 @@ pub mod observability;
 mod pages;
 mod rum;
 mod spreadsheet;
+mod editor_width;
 mod theme;
 mod touch;
 
@@ -145,6 +146,16 @@ fn apply_boot_prefs(prefs: Option<&api::client::UiPrefsDto>) {
         theme::cache_doc_theme(Some(dt));
         theme::apply_doc_theme(Some(dt));
     }
+    // Editor width (S/M/L): cache so the document page reads it pre-mount.
+    // Written unconditionally — a served None must overwrite any stale
+    // cache left by a previous user on a shared browser (authoritative pref).
+    // No DOM apply here — the editor isn't mounted at boot.
+    let width = prefs
+        .editor_width
+        .as_deref()
+        .map(crate::editor_width::WidthMode::from_wire)
+        .unwrap_or_default();
+    crate::editor_width::cache_editor_width(width);
 }
 
 /// Install the WASM panic hook. In debug builds (`cfg(debug_assertions)`)

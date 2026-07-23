@@ -891,3 +891,9 @@ menubar-format-clear = Cancella formattazione
 menubar-format-lock = Blocca modifiche
 editorctx-paragraph-style = Stile paragrafo
 editorctx-insert-link = Inserisci link…
+
+# Editor width toggle (S/M/L)
+editor-width-group = Larghezza editor
+editor-width-narrow = Larghezza stretta
+editor-width-medium = Larghezza media
+editor-width-wide = Larghezza ampia
