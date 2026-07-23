@@ -36,11 +36,6 @@
 
 /* ─── Tablet (≤ 1024px) ─────────────────────────────────────────────────── */
 @media (max-width: 1024px) {
-  /* Sidebar starts collapsed on tablet to reclaim canvas width */
-  .sidebar {
-    width: var(--sidebar-collapsed);
-  }
-
   /* Conversation pane hides on tablet by default; surfaces via toggle */
   .conversation-pane {
     display: none;
@@ -53,6 +48,35 @@
   /* Editor padding tightens */
   .editor-content {
     padding-inline: var(--space-md);
+  }
+}
+
+/* ─── Icon-rail band (641–1024px) ───────────────────────────────────────── */
+/* The collapse is driven by an async matchMedia signal (`use_rail_signal`)
+ * that lags this CSS breakpoint by a frame — long enough to flash the full
+ * 240px text sidebar when *entering* the band (from the ≤640 drawer, or from
+ * >1024) before the JS `.collapsed` class lands. Make the icon-rail width AND
+ * content switch synchronous with the breakpoint so it snaps straight to the
+ * 48px strip with no flash. The JS `.collapsed` class still drives the logo
+ * glyph, aria, and the >1024 manual collapse. `.chat-expanded` (the Chats-icon
+ * override) opts back out to the full width so the ChatPanel can show. */
+@media (min-width: 641px) and (max-width: 1024px) {
+  .sidebar:not(.chat-expanded) {
+    width: var(--sidebar-collapsed);
+  }
+
+  /* Show the icon strip, hide the text sections + header buttons synchronously
+   * (!important overrides the inline style:display the collapsed signal sets). */
+  .sidebar:not(.chat-expanded) .sidebar-icons {
+    display: flex !important;
+  }
+
+  .sidebar:not(.chat-expanded) .sidebar-section {
+    display: none !important;
+  }
+
+  .sidebar:not(.chat-expanded) .sidebar-header .toolbar-btn {
+    display: none !important;
   }
 }
 

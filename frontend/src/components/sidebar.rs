@@ -2,6 +2,7 @@
 
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
 
 use crate::api::client;
 use crate::api::documents;
@@ -63,6 +64,110 @@ fn write_collapsed(collapsed: bool) {
     if let Some(storage) = local_storage() {
         let _ = storage.set_item(SIDEBAR_COLLAPSED_KEY, if collapsed { "1" } else { "0" });
     }
+}
+
+/// Tracks the "icon-rail" viewport band (641–1024px). Inside this band the
+/// sidebar is forced to its collapsed icon strip regardless of the user's
+/// manual collapse choice; above it the manual choice wins, and below it
+/// (≤640px) the mobile drawer takes over. This is the middle of the three
+/// responsive phases: expanded → icon rail → off-canvas drawer.
+///
+/// Mirrors the `prefers-color-scheme` listener in `theme.rs` — the change
+/// callback re-queries `match_media` rather than reading a
+/// `MediaQueryListEvent`, so no extra web-sys feature is required.
+fn use_rail_signal() -> ReadSignal<bool> {
+    // Keep these bounds in sync with the CSS breakpoints: the lower bound is
+    // `--bp-mobile` + 1 (below it, the ≤640px drawer takes over) and the upper
+    // bound is `--bp-tablet` (above it, the expanded sidebar). Both tokens live
+    // in `variables.css` and are duplicated as literals in `responsive.css`
+    // (CSS `@media` can't read `var()`). A change there must change this too.
+    const RAIL_QUERY: &str = "(min-width: 641px) and (max-width: 1024px)";
+    let (rail, set_rail) = signal(false);
+    let Some(window) = web_sys::window() else {
+        return rail;
+    };
+    let Ok(Some(media)) = window.match_media(RAIL_QUERY) else {
+        return rail;
+    };
+    set_rail.set(media.matches());
+    let closure = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        if let Some(w) = web_sys::window() {
+            if let Ok(Some(m)) = w.match_media(RAIL_QUERY) {
+                set_rail.set(m.matches());
+            }
+        }
+    }) as Box<dyn FnMut(web_sys::Event)>);
+    let _ = media.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref());
+    // Leak the closure: it must outlive this function and stay attached to
+    // `media` for the app's lifetime. Safe because `Sidebar` is a mount-once
+    // persistent-shell singleton (it lives in `AppShell`), so exactly one
+    // listener is ever created.
+    //
+    // NOTE: unlike `theme.rs`, which guards its `prefers-color-scheme` listener
+    // behind a `thread_local` to stay idempotent across repeated calls, this
+    // has NO such guard. If `Sidebar` is ever changed to remount, add one here
+    // (or a thread_local) — otherwise each remount leaks another live listener
+    // firing on an orphaned signal. (`on_cleanup` can't own the closure: Leptos
+    // 0.7 requires it to be Send + Sync, which a wasm `Closure` is not.)
+    closure.forget();
+    rail
+}
+
+/// True while the window is actively resizing. Used to suppress the sidebar's
+/// CSS transitions during a resize so responsive phase changes snap cleanly
+/// instead of animating — in particular the ≤640px drawer, whose `transform`
+/// and width would otherwise slide-and-widen ("flash bigger") as the viewport
+/// crosses the breakpoint (a transition firing on a breakpoint change). The
+/// flag clears ~180ms after resize settles, so the hamburger open/close slide
+/// (not a resize) is unaffected. Same mount-once leak caveat as
+/// [`use_rail_signal`].
+fn use_resize_suppression() -> ReadSignal<bool> {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let (resizing, set_resizing) = signal(false);
+    let Some(window) = web_sys::window() else {
+        return resizing;
+    };
+    // Debounce the re-enable: each resize bumps a generation and schedules a
+    // timeout that only clears the flag if no newer resize has arrived since.
+    let generation: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+    // Only suppress on WIDTH changes. Our breakpoints are width-based, and
+    // mobile browsers fire real `resize` events on height-only changes (URL-bar
+    // / soft-keyboard show-hide during scroll or a swipe-to-close). Ignoring
+    // those keeps an in-progress hamburger/swipe drawer slide from snapping.
+    let read_width = || {
+        web_sys::window()
+            .and_then(|w| w.inner_width().ok())
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as i32
+    };
+    let last_width: Rc<Cell<i32>> = Rc::new(Cell::new(read_width()));
+    let window_for_timeout = window.clone();
+    let resize_cb = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        let width = read_width();
+        if width == last_width.get() {
+            return; // height-only resize — leave transitions intact
+        }
+        last_width.set(width);
+        if !resizing.get_untracked() {
+            set_resizing.set(true);
+        }
+        let g = generation.get().wrapping_add(1);
+        generation.set(g);
+        let generation_check = generation.clone();
+        let clear = Closure::once_into_js(move || {
+            if generation_check.get() == g {
+                set_resizing.set(false);
+            }
+        });
+        let _ = window_for_timeout.set_timeout_with_callback_and_timeout_and_arguments_0(
+            clear.unchecked_ref(),
+            180,
+        );
+    }) as Box<dyn FnMut(web_sys::Event)>);
+    let _ = window.add_event_listener_with_callback("resize", resize_cb.as_ref().unchecked_ref());
+    resize_cb.forget();
+    resizing
 }
 
 /// The document a row context menu (right-click or its `⋯` button) is
@@ -133,7 +238,34 @@ pub fn Sidebar(
     // Initialize from persisted state so navigating from the icon
     // strip (the nav icons full-reload via `set_href`) keeps the
     // collapsed view instead of springing back to expanded.
-    let (collapsed, set_collapsed) = signal(read_collapsed());
+    //
+    // `manual_collapsed` is the user's explicit choice (persisted). `rail`
+    // is the responsive 641–1024px band that forces the icon strip. The
+    // effective `collapsed` used throughout the view is the OR of the two:
+    // above the rail band the manual choice wins; inside it, icons are
+    // forced. Only `manual_collapsed` is persisted, so leaving the band
+    // restores the user's real choice.
+    let (manual_collapsed, set_manual_collapsed) = signal(read_collapsed());
+    let rail = use_rail_signal();
+    // Suppress transitions during resize so phase changes snap cleanly (no
+    // drawer "flash bigger" as the ≤640px breakpoint is crossed).
+    let resizing = use_resize_suppression();
+    // Lets the Chats icon open the ChatPanel from inside the forced rail band
+    // (ChatPanel only renders in the expanded sidebar). Transient — never
+    // persisted — so peeking at Chat never pollutes the real collapse choice.
+    let (chat_expand, set_chat_expand) = signal(false);
+    let collapsed =
+        Memo::new(move |_| !chat_expand.get() && (manual_collapsed.get() || rail.get()));
+    // Scope the transient chat override to the rail band: the moment the
+    // viewport leaves the band (either direction out of 641–1024px), drop it
+    // so the manual choice governs again above the band and the drawer below.
+    // Without this, resizing rail→desktop with Chat open would keep the sidebar
+    // expanded against a persisted "collapsed" preference until the next click.
+    Effect::new(move |_| {
+        if !rail.get() {
+            set_chat_expand.set(false);
+        }
+    });
 
     // #144: the current user's starred docs. Fetched on mount and whenever
     // `favorites_refresh` ticks.
@@ -318,12 +450,23 @@ pub fn Sidebar(
         ]
     });
 
-    let toggle = move |_| set_collapsed.update(|c| *c = !*c);
+    // Collapse/expand. Read the effective state BEFORE mutating so clearing
+    // `chat_expand` in the same handler can't flip the intent mid-computation.
+    // Above the rail band we flip and persist the manual choice; inside the
+    // rail band we only drop the transient chat expand — `rail` re-forces the
+    // strip and the persisted desktop choice stays untouched.
+    let toggle = move |_| {
+        let was_collapsed = collapsed.get();
+        set_chat_expand.set(false);
+        if !rail.get() {
+            set_manual_collapsed.set(!was_collapsed);
+        }
+    };
 
-    // Persist every collapse/expand (the header toggle, and the Chats
-    // icon which expands to reveal the ChatPanel) so the choice
-    // survives reloads.
-    Effect::new(move |_| write_collapsed(collapsed.get()));
+    // Persist every manual collapse/expand (the header toggle, and the Chats
+    // icon which expands to reveal the ChatPanel) so the choice survives
+    // reloads. The responsive `rail` forcing is deliberately NOT persisted.
+    Effect::new(move |_| write_collapsed(manual_collapsed.get()));
 
     let is_open_class = move || is_open.map(|s| s.get()).unwrap_or(false);
 
@@ -339,6 +482,8 @@ pub fn Sidebar(
             class:sidebar=true
             class:collapsed=collapsed
             class:is-open=is_open_class
+            class:no-anim=resizing
+            class:chat-expanded=chat_expand
             aria-label=crate::t!("sidebar-aria-main-nav")
             on:touchstart=on_nav_touchstart
             on:touchend=on_nav_touchend
@@ -363,6 +508,10 @@ pub fn Sidebar(
                     class="toolbar-btn"
                     on:click=toggle
                     style="color: white;"
+                    // Hidden in the 641–1024px rail band (collapse is forced by
+                    // viewport size) — but shown when the Chats icon has forced
+                    // an expand there, so the user can close it again.
+                    style:display=move || if rail.get() && !chat_expand.get() { "none" } else { "inline-flex" }
                     aria-label=move || if collapsed.get() { crate::t!("sidebar-aria-expand") } else { crate::t!("sidebar-aria-collapse") }
                     aria-expanded=move || (!collapsed.get()).to_string()
                 >
@@ -426,10 +575,18 @@ pub fn Sidebar(
                     class="sidebar-icon-btn"
                     title="Chats"
                     aria-label="Chats"
-                    // Click expands the sidebar so the ChatPanel
-                    // becomes visible. Re-collapsing is via the ←
-                    // button in the header.
-                    on:click=move |_| set_collapsed.set(false)
+                    // Click expands the sidebar so the ChatPanel becomes
+                    // visible; re-collapse via the ← button in the header.
+                    // Above the rail band this persists the expand (the manual
+                    // choice); inside the rail band it uses the transient
+                    // `chat_expand` override so the strip returns on close.
+                    on:click=move |_| {
+                        if rail.get() {
+                            set_chat_expand.set(true);
+                        } else {
+                            set_manual_collapsed.set(false);
+                        }
+                    }
                 >"\u{1F4AC}"</button>
 
                 <button

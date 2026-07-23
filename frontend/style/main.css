@@ -189,6 +189,15 @@ html, body {
   width: var(--sidebar-collapsed);
 }
 
+/* During an active window resize, snap phase changes instead of animating.
+ * Higher specificity than the base `transition: width` and the ≤640px
+ * `transition: transform`, so it wins in every phase. Prevents the drawer
+ * from sliding/widening ("flash bigger") as the viewport crosses 640px.
+ * The hamburger open/close slide is unaffected — that's not a resize. */
+.sidebar.no-anim {
+  transition: none;
+}
+
 .sidebar-header {
   padding: var(--space-md);
   display: flex;
