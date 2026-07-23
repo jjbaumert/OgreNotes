@@ -359,6 +359,9 @@ pub fn DocumentPage() -> impl IntoView {
     // so headings/lists/code all scale proportionally without re-flowing
     // around scaled-down line heights.
     let (editor_zoom, set_editor_zoom) = signal(1.0f64);
+    let (width_mode, set_width_mode) = signal(
+        crate::editor_width::read_cached_editor_width().unwrap_or_default(),
+    );
     let (comments_visible, set_comments_visible) = signal(true);
     // #99: remote collaborators' cursors can obscure text; View → Show
     // Cursors toggles their rendering (default on).
@@ -2802,6 +2805,15 @@ pub fn DocumentPage() -> impl IntoView {
                         >{crate::t!("document-folder-add")}</button>
                     </div>
                     <div class="doc-header-actions">
+                        <crate::components::editor_width_toggle::EditorWidthToggle
+                            mode=width_mode
+                            on_select=Callback::new(move |m: crate::editor_width::WidthMode| {
+                                set_width_mode.set(m);
+                                leptos::task::spawn_local(async move {
+                                    let _ = crate::editor_width::persist_editor_width(m).await;
+                                });
+                            })
+                        />
                         <SyncIndicator state=sync_state.into() />
                         {move || crate::api::client::get_auth().map(|auth| {
                             view! { <span class="user-name">{auth.name.clone()}</span> }
@@ -3018,6 +3030,7 @@ pub fn DocumentPage() -> impl IntoView {
                 <div
                     class="editor-with-panels"
                     style:--editor-zoom=move || format!("{}", editor_zoom.get())
+                    style:--content-max-width=move || format!("{}px", width_mode.get().max_width_px())
                     on:touchstart=on_editor_pinch_start
                     on:touchmove=on_editor_pinch_move
                     on:touchend=on_editor_pinch_end
