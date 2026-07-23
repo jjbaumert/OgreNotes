@@ -113,6 +113,63 @@ fn use_rail_signal() -> ReadSignal<bool> {
     rail
 }
 
+/// True while the window is actively resizing. Used to suppress the sidebar's
+/// CSS transitions during a resize so responsive phase changes snap cleanly
+/// instead of animating — in particular the ≤640px drawer, whose `transform`
+/// and width would otherwise slide-and-widen ("flash bigger") as the viewport
+/// crosses the breakpoint (a transition firing on a breakpoint change). The
+/// flag clears ~180ms after resize settles, so the hamburger open/close slide
+/// (not a resize) is unaffected. Same mount-once leak caveat as
+/// [`use_rail_signal`].
+fn use_resize_suppression() -> ReadSignal<bool> {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let (resizing, set_resizing) = signal(false);
+    let Some(window) = web_sys::window() else {
+        return resizing;
+    };
+    // Debounce the re-enable: each resize bumps a generation and schedules a
+    // timeout that only clears the flag if no newer resize has arrived since.
+    let generation: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+    // Only suppress on WIDTH changes. Our breakpoints are width-based, and
+    // mobile browsers fire real `resize` events on height-only changes (URL-bar
+    // / soft-keyboard show-hide during scroll or a swipe-to-close). Ignoring
+    // those keeps an in-progress hamburger/swipe drawer slide from snapping.
+    let read_width = || {
+        web_sys::window()
+            .and_then(|w| w.inner_width().ok())
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as i32
+    };
+    let last_width: Rc<Cell<i32>> = Rc::new(Cell::new(read_width()));
+    let window_for_timeout = window.clone();
+    let resize_cb = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        let width = read_width();
+        if width == last_width.get() {
+            return; // height-only resize — leave transitions intact
+        }
+        last_width.set(width);
+        if !resizing.get_untracked() {
+            set_resizing.set(true);
+        }
+        let g = generation.get().wrapping_add(1);
+        generation.set(g);
+        let generation_check = generation.clone();
+        let clear = Closure::once_into_js(move || {
+            if generation_check.get() == g {
+                set_resizing.set(false);
+            }
+        });
+        let _ = window_for_timeout.set_timeout_with_callback_and_timeout_and_arguments_0(
+            clear.unchecked_ref(),
+            180,
+        );
+    }) as Box<dyn FnMut(web_sys::Event)>);
+    let _ = window.add_event_listener_with_callback("resize", resize_cb.as_ref().unchecked_ref());
+    resize_cb.forget();
+    resizing
+}
+
 /// The document a row context menu (right-click or its `⋯` button) is
 /// currently open for, plus where to place the menu.
 #[derive(Clone)]
@@ -190,6 +247,9 @@ pub fn Sidebar(
     // restores the user's real choice.
     let (manual_collapsed, set_manual_collapsed) = signal(read_collapsed());
     let rail = use_rail_signal();
+    // Suppress transitions during resize so phase changes snap cleanly (no
+    // drawer "flash bigger" as the ≤640px breakpoint is crossed).
+    let resizing = use_resize_suppression();
     // Lets the Chats icon open the ChatPanel from inside the forced rail band
     // (ChatPanel only renders in the expanded sidebar). Transient — never
     // persisted — so peeking at Chat never pollutes the real collapse choice.
@@ -422,6 +482,7 @@ pub fn Sidebar(
             class:sidebar=true
             class:collapsed=collapsed
             class:is-open=is_open_class
+            class:no-anim=resizing
             aria-label=crate::t!("sidebar-aria-main-nav")
             on:touchstart=on_nav_touchstart
             on:touchend=on_nav_touchend
