@@ -1073,6 +1073,8 @@ menu-cut = Cut
 menu-copy = Copy
 menu-paste = Paste
 menu-copy-block-link = Copy Link to Block
+menu-copy-original-url = Copy Original URL
+menu-convert-to-plain-link = Convert to Plain Link
 menu-bold = Bold
 menu-italic = Italic
 menu-underline = Underline
@@ -1121,3 +1123,7 @@ editorctx-insert-link = Insert link…
 # ─── Block deep links (#b= fragment consumption) ─────────────────
 
 doc-block-link-missing = The linked section no longer exists.
+
+# ─── Mentions spec §5 (Task 5) — per-viewer degradation overlay ──
+
+doc-mention-missing = Missing document

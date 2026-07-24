@@ -427,6 +427,61 @@ pub async fn resolve_embed(url: &str) -> Result<ResolveEmbedResponse, ApiClientE
     api_post("/documents/embeds/resolve", &body).await
 }
 
+// ─── Mentions spec §5 (Task 3) — batch mention resolution ────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MentionResolveTarget<'a> {
+    doc_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_id: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MentionResolveRequest<'a> {
+    targets: Vec<MentionResolveTarget<'a>>,
+}
+
+/// Mirrors the backend's per-target result
+/// (`POST /api/v1/mentions/resolve`). `status` is `"ok"` or `"notFound"` —
+/// a target the caller can't access serializes byte-identically to a
+/// nonexistent one, so the client must never try to distinguish them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MentionResolveResult {
+    pub status: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub block_found: Option<bool>,
+    #[serde(default)]
+    pub snippet: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MentionResolveResponse {
+    results: Vec<MentionResolveResult>,
+}
+
+/// Batch-resolve mention targets (doc id + optional block id). Order of
+/// `results` matches the order of `targets`.
+pub async fn resolve_mentions(
+    targets: &[(String, Option<String>)],
+) -> Result<Vec<MentionResolveResult>, ApiClientError> {
+    let body = MentionResolveRequest {
+        targets: targets
+            .iter()
+            .map(|(doc_id, block_id)| MentionResolveTarget {
+                doc_id,
+                block_id: block_id.as_deref(),
+            })
+            .collect(),
+    };
+    let resp: MentionResolveResponse = api_post("/mentions/resolve", &body).await?;
+    Ok(resp.results)
+}
+
 // ─── Bulk operations (Phase 5 M-P7 piece C) ──────────────────────
 
 /// Per-id outcome row in a bulk-op response body. Mirrors the

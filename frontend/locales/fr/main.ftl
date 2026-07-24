@@ -848,6 +848,8 @@ menu-cut = Couper
 menu-copy = Copier
 menu-paste = Coller
 menu-copy-block-link = Copier le lien du bloc
+menu-copy-original-url = Copier l'URL d'origine
+menu-convert-to-plain-link = Convertir en lien simple
 menu-bold = Gras
 menu-italic = Italique
 menu-underline = Souligné
@@ -902,3 +904,7 @@ editor-width-wide = Grande largeur
 # ─── Block deep links (#b= fragment consumption) ─────────────────
 
 doc-block-link-missing = La section liée n'existe plus.
+
+# ─── Mentions spec §5 (Task 5) — per-viewer degradation overlay ──
+
+doc-mention-missing = Document introuvable

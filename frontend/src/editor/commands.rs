@@ -854,6 +854,201 @@ pub fn insert_user_mention(
     }
 }
 
+/// Mentions spec §5 (Task 3): replace `[from, to)` — which must still
+/// contain exactly `expected_text` (the pasted URL) — with a `DocMention`
+/// atom. Returns `None` (abort, leave the plain URL in place) when the
+/// document changed underneath in a way that invalidates the range: the
+/// user kept typing, undid the paste, or another client's edit landed
+/// there first. This is the concurrent-edit guard the async resolve races
+/// against.
+///
+/// Unlike the other `insert_*`/`toggle_*` commands in this file, this one
+/// returns `Option<Transaction>` directly rather than taking a dispatch
+/// closure: the caller is always post-`await` code re-entering the
+/// reactive world (`editor_component.rs`), which needs the transaction
+/// itself to route through `apply_and_notify` — see that file's mention
+/// paste resolve effect.
+///
+/// Spec §5: a single undo after the URL-to-mention conversion must leave
+/// the raw URL TEXT in the document (conversion undone, paste kept) — NOT
+/// revert the paste too. The returned transaction therefore carries
+/// `meta("history", "isolate")`, which tells `HistoryPlugin::record` to
+/// record this as its OWN undo entry and never fold it into the paste's,
+/// even if the async resolve happens to land inside the normal
+/// time-grouping window. One undo removes the mention and restores the
+/// URL; a second undo removes the URL itself.
+pub fn replace_text_with_doc_mention(
+    state: &EditorState,
+    from: usize,
+    to: usize,
+    expected_text: &str,
+    attrs: std::collections::HashMap<String, String>,
+) -> Option<Transaction> {
+    if text_between_positions(&state.doc, from, to) != expected_text {
+        return None;
+    }
+    let mention = crate::editor::model::Node::element_with_attrs(
+        crate::editor::model::NodeType::DocMention,
+        attrs,
+        crate::editor::model::Fragment::empty(),
+    );
+    let slice = crate::editor::model::Slice::new(
+        crate::editor::model::Fragment::from(vec![mention]),
+        0,
+        0,
+    );
+    let mut txn = state.transaction().replace(from, to, slice).ok()?;
+    txn = txn.set_meta("history", "isolate");
+    txn.selection = Selection::cursor(from + 1);
+    Some(txn)
+}
+
+/// Doc-walk idiom adapted from `EditorState::doc`'s
+/// `find_block_content_start` (model.rs): walk the document looking
+/// for a `DocMention` leaf whose OWN `blockId` attr — this node's
+/// render identity, `data-node-block-id` in view.rs, NOT the
+/// `doc_id`/`target_block_id` attrs it points at — equals
+/// `node_block_id`. Leaf atoms have no content to descend into, so
+/// unlike `find_block_content_start` this returns the atom's own
+/// start position (not a content_start past an open boundary) along
+/// with a clone of its attrs, ready to feed a `[pos, pos + 1)`
+/// replace.
+fn find_doc_mention(doc: &Node, node_block_id: &str) -> Option<(usize, HashMap<String, String>)> {
+    fn walk(
+        children: &[Node],
+        node_block_id: &str,
+        mut offset: usize,
+    ) -> Option<(usize, HashMap<String, String>)> {
+        for child in children {
+            let child_size = child.node_size();
+            if child.node_type() == Some(NodeType::DocMention)
+                && child.block_id() == Some(node_block_id)
+            {
+                return Some((offset, child.attrs().clone()));
+            }
+            if let Node::Element { content, .. } = child {
+                let content_start = offset + 1;
+                if let Some(found) = walk(&content.children, node_block_id, content_start) {
+                    return Some(found);
+                }
+            }
+            offset += child_size;
+        }
+        None
+    }
+
+    let Node::Element { content, .. } = doc else {
+        return None;
+    };
+    walk(&content.children, node_block_id, 0)
+}
+
+/// Mentions spec §5 — the permanent opt-out (element context menu's
+/// "Convert to Plain Link"). Replace a `DocMention` atom — found by
+/// its own `blockId` via `find_doc_mention` — with plain text `title`
+/// (falling back to `url` when `title` is empty or absent) carrying a
+/// `Link` mark to `url`, exactly the linked-text shape `insert_doc_link`
+/// builds. Returns `None` when no DocMention with this `blockId`
+/// exists (already converted/deleted underneath — e.g. a stale
+/// context-menu ctx after a concurrent edit).
+///
+/// Unlike `replace_text_with_doc_mention`'s isolated paste-resolve entry,
+/// this is a normal, standalone undo entry: no `history` meta at all.
+/// Converting an already-settled mention is its own distinct user action,
+/// not a continuation of an in-flight paste.
+pub fn convert_doc_mention_to_link(
+    state: &EditorState,
+    node_block_id: &str,
+) -> Option<Transaction> {
+    let (pos, attrs) = find_doc_mention(&state.doc, node_block_id)?;
+    let url = attrs.get("url").cloned().unwrap_or_default();
+    let title = attrs
+        .get("title")
+        .cloned()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| url.clone());
+    if title.is_empty() {
+        return None;
+    }
+    let end = pos + title.chars().count();
+    let mark = Mark::new(MarkType::Link).with_attr("href", &url);
+    let mut txn = state
+        .transaction()
+        .replace(pos, pos + 1, text_slice(&title))
+        .and_then(|t| t.add_mark(pos, end, mark))
+        .ok()?;
+    txn.selection = Selection::cursor(end);
+    Some(txn)
+}
+
+/// Task 5 — refresh every stale `DocMention`'s cached `title`/
+/// `snippet` attrs after a fresh resolve, in editable sessions only.
+/// Each entry in `updates` is `(node_block_id, title, snippet)`; every
+/// mention is looked up by its own `blockId` via `find_doc_mention`
+/// (same lookup as `convert_doc_mention_to_link`).
+///
+/// Builds ONE transaction covering the whole batch — one
+/// `Step::SetAttr` per attribute that actually differs from the
+/// cached value, for every entry — rather than one transaction per
+/// mention: `SetAttr` never changes doc size, so positions found
+/// against `state.doc` up front stay valid across every step in the
+/// batch, and a single-transaction batch is what lets the caller
+/// (`mention_overlay`) issue exactly one `ToolbarCommand` for a whole
+/// doc-open refresh instead of N commands that would coalesce down to
+/// the last one on the same-tick `set_toolbar_command` signal.
+///
+/// Entries are skipped individually: a `blockId` that no longer
+/// exists (concurrent delete) or whose title/snippet already match
+/// are simply not written. Returns `None` when NOTHING in the batch
+/// changed anything — callers should not dispatch in that case.
+///
+/// Tagged `history: skip` (mentions spec §5 / Task 3's skip meta):
+/// this is a silent per-viewer cache refresh of the CRDT's cached
+/// display text, not a user edit — it must not create an undo entry.
+/// `HistoryPlugin::record` already discards anything carrying this
+/// meta (see `skip_meta_records_nothing` in plugins.rs).
+pub fn update_doc_mention_attrs(
+    state: &EditorState,
+    updates: &[(String, String, String)],
+) -> Option<Transaction> {
+    let mut txn = state.transaction();
+    let mut changed = false;
+    for (node_block_id, title, snippet) in updates {
+        let Some((pos, attrs)) = find_doc_mention(&state.doc, node_block_id) else {
+            continue;
+        };
+        let cur_title = attrs.get("title").map(String::as_str).unwrap_or("");
+        let cur_snippet = attrs.get("snippet").map(String::as_str).unwrap_or("");
+        if cur_title == title && cur_snippet == snippet {
+            continue;
+        }
+        if cur_title != title {
+            txn = txn
+                .step(Step::SetAttr {
+                    pos,
+                    attr: "title".to_string(),
+                    value: title.clone(),
+                })
+                .ok()?;
+            changed = true;
+        }
+        if cur_snippet != snippet {
+            txn = txn
+                .step(Step::SetAttr {
+                    pos,
+                    attr: "snippet".to_string(),
+                    value: snippet.clone(),
+                })
+                .ok()?;
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    Some(txn.set_meta("history", "skip"))
+}
+
 /// Scope of text extracted by `plain_text_from_state`. Callers use it
 /// to phrase the AI prompt correctly — "summarize this selection" vs.
 /// "summarize this document."
@@ -4483,6 +4678,336 @@ mod tests {
         let state = EditorState::create_default(simple_doc());
         assert!(!insert_user_mention(1, 3, "", "u-1", &state, None));
         assert!(!insert_user_mention(1, 3, "Alice", "", &state, None));
+    }
+
+    // ── replace_text_with_doc_mention (mentions spec §5, Task 3) ──
+
+    fn url_doc(url: &str) -> Node {
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text(url)]),
+            )]),
+        )
+    }
+
+    #[test]
+    fn replace_text_with_doc_mention_swaps_in_the_atom_and_marks_isolate() {
+        let url = "https://notes.example/d/abc123";
+        let state = EditorState::create_default(url_doc(url));
+        let from = 1; // just inside <p>
+        let to = from + url.chars().count();
+
+        let mut attrs = HashMap::new();
+        attrs.insert("doc_id".to_string(), "abc123".to_string());
+        attrs.insert("url".to_string(), url.to_string());
+        attrs.insert("title".to_string(), "Target Doc".to_string());
+
+        let txn = replace_text_with_doc_mention(&state, from, to, url, attrs).unwrap();
+        // Spec §5: this must be its own undo entry, never merged into the
+        // paste's — see `HistoryPlugin::record`'s isolate handling.
+        assert_eq!(txn.meta.get("history").map(String::as_str), Some("isolate"));
+        assert!(txn.meta.get("history-merge-tag").is_none());
+
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        let mention = para.child(0).unwrap();
+        assert_eq!(mention.node_type(), Some(NodeType::DocMention));
+        assert!(mention.is_leaf());
+        assert_eq!(mention.attrs().get("doc_id").unwrap(), "abc123");
+        assert_eq!(mention.attrs().get("title").unwrap(), "Target Doc");
+        // Cursor lands just after the atom (leaf takes one position).
+        assert_eq!(new_state.selection.from(), from + 1);
+        // The URL text is gone — replaced wholesale.
+        assert_eq!(para.text_content(), "Target Doc");
+    }
+
+    #[test]
+    fn replace_text_with_doc_mention_aborts_when_text_no_longer_matches() {
+        // Concurrent-edit guard: [from,to) no longer holds `expected_text`
+        // (user kept typing, undid, or a remote edit landed there first).
+        let url = "https://notes.example/d/abc123";
+        let state = EditorState::create_default(url_doc(url));
+        let from = 1;
+        let to = from + url.chars().count();
+        assert!(replace_text_with_doc_mention(&state, from, to, "not the url anymore", HashMap::new())
+            .is_none());
+    }
+
+    #[test]
+    fn replace_text_with_doc_mention_aborts_on_out_of_range_positions() {
+        let url = "https://notes.example/d/abc123";
+        let state = EditorState::create_default(url_doc(url));
+        assert!(replace_text_with_doc_mention(&state, 0, 1000, url, HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn single_undo_after_conversion_leaves_url_text() {
+        // End-to-end spec §5 behavior: paste a URL (normal, time-grouped
+        // record), then convert it to a DocMention via
+        // `replace_text_with_doc_mention` (isolate). One undo must remove
+        // ONLY the mention, restoring the raw URL text with no DocMention
+        // node left in the doc. A second undo removes the URL itself.
+        use crate::editor::plugins::HistoryPlugin;
+
+        let url = "https://notes.example/d/abc123";
+        let state = EditorState::create_default(Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::empty(),
+            )]),
+        ));
+        let mut history = HistoryPlugin::new();
+
+        // "Paste": insert the raw URL text, recorded normally.
+        let paste_txn = EditorState { selection: Selection::cursor(1), ..state.clone() }
+            .transaction()
+            .insert_text(url)
+            .unwrap();
+        history.record(&paste_txn, &state.doc);
+        let after_paste = state.apply(paste_txn);
+        assert_eq!(after_paste.doc.child(0).unwrap().text_content(), url);
+
+        // Async resolve: convert the pasted URL into a DocMention.
+        let from = 1;
+        let to = from + url.chars().count();
+        let mut attrs = HashMap::new();
+        attrs.insert("doc_id".to_string(), "abc123".to_string());
+        attrs.insert("url".to_string(), url.to_string());
+        attrs.insert("title".to_string(), "Target Doc".to_string());
+        let convert_txn =
+            replace_text_with_doc_mention(&after_paste, from, to, url, attrs).unwrap();
+        history.record(&convert_txn, &after_paste.doc);
+        let after_convert = after_paste.apply(convert_txn);
+        assert_eq!(
+            after_convert.doc.child(0).unwrap().child(0).unwrap().node_type(),
+            Some(NodeType::DocMention)
+        );
+
+        // First undo: mention gone, raw URL text back -- NOT the whole
+        // paste reverted.
+        let undo1 = history.undo(&after_convert).expect("first undo should succeed");
+        let after_undo1 = after_convert.apply(undo1);
+        let para = after_undo1.doc.child(0).unwrap();
+        assert_eq!(para.text_content(), url, "first undo must restore the raw URL text");
+        assert_ne!(
+            para.child(0).and_then(|c| c.node_type()),
+            Some(NodeType::DocMention),
+            "first undo must leave no DocMention node behind"
+        );
+        assert!(history.can_undo());
+
+        // Second undo: the URL itself is removed, back to the empty doc.
+        let undo2 = history.undo(&after_undo1).expect("second undo should succeed");
+        let after_undo2 = after_undo1.apply(undo2);
+        assert_eq!(after_undo2.doc, state.doc, "second undo must remove the pasted URL entirely");
+        assert!(!history.can_undo());
+    }
+
+    // ── convert_doc_mention_to_link (mentions spec §5 — permanent opt-out) ──
+
+    fn doc_mention_doc(block_id: &str, url: &str, title: &str) -> Node {
+        let mut attrs = HashMap::new();
+        attrs.insert("blockId".to_string(), block_id.to_string());
+        attrs.insert("url".to_string(), url.to_string());
+        attrs.insert("title".to_string(), title.to_string());
+        attrs.insert("doc_id".to_string(), "abc123".to_string());
+        let mention = Node::element_with_attrs(NodeType::DocMention, attrs, Fragment::empty());
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![mention]),
+            )]),
+        )
+    }
+
+    #[test]
+    fn convert_doc_mention_to_link_replaces_atom_with_linked_title() {
+        let doc = doc_mention_doc("mention-1", "https://notes.example/d/abc123", "Target Doc");
+        let state = EditorState::create_default(doc);
+
+        let txn = convert_doc_mention_to_link(&state, "mention-1").unwrap();
+        // Normal undo entry — no merge meta (unlike replace_text_with_doc_mention,
+        // whose paste-resolve merge this is deliberately NOT).
+        assert!(txn.meta.get("history").is_none());
+        assert!(txn.meta.get("history-merge-tag").is_none());
+
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        // The atom is gone — replaced by plain text carrying a Link mark.
+        let first = para.child(0).unwrap();
+        assert_ne!(first.node_type(), Some(NodeType::DocMention));
+        assert_eq!(para.text_content(), "Target Doc");
+        let link = first.marks().iter().find(|m| m.mark_type == MarkType::Link);
+        assert!(link.is_some(), "converted text must carry a Link mark");
+        assert_eq!(
+            link.unwrap().attrs.get("href").unwrap(),
+            "https://notes.example/d/abc123"
+        );
+        // Cursor sits just after the converted text.
+        assert_eq!(new_state.selection.from(), 1 + "Target Doc".chars().count());
+    }
+
+    #[test]
+    fn convert_doc_mention_to_link_falls_back_to_url_when_title_missing() {
+        let doc = doc_mention_doc("mention-2", "https://notes.example/d/xyz", "");
+        let state = EditorState::create_default(doc);
+        let txn = convert_doc_mention_to_link(&state, "mention-2").unwrap();
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(para.text_content(), "https://notes.example/d/xyz");
+        let link = para.child(0).unwrap().marks().iter().find(|m| m.mark_type == MarkType::Link);
+        assert_eq!(
+            link.unwrap().attrs.get("href").unwrap(),
+            "https://notes.example/d/xyz"
+        );
+    }
+
+    #[test]
+    fn convert_doc_mention_to_link_returns_none_when_block_id_not_found() {
+        let doc = doc_mention_doc("mention-1", "https://notes.example/d/abc123", "Target Doc");
+        let state = EditorState::create_default(doc);
+        assert!(convert_doc_mention_to_link(&state, "does-not-exist").is_none());
+    }
+
+    // ── update_doc_mention_attrs (Task 5 — refresh-on-open cache sync) ──
+
+    fn mention_update(node_block_id: &str, title: &str, snippet: &str) -> (String, String, String) {
+        (node_block_id.to_string(), title.to_string(), snippet.to_string())
+    }
+
+    /// A doc with two independent `DocMention` atoms, both in their
+    /// own top-level paragraph — used by the batch regression test.
+    fn two_doc_mentions_doc(
+        block_id_a: &str,
+        title_a: &str,
+        block_id_b: &str,
+        title_b: &str,
+    ) -> Node {
+        fn mention(block_id: &str, title: &str) -> Node {
+            let mut attrs = HashMap::new();
+            attrs.insert("blockId".to_string(), block_id.to_string());
+            attrs.insert("url".to_string(), format!("https://notes.example/d/{block_id}"));
+            attrs.insert("title".to_string(), title.to_string());
+            attrs.insert("doc_id".to_string(), block_id.to_string());
+            Node::element_with_attrs(NodeType::DocMention, attrs, Fragment::empty())
+        }
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![mention(block_id_a, title_a)]),
+                ),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![mention(block_id_b, title_b)]),
+                ),
+            ]),
+        )
+    }
+
+    #[test]
+    fn update_doc_mention_attrs_writes_changed_title_and_snippet_with_skip_meta() {
+        let doc = doc_mention_doc("mention-1", "https://notes.example/d/abc123", "Stale Title");
+        let state = EditorState::create_default(doc);
+
+        let txn = update_doc_mention_attrs(
+            &state,
+            &[mention_update("mention-1", "Fresh Title", "fresh snippet")],
+        )
+        .unwrap();
+        // Never a real undo entry — a silent per-viewer cache refresh.
+        assert_eq!(txn.meta.get("history").map(String::as_str), Some("skip"));
+
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        let mention = para.child(0).unwrap();
+        assert_eq!(mention.attrs().get("title").unwrap(), "Fresh Title");
+        assert_eq!(mention.attrs().get("snippet").unwrap(), "fresh snippet");
+    }
+
+    #[test]
+    fn update_doc_mention_attrs_returns_none_when_values_unchanged() {
+        let doc = doc_mention_doc("mention-1", "https://notes.example/d/abc123", "Same Title");
+        let state = EditorState::create_default(doc);
+        // `doc_mention_doc` never sets `snippet`; `default_attrs()` fills it
+        // with "" — pass the identical (title, snippet) pair back.
+        assert!(update_doc_mention_attrs(&state, &[mention_update("mention-1", "Same Title", "")])
+            .is_none());
+    }
+
+    #[test]
+    fn update_doc_mention_attrs_returns_none_when_block_id_not_found() {
+        let doc = doc_mention_doc("mention-1", "https://notes.example/d/abc123", "Title");
+        let state = EditorState::create_default(doc);
+        assert!(
+            update_doc_mention_attrs(&state, &[mention_update("does-not-exist", "New", "new")])
+                .is_none()
+        );
+    }
+
+    /// Regression (batch write-back): the mentions overlay refresh
+    /// loop found TWO stale mentions in the same doc-open resolve.
+    /// Before the batch fix, each stale mention dispatched its own
+    /// `UpdateDocMentionAttrs` command in the same tick, and only the
+    /// last of N synchronous writes to `set_toolbar_command` survived
+    /// — the first mention's refresh silently vanished. A single
+    /// batched call must update BOTH nodes in one transaction.
+    #[test]
+    fn update_doc_mention_attrs_batch_updates_every_stale_mention_in_one_transaction() {
+        let doc = two_doc_mentions_doc("mention-a", "Stale A", "mention-b", "Stale B");
+        let state = EditorState::create_default(doc);
+
+        let txn = update_doc_mention_attrs(
+            &state,
+            &[
+                mention_update("mention-a", "Fresh A", "snippet a"),
+                mention_update("mention-b", "Fresh B", "snippet b"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(txn.meta.get("history").map(String::as_str), Some("skip"));
+
+        let new_state = state.apply(txn);
+        let mention_a = new_state.doc.child(0).unwrap().child(0).unwrap();
+        assert_eq!(mention_a.attrs().get("title").unwrap(), "Fresh A");
+        assert_eq!(mention_a.attrs().get("snippet").unwrap(), "snippet a");
+
+        let mention_b = new_state.doc.child(1).unwrap().child(0).unwrap();
+        assert_eq!(mention_b.attrs().get("title").unwrap(), "Fresh B");
+        assert_eq!(mention_b.attrs().get("snippet").unwrap(), "snippet b");
+    }
+
+    /// Per-item skip: one entry in the batch is unchanged, the other
+    /// is stale — only the stale one should produce a step, but the
+    /// transaction must still be `Some` (not dropped just because one
+    /// entry had nothing to write).
+    #[test]
+    fn update_doc_mention_attrs_batch_skips_unchanged_entries_but_applies_changed_ones() {
+        let doc = two_doc_mentions_doc("mention-a", "Same A", "mention-b", "Stale B");
+        let state = EditorState::create_default(doc);
+
+        let txn = update_doc_mention_attrs(
+            &state,
+            &[
+                // Matches cached title, empty snippet == default — no-op.
+                mention_update("mention-a", "Same A", ""),
+                mention_update("mention-b", "Fresh B", "snippet b"),
+            ],
+        )
+        .unwrap();
+
+        let new_state = state.apply(txn);
+        let mention_a = new_state.doc.child(0).unwrap().child(0).unwrap();
+        assert_eq!(mention_a.attrs().get("title").unwrap(), "Same A");
+
+        let mention_b = new_state.doc.child(1).unwrap().child(0).unwrap();
+        assert_eq!(mention_b.attrs().get("title").unwrap(), "Fresh B");
+        assert_eq!(mention_b.attrs().get("snippet").unwrap(), "snippet b");
     }
 
     #[test]

@@ -160,6 +160,54 @@ fn convert_element_node(
         }
     }
 
+    // Mentions spec §7 — `<a class="doc-mention" data-doc-id="…"
+    // data-block-id="…" href="…">title</a>` (the copy-out shape this
+    // file serializes, matching `crates/collab/src/export.rs`) or
+    // `<span class="doc-mention" ...>` (the in-editor chip shape,
+    // reached if a paste source copied the rendered DOM directly
+    // rather than going through our clipboard handler) both parse
+    // back into a `NodeType::DocMention` atom. Recognized before
+    // `tag_to_mark` so the `a` branch doesn't steal a `<a
+    // class="doc-mention">` as a plain Link mark.
+    if (tag == "a" || tag == "span")
+        && el.class_list().contains("doc-mention")
+    {
+        let doc_id = el.get_attribute("data-doc-id").unwrap_or_default();
+        if !doc_id.is_empty() {
+            // `data-block-id` is the copy-out `<a>` shape's target-id
+            // name (spec §7); `data-block-id-target` is the in-editor
+            // `<span>` shape's name (view.rs's render arm) — accept
+            // either, whichever this element happens to carry.
+            let target_block_id = el
+                .get_attribute("data-block-id")
+                .or_else(|| el.get_attribute("data-block-id-target"))
+                .unwrap_or_default();
+            let url = el
+                .get_attribute("href")
+                .or_else(|| el.get_attribute("data-url"))
+                .unwrap_or_default();
+            let mut title = el.text_content().unwrap_or_default();
+            for glyph in ["\u{2693} ", "\u{1F4C4} "] {
+                if let Some(stripped) = title.strip_prefix(glyph) {
+                    title = stripped.to_string();
+                    break;
+                }
+            }
+            let mut attrs = std::collections::HashMap::new();
+            attrs.insert("doc_id".to_string(), doc_id);
+            attrs.insert("target_block_id".to_string(), target_block_id);
+            attrs.insert("url".to_string(), url);
+            attrs.insert("title".to_string(), title);
+            attrs.insert("snippet".to_string(), String::new());
+            out.push(Node::element_with_attrs(
+                NodeType::DocMention,
+                attrs,
+                Fragment::empty(),
+            ));
+            return;
+        }
+    }
+
     // Inline formatting element → push mark and recurse
     if let Some(mark) = tag_to_mark(&tag, el) {
         let mut new_marks = active_marks.to_vec();
@@ -1062,6 +1110,42 @@ fn element_tags(
             );
             (open, None)
         }
+        // Mentions spec §7 — copy-out shape. Mirrors
+        // `crates/collab/src/export.rs`'s DocMention arm byte-for-byte
+        // (class, data-doc-id, data-block-id, href, title body) so a
+        // doc mention round-trips through copy/paste the same as
+        // through the server-side HTML export. `data-block-id` here
+        // names the TARGET block (spec §7's wire name) — distinct from
+        // the in-editor DOM's `data-block-id-target` (see the render
+        // arm in view.rs), because this shape leaves the app and has
+        // no "own block" attribute to collide with.
+        NodeType::DocMention => {
+            let doc_id = attrs.get("doc_id").map(String::as_str).unwrap_or("");
+            let target = attrs.get("target_block_id").map(String::as_str).unwrap_or("");
+            let url = attrs.get("url").map(String::as_str).unwrap_or("");
+            let title = attrs
+                .get("title")
+                .filter(|t| !t.is_empty())
+                .map(String::as_str)
+                .unwrap_or(url);
+            let mut open = format!(
+                "<a class=\"doc-mention\" data-doc-id=\"{}\"",
+                html_escape_attr(doc_id),
+            );
+            if !target.is_empty() {
+                open.push_str(&format!(" data-block-id=\"{}\"", html_escape_attr(target)));
+            }
+            // #7: scheme-gated via is_safe_url like every other
+            // clipboard-emitted href (links, images) — a `javascript:`
+            // (or otherwise unsafe) url is dropped rather than emitted.
+            if super::view::is_safe_url(url) {
+                open.push_str(&format!(" href=\"{}\"", html_escape_attr(url)));
+            }
+            open.push('>');
+            open.push_str(&html_escape(title));
+            open.push_str("</a>");
+            (open, None)
+        }
         // Mermaid: leaf block atom, mirrors Embed's minimal-shape
         // clipboard emission (no dedicated render pipeline on the
         // clipboard path yet). Source is in the `source` attribute.
@@ -1308,6 +1392,91 @@ mod tests {
         let slice = Slice::new(Fragment::from(vec![Node::text("Hello")]), 0, 0);
         assert_eq!(serialize_to_html(&slice), "Hello");
         assert_eq!(serialize_to_text(&slice), "Hello");
+    }
+
+    // ─── DocMention clipboard round-trip (mentions spec §7) ────────
+    //
+    // `parse_from_html` dispatches to a browser `DomParser` on
+    // `wasm32` and to a plain tag-stripping fallback everywhere else
+    // (see the `#[cfg(target_arch = "wasm32")]` split at the top of
+    // this file) — there's no native path that runs
+    // `convert_element_node`, so a native `#[test]` can only exercise
+    // `serialize_to_html` (this file's real serialize entry point,
+    // used the same way by the existing `serialize_table_cell_*`
+    // tests above). The parse half — including the full
+    // serialize→parse round trip — is covered by
+    // `frontend/tests/browser.rs` under `#[wasm_bindgen_test]`,
+    // matching how every other `parse_from_html` case in this crate
+    // (bold text, lists, nested marks, …) is tested; none of them
+    // have a native counterpart either.
+
+    fn doc_mention_node(url: &str, doc_id: &str, target: &str, title: &str, snippet: &str) -> Node {
+        let mut attrs = HashMap::new();
+        attrs.insert("url".to_string(), url.to_string());
+        attrs.insert("doc_id".to_string(), doc_id.to_string());
+        attrs.insert("target_block_id".to_string(), target.to_string());
+        attrs.insert("title".to_string(), title.to_string());
+        attrs.insert("snippet".to_string(), snippet.to_string());
+        Node::element_with_attrs(NodeType::DocMention, attrs, Fragment::empty())
+    }
+
+    #[test]
+    fn doc_mention_serializes_anchor_mention_to_html() {
+        let node = doc_mention_node(
+            "https://notes.example/d/abc#b=blk1",
+            "abc",
+            "blk1",
+            "Roadmap",
+            "Q3 goals",
+        );
+        let html = serialize_to_html(&Slice::new(Fragment::from(vec![node]), 0, 0));
+        assert!(html.contains(r#"class="doc-mention""#), "got: {html}");
+        assert!(html.contains(r#"data-doc-id="abc""#), "got: {html}");
+        assert!(html.contains(r#"data-block-id="blk1""#), "got: {html}");
+        assert!(html.contains(r#"href="https://notes.example/d/abc#b=blk1""#), "got: {html}");
+        // Title (not snippet) is the copy-out body — matches export.rs,
+        // which never emits the snippet.
+        assert!(html.contains(">Roadmap</a>"), "got: {html}");
+        assert!(html.starts_with("<a "), "must serialize as an <a>, got: {html}");
+    }
+
+    #[test]
+    fn doc_mention_serializes_document_mention_omits_data_block_id() {
+        // Empty target_block_id ⇒ whole-document mention ⇒ no
+        // data-block-id attr at all (matches export.rs's `.filter`).
+        let node = doc_mention_node("https://notes.example/d/abc", "abc", "", "Roadmap", "");
+        let html = serialize_to_html(&Slice::new(Fragment::from(vec![node]), 0, 0));
+        assert!(!html.contains("data-block-id="), "got: {html}");
+    }
+
+    #[test]
+    fn doc_mention_serialize_falls_back_to_url_when_title_empty() {
+        let node = doc_mention_node("https://notes.example/d/abc", "abc", "", "", "");
+        let html = serialize_to_html(&Slice::new(Fragment::from(vec![node]), 0, 0));
+        assert!(html.contains(">https://notes.example/d/abc</a>"), "got: {html}");
+    }
+
+    #[test]
+    fn doc_mention_serialize_drops_unsafe_href_but_keeps_title() {
+        let node = doc_mention_node("javascript:alert(1)", "abc", "", "Roadmap", "");
+        let html = serialize_to_html(&Slice::new(Fragment::from(vec![node]), 0, 0));
+        assert!(!html.contains("javascript:"), "unsafe url leaked into href: {html}");
+        assert!(!html.contains("href="), "no href should be emitted at all: {html}");
+        assert!(html.contains(">Roadmap</a>"), "title body must still render: {html}");
+    }
+
+    #[test]
+    fn doc_mention_serialize_escapes_html_special_chars() {
+        let node = doc_mention_node(
+            "https://notes.example/d/abc",
+            "abc",
+            "",
+            r#"<script>x</script> & "quotes""#,
+            "",
+        );
+        let html = serialize_to_html(&Slice::new(Fragment::from(vec![node]), 0, 0));
+        assert!(!html.contains("<script>"), "title must be HTML-escaped, got: {html}");
+        assert!(html.contains("&lt;script&gt;"), "got: {html}");
     }
 
     #[test]

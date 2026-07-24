@@ -851,6 +851,8 @@ menu-cut = قص
 menu-copy = نسخ
 menu-paste = لصق
 menu-copy-block-link = نسخ رابط الكتلة
+menu-copy-original-url = نسخ الرابط الأصلي
+menu-convert-to-plain-link = تحويل إلى رابط عادي
 menu-bold = عريض
 menu-italic = مائل
 menu-underline = تسطير
@@ -905,3 +907,7 @@ editor-width-wide = عرض واسع
 # ─── Block deep links (#b= fragment consumption) ─────────────────
 
 doc-block-link-missing = القسم المرتبط لم يعد موجودًا.
+
+# ─── Mentions spec §5 (Task 5) — per-viewer degradation overlay ──
+
+doc-mention-missing = مستند مفقود

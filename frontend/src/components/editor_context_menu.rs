@@ -27,6 +27,14 @@ pub enum EditorContextCommand {
     /// Copy a `{origin}{path}#b=<blockId>` deep link to the block at the
     /// selection (mentions spec §1).
     CopyBlockLink,
+    /// Copy the right-clicked DocMention chip's original `url` attr to
+    /// the clipboard. Works in every chip state, including a missing
+    /// (dangling) target — the url is always present even when the
+    /// document/block it points at no longer resolves.
+    CopyOriginalUrl,
+    /// Replace the right-clicked DocMention chip with plain linked text
+    /// — the permanent opt-out (mentions spec §5).
+    ConvertMentionToLink,
     Comment,
     ToggleBold,
     ToggleItalic,
@@ -53,6 +61,20 @@ pub enum EditorContextCommand {
     AlignRight,
 }
 
+/// Snapshot of the DocMention chip under the cursor at the moment the
+/// menu opened, captured by `editor_component.rs`'s `on:contextmenu`
+/// handler walking up from `e.target()` for `span.doc-mention` (the
+/// same ancestry-walk idiom as `view.rs`'s click handler). `url` is the
+/// chip's `data-url` attr (its original target — always present, even
+/// for a dangling/missing mention); `node_block_id` is the chip's OWN
+/// `data-node-block-id` (its render identity, not the target it points
+/// at) — the key `commands::convert_doc_mention_to_link` locates it by.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocMentionCtx {
+    pub url: String,
+    pub node_block_id: String,
+}
+
 /// Right-click context menu over the document editor.
 #[component]
 pub fn EditorContextMenu(
@@ -64,6 +86,12 @@ pub fn EditorContextMenu(
     /// as `Signal<bool>` so callers can pass a `Memo` or a
     /// `Signal::derive` rather than only a `ReadSignal`.
     selection_empty: Signal<bool>,
+    /// The right-clicked DocMention chip, if any. When `Some`, two
+    /// extra entries (Copy Original URL / Convert to Plain Link)
+    /// appear; when `None` (a normal right-click elsewhere in the
+    /// document), neither entry is shown.
+    #[prop(into)]
+    doc_mention: Signal<Option<DocMentionCtx>>,
     on_command: Callback<EditorContextCommand>,
     on_close: Callback<()>,
 ) -> impl IntoView {
@@ -75,7 +103,8 @@ pub fn EditorContextMenu(
 
     let entries = Callback::new(move |()| {
         let empty = selection_empty.get();
-        vec![
+        let mention = doc_mention.get();
+        let mut entries = vec![
             item("menu-cut", EditorContextCommand::Cut)
                 .with_shortcut("Ctrl+X")
                 .disabled_when(empty),
@@ -84,7 +113,21 @@ pub fn EditorContextMenu(
                 .disabled_when(empty),
             item("menu-paste", EditorContextCommand::Paste).with_shortcut("Ctrl+V"),
             item("menu-copy-block-link", EditorContextCommand::CopyBlockLink),
-            MenuEntry::Separator,
+        ];
+        // DocMention element actions — only when the right-click landed
+        // on a chip. "Copy Original URL" works in every chip state
+        // (including a dangling/missing target), since `url` is always
+        // captured regardless of resolution.
+        if mention.is_some() {
+            entries.push(MenuEntry::Separator);
+            entries.push(item("menu-copy-original-url", EditorContextCommand::CopyOriginalUrl));
+            entries.push(item(
+                "menu-convert-to-plain-link",
+                EditorContextCommand::ConvertMentionToLink,
+            ));
+        }
+        entries.push(MenuEntry::Separator);
+        entries.extend(vec![
             item("menu-comment", EditorContextCommand::Comment)
                 .with_shortcut("\u{1F4AC}")
                 .disabled_when(empty),
@@ -121,7 +164,8 @@ pub fn EditorContextMenu(
             item("menu-code", EditorContextCommand::ToggleCode),
             MenuEntry::Separator,
             item("editorctx-insert-link", EditorContextCommand::InsertLink).with_shortcut("Ctrl+K"),
-        ]
+        ]);
+        entries
     });
 
     view! {

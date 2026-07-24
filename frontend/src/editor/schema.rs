@@ -675,6 +675,27 @@ pub fn default_schema() -> Schema {
         },
     );
 
+    // DocMention: inline doc/anchor mention leaf atom. Same shape as
+    // Mention above — sits inside a paragraph's text stream, no
+    // children, deletes as a single position, carries no marks of
+    // its own (url/doc_id/target_block_id/title/snippet fully
+    // describe it).
+    nodes.insert(
+        NodeType::DocMention,
+        NodeSpec {
+            valid_children: vec![],
+            inline_content: false,
+            block: false,
+            leaf: true,
+            code: false,
+            atom: true,
+            defining: false,
+            isolating: false,
+            default_attrs: HashMap::new(),
+            allowed_marks: Some(vec![]),
+        },
+    );
+
     // Table: contains table rows. Isolating prevents edits from escaping.
     nodes.insert(
         NodeType::Table,

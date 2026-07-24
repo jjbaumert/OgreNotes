@@ -98,6 +98,13 @@ impl HistoryPlugin {
             return;
         }
 
+        // Mentions spec §5 (Task 3): a "skip" transaction records nothing
+        // at all — not even a new entry — and must NOT clear the redo
+        // stack either, unlike a normal recorded change.
+        if transaction.meta.get("history") == Some(&"skip".to_string()) {
+            return;
+        }
+
         // Skip if the transaction is marked as an undo/redo operation
         if transaction.meta.get("history") == Some(&"undo".to_string())
             || transaction.meta.get("history") == Some(&"redo".to_string())
@@ -127,13 +134,28 @@ impl HistoryPlugin {
         }
         inverted.reverse(); // Undo steps must be applied in reverse order
 
-        // Decide whether to group with the previous entry
+        // Decide whether to group with the previous entry.
+        //
+        // Mentions spec §5: a single undo of a pasted-URL-turned-DocMention
+        // must restore the raw URL TEXT — i.e. the mention-replace has to
+        // land as its OWN undo entry, never folded into the paste's. A
+        // transaction tagged `history=isolate` (the async-resolved replace
+        // in `commands::replace_text_with_doc_mention`) therefore forces
+        // `should_group = false` unconditionally, overriding the normal
+        // time-window grouping — without this override, a fast network
+        // resolve landing inside the 500ms window would still get
+        // time-grouped into the paste's entry and silently reintroduce the
+        // bug this isolation exists to prevent. Isolation only suppresses
+        // grouping *into* the previous entry; the isolated transaction is
+        // still recorded as a normal new entry (unlike `history=skip`,
+        // which records nothing).
         let now = current_time_ms();
-        let should_group = self
+        let isolate = transaction.meta.get("history") == Some(&"isolate".to_string());
+        let time_grouped = self
             .last_change_time
             .map(|t| now - t < self.new_group_delay)
-            .unwrap_or(false)
-            && !self.undo_stack.is_empty();
+            .unwrap_or(false);
+        let should_group = !isolate && time_grouped && !self.undo_stack.is_empty();
 
         if should_group {
             // Merge with the last undo entry.
@@ -420,6 +442,82 @@ mod tests {
         history.clear();
         assert!(!history.can_undo());
         assert!(!history.can_redo());
+    }
+
+    // ── meta("history") == "isolate" / "skip" (mentions spec §5: a single
+    // undo of a pasted-URL-turned-DocMention must restore the raw URL
+    // TEXT, so the mention-replace can never be time-grouped into the
+    // paste's entry) ──
+
+    #[test]
+    fn skip_meta_records_nothing() {
+        let state = EditorState::create_default(simple_doc());
+        let mut history = HistoryPlugin::new();
+
+        let txn_a = state.transaction().insert_text("A").unwrap();
+        let state_a = state.apply(txn_a.clone());
+        history.record(&txn_a, &state.doc);
+        assert!(history.can_undo());
+
+        // Build up a non-empty redo stack so we can prove skip doesn't
+        // clear it either.
+        let undo_txn = history.undo(&state_a).unwrap();
+        let state_undo = state_a.apply(undo_txn);
+        assert!(history.can_redo());
+
+        let txn_b = state_undo
+            .transaction()
+            .insert_text("B")
+            .unwrap()
+            .set_meta("history", "skip");
+        history.record(&txn_b, &state_undo.doc);
+
+        assert_eq!(history.undo_stack.len(), 0); // nothing recorded
+        assert!(history.can_redo()); // redo stack NOT cleared
+    }
+
+    #[test]
+    fn isolate_never_groups_even_within_window() {
+        // The core of the spec §5 fix: even when a second transaction
+        // arrives well inside the time-grouping window (so an ordinary
+        // keystroke WOULD merge into the previous entry), a
+        // `history=isolate` transaction must still land as its own,
+        // separate undo entry -- and a single undo must revert only that
+        // isolated transaction, not the one before it.
+        let state = EditorState::create_default(simple_doc());
+        // A large window: without the isolate override, txn_b would
+        // time-group into txn_a's entry (current_time_ms() == 0 natively,
+        // so 0 - 0 < 100000 is true).
+        let mut history = HistoryPlugin::with_options(100, 100_000.0);
+
+        let txn_a = state.transaction().insert_text("A").unwrap();
+        let state_a = state.apply(txn_a.clone());
+        history.record(&txn_a, &state.doc);
+        assert_eq!(history.undo_stack.len(), 1);
+
+        let txn_b = state_a
+            .transaction()
+            .insert_text("B")
+            .unwrap()
+            .set_meta("history", "isolate");
+        let state_b = state_a.apply(txn_b.clone());
+        history.record(&txn_b, &state_a.doc);
+
+        // TWO entries -- isolation defeated the time-grouping window.
+        assert_eq!(history.undo_stack.len(), 2);
+
+        // One undo reverts ONLY txn_b (the isolated one), leaving txn_a's
+        // insertion in place.
+        let undo_txn = history.undo(&state_b).unwrap();
+        let after_undo = state_b.apply(undo_txn);
+        assert_eq!(after_undo.doc, state_a.doc);
+        assert!(history.can_undo());
+
+        // A second undo reverts txn_a, back to the pristine doc.
+        let undo_txn2 = history.undo(&after_undo).unwrap();
+        let restored = after_undo.apply(undo_txn2);
+        assert_eq!(restored.doc, state.doc);
+        assert!(!history.can_undo());
     }
 
     // ── Undo after concurrent edit (known bug) ──

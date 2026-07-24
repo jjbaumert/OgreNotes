@@ -20,7 +20,7 @@ use super::calendar_modal::{
     CalendarModal, CalendarModalMode, CalendarModalState, ModalOutcome,
 };
 use super::code_lang_chip::{CodeLangChip, CodeLangChipState};
-use super::editor_context_menu::{EditorContextCommand, EditorContextMenu};
+use super::editor_context_menu::{DocMentionCtx, EditorContextCommand, EditorContextMenu};
 use super::kanban_card_modal::{
     KanbanCardModal, KanbanCardModalMode, KanbanCardModalState, KanbanCardOutcome,
 };
@@ -602,23 +602,30 @@ enum KanbanColumnAction {
     SetWipLimit { kanban_id: String, column_id: String, prompt_default: String },
 }
 
-/// Copy a deep link to `block_id` in the CURRENT document to the
-/// clipboard: `{origin}{pathname}#b=<blockId>`. Uses the same
-/// `navigator.clipboard.writeText` reflection pattern as
-/// `sidebar::copy_doc_link`.
-fn copy_block_link(block_id: &str) {
+/// Write `text` to the clipboard via `navigator.clipboard.writeText`,
+/// reached through `js_sys::Reflect` (same pattern as
+/// `sidebar::copy_doc_link`) rather than a typed `web_sys::Clipboard`
+/// binding. Best-effort: silently no-ops without a `window` or
+/// clipboard access.
+fn write_clipboard_text(text: &str) {
     let Some(window) = web_sys::window() else { return };
-    let Ok(origin) = window.location().origin() else { return };
-    let Ok(path) = window.location().pathname() else { return };
-    let href = format!("{origin}{path}#b={block_id}");
     let write_text = js_sys::Reflect::get(&window.navigator(), &"clipboard".into())
         .and_then(|clip| js_sys::Reflect::get(&clip, &"writeText".into()))
         .and_then(|func| func.dyn_into::<js_sys::Function>());
     if let Ok(write_text) = write_text {
         let clip = js_sys::Reflect::get(&window.navigator(), &"clipboard".into())
             .unwrap_or(wasm_bindgen::JsValue::NULL);
-        let _ = write_text.call1(&clip, &href.into());
+        let _ = write_text.call1(&clip, &text.into());
     }
+}
+
+/// Copy a deep link to `block_id` in the CURRENT document to the
+/// clipboard: `{origin}{pathname}#b=<blockId>`.
+fn copy_block_link(block_id: &str) {
+    let Some(window) = web_sys::window() else { return };
+    let Ok(origin) = window.location().origin() else { return };
+    let Ok(path) = window.location().pathname() else { return };
+    write_clipboard_text(&format!("{origin}{path}#b={block_id}"));
 }
 
 /// window.prompt() wrapper — returns None on cancel/absent window.
@@ -1779,6 +1786,14 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let view_ref: Rc<RefCell<Option<EditorView>>> = Rc::new(RefCell::new(None));
     let history_ref: Rc<RefCell<HistoryPlugin>> = Rc::new(RefCell::new(HistoryPlugin::new()));
 
+    // Mentions spec §5 (Task 3) — a lone same-origin doc-URL paste hands
+    // its `PendingMentionPaste` out of `EditorView::on_paste` (plain
+    // closure, not reactive) through this signal, mirroring the
+    // `pending_ctx_cmd` indirection below: the async resolve + guarded
+    // replace live in an Effect that can safely borrow `view_ref`.
+    let (pending_mention_paste, set_pending_mention_paste) =
+        signal::<Option<crate::editor::mention_url::PendingMentionPaste>>(None);
+
     // #136 — Calendar modal state. `None` = hidden. A delegated
     // click listener on `.editor-content` populates this on
     // clicks inside `.calendar-block`; the modal callback
@@ -1859,14 +1874,98 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             apply_and_notify(view, txn, None, &on_change, &on_state_change, on_mapping_dispatch.as_ref());
         };
 
+        let on_mention_paste =
+            move |p: crate::editor::mention_url::PendingMentionPaste| {
+                set_pending_mention_paste.set(Some(p));
+            };
+
         let editor_view = EditorView::new_with_options(
             html_element,
             state,
             dispatch,
             Rc::clone(&history_ref_init),
             props_clone.readonly,
+            on_mention_paste,
         );
         *view_ref_init.borrow_mut() = Some(editor_view);
+    });
+
+    // Mentions spec §5 (Task 3) — drains `pending_mention_paste` and runs
+    // the async resolve → guarded replace. Shape mirrors
+    // `handle_image_upload`: `spawn_local(async move { ...await...
+    // then re-borrow `view_ref` for the CURRENT state and dispatch via
+    // `apply_and_notify` })`, the established pattern in this file for
+    // "async command result re-enters the reactive world." `Some(&history)`
+    // (not `None`, unlike the plain-dispatch closure above) because this
+    // path bypasses the view's own dispatch wrapper — `apply_and_notify`
+    // must record history itself, same as the toolbar-command Effect.
+    //
+    // Spec §5: a single undo after conversion must restore the raw URL
+    // text, so `replace_text_with_doc_mention` tags its own transaction
+    // `history=isolate` — no tagging/coordination needed here on the
+    // dispatch side; `HistoryPlugin::record` forces that transaction into
+    // its own undo entry regardless of timing.
+    let view_ref_mention = Rc::clone(&view_ref);
+    let history_ref_mention = Rc::clone(&history_ref);
+    let on_change_mention = props.on_change.clone();
+    let on_state_change_mention = on_state_change_shared.clone();
+    let on_mapping_mention = props.on_mapping.clone();
+
+    Effect::new(move |_| {
+        let Some(p) = pending_mention_paste.get() else { return };
+        // Drain immediately so a later read doesn't re-fire the same paste.
+        set_pending_mention_paste.set(None);
+
+        let view_ref = Rc::clone(&view_ref_mention);
+        let history = Rc::clone(&history_ref_mention);
+        let on_change = on_change_mention.clone();
+        let on_state_change = on_state_change_mention.clone();
+        let on_mapping = on_mapping_mention.clone();
+
+        leptos::task::spawn_local(async move {
+            let targets = vec![(p.parsed.doc_id.clone(), p.parsed.block_id.clone())];
+            let Ok(results) = crate::api::documents::resolve_mentions(&targets).await else {
+                return; // network error: the pasted URL stays a plain URL
+            };
+            let Some(r) = results.first() else { return };
+            if r.status != "ok" {
+                return; // notFound (incl. no-access, by design): URL stays
+            }
+
+            // async ladder: block resolved → anchor attrs (snippet +
+            // target_block_id); fragment present but block missing →
+            // document mention that KEEPS target_block_id (dangling, so
+            // the chip can show its own notice); no fragment → plain
+            // document mention.
+            let block_found = r.block_found.unwrap_or(false);
+            let mut attrs = HashMap::new();
+            attrs.insert("url".to_string(), p.url.clone());
+            attrs.insert("doc_id".to_string(), p.parsed.doc_id.clone());
+            attrs.insert(
+                "target_block_id".to_string(),
+                p.parsed.block_id.clone().unwrap_or_default(),
+            );
+            attrs.insert("title".to_string(), r.title.clone().unwrap_or_default());
+            attrs.insert(
+                "snippet".to_string(),
+                if block_found { r.snippet.clone().unwrap_or_default() } else { String::new() },
+            );
+
+            let view = view_ref.borrow();
+            let Some(view) = view.as_ref() else { return };
+            // CURRENT state (post-await), not the pre-await snapshot — the
+            // concurrent-edit guard inside `replace_text_with_doc_mention`
+            // is only meaningful against what the document looks like now.
+            let current = view.state();
+            if let Some(txn) =
+                commands::replace_text_with_doc_mention(&current, p.from, p.to, &p.url, attrs)
+            {
+                apply_and_notify(view, txn, Some(&history), &on_change, &on_state_change, on_mapping.as_ref());
+            }
+            // None: the range no longer holds the raw URL (user kept
+            // typing, undid the paste, a remote edit landed there) — leave
+            // it as-is, per spec §5 case c.
+        });
     });
 
     // #136 — delegated click listener for `.calendar-block`
@@ -2737,6 +2836,15 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             }
             // Spreadsheet-only: no-op in document mode.
             ToolbarCommand::SetNumberFormat(_) => {}
+            ToolbarCommand::UpdateDocMentionAttrs { ref updates } => {
+                let updates: Vec<(String, String, String)> = updates
+                    .iter()
+                    .map(|u| (u.node_block_id.clone(), u.title.clone(), u.snippet.clone()))
+                    .collect();
+                if let Some(txn) = commands::update_doc_mention_attrs(&state, &updates) {
+                    dispatch_fn(txn);
+                }
+            }
         }
     });
 
@@ -2758,6 +2866,15 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     // need to capture the !Send+!Sync `view_ref` Rc; this signal-
     // backed approach keeps the closure free of the Rc.
     let (selection_empty, set_selection_empty) = signal(true);
+
+    // The DocMention chip under the cursor at the moment the menu
+    // opened, if the right-click landed on one — set by the
+    // `on:contextmenu` handler's ancestry walk (same idiom as
+    // view.rs's click handler), read by both the menu (to show/hide
+    // the two element actions) and the dispatch Effect below (to
+    // supply `url`/`node_block_id` to CopyOriginalUrl/
+    // ConvertMentionToLink, which carry no payload of their own).
+    let (ctx_doc_mention, set_ctx_doc_mention) = signal::<Option<DocMentionCtx>>(None);
 
     // The menu's `on_command` Callback writes to this signal; an
     // Effect below watches the signal and runs the actual dispatch.
@@ -2844,6 +2961,16 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                     if let Some(block_id) = state.doc.block_id_at(pos) {
                         copy_block_link(&block_id);
                     }
+                }
+                return;
+            }
+            EditorContextCommand::CopyOriginalUrl => {
+                // The right-clicked DocMention chip's `url` — captured
+                // by the on:contextmenu ancestry walk into
+                // ctx_doc_mention. Works in every chip state (incl. a
+                // dangling/missing target): `url` is always present.
+                if let Some(ctx) = ctx_doc_mention.get() {
+                    write_clipboard_text(&ctx.url);
                 }
                 return;
             }
@@ -2977,11 +3104,24 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                     }
                 }
             }
-            // Clipboard + block link + Comment handled above.
+            EditorContextCommand::ConvertMentionToLink => {
+                // The right-clicked chip's own blockId — commands::
+                // convert_doc_mention_to_link locates the atom by it
+                // (doc-walk, not by the current selection).
+                if let Some(ctx) = ctx_doc_mention.get() {
+                    if let Some(txn) =
+                        commands::convert_doc_mention_to_link(&state, &ctx.node_block_id)
+                    {
+                        dispatch_fn(txn);
+                    }
+                }
+            }
+            // Clipboard + block link + Comment + CopyOriginalUrl handled above.
             EditorContextCommand::Cut
             | EditorContextCommand::Copy
             | EditorContextCommand::Paste
             | EditorContextCommand::CopyBlockLink
+            | EditorContextCommand::CopyOriginalUrl
             | EditorContextCommand::Comment => {}
         }
     });
@@ -3088,6 +3228,32 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                         .map(|s| s.empty())
                         .unwrap_or(true);
                     set_selection_empty.set(empty);
+
+                    // Walk up from the click target for a DocMention
+                    // chip — same ancestry-walk idiom as view.rs's
+                    // on_click. `data-url` is always present (even
+                    // for a dangling/missing target); `data-node-
+                    // block-id` is the chip's own render identity,
+                    // which convert_doc_mention_to_link locates by.
+                    let mut mention_node =
+                        e.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok());
+                    let mut mention_ctx = None;
+                    while let Some(el) = mention_node {
+                        if el.tag_name().to_lowercase() == "span"
+                            && el.class_list().contains("doc-mention")
+                        {
+                            if let (Some(url), Some(node_block_id)) = (
+                                el.get_attribute("data-url"),
+                                el.get_attribute("data-node-block-id"),
+                            ) {
+                                mention_ctx = Some(DocMentionCtx { url, node_block_id });
+                            }
+                            break;
+                        }
+                        mention_node = el.parent_element();
+                    }
+                    set_ctx_doc_mention.set(mention_ctx);
+
                     set_ctx_menu_x.set(e.client_x() as f64);
                     set_ctx_menu_y.set(e.client_y() as f64);
                     set_ctx_menu_visible.set(true);
@@ -3098,6 +3264,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                 x=ctx_menu_x
                 y=ctx_menu_y
                 selection_empty=selection_empty.into()
+                doc_mention=ctx_doc_mention
                 on_command=on_ctx_command
                 on_close=Callback::new(move |()| set_ctx_menu_visible.set(false))
             />

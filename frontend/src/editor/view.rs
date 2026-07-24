@@ -29,6 +29,13 @@ pub struct EditorView {
     pending_composition: Rc<RefCell<Option<gloo_timers::callback::Timeout>>>,
     /// History plugin for undo/redo (shared with editor component).
     history: Rc<RefCell<super::plugins::HistoryPlugin>>,
+    /// Mentions spec §5 (Task 3): hands a lone same-origin doc-URL paste
+    /// out to the Leptos side (`editor_component.rs`), which drives the
+    /// async resolve → guarded replace. Mirrors `dispatch`: a plain
+    /// closure crossing from this DOM-event world into the reactive one,
+    /// supplied at construction the same way `dispatch` is — there's no
+    /// other hook-passing mechanism into `EditorView` today.
+    mention_paste_hook: Rc<dyn Fn(super::mention_url::PendingMentionPaste)>,
     /// Stored (event_name, closure) pairs for cleanup in destroy().
     listeners: Vec<(&'static str, Closure<dyn Fn(web_sys::Event)>)>,
     /// selectionchange listener (attached to document, not container).
@@ -42,8 +49,9 @@ impl EditorView {
         state: EditorState,
         dispatch: impl Fn(Transaction) + 'static,
         history: Rc<RefCell<super::plugins::HistoryPlugin>>,
+        on_mention_paste: impl Fn(super::mention_url::PendingMentionPaste) + 'static,
     ) -> Self {
-        Self::new_with_options(container, state, dispatch, history, false)
+        Self::new_with_options(container, state, dispatch, history, false, on_mention_paste)
     }
 
     /// Create a new editor view with the option to render it read-only.
@@ -59,6 +67,7 @@ impl EditorView {
         dispatch: impl Fn(Transaction) + 'static,
         history: Rc<RefCell<super::plugins::HistoryPlugin>>,
         readonly: bool,
+        on_mention_paste: impl Fn(super::mention_url::PendingMentionPaste) + 'static,
     ) -> Self {
         if !readonly {
             container
@@ -97,6 +106,7 @@ impl EditorView {
             just_composed,
             pending_composition: Rc::new(RefCell::new(None)),
             history,
+            mention_paste_hook: Rc::new(on_mention_paste),
             listeners: Vec::new(),
             selectionchange_closure: None,
         };
@@ -798,6 +808,7 @@ impl EditorView {
         let state_paste = Rc::clone(&self.state);
         let dispatch_paste = Rc::clone(&self.dispatch);
         let container_paste = self.container.clone();
+        let mention_paste_hook = Rc::clone(&self.mention_paste_hook);
         let on_paste = Closure::wrap(Box::new(move |event: web_sys::Event| {
             event.prevent_default();
             let Some(ce) = event.dyn_ref::<web_sys::ClipboardEvent>() else { return };
@@ -824,6 +835,43 @@ impl EditorView {
                 ("text_len", &text.len().to_string()),
                 ("text_preview", &text.chars().take(500).collect::<String>()),
             ]);
+
+            // Mentions spec §5: a lone same-origin doc URL pastes as plain
+            // text immediately (no latency), then async-converts to a
+            // DocMention. Only when the paste is EXACTLY one URL with no
+            // meaningful HTML structure — multi-URL, URL-in-sentence, and
+            // rich (non-trivial) HTML pastes fall through to the normal
+            // paths below, untouched.
+            let html_is_trivial = html.is_empty() || {
+                let probe = super::clipboard::parse_from_html(&html);
+                super::markdown::is_trivial_slice(&probe)
+            };
+            if html_is_trivial && !text.is_empty() {
+                if let Some(origin) = web_sys::window().and_then(|w| w.location().origin().ok()) {
+                    if let Some(parsed) = super::mention_url::parse_ogre_doc_url(&text, &origin) {
+                        let url = text.trim().to_string();
+                        if let Ok(txn) = state_with_sel.transaction().insert_text(&url) {
+                            // Model positions of the just-inserted range: `from`
+                            // is the pre-insert selection start, `to` is where
+                            // the cursor actually lands after the insert (per
+                            // `insert_text`'s own position mapping) — NOT a
+                            // char-count guess, so it's correct regardless of
+                            // marks/position-accounting subtleties.
+                            let from = state_with_sel.selection.from();
+                            let to = txn.selection.from();
+                            dispatch_paste(txn);
+                            mention_paste_hook(super::mention_url::PendingMentionPaste {
+                                from,
+                                to,
+                                url,
+                                parsed,
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+
             let slice = if !html.is_empty() {
                 let html_slice = super::clipboard::parse_from_html(&html);
                 // Sources like terminals, file viewers, and "view source" panels
@@ -1023,10 +1071,60 @@ impl EditorView {
         }) as Box<dyn Fn(web_sys::Event)>);
         self.add_listener("paste", on_paste);
 
-        // click — open links with Ctrl+click (Cmd+click on Mac) in a new tab.
-        // Regular clicks in contenteditable just position the cursor.
+        // click — open links with Ctrl+click (Cmd+click on Mac) in a new tab;
+        // navigate DocMention chips on a plain click. Regular clicks in
+        // contenteditable just position the cursor.
         let on_click = Closure::wrap(Box::new(move |event: web_sys::Event| {
             let Some(me) = event.dyn_ref::<web_sys::MouseEvent>() else { return };
+
+            // DocMention chips: plain click navigates, no Ctrl/Cmd gate
+            // needed — the chip is `contenteditable="false"`, so a click
+            // on it can never be a text-editing click the way clicking
+            // inside a link's own text run can. Checked before the Ctrl
+            // gate below (and independent of it) so the chip works
+            // whether or not a modifier happens to be held.
+            let mut mention_node =
+                event.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok());
+            while let Some(el) = mention_node {
+                if el.tag_name().to_lowercase() == "span"
+                    && el.class_list().contains("doc-mention")
+                {
+                    if !el.class_list().contains("doc-mention-missing") {
+                        // Mentions spec §2: activation navigates to
+                        // `/d/<doc_id>` (or `/d/<doc_id>#b=<block_id>`),
+                        // RECONSTRUCTED from the chip's own id
+                        // attributes — never `data-url`. `data-url` is
+                        // whatever URL the mention was created from
+                        // (spec §7's clipboard round-trip needs the
+                        // original), which a clipboard-injected chip can
+                        // forge to any off-origin target while still
+                        // carrying a legit-looking `data-doc-id`; a
+                        // plain click would then silently phish the
+                        // user off-site. `data-doc-id` and
+                        // `data-block-id-target` are validated against
+                        // the same id charset `mention_url` parses
+                        // pasted doc URLs with, so the built href is
+                        // always a same-origin relative path.
+                        if let Some(doc_id) = el.get_attribute("data-doc-id") {
+                            if super::mention_url::valid_id(&doc_id) {
+                                let href = match el.get_attribute("data-block-id-target") {
+                                    Some(target) if super::mention_url::valid_id(&target) => {
+                                        format!("/d/{doc_id}#b={target}")
+                                    }
+                                    _ => format!("/d/{doc_id}"),
+                                };
+                                event.prevent_default();
+                                if let Some(w) = web_sys::window() {
+                                    let _ = w.location().set_href(&href);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                mention_node = el.parent_element();
+            }
+
             // Ctrl+click (Windows/Linux) or Meta+click (Mac)
             if !me.ctrl_key() && !me.meta_key() {
                 return;
@@ -1325,6 +1423,53 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                     el.set_text_content(Some(display));
                     return Some(el.into());
                 }
+                NodeType::DocMention => {
+                    // Mentions spec §3 — in-editor doc/anchor mention
+                    // chip. Same atom shape as Mention above (leaf,
+                    // `contenteditable="false"`, `data-atom-size`), but
+                    // carries its own set of attributes and a
+                    // glyph+label body instead of a bare display name.
+                    //
+                    // `data-node-block-id` is this NODE's own identity
+                    // id (Task 5's degradation overlay keys on it) —
+                    // NOT the target. The target block lives under
+                    // `data-block-id-target`, deliberately NOT
+                    // `data-block-id`: that attribute name means "this
+                    // node's own block" everywhere else in the DOM, and
+                    // reusing it here would collide with every other
+                    // block-id reader that walks up from a click. The
+                    // clipboard/export `<a>` shape (clipboard.rs,
+                    // crates/collab/src/export.rs) keeps spec §7's
+                    // `data-block-id` name since it leaves the app and
+                    // has no such collision to worry about.
+                    let el = doc.create_element("span").ok()?;
+                    el.set_attribute("class", "doc-mention").ok()?;
+                    el.set_attribute("contenteditable", "false").ok()?;
+                    el.set_attribute("data-atom-size", &node.node_size().to_string()).ok()?;
+                    let get = |k: &str| attrs.get(k).map(String::as_str).unwrap_or("");
+                    el.set_attribute("data-doc-id", get("doc_id")).ok()?;
+                    if !get("target_block_id").is_empty() {
+                        el.set_attribute("data-block-id-target", get("target_block_id")).ok()?;
+                    }
+                    el.set_attribute("data-url", get("url")).ok()?;
+                    if let Some(bid) = node.block_id() {
+                        el.set_attribute("data-node-block-id", bid).ok()?;
+                    }
+                    // Glyph: anchor for a within-doc target, document
+                    // otherwise. Label: anchor snippet, else title,
+                    // else the bare url (mirrors export.rs's fallback).
+                    let is_anchor = !get("target_block_id").is_empty();
+                    let icon = if is_anchor { "\u{2693} " } else { "\u{1F4C4} " };
+                    let label = if is_anchor && !get("snippet").is_empty() {
+                        get("snippet")
+                    } else if !get("title").is_empty() {
+                        get("title")
+                    } else {
+                        get("url")
+                    };
+                    el.set_text_content(Some(&format!("{icon}{label}")));
+                    return Some(el.into());
+                }
                 NodeType::Embed => {
                     // M-P6 piece B: wrap the iframe in a non-editable
                     // div so the editor treats the embed as a single
@@ -1599,6 +1744,10 @@ fn node_type_to_tag(nt: NodeType) -> &'static str {
         // pre-existing text+MarkType::Mention DOM output for
         // paste round-trip stability.
         NodeType::Mention => "span",
+        // Mentions spec §3 — doc/anchor mention chip. Attribute +
+        // inner text emission handled by the renderer's per-node
+        // override (Task 2), same as Mention above.
+        NodeType::DocMention => "span",
         NodeType::Mermaid => "div",
     }
 }
