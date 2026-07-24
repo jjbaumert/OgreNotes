@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
 use leptos::prelude::*;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use wasm_bindgen::prelude::*;
@@ -1794,17 +1794,6 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let (pending_mention_paste, set_pending_mention_paste) =
         signal::<Option<crate::editor::mention_url::PendingMentionPaste>>(None);
 
-    // Task 3 review fix: a fresh, monotonically increasing id per pasted
-    // mention URL. Deliberately NOT `Date::now()`/`Math.random()` — a
-    // plain counter is enough to distinguish "this exact paste's undo
-    // entry" from anything else, and is trivially reproducible in native
-    // tests. Tags `HistoryPlugin`'s top entry right after the paste
-    // dispatches (below), then rides along on the async-resolved replace
-    // transaction's `history-merge-tag` meta so `HistoryPlugin::record`
-    // can refuse to merge into the wrong entry if something else landed
-    // on top while the resolve was in flight.
-    let mention_paste_tag_counter: Rc<Cell<u64>> = Rc::new(Cell::new(0));
-
     // #136 — Calendar modal state. `None` = hidden. A delegated
     // click listener on `.editor-content` populates this on
     // clicks inside `.calendar-block`; the modal callback
@@ -1910,12 +1899,17 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     // (not `None`, unlike the plain-dispatch closure above) because this
     // path bypasses the view's own dispatch wrapper — `apply_and_notify`
     // must record history itself, same as the toolbar-command Effect.
+    //
+    // Spec §5: a single undo after conversion must restore the raw URL
+    // text, so `replace_text_with_doc_mention` tags its own transaction
+    // `history=isolate` — no tagging/coordination needed here on the
+    // dispatch side; `HistoryPlugin::record` forces that transaction into
+    // its own undo entry regardless of timing.
     let view_ref_mention = Rc::clone(&view_ref);
     let history_ref_mention = Rc::clone(&history_ref);
     let on_change_mention = props.on_change.clone();
     let on_state_change_mention = on_state_change_shared.clone();
     let on_mapping_mention = props.on_mapping.clone();
-    let mention_paste_tag_counter_effect = Rc::clone(&mention_paste_tag_counter);
 
     Effect::new(move |_| {
         let Some(p) = pending_mention_paste.get() else { return };
@@ -1927,19 +1921,6 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
         let on_change = on_change_mention.clone();
         let on_state_change = on_state_change_mention.clone();
         let on_mapping = on_mapping_mention.clone();
-
-        // Task 3 review fix: tag the paste's undo entry NOW, synchronously,
-        // right after the URL-insert paste has already been dispatched and
-        // recorded (by `EditorView`'s own wrapped `dispatch`, before
-        // `mention_paste_hook` — and thus this Effect — ever fires). This
-        // is still the same entry the paste created: nothing else can have
-        // been recorded between that dispatch and this Effect running.
-        // From here on, the id travels with `p`/the async task, and
-        // `HistoryPlugin::record` will refuse to merge later if this tag
-        // is no longer on top by the time the resolve returns.
-        let tag = mention_paste_tag_counter_effect.get() + 1;
-        mention_paste_tag_counter_effect.set(tag);
-        history.borrow_mut().tag_last_entry(tag);
 
         leptos::task::spawn_local(async move {
             let targets = vec![(p.parsed.doc_id.clone(), p.parsed.block_id.clone())];
@@ -1977,7 +1958,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             // is only meaningful against what the document looks like now.
             let current = view.state();
             if let Some(txn) =
-                commands::replace_text_with_doc_mention(&current, p.from, p.to, &p.url, attrs, tag)
+                commands::replace_text_with_doc_mention(&current, p.from, p.to, &p.url, attrs)
             {
                 apply_and_notify(view, txn, Some(&history), &on_change, &on_state_change, on_mapping.as_ref());
             }

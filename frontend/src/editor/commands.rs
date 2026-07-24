@@ -869,27 +869,20 @@ pub fn insert_user_mention(
 /// itself to route through `apply_and_notify` — see that file's mention
 /// paste resolve effect.
 ///
-/// The returned transaction carries `meta("history", "merge")` PLUS
-/// `meta("history-merge-tag", tag)` so `HistoryPlugin` folds it into the
-/// SAME undo entry as the original paste-the-URL transaction — but ONLY
-/// if that entry is still on top and still carries the matching tag
-/// (Task 3 review fix: an unrelated edit landing on top between the paste
-/// and this async-resolved replace must NOT be corrupted by a merge into
-/// the wrong entry — see `HistoryPlugin::record`'s merge path). `tag`
-/// must be the SAME id the caller passed to `HistoryPlugin::tag_last_entry`
-/// right after dispatching the original paste transaction.
-///
-/// When the merge succeeds, one undo removes the mention and restores the
-/// raw URL, matching the paste's single edit from the user's perspective.
-/// When the tag is stale (some other entry now sits on top), `record`
-/// degrades safely to a separate undo entry instead.
+/// Spec §5: a single undo after the URL-to-mention conversion must leave
+/// the raw URL TEXT in the document (conversion undone, paste kept) — NOT
+/// revert the paste too. The returned transaction therefore carries
+/// `meta("history", "isolate")`, which tells `HistoryPlugin::record` to
+/// record this as its OWN undo entry and never fold it into the paste's,
+/// even if the async resolve happens to land inside the normal
+/// time-grouping window. One undo removes the mention and restores the
+/// URL; a second undo removes the URL itself.
 pub fn replace_text_with_doc_mention(
     state: &EditorState,
     from: usize,
     to: usize,
     expected_text: &str,
     attrs: std::collections::HashMap<String, String>,
-    tag: u64,
 ) -> Option<Transaction> {
     if text_between_positions(&state.doc, from, to) != expected_text {
         return None;
@@ -905,9 +898,7 @@ pub fn replace_text_with_doc_mention(
         0,
     );
     let mut txn = state.transaction().replace(from, to, slice).ok()?;
-    txn = txn
-        .set_meta("history", "merge")
-        .set_meta("history-merge-tag", &tag.to_string());
+    txn = txn.set_meta("history", "isolate");
     txn.selection = Selection::cursor(from + 1);
     Some(txn)
 }
@@ -961,10 +952,10 @@ fn find_doc_mention(doc: &Node, node_block_id: &str) -> Option<(usize, HashMap<S
 /// exists (already converted/deleted underneath — e.g. a stale
 /// context-menu ctx after a concurrent edit).
 ///
-/// Unlike `replace_text_with_doc_mention`'s paste-resolve merge, this
-/// is a normal, standalone undo entry: no `history`/`history-merge-tag`
-/// meta. Converting an already-settled mention is its own distinct
-/// user action, not a continuation of an in-flight paste.
+/// Unlike `replace_text_with_doc_mention`'s isolated paste-resolve entry,
+/// this is a normal, standalone undo entry: no `history` meta at all.
+/// Converting an already-settled mention is its own distinct user action,
+/// not a continuation of an in-flight paste.
 pub fn convert_doc_mention_to_link(
     state: &EditorState,
     node_block_id: &str,
@@ -4702,7 +4693,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_text_with_doc_mention_swaps_in_the_atom_and_marks_merge() {
+    fn replace_text_with_doc_mention_swaps_in_the_atom_and_marks_isolate() {
         let url = "https://notes.example/d/abc123";
         let state = EditorState::create_default(url_doc(url));
         let from = 1; // just inside <p>
@@ -4713,11 +4704,11 @@ mod tests {
         attrs.insert("url".to_string(), url.to_string());
         attrs.insert("title".to_string(), "Target Doc".to_string());
 
-        let txn = replace_text_with_doc_mention(&state, from, to, url, attrs, 99).unwrap();
-        assert_eq!(txn.meta.get("history").map(String::as_str), Some("merge"));
-        // Task 3 review fix: the merge tag rides along so HistoryPlugin
-        // can prove it's folding into the SAME entry the paste tagged.
-        assert_eq!(txn.meta.get("history-merge-tag").map(String::as_str), Some("99"));
+        let txn = replace_text_with_doc_mention(&state, from, to, url, attrs).unwrap();
+        // Spec §5: this must be its own undo entry, never merged into the
+        // paste's — see `HistoryPlugin::record`'s isolate handling.
+        assert_eq!(txn.meta.get("history").map(String::as_str), Some("isolate"));
+        assert!(txn.meta.get("history-merge-tag").is_none());
 
         let new_state = state.apply(txn);
         let para = new_state.doc.child(0).unwrap();
@@ -4740,7 +4731,7 @@ mod tests {
         let state = EditorState::create_default(url_doc(url));
         let from = 1;
         let to = from + url.chars().count();
-        assert!(replace_text_with_doc_mention(&state, from, to, "not the url anymore", HashMap::new(), 1)
+        assert!(replace_text_with_doc_mention(&state, from, to, "not the url anymore", HashMap::new())
             .is_none());
     }
 
@@ -4748,7 +4739,71 @@ mod tests {
     fn replace_text_with_doc_mention_aborts_on_out_of_range_positions() {
         let url = "https://notes.example/d/abc123";
         let state = EditorState::create_default(url_doc(url));
-        assert!(replace_text_with_doc_mention(&state, 0, 1000, url, HashMap::new(), 1).is_none());
+        assert!(replace_text_with_doc_mention(&state, 0, 1000, url, HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn single_undo_after_conversion_leaves_url_text() {
+        // End-to-end spec §5 behavior: paste a URL (normal, time-grouped
+        // record), then convert it to a DocMention via
+        // `replace_text_with_doc_mention` (isolate). One undo must remove
+        // ONLY the mention, restoring the raw URL text with no DocMention
+        // node left in the doc. A second undo removes the URL itself.
+        use crate::editor::plugins::HistoryPlugin;
+
+        let url = "https://notes.example/d/abc123";
+        let state = EditorState::create_default(Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::empty(),
+            )]),
+        ));
+        let mut history = HistoryPlugin::new();
+
+        // "Paste": insert the raw URL text, recorded normally.
+        let paste_txn = EditorState { selection: Selection::cursor(1), ..state.clone() }
+            .transaction()
+            .insert_text(url)
+            .unwrap();
+        history.record(&paste_txn, &state.doc);
+        let after_paste = state.apply(paste_txn);
+        assert_eq!(after_paste.doc.child(0).unwrap().text_content(), url);
+
+        // Async resolve: convert the pasted URL into a DocMention.
+        let from = 1;
+        let to = from + url.chars().count();
+        let mut attrs = HashMap::new();
+        attrs.insert("doc_id".to_string(), "abc123".to_string());
+        attrs.insert("url".to_string(), url.to_string());
+        attrs.insert("title".to_string(), "Target Doc".to_string());
+        let convert_txn =
+            replace_text_with_doc_mention(&after_paste, from, to, url, attrs).unwrap();
+        history.record(&convert_txn, &after_paste.doc);
+        let after_convert = after_paste.apply(convert_txn);
+        assert_eq!(
+            after_convert.doc.child(0).unwrap().child(0).unwrap().node_type(),
+            Some(NodeType::DocMention)
+        );
+
+        // First undo: mention gone, raw URL text back -- NOT the whole
+        // paste reverted.
+        let undo1 = history.undo(&after_convert).expect("first undo should succeed");
+        let after_undo1 = after_convert.apply(undo1);
+        let para = after_undo1.doc.child(0).unwrap();
+        assert_eq!(para.text_content(), url, "first undo must restore the raw URL text");
+        assert_ne!(
+            para.child(0).and_then(|c| c.node_type()),
+            Some(NodeType::DocMention),
+            "first undo must leave no DocMention node behind"
+        );
+        assert!(history.can_undo());
+
+        // Second undo: the URL itself is removed, back to the empty doc.
+        let undo2 = history.undo(&after_undo1).expect("second undo should succeed");
+        let after_undo2 = after_undo1.apply(undo2);
+        assert_eq!(after_undo2.doc, state.doc, "second undo must remove the pasted URL entirely");
+        assert!(!history.can_undo());
     }
 
     // ── convert_doc_mention_to_link (mentions spec §5 — permanent opt-out) ──
