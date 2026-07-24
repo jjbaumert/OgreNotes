@@ -912,6 +912,84 @@ pub fn replace_text_with_doc_mention(
     Some(txn)
 }
 
+/// Doc-walk idiom adapted from `EditorState::doc`'s
+/// `find_block_content_start` (model.rs): walk the document looking
+/// for a `DocMention` leaf whose OWN `blockId` attr — this node's
+/// render identity, `data-node-block-id` in view.rs, NOT the
+/// `doc_id`/`target_block_id` attrs it points at — equals
+/// `node_block_id`. Leaf atoms have no content to descend into, so
+/// unlike `find_block_content_start` this returns the atom's own
+/// start position (not a content_start past an open boundary) along
+/// with a clone of its attrs, ready to feed a `[pos, pos + 1)`
+/// replace.
+fn find_doc_mention(doc: &Node, node_block_id: &str) -> Option<(usize, HashMap<String, String>)> {
+    fn walk(
+        children: &[Node],
+        node_block_id: &str,
+        mut offset: usize,
+    ) -> Option<(usize, HashMap<String, String>)> {
+        for child in children {
+            let child_size = child.node_size();
+            if child.node_type() == Some(NodeType::DocMention)
+                && child.block_id() == Some(node_block_id)
+            {
+                return Some((offset, child.attrs().clone()));
+            }
+            if let Node::Element { content, .. } = child {
+                let content_start = offset + 1;
+                if let Some(found) = walk(&content.children, node_block_id, content_start) {
+                    return Some(found);
+                }
+            }
+            offset += child_size;
+        }
+        None
+    }
+
+    let Node::Element { content, .. } = doc else {
+        return None;
+    };
+    walk(&content.children, node_block_id, 0)
+}
+
+/// Mentions spec §5 — the permanent opt-out (element context menu's
+/// "Convert to Plain Link"). Replace a `DocMention` atom — found by
+/// its own `blockId` via `find_doc_mention` — with plain text `title`
+/// (falling back to `url` when `title` is empty or absent) carrying a
+/// `Link` mark to `url`, exactly the linked-text shape `insert_doc_link`
+/// builds. Returns `None` when no DocMention with this `blockId`
+/// exists (already converted/deleted underneath — e.g. a stale
+/// context-menu ctx after a concurrent edit).
+///
+/// Unlike `replace_text_with_doc_mention`'s paste-resolve merge, this
+/// is a normal, standalone undo entry: no `history`/`history-merge-tag`
+/// meta. Converting an already-settled mention is its own distinct
+/// user action, not a continuation of an in-flight paste.
+pub fn convert_doc_mention_to_link(
+    state: &EditorState,
+    node_block_id: &str,
+) -> Option<Transaction> {
+    let (pos, attrs) = find_doc_mention(&state.doc, node_block_id)?;
+    let url = attrs.get("url").cloned().unwrap_or_default();
+    let title = attrs
+        .get("title")
+        .cloned()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| url.clone());
+    if title.is_empty() {
+        return None;
+    }
+    let end = pos + title.chars().count();
+    let mark = Mark::new(MarkType::Link).with_attr("href", &url);
+    let mut txn = state
+        .transaction()
+        .replace(pos, pos + 1, text_slice(&title))
+        .and_then(|t| t.add_mark(pos, end, mark))
+        .ok()?;
+    txn.selection = Selection::cursor(end);
+    Some(txn)
+}
+
 /// Scope of text extracted by `plain_text_from_state`. Callers use it
 /// to phrase the AI prompt correctly — "summarize this selection" vs.
 /// "summarize this document."
@@ -4603,6 +4681,73 @@ mod tests {
         let url = "https://notes.example/d/abc123";
         let state = EditorState::create_default(url_doc(url));
         assert!(replace_text_with_doc_mention(&state, 0, 1000, url, HashMap::new(), 1).is_none());
+    }
+
+    // ── convert_doc_mention_to_link (mentions spec §5 — permanent opt-out) ──
+
+    fn doc_mention_doc(block_id: &str, url: &str, title: &str) -> Node {
+        let mut attrs = HashMap::new();
+        attrs.insert("blockId".to_string(), block_id.to_string());
+        attrs.insert("url".to_string(), url.to_string());
+        attrs.insert("title".to_string(), title.to_string());
+        attrs.insert("doc_id".to_string(), "abc123".to_string());
+        let mention = Node::element_with_attrs(NodeType::DocMention, attrs, Fragment::empty());
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![mention]),
+            )]),
+        )
+    }
+
+    #[test]
+    fn convert_doc_mention_to_link_replaces_atom_with_linked_title() {
+        let doc = doc_mention_doc("mention-1", "https://notes.example/d/abc123", "Target Doc");
+        let state = EditorState::create_default(doc);
+
+        let txn = convert_doc_mention_to_link(&state, "mention-1").unwrap();
+        // Normal undo entry — no merge meta (unlike replace_text_with_doc_mention,
+        // whose paste-resolve merge this is deliberately NOT).
+        assert!(txn.meta.get("history").is_none());
+        assert!(txn.meta.get("history-merge-tag").is_none());
+
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        // The atom is gone — replaced by plain text carrying a Link mark.
+        let first = para.child(0).unwrap();
+        assert_ne!(first.node_type(), Some(NodeType::DocMention));
+        assert_eq!(para.text_content(), "Target Doc");
+        let link = first.marks().iter().find(|m| m.mark_type == MarkType::Link);
+        assert!(link.is_some(), "converted text must carry a Link mark");
+        assert_eq!(
+            link.unwrap().attrs.get("href").unwrap(),
+            "https://notes.example/d/abc123"
+        );
+        // Cursor sits just after the converted text.
+        assert_eq!(new_state.selection.from(), 1 + "Target Doc".chars().count());
+    }
+
+    #[test]
+    fn convert_doc_mention_to_link_falls_back_to_url_when_title_missing() {
+        let doc = doc_mention_doc("mention-2", "https://notes.example/d/xyz", "");
+        let state = EditorState::create_default(doc);
+        let txn = convert_doc_mention_to_link(&state, "mention-2").unwrap();
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(para.text_content(), "https://notes.example/d/xyz");
+        let link = para.child(0).unwrap().marks().iter().find(|m| m.mark_type == MarkType::Link);
+        assert_eq!(
+            link.unwrap().attrs.get("href").unwrap(),
+            "https://notes.example/d/xyz"
+        );
+    }
+
+    #[test]
+    fn convert_doc_mention_to_link_returns_none_when_block_id_not_found() {
+        let doc = doc_mention_doc("mention-1", "https://notes.example/d/abc123", "Target Doc");
+        let state = EditorState::create_default(doc);
+        assert!(convert_doc_mention_to_link(&state, "does-not-exist").is_none());
     }
 
     #[test]
