@@ -13,6 +13,7 @@ pub mod folders;
 pub mod history;
 pub mod jobs;
 pub mod metrics;
+pub mod mentions;
 pub mod mfa;
 pub mod notifications;
 pub mod relationships;
@@ -250,6 +251,7 @@ pub fn api_router() -> Router<AppState> {
         .nest("/api/v1/threads", comments::thread_router())
         .nest("/api/v1/chats", chat::router())
         .nest("/api/v1/notifications", notifications::router())
+        .nest("/api/v1/mentions", mentions::router())
         .nest("/api/v1/folders", folders::router().merge(sharing::router()))
         .nest("/api/v1/workspaces", workspaces::router())
         .nest("/api/v1/search", search::router())
