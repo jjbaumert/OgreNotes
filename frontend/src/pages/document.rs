@@ -788,6 +788,8 @@ pub fn DocumentPage() -> impl IntoView {
                     usize::MAX,
                 );
                 if scrolled {
+                    // clear any stale missing-block toast from a prior failed jump.
+                    set_block_link_missing.set(false);
                     // ~2s flash on the target block; class removal via timer.
                     if let Some(el) =
                         crate::components::dom_position::find_block_element(&block_id)
