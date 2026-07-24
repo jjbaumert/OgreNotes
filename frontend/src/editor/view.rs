@@ -1090,11 +1090,32 @@ impl EditorView {
                     && el.class_list().contains("doc-mention")
                 {
                     if !el.class_list().contains("doc-mention-missing") {
-                        if let Some(url) = el.get_attribute("data-url") {
-                            if is_safe_url(&url) {
+                        // Mentions spec §2: activation navigates to
+                        // `/d/<doc_id>` (or `/d/<doc_id>#b=<block_id>`),
+                        // RECONSTRUCTED from the chip's own id
+                        // attributes — never `data-url`. `data-url` is
+                        // whatever URL the mention was created from
+                        // (spec §7's clipboard round-trip needs the
+                        // original), which a clipboard-injected chip can
+                        // forge to any off-origin target while still
+                        // carrying a legit-looking `data-doc-id`; a
+                        // plain click would then silently phish the
+                        // user off-site. `data-doc-id` and
+                        // `data-block-id-target` are validated against
+                        // the same id charset `mention_url` parses
+                        // pasted doc URLs with, so the built href is
+                        // always a same-origin relative path.
+                        if let Some(doc_id) = el.get_attribute("data-doc-id") {
+                            if super::mention_url::valid_id(&doc_id) {
+                                let href = match el.get_attribute("data-block-id-target") {
+                                    Some(target) if super::mention_url::valid_id(&target) => {
+                                        format!("/d/{doc_id}#b={target}")
+                                    }
+                                    _ => format!("/d/{doc_id}"),
+                                };
                                 event.prevent_default();
                                 if let Some(w) = web_sys::window() {
-                                    let _ = w.location().set_href(&url);
+                                    let _ = w.location().set_href(&href);
                                 }
                             }
                         }

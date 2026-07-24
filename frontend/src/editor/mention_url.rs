@@ -24,7 +24,12 @@ pub struct PendingMentionPaste {
     pub parsed: ParsedDocUrl,
 }
 
-fn valid_id(s: &str) -> bool {
+/// `[A-Za-z0-9_-]+` — the id charset shared by every doc-mention id
+/// consumer: this module's own URL parse below, and `view.rs`'s click
+/// handler (which validates `data-doc-id`/`data-block-id-target` before
+/// building a navigation target from them, rather than trusting the
+/// chip's stored `data-url`).
+pub(crate) fn valid_id(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 

@@ -202,12 +202,26 @@ fn apply_overlay_to_dom(states: &HashMap<String, MentionState>) {
                 }
                 let _ = el.set_attribute("title", &label);
             }
-            MentionState::Dangling { .. } => {
+            MentionState::Dangling { title } => {
                 let _ = class_list.remove_1("doc-mention-missing");
                 let _ = class_list.add_1("doc-mention-dangling");
                 let _ = el.set_attribute("title", &crate::t!("doc-block-link-missing"));
-                // Text stays as rendered (the atom's own cached
-                // title) — only the class + tooltip change.
+                // Spec §3's degradation matrix: a dangling anchor (the
+                // target BLOCK is gone, but the document itself still
+                // resolves) renders as a plain document mention — the
+                // ⚓ glyph promised "this points at a specific block",
+                // and that promise is broken, so force the 📄 glyph
+                // here rather than `icon` (which is still ⚓, computed
+                // from `data-block-id-target` being present). Uses the
+                // state's freshly-resolved `title`, not the chip's
+                // stale cached anchor snippet — the snippet described
+                // a block that no longer exists.
+                if !title.is_empty() {
+                    let text = format!("\u{1F4C4} {title}");
+                    if el.text_content().as_deref() != Some(text.as_str()) {
+                        el.set_text_content(Some(&text));
+                    }
+                }
             }
             MentionState::Live { title, snippet } => {
                 let _ = class_list.remove_1("doc-mention-missing");
@@ -361,8 +375,20 @@ pub fn mount(
     // `a11y::defer` precedent `find_replace_bar` uses before mapping
     // model positions to live DOM ranges).
     Effect::new(move |_| {
-        let _ = editor_state.get();
+        // Read `mention_states` FIRST (and unconditionally) so this
+        // Effect stays subscribed to it even on the early-return below
+        // — otherwise a zero-mention doc would never re-run once the
+        // async resolve later populates the map. Only after confirming
+        // there's something to decorate do we also track `editor_state`
+        // (whose every-keystroke changes are what actually drive the
+        // reapply-on-rerender below) and pay for the DOM query — a doc
+        // with no mentions has no overlay to maintain, so it shouldn't
+        // pay a `querySelectorAll` per keystroke.
         let states = mention_states.get();
+        if states.is_empty() {
+            return;
+        }
+        let _ = editor_state.get();
         crate::a11y::defer(move || {
             apply_overlay_to_dom(&states);
         });

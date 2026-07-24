@@ -3763,9 +3763,30 @@ fn doc_mention_click_skipped_when_missing_class_present() {
 }
 
 #[wasm_bindgen_test]
-fn doc_mention_click_skipped_when_url_unsafe() {
+fn doc_mention_click_skipped_when_doc_id_invalid() {
+    // Fix (final-review, spec §2 fidelity + disguise vector): the click
+    // handler now builds its navigation target from `data-doc-id`/
+    // `data-block-id-target`, not the chip's `data-url` — so this test
+    // replaces the old `doc_mention_click_skipped_when_url_unsafe`,
+    // whose premise (an unsafe `data-url` blocks the click) no longer
+    // holds: `data-url` isn't consulted for navigation at all anymore.
+    // The equivalent guard on the NEW code path is the id-charset check
+    // (`mention_url::valid_id`, shared with the mention-URL paste
+    // parser) — a doc-id that fails it must skip navigation entirely,
+    // since there's no safe `/d/<doc_id>` to build. Note: a click that
+    // DOES navigate isn't exercised here (or anywhere in this file) —
+    // `location().set_href` performs a real same-page navigation in the
+    // wasm-bindgen-test browser, which would tear down the running test
+    // harness; only the skip/no-op paths are asserted, same as the
+    // pre-existing `doc_mention_click_skipped_when_missing_class_present`.
     let container = create_container();
-    let attrs = doc_mention_attrs("javascript:alert(1)", "abc", "", "Roadmap", "");
+    let attrs = doc_mention_attrs(
+        "https://notes.example/d/abc",
+        "not a valid id!",
+        "",
+        "Roadmap",
+        "",
+    );
     let (view, _txns) = create_editor(container.clone(), doc_with_mention(attrs));
 
     let chip = view.container().query_selector("span.doc-mention").unwrap().unwrap();
@@ -3775,7 +3796,7 @@ fn doc_mention_click_skipped_when_url_unsafe() {
     let event = web_sys::MouseEvent::new_with_mouse_event_init_dict("click", &init).unwrap();
     chip.dispatch_event(&event).unwrap();
     assert!(!event.default_prevented(),
-        "click on a chip with an unsafe url must not preventDefault/navigate");
+        "click on a chip with an invalid doc-id must not preventDefault/navigate");
 
     cleanup(&container);
 }
