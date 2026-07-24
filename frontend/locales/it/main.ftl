@@ -904,3 +904,7 @@ editor-width-wide = Larghezza ampia
 # ─── Block deep links (#b= fragment consumption) ─────────────────
 
 doc-block-link-missing = La sezione collegata non esiste più.
+
+# ─── Mentions spec §5 (Task 5) — per-viewer degradation overlay ──
+
+doc-mention-missing = Documento mancante

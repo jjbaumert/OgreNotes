@@ -907,3 +907,7 @@ editor-width-wide = عرض واسع
 # ─── Block deep links (#b= fragment consumption) ─────────────────
 
 doc-block-link-missing = القسم المرتبط لم يعد موجودًا.
+
+# ─── Mentions spec §5 (Task 5) — per-viewer degradation overlay ──
+
+doc-mention-missing = مستند مفقود

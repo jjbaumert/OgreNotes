@@ -990,6 +990,54 @@ pub fn convert_doc_mention_to_link(
     Some(txn)
 }
 
+/// Task 5 — refresh a `DocMention`'s cached `title`/`snippet` attrs
+/// after a fresh resolve, in editable sessions only. Found by its own
+/// `blockId` via `find_doc_mention` (same lookup as
+/// `convert_doc_mention_to_link`). Builds one `Step::SetAttr` per
+/// attribute that actually differs from the cached value; returns
+/// `None` when the DocMention no longer exists (concurrent delete) or
+/// when neither attr changed (nothing to write) — callers should not
+/// dispatch in that case.
+///
+/// Tagged `history: skip` (mentions spec §5 / Task 3's skip meta):
+/// this is a silent per-viewer cache refresh of the CRDT's cached
+/// display text, not a user edit — it must not create an undo entry.
+/// `HistoryPlugin::record` already discards anything carrying this
+/// meta (see `skip_meta_records_nothing` in plugins.rs).
+pub fn update_doc_mention_attrs(
+    state: &EditorState,
+    node_block_id: &str,
+    title: &str,
+    snippet: &str,
+) -> Option<Transaction> {
+    let (pos, attrs) = find_doc_mention(&state.doc, node_block_id)?;
+    let cur_title = attrs.get("title").map(String::as_str).unwrap_or("");
+    let cur_snippet = attrs.get("snippet").map(String::as_str).unwrap_or("");
+    if cur_title == title && cur_snippet == snippet {
+        return None;
+    }
+    let mut txn = state.transaction();
+    if cur_title != title {
+        txn = txn
+            .step(Step::SetAttr {
+                pos,
+                attr: "title".to_string(),
+                value: title.to_string(),
+            })
+            .ok()?;
+    }
+    if cur_snippet != snippet {
+        txn = txn
+            .step(Step::SetAttr {
+                pos,
+                attr: "snippet".to_string(),
+                value: snippet.to_string(),
+            })
+            .ok()?;
+    }
+    Some(txn.set_meta("history", "skip"))
+}
+
 /// Scope of text extracted by `plain_text_from_state`. Callers use it
 /// to phrase the AI prompt correctly — "summarize this selection" vs.
 /// "summarize this document."
@@ -4748,6 +4796,41 @@ mod tests {
         let doc = doc_mention_doc("mention-1", "https://notes.example/d/abc123", "Target Doc");
         let state = EditorState::create_default(doc);
         assert!(convert_doc_mention_to_link(&state, "does-not-exist").is_none());
+    }
+
+    // ── update_doc_mention_attrs (Task 5 — refresh-on-open cache sync) ──
+
+    #[test]
+    fn update_doc_mention_attrs_writes_changed_title_and_snippet_with_skip_meta() {
+        let doc = doc_mention_doc("mention-1", "https://notes.example/d/abc123", "Stale Title");
+        let state = EditorState::create_default(doc);
+
+        let txn =
+            update_doc_mention_attrs(&state, "mention-1", "Fresh Title", "fresh snippet").unwrap();
+        // Never a real undo entry — a silent per-viewer cache refresh.
+        assert_eq!(txn.meta.get("history").map(String::as_str), Some("skip"));
+
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        let mention = para.child(0).unwrap();
+        assert_eq!(mention.attrs().get("title").unwrap(), "Fresh Title");
+        assert_eq!(mention.attrs().get("snippet").unwrap(), "fresh snippet");
+    }
+
+    #[test]
+    fn update_doc_mention_attrs_returns_none_when_values_unchanged() {
+        let doc = doc_mention_doc("mention-1", "https://notes.example/d/abc123", "Same Title");
+        let state = EditorState::create_default(doc);
+        // `doc_mention_doc` never sets `snippet`; `default_attrs()` fills it
+        // with "" — pass the identical (title, snippet) pair back.
+        assert!(update_doc_mention_attrs(&state, "mention-1", "Same Title", "").is_none());
+    }
+
+    #[test]
+    fn update_doc_mention_attrs_returns_none_when_block_id_not_found() {
+        let doc = doc_mention_doc("mention-1", "https://notes.example/d/abc123", "Title");
+        let state = EditorState::create_default(doc);
+        assert!(update_doc_mention_attrs(&state, "does-not-exist", "New", "new").is_none());
     }
 
     #[test]

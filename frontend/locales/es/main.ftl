@@ -904,3 +904,7 @@ editor-width-wide = Ancho amplio
 # ─── Block deep links (#b= fragment consumption) ─────────────────
 
 doc-block-link-missing = La sección enlazada ya no existe.
+
+# ─── Mentions spec §5 (Task 5) — per-viewer degradation overlay ──
+
+doc-mention-missing = Documento no disponible

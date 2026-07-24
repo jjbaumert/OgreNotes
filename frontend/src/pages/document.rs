@@ -26,6 +26,7 @@ use crate::components::editor_gutter::EditorGutterOverlay;
 use crate::components::history_viewer::HistoryViewer;
 use crate::components::menu::AnchoredMenu;
 use crate::components::menu_bar::{DocAction, MenuBar, document_menu_entries};
+use crate::components::mention_overlay;
 use crate::components::document_outline::DocumentOutline;
 use crate::components::editor_component::{EditorComponent, EditorProps};
 use crate::components::notification_bell::NotificationBell;
@@ -1689,6 +1690,22 @@ pub fn DocumentPage() -> impl IntoView {
         }
         set_toolbar_command.set(Some(cmd));
     });
+
+    // Mentions spec §5 (Task 5) — refresh-on-open + the per-viewer
+    // degradation overlay. Mounted beside the comment-highlights
+    // wiring: feeds the page's live `editor_state`, the active doc id
+    // (to detect "a different document just opened" across in-app
+    // navigation — this page component isn't remounted on `/d/:id`
+    // changes), the composite editable signal (mirrors the readonly
+    // gate the `EditorComponent` prop below itself computes), and the
+    // standard `on_command` dispatch path every other outside-the-
+    // editor mutation in this file already uses.
+    mention_overlay::mount(
+        editor_state,
+        current_id,
+        Signal::derive(move || !is_trashed.get() && can_edit.get() && !is_locked.get()),
+        on_command,
+    );
 
     // Detect `@` mention trigger + `/` slash-command trigger.
     // Both use the same word-boundary rule (see

@@ -639,6 +639,19 @@ pub enum ToolbarCommand {
     /// the format / reverts to general; `"currency"`, `"percent"`,
     /// etc. match the existing well-known keys).
     SetNumberFormat(String),
+    /// Mentions spec §5 (Task 5) — silently refresh a `DocMention`
+    /// chip's cached `title`/`snippet` attrs after the per-viewer
+    /// degradation overlay's batch resolve found fresher values.
+    /// Editable sessions only; the caller (`mention_overlay`) has
+    /// already confirmed the values differ from what's cached.
+    /// Routes through `commands::update_doc_mention_attrs`, which
+    /// tags the transaction `history: skip` — this never creates an
+    /// undo entry.
+    UpdateDocMentionAttrs {
+        node_block_id: String,
+        title: String,
+        snippet: String,
+    },
 }
 
 /// Render a single item in the block type dropdown menu.

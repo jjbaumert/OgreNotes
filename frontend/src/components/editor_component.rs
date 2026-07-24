@@ -2855,6 +2855,11 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             }
             // Spreadsheet-only: no-op in document mode.
             ToolbarCommand::SetNumberFormat(_) => {}
+            ToolbarCommand::UpdateDocMentionAttrs { ref node_block_id, ref title, ref snippet } => {
+                if let Some(txn) = commands::update_doc_mention_attrs(&state, node_block_id, title, snippet) {
+                    dispatch_fn(txn);
+                }
+            }
         }
     });
 

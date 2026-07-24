@@ -1123,3 +1123,7 @@ editorctx-insert-link = Insert link…
 # ─── Block deep links (#b= fragment consumption) ─────────────────
 
 doc-block-link-missing = The linked section no longer exists.
+
+# ─── Mentions spec §5 (Task 5) — per-viewer degradation overlay ──
+
+doc-mention-missing = Missing document
