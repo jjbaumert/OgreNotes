@@ -31,7 +31,9 @@ use std::cell::RefCell;
 
 pub mod ask_bridge;
 pub mod editor_bridge;
-pub mod nav_bridge;
+// Moved to a top-level module so the lib-compiled editor can reach it
+// (`crate::nav_bridge`); re-exported here to keep existing paths working.
+pub(crate) use crate::nav_bridge;
 
 /// Local-storage key for the MRU list. Versioned via the schema so
 /// a future change to the serialization shape doesn't try to read

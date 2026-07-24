@@ -962,11 +962,21 @@ pub fn convert_doc_mention_to_link(
 ) -> Option<Transaction> {
     let (pos, attrs) = find_doc_mention(&state.doc, node_block_id)?;
     let url = attrs.get("url").cloned().unwrap_or_default();
-    let title = attrs
-        .get("title")
-        .cloned()
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| url.clone());
+    // Link text mirrors what the CHIP displayed (final-review UX note):
+    // anchor mentions label with their snippet, so converting one must not
+    // silently swap in the doc title. Ladder: snippet (anchors only) →
+    // title → url — the same order as the render arm in view.rs.
+    let is_anchor = attrs
+        .get("target_block_id")
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+    let title = if is_anchor {
+        attrs.get("snippet").cloned().filter(|s| !s.is_empty())
+    } else {
+        None
+    }
+    .or_else(|| attrs.get("title").cloned().filter(|t| !t.is_empty()))
+    .unwrap_or_else(|| url.clone());
     if title.is_empty() {
         return None;
     }
@@ -4822,6 +4832,49 @@ mod tests {
                 Fragment::from(vec![mention]),
             )]),
         )
+    }
+
+    /// Anchor-mention variant: carries a target block id + snippet, the
+    /// state a chip labeled by its snippet is in.
+    fn doc_mention_anchor_doc(block_id: &str, title: &str, snippet: &str) -> Node {
+        let mut attrs = HashMap::new();
+        attrs.insert("blockId".to_string(), block_id.to_string());
+        attrs.insert("url".to_string(), "https://notes.example/d/abc123#b=blk1".to_string());
+        attrs.insert("title".to_string(), title.to_string());
+        attrs.insert("snippet".to_string(), snippet.to_string());
+        attrs.insert("target_block_id".to_string(), "blk1".to_string());
+        attrs.insert("doc_id".to_string(), "abc123".to_string());
+        let mention = Node::element_with_attrs(NodeType::DocMention, attrs, Fragment::empty());
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![mention]),
+            )]),
+        )
+    }
+
+    #[test]
+    fn convert_anchor_mention_labels_with_snippet_like_the_chip() {
+        // The chip displays snippet-first for anchors (view.rs render
+        // ladder); converting must produce the text the user was looking
+        // at, not silently swap in the doc title.
+        let doc = doc_mention_anchor_doc("mention-a", "Doc Title", "Q3 goals snippet");
+        let state = EditorState::create_default(doc);
+        let txn = convert_doc_mention_to_link(&state, "mention-a").unwrap();
+        let new_state = state.apply(txn);
+        let text = new_state.doc.text_content();
+        assert!(text.contains("Q3 goals snippet"), "got: {text}");
+        assert!(!text.contains("Doc Title"), "got: {text}");
+    }
+
+    #[test]
+    fn convert_anchor_mention_without_snippet_falls_back_to_title() {
+        let doc = doc_mention_anchor_doc("mention-b", "Doc Title", "");
+        let state = EditorState::create_default(doc);
+        let txn = convert_doc_mention_to_link(&state, "mention-b").unwrap();
+        let new_state = state.apply(txn);
+        assert!(new_state.doc.text_content().contains("Doc Title"));
     }
 
     #[test]
