@@ -55,8 +55,10 @@ navigation, refresh, and degradation contract.
   fallback_index)` (`components/dom_position.rs`), and briefly
   highlights the target block. If the block no longer exists, open at
   top and show a dismissible "linked section no longer exists" notice.
-- i18n: the notice, the copy action label, and copy confirmation are
-  Fluent keys in all six catalogs.
+- i18n: the notice and the copy action label are Fluent keys in all six
+  catalogs. (Amended 2026-07-23: copy is silent — no confirmation toast —
+  matching the codebase's established silent-copy convention
+  (`copy_doc_link`, share dialog). Decision recorded at S1 review.)
 
 ## 2. The `DocMention` element
 
@@ -145,7 +147,12 @@ All visible strings and tooltips are Fluent keys in all six catalogs.
   writes to identity/sharing/destructive state).
 - Callers: paste-time (single target), document open (one batch for
   every mention in the doc). No per-element polling, no WS
-  subscription.
+  subscription. Repeated targets into the same document within one batch
+  reuse a single per-request doc load (S2 implementation note).
+- Contract note for the S3/S4 element: `blockFound` is the anchor's
+  liveness signal — an existing-but-empty block yields `blockFound:
+  true` with an empty-string snippet, which must render as a live
+  anchor, never be conflated with "no snippet"/dangling.
 
 ## 5. Paste conversion
 
