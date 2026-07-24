@@ -17,5 +17,6 @@ pub mod i18n;
 // (components/menu in the binary). Lib-visible so `cargo test --lib`
 // (the CI tier-1 command) runs its unit tests.
 pub mod menu_nav;
+pub mod nav_bridge;
 pub mod observability;
 pub mod touch;
