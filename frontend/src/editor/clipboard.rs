@@ -170,7 +170,7 @@ fn convert_element_node(
     // `tag_to_mark` so the `a` branch doesn't steal a `<a
     // class="doc-mention">` as a plain Link mark.
     if (tag == "a" || tag == "span")
-        && el.get_attribute("class").as_deref() == Some("doc-mention")
+        && el.class_list().contains("doc-mention")
     {
         let doc_id = el.get_attribute("data-doc-id").unwrap_or_default();
         if !doc_id.is_empty() {

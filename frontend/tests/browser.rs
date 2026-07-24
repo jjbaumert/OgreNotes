@@ -3850,6 +3850,23 @@ fn parse_html_doc_mention_ignores_span_without_doc_id() {
 }
 
 #[wasm_bindgen_test]
+fn parse_html_doc_mention_from_span_with_multiple_state_classes() {
+    // Rendered chips can carry additional state classes (doc-mention-missing,
+    // doc-mention-dangling) via the overlay (Task 5). When pasting a live
+    // rendered chip, the class attribute contains multiple tokens like
+    // "doc-mention doc-mention-missing". The paste guard must match by
+    // class token, not exact string equality.
+    let html = r#"<span class="doc-mention doc-mention-missing" data-doc-id="d1" data-url="/d/d1">📄 T</span>"#;
+    let slice = clipboard::parse_from_html(html);
+    assert_eq!(slice.content.children.len(), 1);
+    let node = &slice.content.children[0];
+    assert_eq!(node.node_type(), Some(NodeType::DocMention));
+    let attrs = node.attrs();
+    assert_eq!(attrs.get("doc_id").map(String::as_str), Some("d1"));
+    assert_eq!(attrs.get("url").map(String::as_str), Some("/d/d1"));
+}
+
+#[wasm_bindgen_test]
 fn doc_mention_serialize_and_parse_roundtrip() {
     let attrs = doc_mention_attrs(
         "https://notes.example/d/abc#b=blk1",
