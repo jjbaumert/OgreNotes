@@ -850,6 +850,7 @@ theme-label-dark = داكن
 menu-cut = قص
 menu-copy = نسخ
 menu-paste = لصق
+menu-copy-block-link = نسخ رابط الكتلة
 menu-bold = عريض
 menu-italic = مائل
 menu-underline = تسطير

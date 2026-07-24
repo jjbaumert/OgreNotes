@@ -602,6 +602,25 @@ enum KanbanColumnAction {
     SetWipLimit { kanban_id: String, column_id: String, prompt_default: String },
 }
 
+/// Copy a deep link to `block_id` in the CURRENT document to the
+/// clipboard: `{origin}{pathname}#b=<blockId>`. Uses the same
+/// `navigator.clipboard.writeText` reflection pattern as
+/// `sidebar::copy_doc_link`.
+fn copy_block_link(block_id: &str) {
+    let Some(window) = web_sys::window() else { return };
+    let Ok(origin) = window.location().origin() else { return };
+    let Ok(path) = window.location().pathname() else { return };
+    let href = format!("{origin}{path}#b={block_id}");
+    let write_text = js_sys::Reflect::get(&window.navigator(), &"clipboard".into())
+        .and_then(|clip| js_sys::Reflect::get(&clip, &"writeText".into()))
+        .and_then(|func| func.dyn_into::<js_sys::Function>());
+    if let Ok(write_text) = write_text {
+        let clip = js_sys::Reflect::get(&window.navigator(), &"clipboard".into())
+            .unwrap_or(wasm_bindgen::JsValue::NULL);
+        let _ = write_text.call1(&clip, &href.into());
+    }
+}
+
 /// window.prompt() wrapper — returns None on cancel/absent window.
 fn window_prompt(message: &str, default: &str) -> Option<String> {
     web_sys::window()?
@@ -2815,6 +2834,19 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                 });
                 return;
             }
+            EditorContextCommand::CopyBlockLink => {
+                // Block containing the selection head; block_id_at walks to
+                // the innermost block carrying a blockId.
+                let view = view_ref_cmd2.borrow();
+                if let Some(view) = view.as_ref() {
+                    let state = view.state();
+                    let pos = state.selection.from();
+                    if let Some(block_id) = state.doc.block_id_at(pos) {
+                        copy_block_link(&block_id);
+                    }
+                }
+                return;
+            }
             EditorContextCommand::Comment => {
                 if let Some(cb) = on_request_comment_prop {
                     cb.run(());
@@ -2945,10 +2977,11 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                     }
                 }
             }
-            // Clipboard + Comment handled above.
+            // Clipboard + block link + Comment handled above.
             EditorContextCommand::Cut
             | EditorContextCommand::Copy
             | EditorContextCommand::Paste
+            | EditorContextCommand::CopyBlockLink
             | EditorContextCommand::Comment => {}
         }
     });

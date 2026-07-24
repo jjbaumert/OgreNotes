@@ -847,6 +847,7 @@ theme-label-dark = Sombre
 menu-cut = Couper
 menu-copy = Copier
 menu-paste = Coller
+menu-copy-block-link = Copier le lien du bloc
 menu-bold = Gras
 menu-italic = Italique
 menu-underline = Souligné

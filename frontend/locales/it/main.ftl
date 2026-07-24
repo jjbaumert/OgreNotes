@@ -847,6 +847,7 @@ theme-label-dark = Scuro
 menu-cut = Taglia
 menu-copy = Copia
 menu-paste = Incolla
+menu-copy-block-link = Copia link al blocco
 menu-bold = Grassetto
 menu-italic = Corsivo
 menu-underline = Sottolineato

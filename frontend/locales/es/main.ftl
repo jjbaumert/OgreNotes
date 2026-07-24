@@ -847,6 +847,7 @@ theme-label-dark = Oscuro
 menu-cut = Cortar
 menu-copy = Copiar
 menu-paste = Pegar
+menu-copy-block-link = Copiar enlace al bloque
 menu-bold = Negrita
 menu-italic = Cursiva
 menu-underline = Subrayado

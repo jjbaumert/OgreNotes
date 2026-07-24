@@ -1072,6 +1072,7 @@ collab-liveapp-rejected-toast = Your last change couldn't be saved. Refresh to s
 menu-cut = Cut
 menu-copy = Copy
 menu-paste = Paste
+menu-copy-block-link = Copy Link to Block
 menu-bold = Bold
 menu-italic = Italic
 menu-underline = Underline
