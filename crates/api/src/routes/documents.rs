@@ -1592,7 +1592,10 @@ async fn purge_document(
 /// snapshot at create time). Update-decode errors surface as
 /// `Internal` — a bad UPDATE# row indicates op-log corruption or a
 /// version-skew bug, not a caller mistake.
-async fn load_current_doc_state(state: &AppState, doc_id: &str) -> Result<OgreDoc, ApiError> {
+pub(crate) async fn load_current_doc_state(
+    state: &AppState,
+    doc_id: &str,
+) -> Result<OgreDoc, ApiError> {
     let snapshot = state
         .doc_repo
         .load_snapshot(doc_id)

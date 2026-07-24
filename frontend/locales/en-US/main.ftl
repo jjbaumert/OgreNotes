@@ -1072,6 +1072,7 @@ collab-liveapp-rejected-toast = Your last change couldn't be saved. Refresh to s
 menu-cut = Cut
 menu-copy = Copy
 menu-paste = Paste
+menu-copy-block-link = Copy Link to Block
 menu-bold = Bold
 menu-italic = Italic
 menu-underline = Underline
@@ -1116,3 +1117,7 @@ menubar-format-clear = Clear Formatting
 menubar-format-lock = Lock Edits
 editorctx-paragraph-style = Paragraph style
 editorctx-insert-link = Insert link…
+
+# ─── Block deep links (#b= fragment consumption) ─────────────────
+
+doc-block-link-missing = The linked section no longer exists.

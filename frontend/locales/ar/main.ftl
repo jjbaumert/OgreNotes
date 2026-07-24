@@ -850,6 +850,7 @@ theme-label-dark = داكن
 menu-cut = قص
 menu-copy = نسخ
 menu-paste = لصق
+menu-copy-block-link = نسخ رابط الكتلة
 menu-bold = عريض
 menu-italic = مائل
 menu-underline = تسطير
@@ -900,3 +901,7 @@ editor-width-group = عرض المحرر
 editor-width-narrow = عرض ضيق
 editor-width-medium = عرض متوسط
 editor-width-wide = عرض واسع
+
+# ─── Block deep links (#b= fragment consumption) ─────────────────
+
+doc-block-link-missing = القسم المرتبط لم يعد موجودًا.

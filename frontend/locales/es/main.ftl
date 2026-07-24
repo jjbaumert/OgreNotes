@@ -847,6 +847,7 @@ theme-label-dark = Oscuro
 menu-cut = Cortar
 menu-copy = Copiar
 menu-paste = Pegar
+menu-copy-block-link = Copiar enlace al bloque
 menu-bold = Negrita
 menu-italic = Cursiva
 menu-underline = Subrayado
@@ -897,3 +898,7 @@ editor-width-group = Ancho del editor
 editor-width-narrow = Ancho estrecho
 editor-width-medium = Ancho medio
 editor-width-wide = Ancho amplio
+
+# ─── Block deep links (#b= fragment consumption) ─────────────────
+
+doc-block-link-missing = La sección enlazada ya no existe.

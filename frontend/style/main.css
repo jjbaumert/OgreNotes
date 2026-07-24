@@ -1260,6 +1260,21 @@ html, body {
   background: rgba(210, 150, 60, 0.4);
 }
 
+/* Transient flash for a block reached via a #b= deep link (mentions
+ * spec §1). Toggled by document.rs after scroll_to_block; removed by
+ * a timer. No dedicated selection/highlight token exists in
+ * tokens-{light,dark}.css (::selection there is hand-tuned rgba, not
+ * a variable) — --color-primary already flips Swamp Green/Pale Green
+ * per theme, so it reads as a highlight in both. */
+@keyframes block-link-flash {
+  0%   { background-color: color-mix(in srgb, var(--color-primary) 25%, transparent); }
+  100% { background-color: transparent; }
+}
+
+.block-link-flash {
+  animation: block-link-flash 2s ease-out 1;
+}
+
 /* Comment bubble — numbered icon in the left margin */
 .comment-bubble {
   position: fixed;

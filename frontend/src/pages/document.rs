@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
 use leptos::prelude::*;
-use leptos_router::hooks::{use_navigate, use_params_map, use_query_map};
+use leptos_router::hooks::{use_location, use_navigate, use_params_map, use_query_map};
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 
@@ -179,6 +179,20 @@ fn block_id_selector(block_id: &str) -> String {
     format!("[data-block-id=\"{escaped}\"]")
 }
 
+/// Parse a `#b=<blockId>` fragment (mentions spec §1). Returns the block
+/// id when the hash is exactly the block form with a valid id charset
+/// (`[A-Za-z0-9_-]+`, matching `generate_block_id`); `None` for empty,
+/// foreign (e.g. settings-tab), or malformed hashes.
+fn block_id_from_hash(raw: &str) -> Option<String> {
+    let id = raw.trim_start_matches('#').strip_prefix("b=")?;
+    if id.is_empty()
+        || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(id.to_string())
+}
+
 // #139: localStorage keys for the editor view-option preferences.
 // `pub(crate)` so `AppShell` can seed the shared `ShellCtx` line-number /
 // page-break signals once on mount (those flags now live in the shell, so
@@ -257,6 +271,10 @@ pub fn DocumentPage() -> impl IntoView {
 
     let (title, set_title) = signal("Loading...".to_string());
     let (error, set_error) = signal::<Option<String>>(None);
+    // #b= deep-link consumption (mentions spec §1): transient toast shown
+    // when the target block no longer exists (deleted since the link was
+    // copied). Cleared on click or after ~6s.
+    let (block_link_missing, set_block_link_missing) = signal(false);
     let (current_id, set_current_id) = signal(String::new());
     let (is_trashed, set_is_trashed) = signal(false);
     // #110: viewer-facing "request edit access" affordance. The backend
@@ -743,6 +761,55 @@ pub fn DocumentPage() -> impl IntoView {
                 })
                 .forget();
             }
+        });
+    }
+
+    // #b=<blockId> deep-link consumption (mentions spec §1). Mirrors the
+    // comment-navigation effect above: gate on content_loaded, handle a
+    // given fragment once, defer 80ms so the editor DOM is mounted.
+    {
+        let location = use_location();
+        let handled_fragment: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        Effect::new(move |_| {
+            if !content_loaded.get() {
+                return;
+            }
+            let Some(block_id) = block_id_from_hash(&location.hash.get()) else {
+                return;
+            };
+            if handled_fragment.borrow().as_deref() == Some(block_id.as_str()) {
+                return;
+            }
+            *handled_fragment.borrow_mut() = Some(block_id.clone());
+            gloo_timers::callback::Timeout::new(80, move || {
+                let scrolled = crate::components::dom_position::scroll_to_block(
+                    Some(&block_id),
+                    usize::MAX,
+                );
+                if scrolled {
+                    // clear any stale missing-block toast from a prior failed jump.
+                    set_block_link_missing.set(false);
+                    // ~2s flash on the target block; class removal via timer.
+                    if let Some(el) =
+                        crate::components::dom_position::find_block_element(&block_id)
+                    {
+                        let _ = el.class_list().add_1("block-link-flash");
+                        gloo_timers::callback::Timeout::new(2100, move || {
+                            let _ = el.class_list().remove_1("block-link-flash");
+                        })
+                        .forget();
+                    }
+                } else {
+                    // Block gone: open stays at top; transient notice.
+                    set_block_link_missing.set(true);
+                    gloo_timers::callback::Timeout::new(6000, move || {
+                        set_block_link_missing.set(false);
+                    })
+                    .forget();
+                }
+            })
+            .forget();
         });
     }
 
@@ -2629,6 +2696,13 @@ pub fn DocumentPage() -> impl IntoView {
                     </div>
                 })}
 
+                {move || block_link_missing.get().then(|| view! {
+                    <div class="collab-liveapp-toast" role="alert"
+                        on:click=move |_| set_block_link_missing.set(false)>
+                        {crate::t!("doc-block-link-missing")}
+                    </div>
+                })}
+
                 <Show when=move || is_trashed.get()>
                     <div class="trash-banner">
                         <span class="trash-banner-message">
@@ -3936,5 +4010,30 @@ mod tests {
         // continuation, not space/newline, so no fire.
         assert_eq!(detect_menu_trigger("café/table", '/'), None);
         assert_eq!(detect_menu_trigger("café@name", '@'), None);
+    }
+}
+
+#[cfg(test)]
+mod block_fragment_tests {
+    use super::block_id_from_hash;
+
+    #[test]
+    fn parses_well_formed_fragment() {
+        assert_eq!(block_id_from_hash("#b=abc-123_XY").as_deref(), Some("abc-123_XY"));
+    }
+
+    #[test]
+    fn rejects_empty_missing_and_foreign_hashes() {
+        assert_eq!(block_id_from_hash(""), None);
+        assert_eq!(block_id_from_hash("#"), None);
+        assert_eq!(block_id_from_hash("#b="), None);
+        assert_eq!(block_id_from_hash("#appearance"), None); // settings-style tab hash
+        assert_eq!(block_id_from_hash("#x=abc"), None);
+    }
+
+    #[test]
+    fn rejects_invalid_charset() {
+        assert_eq!(block_id_from_hash("#b=abc def"), None);
+        assert_eq!(block_id_from_hash("#b=abc\"onmouseover"), None);
     }
 }

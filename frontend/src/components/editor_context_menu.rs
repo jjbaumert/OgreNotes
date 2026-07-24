@@ -24,6 +24,9 @@ pub enum EditorContextCommand {
     Cut,
     Copy,
     Paste,
+    /// Copy a `{origin}{path}#b=<blockId>` deep link to the block at the
+    /// selection (mentions spec §1).
+    CopyBlockLink,
     Comment,
     ToggleBold,
     ToggleItalic,
@@ -80,6 +83,7 @@ pub fn EditorContextMenu(
                 .with_shortcut("Ctrl+C")
                 .disabled_when(empty),
             item("menu-paste", EditorContextCommand::Paste).with_shortcut("Ctrl+V"),
+            item("menu-copy-block-link", EditorContextCommand::CopyBlockLink),
             MenuEntry::Separator,
             item("menu-comment", EditorContextCommand::Comment)
                 .with_shortcut("\u{1F4AC}")
