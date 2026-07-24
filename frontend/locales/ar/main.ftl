@@ -901,3 +901,7 @@ editor-width-group = عرض المحرر
 editor-width-narrow = عرض ضيق
 editor-width-medium = عرض متوسط
 editor-width-wide = عرض واسع
+
+# ─── Block deep links (#b= fragment consumption) ─────────────────
+
+doc-block-link-missing = القسم المرتبط لم يعد موجودًا.

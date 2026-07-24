@@ -898,3 +898,7 @@ editor-width-group = Larghezza editor
 editor-width-narrow = Larghezza stretta
 editor-width-medium = Larghezza media
 editor-width-wide = Larghezza ampia
+
+# ─── Block deep links (#b= fragment consumption) ─────────────────
+
+doc-block-link-missing = La sezione collegata non esiste più.

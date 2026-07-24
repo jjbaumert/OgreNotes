@@ -1117,3 +1117,7 @@ menubar-format-clear = Clear Formatting
 menubar-format-lock = Lock Edits
 editorctx-paragraph-style = Paragraph style
 editorctx-insert-link = Insert link…
+
+# ─── Block deep links (#b= fragment consumption) ─────────────────
+
+doc-block-link-missing = The linked section no longer exists.

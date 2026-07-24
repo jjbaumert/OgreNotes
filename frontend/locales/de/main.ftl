@@ -898,3 +898,7 @@ editor-width-group = Editorbreite
 editor-width-narrow = Schmale Breite
 editor-width-medium = Mittlere Breite
 editor-width-wide = Große Breite
+
+# ─── Block deep links (#b= fragment consumption) ─────────────────
+
+doc-block-link-missing = Der verlinkte Abschnitt existiert nicht mehr.
