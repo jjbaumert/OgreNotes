@@ -169,7 +169,8 @@ impl HistoryPlugin {
         //
         // A plain time-grouped merge (ordinary consecutive keystrokes, no
         // `history=merge` meta) is unaffected by tagging: it always groups
-        // into the top entry, same as before.
+        // into the top entry, same as before. The tag survives: a later
+        // async-resolved force-merge may still match and fold into the group.
         let now = current_time_ms();
         let force_merge = transaction.meta.get("history") == Some(&"merge".to_string());
         let merge_tag: Option<u64> = transaction
@@ -195,10 +196,12 @@ impl HistoryPlugin {
                 let mut merged = inverted;
                 merged.extend(last.steps.drain(..));
                 last.steps = merged;
-                // The tag has done its job; clear it so a stray duplicate
-                // merge meta later in the same session can't accidentally
-                // re-match this entry.
-                last.tag = None;
+                // Clear the tag ONLY for force-merges (tag-matching, one-time merges).
+                // Plain time-grouped merges preserve the tag so a later async resolve
+                // can still match it and fold in.
+                if force_merge {
+                    last.tag = None;
+                }
             }
         } else {
             // New undo entry
@@ -662,6 +665,66 @@ mod tests {
 
         assert_eq!(history.undo_stack.len(), 0); // nothing recorded
         assert!(history.can_redo()); // redo stack NOT cleared
+    }
+
+    #[test]
+    fn time_grouped_edit_preserves_tag_so_resolve_still_merges() {
+        // Bug fix: paste entry is tagged (tag 1), then a keystroke within
+        // the time-group window arrives (untagged). The keystroke should
+        // time-group into the paste entry. After the fix, the tag SURVIVES
+        // this time-grouped merge, so a later async mention-resolve carrying
+        // the SAME tag can still match and fold in.
+        //
+        // Before the fix: time-grouped merge wrongly cleared the tag,
+        // causing the later merge to push a separate entry (two undos instead
+        // of one).
+        let state = EditorState::create_default(simple_doc());
+        // Use a large new_group_delay so current_time_ms() == 0 satisfies
+        // the time-group check (0 - 0 < 1000 is true).
+        let mut history = HistoryPlugin::with_options(100, 1000.0);
+
+        // Paste entry: insert "A", tag it with 1.
+        let txn_a = state.transaction().insert_text("A").unwrap();
+        let state_a = state.apply(txn_a.clone());
+        history.record(&txn_a, &state.doc);
+        history.tag_last_entry(1);
+        assert_eq!(history.undo_stack.len(), 1);
+
+        // Plain keystroke: insert "B", no merge meta. Should time-group into
+        // the paste entry (current_time_ms() == 0 both times, so 0 - 0 < 1000).
+        let txn_b = state_a.transaction().insert_text("B").unwrap();
+        let state_b = state_a.apply(txn_b.clone());
+        history.record(&txn_b, &state_a.doc);
+
+        // Still one entry (time-grouped merge).
+        assert_eq!(history.undo_stack.len(), 1);
+
+        // Verify the tag still exists after the time-grouped merge.
+        assert_eq!(
+            history.undo_stack.last().and_then(|e| e.tag),
+            Some(1),
+            "Tag should survive time-grouped merge so a later force-merge can find it"
+        );
+
+        // Async resolve arrives with merge tag 1.
+        let txn_c = state_b.transaction().insert_text("C").unwrap();
+        let txn_c = txn_c
+            .set_meta("history", "merge")
+            .set_meta("history-merge-tag", "1");
+        let state_c = state_b.apply(txn_c.clone());
+        history.record(&txn_c, &state_b.doc);
+
+        // Still one entry (force-merge matched the tag).
+        assert_eq!(
+            history.undo_stack.len(), 1,
+            "Force-merge should fold into the time-grouped entry"
+        );
+
+        // Single undo reverts all three insertions.
+        let undo_txn = history.undo(&state_c).unwrap();
+        let restored = state_c.apply(undo_txn);
+        assert_eq!(restored.doc, state.doc);
+        assert!(!history.can_undo());
     }
 
     // ── Undo after concurrent edit (known bug) ──
