@@ -950,6 +950,21 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
                     ));
                     return;
                 }
+                // DocMention — title (fallback url) goes between the
+                // `<a>` tags; empty title with an empty url would
+                // otherwise render an empty link body.
+                if matches!(node_type, NodeType::DocMention) {
+                    let url = el.get_attribute(txn, "url").unwrap_or_default();
+                    let title = el
+                        .get_attribute(txn, "title")
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or(url);
+                    out.push_str(&format!(
+                        "<{html_tag}{attrs}>{}</{html_tag}>",
+                        html_escape(&title),
+                    ));
+                    return;
+                }
                 if matches!(node_type, NodeType::Mermaid) {
                     let source = el.get_attribute(txn, "source").unwrap_or_default();
                     let out_render = ogrenotes_mermaid::render(&source);
@@ -1186,6 +1201,22 @@ fn render_node_markdown<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String, de
                     let display = el.get_attribute(txn, "display").unwrap_or_default();
                     out.push_str(&display);
                 }
+                NodeType::DocMention => {
+                    // DocMention — a live doc/anchor link. Renders
+                    // as a standard Markdown link; title falls back
+                    // to the url when absent so the label is never
+                    // empty, matching the Embed arm's fallback.
+                    let url = el.get_attribute(txn, "url").unwrap_or_default();
+                    let title = el
+                        .get_attribute(txn, "title")
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or_else(|| url.clone());
+                    out.push_str(&format!(
+                        "[{}]({})",
+                        escape_md_link_text(&title),
+                        escape_md_url(&url)
+                    ));
+                }
                 _ => {
                     render_children_markdown(txn, el, out, depth);
                 }
@@ -1308,6 +1339,11 @@ fn node_type_to_html_tag(nt: NodeType) -> &'static str {
         // `render_html_attrs`, and the inner display text
         // comes from the node's `display` attr.
         NodeType::Mention => "span",
+        // DocMention — inline doc/anchor link, rendered as `<a>`.
+        // Attribute emission happens in `render_html_attrs`; the
+        // inner text (the node's `title`) is written by the leaf
+        // special-case in `render_node_html`.
+        NodeType::DocMention => "a",
         NodeType::Mermaid => "div",
     }
 }
@@ -1476,6 +1512,26 @@ fn render_html_attrs<T: ReadTxn>(
                     " data-user-id=\"{}\"",
                     html_escape_attr(&uid),
                 ));
+            }
+        }
+        NodeType::DocMention => {
+            attrs.push_str(" class=\"doc-mention\"");
+            if let Some(doc_id) = el.get_attribute(txn, "doc_id") {
+                attrs.push_str(&format!(
+                    " data-doc-id=\"{}\"",
+                    html_escape_attr(&doc_id),
+                ));
+            }
+            // Omit data-block-id when the mention targets the whole
+            // document (empty target_block_id).
+            if let Some(block_id) = el.get_attribute(txn, "target_block_id").filter(|b| !b.is_empty()) {
+                attrs.push_str(&format!(
+                    " data-block-id=\"{}\"",
+                    html_escape_attr(&block_id),
+                ));
+            }
+            if let Some(url) = el.get_attribute(txn, "url") {
+                attrs.push_str(&format!(" href=\"{}\"", html_escape_attr(&url)));
             }
         }
         _ => {}
@@ -1903,6 +1959,53 @@ mod tests {
     }
 
     #[test]
+    fn html_doc_mention_renders_anchor_with_data_attrs() {
+        let doc = doc_with(|txn, frag| {
+            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            dm.insert_attribute(txn, "url", "/d/abc123");
+            dm.insert_attribute(txn, "doc_id", "abc123");
+            dm.insert_attribute(txn, "target_block_id", "blk-1");
+            dm.insert_attribute(txn, "title", "Target Doc");
+        });
+        let html = to_html(&doc);
+        assert!(
+            html.contains(
+                r#"<a class="doc-mention" data-doc-id="abc123" data-block-id="blk-1" href="/d/abc123">Target Doc</a>"#
+            ),
+            "got: {html}"
+        );
+    }
+
+    #[test]
+    fn html_doc_mention_omits_data_block_id_when_target_empty() {
+        let doc = doc_with(|txn, frag| {
+            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            dm.insert_attribute(txn, "url", "/d/abc123");
+            dm.insert_attribute(txn, "doc_id", "abc123");
+            dm.insert_attribute(txn, "title", "Target Doc");
+        });
+        let html = to_html(&doc);
+        assert!(!html.contains("data-block-id"), "got: {html}");
+        assert!(
+            html.contains(r#"<a class="doc-mention" data-doc-id="abc123" href="/d/abc123">Target Doc</a>"#),
+            "got: {html}"
+        );
+    }
+
+    #[test]
+    fn html_doc_mention_falls_back_to_url_when_no_title() {
+        let doc = doc_with(|txn, frag| {
+            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            dm.insert_attribute(txn, "url", "/d/abc123");
+        });
+        let html = to_html(&doc);
+        assert!(html.contains(">/d/abc123</a>"), "got: {html}");
+    }
+
+    #[test]
     fn html_task_list() {
         let doc = doc_with(|txn, frag| {
             let tl = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::TaskList.tag_name()));
@@ -2127,6 +2230,29 @@ mod tests {
         // an attacker-controlled scheme even with a "[Embed: ...]"
         // wrapper around it.
         assert!(!md.contains("[Embed:"), "got: {md}");
+    }
+
+    #[test]
+    fn markdown_doc_mention_emits_link() {
+        let doc = doc_with(|txn, frag| {
+            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            dm.insert_attribute(txn, "url", "/d/abc123");
+            dm.insert_attribute(txn, "title", "Target Doc");
+        });
+        let md = to_markdown(&doc);
+        assert!(md.contains("[Target Doc](/d/abc123)"), "got: {md}");
+    }
+
+    #[test]
+    fn markdown_doc_mention_falls_back_to_url_when_no_title() {
+        let doc = doc_with(|txn, frag| {
+            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            dm.insert_attribute(txn, "url", "/d/abc123");
+        });
+        let md = to_markdown(&doc);
+        assert!(md.contains("[/d/abc123](/d/abc123)"), "got: {md}");
     }
 
     // ── CSV export tests ───────────────────────────────────────────

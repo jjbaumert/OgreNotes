@@ -184,6 +184,13 @@ pub enum NodeType {
     /// atom; deletes as one keystroke. Mirrors the same-named
     /// variant in `crates/collab/src/schema.rs`.
     Mention,
+    /// Inline document/anchor mention as a leaf atom (mentions spec §2).
+    /// Carries the pasted `url`, target `doc_id`, optional
+    /// `target_block_id` ("" ⇒ document mention), and cached
+    /// `title`/`snippet`. Live/degraded render state is per-viewer and
+    /// never stored. Single-keystroke delete like Mention. Mirrors the
+    /// same-named variant in `crates/collab/src/schema.rs`.
+    DocMention,
     /// Mermaid diagram block. Block-level leaf atom; source stored in
     /// the `source` attribute; rendered to SVG by `ogrenotes-mermaid`.
     /// Mirrors the same-named variant in `crates/collab/src/schema.rs`.
@@ -202,6 +209,7 @@ impl NodeType {
                 | NodeType::CalendarEvent
                 | NodeType::KanbanCard
                 | NodeType::Mention
+                | NodeType::DocMention
                 | NodeType::Mermaid
         )
     }
@@ -210,7 +218,7 @@ impl NodeType {
     /// inside a Paragraph's text stream, next to characters);
     /// Image is block-level (sits between paragraphs).
     pub fn is_inline(&self) -> bool {
-        matches!(self, NodeType::HardBreak | NodeType::Mention)
+        matches!(self, NodeType::HardBreak | NodeType::Mention | NodeType::DocMention)
     }
 
     /// Whether this is a block node.
@@ -235,6 +243,7 @@ impl NodeType {
                 | NodeType::Kanban
                 | NodeType::KanbanCard
                 | NodeType::Mention
+                | NodeType::DocMention
                 | NodeType::Mermaid
         )
     }
@@ -276,6 +285,7 @@ impl NodeType {
             | NodeType::CalendarEvent
             | NodeType::KanbanColumn
             | NodeType::Mention
+            | NodeType::DocMention
             | NodeType::Mermaid => false,
         }
     }
@@ -324,6 +334,7 @@ impl NodeType {
             | NodeType::KanbanColumn
             | NodeType::KanbanCard
             | NodeType::Mention
+            | NodeType::DocMention
             | NodeType::Mermaid => true,
         }
     }
@@ -394,6 +405,15 @@ impl NodeType {
                 let mut m = HashMap::new();
                 m.insert("user_id".to_string(), String::new());
                 m.insert("display".to_string(), String::new());
+                m
+            }
+            NodeType::DocMention => {
+                let mut m = HashMap::new();
+                m.insert("url".to_string(), String::new());
+                m.insert("doc_id".to_string(), String::new());
+                m.insert("target_block_id".to_string(), String::new());
+                m.insert("title".to_string(), String::new());
+                m.insert("snippet".to_string(), String::new());
                 m
             }
             _ => HashMap::new(),
@@ -648,6 +668,19 @@ impl Node {
                 content: _,
                 marks: _,
             } => attrs.get("display").cloned().unwrap_or_default(),
+            Node::Element {
+                node_type: NodeType::DocMention,
+                attrs,
+                content: _,
+                marks: _,
+            } => {
+                let title = attrs.get("title").cloned().unwrap_or_default();
+                if !title.is_empty() {
+                    title
+                } else {
+                    attrs.get("url").cloned().unwrap_or_default()
+                }
+            }
             Node::Element { content, .. } => {
                 content.children.iter().map(|c| c.text_content()).collect()
             }
@@ -1684,6 +1717,31 @@ mod tests {
         assert_eq!(NodeType::Mention.default_attrs().len(), 2);
         assert!(NodeType::Mention.default_attrs().contains_key("user_id"));
         assert!(NodeType::Mention.default_attrs().contains_key("display"));
+    }
+
+    #[test]
+    fn doc_mention_is_inline_leaf_atom_with_expected_attrs() {
+        assert!(NodeType::DocMention.is_leaf());
+        assert!(NodeType::DocMention.is_atom());
+        assert!(NodeType::DocMention.is_inline());
+        assert!(!NodeType::DocMention.is_block());
+        assert!(!NodeType::DocMention.is_commentable());
+        assert!(NodeType::DocMention.needs_block_id());
+        let attrs = NodeType::DocMention.default_attrs();
+        assert_eq!(attrs.len(), 5);
+        for key in ["url", "doc_id", "target_block_id", "title", "snippet"] {
+            assert!(attrs.contains_key(key), "missing default attr {key}");
+        }
+    }
+
+    #[test]
+    fn doc_mention_text_content_is_title() {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("title".to_string(), "Target Doc".to_string());
+        attrs.insert("url".to_string(), "/d/abc".to_string());
+        let node = Node::element_with_attrs(NodeType::DocMention, attrs, Fragment::empty());
+        assert_eq!(node.text_content(), "Target Doc");
+        assert_eq!(node.node_size(), 1); // leaf atom = one position
     }
 
     // ── Document construction ──

@@ -883,6 +883,10 @@ fn node_type_to_tag(nt: NodeType) -> &'static str {
         // `crates/collab/src/schema.rs::NodeType::Mention::tag_name`
         // so both sides of the yrs bridge speak the same wire.
         NodeType::Mention => "mention",
+        // Matches
+        // `crates/collab/src/schema.rs::NodeType::DocMention::tag_name`
+        // so both sides of the yrs bridge speak the same wire.
+        NodeType::DocMention => "doc_mention",
         NodeType::Mermaid => "mermaid",
     }
 }
@@ -913,6 +917,7 @@ fn tag_to_node_type(tag: &str) -> Option<NodeType> {
         "kanban_column" => Some(NodeType::KanbanColumn),
         "kanban_card" => Some(NodeType::KanbanCard),
         "mention" => Some(NodeType::Mention),
+        "doc_mention" => Some(NodeType::DocMention),
         "mermaid" => Some(NodeType::Mermaid),
         _ => None,
     }

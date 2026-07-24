@@ -1599,6 +1599,10 @@ fn node_type_to_tag(nt: NodeType) -> &'static str {
         // pre-existing text+MarkType::Mention DOM output for
         // paste round-trip stability.
         NodeType::Mention => "span",
+        // Task 1 placeholder — base tag only; Task 2 adds the real
+        // render (attrs + inner text) via a per-node override, same
+        // as Mention above.
+        NodeType::DocMention => "span",
         NodeType::Mermaid => "div",
     }
 }

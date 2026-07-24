@@ -1062,6 +1062,19 @@ fn element_tags(
             );
             (open, None)
         }
+        // Task 1 placeholder — minimal span shape so the exhaustive
+        // match compiles; Task 2 replaces this with the real
+        // `<a class="doc-mention" ...>` clipboard emission mirroring
+        // `crates/collab/src/export.rs`.
+        NodeType::DocMention => {
+            let title = attrs.get("title").map(String::as_str).unwrap_or("");
+            let url = attrs.get("url").map(String::as_str).unwrap_or("");
+            let label = if !title.is_empty() { title } else { url };
+            (
+                format!("<span class=\"doc-mention\">{}</span>", html_escape_attr(label)),
+                None,
+            )
+        }
         // Mermaid: leaf block atom, mirrors Embed's minimal-shape
         // clipboard emission (no dedicated render pipeline on the
         // clipboard path yet). Source is in the `source` attribute.

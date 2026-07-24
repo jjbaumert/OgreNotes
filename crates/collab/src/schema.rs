@@ -71,6 +71,12 @@ pub enum NodeType {
     /// dual-read of documents written before this slice; new
     /// inserts always produce `NodeType::Mention` nodes.
     Mention,
+    /// Inline document/anchor mention as a leaf atom (mentions spec §2).
+    /// Carries the pasted `url`, target `doc_id`, optional
+    /// `target_block_id` ("" ⇒ document mention), and cached
+    /// `title`/`snippet`. Live/degraded render state is per-viewer and
+    /// never stored. Single-keystroke delete like Mention.
+    DocMention,
     /// Mermaid diagram block. Leaf atom; source stored in the
     /// `source` attribute. Rendered to SVG by `ogrenotes-mermaid`
     /// on both the client (live view) and server (HTML export).
@@ -107,6 +113,7 @@ impl NodeType {
             NodeType::KanbanColumn => "kanban_column",
             NodeType::KanbanCard => "kanban_card",
             NodeType::Mention => "mention",
+            NodeType::DocMention => "doc_mention",
             NodeType::Mermaid => "mermaid",
         }
     }
@@ -138,6 +145,7 @@ impl NodeType {
             "kanban_column" => Some(NodeType::KanbanColumn),
             "kanban_card" => Some(NodeType::KanbanCard),
             "mention" => Some(NodeType::Mention),
+            "doc_mention" => Some(NodeType::DocMention),
             "mermaid" => Some(NodeType::Mermaid),
             _ => None,
         }
@@ -174,7 +182,7 @@ impl NodeType {
 
     /// Whether this node type is an inline/leaf node.
     pub fn is_inline(&self) -> bool {
-        matches!(self, NodeType::HardBreak | NodeType::Mention)
+        matches!(self, NodeType::HardBreak | NodeType::Mention | NodeType::DocMention)
     }
 
     /// Whether this node is a leaf (no children).
@@ -188,6 +196,7 @@ impl NodeType {
                 | NodeType::CalendarEvent
                 | NodeType::KanbanCard
                 | NodeType::Mention
+                | NodeType::DocMention
                 | NodeType::Mermaid
         )
     }
@@ -271,6 +280,7 @@ impl NodeType {
             | NodeType::CalendarEvent
             | NodeType::KanbanCard
             | NodeType::Mention
+            | NodeType::DocMention
             | NodeType::Mermaid => &[],
         }
     }
@@ -365,6 +375,7 @@ mod tests {
             NodeType::KanbanColumn,
             NodeType::KanbanCard,
             NodeType::Mention,
+            NodeType::DocMention,
             NodeType::Mermaid,
         ];
 
@@ -490,6 +501,7 @@ mod tests {
         NodeType::KanbanColumn,
         NodeType::KanbanCard,
         NodeType::Mention,
+        NodeType::DocMention,
         NodeType::Mermaid,
     ];
 
@@ -524,7 +536,7 @@ mod tests {
         // If this fails, a node type was added to or removed from the collab
         // schema without updating the expected set. Update ALL_NODE_TYPES and
         // the corresponding frontend/src/editor/model.rs NodeType enum.
-        assert_eq!(ALL_NODE_TYPES.len(), 25, "expected 25 node types");
+        assert_eq!(ALL_NODE_TYPES.len(), 26, "expected 26 node types");
     }
 
     #[test]
@@ -585,6 +597,7 @@ mod tests {
             ("kanban_column", NodeType::KanbanColumn),
             ("kanban_card", NodeType::KanbanCard),
             ("mention", NodeType::Mention),
+            ("doc_mention", NodeType::DocMention),
             ("mermaid", NodeType::Mermaid),
         ];
         for (tag, nt) in expected {
@@ -631,6 +644,7 @@ mod tests {
             NodeType::CalendarEvent,
             NodeType::KanbanCard,
             NodeType::Mention,
+            NodeType::DocMention,
             NodeType::Mermaid,
         ];
         for nt in ALL_NODE_TYPES {
@@ -641,9 +655,9 @@ mod tests {
 
     #[test]
     fn cross_schema_inline_nodes() {
-        // Must match frontend: HardBreak and (as of #148 slice 6)
-        // Mention are inline; everything else is block-level.
-        let expected_inline = [NodeType::HardBreak, NodeType::Mention];
+        // Must match frontend: HardBreak, Mention (#148 slice 6), and
+        // DocMention are inline; everything else is block-level.
+        let expected_inline = [NodeType::HardBreak, NodeType::Mention, NodeType::DocMention];
         for nt in ALL_NODE_TYPES {
             let expected = expected_inline.contains(nt);
             assert_eq!(nt.is_inline(), expected, "inline mismatch for {nt:?}");
