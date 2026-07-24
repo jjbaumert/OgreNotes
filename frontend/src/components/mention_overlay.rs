@@ -270,9 +270,17 @@ pub fn mount(
         }
         *resolved_for_id.borrow_mut() = id;
 
+        // Eagerly drop the previous doc's states as soon as we know a
+        // different doc has opened — before the scan, before the
+        // async resolve. Otherwise a doc-with-mentions switch would
+        // leave the OLD doc's `mention_states` (and thus its DOM
+        // overlay) showing until the new doc's resolve round-trip
+        // returns, while the empty-doc case cleared immediately. Both
+        // branches now clear at the same point, symmetrically.
+        mention_states.set(HashMap::new());
+
         let infos = scan_doc_mentions_full(&state.doc);
         if infos.is_empty() {
-            mention_states.set(HashMap::new());
             return;
         }
 
@@ -320,14 +328,26 @@ pub fn mount(
             // stale cache. `update_doc_mention_attrs` (routed through
             // `UpdateDocMentionAttrs`) tags the transaction
             // `history: skip` — this never creates an undo entry.
-            if editable.get_untracked() {
-                for (node_block_id, title, snippet) in refreshes {
-                    on_command.run(ToolbarCommand::UpdateDocMentionAttrs {
-                        node_block_id,
-                        title,
-                        snippet,
-                    });
-                }
+            //
+            // Sent as ONE command carrying the whole batch, not one
+            // command per stale mention: `on_command` runs through
+            // `set_toolbar_command`, a plain signal — N synchronous
+            // `.run()` calls in the same tick each overwrite the
+            // last, so only the final mention's refresh would survive
+            // (same coalescing hazard `pages/document.rs`'s
+            // `clear_at_trigger_then_dispatch` documents).
+            if editable.get_untracked() && !refreshes.is_empty() {
+                let updates = refreshes
+                    .into_iter()
+                    .map(|(node_block_id, title, snippet)| {
+                        crate::components::toolbar::DocMentionAttrUpdate {
+                            node_block_id,
+                            title,
+                            snippet,
+                        }
+                    })
+                    .collect();
+                on_command.run(ToolbarCommand::UpdateDocMentionAttrs { updates });
             }
         });
     });

@@ -525,6 +525,20 @@ pub fn Toolbar(
     }
 }
 
+/// One `DocMention`'s fresh `title`/`snippet` pair, as found by the
+/// per-viewer degradation overlay's batch resolve. Payload element of
+/// `ToolbarCommand::UpdateDocMentionAttrs` — batched so that a doc
+/// with N stale mentions produces one `on_command.run(...)` call, not
+/// N (see that variant's doc comment for why: N synchronous same-tick
+/// writes to the same command signal would coalesce down to the last
+/// one).
+#[derive(Debug, Clone)]
+pub struct DocMentionAttrUpdate {
+    pub node_block_id: String,
+    pub title: String,
+    pub snippet: String,
+}
+
 /// Commands that the toolbar can dispatch.
 #[derive(Debug, Clone)]
 pub enum ToolbarCommand {
@@ -639,18 +653,24 @@ pub enum ToolbarCommand {
     /// the format / reverts to general; `"currency"`, `"percent"`,
     /// etc. match the existing well-known keys).
     SetNumberFormat(String),
-    /// Mentions spec §5 (Task 5) — silently refresh a `DocMention`
-    /// chip's cached `title`/`snippet` attrs after the per-viewer
-    /// degradation overlay's batch resolve found fresher values.
-    /// Editable sessions only; the caller (`mention_overlay`) has
-    /// already confirmed the values differ from what's cached.
-    /// Routes through `commands::update_doc_mention_attrs`, which
-    /// tags the transaction `history: skip` — this never creates an
-    /// undo entry.
+    /// Mentions spec §5 (Task 5) — silently refresh every stale
+    /// `DocMention` chip's cached `title`/`snippet` attrs after the
+    /// per-viewer degradation overlay's batch resolve found fresher
+    /// values. Editable sessions only; the caller (`mention_overlay`)
+    /// has already confirmed each entry's values differ from what's
+    /// cached.
+    ///
+    /// Carries the WHOLE batch for the doc-open resolve in one
+    /// command, not one command per stale mention: `set_toolbar_command`
+    /// is a plain signal, and N synchronous `.run()` calls in the same
+    /// tick each overwrite the last — only the final one would survive
+    /// (same coalescing hazard `pages/document.rs`'s
+    /// `clear_at_trigger_then_dispatch` documents). Routes through
+    /// `commands::update_doc_mention_attrs`, which builds one
+    /// transaction covering every entry and tags it `history: skip` —
+    /// this never creates an undo entry.
     UpdateDocMentionAttrs {
-        node_block_id: String,
-        title: String,
-        snippet: String,
+        updates: Vec<DocMentionAttrUpdate>,
     },
 }
 

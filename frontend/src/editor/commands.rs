@@ -990,14 +990,26 @@ pub fn convert_doc_mention_to_link(
     Some(txn)
 }
 
-/// Task 5 — refresh a `DocMention`'s cached `title`/`snippet` attrs
-/// after a fresh resolve, in editable sessions only. Found by its own
-/// `blockId` via `find_doc_mention` (same lookup as
-/// `convert_doc_mention_to_link`). Builds one `Step::SetAttr` per
-/// attribute that actually differs from the cached value; returns
-/// `None` when the DocMention no longer exists (concurrent delete) or
-/// when neither attr changed (nothing to write) — callers should not
-/// dispatch in that case.
+/// Task 5 — refresh every stale `DocMention`'s cached `title`/
+/// `snippet` attrs after a fresh resolve, in editable sessions only.
+/// Each entry in `updates` is `(node_block_id, title, snippet)`; every
+/// mention is looked up by its own `blockId` via `find_doc_mention`
+/// (same lookup as `convert_doc_mention_to_link`).
+///
+/// Builds ONE transaction covering the whole batch — one
+/// `Step::SetAttr` per attribute that actually differs from the
+/// cached value, for every entry — rather than one transaction per
+/// mention: `SetAttr` never changes doc size, so positions found
+/// against `state.doc` up front stay valid across every step in the
+/// batch, and a single-transaction batch is what lets the caller
+/// (`mention_overlay`) issue exactly one `ToolbarCommand` for a whole
+/// doc-open refresh instead of N commands that would coalesce down to
+/// the last one on the same-tick `set_toolbar_command` signal.
+///
+/// Entries are skipped individually: a `blockId` that no longer
+/// exists (concurrent delete) or whose title/snippet already match
+/// are simply not written. Returns `None` when NOTHING in the batch
+/// changed anything — callers should not dispatch in that case.
 ///
 /// Tagged `history: skip` (mentions spec §5 / Task 3's skip meta):
 /// this is a silent per-viewer cache refresh of the CRDT's cached
@@ -1006,34 +1018,42 @@ pub fn convert_doc_mention_to_link(
 /// meta (see `skip_meta_records_nothing` in plugins.rs).
 pub fn update_doc_mention_attrs(
     state: &EditorState,
-    node_block_id: &str,
-    title: &str,
-    snippet: &str,
+    updates: &[(String, String, String)],
 ) -> Option<Transaction> {
-    let (pos, attrs) = find_doc_mention(&state.doc, node_block_id)?;
-    let cur_title = attrs.get("title").map(String::as_str).unwrap_or("");
-    let cur_snippet = attrs.get("snippet").map(String::as_str).unwrap_or("");
-    if cur_title == title && cur_snippet == snippet {
-        return None;
-    }
     let mut txn = state.transaction();
-    if cur_title != title {
-        txn = txn
-            .step(Step::SetAttr {
-                pos,
-                attr: "title".to_string(),
-                value: title.to_string(),
-            })
-            .ok()?;
+    let mut changed = false;
+    for (node_block_id, title, snippet) in updates {
+        let Some((pos, attrs)) = find_doc_mention(&state.doc, node_block_id) else {
+            continue;
+        };
+        let cur_title = attrs.get("title").map(String::as_str).unwrap_or("");
+        let cur_snippet = attrs.get("snippet").map(String::as_str).unwrap_or("");
+        if cur_title == title && cur_snippet == snippet {
+            continue;
+        }
+        if cur_title != title {
+            txn = txn
+                .step(Step::SetAttr {
+                    pos,
+                    attr: "title".to_string(),
+                    value: title.clone(),
+                })
+                .ok()?;
+            changed = true;
+        }
+        if cur_snippet != snippet {
+            txn = txn
+                .step(Step::SetAttr {
+                    pos,
+                    attr: "snippet".to_string(),
+                    value: snippet.clone(),
+                })
+                .ok()?;
+            changed = true;
+        }
     }
-    if cur_snippet != snippet {
-        txn = txn
-            .step(Step::SetAttr {
-                pos,
-                attr: "snippet".to_string(),
-                value: snippet.to_string(),
-            })
-            .ok()?;
+    if !changed {
+        return None;
     }
     Some(txn.set_meta("history", "skip"))
 }
@@ -4800,13 +4820,51 @@ mod tests {
 
     // ── update_doc_mention_attrs (Task 5 — refresh-on-open cache sync) ──
 
+    fn mention_update(node_block_id: &str, title: &str, snippet: &str) -> (String, String, String) {
+        (node_block_id.to_string(), title.to_string(), snippet.to_string())
+    }
+
+    /// A doc with two independent `DocMention` atoms, both in their
+    /// own top-level paragraph — used by the batch regression test.
+    fn two_doc_mentions_doc(
+        block_id_a: &str,
+        title_a: &str,
+        block_id_b: &str,
+        title_b: &str,
+    ) -> Node {
+        fn mention(block_id: &str, title: &str) -> Node {
+            let mut attrs = HashMap::new();
+            attrs.insert("blockId".to_string(), block_id.to_string());
+            attrs.insert("url".to_string(), format!("https://notes.example/d/{block_id}"));
+            attrs.insert("title".to_string(), title.to_string());
+            attrs.insert("doc_id".to_string(), block_id.to_string());
+            Node::element_with_attrs(NodeType::DocMention, attrs, Fragment::empty())
+        }
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![mention(block_id_a, title_a)]),
+                ),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![mention(block_id_b, title_b)]),
+                ),
+            ]),
+        )
+    }
+
     #[test]
     fn update_doc_mention_attrs_writes_changed_title_and_snippet_with_skip_meta() {
         let doc = doc_mention_doc("mention-1", "https://notes.example/d/abc123", "Stale Title");
         let state = EditorState::create_default(doc);
 
-        let txn =
-            update_doc_mention_attrs(&state, "mention-1", "Fresh Title", "fresh snippet").unwrap();
+        let txn = update_doc_mention_attrs(
+            &state,
+            &[mention_update("mention-1", "Fresh Title", "fresh snippet")],
+        )
+        .unwrap();
         // Never a real undo entry — a silent per-viewer cache refresh.
         assert_eq!(txn.meta.get("history").map(String::as_str), Some("skip"));
 
@@ -4823,14 +4881,78 @@ mod tests {
         let state = EditorState::create_default(doc);
         // `doc_mention_doc` never sets `snippet`; `default_attrs()` fills it
         // with "" — pass the identical (title, snippet) pair back.
-        assert!(update_doc_mention_attrs(&state, "mention-1", "Same Title", "").is_none());
+        assert!(update_doc_mention_attrs(&state, &[mention_update("mention-1", "Same Title", "")])
+            .is_none());
     }
 
     #[test]
     fn update_doc_mention_attrs_returns_none_when_block_id_not_found() {
         let doc = doc_mention_doc("mention-1", "https://notes.example/d/abc123", "Title");
         let state = EditorState::create_default(doc);
-        assert!(update_doc_mention_attrs(&state, "does-not-exist", "New", "new").is_none());
+        assert!(
+            update_doc_mention_attrs(&state, &[mention_update("does-not-exist", "New", "new")])
+                .is_none()
+        );
+    }
+
+    /// Regression (batch write-back): the mentions overlay refresh
+    /// loop found TWO stale mentions in the same doc-open resolve.
+    /// Before the batch fix, each stale mention dispatched its own
+    /// `UpdateDocMentionAttrs` command in the same tick, and only the
+    /// last of N synchronous writes to `set_toolbar_command` survived
+    /// — the first mention's refresh silently vanished. A single
+    /// batched call must update BOTH nodes in one transaction.
+    #[test]
+    fn update_doc_mention_attrs_batch_updates_every_stale_mention_in_one_transaction() {
+        let doc = two_doc_mentions_doc("mention-a", "Stale A", "mention-b", "Stale B");
+        let state = EditorState::create_default(doc);
+
+        let txn = update_doc_mention_attrs(
+            &state,
+            &[
+                mention_update("mention-a", "Fresh A", "snippet a"),
+                mention_update("mention-b", "Fresh B", "snippet b"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(txn.meta.get("history").map(String::as_str), Some("skip"));
+
+        let new_state = state.apply(txn);
+        let mention_a = new_state.doc.child(0).unwrap().child(0).unwrap();
+        assert_eq!(mention_a.attrs().get("title").unwrap(), "Fresh A");
+        assert_eq!(mention_a.attrs().get("snippet").unwrap(), "snippet a");
+
+        let mention_b = new_state.doc.child(1).unwrap().child(0).unwrap();
+        assert_eq!(mention_b.attrs().get("title").unwrap(), "Fresh B");
+        assert_eq!(mention_b.attrs().get("snippet").unwrap(), "snippet b");
+    }
+
+    /// Per-item skip: one entry in the batch is unchanged, the other
+    /// is stale — only the stale one should produce a step, but the
+    /// transaction must still be `Some` (not dropped just because one
+    /// entry had nothing to write).
+    #[test]
+    fn update_doc_mention_attrs_batch_skips_unchanged_entries_but_applies_changed_ones() {
+        let doc = two_doc_mentions_doc("mention-a", "Same A", "mention-b", "Stale B");
+        let state = EditorState::create_default(doc);
+
+        let txn = update_doc_mention_attrs(
+            &state,
+            &[
+                // Matches cached title, empty snippet == default — no-op.
+                mention_update("mention-a", "Same A", ""),
+                mention_update("mention-b", "Fresh B", "snippet b"),
+            ],
+        )
+        .unwrap();
+
+        let new_state = state.apply(txn);
+        let mention_a = new_state.doc.child(0).unwrap().child(0).unwrap();
+        assert_eq!(mention_a.attrs().get("title").unwrap(), "Same A");
+
+        let mention_b = new_state.doc.child(1).unwrap().child(0).unwrap();
+        assert_eq!(mention_b.attrs().get("title").unwrap(), "Fresh B");
+        assert_eq!(mention_b.attrs().get("snippet").unwrap(), "snippet b");
     }
 
     #[test]
