@@ -1779,6 +1779,14 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let view_ref: Rc<RefCell<Option<EditorView>>> = Rc::new(RefCell::new(None));
     let history_ref: Rc<RefCell<HistoryPlugin>> = Rc::new(RefCell::new(HistoryPlugin::new()));
 
+    // Mentions spec §5 (Task 3) — a lone same-origin doc-URL paste hands
+    // its `PendingMentionPaste` out of `EditorView::on_paste` (plain
+    // closure, not reactive) through this signal, mirroring the
+    // `pending_ctx_cmd` indirection below: the async resolve + guarded
+    // replace live in an Effect that can safely borrow `view_ref`.
+    let (pending_mention_paste, set_pending_mention_paste) =
+        signal::<Option<crate::editor::mention_url::PendingMentionPaste>>(None);
+
     // #136 — Calendar modal state. `None` = hidden. A delegated
     // click listener on `.editor-content` populates this on
     // clicks inside `.calendar-block`; the modal callback
@@ -1859,14 +1867,92 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             apply_and_notify(view, txn, None, &on_change, &on_state_change, on_mapping_dispatch.as_ref());
         };
 
+        let on_mention_paste =
+            move |p: crate::editor::mention_url::PendingMentionPaste| {
+                set_pending_mention_paste.set(Some(p));
+            };
+
         let editor_view = EditorView::new_with_options(
             html_element,
             state,
             dispatch,
             Rc::clone(&history_ref_init),
             props_clone.readonly,
+            on_mention_paste,
         );
         *view_ref_init.borrow_mut() = Some(editor_view);
+    });
+
+    // Mentions spec §5 (Task 3) — drains `pending_mention_paste` and runs
+    // the async resolve → guarded replace. Shape mirrors
+    // `handle_image_upload`: `spawn_local(async move { ...await...
+    // then re-borrow `view_ref` for the CURRENT state and dispatch via
+    // `apply_and_notify` })`, the established pattern in this file for
+    // "async command result re-enters the reactive world." `Some(&history)`
+    // (not `None`, unlike the plain-dispatch closure above) because this
+    // path bypasses the view's own dispatch wrapper — `apply_and_notify`
+    // must record history itself, same as the toolbar-command Effect.
+    let view_ref_mention = Rc::clone(&view_ref);
+    let history_ref_mention = Rc::clone(&history_ref);
+    let on_change_mention = props.on_change.clone();
+    let on_state_change_mention = on_state_change_shared.clone();
+    let on_mapping_mention = props.on_mapping.clone();
+
+    Effect::new(move |_| {
+        let Some(p) = pending_mention_paste.get() else { return };
+        // Drain immediately so a later read doesn't re-fire the same paste.
+        set_pending_mention_paste.set(None);
+
+        let view_ref = Rc::clone(&view_ref_mention);
+        let history = Rc::clone(&history_ref_mention);
+        let on_change = on_change_mention.clone();
+        let on_state_change = on_state_change_mention.clone();
+        let on_mapping = on_mapping_mention.clone();
+
+        leptos::task::spawn_local(async move {
+            let targets = vec![(p.parsed.doc_id.clone(), p.parsed.block_id.clone())];
+            let Ok(results) = crate::api::documents::resolve_mentions(&targets).await else {
+                return; // network error: the pasted URL stays a plain URL
+            };
+            let Some(r) = results.first() else { return };
+            if r.status != "ok" {
+                return; // notFound (incl. no-access, by design): URL stays
+            }
+
+            // async ladder: block resolved → anchor attrs (snippet +
+            // target_block_id); fragment present but block missing →
+            // document mention that KEEPS target_block_id (dangling, so
+            // the chip can show its own notice); no fragment → plain
+            // document mention.
+            let block_found = r.block_found.unwrap_or(false);
+            let mut attrs = HashMap::new();
+            attrs.insert("url".to_string(), p.url.clone());
+            attrs.insert("doc_id".to_string(), p.parsed.doc_id.clone());
+            attrs.insert(
+                "target_block_id".to_string(),
+                p.parsed.block_id.clone().unwrap_or_default(),
+            );
+            attrs.insert("title".to_string(), r.title.clone().unwrap_or_default());
+            attrs.insert(
+                "snippet".to_string(),
+                if block_found { r.snippet.clone().unwrap_or_default() } else { String::new() },
+            );
+
+            let view = view_ref.borrow();
+            let Some(view) = view.as_ref() else { return };
+            // CURRENT state (post-await), not the pre-await snapshot — the
+            // concurrent-edit guard inside `replace_text_with_doc_mention`
+            // is only meaningful against what the document looks like now.
+            let current = view.state();
+            if let Some(txn) =
+                commands::replace_text_with_doc_mention(&current, p.from, p.to, &p.url, attrs)
+            {
+                apply_and_notify(view, txn, Some(&history), &on_change, &on_state_change, on_mapping.as_ref());
+            }
+            // None: the range no longer holds the raw URL (user kept
+            // typing, undid the paste, a remote edit landed there) — leave
+            // it as-is, per spec §5 case c.
+        });
     });
 
     // #136 — delegated click listener for `.calendar-block`

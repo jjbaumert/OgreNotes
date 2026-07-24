@@ -98,6 +98,13 @@ impl HistoryPlugin {
             return;
         }
 
+        // Mentions spec §5 (Task 3): a "skip" transaction records nothing
+        // at all — not even a new entry — and must NOT clear the redo
+        // stack either, unlike a normal recorded change.
+        if transaction.meta.get("history") == Some(&"skip".to_string()) {
+            return;
+        }
+
         // Skip if the transaction is marked as an undo/redo operation
         if transaction.meta.get("history") == Some(&"undo".to_string())
             || transaction.meta.get("history") == Some(&"redo".to_string())
@@ -127,13 +134,18 @@ impl HistoryPlugin {
         }
         inverted.reverse(); // Undo steps must be applied in reverse order
 
-        // Decide whether to group with the previous entry
+        // Decide whether to group with the previous entry. A "merge"
+        // transaction (mentions spec §5: paste-then-async-convert must be
+        // ONE undo) groups with the previous entry regardless of elapsed
+        // time — and regardless of whether `last_change_time` was ever
+        // set — as long as there IS a previous entry to group into.
         let now = current_time_ms();
-        let should_group = self
+        let force_merge = transaction.meta.get("history") == Some(&"merge".to_string());
+        let time_grouped = self
             .last_change_time
             .map(|t| now - t < self.new_group_delay)
-            .unwrap_or(false)
-            && !self.undo_stack.is_empty();
+            .unwrap_or(false);
+        let should_group = (force_merge || time_grouped) && !self.undo_stack.is_empty();
 
         if should_group {
             // Merge with the last undo entry.
@@ -420,6 +432,88 @@ mod tests {
         history.clear();
         assert!(!history.can_undo());
         assert!(!history.can_redo());
+    }
+
+    // ── meta("history") == "merge" / "skip" (mentions spec §5: single-undo
+    // paste-then-async-convert) ──
+
+    #[test]
+    fn merge_meta_groups_with_previous_entry_regardless_of_time() {
+        // new_group_delay = 0.0 so the native `current_time_ms() == 0`
+        // quirk can't accidentally satisfy this on its own: without the
+        // merge meta, two back-to-back records here would NOT group
+        // (0.0 - 0.0 < 0.0 is false). The merge meta must force grouping
+        // anyway.
+        let state = EditorState::create_default(simple_doc());
+        let mut history = HistoryPlugin::with_options(100, 0.0);
+
+        let txn_a = state.transaction().insert_text("A").unwrap();
+        let state_a = state.apply(txn_a.clone());
+        history.record(&txn_a, &state.doc);
+        assert_eq!(history.undo_stack.len(), 1);
+
+        let txn_b = state_a.transaction().insert_text("B").unwrap();
+        let txn_b = txn_b.set_meta("history", "merge");
+        let state_b = state_a.apply(txn_b.clone());
+        history.record(&txn_b, &state_a.doc);
+
+        // Grouped into the same entry, not a second one.
+        assert_eq!(history.undo_stack.len(), 1);
+
+        // A single undo reverts BOTH insertions.
+        let undo_txn = history.undo(&state_b).unwrap();
+        let restored = state_b.apply(undo_txn);
+        assert_eq!(restored.doc, state.doc);
+        assert!(!history.can_undo());
+    }
+
+    #[test]
+    fn merge_meta_groups_even_when_last_change_time_is_none() {
+        // Edge case named explicitly by the contract: force_merge must
+        // group with a non-empty undo_stack even if last_change_time was
+        // never set (e.g. history state constructed/seeded some other
+        // way than through record()).
+        let state = EditorState::create_default(simple_doc());
+        let mut history = HistoryPlugin::new();
+        history.undo_stack.push(UndoEntry { steps: Vec::new() });
+        assert!(history.last_change_time.is_none());
+
+        let txn = state
+            .transaction()
+            .insert_text("X")
+            .unwrap()
+            .set_meta("history", "merge");
+        history.record(&txn, &state.doc);
+
+        // Merged into the seeded entry, not pushed as a second one.
+        assert_eq!(history.undo_stack.len(), 1);
+    }
+
+    #[test]
+    fn skip_meta_records_nothing() {
+        let state = EditorState::create_default(simple_doc());
+        let mut history = HistoryPlugin::new();
+
+        let txn_a = state.transaction().insert_text("A").unwrap();
+        let state_a = state.apply(txn_a.clone());
+        history.record(&txn_a, &state.doc);
+        assert!(history.can_undo());
+
+        // Build up a non-empty redo stack so we can prove skip doesn't
+        // clear it either.
+        let undo_txn = history.undo(&state_a).unwrap();
+        let state_undo = state_a.apply(undo_txn);
+        assert!(history.can_redo());
+
+        let txn_b = state_undo
+            .transaction()
+            .insert_text("B")
+            .unwrap()
+            .set_meta("history", "skip");
+        history.record(&txn_b, &state_undo.doc);
+
+        assert_eq!(history.undo_stack.len(), 0); // nothing recorded
+        assert!(history.can_redo()); // redo stack NOT cleared
     }
 
     // ── Undo after concurrent edit (known bug) ──

@@ -854,6 +854,52 @@ pub fn insert_user_mention(
     }
 }
 
+/// Mentions spec §5 (Task 3): replace `[from, to)` — which must still
+/// contain exactly `expected_text` (the pasted URL) — with a `DocMention`
+/// atom. Returns `None` (abort, leave the plain URL in place) when the
+/// document changed underneath in a way that invalidates the range: the
+/// user kept typing, undid the paste, or another client's edit landed
+/// there first. This is the concurrent-edit guard the async resolve races
+/// against.
+///
+/// Unlike the other `insert_*`/`toggle_*` commands in this file, this one
+/// returns `Option<Transaction>` directly rather than taking a dispatch
+/// closure: the caller is always post-`await` code re-entering the
+/// reactive world (`editor_component.rs`), which needs the transaction
+/// itself to route through `apply_and_notify` — see that file's mention
+/// paste resolve effect.
+///
+/// The returned transaction carries `meta("history", "merge")` so
+/// `HistoryPlugin` folds it into the SAME undo entry as the original
+/// paste-the-URL transaction: one undo removes the mention and restores
+/// the raw URL, matching the paste's single edit from the user's
+/// perspective.
+pub fn replace_text_with_doc_mention(
+    state: &EditorState,
+    from: usize,
+    to: usize,
+    expected_text: &str,
+    attrs: std::collections::HashMap<String, String>,
+) -> Option<Transaction> {
+    if text_between_positions(&state.doc, from, to) != expected_text {
+        return None;
+    }
+    let mention = crate::editor::model::Node::element_with_attrs(
+        crate::editor::model::NodeType::DocMention,
+        attrs,
+        crate::editor::model::Fragment::empty(),
+    );
+    let slice = crate::editor::model::Slice::new(
+        crate::editor::model::Fragment::from(vec![mention]),
+        0,
+        0,
+    );
+    let mut txn = state.transaction().replace(from, to, slice).ok()?;
+    txn = txn.set_meta("history", "merge");
+    txn.selection = Selection::cursor(from + 1);
+    Some(txn)
+}
+
 /// Scope of text extracted by `plain_text_from_state`. Callers use it
 /// to phrase the AI prompt correctly — "summarize this selection" vs.
 /// "summarize this document."
@@ -4483,6 +4529,65 @@ mod tests {
         let state = EditorState::create_default(simple_doc());
         assert!(!insert_user_mention(1, 3, "", "u-1", &state, None));
         assert!(!insert_user_mention(1, 3, "Alice", "", &state, None));
+    }
+
+    // ── replace_text_with_doc_mention (mentions spec §5, Task 3) ──
+
+    fn url_doc(url: &str) -> Node {
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text(url)]),
+            )]),
+        )
+    }
+
+    #[test]
+    fn replace_text_with_doc_mention_swaps_in_the_atom_and_marks_merge() {
+        let url = "https://notes.example/d/abc123";
+        let state = EditorState::create_default(url_doc(url));
+        let from = 1; // just inside <p>
+        let to = from + url.chars().count();
+
+        let mut attrs = HashMap::new();
+        attrs.insert("doc_id".to_string(), "abc123".to_string());
+        attrs.insert("url".to_string(), url.to_string());
+        attrs.insert("title".to_string(), "Target Doc".to_string());
+
+        let txn = replace_text_with_doc_mention(&state, from, to, url, attrs).unwrap();
+        assert_eq!(txn.meta.get("history").map(String::as_str), Some("merge"));
+
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        let mention = para.child(0).unwrap();
+        assert_eq!(mention.node_type(), Some(NodeType::DocMention));
+        assert!(mention.is_leaf());
+        assert_eq!(mention.attrs().get("doc_id").unwrap(), "abc123");
+        assert_eq!(mention.attrs().get("title").unwrap(), "Target Doc");
+        // Cursor lands just after the atom (leaf takes one position).
+        assert_eq!(new_state.selection.from(), from + 1);
+        // The URL text is gone — replaced wholesale.
+        assert_eq!(para.text_content(), "Target Doc");
+    }
+
+    #[test]
+    fn replace_text_with_doc_mention_aborts_when_text_no_longer_matches() {
+        // Concurrent-edit guard: [from,to) no longer holds `expected_text`
+        // (user kept typing, undid, or a remote edit landed there first).
+        let url = "https://notes.example/d/abc123";
+        let state = EditorState::create_default(url_doc(url));
+        let from = 1;
+        let to = from + url.chars().count();
+        assert!(replace_text_with_doc_mention(&state, from, to, "not the url anymore", HashMap::new())
+            .is_none());
+    }
+
+    #[test]
+    fn replace_text_with_doc_mention_aborts_on_out_of_range_positions() {
+        let url = "https://notes.example/d/abc123";
+        let state = EditorState::create_default(url_doc(url));
+        assert!(replace_text_with_doc_mention(&state, 0, 1000, url, HashMap::new()).is_none());
     }
 
     #[test]

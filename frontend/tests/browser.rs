@@ -56,7 +56,7 @@ fn create_editor(
     ));
     let view = EditorView::new(container, state, move |txn: Transaction| {
         txns_clone.borrow_mut().push(txn);
-    }, history);
+    }, history, |_p| {});
     (view, txns)
 }
 

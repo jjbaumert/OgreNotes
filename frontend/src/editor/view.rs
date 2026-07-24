@@ -29,6 +29,13 @@ pub struct EditorView {
     pending_composition: Rc<RefCell<Option<gloo_timers::callback::Timeout>>>,
     /// History plugin for undo/redo (shared with editor component).
     history: Rc<RefCell<super::plugins::HistoryPlugin>>,
+    /// Mentions spec §5 (Task 3): hands a lone same-origin doc-URL paste
+    /// out to the Leptos side (`editor_component.rs`), which drives the
+    /// async resolve → guarded replace. Mirrors `dispatch`: a plain
+    /// closure crossing from this DOM-event world into the reactive one,
+    /// supplied at construction the same way `dispatch` is — there's no
+    /// other hook-passing mechanism into `EditorView` today.
+    mention_paste_hook: Rc<dyn Fn(super::mention_url::PendingMentionPaste)>,
     /// Stored (event_name, closure) pairs for cleanup in destroy().
     listeners: Vec<(&'static str, Closure<dyn Fn(web_sys::Event)>)>,
     /// selectionchange listener (attached to document, not container).
@@ -42,8 +49,9 @@ impl EditorView {
         state: EditorState,
         dispatch: impl Fn(Transaction) + 'static,
         history: Rc<RefCell<super::plugins::HistoryPlugin>>,
+        on_mention_paste: impl Fn(super::mention_url::PendingMentionPaste) + 'static,
     ) -> Self {
-        Self::new_with_options(container, state, dispatch, history, false)
+        Self::new_with_options(container, state, dispatch, history, false, on_mention_paste)
     }
 
     /// Create a new editor view with the option to render it read-only.
@@ -59,6 +67,7 @@ impl EditorView {
         dispatch: impl Fn(Transaction) + 'static,
         history: Rc<RefCell<super::plugins::HistoryPlugin>>,
         readonly: bool,
+        on_mention_paste: impl Fn(super::mention_url::PendingMentionPaste) + 'static,
     ) -> Self {
         if !readonly {
             container
@@ -97,6 +106,7 @@ impl EditorView {
             just_composed,
             pending_composition: Rc::new(RefCell::new(None)),
             history,
+            mention_paste_hook: Rc::new(on_mention_paste),
             listeners: Vec::new(),
             selectionchange_closure: None,
         };
@@ -798,6 +808,7 @@ impl EditorView {
         let state_paste = Rc::clone(&self.state);
         let dispatch_paste = Rc::clone(&self.dispatch);
         let container_paste = self.container.clone();
+        let mention_paste_hook = Rc::clone(&self.mention_paste_hook);
         let on_paste = Closure::wrap(Box::new(move |event: web_sys::Event| {
             event.prevent_default();
             let Some(ce) = event.dyn_ref::<web_sys::ClipboardEvent>() else { return };
@@ -824,6 +835,43 @@ impl EditorView {
                 ("text_len", &text.len().to_string()),
                 ("text_preview", &text.chars().take(500).collect::<String>()),
             ]);
+
+            // Mentions spec §5: a lone same-origin doc URL pastes as plain
+            // text immediately (no latency), then async-converts to a
+            // DocMention. Only when the paste is EXACTLY one URL with no
+            // meaningful HTML structure — multi-URL, URL-in-sentence, and
+            // rich (non-trivial) HTML pastes fall through to the normal
+            // paths below, untouched.
+            let html_is_trivial = html.is_empty() || {
+                let probe = super::clipboard::parse_from_html(&html);
+                super::markdown::is_trivial_slice(&probe)
+            };
+            if html_is_trivial && !text.is_empty() {
+                if let Some(origin) = web_sys::window().and_then(|w| w.location().origin().ok()) {
+                    if let Some(parsed) = super::mention_url::parse_ogre_doc_url(&text, &origin) {
+                        let url = text.trim().to_string();
+                        if let Ok(txn) = state_with_sel.transaction().insert_text(&url) {
+                            // Model positions of the just-inserted range: `from`
+                            // is the pre-insert selection start, `to` is where
+                            // the cursor actually lands after the insert (per
+                            // `insert_text`'s own position mapping) — NOT a
+                            // char-count guess, so it's correct regardless of
+                            // marks/position-accounting subtleties.
+                            let from = state_with_sel.selection.from();
+                            let to = txn.selection.from();
+                            dispatch_paste(txn);
+                            mention_paste_hook(super::mention_url::PendingMentionPaste {
+                                from,
+                                to,
+                                url,
+                                parsed,
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+
             let slice = if !html.is_empty() {
                 let html_slice = super::clipboard::parse_from_html(&html);
                 // Sources like terminals, file viewers, and "view source" panels
