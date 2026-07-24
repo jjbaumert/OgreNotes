@@ -1023,10 +1023,39 @@ impl EditorView {
         }) as Box<dyn Fn(web_sys::Event)>);
         self.add_listener("paste", on_paste);
 
-        // click — open links with Ctrl+click (Cmd+click on Mac) in a new tab.
-        // Regular clicks in contenteditable just position the cursor.
+        // click — open links with Ctrl+click (Cmd+click on Mac) in a new tab;
+        // navigate DocMention chips on a plain click. Regular clicks in
+        // contenteditable just position the cursor.
         let on_click = Closure::wrap(Box::new(move |event: web_sys::Event| {
             let Some(me) = event.dyn_ref::<web_sys::MouseEvent>() else { return };
+
+            // DocMention chips: plain click navigates, no Ctrl/Cmd gate
+            // needed — the chip is `contenteditable="false"`, so a click
+            // on it can never be a text-editing click the way clicking
+            // inside a link's own text run can. Checked before the Ctrl
+            // gate below (and independent of it) so the chip works
+            // whether or not a modifier happens to be held.
+            let mut mention_node =
+                event.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok());
+            while let Some(el) = mention_node {
+                if el.tag_name().to_lowercase() == "span"
+                    && el.class_list().contains("doc-mention")
+                {
+                    if !el.class_list().contains("doc-mention-missing") {
+                        if let Some(url) = el.get_attribute("data-url") {
+                            if is_safe_url(&url) {
+                                event.prevent_default();
+                                if let Some(w) = web_sys::window() {
+                                    let _ = w.location().set_href(&url);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                mention_node = el.parent_element();
+            }
+
             // Ctrl+click (Windows/Linux) or Meta+click (Mac)
             if !me.ctrl_key() && !me.meta_key() {
                 return;
@@ -1325,6 +1354,53 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                     el.set_text_content(Some(display));
                     return Some(el.into());
                 }
+                NodeType::DocMention => {
+                    // Mentions spec §3 — in-editor doc/anchor mention
+                    // chip. Same atom shape as Mention above (leaf,
+                    // `contenteditable="false"`, `data-atom-size`), but
+                    // carries its own set of attributes and a
+                    // glyph+label body instead of a bare display name.
+                    //
+                    // `data-node-block-id` is this NODE's own identity
+                    // id (Task 5's degradation overlay keys on it) —
+                    // NOT the target. The target block lives under
+                    // `data-block-id-target`, deliberately NOT
+                    // `data-block-id`: that attribute name means "this
+                    // node's own block" everywhere else in the DOM, and
+                    // reusing it here would collide with every other
+                    // block-id reader that walks up from a click. The
+                    // clipboard/export `<a>` shape (clipboard.rs,
+                    // crates/collab/src/export.rs) keeps spec §7's
+                    // `data-block-id` name since it leaves the app and
+                    // has no such collision to worry about.
+                    let el = doc.create_element("span").ok()?;
+                    el.set_attribute("class", "doc-mention").ok()?;
+                    el.set_attribute("contenteditable", "false").ok()?;
+                    el.set_attribute("data-atom-size", &node.node_size().to_string()).ok()?;
+                    let get = |k: &str| attrs.get(k).map(String::as_str).unwrap_or("");
+                    el.set_attribute("data-doc-id", get("doc_id")).ok()?;
+                    if !get("target_block_id").is_empty() {
+                        el.set_attribute("data-block-id-target", get("target_block_id")).ok()?;
+                    }
+                    el.set_attribute("data-url", get("url")).ok()?;
+                    if let Some(bid) = node.block_id() {
+                        el.set_attribute("data-node-block-id", bid).ok()?;
+                    }
+                    // Glyph: anchor for a within-doc target, document
+                    // otherwise. Label: anchor snippet, else title,
+                    // else the bare url (mirrors export.rs's fallback).
+                    let is_anchor = !get("target_block_id").is_empty();
+                    let icon = if is_anchor { "\u{2693} " } else { "\u{1F4C4} " };
+                    let label = if is_anchor && !get("snippet").is_empty() {
+                        get("snippet")
+                    } else if !get("title").is_empty() {
+                        get("title")
+                    } else {
+                        get("url")
+                    };
+                    el.set_text_content(Some(&format!("{icon}{label}")));
+                    return Some(el.into());
+                }
                 NodeType::Embed => {
                     // M-P6 piece B: wrap the iframe in a non-editable
                     // div so the editor treats the embed as a single
@@ -1599,9 +1675,9 @@ fn node_type_to_tag(nt: NodeType) -> &'static str {
         // pre-existing text+MarkType::Mention DOM output for
         // paste round-trip stability.
         NodeType::Mention => "span",
-        // Task 1 placeholder — base tag only; Task 2 adds the real
-        // render (attrs + inner text) via a per-node override, same
-        // as Mention above.
+        // Mentions spec §3 — doc/anchor mention chip. Attribute +
+        // inner text emission handled by the renderer's per-node
+        // override (Task 2), same as Mention above.
         NodeType::DocMention => "span",
         NodeType::Mermaid => "div",
     }

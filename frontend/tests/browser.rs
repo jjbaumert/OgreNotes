@@ -14,7 +14,7 @@ use web_sys::{Document, HtmlElement};
 
 use std::collections::HashMap;
 
-use ogrenotes_frontend::editor::model::{Fragment, Mark, MarkType, Node, NodeType};
+use ogrenotes_frontend::editor::model::{Fragment, Mark, MarkType, Node, NodeType, Slice};
 use ogrenotes_frontend::editor::selection::Selection;
 use ogrenotes_frontend::editor::state::{EditorState, Transaction};
 use ogrenotes_frontend::editor::view::EditorView;
@@ -3639,6 +3639,267 @@ fn fit_list_content_in_paragraph_extracts_text() {
             "BulletList should not appear inside Paragraph context"
         );
     }
+}
+
+// ─── DocMention chip: render, clipboard round-trip, navigate ──
+//
+// `NodeType::DocMention`'s clipboard parse path (`convert_element_node`
+// in clipboard.rs) lives behind `#[cfg(target_arch = "wasm32")]` —
+// same as every other `parse_from_html` case in this codebase — so it
+// only runs here, not under native `cargo test`. clipboard.rs's own
+// `#[test]`s cover the pure `serialize_to_html` half.
+
+fn doc_mention_attrs(
+    url: &str,
+    doc_id: &str,
+    target_block_id: &str,
+    title: &str,
+    snippet: &str,
+) -> HashMap<String, String> {
+    let mut attrs = HashMap::new();
+    attrs.insert("url".to_string(), url.to_string());
+    attrs.insert("doc_id".to_string(), doc_id.to_string());
+    attrs.insert("target_block_id".to_string(), target_block_id.to_string());
+    attrs.insert("title".to_string(), title.to_string());
+    attrs.insert("snippet".to_string(), snippet.to_string());
+    attrs
+}
+
+fn doc_with_mention(attrs: HashMap<String, String>) -> Node {
+    let mention = Node::element_with_attrs(NodeType::DocMention, attrs, Fragment::empty());
+    Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![mention]),
+        )]),
+    )
+}
+
+#[wasm_bindgen_test]
+fn doc_mention_renders_anchor_chip_with_icon_snippet_and_attrs() {
+    let container = create_container();
+    let attrs = doc_mention_attrs(
+        "https://notes.example/d/abc#b=blk1",
+        "abc",
+        "blk1",
+        "Roadmap",
+        "Q3 goals",
+    );
+    let (view, _txns) = create_editor(container.clone(), doc_with_mention(attrs));
+
+    let chip = view.container().query_selector("span.doc-mention").unwrap()
+        .expect("should render a span.doc-mention chip");
+    assert_eq!(chip.get_attribute("contenteditable").as_deref(), Some("false"));
+    assert_eq!(chip.get_attribute("data-doc-id").as_deref(), Some("abc"));
+    assert_eq!(chip.get_attribute("data-block-id-target").as_deref(), Some("blk1"));
+    assert_eq!(
+        chip.get_attribute("data-url").as_deref(),
+        Some("https://notes.example/d/abc#b=blk1"),
+    );
+    assert!(chip.get_attribute("data-atom-size").is_some());
+    // Own identity id — distinct attribute name from the target above.
+    assert!(chip.get_attribute("data-node-block-id").is_some());
+    let text = chip.text_content().unwrap_or_default();
+    assert!(text.starts_with('\u{2693}'), "anchor mention must use the anchor glyph, got: {text}");
+    assert!(text.contains("Q3 goals"), "anchor mention prefers snippet over title, got: {text}");
+
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn doc_mention_renders_document_chip_with_document_icon_and_title() {
+    let container = create_container();
+    // No target_block_id ⇒ whole-document mention; no snippet ⇒ title used.
+    let attrs = doc_mention_attrs("https://notes.example/d/abc", "abc", "", "Roadmap", "");
+    let (view, _txns) = create_editor(container.clone(), doc_with_mention(attrs));
+
+    let chip = view.container().query_selector("span.doc-mention").unwrap()
+        .expect("should render a span.doc-mention chip");
+    assert!(
+        chip.get_attribute("data-block-id-target").is_none(),
+        "document mention (empty target) must omit data-block-id-target",
+    );
+    let text = chip.text_content().unwrap_or_default();
+    assert!(text.starts_with('\u{1F4C4}'), "document mention must use the document glyph, got: {text}");
+    assert!(text.contains("Roadmap"), "got: {text}");
+
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn doc_mention_renders_label_falls_back_to_url_when_title_and_snippet_empty() {
+    let container = create_container();
+    let attrs = doc_mention_attrs("https://notes.example/d/abc", "abc", "", "", "");
+    let (view, _txns) = create_editor(container.clone(), doc_with_mention(attrs));
+
+    let chip = view.container().query_selector("span.doc-mention").unwrap().unwrap();
+    let text = chip.text_content().unwrap_or_default();
+    assert!(text.contains("https://notes.example/d/abc"), "got: {text}");
+
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn doc_mention_click_skipped_when_missing_class_present() {
+    // The overlay (Task 5) marks a dangling target with `doc-mention-missing`;
+    // a plain click on that chip must not navigate or preventDefault.
+    let container = create_container();
+    let attrs = doc_mention_attrs("https://notes.example/d/abc", "abc", "", "Roadmap", "");
+    let (view, _txns) = create_editor(container.clone(), doc_with_mention(attrs));
+
+    let chip = view.container().query_selector("span.doc-mention").unwrap().unwrap();
+    chip.class_list().add_1("doc-mention-missing").unwrap();
+
+    let init = web_sys::MouseEventInit::new();
+    init.set_bubbles(true);
+    init.set_cancelable(true);
+    let event = web_sys::MouseEvent::new_with_mouse_event_init_dict("click", &init).unwrap();
+    chip.dispatch_event(&event).unwrap();
+    assert!(!event.default_prevented(),
+        "click on a doc-mention-missing chip must not preventDefault/navigate");
+
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn doc_mention_click_skipped_when_url_unsafe() {
+    let container = create_container();
+    let attrs = doc_mention_attrs("javascript:alert(1)", "abc", "", "Roadmap", "");
+    let (view, _txns) = create_editor(container.clone(), doc_with_mention(attrs));
+
+    let chip = view.container().query_selector("span.doc-mention").unwrap().unwrap();
+    let init = web_sys::MouseEventInit::new();
+    init.set_bubbles(true);
+    init.set_cancelable(true);
+    let event = web_sys::MouseEvent::new_with_mouse_event_init_dict("click", &init).unwrap();
+    chip.dispatch_event(&event).unwrap();
+    assert!(!event.default_prevented(),
+        "click on a chip with an unsafe url must not preventDefault/navigate");
+
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn parse_html_doc_mention_anchor_from_copy_out_a_tag() {
+    // The `<a>` shape this crate's own `serialize_to_html` emits (and
+    // that `crates/collab/src/export.rs` emits server-side).
+    let html = r#"<a class="doc-mention" data-doc-id="abc" data-block-id="blk1" href="https://notes.example/d/abc#b=blk1">Roadmap</a>"#;
+    let slice = clipboard::parse_from_html(html);
+    assert_eq!(slice.content.children.len(), 1);
+    let node = &slice.content.children[0];
+    assert_eq!(node.node_type(), Some(NodeType::DocMention));
+    let attrs = node.attrs();
+    assert_eq!(attrs.get("doc_id").map(String::as_str), Some("abc"));
+    assert_eq!(attrs.get("target_block_id").map(String::as_str), Some("blk1"));
+    assert_eq!(
+        attrs.get("url").map(String::as_str),
+        Some("https://notes.example/d/abc#b=blk1"),
+    );
+    assert_eq!(attrs.get("title").map(String::as_str), Some("Roadmap"));
+}
+
+#[wasm_bindgen_test]
+fn parse_html_doc_mention_document_a_tag_omits_target() {
+    let html = r#"<a class="doc-mention" data-doc-id="abc" href="https://notes.example/d/abc">Roadmap</a>"#;
+    let slice = clipboard::parse_from_html(html);
+    let node = &slice.content.children[0];
+    assert_eq!(node.node_type(), Some(NodeType::DocMention));
+    assert_eq!(node.attrs().get("target_block_id").map(String::as_str), Some(""));
+}
+
+#[wasm_bindgen_test]
+fn parse_html_doc_mention_from_span_strips_anchor_glyph() {
+    // The in-editor chip shape (view.rs render arm) — reached when a
+    // paste source copies the rendered DOM directly.
+    let html = "<span class=\"doc-mention\" data-doc-id=\"abc\" data-url=\"https://notes.example/d/abc#b=blk1\" data-block-id-target=\"blk1\">\u{2693} Q3 goals</span>";
+    let slice = clipboard::parse_from_html(html);
+    let node = &slice.content.children[0];
+    assert_eq!(node.node_type(), Some(NodeType::DocMention));
+    let attrs = node.attrs();
+    assert_eq!(attrs.get("target_block_id").map(String::as_str), Some("blk1"));
+    assert_eq!(
+        attrs.get("url").map(String::as_str),
+        Some("https://notes.example/d/abc#b=blk1"),
+    );
+    assert_eq!(attrs.get("title").map(String::as_str), Some("Q3 goals"),
+        "leading anchor glyph must be stripped from the title");
+}
+
+#[wasm_bindgen_test]
+fn parse_html_doc_mention_from_span_strips_document_glyph() {
+    let html = "<span class=\"doc-mention\" data-doc-id=\"abc\" data-url=\"https://notes.example/d/abc\">\u{1F4C4} Roadmap</span>";
+    let slice = clipboard::parse_from_html(html);
+    let node = &slice.content.children[0];
+    assert_eq!(node.attrs().get("title").map(String::as_str), Some("Roadmap"),
+        "leading document glyph must be stripped from the title");
+}
+
+#[wasm_bindgen_test]
+fn parse_html_doc_mention_ignores_span_without_doc_id() {
+    // A `doc-mention` classed span with no `data-doc-id` isn't a mention
+    // (defensive: malformed/foreign HTML) — falls through to plain text.
+    let html = "<span class=\"doc-mention\">not a mention</span>";
+    let slice = clipboard::parse_from_html(html);
+    let all_text: String = slice.content.children.iter().map(|c| c.text_content()).collect();
+    assert!(all_text.contains("not a mention"));
+    assert!(
+        !slice.content.children.iter().any(|c| c.node_type() == Some(NodeType::DocMention)),
+        "must not produce a DocMention without a doc_id",
+    );
+}
+
+#[wasm_bindgen_test]
+fn doc_mention_serialize_and_parse_roundtrip() {
+    let attrs = doc_mention_attrs(
+        "https://notes.example/d/abc#b=blk1",
+        "abc",
+        "blk1",
+        "Roadmap",
+        "Q3 goals",
+    );
+    let node = Node::element_with_attrs(NodeType::DocMention, attrs, Fragment::empty());
+    let html = clipboard::serialize_to_html(&Slice::new(Fragment::from(vec![node]), 0, 0));
+    assert!(html.contains(r#"class="doc-mention""#));
+    assert!(html.contains(r#"data-doc-id="abc""#));
+
+    let parsed = clipboard::parse_from_html(&html);
+    assert_eq!(parsed.content.children.len(), 1);
+    let round_tripped = &parsed.content.children[0];
+    assert_eq!(round_tripped.node_type(), Some(NodeType::DocMention));
+    let rt_attrs = round_tripped.attrs();
+    assert_eq!(rt_attrs.get("doc_id").map(String::as_str), Some("abc"));
+    assert_eq!(rt_attrs.get("target_block_id").map(String::as_str), Some("blk1"));
+    assert_eq!(
+        rt_attrs.get("url").map(String::as_str),
+        Some("https://notes.example/d/abc#b=blk1"),
+    );
+    // Only title survives the copy-out `<a>` shape — export.rs (and this
+    // serializer) never emit the snippet, matching the spec.
+    assert_eq!(rt_attrs.get("title").map(String::as_str), Some("Roadmap"));
+}
+
+#[wasm_bindgen_test]
+fn paste_doc_mention_html_inserts_chip_into_document() {
+    // Full glue: paste → parse → transaction → render, through the real
+    // EditorView paste handler (not just the clipboard functions).
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+
+    let html = r#"<a class="doc-mention" data-doc-id="abc" data-block-id="blk1" href="https://notes.example/d/abc#b=blk1">Roadmap</a>"#;
+    dispatch_paste_html(&view, &txns, "Roadmap", html);
+
+    let chip = view.container().query_selector("span.doc-mention").unwrap()
+        .expect("paste should insert a rendered doc-mention chip");
+    assert_eq!(chip.get_attribute("data-doc-id").as_deref(), Some("abc"));
+    assert_eq!(chip.get_attribute("data-block-id-target").as_deref(), Some("blk1"));
+    assert_eq!(
+        chip.get_attribute("data-url").as_deref(),
+        Some("https://notes.example/d/abc#b=blk1"),
+    );
+
+    cleanup(&container);
 }
 
 // ─── Backspace in List Item Tests ─────────────────────────────
