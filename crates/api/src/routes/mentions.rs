@@ -8,6 +8,8 @@
 //! byte-identical to a nonexistent one, so mention resolution can never
 //! leak a document's title or its existence.
 
+use std::collections::HashMap;
+
 use axum::extract::State;
 use axum::{routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
@@ -79,8 +81,12 @@ async fn resolve(
         )));
     }
     let mut results = Vec::with_capacity(req.targets.len());
+    // Per-request memoization: repeated targets into the same doc (common
+    // once document-open batches land in Plan 2) reuse one loaded snapshot
+    // instead of reloading it once per target.
+    let mut doc_cache: HashMap<String, ogrenotes_collab::document::OgreDoc> = HashMap::new();
     for target in &req.targets {
-        results.push(resolve_target(&state, &user_id, target).await?);
+        results.push(resolve_target(&state, &user_id, target, &mut doc_cache).await?);
     }
     Ok(Json(ResolveResponse { results }))
 }
@@ -89,10 +95,12 @@ async fn resolve_target(
     state: &AppState,
     user_id: &str,
     target: &ResolveTarget,
+    doc_cache: &mut HashMap<String, ogrenotes_collab::document::OgreDoc>,
 ) -> Result<ResolveResult, ApiError> {
-    // Gate first. Forbidden and NotFound collapse to the same result;
-    // infrastructure errors still surface as 500 rather than masquerading
-    // as a missing document.
+    // Gate first, ALWAYS — this must run for every target before any cache
+    // lookup. A doc_cache hit must never let a later target in the batch
+    // skip its own access check just because an earlier target already
+    // loaded the same doc_id.
     let meta = match check_doc_access(
         state,
         &target.doc_id,
@@ -111,7 +119,11 @@ async fn resolve_target(
     let (block_found, snippet) = match &target.block_id {
         None => (false, None),
         Some(block_id) => {
-            let doc = load_current_doc_state(state, &target.doc_id).await?;
+            if !doc_cache.contains_key(&target.doc_id) {
+                let doc = load_current_doc_state(state, &target.doc_id).await?;
+                doc_cache.insert(target.doc_id.clone(), doc);
+            }
+            let doc = doc_cache.get(&target.doc_id).expect("just inserted above");
             match ogrenotes_collab::diff::block_plain_text(doc.inner(), block_id, SNIPPET_MAX_CHARS)
             {
                 Some(text) => (true, Some(text)),
