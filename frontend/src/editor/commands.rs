@@ -869,17 +869,27 @@ pub fn insert_user_mention(
 /// itself to route through `apply_and_notify` — see that file's mention
 /// paste resolve effect.
 ///
-/// The returned transaction carries `meta("history", "merge")` so
-/// `HistoryPlugin` folds it into the SAME undo entry as the original
-/// paste-the-URL transaction: one undo removes the mention and restores
-/// the raw URL, matching the paste's single edit from the user's
-/// perspective.
+/// The returned transaction carries `meta("history", "merge")` PLUS
+/// `meta("history-merge-tag", tag)` so `HistoryPlugin` folds it into the
+/// SAME undo entry as the original paste-the-URL transaction — but ONLY
+/// if that entry is still on top and still carries the matching tag
+/// (Task 3 review fix: an unrelated edit landing on top between the paste
+/// and this async-resolved replace must NOT be corrupted by a merge into
+/// the wrong entry — see `HistoryPlugin::record`'s merge path). `tag`
+/// must be the SAME id the caller passed to `HistoryPlugin::tag_last_entry`
+/// right after dispatching the original paste transaction.
+///
+/// When the merge succeeds, one undo removes the mention and restores the
+/// raw URL, matching the paste's single edit from the user's perspective.
+/// When the tag is stale (some other entry now sits on top), `record`
+/// degrades safely to a separate undo entry instead.
 pub fn replace_text_with_doc_mention(
     state: &EditorState,
     from: usize,
     to: usize,
     expected_text: &str,
     attrs: std::collections::HashMap<String, String>,
+    tag: u64,
 ) -> Option<Transaction> {
     if text_between_positions(&state.doc, from, to) != expected_text {
         return None;
@@ -895,7 +905,9 @@ pub fn replace_text_with_doc_mention(
         0,
     );
     let mut txn = state.transaction().replace(from, to, slice).ok()?;
-    txn = txn.set_meta("history", "merge");
+    txn = txn
+        .set_meta("history", "merge")
+        .set_meta("history-merge-tag", &tag.to_string());
     txn.selection = Selection::cursor(from + 1);
     Some(txn)
 }
@@ -4555,8 +4567,11 @@ mod tests {
         attrs.insert("url".to_string(), url.to_string());
         attrs.insert("title".to_string(), "Target Doc".to_string());
 
-        let txn = replace_text_with_doc_mention(&state, from, to, url, attrs).unwrap();
+        let txn = replace_text_with_doc_mention(&state, from, to, url, attrs, 99).unwrap();
         assert_eq!(txn.meta.get("history").map(String::as_str), Some("merge"));
+        // Task 3 review fix: the merge tag rides along so HistoryPlugin
+        // can prove it's folding into the SAME entry the paste tagged.
+        assert_eq!(txn.meta.get("history-merge-tag").map(String::as_str), Some("99"));
 
         let new_state = state.apply(txn);
         let para = new_state.doc.child(0).unwrap();
@@ -4579,7 +4594,7 @@ mod tests {
         let state = EditorState::create_default(url_doc(url));
         let from = 1;
         let to = from + url.chars().count();
-        assert!(replace_text_with_doc_mention(&state, from, to, "not the url anymore", HashMap::new())
+        assert!(replace_text_with_doc_mention(&state, from, to, "not the url anymore", HashMap::new(), 1)
             .is_none());
     }
 
@@ -4587,7 +4602,7 @@ mod tests {
     fn replace_text_with_doc_mention_aborts_on_out_of_range_positions() {
         let url = "https://notes.example/d/abc123";
         let state = EditorState::create_default(url_doc(url));
-        assert!(replace_text_with_doc_mention(&state, 0, 1000, url, HashMap::new()).is_none());
+        assert!(replace_text_with_doc_mention(&state, 0, 1000, url, HashMap::new(), 1).is_none());
     }
 
     #[test]

@@ -46,6 +46,12 @@ pub struct HistoryPlugin {
 struct UndoEntry {
     /// The steps to undo this entry (inverted steps).
     steps: Vec<Step>,
+    /// Mentions spec §5 (Task 3 fix): an optional caller-assigned tag,
+    /// set via `tag_last_entry` right after the entry is recorded. A
+    /// later `history=merge` transaction may only fold into THIS entry
+    /// if its `history-merge-tag` meta matches — see `record`'s merge
+    /// path. `None` for every entry recorded the normal way.
+    tag: Option<u64>,
 }
 
 impl HistoryPlugin {
@@ -66,6 +72,18 @@ impl HistoryPlugin {
             max_depth,
             new_group_delay: new_group_delay_ms,
             ..Self::new()
+        }
+    }
+
+    /// Mentions spec §5 (Task 3 fix): tag the CURRENT top of the undo
+    /// stack. No-op if the stack is empty. Called right after dispatching
+    /// the plain-URL paste, so a later async-resolved `history=merge`
+    /// transaction can prove it's still folding into that SAME entry
+    /// (not whatever unrelated edit happens to be on top by the time the
+    /// resolve returns) before `record` allows the merge.
+    pub fn tag_last_entry(&mut self, tag: u64) {
+        if let Some(last) = self.undo_stack.last_mut() {
+            last.tag = Some(tag);
         }
     }
 
@@ -134,18 +152,41 @@ impl HistoryPlugin {
         }
         inverted.reverse(); // Undo steps must be applied in reverse order
 
-        // Decide whether to group with the previous entry. A "merge"
-        // transaction (mentions spec §5: paste-then-async-convert must be
-        // ONE undo) groups with the previous entry regardless of elapsed
-        // time — and regardless of whether `last_change_time` was ever
-        // set — as long as there IS a previous entry to group into.
+        // Decide whether to group with the previous entry.
+        //
+        // A "merge" transaction (mentions spec §5: paste-then-async-convert
+        // must be ONE undo) groups with the previous entry ONLY IF that
+        // entry is still tagged with the SAME id the transaction carries in
+        // its `history-merge-tag` meta (Task 3 review fix: the async
+        // resolve can return after an unrelated edit has landed on top of
+        // the paste's entry — merging unconditionally into whatever is on
+        // top would fold the mention-replace into that unrelated edit,
+        // corrupting it on undo). No tag match — including a `merge`
+        // transaction that carries no tag at all, or a stack whose top
+        // entry was never tagged — falls through to pushing a normal,
+        // separate entry: a safe two-undo degradation instead of a
+        // coordinate-unsafe merge into the wrong place.
+        //
+        // A plain time-grouped merge (ordinary consecutive keystrokes, no
+        // `history=merge` meta) is unaffected by tagging: it always groups
+        // into the top entry, same as before.
         let now = current_time_ms();
         let force_merge = transaction.meta.get("history") == Some(&"merge".to_string());
+        let merge_tag: Option<u64> = transaction
+            .meta
+            .get("history-merge-tag")
+            .and_then(|s| s.parse().ok());
+        let top_tag_matches = merge_tag.is_some()
+            && self.undo_stack.last().and_then(|e| e.tag) == merge_tag;
         let time_grouped = self
             .last_change_time
             .map(|t| now - t < self.new_group_delay)
             .unwrap_or(false);
-        let should_group = (force_merge || time_grouped) && !self.undo_stack.is_empty();
+        let should_group = if force_merge {
+            top_tag_matches && !self.undo_stack.is_empty()
+        } else {
+            time_grouped && !self.undo_stack.is_empty()
+        };
 
         if should_group {
             // Merge with the last undo entry.
@@ -154,10 +195,14 @@ impl HistoryPlugin {
                 let mut merged = inverted;
                 merged.extend(last.steps.drain(..));
                 last.steps = merged;
+                // The tag has done its job; clear it so a stray duplicate
+                // merge meta later in the same session can't accidentally
+                // re-match this entry.
+                last.tag = None;
             }
         } else {
             // New undo entry
-            self.undo_stack.push(UndoEntry { steps: inverted });
+            self.undo_stack.push(UndoEntry { steps: inverted, tag: None });
 
             // Enforce max depth
             if self.undo_stack.len() > self.max_depth {
@@ -200,7 +245,7 @@ impl HistoryPlugin {
             }
         }
         redo_steps.reverse();
-        self.redo_stack.push(UndoEntry { steps: redo_steps });
+        self.redo_stack.push(UndoEntry { steps: redo_steps, tag: None });
 
         Some(txn)
     }
@@ -233,7 +278,7 @@ impl HistoryPlugin {
             }
         }
         undo_steps.reverse();
-        self.undo_stack.push(UndoEntry { steps: undo_steps });
+        self.undo_stack.push(UndoEntry { steps: undo_steps, tag: None });
 
         Some(txn)
     }
@@ -444,6 +489,15 @@ mod tests {
         // merge meta, two back-to-back records here would NOT group
         // (0.0 - 0.0 < 0.0 is false). The merge meta must force grouping
         // anyway.
+        //
+        // Task 3 review fix: merging now additionally requires the top
+        // entry to carry a matching `history-merge-tag` (set here via
+        // `tag_last_entry`, mirroring what the paste flow does right
+        // after dispatching the URL-insert) — an untagged merge (or a
+        // mismatched tag) is no longer enough on its own. This test still
+        // covers the "no elapsed-time requirement" contract; the untagged
+        // case is covered separately by `merge_with_stale_tag_pushes_
+        // separate_entry`.
         let state = EditorState::create_default(simple_doc());
         let mut history = HistoryPlugin::with_options(100, 0.0);
 
@@ -451,9 +505,12 @@ mod tests {
         let state_a = state.apply(txn_a.clone());
         history.record(&txn_a, &state.doc);
         assert_eq!(history.undo_stack.len(), 1);
+        history.tag_last_entry(7);
 
         let txn_b = state_a.transaction().insert_text("B").unwrap();
-        let txn_b = txn_b.set_meta("history", "merge");
+        let txn_b = txn_b
+            .set_meta("history", "merge")
+            .set_meta("history-merge-tag", "7");
         let state_b = state_a.apply(txn_b.clone());
         history.record(&txn_b, &state_a.doc);
 
@@ -472,21 +529,112 @@ mod tests {
         // Edge case named explicitly by the contract: force_merge must
         // group with a non-empty undo_stack even if last_change_time was
         // never set (e.g. history state constructed/seeded some other
-        // way than through record()).
+        // way than through record()) -- as long as the seeded top entry
+        // carries the matching tag (Task 3 review fix).
         let state = EditorState::create_default(simple_doc());
         let mut history = HistoryPlugin::new();
-        history.undo_stack.push(UndoEntry { steps: Vec::new() });
+        history.undo_stack.push(UndoEntry { steps: Vec::new(), tag: Some(1) });
         assert!(history.last_change_time.is_none());
 
         let txn = state
             .transaction()
             .insert_text("X")
             .unwrap()
-            .set_meta("history", "merge");
+            .set_meta("history", "merge")
+            .set_meta("history-merge-tag", "1");
         history.record(&txn, &state.doc);
 
         // Merged into the seeded entry, not pushed as a second one.
         assert_eq!(history.undo_stack.len(), 1);
+    }
+
+    #[test]
+    fn merge_with_matching_tag_folds_into_tagged_top() {
+        // The happy path this fix preserves: paste entry gets tagged right
+        // after dispatch, the async-resolved replace carries the SAME tag,
+        // record() folds it into that entry -- one undo reverts both.
+        let state = EditorState::create_default(simple_doc());
+        let mut history = HistoryPlugin::with_options(100, 0.0);
+
+        let txn_a = state.transaction().insert_text("A").unwrap();
+        let state_a = state.apply(txn_a.clone());
+        history.record(&txn_a, &state.doc);
+        history.tag_last_entry(42);
+        assert_eq!(history.undo_stack.len(), 1);
+
+        let txn_b = state_a.transaction().insert_text("B").unwrap();
+        let txn_b = txn_b
+            .set_meta("history", "merge")
+            .set_meta("history-merge-tag", "42");
+        let state_b = state_a.apply(txn_b.clone());
+        history.record(&txn_b, &state_a.doc);
+
+        // Still one entry -- merged, not pushed separately.
+        assert_eq!(history.undo_stack.len(), 1);
+
+        // One undo reverts both insertions, back to the pre-paste doc.
+        let undo_txn = history.undo(&state_b).unwrap();
+        let restored = state_b.apply(undo_txn);
+        assert_eq!(restored.doc, state.doc);
+        assert!(!history.can_undo());
+    }
+
+    #[test]
+    fn merge_with_stale_tag_pushes_separate_entry() {
+        // The bug this fix closes: the paste's undo entry is tagged, but
+        // an UNRELATED edit lands on top of it before the async
+        // mention-resolve returns (its merge txn still carries the
+        // ORIGINAL, now-stale tag). The stack top is the unrelated edit,
+        // untagged -- no match, so record() must push a separate entry
+        // rather than folding the mention-replace into the unrelated
+        // edit's inverted steps.
+        let state = EditorState::create_default(simple_doc());
+        let mut history = HistoryPlugin::with_options(100, 0.0);
+
+        // Paste entry, tagged 42.
+        let txn_a = state.transaction().insert_text("A").unwrap();
+        let state_a = state.apply(txn_a.clone());
+        history.record(&txn_a, &state.doc);
+        history.tag_last_entry(42);
+        assert_eq!(history.undo_stack.len(), 1);
+
+        // An unrelated edit is recorded on top -- normal path, no merge
+        // meta, so it becomes its own (untagged) entry.
+        let txn_unrelated = state_a.transaction().insert_text("U").unwrap();
+        let state_u = state_a.apply(txn_unrelated.clone());
+        history.record(&txn_unrelated, &state_a.doc);
+        assert_eq!(history.undo_stack.len(), 2);
+
+        // The mention-replace resolve arrives late, still tagged 42 --
+        // stale relative to the current top.
+        let txn_b = state_u.transaction().insert_text("B").unwrap();
+        let txn_b = txn_b
+            .set_meta("history", "merge")
+            .set_meta("history-merge-tag", "42");
+        let state_b = state_u.apply(txn_b.clone());
+        history.record(&txn_b, &state_u.doc);
+
+        // Pushed as its OWN entry -- three entries now, not folded into
+        // entry #2 (the unrelated edit).
+        assert_eq!(history.undo_stack.len(), 3);
+
+        // Undo #1 reverts ONLY the mention-replace, restoring exactly the
+        // state the unrelated edit left behind.
+        let u1 = history.undo(&state_b).unwrap();
+        let after_u1 = state_b.apply(u1);
+        assert_eq!(after_u1.doc, state_u.doc);
+
+        // Undo #2 reverts ONLY the unrelated edit -- untouched by the
+        // mention merge, restoring exactly the post-paste state.
+        let u2 = history.undo(&after_u1).unwrap();
+        let after_u2 = after_u1.apply(u2);
+        assert_eq!(after_u2.doc, state_a.doc);
+
+        // Undo #3 reverts the original paste, back to the pristine doc.
+        let u3 = history.undo(&after_u2).unwrap();
+        let after_u3 = after_u2.apply(u3);
+        assert_eq!(after_u3.doc, state.doc);
+        assert!(!history.can_undo());
     }
 
     #[test]
