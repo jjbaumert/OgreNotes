@@ -8,6 +8,7 @@ mod commands;
 mod components;
 pub mod editor;
 mod inserts;
+mod nav_bridge;
 // `i18n` now lives in `lib.rs` so editor/*.rs and other lib
 // modules can call translate() without going through a shim.
 // The binary re-imports both the module and the `t!` macro

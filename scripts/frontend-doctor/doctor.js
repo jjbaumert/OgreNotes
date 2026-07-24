@@ -6164,6 +6164,401 @@ async function scenarioMenuExportDownloads(ctx, collector) {
   }
 }
 
+// ─── block-links scenario ───────────────────────────────────────
+//
+// Promoted from the ad-hoc probe-block-links.mjs. Exercises block deep
+// links end to end:
+//   - producer: right-click a block → "Copy Link to Block" copies
+//     `<baseUrl>/d/<docId>[/<slug>]#b=<blockId>` to the clipboard.
+//   - consumer: navigating to a valid `#b=` fragment scrolls to and
+//     flashes the target block, with no toast.
+//   - malformed/foreign hashes (`#appearance`, `#b=`, `#b=abc def`) are
+//     inert — no scroll flash, no toast, no console errors.
+//   - navigating to an unknown/deleted block id shows a top toast
+//     ("no longer exists") that auto-dismisses.
+async function scenarioBlockLinks(ctx, collector) {
+  const { baseUrlA, baseUrl, emailA, outDir } = ctx;
+  const target = baseUrlA || baseUrl;
+
+  const tokens = await devLogin(
+    target,
+    emailA || `doctor-blocklinks-${Date.now()}@ogrenotes.example.com`
+  );
+  logJson({ at: "dev-login", userId: tokens.userId });
+
+  const doc = await createDocViaApi(
+    target,
+    tokens.accessToken,
+    `doctor-blocklinks-${Date.now()}`,
+    "document"
+  );
+  logJson({ at: "doc-created", docId: doc.id });
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    ...DOCTOR_CONTEXT_DEFAULTS,
+    recordHar: { path: join(outDir, "tab-a.har"), mode: "full" },
+    permissions: ["clipboard-read", "clipboard-write"],
+  });
+  await seedAuth(context, tokens);
+
+  const page = await context.newPage();
+  instrument(context, page, "tab-a", collector);
+
+  const waitFor = async (pred, ms = 6000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (await pred().catch(() => false)) return true;
+      await page.waitForTimeout(150);
+    }
+    return false;
+  };
+
+  const steps = {};
+  try {
+    await page.goto(`${target}/d/${doc.id}`, {
+      waitUntil: "domcontentloaded",
+      timeout: 30000,
+    });
+    await page.waitForSelector(".editor-content[data-editor-ready]", { timeout: 20000 });
+    await page.waitForTimeout(1200); // first-keystroke flake: settle
+    await page.locator(".editor-content").click();
+    await page.keyboard.type("First paragraph for block links");
+    await page.keyboard.press("Enter");
+    await page.keyboard.type("Second paragraph is the target");
+    await waitFor(async () => (await page.locator(".editor-content [data-block-id]").count()) >= 2);
+
+    const blocks = page.locator(".editor-content [data-block-id]");
+    const nBlocks = await blocks.count();
+    steps.blocksHaveIds = nBlocks >= 2;
+    const targetBlock = blocks.nth(nBlocks - 1);
+    const blockId = await targetBlock.getAttribute("data-block-id");
+    steps.targetBlockId = !!blockId;
+
+    // ── producer: right-click → Copy Link to Block ──
+    await targetBlock.click(); // caret into the target block
+    await targetBlock.click({ button: "right" });
+    const menuItem = page.locator(".ui-menu-item", { hasText: "Copy Link to Block" });
+    steps.menuItemVisible = await menuItem.waitFor({ timeout: 5000 }).then(() => true).catch(() => false);
+    await menuItem.click();
+    await page.waitForTimeout(300);
+    let clip = null;
+    try {
+      clip = await page.evaluate(() => navigator.clipboard.readText());
+    } catch (e) {
+      collector.stepError = `clipboard read blocked: ${e.message}`;
+    }
+    // The page pathname may carry the /d/:id/:slug variant — the fragment
+    // composes with it, so accept both forms.
+    const blockUrlRe = new RegExp(`^${target}/d/${doc.id}(/[^#]*)?#b=${blockId}$`);
+    steps.clipboardUrlCorrect = clip !== null && blockUrlRe.test(clip);
+
+    // ── consumer: navigate to the (actual copied, when readable) block
+    // URL, expect scroll + flash, no toast ──
+    await page.goto(clip ?? `${target}/d/${doc.id}#b=${blockId}`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".editor-content[data-editor-ready]", { timeout: 20000 });
+    steps.validFragmentFlash = await page
+      .waitForSelector(`[data-block-id="${blockId}"].block-link-flash`, { timeout: 6000 })
+      .then(() => true).catch(() => false);
+    steps.validFragmentNoToast = (await page.locator(".collab-liveapp-toast").count()) === 0;
+    await page.screenshot({ path: join(outDir, "1-valid-fragment.png") }).catch(() => {});
+
+    // ── malformed / foreign hashes: no scroll, no toast, no errors ──
+    const foreignHashes = [
+      { key: "foreignHashInertAppearance", frag: "#appearance" },
+      { key: "foreignHashInertEmptyB", frag: "#b=" },
+      { key: "foreignHashInertMalformedB", frag: "#b=abc def" },
+    ];
+    for (const { key, frag } of foreignHashes) {
+      await page.goto(`${target}/d/${doc.id}${encodeURI(frag)}`, { waitUntil: "domcontentloaded" });
+      await page.waitForSelector(".editor-content[data-editor-ready]", { timeout: 20000 });
+      // Settle-poll: confirm the inert state holds steady rather than a
+      // fixed sleep — assert it stays true across the whole window.
+      let inert = true;
+      const end = Date.now() + 1500;
+      while (Date.now() < end) {
+        const toast = await page.locator(".collab-liveapp-toast").count();
+        const flash = await page.locator(".block-link-flash").count();
+        if (toast !== 0 || flash !== 0) { inert = false; break; }
+        await page.waitForTimeout(150);
+      }
+      steps[key] = inert;
+    }
+    await page.screenshot({ path: join(outDir, "2-foreign-hash.png") }).catch(() => {});
+
+    // ── deleted/unknown block: toast appears, stays at top, auto-dismisses ──
+    await page.goto(`${target}/d/${doc.id}#b=zzzz_gone_${Date.now() % 100000}`, {
+      waitUntil: "domcontentloaded",
+    });
+    await page.waitForSelector(".editor-content[data-editor-ready]", { timeout: 20000 });
+    const toastEl = page.locator(".collab-liveapp-toast");
+    steps.missingBlockToastShown = await toastEl.first().waitFor({ timeout: 6000 })
+      .then(() => true).catch(() => false);
+    if (steps.missingBlockToastShown) {
+      const text = await toastEl.first().textContent();
+      steps.missingBlockToastText = /no longer exists/i.test(text ?? "");
+      await page.screenshot({ path: join(outDir, "3-missing-block-toast.png") }).catch(() => {});
+      steps.missingBlockToastAutodismiss = await toastEl.first()
+        .waitFor({ state: "detached", timeout: 8000 })
+        .then(() => true).catch(() => false);
+    }
+  } catch (e) {
+    collector.stepError = `${e.message}`;
+  }
+
+  const tab = collector["tab-a"] || { errors: [], console: [] };
+  const consoleErrors = (tab.console || []).filter((m) => m.type === "error");
+  steps.noConsoleErrors = consoleErrors.length === 0;
+
+  collector.scenario = {
+    name: collector.scenario?.name || "block-links",
+    steps,
+  };
+
+  await page.screenshot({ path: join(outDir, "tab-a.png"), fullPage: false }).catch(() => {});
+  await context.close();
+  await browser.close();
+}
+
+// ─── doc-mentions scenario ───────────────────────────────────────
+//
+// Promoted from the ad-hoc probe-doc-mentions.mjs. Exercises the
+// DocMention paste matrix and chip element behavior:
+//   - paste a bare doc URL / anchor URL / dangling-block URL / stranger's
+//     inaccessible doc URL / a URL embedded mid-sentence, and assert each
+//     converts (or doesn't) correctly.
+//   - a single Ctrl+Z after a doc-URL paste fully restores the raw URL
+//     text (one undo step, not two).
+//   - reload triggers the overlay resolve pass: dangling anchors and
+//     missing (trashed) docs get their degraded class + label.
+//   - chip context menu (Copy Original URL / Convert to Plain Link) is
+//     present on chips, absent on plain text.
+//   - clicking a live doc chip SPA-navigates to the target doc (URL
+//     changes; polled, since it need not be a full reload).
+//   - clicking a missing chip is inert (no navigation).
+//   - Convert to Plain Link removes the chip and leaves plain link text.
+async function scenarioDocMentions(ctx, collector) {
+  const { baseUrlA, baseUrl, emailA, emailB, outDir } = ctx;
+  const target = baseUrlA || baseUrl;
+  const stamp = Date.now();
+
+  // Stranger's private doc first, then the verifying user (A) — mirrors
+  // the probe's login order, though seedAuth (unlike a shared
+  // context.request cookie jar) only ever seeds A's cookies into the
+  // browser context below, so the order isn't load-bearing here.
+  const tokensB = await devLogin(target, emailB || `doctor-mentions-stranger-${stamp}@ogrenotes.example.com`);
+  const bDoc = await createDocViaApi(target, tokensB.accessToken, "B Private");
+
+  const tokensA = await devLogin(target, emailA || `doctor-mentions-verifier-${stamp}@ogrenotes.example.com`);
+  const t1 = await createDocViaApi(target, tokensA.accessToken, "Target One");
+  const t2 = await createDocViaApi(target, tokensA.accessToken, "Target Two");
+  const host = await createDocViaApi(target, tokensA.accessToken, "Host Doc");
+  logJson({ at: "docs-created", t1: t1.id, t2: t2.id, host: host.id, bDoc: bDoc.id });
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    ...DOCTOR_CONTEXT_DEFAULTS,
+    recordHar: { path: join(outDir, "tab-a.har"), mode: "full" },
+    permissions: ["clipboard-read", "clipboard-write"],
+  });
+  await seedAuth(context, tokensA);
+
+  const page = await context.newPage();
+  instrument(context, page, "tab-a", collector);
+
+  const ready = async () => {
+    await page.waitForSelector(".editor-content[data-editor-ready]", { timeout: 20000 });
+    await page.waitForTimeout(1200);
+  };
+  const waitFor = async (pred, ms = 8000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (await pred().catch(() => false)) return true;
+      await page.waitForTimeout(150);
+    }
+    return false;
+  };
+  async function pasteText(text) {
+    await page.evaluate((t) => navigator.clipboard.writeText(t), text);
+    await page.locator(".editor-content").click();
+    await page.keyboard.press("Control+End");
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("Control+v");
+  }
+
+  const steps = {};
+  try {
+    // ── Prep: real block in Target One, capture its blockId ──
+    await page.goto(`${target}/d/${t1.id}`, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await ready();
+    await page.locator(".editor-content").click();
+    await page.keyboard.type("Anchor target paragraph with snippet text");
+    await page.waitForTimeout(1000); // let WS persistence flush
+    const t1BlockId = await page
+      .locator(".editor-content [data-block-id]").last().getAttribute("data-block-id");
+    steps.t1BlockId = !!t1BlockId;
+
+    await page.goto(`${target}/d/${host.id}`, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await ready();
+
+    // ── Cell 1: doc-only URL → chip, then SINGLE undo restores raw URL ──
+    await pasteText(`${target}/d/${t1.id}`);
+    const chip1 = page.locator(`span.doc-mention[data-doc-id="${t1.id}"]`).first();
+    steps.pasteDocUrlConverts = await chip1.waitFor({ timeout: 8000 }).then(() => true).catch(() => false);
+    if (steps.pasteDocUrlConverts) {
+      const text1 = await chip1.textContent();
+      // The app auto-derives doc titles from the first line, so T1's live
+      // title is its typed paragraph, not "Target One". Assert: doc glyph
+      // + the label is the live title (not the raw URL).
+      steps.docChipGlyphTitle = (text1 ?? "").includes("📄") && !(text1 ?? "").includes("/d/");
+
+      await page.keyboard.press("Control+z");
+      const undone = await waitFor(async () =>
+        (await page.locator(`span.doc-mention[data-doc-id="${t1.id}"]`).count()) === 0
+        && (await page.locator(".editor-content").textContent() ?? "").includes(`/d/${t1.id}`)
+      );
+      steps.singleUndoRestoresUrl = undone;
+      // Re-paste fresh (no redo-keybinding dependency) so later cells have
+      // the doc chip.
+      await pasteText(`${target}/d/${t1.id}`);
+      await page.locator(`span.doc-mention[data-doc-id="${t1.id}"]`).first()
+        .waitFor({ timeout: 8000 }).catch(() => {});
+    }
+
+    // ── Cell 2: anchor URL → chip with target + snippet ──
+    await pasteText(`${target}/d/${t1.id}#b=${t1BlockId}`);
+    const chip2 = page.locator(`span.doc-mention[data-block-id-target="${t1BlockId}"]`).first();
+    steps.pasteAnchorUrlConverts = await chip2.waitFor({ timeout: 8000 }).then(() => true).catch(() => false);
+    if (steps.pasteAnchorUrlConverts) {
+      const text2 = await chip2.textContent();
+      steps.anchorChipGlyphSnippet = (text2 ?? "").includes("⚓") && (text2 ?? "").includes("Anchor target");
+    }
+
+    // ── Cell 3: dangling fragment → chip keeps target ──
+    await pasteText(`${target}/d/${t1.id}#b=zzzz_gone_blk`);
+    const chip3 = page.locator('span.doc-mention[data-block-id-target="zzzz_gone_blk"]').first();
+    steps.pasteDanglingConverts = await chip3.waitFor({ timeout: 8000 }).then(() => true).catch(() => false);
+
+    // ── Cell 4: inaccessible doc URL → stays plain text ──
+    await pasteText(`${target}/d/${bDoc.id}`);
+    await page.waitForTimeout(2500); // give a wrong conversion time to (not) happen
+    steps.noAccessStaysPlain = (await page.locator(`span.doc-mention[data-doc-id="${bDoc.id}"]`).count()) === 0;
+
+    // ── Cell 5: URL-in-sentence → untouched ──
+    const before5 = await page.locator("span.doc-mention").count();
+    await pasteText(`see ${target}/d/${t1.id} please`);
+    await page.waitForTimeout(2000);
+    steps.urlInSentenceUntouched = (await page.locator("span.doc-mention").count()) === before5;
+
+    // ── Cell for T2 (used by missing-state later) ──
+    await pasteText(`${target}/d/${t2.id}`);
+    await page.locator(`span.doc-mention[data-doc-id="${t2.id}"]`).first()
+      .waitFor({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1500); // let attrs/persistence settle
+
+    // ── Reload: overlay resolve pass → dangling gets class + glyph ──
+    await page.goto(`${target}/d/${host.id}`, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await ready();
+    await page.waitForTimeout(1500); // resolve round-trip
+    const dangling = page.locator('span.doc-mention[data-block-id-target="zzzz_gone_blk"]').first();
+    const danglingClass = await dangling.getAttribute("class").catch(() => null);
+    steps.danglingClassApplied = (danglingClass ?? "").includes("doc-mention-dangling");
+    const danglingText = await dangling.textContent().catch(() => "");
+    steps.danglingDocGlyph = (danglingText ?? "").includes("📄");
+    await page.screenshot({ path: join(outDir, "1-chips.png") }).catch(() => {});
+
+    // ── Context menu: Copy Original URL + Convert to Plain Link ──
+    const chipT1 = page.locator(`span.doc-mention[data-doc-id="${t1.id}"]`).first();
+    await chipT1.click({ button: "right" });
+    const copyItem = page.locator(".ui-menu-item", { hasText: "Copy Original URL" });
+    const convItem = page.locator(".ui-menu-item", { hasText: "Convert to Plain Link" });
+    steps.ctxEntriesVisible =
+      await copyItem.waitFor({ timeout: 4000 }).then(() => true).catch(() => false)
+      && (await convItem.count()) > 0;
+    await copyItem.click();
+    await page.waitForTimeout(300);
+    let clip = null;
+    try { clip = await page.evaluate(() => navigator.clipboard.readText()); } catch {}
+    steps.ctxCopyOriginalUrl = clip !== null && clip.includes(`/d/${t1.id}`);
+    // Entries absent on plain text right-click:
+    await page.locator(".editor-content").click({ button: "right", position: { x: 40, y: 10 } });
+    await page.waitForTimeout(400);
+    steps.ctxAbsentOnPlainText =
+      (await page.locator(".ui-menu-item", { hasText: "Copy Original URL" }).count()) === 0;
+    await page.keyboard.press("Escape");
+
+    // ── Click-nav: chip click navigates to reconstructed /d/<id> (SPA
+    // navigation — URL still changes, poll instead of waiting for load) ──
+    await chipT1.click();
+    steps.chipClickNavigates = await waitFor(async () => page.url().includes(`/d/${t1.id}`), 6000);
+
+    // ── Missing state: trash T2, reload host → grayed missing chip,
+    // click inert ──
+    const del = await fetch(`${target}/api/v1/documents/${t2.id}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${tokensA.accessToken}` },
+    });
+    steps.t2Trashed = del.ok;
+    await page.goto(`${target}/d/${host.id}`, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await ready();
+    await page.waitForTimeout(1500);
+    const missing = page.locator(`span.doc-mention[data-doc-id="${t2.id}"]`).first();
+    const missingClass = await missing.getAttribute("class").catch(() => null);
+    steps.missingClassApplied = (missingClass ?? "").includes("doc-mention-missing");
+    const missingText = await missing.textContent().catch(() => "");
+    steps.missingLabel = /missing document/i.test(missingText ?? "");
+    const urlBefore = page.url();
+    await missing.click().catch(() => {});
+    await page.waitForTimeout(800);
+    steps.missingClickInert = page.url() === urlBefore;
+    await page.screenshot({ path: join(outDir, "2-missing.png") }).catch(() => {});
+
+    // ── Convert to Plain Link (on the T1 chip) ──
+    await page.goto(`${target}/d/${host.id}`, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await ready();
+    const chipConv = page.locator(`span.doc-mention[data-doc-id="${t1.id}"]`).first();
+    // Read what this chip's title-derived link text will be (strip the glyph).
+    const convLabel = ((await chipConv.textContent()) ?? "").replace(/^[⚓📄]\s*/u, "");
+    const convNodeId = await chipConv.getAttribute("data-node-block-id");
+    await chipConv.click({ button: "right" });
+    const conv2 = page.locator(".ui-menu-item", { hasText: "Convert to Plain Link" });
+    if (await conv2.waitFor({ timeout: 4000 }).then(() => true).catch(() => false)) {
+      await conv2.click();
+      await page.waitForTimeout(600);
+      const chipStillThere =
+        (await page.locator(`span.doc-mention[data-node-block-id="${convNodeId}"]`).count()) > 0;
+      const editorText = (await page.locator(".editor-content").textContent()) ?? "";
+      // The converted text is the TITLE attr (may differ from a snippet
+      // label — recorded UX nit); accept either the chip label or the doc
+      // title.
+      const hasLinkText = editorText.includes("Target One") || (convLabel && editorText.includes(convLabel));
+      steps.convertToPlainLink = !chipStillThere && hasLinkText;
+    }
+    // Backspace-atom deletion: covered by the atom infrastructure's wasm
+    // tests (clicking a chip now navigates, so a click-then-Backspace
+    // probe cell is unreliable) — left to the human sweep if desired.
+    await page.screenshot({ path: join(outDir, "3-final.png") }).catch(() => {});
+  } catch (e) {
+    collector.stepError = `${e.message}`;
+  }
+
+  // Rapid page.goto navigation aborts in-flight requests (title saves,
+  // WASM streaming) — known benign scenario-pace noise, not product errors.
+  const tab = collector["tab-a"] || { errors: [], console: [] };
+  const realErrors = (tab.console || []).filter(
+    (m) => m.type === "error" && !/Failed to fetch|loading was aborted|compilation aborted/i.test(m.text || "")
+  );
+  steps.noConsoleErrors = realErrors.length === 0;
+
+  collector.scenario = {
+    name: collector.scenario?.name || "doc-mentions",
+    steps,
+  };
+
+  await context.close();
+  await browser.close();
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   const scenario = args.scenario || "collab-sync";
@@ -6190,7 +6585,7 @@ async function main() {
         "semantic-search|import-job-round-trip|" +
         "menu-export-downloads|pre-sync-edit-preserved|" +
         "sustained-type-reload|history-pane|delete-document|" +
-        "share-dialog|comment-popup] " +
+        "share-dialog|comment-popup|block-links|doc-mentions] " +
         "[--doc-id <docId>] [--email-a <addr>] [--email-b <addr>]"
     );
     process.exit(2);
@@ -6303,6 +6698,10 @@ async function main() {
       await scenarioShareDialog(ctx, collector);
     } else if (scenario === "comment-popup") {
       await scenarioCommentPopup(ctx, collector);
+    } else if (scenario === "block-links") {
+      await scenarioBlockLinks(ctx, collector);
+    } else if (scenario === "doc-mentions") {
+      await scenarioDocMentions(ctx, collector);
     } else {
       throw new Error(`unknown scenario: ${scenario}`);
     }
@@ -6758,6 +7157,24 @@ async function main() {
       "cSelectionInPre", "dTextContent", "dSinglePre",
       "eParagraphAfterPre", "eSelectionInParagraph",
       "eTextContentUnchanged", "noPageErrors", "noConsoleErrors",
+    ],
+    "block-links": [
+      "blocksHaveIds", "targetBlockId", "menuItemVisible",
+      "clipboardUrlCorrect", "validFragmentFlash", "validFragmentNoToast",
+      "foreignHashInertAppearance", "foreignHashInertEmptyB",
+      "foreignHashInertMalformedB", "missingBlockToastShown",
+      "missingBlockToastText", "missingBlockToastAutodismiss",
+      "noConsoleErrors",
+    ],
+    "doc-mentions": [
+      "t1BlockId", "pasteDocUrlConverts", "docChipGlyphTitle",
+      "singleUndoRestoresUrl", "pasteAnchorUrlConverts",
+      "anchorChipGlyphSnippet", "pasteDanglingConverts",
+      "noAccessStaysPlain", "urlInSentenceUntouched",
+      "danglingClassApplied", "danglingDocGlyph", "ctxEntriesVisible",
+      "ctxCopyOriginalUrl", "ctxAbsentOnPlainText", "chipClickNavigates",
+      "t2Trashed", "missingClassApplied", "missingLabel",
+      "missingClickInert", "convertToPlainLink", "noConsoleErrors",
     ],
   };
   if (ok && Object.prototype.hasOwnProperty.call(requiredSteps, scenario)) {

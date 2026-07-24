@@ -685,6 +685,34 @@ jobs:
             --base-url http://127.0.0.1:3000 \
             --out ../../artifacts/doctor/share-dialog
 
+      # Block deep links (#b= fragments): copy-link menu action, scroll +
+      # flash on a valid fragment, missing-block toast (shown + auto-
+      # dismissed), and foreign/malformed-hash inertness. Promoted from
+      # the ad-hoc probe-block-links.mjs.
+      - name: Run block-links scenario
+        id: block-links
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario block-links \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/block-links
+
+      # DocMention paste matrix (doc/anchor/dangling/no-access/in-sentence),
+      # single-undo restoring the raw URL, chip glyphs, context-menu
+      # actions, SPA click-nav, missing (trashed) state, and Convert to
+      # Plain Link. Promoted from the ad-hoc probe-doc-mentions.mjs.
+      - name: Run doc-mentions scenario
+        id: doc-mentions
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario doc-mentions \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/doc-mentions
+
       # ─── Teardown / artifacts ─────────────────────────────────
       - name: Stop axum server
         if: always()

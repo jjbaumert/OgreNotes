@@ -1107,15 +1107,27 @@ impl EditorView {
                         // always a same-origin relative path.
                         if let Some(doc_id) = el.get_attribute("data-doc-id") {
                             if super::mention_url::valid_id(&doc_id) {
-                                let href = match el.get_attribute("data-block-id-target") {
-                                    Some(target) if super::mention_url::valid_id(&target) => {
-                                        format!("/d/{doc_id}#b={target}")
-                                    }
-                                    _ => format!("/d/{doc_id}"),
-                                };
                                 event.prevent_default();
-                                if let Some(w) = web_sys::window() {
-                                    let _ = w.location().set_href(&href);
+                                match el.get_attribute("data-block-id-target") {
+                                    Some(target) if super::mention_url::valid_id(&target) => {
+                                        // Anchor mention: full reload via
+                                        // set_href — the document page's
+                                        // `#b=` consumption (scroll +
+                                        // flash) is proven on the load
+                                        // path; SPA-routing a fragment
+                                        // through leptos_router is not.
+                                        let href = format!("/d/{doc_id}#b={target}");
+                                        if let Some(w) = web_sys::window() {
+                                            let _ = w.location().set_href(&href);
+                                        }
+                                    }
+                                    _ => {
+                                        // Document mention: SPA navigation
+                                        // via the nav bridge (installed by
+                                        // AppShell; falls back to set_href
+                                        // when no router is mounted).
+                                        crate::nav_bridge::go(&format!("/d/{doc_id}"));
+                                    }
                                 }
                             }
                         }

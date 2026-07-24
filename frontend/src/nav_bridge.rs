@@ -2,7 +2,7 @@
 
 //! #152 — client-side navigation bridge for the command palette.
 //!
-//! Mirror of [`ask_bridge`](super::ask_bridge). Palette commands live in
+//! Mirror of `commands::ask_bridge`. Palette commands live in
 //! the registry from boot time (`register_defaults` runs before mount), so
 //! their action closures have no Router context and can't call
 //! `use_navigate()` themselves. `AppShell` — which is always mounted while

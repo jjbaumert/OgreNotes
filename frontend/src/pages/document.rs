@@ -186,9 +186,11 @@ fn block_id_selector(block_id: &str) -> String {
 /// foreign (e.g. settings-tab), or malformed hashes.
 fn block_id_from_hash(raw: &str) -> Option<String> {
     let id = raw.trim_start_matches('#').strip_prefix("b=")?;
-    if id.is_empty()
-        || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+    // Single charset authority: the same validator the mention URL parser
+    // and the chip click-nav use (`[A-Za-z0-9_-]+`, matching
+    // `generate_block_id`). Keeps producer/consumer coupled by code, not
+    // by convention.
+    if !crate::editor::mention_url::valid_id(id) {
         return None;
     }
     Some(id.to_string())
