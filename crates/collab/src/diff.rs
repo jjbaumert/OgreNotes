@@ -219,6 +219,41 @@ fn read_text_runs<T: ReadTxn>(txn: &T, text: &XmlTextRef) -> Vec<InlineRun> {
     out
 }
 
+/// Plain text of the block with the given `blockId` — the block's own
+/// inline runs followed by its children, depth-first — truncated to
+/// `max_chars` characters (char-boundary safe). `None` if no block in
+/// the document carries that id. Public: consumed by the mentions
+/// resolve endpoint (`crates/api`) for anchor-mention snippets.
+pub fn block_plain_text(doc: &Doc, block_id: &str, max_chars: usize) -> Option<String> {
+    fn find<'a>(blocks: &'a [RichBlock], id: &str) -> Option<&'a RichBlock> {
+        for b in blocks {
+            if b.block_id.as_deref() == Some(id) {
+                return Some(b);
+            }
+            if let Some(hit) = find(&b.children, id) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+    fn collect(b: &RichBlock, out: &mut String) {
+        for run in &b.inline {
+            out.push_str(&run.text);
+        }
+        for child in &b.children {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            collect(child, out);
+        }
+    }
+    let blocks = extract_blocks(doc);
+    let target = find(&blocks, block_id)?;
+    let mut text = String::new();
+    collect(target, &mut text);
+    Some(text.chars().take(max_chars).collect())
+}
+
 /// Translate yrs formatting attributes to canonical `Mark` enum values.
 /// Mirrors `frontend/src/editor/yrs_bridge.rs::attrs_to_marks`. Marks
 /// with payload (link / textColor / highlight) carry a JSON map in the
@@ -963,5 +998,70 @@ mod gap_tests {
         assert_eq!(diffs[0].block_id.as_deref(), Some("a"));
         assert_eq!(diffs[1].kind, DiffKind::Added);
         assert_eq!(diffs[1].block_id, None);
+    }
+}
+
+// ─── block_plain_text tests ──────────────────────────────────────────
+//
+// Own module (mirrors the `tests`/`gap_tests` split above) so its
+// `doc_with_blocks(&[(block_id, text)])` helper — id-first, tag
+// defaulted to "paragraph" — can share the name used informally in
+// the task brief without colliding with the tag-first
+// `doc_with_blocks(&[(tag, text, id)])` helper already defined in
+// `mod tests`.
+#[cfg(test)]
+mod block_plain_text_tests {
+    use super::*;
+    use yrs::{
+        types::xml::{Xml, XmlElementPrelim, XmlFragment, XmlTextPrelim},
+        Transact, WriteTxn,
+    };
+
+    /// Build a doc whose top-level children are unmarked `paragraph`
+    /// blocks, one per `(blockId, text)` pair. Same construction idiom
+    /// as the sibling test modules' doc builders (`Doc::new` →
+    /// `get_or_insert_xml_fragment("content")` → `XmlElementPrelim` +
+    /// `insert_attribute("blockId", ..)` + `XmlTextPrelim`).
+    fn doc_with_blocks(blocks: &[(&str, &str)]) -> Doc {
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let frag = txn.get_or_insert_xml_fragment("content");
+            for &(id, text) in blocks {
+                let pos = frag.len(&txn);
+                let el = frag.insert(&mut txn, pos, XmlElementPrelim::empty("paragraph"));
+                el.insert_attribute(&mut txn, "blockId", id);
+                el.insert(&mut txn, 0, XmlTextPrelim::new(text));
+            }
+        }
+        doc
+    }
+
+    #[test]
+    fn block_plain_text_finds_block_and_truncates() {
+        let doc = doc_with_blocks(&[
+            ("blk-alpha", "Hello mention world"),
+            ("blk-long", &"x".repeat(200)),
+        ]);
+        assert_eq!(
+            block_plain_text(&doc, "blk-alpha", 120).as_deref(),
+            Some("Hello mention world")
+        );
+        let long = block_plain_text(&doc, "blk-long", 120).unwrap();
+        assert_eq!(long.chars().count(), 120);
+    }
+
+    #[test]
+    fn block_plain_text_missing_id_is_none() {
+        let doc = doc_with_blocks(&[("blk-alpha", "Hello")]);
+        assert!(block_plain_text(&doc, "no-such-block", 120).is_none());
+    }
+
+    #[test]
+    fn block_plain_text_truncates_on_char_boundary() {
+        // Multibyte content must not panic or split a char.
+        let doc = doc_with_blocks(&[("blk-uni", &"é".repeat(200))]);
+        let s = block_plain_text(&doc, "blk-uni", 120).unwrap();
+        assert_eq!(s.chars().count(), 120);
     }
 }
