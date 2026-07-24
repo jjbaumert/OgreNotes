@@ -313,6 +313,18 @@ fn extract_text<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef) -> String {
     if el.tag().as_ref() == NodeType::Mention.tag_name() {
         return el.get_attribute(txn, "display").unwrap_or_default();
     }
+    // Fix 2 (parity) — a DocMention leaf carries its label in the
+    // `title` attribute (falling back to `url`) rather than a child
+    // text run, exactly mirroring the frontend `NodeType::DocMention`
+    // `text_content()` contract (added in commit ceb1040). Without
+    // this arm a mention-only doc is invisible to search indexing
+    // and the LLM prompt embed path.
+    if el.tag().as_ref() == NodeType::DocMention.tag_name() {
+        return el
+            .get_attribute(txn, "title")
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| el.get_attribute(txn, "url").unwrap_or_default());
+    }
     let mut text = String::new();
     let len = el.len(txn);
     for i in 0..len {
@@ -1205,17 +1217,25 @@ fn render_node_markdown<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String, de
                     // DocMention — a live doc/anchor link. Renders
                     // as a standard Markdown link; title falls back
                     // to the url when absent so the label is never
-                    // empty, matching the Embed arm's fallback.
+                    // empty, matching the Embed arm's fallback. #7:
+                    // scheme-gated via is_safe_url like the Image/
+                    // Embed/link-mark arms — an unsafe url still
+                    // shows the mention's title text, just without
+                    // the `[…](…)` link wrapper.
                     let url = el.get_attribute(txn, "url").unwrap_or_default();
                     let title = el
                         .get_attribute(txn, "title")
                         .filter(|t| !t.is_empty())
                         .unwrap_or_else(|| url.clone());
-                    out.push_str(&format!(
-                        "[{}]({})",
-                        escape_md_link_text(&title),
-                        escape_md_url(&url)
-                    ));
+                    if is_safe_url(&url) {
+                        out.push_str(&format!(
+                            "[{}]({})",
+                            escape_md_link_text(&title),
+                            escape_md_url(&url)
+                        ));
+                    } else {
+                        out.push_str(&escape_md_link_text(&title));
+                    }
                 }
                 _ => {
                     render_children_markdown(txn, el, out, depth);
@@ -1530,7 +1550,13 @@ fn render_html_attrs<T: ReadTxn>(
                     html_escape_attr(&block_id),
                 ));
             }
-            if let Some(url) = el.get_attribute(txn, "url") {
+            // #7: scheme-gated via is_safe_url like every other
+            // exported href/src (link marks, Image, Embed) — a
+            // `javascript:` (or otherwise unsafe) url is dropped
+            // entirely rather than emitted. The `<a>` element and
+            // title text still render (see the fallback body arm
+            // above); it's just not a clickable link.
+            if let Some(url) = el.get_attribute(txn, "url").filter(|u| is_safe_url(u)) {
                 attrs.push_str(&format!(" href=\"{}\"", html_escape_attr(&url)));
             }
         }
@@ -2006,6 +2032,24 @@ mod tests {
     }
 
     #[test]
+    fn doc_mention_javascript_url_stripped_from_html() {
+        let doc = doc_with(|txn, frag| {
+            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            dm.insert_attribute(txn, "url", "javascript:alert(1)");
+            dm.insert_attribute(txn, "doc_id", "abc123");
+            dm.insert_attribute(txn, "title", "Target Doc");
+        });
+        let html = to_html(&doc);
+        assert!(!html.contains("href="), "unsafe href leaked: {html}");
+        assert!(!html.contains("javascript:"), "got: {html}");
+        assert!(
+            html.contains(r#"<a class="doc-mention" data-doc-id="abc123">Target Doc</a>"#),
+            "got: {html}"
+        );
+    }
+
+    #[test]
     fn html_task_list() {
         let doc = doc_with(|txn, frag| {
             let tl = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::TaskList.tag_name()));
@@ -2253,6 +2297,20 @@ mod tests {
         });
         let md = to_markdown(&doc);
         assert!(md.contains("[/d/abc123](/d/abc123)"), "got: {md}");
+    }
+
+    #[test]
+    fn doc_mention_javascript_url_stripped_from_markdown() {
+        let doc = doc_with(|txn, frag| {
+            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            dm.insert_attribute(txn, "url", "javascript:alert(1)");
+            dm.insert_attribute(txn, "title", "Target Doc");
+        });
+        let md = to_markdown(&doc);
+        assert!(!md.contains("](javascript:"), "got: {md}");
+        assert!(!md.contains("javascript:"), "got: {md}");
+        assert!(md.contains("Target Doc"), "got: {md}");
     }
 
     // ── CSV export tests ───────────────────────────────────────────
@@ -2833,6 +2891,31 @@ mod tests {
             }
         }
         assert_eq!(text, "Hi @alice");
+    }
+
+    #[test]
+    fn doc_mention_extract_text_is_title() {
+        // Mirrors the frontend `Node::text_content` contract for
+        // DocMention (added in ceb1040): title first, falling back
+        // to url when the title attr is empty/absent. Without this
+        // arm a mention-only doc is invisible to search indexing and
+        // the LLM prompt embed path (`to_plain_text`/`extract_text`).
+        let doc = doc_with(|txn, frag| {
+            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            dm.insert_attribute(txn, "url", "/d/abc123");
+            dm.insert_attribute(txn, "title", "Target Doc");
+        });
+        let plain = to_plain_text(&doc);
+        assert!(plain.contains("Target Doc"), "got: {plain}");
+
+        let doc_no_title = doc_with(|txn, frag| {
+            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            dm.insert_attribute(txn, "url", "/d/abc123");
+        });
+        let plain_no_title = to_plain_text(&doc_no_title);
+        assert!(plain_no_title.contains("/d/abc123"), "got: {plain_no_title}");
     }
 
     #[test]
