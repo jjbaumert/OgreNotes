@@ -1,16 +1,22 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 //
-// Quip import wizard — Phase 0. Step 1 (the only step this task
-// builds): paste a Quip personal access token, POST it to
-// `/imports/quip/connect`, and on success show the connected
-// profile + a checklist of the caller's root Quip folders. The
-// "Continue" button that would carry the checked scope into Phase 1
-// (actually importing) is intentionally disabled here — that's the
-// next task's wire-up, not this one's.
+// Quip import wizard. Step 1: paste a Quip personal access token,
+// POST it to `/imports/quip/connect`, and on success show the
+// connected profile + a checklist of the caller's root Quip folders
+// (Phase 0). Step 2 (this task): "Continue" persists the checked
+// scope + the user's Home folder as the destination via
+// `POST /imports/quip/{id}/start`, then Step 3 polls
+// `GET /imports/quip/{id}` on an interval and shows live inventory
+// progress until the walk completes (`phase >= 1`) or the run hits a
+// terminal failure status.
 //
 // Mirrors `template_picker_modal.rs` for the modal skeleton (backdrop
 // + `<Show when=visible>` + per-open reset) and `share_dialog.rs` for
-// the focus trap + checkbox-row list pattern.
+// the focus trap + checkbox-row list pattern. The Home-folder lookup
+// mirrors the `UserMeResponse` local-struct pattern in
+// `folder_picker.rs` / `duplicate_dialog.rs` — Phase 1 deliberately
+// skips a destination picker (nesting `FolderPickerDialog` inside
+// this modal risks focus-trap conflicts) and always targets Home.
 //
 // SECURITY: the token field is `type="password"` and its value is
 // never passed to `console.*`/`web_sys::console::*` — only
@@ -19,7 +25,8 @@
 // cleared both when the modal closes and immediately after a
 // successful connect, since the token now lives server-side only
 // (the backend's `ImportRepo`/`ImportRecord` deliberately has no
-// token field — see crates/storage).
+// token field — see crates/storage). No token handling happens past
+// `connect` — `start`/`get_status` never see or send one.
 
 use std::collections::HashMap;
 
@@ -28,7 +35,25 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::a11y;
+use crate::api::client;
 use crate::api::imports::{self, ConnectResponse};
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UserMeResponse {
+    home_folder_id: String,
+}
+
+/// Why an in-flight import stopped polling with something the user
+/// needs to act on. `Cancelled` collapses into `Failed` — Phase 1 has
+/// no user-facing "cancel" affordance, so if the run shows up
+/// cancelled it was cancelled some other way and reads the same as a
+/// failure to this wizard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImportTerminal {
+    Failed,
+    TokenExpired,
+}
 
 #[component]
 pub fn QuipImportWizard(
@@ -44,19 +69,38 @@ pub fn QuipImportWizard(
     let (error, set_error) = signal::<Option<String>>(None);
     let (response, set_response) = signal::<Option<ConnectResponse>>(None);
     // Keyed by root-folder id; default-checked once a connect response
-    // arrives (see `do_connect`). Phase 1 reads this to build the scope
-    // for the actual import — unused by this task's disabled Continue.
+    // arrives (see `do_connect`). Read by `do_start` to build the
+    // scope for the actual import.
     let selected: RwSignal<HashMap<String, bool>> = RwSignal::new(HashMap::new());
+
+    // Phase 1 state: the destination (always the user's Home folder —
+    // see the module doc comment), the start-in-flight flag, whether
+    // we've moved into the progress step, the latest poll result, and
+    // a terminal outcome if the run failed / the token was rejected.
+    let (home_folder_id, set_home_folder_id) = signal::<Option<String>>(None);
+    let (starting, set_starting) = signal(false);
+    let (started, set_started) = signal(false);
+    // Gate for the poll loop below: flipped false to stop it early
+    // (modal close, a terminal result) without waiting out the
+    // in-flight `TimeoutFuture`.
+    let (polling, set_polling) = signal(false);
+    let (progress, set_progress) = signal::<Option<imports::StatusResponse>>(None);
+    let (terminal, set_terminal) = signal::<Option<ImportTerminal>>(None);
 
     let dialog_ref = NodeRef::<leptos::html::Div>::new();
     a11y::install_focus_trap(dialog_ref, visible.into());
 
     // Per-open reset + close-time token wipe. Fires on every `visible`
     // transition (not just "became true") so the token never lingers
-    // in the signal after the dialog is dismissed.
+    // in the signal after the dialog is dismissed. `set_polling(false)`
+    // runs unconditionally on *every* transition (open or close) so a
+    // live progress-poll loop is always stopped the instant the modal
+    // is dismissed — the loop below re-checks this signal every tick
+    // and right before its `await`, so it can't outlive the close.
     Effect::new(move |_| {
         let is_open = visible.get();
         set_token.set(String::new());
+        set_polling.set(false);
         if !is_open {
             return;
         }
@@ -64,6 +108,29 @@ pub fn QuipImportWizard(
         set_error.set(None);
         set_response.set(None);
         selected.set(HashMap::new());
+        set_starting.set(false);
+        set_started.set(false);
+        set_progress.set(None);
+        set_terminal.set(None);
+    });
+
+    // Defensive: if the wizard component is ever unmounted outright
+    // (not just hidden via `<Show>`), stop any live poll loop too.
+    on_cleanup(move || set_polling.set(false));
+
+    // Home folder id for the destination line + the `start` call.
+    // Fetched once, eagerly, rather than gated on `visible` — mirrors
+    // `folder_picker.rs`'s rationale: gating on `visible` risks the
+    // fetch not re-firing on a later open if the effect already ran.
+    Effect::new(move |_| {
+        if home_folder_id.get_untracked().is_some() {
+            return;
+        }
+        leptos::task::spawn_local(async move {
+            if let Ok(me) = client::api_get::<UserMeResponse>("/users/me").await {
+                set_home_folder_id.set(Some(me.home_folder_id));
+            }
+        });
     });
 
     let do_connect = move || {
@@ -99,6 +166,99 @@ pub fn QuipImportWizard(
                     // surface directly, and never logged.
                     set_error.set(Some(e.to_string()));
                     set_connecting.set(false);
+                }
+            }
+        });
+    };
+
+    // Kick off the actual import: persist the checked scope + Home as
+    // the destination, then switch into the progress step and start
+    // polling. `start`'s failure path reuses the same `error` signal
+    // + `quip-import-error` banner the connect step already uses —
+    // `ApiClientError::Display` is opaque by construction (see
+    // `do_connect` above), so it's safe to surface directly here too.
+    let do_start = move || {
+        if starting.get_untracked() || started.get_untracked() {
+            return;
+        }
+        let Some(resp) = response.get_untracked() else {
+            return;
+        };
+        let Some(home) = home_folder_id.get_untracked() else {
+            return;
+        };
+        let roots: Vec<String> = selected
+            .get_untracked()
+            .into_iter()
+            .filter_map(|(id, checked)| checked.then_some(id))
+            .collect();
+        if roots.is_empty() {
+            return;
+        }
+        set_starting.set(true);
+        set_error.set(None);
+        let import_id = resp.import_id.clone();
+        leptos::task::spawn_local(async move {
+            match imports::start(&import_id, &roots, &home).await {
+                Ok(_) => {
+                    set_starting.set(false);
+                    set_started.set(true);
+                    set_progress.set(None);
+                    set_terminal.set(None);
+                    set_polling.set(true);
+
+                    // Poll loop: ~1500ms cadence, stopped by
+                    // `polling` (flipped false on modal close/reopen
+                    // by the reset Effect above, or by this loop
+                    // itself once the run reaches a terminal state)
+                    // or by `visible` going false directly. Checked
+                    // both before the request and before the sleep,
+                    // so at most one in-flight `get_status` outlives
+                    // a close — never the timer itself.
+                    let poll_import_id = import_id.clone();
+                    leptos::task::spawn_local(async move {
+                        loop {
+                            if !polling.get_untracked() || !visible.get_untracked() {
+                                break;
+                            }
+                            if let Ok(st) = imports::get_status(&poll_import_id).await {
+                                let is_failure = matches!(
+                                    st.status.as_str(),
+                                    "failed" | "tokenrejected" | "cancelled"
+                                );
+                                let inventory_done = st.phase >= 1;
+                                if is_failure {
+                                    set_terminal.set(Some(if st.status == "tokenrejected" {
+                                        ImportTerminal::TokenExpired
+                                    } else {
+                                        ImportTerminal::Failed
+                                    }));
+                                    set_progress.set(Some(st));
+                                    set_polling.set(false);
+                                    break;
+                                }
+                                set_progress.set(Some(st));
+                                if inventory_done {
+                                    set_polling.set(false);
+                                    break;
+                                }
+                            }
+                            // A dropped/errored poll is treated as
+                            // transient and retried on the next tick
+                            // rather than surfaced — a single flaky
+                            // request shouldn't flash an error banner
+                            // over an otherwise-healthy "Scanning…"
+                            // view.
+                            if !polling.get_untracked() || !visible.get_untracked() {
+                                break;
+                            }
+                            gloo_timers::future::TimeoutFuture::new(1500).await;
+                        }
+                    });
+                }
+                Err(e) => {
+                    set_starting.set(false);
+                    set_error.set(Some(e.to_string()));
                 }
             }
         });
@@ -178,13 +338,13 @@ pub fn QuipImportWizard(
                                     </div>
                                 </div>
                             }.into_any(),
-                            Some(resp) => {
+                            Some(resp) if !started.get() => {
                                 let profile_name = resp.quip_profile.name.clone();
                                 let folders = resp.root_folders;
                                 view! {
                                     // ─── Step 2: profile + folder scope ───
                                     // `data-import-id` / `data-quip-user-id`
-                                    // are Phase 1 hooks (the scope-continue
+                                    // are Phase 1 hooks (the Continue
                                     // wire-up needs both to kick off the
                                     // import against this connect session)
                                     // and double as a test-automation
@@ -229,13 +389,108 @@ pub fn QuipImportWizard(
                                                 }
                                             }).collect::<Vec<_>>().into_any()
                                         }}
+                                        <p class="quip-import-target-home">
+                                            {crate::t!("quip-import-target-home")}
+                                        </p>
+                                        {move || error.get().map(|e| view! {
+                                            <div class="template-picker-error" role="alert">
+                                                {crate::t!("quip-import-error", err = e)}
+                                            </div>
+                                        })}
                                         <div class="confirm-actions">
                                             <button
                                                 class="btn btn-primary"
-                                                disabled=true
-                                                title=crate::t!("quip-import-continue-hint")
-                                            >{crate::t!("quip-import-continue")}</button>
+                                                disabled=move || {
+                                                    starting.get()
+                                                        || home_folder_id.get().is_none()
+                                                        || !selected.get().values().any(|v| *v)
+                                                }
+                                                on:click=move |_| do_start()
+                                            >{move || if starting.get() {
+                                                crate::t!("quip-import-starting")
+                                            } else {
+                                                crate::t!("quip-import-continue")
+                                            }}</button>
                                         </div>
+                                    </div>
+                                }.into_any()
+                            }
+                            Some(resp) => {
+                                // ─── Step 3: live inventory progress ───
+                                // `data-quip-import-*` attrs are test-
+                                // automation anchors (mirrors step 2's
+                                // `data-import-id` / `data-quip-user-id`
+                                // convention) for the doctor probe.
+                                view! {
+                                    <div
+                                        class="quip-import-step-progress"
+                                        data-import-id=resp.import_id
+                                    >
+                                        {move || {
+                                            if let Some(term) = terminal.get() {
+                                                let msg = match term {
+                                                    ImportTerminal::TokenExpired => {
+                                                        crate::t!("quip-import-token-expired")
+                                                    }
+                                                    ImportTerminal::Failed => {
+                                                        crate::t!("quip-import-import-failed")
+                                                    }
+                                                };
+                                                view! {
+                                                    <div
+                                                        class="template-picker-error"
+                                                        role="alert"
+                                                        data-quip-import-terminal="true"
+                                                    >
+                                                        {msg}
+                                                    </div>
+                                                }.into_any()
+                                            } else {
+                                                match progress.get() {
+                                                    None => view! {
+                                                        <p class="quip-import-progress-line">
+                                                            {crate::t!("quip-import-starting")}
+                                                        </p>
+                                                    }.into_any(),
+                                                    Some(st) if st.phase >= 1 => {
+                                                        let total = st.progress.total;
+                                                        let minutes = total.div_ceil(45);
+                                                        view! {
+                                                            <p
+                                                                class="quip-import-progress-line"
+                                                                data-quip-import-total=total
+                                                                data-quip-import-done="true"
+                                                            >
+                                                                {crate::t!(
+                                                                    "quip-import-inventory-done",
+                                                                    total = total as i64,
+                                                                )}
+                                                            </p>
+                                                            <p class="quip-import-progress-estimate">
+                                                                {crate::t!(
+                                                                    "quip-import-estimate",
+                                                                    minutes = minutes as i64,
+                                                                )}
+                                                            </p>
+                                                        }.into_any()
+                                                    }
+                                                    Some(st) => {
+                                                        let total = st.progress.total;
+                                                        view! {
+                                                            <p
+                                                                class="quip-import-progress-line"
+                                                                data-quip-import-total=total
+                                                            >
+                                                                {crate::t!(
+                                                                    "quip-import-scanning",
+                                                                    total = total as i64,
+                                                                )}
+                                                            </p>
+                                                        }.into_any()
+                                                    }
+                                                }
+                                            }
+                                        }}
                                     </div>
                                 }.into_any()
                             }
