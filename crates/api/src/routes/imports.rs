@@ -190,7 +190,16 @@ async fn rollback_stashed_token(state: &AppState, import_id: &str) {
 fn map_quip_error(err: QuipError) -> ApiError {
     match err {
         QuipError::Unauthorized => ApiError::BadRequest("invalid Quip token".to_string()),
-        QuipError::RateLimited { .. } | QuipError::Http(_) | QuipError::Api { .. } | QuipError::Parse(_) => {
+        // Routine throttling — no server log; the caller already gets a 503.
+        QuipError::RateLimited { .. } => ApiError::ServiceUnavailable("Quip API error".to_string()),
+        // Unexpected Quip-side failure (transport, unexpected status/body,
+        // parse). Log it so an operator can tell an outage or a shape change
+        // apart from routine throttling — without this, every non-auth Quip
+        // failure is an indistinguishable "503, no reason" in the logs.
+        // Safe to emit: none of these variants carry the token (pinned by
+        // client.rs's `unauthorized_and_rate_limited_map` test).
+        QuipError::Http(_) | QuipError::Api { .. } | QuipError::Parse(_) => {
+            tracing::warn!(error = %err, "quip API call failed unexpectedly");
             ApiError::ServiceUnavailable("Quip API error".to_string())
         }
     }
