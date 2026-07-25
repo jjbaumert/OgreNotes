@@ -221,11 +221,13 @@ rendering support.
 
 ## Idempotent re-run
 
-Dedup index = the import's `THREAD#` rows keyed by owner + `quip_thread_id`
-(Open Item C — avoids a DocumentMeta change). Unchanged `updated_usec` →
-skip (counted); newer → listed "changed since import," untouched;
-`changed_thread_optins[]` re-imports chosen ones as NEW mention-linked docs.
-Never overwrites (decision 3).
+Dedup index = a sparse `(owner_id, quip_thread_id)` GSI on the document table
+(Open Item C, option 2). A re-run resolves each Quip thread to the caller's
+own prior import via this GSI. Unchanged `updated_usec` → skip (counted);
+newer → listed "changed since import," untouched; `changed_thread_optins[]`
+re-imports chosen ones as NEW mention-linked docs. Never overwrites
+(decision 3). Re-run reads/writes use the caller's CURRENT permissions, never
+import-time ones, and never relocate an existing doc (see below).
 
 ## Throttle
 
@@ -250,6 +252,28 @@ independent of the request-path limiter.
 - Per-doc transactionality: doc + its comments land completely or the
   `THREAD#` checkpoint stays short of `CommentsDone` and is retried.
 
+**Security review requirements for the re-run / dedup path (Open Item C
+gate).** A `security-auditor` pass must confirm, before that milestone
+merges:
+
+- *Permissions / no cross-user leakage.* The `(owner_id, quip_thread_id)`
+  GSI is queried owner-scoped only; a `quip_thread_id` is never a global key,
+  so two users importing the same shared Quip thread get independent docs and
+  neither can observe the other's. The re-run never discloses the existence
+  of a doc the caller cannot currently access (e.g. one whose ownership was
+  transferred away — confirm `owner_id` semantics on transfer). No enumeration
+  across owners via the GSI.
+- *Folder location & membership are mutable post-import.* After import the
+  user may move the doc, change its `additional_folder_ids`, trash, or delete
+  it. Re-run behavior must be: doc still exists anywhere ⇒ dedup hit ⇒
+  skip/changed-detect, **never force it back to the import target folder**;
+  doc trashed ⇒ treated as still-imported (skip, note in report — no silent
+  resurrection); doc hard-deleted ⇒ absent from the GSI ⇒ re-import as new.
+  Authorization is evaluated against CURRENT ACLs, not import-time ones.
+- *Data at rest.* `quip_thread_id` is the caller's own data and non-sensitive,
+  but must not become an enumeration oracle; the token and IDMAP remain
+  out of this table entirely.
+
 ## Open items
 
 - **A — DISPOSED.** Source parity is the target; where OgreNotes differs
@@ -258,9 +282,14 @@ independent of the request-path limiter.
   inline `DocMention`.
 - **B — DISPOSED.** Identity pre-pass front-loaded; the identity working-set
   is memory-resident + secure-encrypted for the import's life (above).
-- **C — OPEN (needs your call).** Where the "already imported this Quip
-  thread" record lives, so a *future* re-run can skip/detect changes. See the
-  explanation below — three options, recommendation noted.
+- **C — DISPOSED (option 2, security-gated).** Add a sparse
+  `DocumentMeta.quip_thread_id: Option<String>` + a **sparse** GSI keyed
+  `(owner_id, quip_thread_id)` (sparse ⇒ only imported docs are indexed, no
+  backfill). This is a deliberate core-table schema + infra (CDK) change,
+  flagged per the repo's schema-change policy: the field is additive/
+  backward-compatible; the GSI is new. Merge blocked on a **security-auditor
+  review of the re-run + dedup path** (requirements in Security & privacy
+  below).
 - **D — DISPOSED.** OgreNotes natively supports multi-folder membership
   (`DocumentMeta.folder_id` ∪ `additional_folder_ids`) — use it; no
   divergence, no stub docs.
@@ -307,8 +336,10 @@ without touching `DocumentMeta` or relying on the ephemeral manifest.
 3. Identity pre-pass + mapping UI + confirm gate.
 4. Comments (inline + conversation) preserving author/timestamp +
    `imported_author` rendering.
-5. Report UI + idempotent re-run + changed-thread opt-in. (Optionally: the
-   "Referenced by" panel, per Open Item F.)
+5. Report UI + idempotent re-run (`quip_thread_id` field + sparse GSI +
+   CDK) + changed-thread opt-in + the **`security-auditor` gate** on the
+   dedup/re-run path (Open Item C). Plus the "Referenced by" panel + wiring
+   the editor mention paths into `LinkRepo` (Open Item F).
 
 ## Testing
 
@@ -317,8 +348,11 @@ section→block/link-rewrite matrix); identity normalization; manifest resume
 (503 storm + mid-phase restart: no refetch of `ContentDone`; exact-boundary
 `max_created_usec` paging); throttle (≤45/min, header-honoring, backoff+
 jitter); link index (edge upsert/reverse-lookup/cleanup on delete); security
-(no `Secret` ever serialized; token absent from every Dynamo item, S3 object,
-captured log).
+(no `Secret` ever serialized; token + IDMAP absent from every plaintext
+Dynamo item, S3 object, captured log); re-run permissions (GSI owner-scoping,
+no cross-user dedup hit on a shared thread, no existence disclosure of an
+inaccessible doc, and moved/trashed/deleted-doc handling per the review
+requirements).
 
 ## Out of scope
 
