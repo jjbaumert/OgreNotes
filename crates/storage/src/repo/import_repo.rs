@@ -606,6 +606,18 @@ mod tests {
     }
 
     #[test]
+    fn folder_row_item_round_trips_and_has_no_token() {
+        // Mirrors thread_row_item_round_trips_and_has_no_token: the task's
+        // no-token guard names both FolderRow and ThreadRow mappers.
+        let f = FolderRow { quip_folder_id: "qf1".into(), owner_id: "u1".into(),
+            title: "Root".into(), parent_quip_id: Some("qp".into()),
+            ogre_folder_id: Some("of1".into()) };
+        let item = folder_to_item(&f);
+        assert!(!item.contains_key("token") && !item.contains_key("secret"));
+        assert_eq!(folder_from_item(&item).expect("from_item"), f);
+    }
+
+    #[test]
     fn thread_row_item_round_trips_and_has_no_token() {
         let t = ThreadRow { quip_thread_id: "qt1".into(), owner_id: "u1".into(),
             title: "Doc".into(), thread_type: "document".into(), updated_usec: 42,
