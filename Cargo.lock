@@ -3889,6 +3889,7 @@ version = "0.1.2"
 dependencies = [
  "async-trait",
  "aws-sdk-ssm",
+ "dashmap",
  "ogrenotes-common",
  "ogrenotes-storage",
  "reqwest",

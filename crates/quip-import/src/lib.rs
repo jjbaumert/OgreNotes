@@ -3,6 +3,8 @@
 pub mod client;
 pub mod secret;
 pub mod throttle;
+pub mod token_store;
 pub use client::{QuipClient, QuipError, QuipFolder, QuipFolderChild, QuipUser};
 pub use secret::QuipToken;
 pub use throttle::{RateState, Throttle};
+pub use token_store::{InMemoryTokenStore, SsmTokenStore, TokenStore, TokenStoreError};
