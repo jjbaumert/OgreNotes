@@ -14,10 +14,15 @@
 
 mod common;
 
-use ogrenotes_api::worker_mode::{execute_start_quip_import, WorkerCtx};
+use std::sync::Arc;
+
+use fred::clients::RedisClient;
+use fred::prelude::*;
+use ogrenotes_api::worker_mode::{execute_and_finalize, execute_start_quip_import, WorkerCtx};
 use ogrenotes_quip_import::QuipToken;
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
 use ogrenotes_storage::models::import_inventory::{ThreadRow, ThreadState};
+use ogrenotes_worker::{Job, JobQueue};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -94,6 +99,21 @@ const CLAIM_STALE_MS: i64 = 30_000; // mirror worker_mode::CLAIM_STALE_MS
 
 fn now_ms() -> i64 {
     ogrenotes_common::time::now_usec() / 1000
+}
+
+/// A fresh Redis client + uniquely-named job stream, so the dead-letter test
+/// doesn't compete with concurrent tests on the same Redis. Mirrors the helper
+/// in `test_worker_mode.rs`.
+async fn fresh_queue(suffix: &str) -> JobQueue {
+    let config = fred::types::RedisConfig::from_url("redis://127.0.0.1:6379")
+        .expect("parse REDIS_URL");
+    let client = RedisClient::new(config, None, None, None);
+    client.init().await.expect("connect redis");
+    let stream = format!("quip-inv-test:{}:{}", suffix, nanoid::nanoid!(6));
+    let client = Arc::new(client);
+    let _: Result<(), _> = client.del(stream.as_str()).await;
+    let _: Result<(), _> = client.del(format!("{stream}:dlq").as_str()).await;
+    JobQueue::new(client, stream).await.expect("queue init")
 }
 
 /// Seed a `Scoping` import record with the given owner + selected roots,
@@ -369,4 +389,65 @@ async fn inventory_clears_lease_on_transient_error() {
         .await
         .unwrap();
     assert!(reclaimed, "handler must clear the lease on a transient-error exit");
+}
+
+/// A SUSTAINED Quip failure must leave the `ImportRecord` in a terminal state.
+/// The handler returns `Err` on each transient (503) attempt so the queue
+/// retries; once `MAX_RETRIES` is exhausted the job dead-letters. Without the
+/// dead-letter → `ImportStatus::Failed` write, the record stays `Running`/phase
+/// 0 and the wizard's poll loop (which only stops on phase>=1 or a terminal
+/// status) hangs on "Scanning…" forever. Drives the real
+/// `execute_and_finalize` retry budget, mirroring
+/// `test_worker_mode::execute_and_finalize_retries_to_budget_then_dead_letters`.
+#[tokio::test]
+async fn dead_lettered_quip_import_ends_failed() {
+    common::require_infra!();
+    let server = quip_transient_error_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1", &["root"]).await;
+    app.state
+        .quip_token_store
+        .put(&import_id, &QuipToken::new("tok".into()))
+        .await
+        .unwrap();
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    let queue = fresh_queue("deadletter").await;
+
+    let job_id = queue
+        .enqueue(Job::StartQuipImport {
+            import_id: import_id.clone(),
+            owner_id: "owner1".to_string(),
+        })
+        .await
+        .expect("enqueue");
+
+    // MAX_RETRIES = 3: attempts 0,1,2 retry; attempt 3 dead-letters. Drive the
+    // real finalize once per attempt.
+    for expected_attempt in 0..=3u32 {
+        let claimed = loop {
+            if let Some(c) = queue.consume_next("c1", 1_000).await.expect("consume") {
+                break c;
+            }
+        };
+        assert_eq!(
+            claimed.envelope.attempt, expected_attempt,
+            "the retry budget must re-enqueue with an incremented attempt"
+        );
+        execute_and_finalize(&queue, claimed, &ctx).await;
+    }
+
+    // Job is dead-lettered (gone from the main stream)...
+    let next = queue.consume_next("c1", 500).await.expect("consume");
+    assert!(next.is_none(), "job must be dead-lettered once the retry budget is spent");
+    let _ = job_id; // job_id retained for parity with the queue-status precedent
+
+    // ...and — the fix under test — the ImportRecord is now terminal Failed, so
+    // the frontend poll loop stops instead of hanging on "Scanning…".
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(
+        rec.status,
+        ImportStatus::Failed,
+        "a dead-lettered Quip import must end Failed, not stay Running"
+    );
 }

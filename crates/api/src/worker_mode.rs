@@ -187,21 +187,8 @@ pub async fn run(config: AppConfig) {
     tracing::info!("worker mode: persistence context ready");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let consumer_prefix = consumer_prefix();
 
-    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    for i in 0..config.worker_concurrency.max(1) {
-        let q = queue.clone();
-        let consumer = format!("{consumer_prefix}-{i}");
-        let rx = shutdown_rx.clone();
-        handles.push(tokio::spawn(consume_loop(q, consumer, rx, Arc::clone(&ctx))));
-    }
-    {
-        let q = queue.clone();
-        let consumer = format!("{consumer_prefix}-reaper");
-        let rx = shutdown_rx.clone();
-        handles.push(tokio::spawn(reaper_loop(q, consumer, rx, Arc::clone(&ctx))));
-    }
+    let handles = spawn_workers(queue, ctx, config.worker_concurrency, shutdown_rx);
 
     await_shutdown_signal().await;
     tracing::info!("worker mode: shutdown signal received, draining");
@@ -215,6 +202,36 @@ pub async fn run(config: AppConfig) {
         tracing::warn!("worker mode: drain timeout exceeded; some tasks still running");
     }
     tracing::info!("worker mode: stopped");
+}
+
+/// Spawn `concurrency` consumer tasks plus one reaper against `queue`, all
+/// sharing `ctx` and observing `shutdown_rx`. Returns the join handles so the
+/// caller can await a graceful drain. Factored out of [`run`] so the API server
+/// can host an *embedded* worker in dev mode (see `main.rs`) — sharing the same
+/// `AppState` components, crucially the same in-process `TokenStore`, so a
+/// single-process `cargo run` fully processes Quip jobs without a separate
+/// worker. The deployed `--mode=worker` path calls this unchanged.
+pub fn spawn_workers(
+    queue: JobQueue,
+    ctx: Arc<WorkerCtx>,
+    concurrency: u32,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let consumer_prefix = consumer_prefix();
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    for i in 0..concurrency.max(1) {
+        let q = queue.clone();
+        let consumer = format!("{consumer_prefix}-{i}");
+        let rx = shutdown_rx.clone();
+        handles.push(tokio::spawn(consume_loop(q, consumer, rx, Arc::clone(&ctx))));
+    }
+    {
+        let q = queue.clone();
+        let consumer = format!("{consumer_prefix}-reaper");
+        let rx = shutdown_rx.clone();
+        handles.push(tokio::spawn(reaper_loop(q, consumer, rx, Arc::clone(&ctx))));
+    }
+    handles
 }
 
 /// Consume one entry at a time, execute it, finalize. The
@@ -348,6 +365,12 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
                     // Terminal failure: drop the staging upload too —
                     // no future attempt will read it.
                     cleanup_staging_blob(ctx, &claimed.envelope.payload).await;
+                    // For a Quip import the queue's dead-letter is invisible to
+                    // the frontend, which polls the ImportRecord: without a
+                    // terminal status the record stays Running/phase 0 and the
+                    // wizard hangs on "Scanning…" forever. Flip it to Failed so
+                    // the poll loop stops. Only on DeadLettered, never on Retried.
+                    mark_import_dead_lettered(ctx, &claimed.envelope.payload).await;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -433,6 +456,27 @@ async fn cleanup_staging_blob(ctx: &WorkerCtx, payload: &Job) {
     };
     if let Err(e) = ctx.s3.delete_object(s3_key).await {
         tracing::warn!(s3_key, error = %e, "failed to delete import staging blob");
+    }
+}
+
+/// Best-effort terminal-status write for a dead-lettered import job. The
+/// job queue's dead-letter is invisible to the frontend, which polls the
+/// `ImportRecord`; a sustained-failure Quip inventory job that exhausts its
+/// retry budget would otherwise leave the record in `Running`/phase 0 and hang
+/// the wizard on "Scanning…" forever. Flipping the status to `Failed` gives the
+/// poll loop a terminal state to stop on (the frontend already treats
+/// `"failed"` as terminal). Dispatches on the payload exactly like
+/// [`cleanup_staging_blob`]; only the Quip variant has an `ImportRecord` to
+/// finalize. A write error is logged, not propagated — this runs after the job
+/// is already terminal in the queue.
+async fn mark_import_dead_lettered(ctx: &WorkerCtx, payload: &Job) {
+    match payload {
+        Job::StartQuipImport { import_id, .. } => {
+            if let Err(e) = ctx.import_repo.set_status(import_id, ImportStatus::Failed).await {
+                tracing::warn!(import_id, error = %e, "failed to mark dead-lettered import Failed");
+            }
+        }
+        Job::ImportDocx { .. } | Job::ImportPdf { .. } | Job::Noop { .. } => {}
     }
 }
 
