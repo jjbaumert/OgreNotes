@@ -13,11 +13,13 @@ use crate::middleware::activity::ActivityTracker;
 use ogrenotes_embeddings::EmbeddingPipeline;
 use ogrenotes_notify::{EmailCapRepo, EmailService, NoopSender, SmtpSender};
 use ogrenotes_search::SearchIndex;
+use ogrenotes_quip_import::{QuipClient, TokenStore};
 use ogrenotes_storage::dynamo::DynamoClient;
 use ogrenotes_storage::repo::activity_repo::ActivityRepo;
 use ogrenotes_storage::repo::admin_audit_repo::AdminAuditRepo;
 use ogrenotes_storage::repo::doc_repo::DocRepo;
 use ogrenotes_storage::repo::folder_repo::FolderRepo;
+use ogrenotes_storage::repo::import_repo::ImportRepo;
 use ogrenotes_storage::repo::mfa_recovery_repo::MfaRecoveryRepo;
 use ogrenotes_storage::repo::notification_repo::NotificationRepo;
 use ogrenotes_storage::repo::security_audit_repo::SecurityAuditRepo;
@@ -86,6 +88,15 @@ pub struct AppState {
     /// path. The WS-connect check bypasses it (authoritative). Invalidated
     /// on folder update/delete in `routes/folders.rs`.
     pub folder_inherit_cache: Arc<FolderInheritCache>,
+    /// Quip import manifest repo (Phase 0 Task 5). Deliberately narrow —
+    /// never stores the Quip token; see `quip_token_store`.
+    pub import_repo: Arc<ImportRepo>,
+    /// Where the Quip personal access token lives for the duration of an
+    /// import. `SsmTokenStore` in prod, `InMemoryTokenStore` in dev (the
+    /// local stack has no SSM) — selected in `main.rs` by `config.dev_mode`.
+    pub quip_token_store: Arc<dyn TokenStore>,
+    /// Throttled client for the Quip Automation API (platform.quip.com).
+    pub quip_client: Arc<QuipClient>,
 }
 
 impl AppState {
@@ -98,6 +109,8 @@ impl AppState {
         embedding_pipeline: Option<EmbeddingPipeline>,
         claude_client: Option<Arc<dyn ClaudeMessages>>,
         job_producer: Option<Arc<dyn ogrenotes_worker::JobProducer>>,
+        quip_token_store: Arc<dyn TokenStore>,
+        quip_client: Arc<QuipClient>,
     ) -> Self {
         // Phase 4 M-E3: surface a misconfigured MFA key at startup
         // instead of on the first enroll/verify request. We only
@@ -133,6 +146,7 @@ impl AppState {
             dynamo.clone(),
             config.email_daily_cap,
         ));
+        let import_repo = Arc::new(ImportRepo::new(dynamo.clone()));
         let session_repo = Arc::new(SessionRepo::new(dynamo));
 
         // Pick the email transport at startup. A falsy EMAIL_ENABLED or a
@@ -218,6 +232,9 @@ impl AppState {
             activity_tracker,
             edit_activity_debouncer: Arc::new(EditActivityDebouncer::new()),
             folder_inherit_cache: Arc::new(FolderInheritCache::new()),
+            import_repo,
+            quip_token_store,
+            quip_client,
         }
     }
 }

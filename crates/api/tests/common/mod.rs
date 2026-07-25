@@ -445,6 +445,10 @@ impl TestApp {
         .expect("job queue init");
         let job_producer: Arc<dyn ogrenotes_worker::JobProducer> = Arc::new(job_queue);
 
+        let quip_token_store: Arc<dyn ogrenotes_quip_import::TokenStore> =
+            Arc::new(ogrenotes_quip_import::InMemoryTokenStore::new());
+        let quip_client = Arc::new(ogrenotes_quip_import::QuipClient::new(None));
+
         let state = AppState::new(
             config,
             dynamo,
@@ -454,6 +458,8 @@ impl TestApp {
             None,
             claude,
             Some(job_producer),
+            quip_token_store,
+            quip_client,
         );
         // Apply the same security-headers stack as production so
         // tests can assert against the live policy (#35). dev_mode

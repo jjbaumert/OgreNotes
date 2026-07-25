@@ -36,7 +36,9 @@ ogrenotes-search = { workspace = true }
 ogrenotes-embeddings = { workspace = true }
 ogrenotes-notify = { workspace = true }
 ogrenotes-worker = { workspace = true }
+ogrenotes-quip-import = { workspace = true }
 aws-sdk-bedrockruntime = { workspace = true }
+aws-sdk-ssm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
