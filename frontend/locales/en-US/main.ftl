@@ -127,6 +127,23 @@ template-picker-section-sample = Samples
 template-picker-section-untagged = Templates
 modal-close = Close
 
+# ─── Quip import wizard (Phase 0) — shell-mounted, opens from the
+# sidebar "+ New" menu. Step 1: paste a token, connect, see the
+# profile + a root-folder checklist. The scope Continue is disabled
+# until Phase 1 wires the actual import.
+quip-import-menu-entry = Import from Quip…
+quip-import-title = Import from Quip
+quip-import-token-label = Quip API token
+quip-import-token-placeholder = Paste your Quip personal access token
+quip-import-connect = Connect
+quip-import-connecting = Connecting…
+quip-import-error = Couldn't connect: { $err }
+quip-import-profile = Connected as { $name }
+quip-import-folder-scope-heading = Choose folders to import
+quip-import-no-folders = No folders found in this Quip account.
+quip-import-continue = Continue
+quip-import-continue-hint = Coming soon — folder-scoped import isn't wired up yet.
+
 # ─── Notification panel ─────────────────────────────────────────
 
 notifications-title = Notifications

@@ -908,3 +908,20 @@ doc-block-link-missing = Der verlinkte Abschnitt existiert nicht mehr.
 # ─── Mentions spec §5 (Task 5) — per-viewer degradation overlay ──
 
 doc-mention-missing = Fehlendes Dokument
+
+# ─── Quip import wizard (Phase 0) — shell-mounted, opens from the
+# sidebar "+ New" menu. Step 1: paste a token, connect, see the
+# profile + a root-folder checklist. The scope Continue is disabled
+# until Phase 1 wires the actual import.
+quip-import-menu-entry = Aus Quip importieren…
+quip-import-title = Aus Quip importieren
+quip-import-token-label = Quip-API-Token
+quip-import-token-placeholder = Füge deinen persönlichen Quip-Zugriffstoken ein
+quip-import-connect = Verbinden
+quip-import-connecting = Verbindung wird hergestellt…
+quip-import-error = Verbindung fehlgeschlagen: { $err }
+quip-import-profile = Verbunden als { $name }
+quip-import-folder-scope-heading = Ordner für den Import auswählen
+quip-import-no-folders = In diesem Quip-Konto wurden keine Ordner gefunden.
+quip-import-continue = Weiter
+quip-import-continue-hint = Demnächst verfügbar — der ordnerbezogene Import ist noch nicht angebunden.

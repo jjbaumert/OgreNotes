@@ -219,6 +219,10 @@ pub fn Sidebar(
     /// #142: open the template picker modal. Shell-owned (mounted in
     /// `AppShell`); the sidebar Templates entry calls this.
     #[prop(optional)] on_templates: Option<Callback<()>>,
+    /// Quip import Phase 0: open the shell-mounted `QuipImportWizard`.
+    /// Same split as `on_templates` — shown in the "+ New" menu when
+    /// wired (always when mounted under `AppShell`).
+    #[prop(optional)] on_quip_import: Option<Callback<()>>,
     /// #152: when set (the home page provides it), the Home item resets to
     /// the home root IN MEMORY instead of a full-page reload — no teardown
     /// flash. Absent elsewhere, where the Home item full-reloads to `/`.
@@ -356,9 +360,17 @@ pub fn Sidebar(
                 });
             }),
         ];
-        if let Some(cb) = on_templates {
+        if on_templates.is_some() || on_quip_import.is_some() {
             items.push(MenuEntry::Separator);
+        }
+        if let Some(cb) = on_templates {
             items.push(MenuEntry::action(crate::t!("menubar-doc-new-template"), move || {
+                close_drawer();
+                cb.run(());
+            }));
+        }
+        if let Some(cb) = on_quip_import {
+            items.push(MenuEntry::action(crate::t!("quip-import-menu-entry"), move || {
                 close_drawer();
                 cb.run(());
             }));

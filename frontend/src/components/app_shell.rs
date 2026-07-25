@@ -20,6 +20,7 @@ use leptos_router::components::Outlet;
 use leptos_router::hooks::use_navigate;
 
 use crate::a11y;
+use crate::components::quip_import::QuipImportWizard;
 use crate::components::sidebar::Sidebar;
 use crate::components::template_picker_modal::TemplatePickerModal;
 use crate::pages::document::{load_bool_pref, PREF_LINE_NUMBERS, PREF_PAGE_BREAKS};
@@ -41,6 +42,11 @@ pub struct ShellCtx {
     /// from multiple surfaces (sidebar, Document menu, home page) — having
     /// one mount avoids state duplication.
     pub template_picker_open: RwSignal<bool>,
+    /// Quip-import wizard (Phase 0). Shell-owned for the same reason
+    /// as `template_picker_open` — the entry point lives in the
+    /// sidebar's "+ New" menu, but the modal is mounted once here so
+    /// state doesn't duplicate if more entry points are added later.
+    pub quip_import_open: RwSignal<bool>,
     /// Mobile drawer open state. The shell renders the backdrop; a page's
     /// header hamburger toggles it.
     pub drawer_open: RwSignal<bool>,
@@ -70,6 +76,7 @@ impl ShellCtx {
             search_open: RwSignal::new(false),
             ask_open: RwSignal::new(false),
             template_picker_open: RwSignal::new(false),
+            quip_import_open: RwSignal::new(false),
             drawer_open: RwSignal::new(false),
             favorites_dirty: RwSignal::new(0),
             collections_dirty: RwSignal::new(0),
@@ -103,6 +110,7 @@ pub fn AppShell() -> impl IntoView {
     let on_search = Callback::new(move |()| ctx.search_open.set(true));
     let on_ask = Callback::new(move |()| ctx.ask_open.set(true));
     let on_templates = Callback::new(move |()| ctx.template_picker_open.set(true));
+    let on_quip_import = Callback::new(move |()| ctx.quip_import_open.set(true));
 
     // Home nav: run the page-registered in-memory reset if present (the
     // home page is the active outlet), else a client-side navigate to "/".
@@ -129,6 +137,7 @@ pub fn AppShell() -> impl IntoView {
                 on_search=on_search
                 on_ask=on_ask
                 on_templates=on_templates
+                on_quip_import=on_quip_import
                 on_home=on_home
                 is_open=ctx.drawer_open.read_only()
                 favorites_refresh=ctx.favorites_dirty
@@ -147,6 +156,12 @@ pub fn AppShell() -> impl IntoView {
             <TemplatePickerModal
                 visible=ctx.template_picker_open.read_only()
                 on_close=Callback::new(move |_| ctx.template_picker_open.set(false))
+            />
+            // Quip import wizard (Phase 0): token-entry + connect step.
+            // Same shell-mount rationale as the template picker above.
+            <QuipImportWizard
+                visible=ctx.quip_import_open.read_only()
+                on_close=Callback::new(move |_| ctx.quip_import_open.set(false))
             />
         </div>
     }
