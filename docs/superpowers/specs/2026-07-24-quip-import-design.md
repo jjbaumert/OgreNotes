@@ -1,331 +1,299 @@
 # Quip Import — design
 
-**Date:** 2026-07-24
-**Area:** new `crates/quip-import` + `crates/api` (routes + an in-process runner)
-+ `crates/storage` (import-state tables) + `crates/collab` (a Quip HTML
-walker) + `frontend/` (import wizard). Backend cargo workspace; frontend is
-outside it.
-**Status:** DESIGN — awaiting disposition. No code until this is approved.
+**Date:** 2026-07-24 (rev. 2 — token store + link index)
+**Area:** new `crates/quip-import` + `crates/api` (routes + worker runner) +
+`crates/storage` (import-state + link-index tables) + `crates/collab` (Quip
+HTML walker) + `frontend/` (import wizard + optional backlinks panel).
+Backend cargo workspace; frontend outside it.
+**Status:** DESIGN — awaiting disposition. No code until approved.
 
 ## Provenance & scope
 
 Implements the "Quip Import (Documents, Structure, Comments, People)"
-feature request. This document resolves the architecture and every item the
-request marked "propose"; it is the disposition gate the request asked for
-("Design document first … Stop for disposition before code"). It does not
-contain an implementation plan — that follows on approval.
+request, incorporating the reviewer's rev-2 steers: (a) a secure transient
+token store is acceptable if it eases the design; (b) collect unresolved
+links and back-patch them at the end; (c) persist all links in DynamoDB as a
+durable index that also powers a "referenced by / backlinks" capability. This
+is the disposition gate; no implementation plan yet.
 
-## Disposed decisions (confirmed 2026-07-24)
+## Disposed decisions
 
-1. **Token lifetime:** the Quip PAT lives ONLY in the running import task's
-   memory (a redacting/zeroizing wrapper), never in Redis, DynamoDB, S3, or
-   logs. A process restart pauses the import in a `NeedsToken` state; the
-   user re-pastes the token to resume from the last checkpoint.
-2. **Unmatched comment authors:** preserved as author *metadata on the
-   comment* (name + email + Quip user id, badged external) — no synthetic
-   user accounts. Matched authors link to the real `user_id`.
-3. **Changed thread on re-run:** never overwrite. Already-imported threads
-   that changed in Quip are listed in the report; the user may opt in to
-   re-import a chosen one as a NEW doc (mention-linked from the prior). No
-   in-place content replacement, ever.
-4. **Spreadsheets:** import as native OgreNotes `DocType::Spreadsheet` docs
-   via the existing `import_spreadsheet::from_xlsx` path. Raw `.xlsx` is
-   retained as a doc blob only as a fidelity fallback when conversion loses
-   data.
+1. **Token lifetime (revised):** the Quip PAT is held in a **secure,
+   transient, per-import store** (recommended: an SSM SecureString parameter
+   `/{prefix}import/{import_id}/quip-token`, KMS-backed, or a KMS-envelope-
+   encrypted Dynamo item — see Open Item E), created at `connect`, deleted on
+   any terminal state, with a sweeper deleting stale entries as a backstop.
+   The worker also holds a `Secret<String>` copy in memory (zeroize-on-drop,
+   `Debug=[redacted]`). It is never placed in a Redis job envelope, never in
+   a manifest row, never logged. Consequence: the import can be **worker-
+   hosted** and **auto-resumes after a restart** by re-reading the store — no
+   client re-prompt.
+2. **Unmatched comment authors:** preserved as author metadata on the comment
+   (`imported_author {name, email?, quip_user_id}`, badged external) — no
+   synthetic user accounts. Matched authors link to the real `user_id`.
+3. **Changed thread on re-run:** never overwrite. Changed threads are listed
+   in the report; the user may opt in to re-import a chosen one as a NEW doc,
+   mention-linked from the prior. No in-place content replacement.
+4. **Spreadsheets:** native `DocType::Spreadsheet` via
+   `import_spreadsheet::from_xlsx`; raw `.xlsx` retained as a doc blob only as
+   a fidelity fallback on data loss.
 
-## The architecture-forcing constraint
+## Architecture
 
-Browsers cannot call `platform.quip.com` (no CORS for arbitrary origins), so
-the token and all Quip fetching are server-side. Decision 1 forbids
-persisting the token. The existing Redis-Streams job queue
-(`crates/worker`) serializes the whole job envelope into Redis and, on
-failure, the dead-letter queue — putting a PAT there would persist it. That
-queue is also *atomic* (crash ⇒ full redo or DLQ after 3 tries) with no
-checkpoint model.
+Browsers can't call `platform.quip.com` (CORS), so all Quip fetching is
+server-side. With a secure token store (decision 1) the long, rate-limited,
+resumable import lives in the **worker process**, not the API — long jobs
+belong there, off the request path.
 
-**Therefore the import runs as an API-process-hosted task, not a Redis
-job.** The API instance that receives the token from the client's HTTPS
-request spawns the runner and holds the PAT in that instance's memory. All
-durable state (the manifest) lives in DynamoDB + S3 and contains NO token.
-If the hosting instance restarts, the task dies; a sweeper marks the import
-`NeedsToken`; the client re-supplies the token to any instance, which claims
-the import and resumes from the checkpoint. This is the only topology that
-satisfies "token in memory only, resumable" — a cross-process hand-off would
-require persisting or network-relaying the secret.
+The existing Redis-Streams queue is *atomic* (crash ⇒ full redo/DLQ, 60 s
+reaper) and serializes its envelope to Redis + DLQ, so it cannot host a
+multi-hour checkpointed job nor carry the token. Instead:
+
+- The Redis queue carries only a **token-free trigger** `StartQuipImport
+  { import_id, owner_id }` to wake a worker promptly.
+- Durable state is a **DynamoDB manifest** (below). A dedicated import loop in
+  the worker **claims** an import (conditional write of `runner_claim
+  {instance_id, heartbeat_ms}`) and heartbeats while running; a
+  `claim_stale`-style sweep reclaims imports whose heartbeat went cold (crash/
+  redeploy). On (re)claim the worker re-reads the token from the secure store
+  and resumes from the last per-thread checkpoint.
 
 ```
-Browser wizard ──HTTPS──▶ API instance ──▶ ImportRunner (tokio task)
-   token+scope            │  in-mem token   │   ├─ QuipClient (throttled)
-   progress polling       │  (AppState map) │   ├─ converter (crates/quip-import)
-   identity confirm       │                 │   └─ writes via DocRepo/ThreadRepo/S3
-                          ▼                 ▼
-                   DynamoDB import tables   S3 staging (imports/{id}/…)
-                   (manifest, NO token)     (raw HTML, message pages, blobs)
+Browser wizard ──HTTPS──▶ API (routes/imports.rs) ──▶ secure token store
+  token+scope             │  enqueue trigger              (SSM SecureString)
+  progress / identity     ▼                                     ▲
+                    Redis trigger ──▶ Worker import loop ────────┘ (read at run)
+                                      │  QuipClient (throttled)
+                                      │  converter (crates/quip-import)
+                                      ▼  DocRepo/ThreadRepo/S3 writes
+                    DynamoDB: manifest + link index    S3: imports/{id}/ staging
 ```
 
 ## Component layout
 
-- **`crates/quip-import`** (new) — pure-ish domain crate: the `QuipClient`
-  (endpoint wrappers + throttle), the Quip-HTML→OgreNotes converter/walker,
-  the manifest types, and the phase state machine. No Axum, no direct AWS;
-  takes repo/S3 handles by trait so it's unit-testable with fakes.
-- **`crates/api/src/routes/imports.rs`** (new) — the wizard's REST surface
-  and the in-process runner registry on `AppState`.
-- **`crates/storage`** — new `ImportRepo` over new DynamoDB item types.
-- **`crates/collab`** — the converter lives here or in `quip-import`; it
-  produces a `yrs::Doc` (content fragment) the same shape `import::from_html`
-  produces, then `snapshot::doc_to_bytes`. (It does NOT reuse `from_html`
-  as-is — that drops tables/images/links/marks and assigns no block IDs.)
-- **`frontend/src/components/quip_import/`** (new) — the wizard.
+- **`crates/quip-import`** (new) — `QuipClient` (endpoints + throttle), the
+  Quip-HTML→OgreNotes walker, manifest/link types, the phase state machine.
+  Repo/S3/secret access via traits for unit tests with fakes.
+- **`crates/api/src/routes/imports.rs`** (new) — wizard REST surface; writes
+  the token to the secure store; enqueues the trigger.
+- **`crates/api/src/worker_mode.rs`** — add the import loop + `StartQuipImport`
+  dispatch alongside the existing atomic handlers.
+- **`crates/storage`** — new `ImportRepo` (manifest) and `LinkRepo` (durable
+  link index).
+- **`crates/collab`** — the converter (new Quip walker; not the lossy
+  `from_html`) producing a `yrs::Doc` → `snapshot::doc_to_bytes`.
+- **`frontend/src/components/quip_import/`** (new) — the wizard; plus an
+  optional `referenced_by` panel (Open Item F).
 
-## REST surface (`/api/v1/imports/quip`)
+## REST surface (`/api/v1/imports/quip`, owner-gated)
 
-All owner-gated. Token appears only in request bodies of `connect`/`token`,
-never in any response or stored row.
+Token appears only in the `connect` request body; never in any response or
+manifest row.
 
 | Method / path | Purpose |
 |---|---|
-| `POST /connect` | Body `{ token }`. Validate via Quip `GET /1/users/current`. Create an import record (`status=Scoping`), stash the token in the in-memory registry keyed by `import_id` (idle-TTL). Return `{ import_id, quip_profile, root_folders[] }` for the scope checklist. |
-| `POST /{id}/start` | Body `{ selected_root_folder_ids[], target_folder_id?｜create, changed_thread_optins?[] }`. Authorizes the target folder in the request's auth context (like `documents::import_job`). Spawns the runner. Returns `{ estimate: {thread_count, projected_minutes} }`. |
-| `GET /{id}` | Poll: `{ status, phase, progress{done,total,stage}, needs_token: bool, pending_identity_confirmation: bool }`. |
-| `GET /{id}/identities` | The proposed identity table (matched / unmatched-with-email / anonymous) — served once the identity pre-pass completes; the runner *blocks here* until confirmed. |
-| `POST /{id}/confirm-identities` | Body `{ overrides: [{quip_user_id, action: attribute(user_id)｜placeholder｜skip}] }`. Unblocks the runner into comment writing. |
-| `POST /{id}/token` | Re-supply the token to resume a `NeedsToken` import; re-claims + restarts the runner from checkpoint. |
-| `GET /{id}/report` | The final structured report (also embedded in `status=Succeeded`). |
-| `POST /{id}/cancel` | Cooperative cancel; leaves completed docs, marks the rest skipped-cancelled in the report. |
+| `POST /connect` | `{ token }` → validate via Quip `/1/users/current`; create manifest `META (status=Scoping)`; write token to the secure store keyed by `import_id`; return `{ import_id, quip_profile, root_folders[] }`. |
+| `POST /{id}/start` | `{ selected_root_folder_ids[], target_folder_id?｜create, changed_thread_optins?[] }`; authorize target folder in the request auth context; enqueue `StartQuipImport`; return `{ estimate }`. |
+| `GET /{id}` | `{ status, phase, progress{done,total,stage}, pending_identity_confirmation }`. |
+| `GET /{id}/identities` | proposed identity table; runner blocks here until confirmed. |
+| `POST /{id}/confirm-identities` | `{ overrides:[{quip_user_id, action}] }` → unblock. |
+| `GET /{id}/report` | final structured report. |
+| `POST /{id}/cancel` | cooperative cancel; secure token deleted. |
 
-**In-memory token registry:** `AppState.quip_tokens:
-Arc<DashMap<ImportId, TokenEntry>>` where `TokenEntry { secret:
-Secret<String>, last_used: Instant }`. `Secret<String>` is a small
-zeroize-on-drop, `Debug=[redacted]` newtype (the `secrecy`/`zeroize` crates —
-neither is currently a dependency; adding them is part of this feature). A
-periodic sweep evicts idle entries and, when an import's runner is gone but
-its Dynamo status is `Running` with a stale heartbeat, flips it to
-`NeedsToken`.
+(No `/token` re-prompt endpoint — auto-resume from the store. A 401/403 from
+Quip mid-run marks the import `TokenRejected` and surfaces a re-connect
+prompt, which is the only path that re-collects a token.)
 
-## DynamoDB manifest schema (`ImportRepo`)
+## DynamoDB manifest (`ImportRepo`) — `PK = IMPORT#<import_id>`
 
-One partition per import: `PK = IMPORT#<import_id>`. All rows carry
-`owner_id`; reads are owner-gated. A TTL attribute expires the whole
-partition 30 days after completion. **No row ever contains the token.**
+All rows carry `owner_id`; owner-gated. TTL expires the partition 30 days
+after completion. **No row contains the token.**
 
 | SK | Item | Key fields |
 |---|---|---|
-| `META` | import record | `owner_id`, `status` (Scoping｜Running｜NeedsToken｜AwaitingIdentityConfirm｜Succeeded｜Failed｜Cancelled), `phase` (0–5), `target_folder_id`, `selected_roots[]`, `quip_user_id`, `runner_claim` `{instance_id, heartbeat_ms}`, `created_at`, `report_summary` (counts) |
-| `FOLDER#<quip_folder_id>` | inventory folder | `title`, `parent_quip_id?`, `ogre_folder_id` (assigned) |
-| `THREAD#<quip_thread_id>` | per-thread checkpoint (the resumability unit) | `title`, `type`, `updated_usec`, `member_folders[]`, `state` (Pending｜ContentDone｜CommentsDone｜Skipped{reason}), `ogre_doc_id?`, `content_s3_key?`, `first_folder` (canonical) |
-| `SECMAP#<quip_thread_id>` | section→block map | `map: { quip_section_id: ogre_block_id }` (chunked to stay under 400 KB; large docs split across `SECMAP#<thread>#<n>`) |
-| `IDMAP` | identity map | `authors: { quip_user_id: {name, email?, resolution: matched(user_id)｜placeholder｜anonymous｜skip} }` |
-| `REPORT` | accumulating report | append-only counters + a bounded list of named losses/fallbacks |
+| `META` | import record | `owner_id`, `status`, `phase`, `target_folder_id`, `selected_roots[]`, `quip_user_id`, `runner_claim{instance_id,heartbeat_ms}`, `report_summary` |
+| `FOLDER#<quip_folder_id>` | inventory folder | `title`, `parent_quip_id?`, `ogre_folder_id` |
+| `THREAD#<quip_thread_id>` | per-thread checkpoint (resumability unit) | `title`, `type`, `updated_usec`, `member_folders[]`, `state (Pending｜ContentDone｜CommentsDone｜Skipped{reason})`, `ogre_doc_id?`, `content_s3_key?`, `first_folder` |
+| `SECMAP#<quip_thread_id>[#<n>]` | section→block map | `{ quip_section_id: ogre_block_id }` (chunked <400 KB) |
+| `UNRESOLVED#<source_quip_thread_id>` | pending back-patch links | `[ {source_block_id, kind: doc｜section, target_quip_thread_id, target_quip_section_id?} ]` |
+| `IDMAP` | identity map | `{ quip_user_id: {name,email?,resolution} }` |
+| `REPORT` | accumulating report | counters + bounded list of named losses/fallbacks |
 
-**Why Dynamo for the index and S3 for payloads:** Dynamo items cap at
-400 KB, so raw thread HTML, fetched message pages, and blobs stage to S3
-under `imports/{import_id}/…` (reusing `S3Client::put_object` and the
-`imports/` prefix `documents::import_job` already writes to). Dynamo holds
-only cursors, statuses, and the two maps. Per-thread items give clean,
-idempotent, conditional-write checkpointing with no read-modify-write races
-(the failure mode of a single JSON blob manifest).
+Rationale for Dynamo-index + S3-payload split: Dynamo's 400 KB item cap makes
+it wrong for raw HTML/message-pages/blobs (→ S3 under `imports/{id}/…`,
+reusing `S3Client::put_object` and the existing `imports/` prefix). Per-thread
+items give idempotent conditional-write checkpointing with no
+read-modify-write races.
 
-**Section→block persistence (called out because comment anchoring and future
-link rewriting both depend on it):** during Phase 2 the converter assigns
-each block a `blockId` (server-side `schema::generate_block_id`,
-`[A-Za-z0-9]{10}` — a valid `#b=` anchor target) and records
-`quip_section_id → blockId` into `SECMAP#…` *before* serializing the doc, in
-the same checkpoint that flips the thread to `ContentDone`. Phase 4 reads it
-to anchor inline comments; the link-rewrite step reads it to build `#b=`
-anchors. It survives for the import's lifetime + report retention.
+## Link handling: two-pass back-patch + durable index
 
-## Pipeline (each phase checkpointed in the manifest)
+**Why two passes:** when converting doc A we may encounter a `quip.com` link
+to thread B before B has been imported (no `ogre_doc_id`, no `SECMAP` yet). So
+the converter emits a **placeholder** and records the edge in
+`UNRESOLVED#<A>`; a back-patch pass after all threads reach `ContentDone`
+resolves every edge (both endpoints now known), rewriting A's content and
+recording the settled edge in the durable index.
 
-- **Phase 0 Connect & scope** — `POST /connect` validates the token and
-  returns the Quip root folders; the wizard shows a scope checklist (default
-  private + shared) and a target-folder picker; `POST /start` walks folder
-  metadata to estimate thread count and projects time from the throttle rate,
-  then spawns the runner.
-- **Phase 1 Inventory** — BFS the selected folders; write `FOLDER#…` and
-  `THREAD#…` rows (title, type, `updated_usec`, `member_folders`). **Dedup /
-  tag membership:** a thread is imported ONCE, at its first-encountered
-  folder (`first_folder`). *Proposed representation of the extra
-  memberships:* add the single imported doc as a `FolderChild` under each
-  other folder too (multi-folder membership — one doc, no duplicated
-  content), which is the exact OgreNotes-native analog of Quip's tag-like
-  folders. **This diverges from the request's "document mentions at the other
-  locations"**, which doesn't fit the folder model (a folder holds
-  doc/folder children, not inline mention content). See Open Item D.
-- **Phase 2 Content** — per document thread: fetch `/2/threads/{id}/html`
-  (paginated) → stage to S3 → run the Quip walker →
-    - map every section id to a fresh `blockId` (persist `SECMAP`),
-    - fetch each referenced blob (`GET /1/blob/…`) → `put_object` under
-      `blobs/{ogre_doc_id}/{blob_id}/…` → set the `Image` node `src`,
-    - defer link rewriting to a second pass (targets may not have doc ids
-      until their own thread is imported): after all threads have
-      `ogre_doc_id`s, rewrite intra-import `quip.com` thread URLs →
-      `DocMention` nodes (`doc_id` set; `url={origin}/d/{doc_id}`), and
-      section-fragment URLs → `#b=<blockId>` anchors via `SECMAP`
-      (`target_block_id` set) — the exact node/attr shape and URL form
-      `parse_ogre_doc_url` already consumes. External URLs pass through.
-    - Spreadsheet threads → native Spreadsheet doc (decision 4). Embedded
-      grids → *proposed threshold* (Open Item A). Chat-type threads → skip
-      content, note in report.
-    - create the doc via the `worker_mode::persist_imported_document` path
-      (`DocRepo::create` + `FolderRepo::add_child`), preserving Quip
-      created/updated as document metadata; checkpoint `ContentDone`.
-- **Phase 3 People (identity pre-pass + gated confirm)** — *Proposed
-  ordering (Open Item B):* run a message-metadata scan at the FRONT of the
-  comment work: page every selected thread's `/1/messages` once, stage the
-  pages to S3, collect the distinct `author_id` set + each message's
-  `created_usec`/section refs into the manifest. Resolve the author set via
-  `/1/users/` batch, build `IDMAP`, set `status=AwaitingIdentityConfirm`, and
-  BLOCK. The wizard shows the mapping table (email-matched via
-  `UserRepo::get_by_email`, lowercased + plus-addressing stripped for compare
-  but preserved for display; unmatched-with-email; anonymous). On
-  `confirm-identities` the runner proceeds. Automation proposes, human
-  disposes.
-- **Phase 4 Comments** — replay the staged message pages oldest-first, per
-  thread, splitting the two populations:
-    - inline annotations → `ThreadType::Inline`, `block_id` from `SECMAP`;
-      unmapped section → document-level thread with a "context lost" marker +
-      the original highlighted text if recoverable.
-    - conversation-pane messages → one `ThreadType::Document` discussion,
-      chronological.
-    - written via `ThreadRepo::create_thread` / `add_message` DIRECTLY (not
-      the REST routes, which stamp caller id + now) to preserve original
-      author + `created_at`. Author id = matched `user_id`; unmatched →
-      the new author-metadata field (decision 2). Attachments via blob fetch.
-      Checkpoint `CommentsDone` per thread.
-- **Phase 5 Report & verify** — counts per phase; imported vs skipped
-  (with reasons); comments anchored vs context-lost; identities matched vs
-  placeholder vs anonymous; every fallback taken. Nothing dropped silently.
+**Placeholder representation:** an unresolved intra-import link is stored as
+plain text of the original Quip URL wrapped so the back-patch can find it
+(e.g. a `DocMention` with `doc_id=""` + a `pending_quip_thread` attr, hidden
+from resolve until patched); on patch it becomes a real `DocMention`
+(`doc_id`, `url={origin}/d/{doc_id}[#b=<blockId>]`, `target_block_id` from the
+target's `SECMAP`). External URLs pass through untouched at pass 1.
 
-## Identity map semantics (detail)
+**Durable link index (`LinkRepo`) — a permanent OgreNotes capability, not
+import-only.** A separate table of resolved reference edges, keyed for
+**reverse lookup** so any doc can answer "what references me?":
 
-- Compare key: `email.trim().to_lowercase()`, with `+tag` stripped from the
-  local part for MATCHING only (display keeps the original). `get_by_email`
-  already lowercases.
-- `matched` → `Message.user_id = <ogre user_id>`, no author metadata.
-- `placeholder` (email present, no match, or user chose placeholder) →
-  `user_id = "quip:<quip_user_id>"` sentinel + `imported_author {name,
-  email, quip_user_id}` metadata; frontend renders the metadata with an
-  external badge and never tries to resolve the sentinel as a real user.
-- `anonymous` (no email visible) → same, `email=None`.
-- `skip` (user opts out) → comments from that author are omitted, counted in
-  the report.
+- `PK = LINKTGT#<target_doc_id>`, `SK = SRC#<source_doc_id>#<source_block_id>`
+- attrs: `target_block_id?`, `origin (quip_import｜mention)`, `created_at`,
+  and a denormalized `source_title` for cheap rendering.
+- A forward view (`PK = LINKSRC#<source_doc_id>`) supports edge cleanup when a
+  source doc is deleted or a mention is removed.
 
-New storage: an `imported_author: Option<ImportedAuthor>` field on `Message`
-(and `Thread.created_by` may hold the sentinel). Frontend comment rendering
-learns to show `imported_author` when present. This is additive and the only
-schema change to an existing table.
+The import populates this index during back-patch. **Proposed:** the editor's
+`DocMention` create/convert/resolve paths (`commands.rs`,
+`mention_overlay.rs`) also upsert/remove edges here, so backlinks stay correct
+for user-authored mentions — making the index a first-class feature seeded,
+not defined, by the import. This subsumes the reviewer's "store all links in
+DynamoDB" and enables the "referenced by" surface (Open Item F).
 
-## Idempotent re-run semantics (detail)
+## Pipeline (each phase checkpointed)
 
-- Every imported doc stores `quip_thread_id` + `quip_updated_usec` in its
-  DocumentMeta (a new sparse field, or the import's Dynamo `THREAD#` row keyed
-  by owner+quip_thread_id serves as the dedup index — proposed: the latter,
-  to avoid a DocumentMeta schema change; Open Item C).
-- Re-run against the same target: threads whose `quip_thread_id` already
-  imported and whose `updated_usec` is unchanged → skipped (counted).
-- Changed (`updated_usec` newer) → listed in the report as "changed since
-  import"; NOT touched. `start` accepts `changed_thread_optins[]` to
-  re-import specific ones as NEW docs (mention-linked from the prior via a
-  `DocMention`), never overwriting (decision 3).
+- **Phase 0 Connect & scope** — `connect` validates + returns roots + stores
+  token; wizard scope checklist + target-folder picker; `start` estimates
+  thread count and projects time from the 45/min throttle, enqueues trigger.
+- **Phase 1 Inventory** — BFS selected folders → `FOLDER#`/`THREAD#` rows.
+  **Dedup / tag membership:** import once at `first_folder`; represent the
+  other memberships as multi-`FolderChild` (one doc, several folders — the
+  native analog of Quip tag-folders). Diverges from the request's "mentions
+  at other locations," which has no home in the folder model. See Open Item D.
+- **Phase 2 Content** — per doc thread: fetch `/2` HTML → stage S3 → walk →
+  assign `blockId` per block + persist `SECMAP` → fetch blobs → `put_object`
+  under `blobs/{doc_id}/…` + set `Image.src` → emit placeholders + record
+  `UNRESOLVED#` for intra-import links → create doc via the
+  `persist_imported_document` path (+ explicit search index) preserving Quip
+  timestamps → checkpoint `ContentDone`. Spreadsheet threads → native
+  Spreadsheet doc; embedded grids → threshold (Open Item A); chat threads →
+  skip, note. **Back-patch pass** after all `ContentDone`: resolve every
+  `UNRESOLVED#` edge → rewrite content → write `LinkRepo` edges.
+- **Phase 3 People (front-loaded identity pre-pass, gated)** — page every
+  thread's `/1/messages` once → stage pages to S3, collect distinct
+  `author_id` + `created_usec` + section refs → resolve via `/1/users/` batch
+  → build `IDMAP` → `status=AwaitingIdentityConfirm`, BLOCK. Wizard shows the
+  mapping table (email-matched via `get_by_email`, lowercased + plus-stripped
+  for compare, preserved for display; unmatched-with-email; anonymous). On
+  confirm, proceed. (Open Item B.)
+- **Phase 4 Comments** — replay staged pages oldest-first: inline annotations
+  → `ThreadType::Inline` `block_id` from `SECMAP` (unmapped → document-level +
+  "context lost" marker + original highlighted text); conversation-pane →
+  one `ThreadType::Document` thread chronological. Written via
+  `ThreadRepo::create_thread`/`add_message` DIRECTLY (not REST routes, which
+  restamp author+now) to preserve original author (`user_id` if matched, else
+  `imported_author` metadata) + `created_at`; attachments via blob fetch.
+  Checkpoint `CommentsDone`.
+- **Phase 5 Report** — counts per phase; imported/skipped(+reason);
+  anchored/context-lost; matched/placeholder/anonymous; every fallback.
+  Nothing dropped silently.
 
-## Throttle design
+## Identity map semantics
 
-- One `QuipClient` per running import; ALL Quip requests funnel through it.
-- Token-bucket pinned at **45 req/min** (10% under the 50/min limit), refill
-  computed from `X-Ratelimit-Reset`; before each request, consult
-  `X-Ratelimit-Remaining` and pre-emptively sleep when it approaches 0.
-- On HTTP 503 "Over Rate Limit": exponential backoff with full jitter
-  (base 1 s, cap 60 s), honoring `X-Ratelimit-Reset` as a floor; the thread's
-  checkpoint means a backoff/stall never loses progress.
-- On 401/403: pause `NeedsToken`, drop the in-memory token, surface to the
-  wizard for re-auth; resume from checkpoint.
-- Rate-limit waits are cooperative-cancellable and heartbeat the Dynamo
-  `runner_claim` so the sweeper doesn't reclaim a legitimately-throttled job.
-- No worker-side limiter exists today; this is new (a small `governor` or
-  hand-rolled bucket inside `quip-import`, independent of the request-path
-  `middleware::rate_limit`).
+Compare key `email.trim().lowercase()` with `+tag` stripped for matching only
+(display keeps original). `matched` → real `user_id`, no metadata.
+`placeholder`/`anonymous` → sentinel `user_id="quip:<quip_user_id>"` +
+`imported_author` metadata, rendered with an external badge, never resolved as
+a real user. `skip` → omitted, counted. Only additive schema change to an
+existing table: `Message.imported_author: Option<ImportedAuthor>` + comment
+rendering support.
+
+## Idempotent re-run
+
+Dedup index = the import's `THREAD#` rows keyed by owner + `quip_thread_id`
+(Open Item C — avoids a DocumentMeta change). Unchanged `updated_usec` →
+skip (counted); newer → listed "changed since import," untouched;
+`changed_thread_optins[]` re-imports chosen ones as NEW mention-linked docs.
+Never overwrites (decision 3).
+
+## Throttle
+
+One `QuipClient` per import; all requests funnel through it. Token bucket at
+**45 req/min** (10% under 50), refill from `X-Ratelimit-Reset`, pre-emptive
+sleep as `X-Ratelimit-Remaining`→0. On 503: exp backoff + full jitter (1 s
+base, 60 s cap) floored at `X-Ratelimit-Reset`; checkpoints mean a stall
+loses nothing. Waits are cancellable and heartbeat `runner_claim` so the
+sweeper won't reclaim a throttled job. New code (`governor` or hand-rolled),
+independent of the request-path limiter.
 
 ## Security & privacy
 
-- Token: `Secret<String>`, zeroized on drop, `Debug=[redacted]`; never
-  serialized into Dynamo/Redis/S3/logs. `tracing` call sites in the runner
-  log only `import_id`/`owner_id`/counts — never the token or user emails
-  (emails appear only in the identity table response and comment metadata,
-  both owner-scoped, and never in logs at any verbosity).
-- All writes go through the normal repo create paths, so block IDs (now
-  server-assigned), indexing, and edit-history behave as authored. (Caveat:
-  the worker-style create path does NOT auto-index for search; the importer
-  will explicitly call `spawn_index_document_from_bytes` so imported docs are
-  searchable immediately — a deliberate deviation from `worker_mode`.)
-- Per-document transactionality: a doc + its comments land completely or the
-  thread stays `Pending`/`ContentDone` and is retried; the `THREAD#`
-  checkpoint is the transaction boundary.
+- Token: transiently in the secure store (KMS-backed), memory copy is
+  `Secret<String>` (zeroize, redacted Debug), deleted on every terminal state
+  + swept as backstop; never in Redis/manifest/S3/logs. Runner `tracing` logs
+  only `import_id`/`owner_id`/counts. Emails appear only in owner-scoped
+  identity responses + comment metadata, never in logs.
+- All writes via normal repo create paths; block IDs server-assigned; the
+  importer explicitly indexes for search (deviation from `worker_mode`, which
+  defers indexing).
+- Per-doc transactionality: doc + its comments land completely or the
+  `THREAD#` checkpoint stays short of `CommentsDone` and is retried.
 
-## Open items proposed here (dispose at review)
+## Open items (dispose at review)
 
-- **A — embedded-spreadsheet inline threshold.** Proposed: a grid with
-  ≤ 20 rows × ≤ 12 cols AND ≤ 200 non-empty cells renders inline as a native
-  `Table` block in the parent doc; anything larger becomes a separate
-  `DocType::Spreadsheet` doc, `DocMention`-linked. Standalone spreadsheet
-  threads are always their own Spreadsheet doc.
-- **B — identity pre-pass ordering** (message-scan front-loaded, above).
-  Proposed as described so messages are fetched once and the identity gate
-  precedes any comment write.
-- **C — dedup index location.** Proposed: the import's `THREAD#` Dynamo rows
-  (keyed by owner + `quip_thread_id`) are the re-run dedup index, avoiding a
-  DocumentMeta schema change. Alternative: add `quip_thread_id` to
-  DocumentMeta (queryable independent of an import record, but a schema
-  change).
-- **D — multi-folder membership vs mentions** for tag-like Quip folders.
-  Proposed: multi-`FolderChild` membership (native, no duplication). Diverges
-  from the request's "DocMention at other locations." **Needs confirmation
-  that the OgreNotes sidebar/UI renders a doc that is a child of multiple
-  folders sanely** — a design-review verification item; fallback is
-  "canonical location only, cross-membership noted in the report."
+- **A — embedded-spreadsheet inline threshold.** Proposed: ≤ 20 rows × 12
+  cols AND ≤ 200 non-empty cells → inline native `Table`; larger → separate
+  linked Spreadsheet doc. Standalone spreadsheet threads always own doc.
+- **B — identity pre-pass front-loaded** (messages fetched once, gate before
+  any comment write). Proposed as above.
+- **C — dedup index location.** Proposed: the import `THREAD#` rows (no
+  DocumentMeta change). Alt: add `quip_thread_id` to DocumentMeta (queryable
+  standalone, but a schema change).
+- **D — multi-folder membership vs mentions** for tag-folders. Proposed
+  multi-`FolderChild`. Needs a quick check that the sidebar renders a
+  multi-parent doc sanely; fallback: canonical folder only + report note.
+- **E — secure token store choice.** Proposed SSM SecureString (project-
+  idiomatic, KMS-backed, separate IAM) + delete-on-terminal + stale sweeper.
+  Alt: KMS-envelope-encrypted Dynamo item with native TTL (one store, harder
+  delete guarantees satisfied by TTL). Both add a runtime AWS SDK path not
+  present today.
+- **F — backlinks scope.** The `LinkRepo` index is in scope (import needs it
+  for back-patch + it's the reviewer's ask). Building the "Referenced by" UI
+  now (reuse `relationship_panel` + a `GET /documents/:id/backlinks`
+  endpoint) vs. laying only the index this milestone — dispose. Also dispose:
+  wire the editor mention paths to feed `LinkRepo` now (keeps backlinks live
+  for user mentions) or defer.
 
-## Build order (each phase demonstrable against a real Quip account)
+## Build order (each phase demoable on a real account)
 
-0. `crates/quip-import` skeleton: `QuipClient` + throttle + `/1/users/current`
-   validation; `Secret` wrapper; `connect` endpoint + token registry.
-   Demo: paste token, see profile + roots.
-1. Inventory + manifest (`ImportRepo`, Dynamo tables) + scope UI + estimate.
-   Demo: scoped inventory persisted, resumable.
-2. The Quip HTML walker (tables/lists/checklists/code/images/marks +
-   section-id capture + blockId assignment) with fixture tests; content
-   import + blob fetch; link-rewrite second pass. Demo: real docs imported
-   faithfully with working image + intra-import links.
-3. Identity pre-pass + mapping table UI + confirm gate. Demo: mapping shown,
-   overrides honored.
-4. Comment import (inline-anchored + conversation) with preserved
-   author/timestamp + `imported_author` rendering. Demo: comments land
-   anchored and attributed.
-5. Report UI + idempotent re-run + changed-thread opt-in. Demo: re-run is a
-   no-op except opted-in changes; report names every outcome.
+0. `quip-import` skeleton + `QuipClient`/throttle + `/1/users/current` +
+   `Secret` + secure store + `connect`. Demo: paste token → profile + roots.
+1. Inventory + `ImportRepo` + scope UI + estimate; worker trigger + claim +
+   resume. Demo: scoped inventory persisted + resumable.
+2. Quip walker (tables/lists/checklists/code/images/marks + section capture +
+   blockId) with fixtures; content + blobs; `UNRESOLVED` + back-patch;
+   `LinkRepo` writes. Demo: real docs faithful, images + intra-import links
+   work.
+3. Identity pre-pass + mapping UI + confirm gate.
+4. Comments (inline + conversation) preserving author/timestamp +
+   `imported_author` rendering.
+5. Report UI + idempotent re-run + changed-thread opt-in. (Optionally: the
+   "Referenced by" panel, per Open Item F.)
 
 ## Testing
 
-- Converter fixtures: headings, ordered/bulleted/checklists, tables, code
-  (with language), images, inline marks, section-id→block mapping, and the
-  link-rewrite matrix (intra-import thread URL, section-fragment URL,
-  external URL).
-- Identity normalization (case, plus-addressing, missing email).
-- Manifest resume: simulate a 503 storm and a mid-phase restart; assert no
-  refetch of `ContentDone` threads and exact-boundary message paging
-  (`max_created_usec` on the last message of a full page).
-- Throttle: never exceeds 45/min under load; honors headers; backoff+jitter
-  on injected 503s.
-- Security: property test that no code path serializes a `Secret` and that
-  the token never appears in a Dynamo item, an S3 object, or a captured log.
+Converter fixtures (headings/lists/checklists/tables/code+lang/images/marks/
+section→block/link-rewrite matrix); identity normalization; manifest resume
+(503 storm + mid-phase restart: no refetch of `ContentDone`; exact-boundary
+`max_created_usec` paging); throttle (≤45/min, header-honoring, backoff+
+jitter); link index (edge upsert/reverse-lookup/cleanup on delete); security
+(no `Secret` ever serialized; token absent from every Dynamo item, S3 object,
+captured log).
 
 ## Out of scope
 
-- Live/incremental sync (this is a one-time import; re-run is manual).
-- Quip live-app/embedded non-spreadsheet widgets beyond best-effort HTML.
-- Importing Quip access-control/sharing (imported docs are owned by the
-  importing user).
+Live/incremental sync; non-spreadsheet Quip live-apps beyond best-effort HTML;
+importing Quip ACLs (imported docs owned by the importer).
 
-## Reference (consult, do not copy)
+## Reference (consult, don't copy)
 
-`github.com/quip/quip-api` — `samples/baqup` (full-account export; its
-rate-limit troubles motivate the throttle) and `quip.py` for endpoint shapes.
+`github.com/quip/quip-api` — `samples/baqup` (rate-limit cautionary tale) +
+`quip.py` endpoint shapes.
