@@ -77,6 +77,25 @@ async fn quip_unauthorized_server() -> MockServer {
     server
 }
 
+/// Wiremock Quip server whose `/1/folders/` always 503s — a transient
+/// (rate-limit-class) error that the handler must surface as `Err` for the
+/// queue to retry.
+async fn quip_transient_error_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/1/folders/"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    server
+}
+
+const CLAIM_STALE_MS: i64 = 30_000; // mirror worker_mode::CLAIM_STALE_MS
+
+fn now_ms() -> i64 {
+    ogrenotes_common::time::now_usec() / 1000
+}
+
 /// Seed a `Scoping` import record with the given owner + selected roots,
 /// returning its id.
 async fn seed_scoping_import(app: &common::TestApp, owner: &str, roots: &[&str]) -> String {
@@ -242,4 +261,112 @@ async fn inventory_token_rejected_sets_status() {
         ImportStatus::TokenRejected,
         "a revoked token must set TokenRejected, not a generic Failed"
     );
+
+    // The runner claim must be released even on this early (non-happy)
+    // exit — a fresh instance can immediately re-claim (Ok(true) proves no
+    // live lease was left behind by the clear-on-every-exit guard).
+    let reclaimed = app
+        .state
+        .import_repo
+        .claim_runner(&import_id, "fresh-after-tokenrejected", now_ms(), CLAIM_STALE_MS)
+        .await
+        .unwrap();
+    assert!(reclaimed, "handler must clear the lease on the token-rejected path");
+}
+
+/// Regression: a crashed worker's still-fresh-looking DDB lease must not
+/// strand the import when the queue redelivers the entry. With
+/// `CLAIM_STALE_MS` (30s) below the reaper interval (60s), a lease whose
+/// heartbeat is ~61s old is stale by redelivery time, so the handler
+/// reclaims it and drives the import to completion instead of no-opping and
+/// acking the job away.
+#[tokio::test]
+async fn inventory_reclaims_stale_lease() {
+    common::require_infra!();
+    let server = quip_fixture_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1", &["root"]).await;
+    app.state
+        .quip_token_store
+        .put(&import_id, &QuipToken::new("tok".into()))
+        .await
+        .unwrap();
+
+    // Simulate a crashed worker: a lease whose heartbeat is 61s old. Passing
+    // an old `now_ms` sets `runner_heartbeat_ms` to that old timestamp.
+    let acquired = app
+        .state
+        .import_repo
+        .claim_runner(&import_id, "crashed-inst", now_ms() - 61_000, CLAIM_STALE_MS)
+        .await
+        .unwrap();
+    assert!(acquired, "seed: crashed worker acquires the lease");
+
+    // The redelivered handler (fresh instance id) must reclaim the stale
+    // lease and complete — NOT no-op and get acked while the import strands.
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.phase, 1, "reclaimed run must reach phase 1");
+    let (total, _) = app.state.import_repo.count_threads_by_state(&import_id).await.unwrap();
+    assert_eq!(total, 2, "reclaimed run must persist the discovered threads");
+}
+
+/// The happy path must release the runner claim on success so a subsequent
+/// run (or Phase-2 handler) can re-acquire immediately rather than waiting
+/// out the stale window.
+#[tokio::test]
+async fn inventory_clears_lease_on_success() {
+    common::require_infra!();
+    let server = quip_fixture_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1", &["root"]).await;
+    app.state
+        .quip_token_store
+        .put(&import_id, &QuipToken::new("tok".into()))
+        .await
+        .unwrap();
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    // No live lease should remain: a fresh instance claims immediately.
+    let reclaimed = app
+        .state
+        .import_repo
+        .claim_runner(&import_id, "fresh-after-success", now_ms(), CLAIM_STALE_MS)
+        .await
+        .unwrap();
+    assert!(reclaimed, "successful run must clear the runner claim");
+}
+
+/// A transient Quip error must surface as `Err` (so the queue retries) AND
+/// the runner claim must be released on that error exit — otherwise the
+/// retry (running under a different instance id) would see a live lease,
+/// no-op, and get acked, stranding the import.
+#[tokio::test]
+async fn inventory_clears_lease_on_transient_error() {
+    common::require_infra!();
+    let server = quip_transient_error_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1", &["root"]).await;
+    app.state
+        .quip_token_store
+        .put(&import_id, &QuipToken::new("tok".into()))
+        .await
+        .unwrap();
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    let result = execute_start_quip_import(&ctx, &import_id, "owner1").await;
+    assert!(result.is_err(), "a transient (503) error must return Err for the queue to retry");
+
+    // Lease released despite the Err → the retry can re-claim.
+    let reclaimed = app
+        .state
+        .import_repo
+        .claim_runner(&import_id, "fresh-after-transient", now_ms(), CLAIM_STALE_MS)
+        .await
+        .unwrap();
+    assert!(reclaimed, "handler must clear the lease on a transient-error exit");
 }

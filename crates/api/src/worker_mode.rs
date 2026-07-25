@@ -111,13 +111,19 @@ const REAPER_INTERVAL_SECS: u64 = 30;
 /// threshold.
 const REAPER_MIN_IDLE_MS: u64 = 60_000;
 
-/// Inventory-lease staleness cutoff (ms). Kept above [`REAPER_MIN_IDLE_MS`]
-/// so the DynamoDB lease outlives one reaper cycle: a runner that is still
-/// making progress won't have its lease stolen out from under it before it
-/// heartbeats. The lease is an optimization (avoid two runners walking the
-/// same import), not a correctness gate — `put_thread` insert-if-absent is
-/// the real idempotency net, so a rare double-run is harmless.
-const CLAIM_STALE_MS: i64 = 90_000;
+/// Inventory-lease staleness cutoff (ms). Deliberately kept BELOW
+/// [`REAPER_MIN_IDLE_MS`] (60s) so a crashed worker's DynamoDB lease looks
+/// stale by the time the Redis reaper redelivers the orphaned entry (~60s):
+/// the redelivered handler then finds the ~60s-old lease past this 30s
+/// cutoff → `claim_runner` returns `Ok(true)` → it reclaims and resumes. If
+/// this sat above the reaper interval, a redelivered crashed job would see
+/// the dead worker's lease as still-live, no-op, get acked, and the import
+/// would strand — defeating crash-resumability. A live long-running walk
+/// heartbeats (folder→meta boundary and per thread-meta chunk) to keep its
+/// lease fresh; a rare stolen-live lease only causes a harmless double-run
+/// (`put_thread` is insert-if-absent), so the lease is an optimization, not
+/// a correctness gate.
+const CLAIM_STALE_MS: i64 = 30_000;
 
 /// Thread-metadata fetch batch size for `/1/threads/`. Quip accepts many
 /// ids per call; 100 keeps each request comfortably under URL limits.
@@ -584,8 +590,12 @@ pub async fn execute_start_quip_import(
     let instance = worker_instance_id();
     let now_ms = ogrenotes_common::time::now_usec() / 1000;
 
-    // Best-effort lease. `Ok(false)` means a live runner already owns this
-    // import — nothing to do (NOT an error).
+    // Best-effort lease. `Ok(false)` means a genuinely-live *other* runner
+    // owns this import — nothing to do (NOT an error), and we must NOT clear
+    // the claim: it belongs to that runner. `Ok(true)` means either no claim
+    // existed or the prior holder's heartbeat is stale (past CLAIM_STALE_MS,
+    // which sits below the reaper interval so a crashed worker's lease is
+    // reclaimable by the time the entry is redelivered).
     if !ctx
         .import_repo
         .claim_runner(import_id, &instance, now_ms, CLAIM_STALE_MS)
@@ -596,6 +606,26 @@ pub async fn execute_start_quip_import(
         return Ok(());
     }
 
+    // From here we OWN the lease. Clear it on EVERY exit — success OR error —
+    // so a mid-handler failure never leaves a held claim that would make the
+    // queue's retry (running under a *different* instance id) see a live
+    // lease, no-op, and get acked as success while the import stays stranded
+    // below phase 1. This mirrors what `mark_quip_failure` does for Quip
+    // errors, now applied uniformly to DDB-error `?`-returns too.
+    let result = run_inventory(ctx, import_id, owner_id, &instance).await;
+    ctx.import_repo.clear_runner_claim(import_id).await.ok();
+    result
+}
+
+/// The owned-lease body of the inventory handler. Split out so
+/// [`execute_start_quip_import`] can clear the runner claim on every exit
+/// path (via a single guard) regardless of where the body returns.
+async fn run_inventory(
+    ctx: &WorkerCtx,
+    import_id: &str,
+    owner_id: &str,
+    instance: &str,
+) -> Result<(), String> {
     let record = ctx
         .import_repo
         .get(import_id)
@@ -620,7 +650,6 @@ pub async fn execute_start_quip_import(
                 .set_status(import_id, ImportStatus::TokenRejected)
                 .await
                 .ok();
-            ctx.import_repo.clear_runner_claim(import_id).await.ok();
             tracing::warn!(import_id, "quip inventory: no token in store; TokenRejected");
             return Ok(());
         }
@@ -644,13 +673,13 @@ pub async fn execute_start_quip_import(
     .await
     {
         Ok(inv) => inv,
-        Err(e) => return mark_quip_failure(ctx, import_id, &instance, &e).await,
+        Err(e) => return mark_quip_failure(ctx, import_id, &e).await,
     };
 
     // Heartbeat between the folder walk and the thread-meta fetch so a
     // large tree doesn't look stalled to the reaper.
     ctx.import_repo
-        .heartbeat_runner(import_id, &instance, ogrenotes_common::time::now_usec() / 1000)
+        .heartbeat_runner(import_id, instance, ogrenotes_common::time::now_usec() / 1000)
         .await
         .ok();
 
@@ -673,9 +702,9 @@ pub async fn execute_start_quip_import(
 
     // Fetch thread metadata in id-batches, then persist THREAD# rows
     // (insert-if-absent → a re-run never downgrades an advanced thread).
-    let meta = match fetch_thread_meta(&client, &token, &inv).await {
+    let meta = match fetch_thread_meta(&client, &token, &inv, ctx, import_id, instance).await {
         Ok(m) => m,
-        Err(e) => return mark_quip_failure(ctx, import_id, &instance, &e).await,
+        Err(e) => return mark_quip_failure(ctx, import_id, &e).await,
     };
     for t in &inv.threads {
         let m = meta.get(&t.quip_thread_id);
@@ -711,27 +740,27 @@ pub async fn execute_start_quip_import(
         .set_phase(import_id, 1)
         .await
         .map_err(|e| format!("set phase: {e}"))?;
-    ctx.import_repo.clear_runner_claim(import_id).await.ok();
     tracing::info!(import_id, total, "quip inventory: phase 1 complete");
     Ok(())
 }
 
 /// Map a [`QuipError`] hit during the inventory walk to the handler's
-/// return disposition:
+/// return disposition. The runner claim is released by the caller's
+/// clear-on-every-exit guard in [`execute_start_quip_import`], so this
+/// helper only decides status + Ok/Err:
 ///
 /// - `Unauthorized` → the stored token is revoked/expired and won't recover
-///   on retry. Flip status to `TokenRejected`, release the lease, and return
-///   `Ok(())` — terminal for this run; the UI prompts a reconnect. Returning
-///   `Err` here would burn the retry budget hammering Quip with a dead token.
-/// - transient (`RateLimited`/`Http`/`Api`/`Parse`) → release the lease and
-///   return `Err` so the queue's retry/reaper resumes the job. The walk
-///   restarts from scratch, which insert-if-absent makes cheap and safe.
+///   on retry. Flip status to `TokenRejected` and return `Ok(())` — terminal
+///   for this run; the UI prompts a reconnect. Returning `Err` here would
+///   burn the retry budget hammering Quip with a dead token.
+/// - transient (`RateLimited`/`Http`/`Api`/`Parse`) → return `Err` so the
+///   queue's retry/reaper resumes the job. The walk restarts from scratch,
+///   which insert-if-absent makes cheap and safe.
 ///
 /// Never logs or formats the token (the `QuipError` variants never carry it).
 async fn mark_quip_failure(
     ctx: &WorkerCtx,
     import_id: &str,
-    _instance: &str,
     err: &QuipError,
 ) -> Result<(), String> {
     match err {
@@ -740,14 +769,10 @@ async fn mark_quip_failure(
                 .set_status(import_id, ImportStatus::TokenRejected)
                 .await
                 .ok();
-            ctx.import_repo.clear_runner_claim(import_id).await.ok();
             tracing::warn!(import_id, "quip inventory: token rejected (401/403); TokenRejected");
             Ok(())
         }
         transient => {
-            // Release the lease so the retrying runner can re-claim without
-            // waiting out the stale window.
-            ctx.import_repo.clear_runner_claim(import_id).await.ok();
             tracing::warn!(import_id, error = %transient, "quip inventory: transient failure; will retry");
             Err(format!("quip inventory transient error: {transient}"))
         }
@@ -756,12 +781,16 @@ async fn mark_quip_failure(
 
 /// Fetch thread metadata for every discovered thread in id-batches of
 /// [`THREAD_META_CHUNK`], collecting into a `quip_thread_id -> QuipThread`
-/// map. Threads with no returned metadata are simply absent (the caller
-/// defaults their fields).
+/// map. Heartbeats the runner lease after each chunk so a long metadata
+/// fetch keeps its lease fresh and isn't needlessly reclaimed. Threads with
+/// no returned metadata are simply absent (the caller defaults their fields).
 async fn fetch_thread_meta(
     client: &QuipClient,
     token: &QuipToken,
     inv: &ogrenotes_quip_import::Inventory,
+    ctx: &WorkerCtx,
+    import_id: &str,
+    instance: &str,
 ) -> Result<std::collections::HashMap<String, QuipThread>, QuipError> {
     let mut meta = std::collections::HashMap::new();
     let ids: Vec<String> = inv.threads.iter().map(|t| t.quip_thread_id.clone()).collect();
@@ -769,6 +798,10 @@ async fn fetch_thread_meta(
         for t in client.threads(token, chunk).await? {
             meta.insert(t.id.clone(), t);
         }
+        ctx.import_repo
+            .heartbeat_runner(import_id, instance, ogrenotes_common::time::now_usec() / 1000)
+            .await
+            .ok();
     }
     Ok(meta)
 }
