@@ -12,15 +12,16 @@
 //! the stashed token and marks the manifest `Failed` before returning
 //! the error — a live Quip token is never left stranded in the store.
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use ogrenotes_common::id::new_id;
 use ogrenotes_common::time::now_usec;
 use ogrenotes_quip_import::{QuipError, QuipToken};
+use ogrenotes_storage::models::AccessLevel;
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
 
 use crate::error::ApiError;
@@ -28,7 +29,10 @@ use crate::middleware::auth::AuthUser;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/quip/connect", post(connect))
+    Router::new()
+        .route("/quip/connect", post(connect))
+        .route("/quip/{id}/start", post(start))
+        .route("/quip/{id}", get(get_status))
 }
 
 // ─── DTOs ──────────────────────────────────────────────────────
@@ -203,4 +207,129 @@ fn map_quip_error(err: QuipError) -> ApiError {
             ApiError::ServiceUnavailable("Quip API error".to_string())
         }
     }
+}
+
+// ─── Task 4: start + status ───────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartRequest {
+    selected_root_folder_ids: Vec<String>,
+    target_folder_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartResponse {
+    import_id: String,
+    status: String,
+}
+
+/// `POST /api/v1/imports/quip/{id}/start` — body
+/// `{ "selectedRootFolderIds": [...], "targetFolderId": "..." }`.
+///
+/// Owner-gates the import row, authorizes the destination folder
+/// (`check_folder_access` hides an unauthorized/missing folder as 404,
+/// same as a missing/foreign import), persists the chosen scope, then
+/// enqueues the token-free `Job::StartQuipImport` trigger the worker
+/// (Task 3) claims and runs. Deliberately does NOT write `status: Running`
+/// here — the worker sets that authoritatively when it claims the job;
+/// the `"running"` in the response body is only the optimistic label the
+/// wizard shows while the worker spins up.
+async fn start(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(import_id): Path<String>,
+    Json(req): Json<StartRequest>,
+) -> Result<(StatusCode, Json<StartResponse>), ApiError> {
+    state
+        .import_repo
+        .get(&import_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .filter(|r| r.owner_id == user_id)
+        .ok_or_else(|| ApiError::NotFound("import not found".to_string()))?;
+
+    super::folders::check_folder_access(&state, &req.target_folder_id, &user_id, AccessLevel::Edit)
+        .await?;
+
+    state
+        .import_repo
+        .set_scope(&import_id, &req.selected_root_folder_ids, &req.target_folder_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let producer = state
+        .job_producer
+        .as_ref()
+        .ok_or_else(|| ApiError::ServiceUnavailable("job queue unavailable".to_string()))?;
+    producer
+        .enqueue(ogrenotes_worker::Job::StartQuipImport {
+            import_id: import_id.clone(),
+            owner_id: user_id,
+        })
+        .await
+        .map_err(|e| ApiError::ServiceUnavailable(format!("enqueue failed: {e}")))?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(StartResponse {
+            import_id,
+            status: "running".to_string(),
+        }),
+    ))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusResponse {
+    status: String,
+    phase: u8,
+    progress: Progress,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Progress {
+    done: usize,
+    total: usize,
+    stage: String,
+}
+
+/// `GET /api/v1/imports/quip/{id}` — owner-gated status + progress poll
+/// for the wizard. A different user (or a nonexistent id) gets 404, never
+/// 403 — same existence-hiding convention as `start`.
+async fn get_status(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(import_id): Path<String>,
+) -> Result<Json<StatusResponse>, ApiError> {
+    let record = state
+        .import_repo
+        .get(&import_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .filter(|r| r.owner_id == user_id)
+        .ok_or_else(|| ApiError::NotFound("import not found".to_string()))?;
+
+    let (total, done) = state
+        .import_repo
+        .count_threads_by_state(&import_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let stage = if record.phase >= 1 { "inventory" } else { "scoping" };
+
+    Ok(Json(StatusResponse {
+        status: serde_json::to_string(&record.status)
+            .unwrap()
+            .trim_matches('"')
+            .to_string(),
+        phase: record.phase,
+        progress: Progress {
+            done,
+            total,
+            stage: stage.to_string(),
+        },
+    }))
 }
