@@ -148,8 +148,14 @@ pub fn QuipImportWizard(
             return;
         }
         leptos::task::spawn_local(async move {
-            if let Ok(me) = client::api_get::<UserMeResponse>("/users/me").await {
-                set_home_folder_id.set(Some(me.home_folder_id));
+            // Surface a failed lookup into the wizard's error banner — the
+            // Continue button is disabled while `home_folder_id` is None, so a
+            // swallowed error would strand it with no message. `ApiClientError`'s
+            // `Display` is opaque (status + x-request-id, never a body — see
+            // `do_connect`), so it's safe to surface directly.
+            match client::api_get::<UserMeResponse>("/users/me").await {
+                Ok(me) => set_home_folder_id.set(Some(me.home_folder_id)),
+                Err(e) => set_error.set(Some(e.to_string())),
             }
         });
     });
