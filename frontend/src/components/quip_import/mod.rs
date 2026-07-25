@@ -86,6 +86,22 @@ pub fn QuipImportWizard(
     let (polling, set_polling) = signal(false);
     let (progress, set_progress) = signal::<Option<imports::StatusResponse>>(None);
     let (terminal, set_terminal) = signal::<Option<ImportTerminal>>(None);
+    // Session identity for the poll loop. The wizard component stays
+    // mounted across close/reopen (only `visible` toggles via `<Show>`),
+    // so `polling`/`progress`/`terminal` are the SAME signals reused by
+    // every `do_start` in the component's lifetime. `polling` alone only
+    // guards the loop's *continue* points (top of iteration, before the
+    // sleep) — it does NOT guard the moment right after `get_status`
+    // resolves, so a loop that was live when the modal closed and got
+    // reopened+restarted before its in-flight request returned could
+    // write a stale import's status into the signals the NEW import's
+    // Step 3 is rendering, and re-enter its own loop as a second live
+    // poller. `generation` is bumped on every `do_start` (and effectively
+    // invalidated on close, since the next `do_start` after a reopen
+    // bumps it again); each loop iteration compares its captured value
+    // against the live one, both right after the await and before the
+    // sleep, and stops writing/looping the instant it's superseded.
+    let generation: RwSignal<u64> = RwSignal::new(0);
 
     let dialog_ref = NodeRef::<leptos::html::Div>::new();
     a11y::install_focus_trap(dialog_ref, visible.into());
@@ -97,10 +113,15 @@ pub fn QuipImportWizard(
     // live progress-poll loop is always stopped the instant the modal
     // is dismissed — the loop below re-checks this signal every tick
     // and right before its `await`, so it can't outlive the close.
+    // `generation` is bumped here too (belt-and-suspenders with
+    // `polling`/`on_cleanup`) so an in-flight loop's post-await identity
+    // check fails immediately on close, even before its next iteration
+    // would've re-checked `polling`.
     Effect::new(move |_| {
         let is_open = visible.get();
         set_token.set(String::new());
         set_polling.set(false);
+        generation.update(|g| *g = g.wrapping_add(1));
         if !is_open {
             return;
         }
@@ -207,21 +228,52 @@ pub fn QuipImportWizard(
                     set_terminal.set(None);
                     set_polling.set(true);
 
-                    // Poll loop: ~1500ms cadence, stopped by
-                    // `polling` (flipped false on modal close/reopen
-                    // by the reset Effect above, or by this loop
-                    // itself once the run reaches a terminal state)
-                    // or by `visible` going false directly. Checked
-                    // both before the request and before the sleep,
-                    // so at most one in-flight `get_status` outlives
-                    // a close — never the timer itself.
+                    // Bump the session generation and capture it — this
+                    // loop only ever writes `progress`/`terminal` (or
+                    // continues looping) while `generation` still equals
+                    // `my_gen`. The wizard component stays mounted across
+                    // close/reopen (only `visible` toggles), so those
+                    // signals are shared across every `do_start` in its
+                    // lifetime; without this check a stale loop from an
+                    // abandoned import could, after a close+reopen+
+                    // restart race, write its stale status into the NEW
+                    // import's Step 3 and keep running as a second live
+                    // poller (see task-5 fix report for the failure
+                    // sequence this closes).
+                    let my_gen = generation.get_untracked().wrapping_add(1);
+                    generation.set(my_gen);
+
+                    // Poll loop: ~1500ms cadence, stopped by `polling`
+                    // (flipped false on modal close/reopen by the reset
+                    // Effect above, or by this loop itself once the run
+                    // reaches a terminal state), by `visible` going
+                    // false directly, or by `generation` moving past
+                    // `my_gen` (this loop has been superseded by a
+                    // newer `do_start`). `polling`/`visible` are
+                    // checked before the request and before the sleep;
+                    // `generation` is additionally checked immediately
+                    // after `get_status` resolves and BEFORE any
+                    // `set_progress`/`set_terminal` write, so a
+                    // superseded loop can observe a stale response but
+                    // never act on it.
                     let poll_import_id = import_id.clone();
                     leptos::task::spawn_local(async move {
                         loop {
-                            if !polling.get_untracked() || !visible.get_untracked() {
+                            if !polling.get_untracked()
+                                || !visible.get_untracked()
+                                || generation.get_untracked() != my_gen
+                            {
                                 break;
                             }
-                            if let Ok(st) = imports::get_status(&poll_import_id).await {
+                            let status = imports::get_status(&poll_import_id).await;
+                            // Re-check identity right after the await,
+                            // before touching any shared signal — a
+                            // reopen+restart could have superseded this
+                            // loop while the request was in flight.
+                            if generation.get_untracked() != my_gen {
+                                break;
+                            }
+                            if let Ok(st) = status {
                                 let is_failure = matches!(
                                     st.status.as_str(),
                                     "failed" | "tokenrejected" | "cancelled"
@@ -249,7 +301,10 @@ pub fn QuipImportWizard(
                             // request shouldn't flash an error banner
                             // over an otherwise-healthy "Scanning…"
                             // view.
-                            if !polling.get_untracked() || !visible.get_untracked() {
+                            if !polling.get_untracked()
+                                || !visible.get_untracked()
+                                || generation.get_untracked() != my_gen
+                            {
                                 break;
                             }
                             gloo_timers::future::TimeoutFuture::new(1500).await;
