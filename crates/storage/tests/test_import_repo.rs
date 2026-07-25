@@ -14,6 +14,7 @@ use ogrenotes_common::id::new_id;
 use ogrenotes_common::time::now_usec;
 use ogrenotes_storage::dynamo::DynamoClient;
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
+use ogrenotes_storage::models::import_inventory::{ThreadRow, ThreadState};
 use ogrenotes_storage::repo::import_repo::ImportRepo;
 
 static INFRA_AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
@@ -243,4 +244,51 @@ async fn import_record_never_carries_a_token_field() {
 
     assert!(!raw.contains_key("token"));
     assert!(!raw.contains_key("secret"));
+}
+
+fn pending_thread(quip_thread_id: &str, state: ThreadState) -> ThreadRow {
+    ThreadRow {
+        quip_thread_id: quip_thread_id.to_string(),
+        owner_id: "u1".to_string(),
+        title: "Doc".to_string(),
+        thread_type: "document".to_string(),
+        updated_usec: 42,
+        member_folders: vec!["qf1".to_string()],
+        first_folder: "qf1".to_string(),
+        state,
+        ogre_doc_id: None,
+    }
+}
+
+/// Resume-safety invariant: a re-run of inventory BFS re-discovers the
+/// same thread and tries to (re)insert it as `Pending`. `put_thread` must
+/// be insert-if-absent — it must never clobber a row that Phase 2 has
+/// already advanced past `Pending`.
+#[tokio::test]
+async fn put_thread_is_insert_if_absent() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    let t0 = pending_thread("qt1", ThreadState::Pending);
+    let mut advanced = t0.clone();
+    advanced.state = ThreadState::ContentDone;
+
+    // Seed the advanced (Phase-2-progressed) row.
+    repo.put_thread(&record.import_id, &advanced)
+        .await
+        .expect("seed advanced");
+    // A second inventory run tries to (re)insert the Pending version.
+    repo.put_thread(&record.import_id, &t0)
+        .await
+        .expect("re-run insert-if-absent");
+
+    let rows = repo.list_threads(&record.import_id).await.expect("list_threads");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].state,
+        ThreadState::ContentDone,
+        "re-run must not downgrade"
+    );
 }
