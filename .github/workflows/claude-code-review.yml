@@ -1,17 +1,29 @@
 name: Claude Code Review
 
+# ─── DISABLED ──────────────────────────────────────────────────────────
+# This workflow calls anthropics/claude-code-action, which consumes the
+# repo's ANTHROPIC_API_KEY secret (billed usage) on every pull request.
+# It has been disabled to stop that automatic key consumption:
+#   1. the automatic `pull_request` trigger below is removed (only manual
+#      `workflow_dispatch` remains, so it never fires on its own), AND
+#   2. the job is hard-gated with `if: false`, so even a manual dispatch
+#      is a no-op and the key-using step never runs.
+# To RE-ENABLE: restore the `pull_request` trigger and delete the
+# `if: false` guard on the job.
+#
+# Original trigger (restore to re-enable):
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, ready_for_review, reopened]
 on:
-  pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
-    # Optional: Only run on specific file changes
-    # paths:
-    #   - "src/**/*.ts"
-    #   - "src/**/*.tsx"
-    #   - "src/**/*.js"
-    #   - "src/**/*.jsx"
+  workflow_dispatch:
 
 jobs:
   claude-review:
+    # Hard-disabled — see the DISABLED banner at the top of this file.
+    # Delete this line to re-enable (and restore the pull_request trigger).
+    if: false
+
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||
