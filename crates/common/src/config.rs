@@ -255,6 +255,14 @@ pub struct AppConfig {
     /// user without blocking legitimate batch UX.
     pub rate_limit_bulk_op_per_min: u64,
 
+    // Quip import Phase 0 Task 7 — connect-token rate limit.
+    /// Per-user cap on `POST /api/v1/imports/quip/connect` per
+    /// minute. Each call makes 1-2 outbound requests to
+    /// platform.quip.com (current_user + folders) on the caller's
+    /// behalf; a tight cap keeps a compromised session from being
+    /// used to brute-force-probe Quip tokens through our server.
+    pub rate_limit_quip_connect_per_min: u64,
+
     // M-E7 trash-cleanup worker (item 9).
     /// Enable the daily trash-purge scheduler. When false, the
     /// hourly tick short-circuits before querying the deleted_at
@@ -577,6 +585,9 @@ impl AppConfig {
             rate_limit_bulk_op_per_min: env_or("RATE_LIMIT_BULK_OP_PER_MIN", "20")
                 .parse()
                 .unwrap_or_else(|_| panic!("RATE_LIMIT_BULK_OP_PER_MIN must be a positive integer")),
+            rate_limit_quip_connect_per_min: env_or("RATE_LIMIT_QUIP_CONNECT_PER_MIN", "10")
+                .parse()
+                .unwrap_or_else(|_| panic!("RATE_LIMIT_QUIP_CONNECT_PER_MIN must be a positive integer")),
             rate_limit_dev_login_per_min: env_or("RATE_LIMIT_DEV_LOGIN_PER_MIN", "100")
                 .parse()
                 .unwrap_or_else(|_| panic!("RATE_LIMIT_DEV_LOGIN_PER_MIN must be a positive integer")),
@@ -813,6 +824,7 @@ mod tests {
             rate_limit_import_per_min: 10,
             rate_limit_bulk_export_per_min: 5,
             rate_limit_bulk_op_per_min: 20,
+            rate_limit_quip_connect_per_min: 10,
             rate_limit_dev_login_per_min: 100,
             trash_cleanup_enabled: false,
             trash_retention_days: 30,
@@ -1025,6 +1037,7 @@ mod tests {
             rate_limit_import_per_min: 10,
             rate_limit_bulk_export_per_min: 5,
             rate_limit_bulk_op_per_min: 20,
+            rate_limit_quip_connect_per_min: 10,
             rate_limit_dev_login_per_min: 100,
             trash_cleanup_enabled: false,
             trash_retention_days: 30,

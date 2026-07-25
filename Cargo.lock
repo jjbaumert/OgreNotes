@@ -3757,6 +3757,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
+ "wiremock",
  "yrs",
  "zip 2.4.2",
 ]
