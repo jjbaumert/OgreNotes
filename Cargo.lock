@@ -3894,7 +3894,6 @@ dependencies = [
  "aws-sdk-ssm",
  "dashmap",
  "ogrenotes-common",
- "ogrenotes-storage",
  "reqwest",
  "secrecy",
  "serde",
