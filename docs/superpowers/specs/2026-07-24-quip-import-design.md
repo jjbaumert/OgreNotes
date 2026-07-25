@@ -301,28 +301,6 @@ merges:
   `DocMention` create/convert/resolve paths to feed `LinkRepo`, so backlinks
   are live for user-authored mentions too — not import-only.
 
-### Open Item C — the re-run dedup record (for disposition)
-
-Idempotent re-run needs to answer, months later, "has this Quip thread
-already been imported, and did it change?" That requires a durable
-`quip_thread_id → ogre_doc_id (+ imported updated_usec)` record. Three homes:
-
-1. **The import manifest's `THREAD#` rows.** Zero new storage, but the
-   manifest partition TTL-expires 30 days after completion, so a later re-run
-   would find nothing — dedup would silently fail and re-import duplicates.
-   *(Not recommended for real re-run durability.)*
-2. **A field on `DocumentMeta` (`quip_thread_id`) + a GSI.** Durable and
-   queryable directly from the doc, forever. Cost: a schema change to the
-   core document table + an index. Also couples the generic doc model to an
-   importer concept.
-3. **A small dedicated permanent "import provenance" table**
-   (`PK = IMPORTED#<owner_id>#<quip_thread_id> → {doc_id, updated_usec}`).
-   Durable + queryable, no TTL, and keeps the importer concern out of the
-   core doc schema. *(Recommended.)*
-
-Recommendation: **option 3.** It gives correct re-run behavior indefinitely
-without touching `DocumentMeta` or relying on the ephemeral manifest.
-
 ## Build order (each phase demoable on a real account)
 
 0. `quip-import` skeleton + `QuipClient`/throttle + `/1/users/current` +
