@@ -85,6 +85,25 @@ struct FolderMeta {
     title: String,
 }
 
+/// The subset of Quip's thread object we need.
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuipThread {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default, rename = "type")]
+    pub thread_type: String,
+    #[serde(default)]
+    pub updated_usec: i64,
+}
+
+/// A thread as returned inside `/1/threads/?ids=...`, which wraps each
+/// requested thread under a `thread` key.
+#[derive(Debug, Deserialize)]
+struct ThreadEnvelope {
+    thread: QuipThread,
+}
+
 // ─── Client ────────────────────────────────────────────────────
 
 pub struct QuipClient {
@@ -146,6 +165,28 @@ impl QuipClient {
                 children: env.children,
             })
             .collect())
+    }
+
+    /// `GET /1/threads/?ids=<comma-joined>`. Short-circuits to `Ok(vec![])`
+    /// for an empty `ids` (avoids an `ids=` query Quip could 400 on).
+    pub async fn threads(&self, t: &QuipToken, ids: &[String]) -> Result<Vec<QuipThread>, QuipError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.throttle.acquire().await;
+
+        let resp = self
+            .http
+            .get(format!("{}/1/threads/", self.base))
+            .bearer_auth(t.expose())
+            .query(&[("ids", ids.join(","))])
+            .send()
+            .await?;
+
+        let body: std::collections::HashMap<String, ThreadEnvelope> =
+            self.observe_and_check(resp).await?.json_body().await?;
+
+        Ok(body.into_values().map(|env| env.thread).collect())
     }
 
     /// Feed rate-limit headers into the throttle, then map non-2xx statuses
@@ -305,6 +346,33 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].url.query(), Some("ids=f1%2Cf2"));
+    }
+
+    #[tokio::test]
+    async fn threads_joins_ids_and_parses_metadata() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/1/threads/"))
+            .and(header("authorization", "Bearer tok-t"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "t1": {"thread": {"id":"t1","title":"Doc A","type":"document","updated_usec": 111}},
+                "t2": {"thread": {"id":"t2","title":"Sheet","type":"spreadsheet","updated_usec": 222}}
+            })))
+            .mount(&server)
+            .await;
+        let c = QuipClient::new(Some(server.uri()));
+        let mut ts = c
+            .threads(
+                &QuipToken::new("tok-t".into()),
+                &["t1".into(), "t2".into()],
+            )
+            .await
+            .unwrap();
+        ts.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(ts.len(), 2);
+        assert_eq!(ts[0].id, "t1");
+        assert_eq!(ts[0].thread_type, "document");
+        assert_eq!(ts[1].updated_usec, 222);
     }
 
     #[tokio::test]
