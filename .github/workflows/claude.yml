@@ -1,22 +1,36 @@
 name: Claude Code
 
+# ─── DISABLED ──────────────────────────────────────────────────────────
+# This workflow calls anthropics/claude-code-action, which consumes the
+# repo's ANTHROPIC_API_KEY secret (billed usage) whenever someone writes
+# `@claude` in a comment/issue/review. It has been disabled to stop that
+# key consumption:
+#   1. the automatic event triggers below are removed (only manual
+#      `workflow_dispatch` remains), AND
+#   2. the job is hard-gated with `if: false`, so even a manual dispatch
+#      is a no-op and the key-using step never runs.
+# To RE-ENABLE: restore the event triggers and the original `if:` guard
+# (preserved in the comment on the job below), and remove `if: false`.
+#
+# Original triggers (restore to re-enable):
+#   on:
+#     issue_comment:            { types: [created] }
+#     pull_request_review_comment: { types: [created] }
+#     issues:                   { types: [opened, assigned] }
+#     pull_request_review:      { types: [submitted] }
 on:
-  issue_comment:
-    types: [created]
-  pull_request_review_comment:
-    types: [created]
-  issues:
-    types: [opened, assigned]
-  pull_request_review:
-    types: [submitted]
+  workflow_dispatch:
 
 jobs:
   claude:
-    if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    # Hard-disabled — see the DISABLED banner at the top of this file.
+    # Original @claude-mention guard (restore when re-enabling):
+    #   if: |
+    #     (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+    #     (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+    #     (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+    #     (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    if: false
     runs-on: ubuntu-latest
     permissions:
       contents: read

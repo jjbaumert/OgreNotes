@@ -152,6 +152,25 @@ export class ComputeConstruct extends Construct {
       }),
     );
 
+    // Quip import token store (SsmTokenStore). Each in-flight import stashes
+    // its Quip personal access token as a SecureString parameter under
+    // /<prefix>ogrenote/import/<import_id>/quip-token, and deletes it when the
+    // import finishes or fails. Scope the task role to exactly that subtree —
+    // NOT the sibling secret params (oauth/jwt/anthropic), which are injected
+    // by the execution role at container start and must stay out of reach of
+    // the running task. The parameters use the default AWS-managed KMS key
+    // (alias/aws/ssm), so no explicit kms:* grant is needed — SSM performs the
+    // encrypt/decrypt on the task's behalf via that key's policy.
+    const { account } = Stack.of(this);
+    taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: ['ssm:PutParameter', 'ssm:GetParameter', 'ssm:DeleteParameter'],
+        resources: [
+          `arn:aws:ssm:${region}:${account}:parameter/${prefix}ogrenote/import/*`,
+        ],
+      }),
+    );
+
     // ── Secrets from SSM SecureString (no plaintext env) ──
     const ssmSecret = (logicalId: string, name: string) =>
       ecs.Secret.fromSsmParameter(
