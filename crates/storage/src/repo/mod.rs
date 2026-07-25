@@ -4,6 +4,7 @@ pub mod activity_repo;
 pub mod admin_audit_repo;
 pub mod doc_repo;
 pub mod folder_repo;
+pub mod import_repo;
 pub mod mfa_recovery_repo;
 pub mod notification_repo;
 pub mod security_audit_repo;
