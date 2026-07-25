@@ -69,6 +69,7 @@ async fn main() {
         .await;
 
     let dynamo_client = aws_sdk_dynamodb::Client::new(&aws_config);
+    let ssm_client = aws_sdk_ssm::Client::new(&aws_config);
     // Path-style addressing is required for local S3-compatible stores
     // (MinIO) reached via a custom endpoint; they don't support the
     // virtual-host `<bucket>.host` form. Gate on AWS_ENDPOINT_URL_S3 so
@@ -227,6 +228,27 @@ async fn main() {
             None
         };
 
+    // Quip token store: SSM Parameter Store (KMS-backed SecureString) in
+    // prod, in-process in dev — the local compose stack has no SSM. Gated
+    // on the same DEV_MODE flag that already governs dev-only surface
+    // (dev-login, relaxed frontend-origin check) rather than a new env
+    // var. The SSM parameter namespace mirrors the CDK convention in
+    // `infra/lib/compute.ts` (`/${prefix}ogrenote/${name}`) by deriving
+    // the prefix from the existing `DYNAMODB_TABLE_PREFIX` — there's no
+    // separate "stack prefix" config field, and the table prefix is
+    // already the app's one source of truth for which stack it's in.
+    let quip_token_store: std::sync::Arc<dyn ogrenotes_quip_import::TokenStore> =
+        if config.dev_mode {
+            std::sync::Arc::new(ogrenotes_quip_import::InMemoryTokenStore::new())
+        } else {
+            let ssm_prefix = format!("/{}ogrenote/", config.dynamodb_table_prefix);
+            std::sync::Arc::new(ogrenotes_quip_import::SsmTokenStore::new(
+                ssm_client,
+                ssm_prefix,
+            ))
+        };
+    let quip_client = std::sync::Arc::new(ogrenotes_quip_import::QuipClient::new(None));
+
     // Build app state
     let state = AppState::new(
         config.clone(),
@@ -237,6 +259,8 @@ async fn main() {
         embedding_pipeline,
         claude_client,
         job_producer,
+        quip_token_store,
+        quip_client,
     );
 
     // Start background compaction task (checks every 60s, compacts rooms idle > 5min).

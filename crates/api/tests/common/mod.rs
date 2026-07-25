@@ -245,11 +245,35 @@ impl TestApp {
         Self::new_with_claude_and_admin_emails(None, admin_emails).await
     }
 
-    /// The full builder. The two constructors above are thin wrappers so
-    /// existing callers (`new`, `test_ask_acl`) keep their signatures.
+    /// Create a TestApp whose `state.quip_client` is pointed at `quip_base`
+    /// (typically a `wiremock::MockServer::uri()`) instead of the real
+    /// `platform.quip.com`. Used by the Quip-connect integration test
+    /// (Task 7) so `POST /imports/quip/connect` can be exercised without
+    /// making a real outbound call — `QuipClient::new(Some(base))` already
+    /// supports this; this constructor just threads it through the test
+    /// `AppState` the same way `new_with_claude` threads a stub Claude
+    /// client. Everything else uses the same defaults as `new()`.
+    #[allow(dead_code)]
+    pub async fn new_with_quip_base(quip_base: String) -> Self {
+        Self::new_full(None, Vec::new(), Some(quip_base)).await
+    }
+
+    /// Thin wrapper kept for existing callers' signatures — delegates to
+    /// `new_full` with no Quip base override (real `QuipClient::new(None)`,
+    /// i.e. `https://platform.quip.com`, which non-Quip tests never call).
     pub async fn new_with_claude_and_admin_emails(
         claude: Option<Arc<dyn ogrenotes_api::claude::ClaudeMessages>>,
         admin_emails: Vec<String>,
+    ) -> Self {
+        Self::new_full(claude, admin_emails, None).await
+    }
+
+    /// The full builder. The constructors above are thin wrappers so
+    /// existing callers (`new`, `test_ask_acl`) keep their signatures.
+    async fn new_full(
+        claude: Option<Arc<dyn ogrenotes_api::claude::ClaudeMessages>>,
+        admin_emails: Vec<String>,
+        quip_base: Option<String>,
     ) -> Self {
         // Force the tracing subscriber on first call so internal_error
         // logs surface in the failing-test stdout dump.
@@ -363,6 +387,7 @@ impl TestApp {
             rate_limit_import_per_min: 50,
             rate_limit_bulk_export_per_min: 50,
             rate_limit_bulk_op_per_min: 100,
+            rate_limit_quip_connect_per_min: 50,
             // Trash worker stays disabled in tests; the unit
             // tests for the cutoff arithmetic don't need the
             // scheduler running, and integration tests that
@@ -445,6 +470,12 @@ impl TestApp {
         .expect("job queue init");
         let job_producer: Arc<dyn ogrenotes_worker::JobProducer> = Arc::new(job_queue);
 
+        let quip_token_store: Arc<dyn ogrenotes_quip_import::TokenStore> =
+            Arc::new(ogrenotes_quip_import::InMemoryTokenStore::new());
+        // Real prod default (`None` -> platform.quip.com) unless the test
+        // asked for a mock base via `new_with_quip_base`.
+        let quip_client = Arc::new(ogrenotes_quip_import::QuipClient::new(quip_base));
+
         let state = AppState::new(
             config,
             dynamo,
@@ -454,6 +485,8 @@ impl TestApp {
             None,
             claude,
             Some(job_producer),
+            quip_token_store,
+            quip_client,
         );
         // Apply the same security-headers stack as production so
         // tests can assert against the live policy (#35). dev_mode

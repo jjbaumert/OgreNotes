@@ -36,7 +36,9 @@ ogrenotes-search = { workspace = true }
 ogrenotes-embeddings = { workspace = true }
 ogrenotes-notify = { workspace = true }
 ogrenotes-worker = { workspace = true }
+ogrenotes-quip-import = { workspace = true }
 aws-sdk-bedrockruntime = { workspace = true }
+aws-sdk-ssm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -97,3 +99,7 @@ futures-util = "0.3"
 # the test skips rather than false-fails there — see the file header).
 chrono = { workspace = true }
 samael = { workspace = true }
+# Quip-connect integration test (Task 7) mocks platform.quip.com so
+# `POST /imports/quip/connect` can be exercised without a real outbound
+# call. Same version `ogrenotes-quip-import`'s own unit tests already use.
+wiremock = "0.6"

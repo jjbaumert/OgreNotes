@@ -1,0 +1,25 @@
+[package]
+name = "ogrenotes-quip-import"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+publish.workspace = true
+
+[dependencies]
+ogrenotes-common = { workspace = true }
+ogrenotes-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+secrecy = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+aws-sdk-ssm = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }

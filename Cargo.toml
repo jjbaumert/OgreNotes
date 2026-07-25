@@ -12,6 +12,7 @@ members = [
     "crates/notify",
     "crates/worker",
     "crates/api",
+    "crates/quip-import",
 ]
 exclude = [
     "frontend",
@@ -113,6 +114,12 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 async-trait = "0.1"
 minijinja = "2"
 
+# Secrets
+secrecy = "0.8"
+
+# AWS (Quip import)
+aws-sdk-ssm = "1"
+
 # Workspace crates
 ogrenotes-common = { path = "crates/common" }
 ogrenotes-storage = { path = "crates/storage" }
@@ -124,6 +131,7 @@ ogrenotes-search = { path = "crates/search" }
 ogrenotes-embeddings = { path = "crates/embeddings" }
 ogrenotes-notify = { path = "crates/notify" }
 ogrenotes-worker = { path = "crates/worker" }
+ogrenotes-quip-import = { path = "crates/quip-import" }
 
 # Faster-compiling release profile used only by the AWS test-stack Docker
 # build. Trades ~10% runtime perf (no LTO, more codegen units) for ~30–50%

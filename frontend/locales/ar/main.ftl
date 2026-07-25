@@ -911,3 +911,20 @@ doc-block-link-missing = القسم المرتبط لم يعد موجودًا.
 # ─── Mentions spec §5 (Task 5) — per-viewer degradation overlay ──
 
 doc-mention-missing = مستند مفقود
+
+# ─── Quip import wizard (Phase 0) — shell-mounted, opens from the
+# sidebar "+ New" menu. Step 1: paste a token, connect, see the
+# profile + a root-folder checklist. The scope Continue is disabled
+# until Phase 1 wires the actual import.
+quip-import-menu-entry = استيراد من Quip…
+quip-import-title = استيراد من Quip
+quip-import-token-label = رمز واجهة برمجة تطبيقات Quip
+quip-import-token-placeholder = الصق رمز الوصول الشخصي الخاص بك في Quip
+quip-import-connect = اتصال
+quip-import-connecting = جارٍ الاتصال…
+quip-import-error = تعذّر الاتصال: { $err }
+quip-import-profile = متصل باسم { $name }
+quip-import-folder-scope-heading = اختر المجلدات المراد استيرادها
+quip-import-no-folders = لم يتم العثور على مجلدات في حساب Quip هذا.
+quip-import-continue = متابعة
+quip-import-continue-hint = قريبًا — الاستيراد المحدد بالمجلد غير مفعّل بعد.

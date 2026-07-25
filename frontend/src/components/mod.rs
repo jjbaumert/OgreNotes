@@ -38,6 +38,7 @@ pub mod mermaid_modal;
 pub mod notification_bell;
 pub mod notification_settings;
 pub mod profile_settings;
+pub mod quip_import;
 pub mod relationship_panel;
 pub mod share_dialog;
 pub mod search_dialog;

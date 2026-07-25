@@ -10,6 +10,7 @@ pub mod comments;
 pub mod documents;
 pub mod folders;
 pub mod history;
+pub mod imports;
 pub mod mfa;
 pub mod notifications;
 pub mod saml_config;
