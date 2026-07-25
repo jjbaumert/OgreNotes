@@ -33,7 +33,10 @@ pub fn router() -> Router<AppState> {
 
 // ─── DTOs ──────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+// No `Debug` derive: the plaintext token must never be printable, even by a
+// future `tracing::debug!(?req)`. (The value is moved into `QuipToken` — which
+// IS redacted — immediately in the handler.)
+#[derive(Deserialize)]
 struct ConnectRequest {
     token: String,
 }
