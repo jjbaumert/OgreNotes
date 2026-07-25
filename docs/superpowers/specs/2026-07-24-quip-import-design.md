@@ -116,7 +116,7 @@ after completion. **No row contains the token.**
 | `THREAD#<quip_thread_id>` | per-thread checkpoint (resumability unit) | `title`, `type`, `updated_usec`, `member_folders[]`, `state (Pending｜ContentDone｜CommentsDone｜Skipped{reason})`, `ogre_doc_id?`, `content_s3_key?`, `first_folder` |
 | `SECMAP#<quip_thread_id>[#<n>]` | section→block map | `{ quip_section_id: ogre_block_id }` (chunked <400 KB) |
 | `UNRESOLVED#<source_quip_thread_id>` | pending back-patch links | `[ {source_block_id, kind: doc｜section, target_quip_thread_id, target_quip_section_id?} ]` |
-| `IDMAP` | identity map | `{ quip_user_id: {name,email?,resolution} }` |
+| `IDMAP` | identity map — **PII, secure** | KMS-envelope-encrypted `{ quip_user_id: {name,email?,resolution} }`; held in memory during the run; deleted at any terminal state (same posture as the token). |
 | `REPORT` | accumulating report | counters + bounded list of named losses/fallbacks |
 
 Rationale for Dynamo-index + S3-payload split: Dynamo's 400 KB item cap makes
@@ -164,19 +164,26 @@ DynamoDB" and enables the "referenced by" surface (Open Item F).
   token; wizard scope checklist + target-folder picker; `start` estimates
   thread count and projects time from the 45/min throttle, enqueues trigger.
 - **Phase 1 Inventory** — BFS selected folders → `FOLDER#`/`THREAD#` rows.
-  **Dedup / tag membership:** import once at `first_folder`; represent the
-  other memberships as multi-`FolderChild` (one doc, several folders — the
-  native analog of Quip tag-folders). Diverges from the request's "mentions
-  at other locations," which has no home in the folder model. See Open Item D.
+  **Dedup / tag membership:** import once; set the created doc's
+  `DocumentMeta.folder_id` = first-encountered folder and
+  `additional_folder_ids` = every other folder the thread appeared in.
+  OgreNotes natively models multi-folder membership (`folder_id` ∪
+  `additional_folder_ids`), which is the exact analog of Quip's tag-folders —
+  one doc, multiple memberships, zero duplication. (Resolved: this is the
+  intended model, not a divergence.)
 - **Phase 2 Content** — per doc thread: fetch `/2` HTML → stage S3 → walk →
   assign `blockId` per block + persist `SECMAP` → fetch blobs → `put_object`
   under `blobs/{doc_id}/…` + set `Image.src` → emit placeholders + record
   `UNRESOLVED#` for intra-import links → create doc via the
   `persist_imported_document` path (+ explicit search index) preserving Quip
   timestamps → checkpoint `ContentDone`. Spreadsheet threads → native
-  Spreadsheet doc; embedded grids → threshold (Open Item A); chat threads →
-  skip, note. **Back-patch pass** after all `ContentDone`: resolve every
-  `UNRESOLVED#` edge → rewrite content → write `LinkRepo` edges.
+  Spreadsheet doc. Embedded grids aim for source parity (an inline live
+  grid); OgreNotes lacks that block today (issue #133) — interim: import the
+  grid as a native Spreadsheet doc + a `DocMention` inline where it was
+  embedded; migrate to a true inline block when #133 ships. No arbitrary size
+  threshold. Chat threads → skip, note. **Back-patch pass** after all
+  `ContentDone`: resolve every `UNRESOLVED#` edge → rewrite content → write
+  `LinkRepo` edges.
 - **Phase 3 People (front-loaded identity pre-pass, gated)** — page every
   thread's `/1/messages` once → stage pages to S3, collect distinct
   `author_id` + `created_usec` + section refs → resolve via `/1/users/` batch
@@ -198,8 +205,14 @@ DynamoDB" and enables the "referenced by" surface (Open Item F).
 
 ## Identity map semantics
 
-Compare key `email.trim().lowercase()` with `+tag` stripped for matching only
-(display keeps original). `matched` → real `user_id`, no metadata.
+The identity working-set (author id → name/email/resolution) is **PII**: it
+is front-loaded (pre-pass), held in memory during the run, and persisted only
+KMS-envelope-encrypted, deleted at any terminal state — it never sits in a
+plaintext manifest row. The durable outputs are the matched `user_id` links
+and, for unmatched authors, `imported_author` on each comment (which
+persists by design — decision 2). Compare key `email.trim().lowercase()` with
+`+tag` stripped for matching only (display keeps original). `matched` → real
+`user_id`, no metadata.
 `placeholder`/`anonymous` → sentinel `user_id="quip:<quip_user_id>"` +
 `imported_author` metadata, rendered with an external badge, never resolved as
 a real user. `skip` → omitted, counted. Only additive schema change to an
@@ -237,30 +250,49 @@ independent of the request-path limiter.
 - Per-doc transactionality: doc + its comments land completely or the
   `THREAD#` checkpoint stays short of `CommentsDone` and is retried.
 
-## Open items (dispose at review)
+## Open items
 
-- **A — embedded-spreadsheet inline threshold.** Proposed: ≤ 20 rows × 12
-  cols AND ≤ 200 non-empty cells → inline native `Table`; larger → separate
-  linked Spreadsheet doc. Standalone spreadsheet threads always own doc.
-- **B — identity pre-pass front-loaded** (messages fetched once, gate before
-  any comment write). Proposed as above.
-- **C — dedup index location.** Proposed: the import `THREAD#` rows (no
-  DocumentMeta change). Alt: add `quip_thread_id` to DocumentMeta (queryable
-  standalone, but a schema change).
-- **D — multi-folder membership vs mentions** for tag-folders. Proposed
-  multi-`FolderChild`. Needs a quick check that the sidebar renders a
-  multi-parent doc sanely; fallback: canonical folder only + report note.
-- **E — secure token store choice.** Proposed SSM SecureString (project-
-  idiomatic, KMS-backed, separate IAM) + delete-on-terminal + stale sweeper.
-  Alt: KMS-envelope-encrypted Dynamo item with native TTL (one store, harder
-  delete guarantees satisfied by TTL). Both add a runtime AWS SDK path not
-  present today.
-- **F — backlinks scope.** The `LinkRepo` index is in scope (import needs it
-  for back-patch + it's the reviewer's ask). Building the "Referenced by" UI
-  now (reuse `relationship_panel` + a `GET /documents/:id/backlinks`
-  endpoint) vs. laying only the index this milestone — dispose. Also dispose:
-  wire the editor mention paths to feed `LinkRepo` now (keeps backlinks live
-  for user mentions) or defer.
+- **A — DISPOSED.** Source parity is the target; where OgreNotes differs
+  (inline live-grid block), file a generic ticket → **issue #133**. No
+  arbitrary threshold. Interim: embedded grid → native Spreadsheet doc +
+  inline `DocMention`.
+- **B — DISPOSED.** Identity pre-pass front-loaded; the identity working-set
+  is memory-resident + secure-encrypted for the import's life (above).
+- **C — OPEN (needs your call).** Where the "already imported this Quip
+  thread" record lives, so a *future* re-run can skip/detect changes. See the
+  explanation below — three options, recommendation noted.
+- **D — DISPOSED.** OgreNotes natively supports multi-folder membership
+  (`DocumentMeta.folder_id` ∪ `additional_folder_ids`) — use it; no
+  divergence, no stub docs.
+- **E — DISPOSED.** SSM SecureString for the token (+ delete-on-terminal +
+  stale sweeper). (The IDMAP, being larger PII, uses KMS-envelope encryption
+  rather than SSM.)
+- **F — DISPOSED.** Build the "Referenced by" surface this milestone (reuse
+  `relationship_panel` + `GET /documents/:id/backlinks`) AND wire the editor
+  `DocMention` create/convert/resolve paths to feed `LinkRepo`, so backlinks
+  are live for user-authored mentions too — not import-only.
+
+### Open Item C — the re-run dedup record (for disposition)
+
+Idempotent re-run needs to answer, months later, "has this Quip thread
+already been imported, and did it change?" That requires a durable
+`quip_thread_id → ogre_doc_id (+ imported updated_usec)` record. Three homes:
+
+1. **The import manifest's `THREAD#` rows.** Zero new storage, but the
+   manifest partition TTL-expires 30 days after completion, so a later re-run
+   would find nothing — dedup would silently fail and re-import duplicates.
+   *(Not recommended for real re-run durability.)*
+2. **A field on `DocumentMeta` (`quip_thread_id`) + a GSI.** Durable and
+   queryable directly from the doc, forever. Cost: a schema change to the
+   core document table + an index. Also couples the generic doc model to an
+   importer concept.
+3. **A small dedicated permanent "import provenance" table**
+   (`PK = IMPORTED#<owner_id>#<quip_thread_id> → {doc_id, updated_usec}`).
+   Durable + queryable, no TTL, and keeps the importer concern out of the
+   core doc schema. *(Recommended.)*
+
+Recommendation: **option 3.** It gives correct re-run behavior indefinitely
+without touching `DocumentMeta` or relying on the ephemeral manifest.
 
 ## Build order (each phase demoable on a real account)
 
