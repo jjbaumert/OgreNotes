@@ -14,9 +14,10 @@ use tokio::sync::Mutex;
 
 use ogrenotes_common::time::now_usec;
 
-/// Quip's documented rate limit (requests/minute) — the default
-/// [`Throttle::new`] bakes in.
-pub const DEFAULT_RATE_PER_MIN: u32 = 50;
+/// The safety-margined rate limit (requests/minute) the default
+/// [`Throttle::new`] bakes in — 10% under Quip's documented 50/min hard
+/// limit, per the design.
+pub const DEFAULT_RATE_PER_MIN: u32 = 45;
 
 /// Wall-clock milliseconds since the Unix epoch, per the task contract
 /// (`now_usec() / 1000`).
@@ -62,7 +63,10 @@ impl RateState {
 /// If the last-observed server headers said `remaining_hint == 0`, the
 /// server's count is treated as authoritative over the local bucket and the
 /// wait is floored at `reset_at_ms - now_ms` — the local bucket may think a
-/// token is free, but the server has already said no.
+/// token is free, but the server has already said no. Once `now_ms` reaches
+/// `reset_at_ms`, that hint is considered stale (fresh headers should have
+/// superseded it by then) and is cleared so the local bucket resumes normal
+/// accounting rather than returning `0` unconditionally forever.
 pub fn plan_delay(state: &mut RateState, now_ms: i64, rate_per_min: u32) -> u64 {
     let capacity = (rate_per_min.max(1)) as f64;
 
@@ -75,7 +79,16 @@ pub fn plan_delay(state: &mut RateState, now_ms: i64, rate_per_min: u32) -> u64 
     state.last_refill_ms = now_ms;
 
     if state.remaining_hint == Some(0) && let Some(reset_at) = state.reset_at_ms {
-        return (reset_at - now_ms).max(0) as u64;
+        if now_ms < reset_at {
+            return (reset_at - now_ms).max(0) as u64;
+        }
+        // The server's reset window has passed without fresh headers
+        // arriving to supersede it. Treating the stale hint as
+        // authoritative forever would permanently bypass the local bucket
+        // (return 0 without ever spending a token). Clear it and fall
+        // through to normal token-bucket accounting.
+        state.remaining_hint = None;
+        state.reset_at_ms = None;
     }
 
     if state.tokens >= 1.0 {
@@ -214,6 +227,28 @@ mod tests {
     }
 
     #[test]
+    fn new_throttle_defaults_to_45_per_min_not_50() {
+        // Regression for the 50-vs-45 bug: `Throttle::new()` must bake in
+        // the design's 45/min safety margin, not Quip's raw 50/min limit.
+        // Drain 45 tokens at t=0 with zero delay, then the 46th must be
+        // delayed — if the default were still 50, this would fail (the
+        // 46th would sail through with delay 0).
+        let mut s = RateState::full(DEFAULT_RATE_PER_MIN, 0);
+        for _ in 0..45 {
+            assert_eq!(
+                plan_delay(&mut s, 0, DEFAULT_RATE_PER_MIN),
+                0,
+                "first 45 requests at t=0 should never be delayed"
+            );
+        }
+        let d = plan_delay(&mut s, 0, DEFAULT_RATE_PER_MIN);
+        assert!(
+            d > 0,
+            "46th request at t=0 must be delayed under the 45/min default, got {d}"
+        );
+    }
+
+    #[test]
     fn remaining_hint_zero_waits_for_reset() {
         let mut s = RateState::full(45, 0);
         s.remaining_hint = Some(0);
@@ -252,6 +287,37 @@ mod tests {
         let mut s = RateState::full(45, 0);
         s.remaining_hint = Some(0);
         assert_eq!(plan_delay(&mut s, 0, 45), 0); // bucket still has tokens
+    }
+
+    #[test]
+    fn stale_remaining_hint_is_cleared_and_bucket_reenforced_after_reset() {
+        // Regression: once remaining_hint == Some(0), plan_delay must not
+        // return 0 forever once now_ms passes reset_at_ms — it must clear
+        // the stale hint and fall through to real token-bucket accounting.
+        let mut s = RateState::full(45, 0);
+        s.remaining_hint = Some(0);
+        s.reset_at_ms = Some(1_000);
+
+        // Before reset: waits for the remaining reset window.
+        assert!(plan_delay(&mut s, 500, 45) > 0);
+
+        // Reset has passed: hint must be cleared and a token spent from the
+        // (still-full-ish) bucket rather than bypassing it with delay 0
+        // forever.
+        let _ = plan_delay(&mut s, 2_000, 45);
+        assert_eq!(s.remaining_hint, None, "stale hint must be cleared once reset passes");
+        assert_eq!(s.reset_at_ms, None, "stale reset_at_ms must be cleared once reset passes");
+
+        // Drain the rest of the bucket (44 more tokens, 45 already spent
+        // above) and confirm the bucket is actually enforced again — not
+        // perpetually returning 0.
+        for _ in 0..44 {
+            plan_delay(&mut s, 2_000, 45);
+        }
+        assert!(
+            plan_delay(&mut s, 2_000, 45) > 0,
+            "bucket must be enforced again after the stale hint is cleared"
+        );
     }
 
     #[test]
