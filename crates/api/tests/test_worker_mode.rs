@@ -225,6 +225,9 @@ fn worker_ctx(app: &common::TestApp) -> WorkerCtx {
         app.state.doc_repo.clone(),
         app.state.folder_repo.clone(),
         app.state.doc_repo.s3().clone(),
+        app.state.import_repo.clone(),
+        app.state.quip_token_store.clone(),
+        None,
     )
 }
 
