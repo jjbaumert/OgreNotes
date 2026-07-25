@@ -7,7 +7,10 @@
 //! `Scoping`, no token — see `ogrenotes_storage::models::import`), stashes
 //! the token in the `TokenStore` keyed by the new import id, and returns
 //! the caller's Quip profile plus their root folders so Task 8's wizard
-//! can render a folder picker.
+//! can render a folder picker. If any step after the token is stashed
+//! fails (currently: the folders fetch), the handler best-effort deletes
+//! the stashed token and marks the manifest `Failed` before returning
+//! the error — a live Quip token is never left stranded in the store.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -126,11 +129,19 @@ async fn connect(
     root_ids.push(quip_user.private_folder_id.clone());
     root_ids.extend(quip_user.shared_folder_ids.iter().cloned());
 
-    let folders = state
-        .quip_client
-        .folders(&token, &root_ids)
-        .await
-        .map_err(map_quip_error)?;
+    let folders = match state.quip_client.folders(&token, &root_ids).await {
+        Ok(folders) => folders,
+        Err(e) => {
+            // A live Quip token must never be left stranded: best-effort
+            // delete it from the store and mark the manifest row Failed
+            // (rather than a dangling Scoping row) before surfacing the
+            // error. Both are best-effort cleanup — their own failure
+            // must not mask the original Quip error, and neither may log
+            // or return the token.
+            rollback_stashed_token(&state, &import_id).await;
+            return Err(map_quip_error(e));
+        }
+    };
 
     let root_folders = folders
         .into_iter()
@@ -151,6 +162,21 @@ async fn connect(
             root_folders,
         }),
     ))
+}
+
+/// Best-effort cleanup for the "token stashed but a later step in
+/// `connect` failed" path: delete the stranded token and mark the
+/// manifest row `Failed` so it isn't left as a dangling `Scoping` row
+/// with no recoverable token. Never logs or returns the token itself;
+/// only `import_id`. Failures here are logged and swallowed — the
+/// caller already has a real error to report, and this is best-effort.
+async fn rollback_stashed_token(state: &AppState, import_id: &str) {
+    if let Err(e) = state.quip_token_store.delete(import_id).await {
+        tracing::error!(import_id = %import_id, error = %e, "quip token rollback delete failed");
+    }
+    if let Err(e) = state.import_repo.set_status(import_id, ImportStatus::Failed).await {
+        tracing::error!(import_id = %import_id, error = %e, "quip import rollback set_status failed");
+    }
 }
 
 /// Map a `QuipError` to the ApiError this route exposes. Never surfaces

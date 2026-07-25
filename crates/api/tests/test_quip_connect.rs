@@ -168,6 +168,102 @@ async fn connect_with_quip_401_returns_400_and_creates_nothing() {
     assert!(!has_import_row, "no IMPORT row should exist after a rejected token");
 }
 
+/// Task 7 adversarial-review fix: if `folders()` fails *after* the token
+/// has already been stashed in the `TokenStore`, the handler must roll
+/// the stash back — a live Quip token must never be left stranded with
+/// no forward path (a retry mints a fresh `import_id` and abandons the
+/// old one). Mounts a valid `/1/users/current` (so `token_store.put`
+/// happens) but a failing `/1/folders/` (so the handler's post-put step
+/// errors), then asserts: the response is 503, the manifest row (found
+/// via a raw scan for the `IMPORT#` PK the handler must have created) is
+/// `status = failed` rather than a dangling `scoping`, and the token
+/// store has no token for that import id.
+#[tokio::test]
+async fn connect_folders_failure_strands_no_token() {
+    common::require_infra!();
+
+    let quip_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/1/users/current"))
+        .and(header("authorization", "Bearer good-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "quip-u1",
+            "name": "Ada Lovelace",
+            "emails": ["ada@example.com"],
+            "private_folder_id": "pf1",
+            "shared_folder_ids": ["sf1"]
+        })))
+        .mount(&quip_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/1/folders/"))
+        .and(header("authorization", "Bearer good-token"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&quip_server)
+        .await;
+
+    let app = common::TestApp::new_with_quip_base(quip_server.uri()).await;
+    let (_user_id, ogre_token) = app.create_user("stranded@test.com").await;
+
+    let (status, json) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/imports/quip/connect",
+            Some(&ogre_token),
+            Some(serde_json::json!({ "token": "good-token" })),
+        )
+        .await;
+
+    assert_eq!(status, 503, "expected 503 from the folders() failure: {json}");
+
+    // The error response carries no importId, so recover it from a raw
+    // scan for the IMPORT# row the handler must have created before the
+    // folders() call — and assert it was rolled back to Failed rather
+    // than left as a dangling Scoping row.
+    let scan = app
+        .dynamo_client()
+        .scan()
+        .table_name(&app.table_name)
+        .send()
+        .await
+        .expect("scan");
+    let import_items: Vec<_> = scan
+        .items()
+        .iter()
+        .filter(|item| {
+            item.get("PK")
+                .and_then(|v| v.as_s().ok())
+                .is_some_and(|pk| pk.starts_with("IMPORT#"))
+        })
+        .collect();
+    assert_eq!(import_items.len(), 1, "expected exactly one IMPORT row: {import_items:?}");
+    let import_item = import_items[0];
+    assert_eq!(
+        import_item.get("status").and_then(|v| v.as_s().ok()),
+        Some(&"failed".to_string()),
+        "manifest row must be rolled back to failed, not left scoping: {import_item:?}"
+    );
+    let import_id = import_item
+        .get("PK")
+        .and_then(|v| v.as_s().ok())
+        .expect("PK present")
+        .strip_prefix("IMPORT#")
+        .expect("PK has IMPORT# prefix")
+        .to_string();
+
+    // The stranded token must be gone.
+    let stored = app
+        .state
+        .quip_token_store
+        .get(&import_id)
+        .await
+        .expect("token store get");
+    assert!(
+        stored.is_none(),
+        "a folders() failure after the token was stashed must delete it, found: {stored:?}"
+    );
+}
+
 #[tokio::test]
 async fn connect_without_ogrenotes_session_returns_401() {
     common::require_infra!();
