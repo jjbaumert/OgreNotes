@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use crate::dynamo::DynamoClient;
 use crate::models::import::{ImportRecord, ImportStatus};
+use crate::models::import_inventory::{FolderRow, ThreadRow, ThreadState};
 use crate::repo::{RepoError, get_n, get_s};
 
 /// Repository for the Quip import manifest (`IMPORT#<id>` / `META`).
@@ -82,6 +83,232 @@ impl ImportRepo {
             .await
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
+
+    /// Write a folder row discovered during inventory BFS. Folders are
+    /// idempotent to re-write (unlike threads, they carry no progress
+    /// state that a re-run could downgrade), so a plain `put_item`
+    /// unconditionally upserts.
+    pub async fn put_folder(&self, import_id: &str, f: &FolderRow) -> Result<(), RepoError> {
+        let mut item = folder_to_item(f);
+        item.insert("PK".to_string(), AttributeValue::S(format!("IMPORT#{import_id}")));
+        item.insert("SK".to_string(), AttributeValue::S(f.sk()));
+        self.db
+            .put_item(item)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Insert-if-absent: a re-run must never downgrade a thread that has
+    /// advanced past `Pending` (Phase 2+). A conditional-check failure means
+    /// the row already exists — treat as success, leave it as-is.
+    pub async fn put_thread(&self, import_id: &str, t: &ThreadRow) -> Result<(), RepoError> {
+        let mut item = thread_to_item(t);
+        item.insert("PK".to_string(), AttributeValue::S(format!("IMPORT#{import_id}")));
+        item.insert("SK".to_string(), AttributeValue::S(t.sk()));
+        match self
+            .db
+            .put_item_conditional(item, "attribute_not_exists(SK)")
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) if is_conditional_check_failure(&e) => Ok(()),
+            Err(e) => Err(RepoError::Dynamo(e.to_string())),
+        }
+    }
+
+    /// List every folder row inventoried for this import.
+    pub async fn list_folders(&self, import_id: &str) -> Result<Vec<FolderRow>, RepoError> {
+        let items = self
+            .db
+            .query(&format!("IMPORT#{import_id}"), Some("FOLDER#"))
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        items.iter().map(folder_from_item).collect()
+    }
+
+    /// List every thread row inventoried for this import.
+    pub async fn list_threads(&self, import_id: &str) -> Result<Vec<ThreadRow>, RepoError> {
+        let items = self
+            .db
+            .query(&format!("IMPORT#{import_id}"), Some("THREAD#"))
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        items.iter().map(thread_from_item).collect()
+    }
+
+    /// `(total, done_past_pending)` — used by the worker/API to report
+    /// inventory progress without materializing the full row set twice.
+    pub async fn count_threads_by_state(&self, import_id: &str) -> Result<(usize, usize), RepoError> {
+        let rows = self.list_threads(import_id).await?;
+        let total = rows.len();
+        let done = rows.iter().filter(|r| r.state != ThreadState::Pending).count();
+        Ok((total, done))
+    }
+
+    /// Record the total thread count discovered by inventory BFS, on `META`.
+    pub async fn set_inventory_total(&self, import_id: &str, total: usize) -> Result<(), RepoError> {
+        let pk = format!("IMPORT#{import_id}");
+        let mut values = HashMap::new();
+        values.insert(
+            ":total".to_string(),
+            AttributeValue::N(total.to_string()),
+        );
+        values.insert(
+            ":updated_at".to_string(),
+            AttributeValue::N(ogrenotes_common::time::now_usec().to_string()),
+        );
+        self.db
+            .update_item(
+                &pk,
+                ImportRecord::sk(),
+                "SET inventory_total = :total, updated_at = :updated_at",
+                values,
+                None,
+            )
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Advance the import's phase counter on `META`.
+    pub async fn set_phase(&self, import_id: &str, phase: u8) -> Result<(), RepoError> {
+        let pk = format!("IMPORT#{import_id}");
+        let mut values = HashMap::new();
+        values.insert(":phase".to_string(), AttributeValue::N(phase.to_string()));
+        values.insert(
+            ":updated_at".to_string(),
+            AttributeValue::N(ogrenotes_common::time::now_usec().to_string()),
+        );
+        self.db
+            .update_item(
+                &pk,
+                ImportRecord::sk(),
+                "SET phase = :phase, updated_at = :updated_at",
+                values,
+                None,
+            )
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Record the user's chosen scope (selected roots + target folder) on
+    /// `META`. Consumed by Task 4's scoping endpoint.
+    pub async fn set_scope(
+        &self,
+        import_id: &str,
+        roots: &[String],
+        target: &str,
+    ) -> Result<(), RepoError> {
+        let pk = format!("IMPORT#{import_id}");
+        let mut values = HashMap::new();
+        values.insert(
+            ":roots".to_string(),
+            AttributeValue::L(roots.iter().cloned().map(AttributeValue::S).collect()),
+        );
+        values.insert(
+            ":target".to_string(),
+            AttributeValue::S(target.to_string()),
+        );
+        values.insert(
+            ":updated_at".to_string(),
+            AttributeValue::N(ogrenotes_common::time::now_usec().to_string()),
+        );
+        self.db
+            .update_item(
+                &pk,
+                ImportRecord::sk(),
+                "SET selected_roots = :roots, target_folder_id = :target, updated_at = :updated_at",
+                values,
+                None,
+            )
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Acquire the inventory lease. Succeeds if no claim exists or the
+    /// existing claim's heartbeat is older than `stale_ms`. Uses a
+    /// conditional update so two workers cannot both acquire.
+    pub async fn claim_runner(
+        &self,
+        import_id: &str,
+        instance_id: &str,
+        now_ms: i64,
+        stale_ms: i64,
+    ) -> Result<bool, RepoError> {
+        let pk = format!("IMPORT#{import_id}");
+        let mut values = HashMap::new();
+        values.insert(":inst".to_string(), AttributeValue::S(instance_id.to_string()));
+        values.insert(":now".to_string(), AttributeValue::N(now_ms.to_string()));
+        values.insert(
+            ":stale".to_string(),
+            AttributeValue::N((now_ms - stale_ms).to_string()),
+        );
+        // condition: no claim, OR same instance, OR heartbeat older than cutoff.
+        let cond = "attribute_not_exists(runner_instance) OR runner_instance = :inst OR runner_heartbeat_ms < :stale";
+        self.db
+            .update_item_conditional(
+                &pk,
+                ImportRecord::sk(),
+                "SET runner_instance = :inst, runner_heartbeat_ms = :now",
+                cond,
+                values,
+                None,
+            )
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Best-effort heartbeat refresh for the held lease. If the condition
+    /// fails (we've lost the lease to a takeover), that's not this call's
+    /// problem to report — the next `claim_runner` attempt will surface it.
+    pub async fn heartbeat_runner(
+        &self,
+        import_id: &str,
+        instance_id: &str,
+        now_ms: i64,
+    ) -> Result<(), RepoError> {
+        let pk = format!("IMPORT#{import_id}");
+        let mut values = HashMap::new();
+        values.insert(":inst".to_string(), AttributeValue::S(instance_id.to_string()));
+        values.insert(":now".to_string(), AttributeValue::N(now_ms.to_string()));
+        self.db
+            .update_item_conditional(
+                &pk,
+                ImportRecord::sk(),
+                "SET runner_heartbeat_ms = :now",
+                "runner_instance = :inst",
+                values,
+                None,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Release the lease (e.g. worker exiting cleanly) so the next claim
+    /// doesn't need to wait out `stale_ms`.
+    pub async fn clear_runner_claim(&self, import_id: &str) -> Result<(), RepoError> {
+        let pk = format!("IMPORT#{import_id}");
+        self.db
+            .update_item(
+                &pk,
+                ImportRecord::sk(),
+                "REMOVE runner_instance, runner_heartbeat_ms",
+                HashMap::new(),
+                None,
+            )
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+}
+
+/// The `DynamoClient::put_item_conditional` wrapper hands back the
+/// top-level `aws_sdk_dynamodb::Error`, not the per-operation error type —
+/// so match the variant rather than reach for the operation-level
+/// `is_conditional_check_failed_exception()` predicate (which only exists
+/// on `PutItemError` et al., not the aggregated `Error` enum). Mirrors the
+/// idiom at `doc_repo.rs`'s `record_open`.
+fn is_conditional_check_failure(e: &aws_sdk_dynamodb::Error) -> bool {
+    matches!(e, aws_sdk_dynamodb::Error::ConditionalCheckFailedException(_))
 }
 
 fn status_to_str(status: ImportStatus) -> &'static str {
@@ -178,6 +405,112 @@ fn import_from_item(item: &HashMap<String, AttributeValue>) -> Result<ImportReco
     })
 }
 
+fn folder_to_item(f: &FolderRow) -> HashMap<String, AttributeValue> {
+    let mut item = HashMap::new();
+    item.insert(
+        "quip_folder_id".to_string(),
+        AttributeValue::S(f.quip_folder_id.clone()),
+    );
+    item.insert("owner_id".to_string(), AttributeValue::S(f.owner_id.clone()));
+    item.insert("title".to_string(), AttributeValue::S(f.title.clone()));
+    if let Some(ref parent_quip_id) = f.parent_quip_id {
+        item.insert(
+            "parent_quip_id".to_string(),
+            AttributeValue::S(parent_quip_id.clone()),
+        );
+    }
+    if let Some(ref ogre_folder_id) = f.ogre_folder_id {
+        item.insert(
+            "ogre_folder_id".to_string(),
+            AttributeValue::S(ogre_folder_id.clone()),
+        );
+    }
+    item
+}
+
+fn folder_from_item(item: &HashMap<String, AttributeValue>) -> Result<FolderRow, RepoError> {
+    Ok(FolderRow {
+        quip_folder_id: get_s(item, "quip_folder_id")?,
+        owner_id: get_s(item, "owner_id")?,
+        title: get_s(item, "title")?,
+        parent_quip_id: item.get("parent_quip_id").and_then(|v| v.as_s().ok()).cloned(),
+        ogre_folder_id: item.get("ogre_folder_id").and_then(|v| v.as_s().ok()).cloned(),
+    })
+}
+
+fn thread_state_to_str(s: ThreadState) -> &'static str {
+    match s {
+        ThreadState::Pending => "pending",
+        ThreadState::ContentDone => "contentdone",
+        ThreadState::CommentsDone => "commentsdone",
+        ThreadState::Skipped => "skipped",
+    }
+}
+
+fn thread_state_from_item(item: &HashMap<String, AttributeValue>) -> Result<ThreadState, RepoError> {
+    let raw = get_s(item, "state")?;
+    serde_json::from_str(&format!("\"{raw}\""))
+        .map_err(|e| RepoError::MissingField(format!("state: {e}")))
+}
+
+fn thread_to_item(t: &ThreadRow) -> HashMap<String, AttributeValue> {
+    let mut item = HashMap::new();
+    item.insert(
+        "quip_thread_id".to_string(),
+        AttributeValue::S(t.quip_thread_id.clone()),
+    );
+    item.insert("owner_id".to_string(), AttributeValue::S(t.owner_id.clone()));
+    item.insert("title".to_string(), AttributeValue::S(t.title.clone()));
+    item.insert(
+        "thread_type".to_string(),
+        AttributeValue::S(t.thread_type.clone()),
+    );
+    item.insert(
+        "updated_usec".to_string(),
+        AttributeValue::N(t.updated_usec.to_string()),
+    );
+    item.insert(
+        "member_folders".to_string(),
+        AttributeValue::L(
+            t.member_folders
+                .iter()
+                .cloned()
+                .map(AttributeValue::S)
+                .collect(),
+        ),
+    );
+    item.insert(
+        "first_folder".to_string(),
+        AttributeValue::S(t.first_folder.clone()),
+    );
+    item.insert(
+        "state".to_string(),
+        AttributeValue::S(thread_state_to_str(t.state).to_string()),
+    );
+    if let Some(ref ogre_doc_id) = t.ogre_doc_id {
+        item.insert("ogre_doc_id".to_string(), AttributeValue::S(ogre_doc_id.clone()));
+    }
+    item
+}
+
+fn thread_from_item(item: &HashMap<String, AttributeValue>) -> Result<ThreadRow, RepoError> {
+    Ok(ThreadRow {
+        quip_thread_id: get_s(item, "quip_thread_id")?,
+        owner_id: get_s(item, "owner_id")?,
+        title: get_s(item, "title")?,
+        thread_type: get_s(item, "thread_type")?,
+        updated_usec: get_n(item, "updated_usec")?,
+        member_folders: item
+            .get("member_folders")
+            .and_then(|v| v.as_l().ok())
+            .map(|l| l.iter().filter_map(|av| av.as_s().ok().cloned()).collect())
+            .unwrap_or_default(),
+        first_folder: get_s(item, "first_folder")?,
+        state: thread_state_from_item(item)?,
+        ogre_doc_id: item.get("ogre_doc_id").and_then(|v| v.as_s().ok()).cloned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +593,38 @@ mod tests {
         let item = import_to_item(&record_fixture());
         assert!(!item.contains_key("token"));
         assert!(!item.contains_key("secret"));
+    }
+
+    // Pure item (de)serialization round-trips — no live Dynamo needed.
+    #[test]
+    fn folder_row_item_round_trips() {
+        let f = FolderRow { quip_folder_id: "qf1".into(), owner_id: "u1".into(),
+            title: "Root".into(), parent_quip_id: Some("qp".into()),
+            ogre_folder_id: Some("of1".into()) };
+        let back = folder_from_item(&folder_to_item(&f)).expect("from_item");
+        assert_eq!(back, f);
+    }
+
+    #[test]
+    fn folder_row_item_round_trips_and_has_no_token() {
+        // Mirrors thread_row_item_round_trips_and_has_no_token: the task's
+        // no-token guard names both FolderRow and ThreadRow mappers.
+        let f = FolderRow { quip_folder_id: "qf1".into(), owner_id: "u1".into(),
+            title: "Root".into(), parent_quip_id: Some("qp".into()),
+            ogre_folder_id: Some("of1".into()) };
+        let item = folder_to_item(&f);
+        assert!(!item.contains_key("token") && !item.contains_key("secret"));
+        assert_eq!(folder_from_item(&item).expect("from_item"), f);
+    }
+
+    #[test]
+    fn thread_row_item_round_trips_and_has_no_token() {
+        let t = ThreadRow { quip_thread_id: "qt1".into(), owner_id: "u1".into(),
+            title: "Doc".into(), thread_type: "document".into(), updated_usec: 42,
+            member_folders: vec!["qf1".into(), "qf2".into()], first_folder: "qf1".into(),
+            state: ThreadState::Pending, ogre_doc_id: None };
+        let item = thread_to_item(&t);
+        assert!(!item.contains_key("token") && !item.contains_key("secret"));
+        assert_eq!(thread_from_item(&item).expect("from_item"), t);
     }
 }

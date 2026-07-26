@@ -77,6 +77,10 @@ pub enum Job {
         folder_id: Option<String>,
         owner_id: String,
     },
+    /// Token-free trigger for a checkpointed Quip import (Phase 1+). The
+    /// token is NEVER carried here — the worker re-reads it from the
+    /// TokenStore keyed by import_id. See design §"Enqueue path".
+    StartQuipImport { import_id: String, owner_id: String },
     /// No-op job — used by tests to verify the queue mechanics
     /// without dragging in DOCX/PDF deps. Carries an arbitrary
     /// label so a test can correlate the dequeue.
@@ -118,6 +122,7 @@ fn owner_of(payload: &Job) -> Option<&str> {
         Job::ImportDocx { owner_id, .. } | Job::ImportPdf { owner_id, .. } => {
             Some(owner_id.as_str())
         }
+        Job::StartQuipImport { owner_id, .. } => Some(owner_id.as_str()),
         Job::Noop { .. } => None,
     }
 }
@@ -677,6 +682,27 @@ mod tests {
         let json = serde_json::to_string(&job).unwrap();
         let parsed: Job = serde_json::from_str(&json).unwrap();
         assert_eq!(job, parsed);
+    }
+
+    /// The Phase-1 Quip trigger pins its wire tag (`startQuipImport`)
+    /// and round-trips, and `owner_of` must return its owner so the
+    /// poll-auth path (#85) doesn't silently fall through to ownerless.
+    #[test]
+    fn start_quip_import_wire_tag_and_owner() {
+        let job = Job::StartQuipImport { import_id: "imp1".into(), owner_id: "u1".into() };
+        let json = serde_json::to_string(&job).unwrap();
+        assert!(json.contains(r#""type":"startQuipImport""#), "wire tag pinned: {json}");
+        // Token-free trigger: the job envelope must never carry the Quip
+        // token — the worker re-reads it from the TokenStore. Guard the
+        // wire form so a future field addition can't smuggle it in.
+        let lower = json.to_ascii_lowercase();
+        assert!(!lower.contains("token"), "trigger must be token-free: {json}");
+        assert!(!lower.contains("secret"), "trigger must carry no secret: {json}");
+        let back: Job = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, job);
+        // owner_of must return the owner so poll-auth (#85) doesn't silently
+        // fall through to ownerless.
+        assert_eq!(owner_of(&job), Some("u1"));
     }
 
     /// Pre-#85 envelopes were written without the `owner` field.

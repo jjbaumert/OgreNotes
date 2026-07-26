@@ -38,9 +38,13 @@ use fred::clients::RedisClient;
 use fred::prelude::*;
 use futures_util::future::FutureExt;
 use ogrenotes_common::config::AppConfig;
+use ogrenotes_quip_import::{QuipClient, QuipError, QuipThread, QuipToken, TokenStore, walk_inventory};
 use ogrenotes_storage::dynamo::DynamoClient;
+use ogrenotes_storage::models::import::ImportStatus;
+use ogrenotes_storage::models::import_inventory::{FolderRow, ThreadRow, ThreadState};
 use ogrenotes_storage::repo::doc_repo::DocRepo;
 use ogrenotes_storage::repo::folder_repo::FolderRepo;
+use ogrenotes_storage::repo::import_repo::ImportRepo;
 use ogrenotes_storage::s3::S3Client;
 use ogrenotes_worker::{ClaimedJob, Job, JobQueue, RetryOutcome};
 use tokio::sync::watch;
@@ -61,11 +65,28 @@ pub struct WorkerCtx {
     doc_repo: Arc<DocRepo>,
     folder_repo: Arc<FolderRepo>,
     s3: S3Client,
+    /// Quip import manifest repo — the durable, token-free checkpoint the
+    /// inventory handler reads scope from and writes FOLDER#/THREAD# rows to.
+    import_repo: Arc<ImportRepo>,
+    /// Where the per-import Quip token lives (SSM in prod, in-process in
+    /// dev). The `StartQuipImport` trigger is token-free; the handler
+    /// re-reads the token from here and never logs it.
+    quip_token_store: Arc<dyn TokenStore>,
+    /// Base URL override for the per-import Quip client. `None` in prod
+    /// (real `platform.quip.com`); a wiremock URI in integration tests.
+    quip_base: Option<String>,
 }
 
 impl WorkerCtx {
-    pub fn new(doc_repo: Arc<DocRepo>, folder_repo: Arc<FolderRepo>, s3: S3Client) -> Self {
-        Self { doc_repo, folder_repo, s3 }
+    pub fn new(
+        doc_repo: Arc<DocRepo>,
+        folder_repo: Arc<FolderRepo>,
+        s3: S3Client,
+        import_repo: Arc<ImportRepo>,
+        quip_token_store: Arc<dyn TokenStore>,
+        quip_base: Option<String>,
+    ) -> Self {
+        Self { doc_repo, folder_repo, s3, import_repo, quip_token_store, quip_base }
     }
 }
 
@@ -89,6 +110,24 @@ const REAPER_INTERVAL_SECS: u64 = 30;
 /// being treated as crashed; XAUTOCLAIM only moves entries past this
 /// threshold.
 const REAPER_MIN_IDLE_MS: u64 = 60_000;
+
+/// Inventory-lease staleness cutoff (ms). Deliberately kept BELOW
+/// [`REAPER_MIN_IDLE_MS`] (60s) so a crashed worker's DynamoDB lease looks
+/// stale by the time the Redis reaper redelivers the orphaned entry (~60s):
+/// the redelivered handler then finds the ~60s-old lease past this 30s
+/// cutoff → `claim_runner` returns `Ok(true)` → it reclaims and resumes. If
+/// this sat above the reaper interval, a redelivered crashed job would see
+/// the dead worker's lease as still-live, no-op, get acked, and the import
+/// would strand — defeating crash-resumability. A live long-running walk
+/// heartbeats (folder→meta boundary and per thread-meta chunk) to keep its
+/// lease fresh; a rare stolen-live lease only causes a harmless double-run
+/// (`put_thread` is insert-if-absent), so the lease is an optimization, not
+/// a correctness gate.
+const CLAIM_STALE_MS: i64 = 30_000;
+
+/// Thread-metadata fetch batch size for `/1/threads/`. Quip accepts many
+/// ids per call; 100 keeps each request comfortably under URL limits.
+const THREAD_META_CHUNK: usize = 100;
 
 /// Entrypoint. Runs until SIGTERM / SIGINT lands, then drains.
 pub async fn run(config: AppConfig) {
@@ -121,29 +160,35 @@ pub async fn run(config: AppConfig) {
         .await;
     let dynamo = DynamoClient::new(aws_sdk_dynamodb::Client::new(&aws_config), config.table_name());
     let s3 = S3Client::new(aws_sdk_s3::Client::new(&aws_config), config.s3_bucket.clone());
+
+    // Quip import deps. Build `import_repo` from a clone BEFORE `FolderRepo`
+    // consumes `dynamo` below. The token store selection mirrors
+    // `main.rs`/`AppState::new` exactly: in-process in dev (no SSM in the
+    // local stack), SSM SecureString in prod. `quip_base = None` → the
+    // handler builds a per-import client against real platform.quip.com.
+    let import_repo = Arc::new(ImportRepo::new(dynamo.clone()));
+    let quip_token_store: Arc<dyn TokenStore> = if config.dev_mode {
+        Arc::new(ogrenotes_quip_import::InMemoryTokenStore::new())
+    } else {
+        Arc::new(ogrenotes_quip_import::SsmTokenStore::new(
+            aws_sdk_ssm::Client::new(&aws_config),
+            format!("/{}ogrenote/", config.dynamodb_table_prefix),
+        ))
+    };
+
     let ctx = Arc::new(WorkerCtx::new(
         Arc::new(DocRepo::new(dynamo.clone(), s3.clone())),
         Arc::new(FolderRepo::new(dynamo)),
         s3,
+        import_repo,
+        quip_token_store,
+        None,
     ));
     tracing::info!("worker mode: persistence context ready");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let consumer_prefix = consumer_prefix();
 
-    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    for i in 0..config.worker_concurrency.max(1) {
-        let q = queue.clone();
-        let consumer = format!("{consumer_prefix}-{i}");
-        let rx = shutdown_rx.clone();
-        handles.push(tokio::spawn(consume_loop(q, consumer, rx, Arc::clone(&ctx))));
-    }
-    {
-        let q = queue.clone();
-        let consumer = format!("{consumer_prefix}-reaper");
-        let rx = shutdown_rx.clone();
-        handles.push(tokio::spawn(reaper_loop(q, consumer, rx, Arc::clone(&ctx))));
-    }
+    let handles = spawn_workers(queue, ctx, config.worker_concurrency, shutdown_rx);
 
     await_shutdown_signal().await;
     tracing::info!("worker mode: shutdown signal received, draining");
@@ -157,6 +202,36 @@ pub async fn run(config: AppConfig) {
         tracing::warn!("worker mode: drain timeout exceeded; some tasks still running");
     }
     tracing::info!("worker mode: stopped");
+}
+
+/// Spawn `concurrency` consumer tasks plus one reaper against `queue`, all
+/// sharing `ctx` and observing `shutdown_rx`. Returns the join handles so the
+/// caller can await a graceful drain. Factored out of [`run`] so the API server
+/// can host an *embedded* worker in dev mode (see `main.rs`) — sharing the same
+/// `AppState` components, crucially the same in-process `TokenStore`, so a
+/// single-process `cargo run` fully processes Quip jobs without a separate
+/// worker. The deployed `--mode=worker` path calls this unchanged.
+pub fn spawn_workers(
+    queue: JobQueue,
+    ctx: Arc<WorkerCtx>,
+    concurrency: u32,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let consumer_prefix = consumer_prefix();
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    for i in 0..concurrency.max(1) {
+        let q = queue.clone();
+        let consumer = format!("{consumer_prefix}-{i}");
+        let rx = shutdown_rx.clone();
+        handles.push(tokio::spawn(consume_loop(q, consumer, rx, Arc::clone(&ctx))));
+    }
+    {
+        let q = queue.clone();
+        let consumer = format!("{consumer_prefix}-reaper");
+        let rx = shutdown_rx.clone();
+        handles.push(tokio::spawn(reaper_loop(q, consumer, rx, Arc::clone(&ctx))));
+    }
+    handles
 }
 
 /// Consume one entry at a time, execute it, finalize. The
@@ -290,6 +365,12 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
                     // Terminal failure: drop the staging upload too —
                     // no future attempt will read it.
                     cleanup_staging_blob(ctx, &claimed.envelope.payload).await;
+                    // For a Quip import the queue's dead-letter is invisible to
+                    // the frontend, which polls the ImportRecord: without a
+                    // terminal status the record stays Running/phase 0 and the
+                    // wizard hangs on "Scanning…" forever. Flip it to Failed so
+                    // the poll loop stops. Only on DeadLettered, never on Retried.
+                    mark_import_dead_lettered(ctx, &claimed.envelope.payload).await;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -353,6 +434,10 @@ async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<Option<String>, Strin
         }
         #[cfg(not(feature = "pdf"))]
         Job::ImportPdf { .. } => Err("PDF import not compiled into this build".into()),
+        Job::StartQuipImport { import_id, owner_id } => {
+            execute_start_quip_import(ctx, import_id, owner_id).await?;
+            Ok(Some(serde_json::json!({ "importId": import_id }).to_string()))
+        }
     }
 }
 
@@ -364,10 +449,34 @@ async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<Option<String>, Strin
 async fn cleanup_staging_blob(ctx: &WorkerCtx, payload: &Job) {
     let s3_key = match payload {
         Job::ImportDocx { s3_key, .. } | Job::ImportPdf { s3_key, .. } => s3_key.as_str(),
-        Job::Noop { .. } => return,
+        // The Quip inventory trigger stages nothing in S3; its durable
+        // state is the DynamoDB manifest, cleaned up on the import's own
+        // lifecycle, not here.
+        Job::StartQuipImport { .. } | Job::Noop { .. } => return,
     };
     if let Err(e) = ctx.s3.delete_object(s3_key).await {
         tracing::warn!(s3_key, error = %e, "failed to delete import staging blob");
+    }
+}
+
+/// Best-effort terminal-status write for a dead-lettered import job. The
+/// job queue's dead-letter is invisible to the frontend, which polls the
+/// `ImportRecord`; a sustained-failure Quip inventory job that exhausts its
+/// retry budget would otherwise leave the record in `Running`/phase 0 and hang
+/// the wizard on "Scanning…" forever. Flipping the status to `Failed` gives the
+/// poll loop a terminal state to stop on (the frontend already treats
+/// `"failed"` as terminal). Dispatches on the payload exactly like
+/// [`cleanup_staging_blob`]; only the Quip variant has an `ImportRecord` to
+/// finalize. A write error is logged, not propagated — this runs after the job
+/// is already terminal in the queue.
+async fn mark_import_dead_lettered(ctx: &WorkerCtx, payload: &Job) {
+    match payload {
+        Job::StartQuipImport { import_id, .. } => {
+            if let Err(e) = ctx.import_repo.set_status(import_id, ImportStatus::Failed).await {
+                tracing::warn!(import_id, error = %e, "failed to mark dead-lettered import Failed");
+            }
+        }
+        Job::ImportDocx { .. } | Job::ImportPdf { .. } | Job::Noop { .. } => {}
     }
 }
 
@@ -495,6 +604,259 @@ async fn persist_imported_document(
         .map_err(|e| format!("link to folder: {e}"))?;
 
     Ok(doc_id)
+}
+
+/// Phase 1 inventory handler for the `StartQuipImport` trigger.
+///
+/// Claims the import's runner lease, re-reads the (token-free trigger's)
+/// token from the [`TokenStore`], BFS-walks the user's selected Quip roots,
+/// and persists `FOLDER#`/`THREAD#` rows plus the discovered thread total,
+/// advancing the import to phase 1. Every write is insert-if-absent for
+/// threads, so a re-run (retry, reaper takeover, or a rare double-claim)
+/// never downgrades a thread that has already advanced — the inventory is
+/// resumable and the lease is only an optimization.
+///
+/// The token is read here and NEVER logged or formatted. A revoked token
+/// (`Unauthorized`) is terminal for this run: status flips to
+/// `TokenRejected` and the handler returns `Ok(())` rather than burning the
+/// retry budget hammering Quip with a dead credential — the UI polls status
+/// and prompts a reconnect. Transient errors return `Err` so the queue's
+/// retry/reaper resumes the walk from scratch (cheap, thanks to
+/// insert-if-absent).
+///
+/// `pub` so integration tests can drive it directly (the `execute_import_docx`
+/// seam precedent) without standing up a full consumer loop.
+pub async fn execute_start_quip_import(
+    ctx: &WorkerCtx,
+    import_id: &str,
+    owner_id: &str,
+) -> Result<(), String> {
+    let instance = worker_instance_id();
+    let now_ms = ogrenotes_common::time::now_usec() / 1000;
+
+    // Best-effort lease. `Ok(false)` means a genuinely-live *other* runner
+    // owns this import — nothing to do (NOT an error), and we must NOT clear
+    // the claim: it belongs to that runner. `Ok(true)` means either no claim
+    // existed or the prior holder's heartbeat is stale (past CLAIM_STALE_MS,
+    // which sits below the reaper interval so a crashed worker's lease is
+    // reclaimable by the time the entry is redelivered).
+    if !ctx
+        .import_repo
+        .claim_runner(import_id, &instance, now_ms, CLAIM_STALE_MS)
+        .await
+        .map_err(|e| format!("claim runner: {e}"))?
+    {
+        tracing::info!(import_id, "quip inventory: import held by a live runner; skipping");
+        return Ok(());
+    }
+
+    // From here we OWN the lease. Clear it on EVERY exit — success OR error —
+    // so a mid-handler failure never leaves a held claim that would make the
+    // queue's retry (running under a *different* instance id) see a live
+    // lease, no-op, and get acked as success while the import stays stranded
+    // below phase 1. This mirrors what `mark_quip_failure` does for Quip
+    // errors, now applied uniformly to DDB-error `?`-returns too.
+    let result = run_inventory(ctx, import_id, owner_id, &instance).await;
+    ctx.import_repo.clear_runner_claim(import_id).await.ok();
+    result
+}
+
+/// The owned-lease body of the inventory handler. Split out so
+/// [`execute_start_quip_import`] can clear the runner claim on every exit
+/// path (via a single guard) regardless of where the body returns.
+async fn run_inventory(
+    ctx: &WorkerCtx,
+    import_id: &str,
+    owner_id: &str,
+    instance: &str,
+) -> Result<(), String> {
+    let record = ctx
+        .import_repo
+        .get(import_id)
+        .await
+        .map_err(|e| format!("get import: {e}"))?
+        .ok_or_else(|| format!("import {import_id} not found"))?;
+    if record.owner_id != owner_id {
+        return Err(format!("owner mismatch for import {import_id}"));
+    }
+
+    // Token-free trigger: read the token from the store. A missing token
+    // is terminal for this run (same disposition as a revoked one).
+    let token = match ctx
+        .quip_token_store
+        .get(import_id)
+        .await
+        .map_err(|e| format!("token store: {e}"))?
+    {
+        Some(t) => t,
+        None => {
+            ctx.import_repo
+                .set_status(import_id, ImportStatus::TokenRejected)
+                .await
+                .ok();
+            tracing::warn!(import_id, "quip inventory: no token in store; TokenRejected");
+            return Ok(());
+        }
+    };
+
+    // Per-import client: a fresh 45/min throttle isolates each import's
+    // rate budget (never reuse the API's shared `quip_client`).
+    let client = QuipClient::new(ctx.quip_base.clone());
+    ctx.import_repo
+        .set_status(import_id, ImportStatus::Running)
+        .await
+        .map_err(|e| format!("set running: {e}"))?;
+
+    // BFS the selected roots. The walker's closure captures references to
+    // the client and token (not moving the client) so the per-BFS-level
+    // fetch throttles through one shared client.
+    let inv = match walk_inventory(&record.selected_roots, |ids| {
+        let (client, token) = (&client, &token);
+        async move { client.folders(token, &ids).await }
+    })
+    .await
+    {
+        Ok(inv) => inv,
+        Err(e) => return mark_quip_failure(ctx, import_id, &e).await,
+    };
+
+    // Heartbeat between the folder walk and the thread-meta fetch so a
+    // large tree doesn't look stalled to the reaper.
+    ctx.import_repo
+        .heartbeat_runner(import_id, instance, ogrenotes_common::time::now_usec() / 1000)
+        .await
+        .ok();
+
+    // Persist folders (idempotent upsert).
+    for f in &inv.folders {
+        ctx.import_repo
+            .put_folder(
+                import_id,
+                &FolderRow {
+                    quip_folder_id: f.quip_folder_id.clone(),
+                    owner_id: owner_id.to_string(),
+                    title: f.title.clone(),
+                    parent_quip_id: f.parent_quip_id.clone(),
+                    ogre_folder_id: None,
+                },
+            )
+            .await
+            .map_err(|e| format!("put folder: {e}"))?;
+    }
+
+    // Fetch thread metadata in id-batches, then persist THREAD# rows
+    // (insert-if-absent → a re-run never downgrades an advanced thread).
+    let meta = match fetch_thread_meta(&client, &token, &inv, ctx, import_id, instance).await {
+        Ok(m) => m,
+        Err(e) => return mark_quip_failure(ctx, import_id, &e).await,
+    };
+    for t in &inv.threads {
+        let m = meta.get(&t.quip_thread_id);
+        ctx.import_repo
+            .put_thread(
+                import_id,
+                &ThreadRow {
+                    quip_thread_id: t.quip_thread_id.clone(),
+                    owner_id: owner_id.to_string(),
+                    title: m.map(|m| m.title.clone()).unwrap_or_default(),
+                    thread_type: m.map(|m| m.thread_type.clone()).unwrap_or_default(),
+                    updated_usec: m.map(|m| m.updated_usec).unwrap_or(0),
+                    member_folders: t.member_folders.clone(),
+                    first_folder: t.first_folder.clone(),
+                    state: ThreadState::Pending,
+                    ogre_doc_id: None,
+                },
+            )
+            .await
+            .map_err(|e| format!("put thread: {e}"))?;
+    }
+
+    let (total, _) = ctx
+        .import_repo
+        .count_threads_by_state(import_id)
+        .await
+        .map_err(|e| format!("count threads: {e}"))?;
+    ctx.import_repo
+        .set_inventory_total(import_id, total)
+        .await
+        .map_err(|e| format!("set total: {e}"))?;
+    ctx.import_repo
+        .set_phase(import_id, 1)
+        .await
+        .map_err(|e| format!("set phase: {e}"))?;
+    tracing::info!(import_id, total, "quip inventory: phase 1 complete");
+    Ok(())
+}
+
+/// Map a [`QuipError`] hit during the inventory walk to the handler's
+/// return disposition. The runner claim is released by the caller's
+/// clear-on-every-exit guard in [`execute_start_quip_import`], so this
+/// helper only decides status + Ok/Err:
+///
+/// - `Unauthorized` → the stored token is revoked/expired and won't recover
+///   on retry. Flip status to `TokenRejected` and return `Ok(())` — terminal
+///   for this run; the UI prompts a reconnect. Returning `Err` here would
+///   burn the retry budget hammering Quip with a dead token.
+/// - transient (`RateLimited`/`Http`/`Api`/`Parse`) → return `Err` so the
+///   queue's retry/reaper resumes the job. The walk restarts from scratch,
+///   which insert-if-absent makes cheap and safe.
+///
+/// Never logs or formats the token (the `QuipError` variants never carry it).
+async fn mark_quip_failure(
+    ctx: &WorkerCtx,
+    import_id: &str,
+    err: &QuipError,
+) -> Result<(), String> {
+    match err {
+        QuipError::Unauthorized => {
+            ctx.import_repo
+                .set_status(import_id, ImportStatus::TokenRejected)
+                .await
+                .ok();
+            tracing::warn!(import_id, "quip inventory: token rejected (401/403); TokenRejected");
+            Ok(())
+        }
+        transient => {
+            tracing::warn!(import_id, error = %transient, "quip inventory: transient failure; will retry");
+            Err(format!("quip inventory transient error: {transient}"))
+        }
+    }
+}
+
+/// Fetch thread metadata for every discovered thread in id-batches of
+/// [`THREAD_META_CHUNK`], collecting into a `quip_thread_id -> QuipThread`
+/// map. Heartbeats the runner lease after each chunk so a long metadata
+/// fetch keeps its lease fresh and isn't needlessly reclaimed. Threads with
+/// no returned metadata are simply absent (the caller defaults their fields).
+async fn fetch_thread_meta(
+    client: &QuipClient,
+    token: &QuipToken,
+    inv: &ogrenotes_quip_import::Inventory,
+    ctx: &WorkerCtx,
+    import_id: &str,
+    instance: &str,
+) -> Result<std::collections::HashMap<String, QuipThread>, QuipError> {
+    let mut meta = std::collections::HashMap::new();
+    let ids: Vec<String> = inv.threads.iter().map(|t| t.quip_thread_id.clone()).collect();
+    for chunk in ids.chunks(THREAD_META_CHUNK) {
+        for t in client.threads(token, chunk).await? {
+            meta.insert(t.id.clone(), t);
+        }
+        ctx.import_repo
+            .heartbeat_runner(import_id, instance, ogrenotes_common::time::now_usec() / 1000)
+            .await
+            .ok();
+    }
+    Ok(meta)
+}
+
+/// Stable-per-invocation runner identity for the DynamoDB inventory lease
+/// (`claim_runner`/`heartbeat_runner`). Host + pid is enough to distinguish
+/// two worker tasks on different hosts; a random suffix disambiguates two
+/// on the same host (e.g. a dev laptop where HOSTNAME isn't unique).
+fn worker_instance_id() -> String {
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "worker".to_string());
+    format!("{host}-{}-{}", std::process::id(), nanoid::nanoid!(6))
 }
 
 /// Stable per-task identifier for the consumer-id prefix. ECS sets

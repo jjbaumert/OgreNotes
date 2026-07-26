@@ -312,6 +312,69 @@ async fn main() {
     // Start the EMF emitter (every 60s) and the state sampler (every 30s).
     observability::spawn(state.clone(), config.deploy_env.clone(), state.rolling_users.clone());
 
+    // Dev-only embedded worker. In production the job consumer runs as a
+    // separate ECS service (`--mode=worker`, handled by the early return
+    // above). The local compose stack runs NO worker and NO SSM, so the
+    // in-process `InMemoryTokenStore` that `connect` writes the Quip token to
+    // is unreachable from a separately-launched dev worker — every dev-mode
+    // import would `TokenRejected`. Hosting the worker inside the API process
+    // and sharing the SAME `AppState` components (crucially the same
+    // `quip_token_store` Arc) lets a single `cargo run` fully process Quip jobs
+    // with the token living only in the shared in-memory store. Gated on
+    // `dev_mode` so it NEVER runs in prod, and on Redis being connected (the
+    // queue needs it). The shutdown sender is held for the server's lifetime;
+    // process exit tears the tasks down.
+    let _embedded_worker_shutdown_tx = if config.dev_mode && redis_connected {
+        let embedded_redis_config = fred::types::RedisConfig::from_url(&config.redis_url)
+            .expect("invalid REDIS_URL");
+        let embedded_client =
+            fred::prelude::RedisClient::new(embedded_redis_config, None, None, None);
+        embedded_client.connect();
+        match embedded_client.wait_for_connect().await {
+            Ok(()) => match ogrenotes_worker::JobQueue::new(
+                std::sync::Arc::new(embedded_client),
+                config.job_stream_name.clone(),
+            )
+            .await
+            {
+                Ok(queue) => {
+                    let ctx = std::sync::Arc::new(ogrenotes_api::worker_mode::WorkerCtx::new(
+                        state.doc_repo.clone(),
+                        state.folder_repo.clone(),
+                        state.doc_repo.s3().clone(),
+                        state.import_repo.clone(),
+                        state.quip_token_store.clone(),
+                        None,
+                    ));
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                    ogrenotes_api::worker_mode::spawn_workers(
+                        queue,
+                        ctx,
+                        config.worker_concurrency,
+                        shutdown_rx,
+                    );
+                    tracing::info!(
+                        stream = %config.job_stream_name,
+                        concurrency = config.worker_concurrency,
+                        "DEV_MODE: embedded in-process worker started (shares the API's \
+                         in-memory Quip token store; prod uses the --mode=worker service)",
+                    );
+                    Some(shutdown_tx)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "dev embedded worker queue init failed; skipped");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "dev embedded worker redis connect failed; skipped");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Build CORS layer with explicit headers (not Any, which is rejected with credentials).
     //
     // Origin policy:

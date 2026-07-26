@@ -142,7 +142,13 @@ quip-import-profile = Connected as { $name }
 quip-import-folder-scope-heading = Choose folders to import
 quip-import-no-folders = No folders found in this Quip account.
 quip-import-continue = Continue
-quip-import-continue-hint = Coming soon — folder-scoped import isn't wired up yet.
+quip-import-target-home = Documents will be imported into your Home folder.
+quip-import-starting = Starting import…
+quip-import-scanning = Scanning Quip… found { $total } items
+quip-import-inventory-done = Found { $total } items to import
+quip-import-estimate = About { $minutes } min at Quip's rate limit
+quip-import-import-failed = Import failed. Please try again.
+quip-import-token-expired = Your Quip session expired — please reconnect.
 
 # ─── Notification panel ─────────────────────────────────────────
 

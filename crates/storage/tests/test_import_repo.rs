@@ -14,6 +14,7 @@ use ogrenotes_common::id::new_id;
 use ogrenotes_common::time::now_usec;
 use ogrenotes_storage::dynamo::DynamoClient;
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
+use ogrenotes_storage::models::import_inventory::{ThreadRow, ThreadState};
 use ogrenotes_storage::repo::import_repo::ImportRepo;
 
 static INFRA_AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
@@ -243,4 +244,163 @@ async fn import_record_never_carries_a_token_field() {
 
     assert!(!raw.contains_key("token"));
     assert!(!raw.contains_key("secret"));
+}
+
+fn pending_thread(quip_thread_id: &str, state: ThreadState) -> ThreadRow {
+    ThreadRow {
+        quip_thread_id: quip_thread_id.to_string(),
+        owner_id: "u1".to_string(),
+        title: "Doc".to_string(),
+        thread_type: "document".to_string(),
+        updated_usec: 42,
+        member_folders: vec!["qf1".to_string()],
+        first_folder: "qf1".to_string(),
+        state,
+        ogre_doc_id: None,
+    }
+}
+
+/// Resume-safety invariant: a re-run of inventory BFS re-discovers the
+/// same thread and tries to (re)insert it as `Pending`. `put_thread` must
+/// be insert-if-absent — it must never clobber a row that Phase 2 has
+/// already advanced past `Pending`.
+#[tokio::test]
+async fn put_thread_is_insert_if_absent() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    let t0 = pending_thread("qt1", ThreadState::Pending);
+    let mut advanced = t0.clone();
+    advanced.state = ThreadState::ContentDone;
+
+    // Seed the advanced (Phase-2-progressed) row.
+    repo.put_thread(&record.import_id, &advanced)
+        .await
+        .expect("seed advanced");
+    // A second inventory run tries to (re)insert the Pending version.
+    repo.put_thread(&record.import_id, &t0)
+        .await
+        .expect("re-run insert-if-absent");
+
+    let rows = repo.list_threads(&record.import_id).await.expect("list_threads");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].state,
+        ThreadState::ContentDone,
+        "re-run must not downgrade"
+    );
+}
+
+/// Load-bearing dual-worker mutual-exclusion contract that Phase 3
+/// depends on: only one runner can hold the inventory lease at a time,
+/// a heartbeat keeps a live claim from being stolen, a stale claim (no
+/// heartbeat within `stale_ms`) can be taken over, and `clear_runner_claim`
+/// releases the lease immediately for the next claimant.
+#[tokio::test]
+async fn claim_runner_lease_contract() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    const NOW_MS: i64 = 1_000_000;
+    const STALE_MS: i64 = 30_000;
+
+    // inst-A acquires the lease; inst-B is refused while it's live.
+    assert!(
+        repo.claim_runner(&record.import_id, "inst-A", NOW_MS, STALE_MS)
+            .await
+            .expect("claim by inst-A"),
+        "first claim must succeed"
+    );
+    assert!(
+        !repo
+            .claim_runner(&record.import_id, "inst-B", NOW_MS, STALE_MS)
+            .await
+            .expect("claim attempt by inst-B"),
+        "a live claim must not be stealable"
+    );
+
+    // inst-A's heartbeat refreshes the lease.
+    repo.heartbeat_runner(&record.import_id, "inst-A", NOW_MS)
+        .await
+        .expect("heartbeat by inst-A");
+
+    // Once the heartbeat is older than stale_ms, inst-B can take over.
+    assert!(
+        repo.claim_runner(&record.import_id, "inst-B", NOW_MS + STALE_MS + 1, STALE_MS)
+            .await
+            .expect("claim attempt by inst-B after staleness window"),
+        "a stale claim must be takeable over"
+    );
+
+    // Clearing the claim makes it immediately re-acquirable.
+    repo.clear_runner_claim(&record.import_id)
+        .await
+        .expect("clear_runner_claim");
+    assert!(
+        repo.claim_runner(&record.import_id, "inst-C", NOW_MS + STALE_MS + 2, STALE_MS)
+            .await
+            .expect("claim attempt by inst-C after clear"),
+        "a cleared claim must be immediately re-acquirable"
+    );
+}
+
+/// `set_inventory_total` and `set_phase` must durably persist on the
+/// `META` row. `phase` is modeled on `ImportRecord`, so it's checked via
+/// `ImportRepo::get`; `inventory_total` is a Phase-1-only operational
+/// attribute not modeled on `ImportRecord` (deliberately — see task-1
+/// report), so it's checked with a raw item read, mirroring the same
+/// raw-client pattern `import_record_never_carries_a_token_field` already
+/// uses for attributes outside the domain struct.
+#[tokio::test]
+async fn set_inventory_total_and_set_phase_persist() {
+    require_infra!();
+    let (repo, table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    repo.set_inventory_total(&record.import_id, 42)
+        .await
+        .expect("set_inventory_total");
+    repo.set_phase(&record.import_id, 2)
+        .await
+        .expect("set_phase");
+
+    let fetched = repo
+        .get(&record.import_id)
+        .await
+        .expect("get")
+        .expect("record must still exist");
+    assert_eq!(fetched.phase, 2);
+
+    let dynamo_config = aws_sdk_dynamodb::config::Builder::new()
+        .endpoint_url("http://127.0.0.1:8000")
+        .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+        .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+            "fakekey", "fakesecret", None, None, "test",
+        ))
+        .behavior_version_latest()
+        .build();
+    let client = aws_sdk_dynamodb::Client::from_conf(dynamo_config);
+    let raw = client
+        .get_item()
+        .table_name(&table)
+        .key("PK", aws_sdk_dynamodb::types::AttributeValue::S(record.pk()))
+        .key(
+            "SK",
+            aws_sdk_dynamodb::types::AttributeValue::S(ImportRecord::sk().to_string()),
+        )
+        .send()
+        .await
+        .expect("raw get_item")
+        .item
+        .expect("item must exist");
+
+    assert_eq!(
+        raw.get("inventory_total").and_then(|v| v.as_n().ok()),
+        Some(&"42".to_string())
+    );
 }

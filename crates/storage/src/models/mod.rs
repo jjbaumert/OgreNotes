@@ -5,6 +5,7 @@ pub mod admin_audit;
 pub mod document;
 pub mod folder;
 pub mod import;
+pub mod import_inventory;
 pub mod mfa_recovery;
 pub mod notification;
 pub mod security_audit;
