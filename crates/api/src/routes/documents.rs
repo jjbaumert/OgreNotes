@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use ogrenotes_collab::document::OgreDoc;
 use ogrenotes_collab::export;
-use ogrenotes_collab::import_quip;
+use ogrenotes_collab::blob_ref;
 use ogrenotes_collab::import_spreadsheet;
 use ogrenotes_common::id::new_id;
 use ogrenotes_common::metrics::{counter, histogram, MetricKey};
@@ -1868,7 +1868,7 @@ async fn export_document(
     // exact pre-regression parity (the export used to see a real,
     // already-presigned URL because that's what `Image.src` held before
     // durable references existed), not a new, longer-lived guarantee.
-    let blob_refs = import_quip::collect_blob_refs(doc.inner());
+    let blob_refs = blob_ref::collect_blob_refs(doc.inner());
     if !blob_refs.is_empty() {
         let mut resolved = std::collections::HashMap::new();
         for (blob_id, key) in blob_refs {
@@ -1882,10 +1882,10 @@ async fn export_document(
                 continue;
             }
             if let Ok(url) = state.doc_repo.s3().presigned_get_url(&key, 14400).await {
-                resolved.insert(import_quip::blob_ref(&blob_id, &key), url);
+                resolved.insert(blob_ref::blob_ref(&blob_id, &key), url);
             }
         }
-        import_quip::rewrite_blob_refs(doc.inner(), &resolved);
+        blob_ref::rewrite_blob_refs(doc.inner(), &resolved);
     }
 
     match format.as_str() {

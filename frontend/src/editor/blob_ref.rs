@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
 //! Durable blob-reference helpers, mirrored from the backend's
-//! `crates/collab/src/import_quip.rs::{blob_ref, parse_blob_ref}`.
+//! `crates/collab/src/blob_ref.rs::{blob_ref, parse_blob_ref}`.
 //!
 //! The frontend crate doesn't depend on `ogrenotes-collab` for this path
 //! (it's a standalone wasm crate — see the module-level note in
@@ -14,7 +14,7 @@
 
 use std::borrow::Cow;
 
-/// Must match `crates/collab/src/import_quip.rs::BLOB_REF_PREFIX`.
+/// Must match `crates/collab/src/blob_ref.rs::BLOB_REF_PREFIX`.
 pub const BLOB_REF_PREFIX: &str = "ogre-blob:";
 
 /// `Image.src` form for a blob owned by this workspace:
@@ -109,7 +109,7 @@ mod tests {
 
     /// Schema-duality-style parity check: the frontend's `blob_ref` must
     /// produce the exact same literal the backend's
-    /// `crates/collab/src/import_quip.rs::blob_ref` produces for the same
+    /// `crates/collab/src/blob_ref.rs::blob_ref` produces for the same
     /// input. The backend test `blob_ref_key_with_special_characters_round_trips`
     /// exercises the same fixture; this hardcoded literal is the pinned
     /// contract between the two independently-compiled implementations.

@@ -926,11 +926,11 @@ async fn test_export_markdown_round_trips_text() {
 }
 
 /// Build a doc whose sole content is one `Image` node carrying a durable
-/// `ogre-blob:` reference (see `ogrenotes_collab::import_quip`). Used by
+/// `ogre-blob:` reference (see `ogrenotes_collab::blob_ref`). Used by
 /// the export-rewrite regression tests below.
 fn build_doc_with_blob_ref_image(doc_id: &str, blob_id: &str, alt: &str) -> (ogrenotes_collab::document::OgreDoc, String) {
     use ogrenotes_collab::document::OgreDoc;
-    use ogrenotes_collab::import_quip::blob_ref;
+    use ogrenotes_collab::blob_ref::blob_ref;
     use ogrenotes_collab::schema::NodeType;
     use yrs::types::xml::{Xml, XmlElementPrelim, XmlFragment};
     use yrs::{Transact, WriteTxn};
