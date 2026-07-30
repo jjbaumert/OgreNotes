@@ -56,14 +56,58 @@ pub fn blob_ref(blob_id: &str, key: &str) -> String {
 /// `(blob_id, key)`. Returns `None` for anything that doesn't start with
 /// [`BLOB_REF_PREFIX`] — legacy presigned URLs and external absolute URLs
 /// alike — so callers can fall back to using the string verbatim.
+///
+/// ## Why the shape checks matter
+///
+/// Callers that presign a key from a reference (the export path in
+/// `crates/api/src/routes/documents.rs`, and `request_download_url`)
+/// authorize it with a *string* prefix test: does `key` start with
+/// `blobs/{doc_id}/{blob_id}/`? A `blob_id` of `..` plus a key of
+/// `blobs/{my_doc}/../{victim_doc}/{victim_blob}/x.png` satisfies that
+/// test literally while naming a foreign object — the guard would pass
+/// and the server would presign someone else's key. Whether S3 then
+/// serves it depends on how it normalizes `..` in a signed path; an
+/// access-control boundary must not rest on that. So the shape is
+/// constrained here, at the single point where every caller derives
+/// `(blob_id, key)`:
+///
+/// - `blob_id` must be `[A-Za-z0-9_-]+` (the charset the upload path
+///   already mints), which rules out `.`, `..`, and any separator.
+/// - the decoded `key` must contain no `.` or `..` path segment, so a
+///   prefix match can't be satisfied by a traversal that resolves
+///   elsewhere.
+///
+/// Dots inside a segment (`photo.tar.gz`) are untouched — only a
+/// segment that *is* `.` or `..` is rejected.
 pub fn parse_blob_ref(src: &str) -> Option<(String, String)> {
     let rest = src.strip_prefix(BLOB_REF_PREFIX)?;
     let (blob_id, encoded_key) = rest.split_once('/')?;
     if blob_id.is_empty() || encoded_key.is_empty() {
         return None;
     }
+    if !is_safe_blob_id(blob_id) {
+        return None;
+    }
     let key = percent_decode(encoded_key)?;
+    if has_dot_segment(&key) {
+        return None;
+    }
     Some((blob_id.to_string(), key))
+}
+
+/// `[A-Za-z0-9_-]+` — see [`parse_blob_ref`]. Mirrored byte-for-byte by
+/// `frontend/src/editor/blob_ref.rs`.
+fn is_safe_blob_id(blob_id: &str) -> bool {
+    !blob_id.is_empty()
+        && blob_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+/// True if any `/`-delimited segment of `key` is exactly `.` or `..` —
+/// see [`parse_blob_ref`]. Mirrored by the frontend copy.
+fn has_dot_segment(key: &str) -> bool {
+    key.split('/').any(|seg| seg == "." || seg == "..")
 }
 
 /// Every `Image` node in `doc` whose `src` parses as a durable blob
@@ -247,6 +291,44 @@ mod tests {
         // Empty blob_id or empty key.
         assert!(parse_blob_ref("ogre-blob:/key").is_none());
         assert!(parse_blob_ref("ogre-blob:b1/").is_none());
+    }
+
+    /// Security pin: a reference whose shape could satisfy a caller's
+    /// `blobs/{doc_id}/{blob_id}/` string-prefix authorization check
+    /// while naming a *different* document's object must not parse at
+    /// all. See the rationale on [`parse_blob_ref`].
+    ///
+    /// The frontend mirror
+    /// (`frontend/src/editor/blob_ref.rs::blob_ref_rejects_traversal_shapes`)
+    /// asserts the identical fixtures — relaxing one side alone fails a
+    /// test on that side, which is the point of duplicating a security
+    /// check across two independently-compiled crates.
+    #[test]
+    fn blob_ref_rejects_traversal_shapes() {
+        // blob_id == ".." — the crafted prefix `blobs/{my_doc}/../`,
+        // which a key naming a foreign doc then "matches".
+        assert!(parse_blob_ref(
+            "ogre-blob:../blobs%2Fmy_doc%2F..%2Fvictim_doc%2Fbv%2Fx.png"
+        )
+        .is_none());
+        // blob_id == "." and other out-of-charset blob_ids.
+        assert!(parse_blob_ref("ogre-blob:./k.png").is_none());
+        assert!(parse_blob_ref("ogre-blob:a.b/k.png").is_none());
+        assert!(parse_blob_ref("ogre-blob:a%2Fb/k.png").is_none());
+        assert!(parse_blob_ref("ogre-blob:a b/k.png").is_none());
+        // Well-formed blob_id, but the key traverses out of its prefix.
+        assert!(parse_blob_ref("ogre-blob:b1/blobs%2Fmy_doc%2Fb1%2F..%2F..%2Fvictim%2Fx.png").is_none());
+        assert!(parse_blob_ref("ogre-blob:b1/blobs%2F.%2Fx.png").is_none());
+        assert!(parse_blob_ref("ogre-blob:b1/..").is_none());
+        // Dots *inside* a segment are ordinary filename characters and
+        // must still parse — this is the legitimate-reference guard.
+        assert_eq!(
+            parse_blob_ref("ogre-blob:b-1_2/blobs%2Fd1%2Fb-1_2%2Fphoto.tar.gz"),
+            Some((
+                "b-1_2".to_string(),
+                "blobs/d1/b-1_2/photo.tar.gz".to_string()
+            ))
+        );
     }
 
     #[test]

@@ -3641,6 +3641,109 @@ fn fit_list_content_in_paragraph_extracts_text() {
     }
 }
 
+// ─── Image durable-blob-reference clipboard round trip ────────
+//
+// The parse half (`convert_image`) is `#[cfg(target_arch = "wasm32")]`
+// like every other `parse_from_html` case, so the full round trip can
+// only be asserted here. clipboard.rs's own `#[test]`s cover the
+// serialize half.
+
+/// Critical regression: copying an image and pasting it back into the
+/// same document must put the durable `ogre-blob:` reference into the
+/// model — NOT the resolved, 4-hour-lived presigned URL that rides in
+/// `src` for the benefit of external editors.
+///
+/// Before `data-ogre-blob` existed, this round trip wrote the presigned
+/// URL straight back into the CRDT, so duplicating an image silently
+/// recreated the very bug durable references were introduced to fix:
+/// the copy broke four hours later, permanently, with no self-heal.
+#[wasm_bindgen_test]
+fn clipboard_image_round_trip_preserves_durable_blob_ref() {
+    use ogrenotes_frontend::editor::{blob_ref, image_bridge};
+
+    let blob_id = "b-roundtrip";
+    let key = "blobs/d-roundtrip/b-roundtrip/photo.png";
+    let reference = blob_ref::blob_ref(blob_id, key);
+    let resolved_url = "https://s3.example.com/photo.png?X-Amz-Signature=deadbeef";
+
+    // Warm the resolver cache exactly as a render would, so the
+    // serializer emits the resolved URL in `src`.
+    image_bridge::set_resolver(Some(std::rc::Rc::new({
+        let resolved_url = resolved_url.to_string();
+        move |_blob_id: String, _key: String, cb: Box<dyn FnOnce(Option<String>)>| {
+            cb(Some(resolved_url.clone()));
+        }
+    })));
+    assert_eq!(image_bridge::resolve(blob_id, key, |_| {}), None);
+    assert_eq!(image_bridge::peek(blob_id, key), Some(resolved_url.to_string()));
+
+    let mut attrs = HashMap::new();
+    attrs.insert("src".to_string(), reference.clone());
+    attrs.insert("alt".to_string(), "A round-tripped photo".to_string());
+    let slice = Slice::new(
+        Fragment::from(vec![Node::element_with_attrs(
+            NodeType::Image,
+            attrs,
+            Fragment::empty(),
+        )]),
+        0,
+        0,
+    );
+
+    let html = clipboard::serialize_to_html(&slice);
+    assert!(
+        html.contains(resolved_url),
+        "external-paste half must carry the resolved URL: {html}"
+    );
+
+    let parsed = clipboard::parse_from_html(&html);
+    assert_eq!(parsed.content.children.len(), 1, "{html}");
+    let img = &parsed.content.children[0];
+    assert_eq!(img.node_type(), Some(NodeType::Image));
+    assert_eq!(
+        img.attrs().get("src").map(String::as_str),
+        Some(reference.as_str()),
+        "pasted node must store the durable reference, not the presigned URL"
+    );
+    assert_eq!(
+        img.attrs().get("alt").map(String::as_str),
+        Some("A round-tripped photo"),
+        "alt text must survive the round trip"
+    );
+
+    image_bridge::set_resolver(None);
+}
+
+/// The `data-ogre-blob` attribute is trusted only as far as
+/// `parse_blob_ref` validates it. An external page setting a bogus one
+/// must fall back to the ordinary `is_safe_url`-gated `src` path, and
+/// an external `<img src="ogre-blob:…">` must be rejected outright
+/// rather than injecting an attacker-chosen `(blob_id, key)`.
+#[wasm_bindgen_test]
+fn clipboard_image_rejects_externally_supplied_blob_refs() {
+    // Bare `ogre-blob:` src from outside the app — no durable
+    // attribute, and `is_safe_url` rejects the scheme.
+    let slice = clipboard::parse_from_html(
+        r#"<img src="ogre-blob:victim/blobs%2Fvictim-doc%2Fvictim%2Fsecret.png" alt="x" />"#,
+    );
+    assert!(
+        slice.content.children.is_empty(),
+        "external ogre-blob: src must not become an Image node: {:?}",
+        slice.content.children
+    );
+
+    // A malformed durable attribute must not be trusted; the safe
+    // `src` is used instead.
+    let slice = clipboard::parse_from_html(
+        r#"<img src="https://example.com/cat.png" data-ogre-blob="ogre-blob:../evil" alt="cat" />"#,
+    );
+    assert_eq!(slice.content.children.len(), 1);
+    assert_eq!(
+        slice.content.children[0].attrs().get("src").map(String::as_str),
+        Some("https://example.com/cat.png"),
+    );
+}
+
 // ─── DocMention chip: render, clipboard round-trip, navigate ──
 //
 // `NodeType::DocMention`'s clipboard parse path (`convert_element_node`

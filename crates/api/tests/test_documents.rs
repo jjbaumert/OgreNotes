@@ -1074,6 +1074,84 @@ async fn test_export_does_not_presign_blob_ref_for_a_foreign_document() {
     app.cleanup().await;
 }
 
+/// Regression: the **bulk** export route must resolve durable
+/// `ogre-blob:` image references too.
+///
+/// `try_export_one` originally loaded the doc and handed it straight to
+/// the exporter with no collect/presign/rewrite, so
+/// `POST /documents/bulk/export` silently dropped every image *and its
+/// alt text* from Markdown and emitted src-less `<img>`s in HTML — the
+/// same bug already fixed for the single-doc route, and just as silent
+/// (a 200 with a well-formed archive that's simply missing content).
+/// Both routes now share `resolve_blob_refs_for_export`; this test is
+/// what keeps the bulk caller from being dropped again.
+///
+/// Mirrors `test_export_resolves_blob_ref_images_to_real_urls`, reading
+/// the exported Markdown back out of the zip entry.
+#[tokio::test]
+async fn test_bulk_export_resolves_blob_ref_images_to_real_urls() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("img-bulk-export@test.com").await;
+    let doc_id = app.create_doc(&token, "Bulk Doc With Blob Image", None).await;
+
+    let (doc, src) = build_doc_with_blob_ref_image(&doc_id, "b-bulk-1", "A bulk photo");
+    assert!(src.starts_with("ogre-blob:"));
+
+    let (status, _) = app
+        .bytes_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{doc_id}/content"),
+            Some(&token),
+            doc.to_state_bytes(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let (status, body) = app
+        .bytes_request(
+            Method::POST,
+            "/api/v1/documents/bulk/export",
+            Some(&token),
+            serde_json::to_vec(&serde_json::json!({
+                "docIds": [doc_id.clone()],
+                "format": "markdown"
+            }))
+            .unwrap(),
+            "application/json",
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    // Pull the one `.md` entry out of the archive and assert on it the
+    // same way the single-doc test asserts on the response body.
+    let cursor = std::io::Cursor::new(&body);
+    let mut archive = zip::ZipArchive::new(cursor).expect("response is a zip");
+    let md_name = (0..archive.len())
+        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .find(|n| n.ends_with(".md"))
+        .expect("archive must contain a markdown entry");
+    let md = {
+        let mut entry = archive.by_name(&md_name).unwrap();
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut buf).expect("entry is utf-8");
+        buf
+    };
+
+    let expected_key_path = format!("blobs/{doc_id}/b-bulk-1/photo.png");
+    assert!(
+        !md.contains("ogre-blob:"),
+        "raw reference leaked into bulk markdown export: {md:?}"
+    );
+    assert!(
+        md.contains("A bulk photo") && md.contains(&expected_key_path) && md.contains("X-Amz-Signature"),
+        "expected a resolved presigned link (and its alt text) in the bulk markdown export: {md:?}"
+    );
+
+    app.cleanup().await;
+}
+
 /// #59 T-6: a document's comment threads must appear in its exports.
 /// Import a doc, attach a document-level comment, then export as HTML and
 /// Markdown and assert the comment body + author + a "Comments" heading

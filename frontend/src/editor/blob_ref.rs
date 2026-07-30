@@ -30,14 +30,43 @@ pub fn blob_ref(blob_id: &str, key: &str) -> String {
 /// URLs alike — so the render path can fall back to using the string
 /// verbatim (backward compatible with documents written before this
 /// change).
+///
+/// The `blob_id` charset and the no-dot-segment key rule below are a
+/// *security* check, not a cosmetic one: the server authorizes a
+/// presign with a `blobs/{doc_id}/{blob_id}/` string-prefix test, which
+/// a `..` in either half can satisfy while naming a foreign object.
+/// See the long-form rationale on the backend twin,
+/// `crates/collab/src/blob_ref.rs::parse_blob_ref`. Both copies enforce
+/// it and both sides' tests pin the rejections, so relaxing one side
+/// alone fails a test.
 pub fn parse_blob_ref(src: &str) -> Option<(String, String)> {
     let rest = src.strip_prefix(BLOB_REF_PREFIX)?;
     let (blob_id, encoded_key) = rest.split_once('/')?;
     if blob_id.is_empty() || encoded_key.is_empty() {
         return None;
     }
+    if !is_safe_blob_id(blob_id) {
+        return None;
+    }
     let key = percent_decode(encoded_key)?;
+    if has_dot_segment(&key) {
+        return None;
+    }
     Some((blob_id.to_string(), key))
+}
+
+/// `[A-Za-z0-9_-]+` — mirrors the backend's `is_safe_blob_id`.
+fn is_safe_blob_id(blob_id: &str) -> bool {
+    !blob_id.is_empty()
+        && blob_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+/// True if any `/`-delimited segment of `key` is exactly `.` or `..` —
+/// mirrors the backend's `has_dot_segment`.
+fn has_dot_segment(key: &str) -> bool {
+    key.split('/').any(|seg| seg == "." || seg == "..")
 }
 
 /// Minimal percent-encoding: escapes everything outside the RFC 3986
@@ -105,6 +134,36 @@ mod tests {
         assert!(parse_blob_ref("ogre-blob:b1").is_none());
         assert!(parse_blob_ref("ogre-blob:/key").is_none());
         assert!(parse_blob_ref("ogre-blob:b1/").is_none());
+    }
+
+    /// Security pin, mirroring
+    /// `crates/collab/src/blob_ref.rs::blob_ref_rejects_traversal_shapes`
+    /// fixture-for-fixture. A reference whose shape could satisfy the
+    /// server's `blobs/{doc_id}/{blob_id}/` prefix authorization check
+    /// while naming a different document's object must not parse.
+    /// Duplicated deliberately: the two implementations compile
+    /// independently, so each needs its own failing test if the check
+    /// is relaxed on that side.
+    #[test]
+    fn blob_ref_rejects_traversal_shapes() {
+        assert!(parse_blob_ref(
+            "ogre-blob:../blobs%2Fmy_doc%2F..%2Fvictim_doc%2Fbv%2Fx.png"
+        )
+        .is_none());
+        assert!(parse_blob_ref("ogre-blob:./k.png").is_none());
+        assert!(parse_blob_ref("ogre-blob:a.b/k.png").is_none());
+        assert!(parse_blob_ref("ogre-blob:a%2Fb/k.png").is_none());
+        assert!(parse_blob_ref("ogre-blob:a b/k.png").is_none());
+        assert!(parse_blob_ref("ogre-blob:b1/blobs%2Fmy_doc%2Fb1%2F..%2F..%2Fvictim%2Fx.png").is_none());
+        assert!(parse_blob_ref("ogre-blob:b1/blobs%2F.%2Fx.png").is_none());
+        assert!(parse_blob_ref("ogre-blob:b1/..").is_none());
+        assert_eq!(
+            parse_blob_ref("ogre-blob:b-1_2/blobs%2Fd1%2Fb-1_2%2Fphoto.tar.gz"),
+            Some((
+                "b-1_2".to_string(),
+                "blobs/d1/b-1_2/photo.tar.gz".to_string()
+            ))
+        );
     }
 
     /// Schema-duality-style parity check: the frontend's `blob_ref` must
