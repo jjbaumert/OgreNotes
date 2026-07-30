@@ -12,6 +12,13 @@ use crate::throttle::Throttle;
 
 const DEFAULT_BASE: &str = "https://platform.quip.com";
 
+/// Upper bound on a downloaded blob (attachment/image). Guards against a
+/// pathological attachment exhausting worker memory, mirroring
+/// `crates/collab/src/import_pdf.rs`'s `MAX_PDF_BYTES` posture. Checked
+/// against `Content-Length` when present (short-circuits before download)
+/// and again against the actual received length.
+const MAX_BLOB_BYTES: usize = 32 * 1024 * 1024;
+
 // ─── Error ─────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -189,6 +196,60 @@ impl QuipClient {
         Ok(body.into_values().map(|env| env.thread).collect())
     }
 
+    /// `GET /2/threads/{id}/html` — the section-id-bearing HTML used to
+    /// carry over Quip's per-section anchors during import.
+    pub async fn thread_html(&self, t: &QuipToken, thread_id: &str) -> Result<String, QuipError> {
+        self.throttle.acquire().await;
+
+        let resp = self
+            .http
+            .get(format!("{}/2/threads/{thread_id}/html", self.base))
+            .bearer_auth(t.expose())
+            .send()
+            .await?;
+
+        self.observe_and_check(resp).await?.text_body().await
+    }
+
+    /// `GET /1/blob/{thread_id}/{blob_id}` — raw attachment bytes. Refuses
+    /// bodies over `MAX_BLOB_BYTES`, checking `Content-Length` first (to
+    /// avoid downloading an oversized body at all) and the actual received
+    /// length as a backstop for responses that omit or lie about it.
+    pub async fn blob(
+        &self,
+        t: &QuipToken,
+        thread_id: &str,
+        blob_id: &str,
+    ) -> Result<Vec<u8>, QuipError> {
+        self.throttle.acquire().await;
+
+        let resp = self
+            .http
+            .get(format!("{}/1/blob/{thread_id}/{blob_id}", self.base))
+            .bearer_auth(t.expose())
+            .send()
+            .await?;
+
+        let checked = self.observe_and_check(resp).await?;
+
+        if let Some(len) = checked.content_length()
+            && len > MAX_BLOB_BYTES as u64
+        {
+            return Err(QuipError::Parse(format!(
+                "blob is {len} bytes (Content-Length); exceeds the {MAX_BLOB_BYTES}-byte limit"
+            )));
+        }
+
+        let bytes = checked.bytes_body().await?;
+        if bytes.len() > MAX_BLOB_BYTES {
+            return Err(QuipError::Parse(format!(
+                "blob is {} bytes; exceeds the {MAX_BLOB_BYTES}-byte limit",
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
+    }
+
     /// Feed rate-limit headers into the throttle, then map non-2xx statuses
     /// to `QuipError` variants. Reads headers before consuming the body, per
     /// the task contract. Never includes the token (it was never read here)
@@ -235,6 +296,27 @@ impl Checked {
             .json::<T>()
             .await
             .map_err(|e| QuipError::Parse(e.to_string()))
+    }
+
+    async fn text_body(self) -> Result<String, QuipError> {
+        self.0
+            .text()
+            .await
+            .map_err(|e| QuipError::Parse(e.to_string()))
+    }
+
+    async fn bytes_body(self) -> Result<Vec<u8>, QuipError> {
+        self.0
+            .bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| QuipError::Parse(e.to_string()))
+    }
+
+    /// The `Content-Length` response header, if present and parseable.
+    /// Non-consuming — safe to call before reading the body.
+    fn content_length(&self) -> Option<u64> {
+        self.0.content_length()
     }
 }
 
@@ -415,4 +497,63 @@ mod tests {
         // were read via `resp.headers()` (a non-consuming accessor) rather
         // than by draining/re-parsing the body.
     }
+
+    #[tokio::test]
+    async fn thread_html_fetches_the_v2_html_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/2/threads/t1/html"))
+            .and(header("authorization", "Bearer tok-h"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<p id=\"s1\">hi</p>"))
+            .mount(&server)
+            .await;
+        let c = QuipClient::new(Some(server.uri()));
+        let html = c
+            .thread_html(&QuipToken::new("tok-h".into()), "t1")
+            .await
+            .unwrap();
+        assert!(html.contains("id=\"s1\""));
+    }
+
+    #[tokio::test]
+    async fn blob_fetches_raw_bytes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/1/blob/t1/b9"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1u8, 2, 3]))
+            .mount(&server)
+            .await;
+        let c = QuipClient::new(Some(server.uri()));
+        let bytes = c
+            .blob(&QuipToken::new("tok-b".into()), "t1", "b9")
+            .await
+            .unwrap();
+        assert_eq!(bytes, vec![1u8, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn thread_html_401_maps_to_unauthorized_without_leaking_the_token() {
+        let server = MockServer::start().await;
+        Mock::given(path("/2/threads/t1/html"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let c = QuipClient::new(Some(server.uri()));
+        let e = c
+            .thread_html(&QuipToken::new("SEEKRET".into()), "t1")
+            .await
+            .unwrap_err();
+        assert!(matches!(e, QuipError::Unauthorized));
+        assert!(!format!("{e}").contains("SEEKRET"));
+    }
+
+    // No test for the `MAX_BLOB_BYTES` cap itself: wiremock/hyper reject a
+    // declared `Content-Length` that doesn't match the real body length at
+    // the transport layer (`payload claims content-length of N, custom
+    // content-length header claims M` — a hyper panic, not a client-visible
+    // response), so the `Content-Length` short-circuit can't be exercised
+    // without actually transmitting an oversized body. `MAX_BLOB_BYTES` is a
+    // private const with no test-only override, so faking a smaller cap
+    // isn't available either. Per the task brief, skipping this case rather
+    // than allocating a 32MiB+ buffer in a unit test.
 }
