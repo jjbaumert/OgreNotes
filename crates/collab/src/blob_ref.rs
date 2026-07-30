@@ -1,15 +1,17 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
-//! Quip HTML → OgreNotes document import.
+//! Durable blob references for `Image.src`.
 //!
-//! **Current contents:** just the durable blob-reference helpers
-//! (Phase 2a Task 3) — the `Image.src` form that survives longer than a
-//! presigned S3 URL's TTL — and the doc-level collect/rewrite pair the
-//! export route uses to resolve those references back to real URLs
-//! before handing the doc to a format exporter. The Quip HTML walker
-//! (thread content → block-grammar conversion, mirroring
-//! `import_docx`/`import_pdf`) is a later Phase 2a task and lands in
-//! this same module.
+//! Two layers live here: [`blob_ref`]/[`parse_blob_ref`], the stable
+//! `Image.src` form that outlives a presigned S3 URL's TTL, and the
+//! doc-level [`collect_blob_refs`]/[`rewrite_blob_refs`] pair the export
+//! route uses to resolve those references back into real URLs before
+//! handing a document to a format exporter.
+//!
+//! Blob addressing is general — it is not tied to any one import path.
+//! The frontend mirrors the first pair in `frontend/src/editor/blob_ref.rs`
+//! (it cannot depend on this crate from its lib target); the two are pinned
+//! to the same output by tests on both sides.
 //!
 //! ## Why a stable `Image.src` form
 //!

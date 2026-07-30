@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
 pub mod awareness;
+pub mod blob_ref;
 pub mod blocks;
 pub mod diff;
 pub mod document;
@@ -10,7 +11,6 @@ pub mod import;
 pub mod import_docx;
 #[cfg(feature = "pdf")]
 pub mod import_pdf;
-pub mod import_quip;
 pub mod import_spreadsheet;
 pub mod mail_merge;
 pub mod protocol;
