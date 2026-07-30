@@ -1789,12 +1789,24 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     // install the resolver `editor::view`'s render path calls for every
     // `ogre-blob:` src it renders (see `editor::image_bridge` for why the
     // indirection: that module compiles into the lib target, where
-    // `crate::api` isn't visible). Closes over this mount's `doc_id`;
-    // cleared on unmount so a later document's mount isn't shadowed by a
-    // dangling resolver bound to this one's `doc_id`.
+    // `crate::api` isn't visible). Closes over this mount's `doc_id`.
+    //
+    // `EditorComponent` remounts on document switch
+    // (`pages/document.rs`'s `<EditorComponent>` site), so an
+    // unconditional `set_resolver(None)` on cleanup would race a
+    // newer mount's install — if the new mount's setup runs before this
+    // one's `on_cleanup` fires, the unconditional clear would wipe the
+    // NEW resolver, leaving every image in the new document `src`-less
+    // until a full reload (see `image_bridge::clear_resolver_if`'s doc
+    // comment). `clear_resolver_if` only clears when the resolver it's
+    // holding is still (pointer-)identical to the one installed here —
+    // a superseded cleanup becomes a no-op instead of a wipe. The `Rc`
+    // rides in a `SendWrapper` so the `Send + Sync` `on_cleanup` closure
+    // can own it (safe: the wasm runtime is single-threaded) — same
+    // pattern as `pages/document.rs`'s `collab_for_unmount`.
     {
         let doc_id = props.doc_id.clone();
-        crate::editor::image_bridge::set_resolver(Some(Rc::new(
+        let resolver: crate::editor::image_bridge::Resolver = Rc::new(
             move |blob_id: String, key: String, on_ready: Box<dyn FnOnce(Option<String>)>| {
                 let doc_id = doc_id.clone();
                 leptos::task::spawn_local(async move {
@@ -1804,9 +1816,13 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                     on_ready(url);
                 });
             },
-        )));
+        );
+        crate::editor::image_bridge::set_resolver(Some(Rc::clone(&resolver)));
+        let resolver_for_cleanup = send_wrapper::SendWrapper::new(resolver);
+        on_cleanup(move || {
+            crate::editor::image_bridge::clear_resolver_if(&resolver_for_cleanup);
+        });
     }
-    on_cleanup(|| crate::editor::image_bridge::set_resolver(None));
 
     // Mentions spec §5 (Task 3) — a lone same-origin doc-URL paste hands
     // its `PendingMentionPaste` out of `EditorView::on_paste` (plain
