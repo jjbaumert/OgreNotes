@@ -115,16 +115,27 @@ pub fn from_quip_html(html: &str) -> QuipDocument {
 
 // ─── intermediate block model ────────────────────────────────────
 
-/// A run of inline content. Task 1 carries text only; the mark set is
-/// added by the marks pass, so the field name is stable.
+/// A run of inline content. Task 1 carries text plus hard-break
+/// position only; the mark set is added by the marks pass, so the
+/// field name is stable.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Span {
     pub text: String,
+    /// Set when a `<br>` immediately precedes this run. `HardBreak` is
+    /// an inline leaf (`NodeType::is_inline`, `schema.rs:184-186`), a
+    /// category `NodeType::valid_children` never enumerates — it only
+    /// governs *block*-level containment (see the doc on
+    /// `insert_block`'s containment check below). Materializing this
+    /// as a real `HardBreak` element rather than folding it into the
+    /// text as `\n` keeps the invariant documented at
+    /// `frontend/style/main.css:906-907`: a text node never carries a
+    /// literal newline.
+    pub hard_break_before: bool,
 }
 
 impl Span {
     fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+        Self { text: text.into(), hard_break_before: false }
     }
 }
 
@@ -300,6 +311,16 @@ impl InlineBuf {
         }
     }
 
+    /// Record a `<br>`. Pushes a fresh, empty span flagged
+    /// `hard_break_before` so the next `push_text` call appends *after*
+    /// the break rather than into the run that preceded it; two
+    /// consecutive breaks therefore produce two distinct empty spans,
+    /// which `materialize_block` turns into two distinct `HardBreak`
+    /// elements — matching the real DOM's `<br><br>`.
+    fn push_break(&mut self) {
+        self.spans.push(Span { text: String::new(), hard_break_before: true });
+    }
+
     /// Emit the buffer as a paragraph (dropping it when it holds only
     /// whitespace) and reset.
     fn flush(&mut self, out: &mut Vec<QuipBlock>, section_id: Option<String>) {
@@ -321,7 +342,9 @@ fn trim_spans(mut spans: Vec<Span>) -> Vec<Span> {
     if let Some(last) = spans.last_mut() {
         last.text = last.text.trim_end().to_string();
     }
-    spans.retain(|s| !s.text.is_empty());
+    // An empty span still marks a `<br>` — dropping it here would
+    // silently eat a leading/trailing hard break.
+    spans.retain(|s| !s.text.is_empty() || s.hard_break_before);
     spans
 }
 
@@ -461,7 +484,17 @@ fn walk_element(
                 alt: attr(handle, "alt").unwrap_or_default(),
             });
         }
-        "br" => pending.push_text("\n"),
+        // A hard line break inside a run of text. This is *not* folded
+        // into the text as `\n` — see the doc on `Span::hard_break_before`.
+        // `Paragraph::valid_children()` being empty says nothing about
+        // this: it's a block-containment predicate, and `HardBreak` is
+        // an inline leaf, a category that predicate doesn't cover.
+        // `import.rs:198-208` inserts a real `HardBreak` *element* into
+        // the open paragraph for exactly this reason; `push_break` is
+        // the equivalent move for this walker's two-stage pipeline
+        // (`materialize_block` turns the flag into that element once a
+        // yrs transaction actually exists).
+        "br" => pending.push_break(),
         // A checkbox is consumed by `checked_state` on its `<li>`; it
         // contributes no text of its own.
         "input" => {}
@@ -917,8 +950,18 @@ fn insert_block(
     parent_type: NodeType,
     node: NodeType,
 ) -> XmlElementRef {
+    // `valid_children()` is a block-containment predicate; it's
+    // legitimately empty for text containers like `Paragraph` and
+    // `Heading`, which have no *block* children. Inline leaves
+    // (`NodeType::is_inline` — `HardBreak`, `Mention`, `DocMention`)
+    // are a separate, orthogonal category it never enumerates, so they
+    // must be exempted here rather than added to `valid_children`
+    // itself (that would incorrectly claim a `Paragraph` can contain a
+    // whole `HardBreak` *subtree*, which it can't — `HardBreak` is a
+    // leaf). See `frontend/src/editor/schema.rs:60-78`
+    // `content_matches` for the same special-case on the render side.
     debug_assert!(
-        parent_type.valid_children().contains(&node),
+        node.is_inline() || parent_type.valid_children().contains(&node),
         "schema containment violated: {:?} inside {:?}",
         node,
         parent_type
@@ -946,8 +989,28 @@ fn insert_text(txn: &mut yrs::TransactionMut<'_>, el: &XmlElementRef, text: &str
     el.insert(txn, pos, XmlTextPrelim::new(text));
 }
 
+// Only test-side callers remain now that `materialize_block` splices
+// `HardBreak` elements via `insert_spans` instead of concatenating
+// `spans` into one flat string.
+#[cfg(test)]
 fn spans_text(spans: &[Span]) -> String {
     spans.iter().map(|s| s.text.as_str()).collect()
+}
+
+/// Insert `spans` as `el`'s content, splicing in a real `HardBreak`
+/// element wherever a span carries `hard_break_before` — mirrors
+/// `import.rs:198-208` inserting a `HardBreak` into the open paragraph,
+/// adapted for this walker's two-stage (parse-then-materialize)
+/// pipeline. `container` is `el`'s own `NodeType`, passed through only
+/// for `insert_block`'s containment check.
+fn insert_spans(txn: &mut yrs::TransactionMut<'_>, el: &XmlElementRef, container: NodeType, spans: &[Span]) {
+    let scope = XmlOpenable::Element(el.clone());
+    for span in spans {
+        if span.hard_break_before {
+            insert_block(txn, &scope, container, NodeType::HardBreak);
+        }
+        insert_text(txn, el, &span.text);
+    }
 }
 
 /// Build the yrs `Doc` from containment-clean blocks.
@@ -973,12 +1036,12 @@ fn materialize_block(
     match block {
         QuipBlock::Para { spans, .. } => {
             let el = insert_block(txn, parent, parent_type, NodeType::Paragraph);
-            insert_text(txn, &el, &spans_text(spans));
+            insert_spans(txn, &el, NodeType::Paragraph, spans);
         }
         QuipBlock::Heading { level, spans, .. } => {
             let el = insert_block(txn, parent, parent_type, NodeType::Heading);
             el.insert_attribute(txn, "level", (*level).clamp(1, 6).to_string());
-            insert_text(txn, &el, &spans_text(spans));
+            insert_spans(txn, &el, NodeType::Heading, spans);
         }
         QuipBlock::List { task, items, .. } => {
             let list_type = block.node_type();
@@ -1409,6 +1472,52 @@ mod tests {
                 blocks: vec![QuipBlock::Image { src: "x".into(), alt: String::new() }],
             }],
         }]);
+    }
+
+    #[test]
+    fn br_produces_a_hard_break_element_not_a_literal_newline() {
+        // The old (wrong) behavior pushed "\n" into the paragraph's
+        // text, justified by `Paragraph::valid_children()` being empty.
+        // That predicate governs block containment only; `HardBreak` is
+        // an inline leaf (`NodeType::is_inline`), an orthogonal
+        // category it never enumerates. Assert both halves of the fix:
+        // a real `HardBreak` element sits between the two text runs,
+        // and no text run ever carries a raw '\n'.
+        let out = from_quip_html("<p>a<br>b</p>");
+        let txn = out.doc.transact();
+        let frag = crate::document::get_content_fragment(&txn).expect("content fragment");
+        assert_eq!(frag.len(&txn), 1, "one paragraph");
+        let Some(XmlOut::Element(para)) = frag.get(&txn, 0) else { panic!("expected an element") };
+        assert_eq!(NodeType::from_tag(para.tag().as_ref()), Some(NodeType::Paragraph));
+
+        let mut seen = Vec::new();
+        for i in 0..para.len(&txn) {
+            match para.get(&txn, i) {
+                Some(XmlOut::Text(t)) => {
+                    let s = t.get_string(&txn);
+                    assert!(!s.contains('\n'), "text run carries a literal newline: {s:?}");
+                    seen.push(format!("text:{s}"));
+                }
+                Some(XmlOut::Element(el)) => {
+                    assert_eq!(NodeType::from_tag(el.tag().as_ref()), Some(NodeType::HardBreak));
+                    assert!(
+                        el.get_attribute(&txn, "blockId").is_some_and(|id| id.len() == 10),
+                        "HardBreak gets a blockId like any other element"
+                    );
+                    seen.push("hard_break".to_string());
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(seen, vec!["text:a", "hard_break", "text:b"], "{seen:?}");
+    }
+
+    #[test]
+    fn br_exports_as_a_real_br_tag_not_a_newline() {
+        let out = from_quip_html("<p>a<br>b</p>");
+        let html = crate::export::to_html(&out.doc);
+        assert!(html.contains("<br"), "HardBreak must export as <br>: {html}");
+        assert!(!html.contains("a\nb"), "no literal newline leaked into the exported text: {html}");
     }
 
     #[test]
