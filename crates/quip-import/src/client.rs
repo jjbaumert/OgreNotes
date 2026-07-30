@@ -16,7 +16,11 @@ const DEFAULT_BASE: &str = "https://platform.quip.com";
 /// pathological attachment exhausting worker memory, mirroring
 /// `crates/collab/src/import_pdf.rs`'s `MAX_PDF_BYTES` posture. Checked
 /// against `Content-Length` when present (short-circuits before download)
-/// and again against the actual received length.
+/// and again against the actual received length. A chunked or
+/// header-less response skips the short-circuit and is only caught by
+/// the post-read check, meaning `reqwest` will have buffered the full
+/// (oversized) body into memory before the error is raised — accepted,
+/// same posture as `import_pdf.rs`, given Quip is a fixed trusted host.
 const MAX_BLOB_BYTES: usize = 32 * 1024 * 1024;
 
 // ─── Error ─────────────────────────────────────────────────────
@@ -232,21 +236,10 @@ impl QuipClient {
 
         let checked = self.observe_and_check(resp).await?;
 
-        if let Some(len) = checked.content_length()
-            && len > MAX_BLOB_BYTES as u64
-        {
-            return Err(QuipError::Parse(format!(
-                "blob is {len} bytes (Content-Length); exceeds the {MAX_BLOB_BYTES}-byte limit"
-            )));
-        }
+        check_blob_size(checked.content_length(), 0)?;
 
         let bytes = checked.bytes_body().await?;
-        if bytes.len() > MAX_BLOB_BYTES {
-            return Err(QuipError::Parse(format!(
-                "blob is {} bytes; exceeds the {MAX_BLOB_BYTES}-byte limit",
-                bytes.len()
-            )));
-        }
+        check_blob_size(None, bytes.len())?;
         Ok(bytes)
     }
 
@@ -318,6 +311,30 @@ impl Checked {
     fn content_length(&self) -> Option<u64> {
         self.0.content_length()
     }
+}
+
+/// Enforce the `MAX_BLOB_BYTES` ceiling. Split out of `blob()` so both
+/// branches are unit-testable without a 32 MiB body or a live HTTP
+/// round-trip: `blob()` calls this once with `(declared_content_length, 0)`
+/// before reading the body (the short-circuit, skipped when the header is
+/// absent) and once with `(None, bytes.len())` after (the backstop, which
+/// also catches chunked / header-less responses that lied about or omitted
+/// `Content-Length`). Refuses bodies strictly *over* the cap — exactly at
+/// the cap is allowed.
+fn check_blob_size(content_length: Option<u64>, actual_len: usize) -> Result<(), QuipError> {
+    if let Some(len) = content_length
+        && len > MAX_BLOB_BYTES as u64
+    {
+        return Err(QuipError::Parse(format!(
+            "blob is {len} bytes (Content-Length); exceeds the {MAX_BLOB_BYTES}-byte limit"
+        )));
+    }
+    if actual_len > MAX_BLOB_BYTES {
+        return Err(QuipError::Parse(format!(
+            "blob is {actual_len} bytes; exceeds the {MAX_BLOB_BYTES}-byte limit"
+        )));
+    }
+    Ok(())
 }
 
 fn header_u32(resp: &reqwest::Response, name: &str) -> Option<u32> {
@@ -547,13 +564,41 @@ mod tests {
         assert!(!format!("{e}").contains("SEEKRET"));
     }
 
-    // No test for the `MAX_BLOB_BYTES` cap itself: wiremock/hyper reject a
-    // declared `Content-Length` that doesn't match the real body length at
-    // the transport layer (`payload claims content-length of N, custom
-    // content-length header claims M` — a hyper panic, not a client-visible
-    // response), so the `Content-Length` short-circuit can't be exercised
-    // without actually transmitting an oversized body. `MAX_BLOB_BYTES` is a
-    // private const with no test-only override, so faking a smaller cap
-    // isn't available either. Per the task brief, skipping this case rather
-    // than allocating a 32MiB+ buffer in a unit test.
+    // `check_blob_size` is extracted from `blob()` specifically so the cap
+    // logic is testable as pure comparisons — no wiremock, no I/O, no
+    // large allocation needed (a real 32MiB+ body can't be faked through
+    // wiremock/hyper: a declared `Content-Length` that doesn't match the
+    // real transmitted body size panics at the hyper transport layer, not
+    // as a client-visible response).
+
+    #[test]
+    fn check_blob_size_under_cap_passes() {
+        assert!(check_blob_size(Some(1000), 500).is_ok());
+    }
+
+    #[test]
+    fn check_blob_size_exactly_at_cap_passes() {
+        // Pins `>` (not `>=`) semantics: refuse bodies *over* the cap.
+        assert!(check_blob_size(Some(MAX_BLOB_BYTES as u64), 0).is_ok());
+        assert!(check_blob_size(None, MAX_BLOB_BYTES).is_ok());
+    }
+
+    #[test]
+    fn check_blob_size_declared_length_over_cap_errors() {
+        let err = check_blob_size(Some(MAX_BLOB_BYTES as u64 + 1), 0).unwrap_err();
+        assert!(matches!(err, QuipError::Parse(_)));
+        assert!(format!("{err}").contains("Content-Length"));
+    }
+
+    #[test]
+    fn check_blob_size_post_read_length_over_cap_errors() {
+        let err = check_blob_size(None, MAX_BLOB_BYTES + 1).unwrap_err();
+        assert!(matches!(err, QuipError::Parse(_)));
+        assert!(!format!("{err}").contains("Content-Length"));
+    }
+
+    #[test]
+    fn check_blob_size_none_content_length_with_under_cap_body_passes() {
+        assert!(check_blob_size(None, 500).is_ok());
+    }
 }
