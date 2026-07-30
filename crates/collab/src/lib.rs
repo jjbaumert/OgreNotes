@@ -6,6 +6,7 @@ pub mod diff;
 pub mod document;
 pub mod export;
 pub mod import;
+pub mod import_quip;
 #[cfg(feature = "docx")]
 pub mod import_docx;
 #[cfg(feature = "pdf")]
