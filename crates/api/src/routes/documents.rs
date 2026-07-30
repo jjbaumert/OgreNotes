@@ -1842,6 +1842,58 @@ async fn load_export_comments(state: &AppState, doc_id: &str) -> Vec<export::Exp
         .collect()
 }
 
+/// Resolve every durable `ogre-blob:` image reference in `doc` to a
+/// fresh presigned URL and rewrite `Image.src` in place, so a
+/// format exporter sees a real URL.
+///
+/// **Every export path must call this**, single-doc and bulk alike.
+/// Exporters read `Image.src` verbatim and `export.rs`'s `is_safe_url`
+/// gate deliberately rejects the `ogre-blob:` scheme, so skipping this
+/// step means a Markdown export silently drops the image *and its alt
+/// text*, and an HTML export emits an `<img>` with no `src`. That's a
+/// silent data-loss bug on an export, not a rendering nit — the bulk
+/// route shipped with exactly that gap because the rewrite lived
+/// inline in `export_document`, which is why it lives here now.
+///
+/// Presigning here is server-to-S3, so none of the Bearer-header-auth
+/// problem that rules out a live client-facing resolve route applies
+/// (see `frontend/src/editor/image_bridge.rs`). Doing it before any
+/// format-specific exporter runs means every format
+/// (html/markdown/csv/xlsx/docx/pdf) benefits from the one rewrite
+/// rather than needing its own `ogre-blob:` awareness. The 14400s TTL
+/// matches the live per-image resolve path: this restores exact
+/// pre-regression parity (the export used to see a real, already-
+/// presigned URL because that's what `Image.src` held before durable
+/// references existed), not a new, longer-lived guarantee.
+///
+/// Failures are silent by design — an S3 presign error leaves that one
+/// reference unrewritten (the image drops out of the export) rather
+/// than failing the whole export.
+async fn resolve_blob_refs_for_export(state: &AppState, doc: &OgreDoc, doc_id: &str) {
+    let blob_refs = blob_ref::collect_blob_refs(doc.inner());
+    if blob_refs.is_empty() {
+        return;
+    }
+    let mut resolved = std::collections::HashMap::new();
+    for (blob_id, key) in blob_refs {
+        // Defense in depth, mirroring `request_download_url`'s own
+        // prefix check: only presign keys that actually belong to this
+        // document. A blob ref naming a foreign doc/blob_id (malformed
+        // content, or a pasted/injected reference) is left as-is rather
+        // than handed a presigned URL. `parse_blob_ref` has already
+        // rejected `.`/`..` segments in either half, so this prefix
+        // test can't be satisfied by a path that traverses out of it.
+        let expected_prefix = format!("blobs/{doc_id}/{blob_id}/");
+        if !key.starts_with(&expected_prefix) {
+            continue;
+        }
+        if let Ok(url) = state.doc_repo.s3().presigned_get_url(&key, 14400).await {
+            resolved.insert(blob_ref::blob_ref(&blob_id, &key), url);
+        }
+    }
+    blob_ref::rewrite_blob_refs(doc.inner(), &resolved);
+}
+
 /// GET /documents/:id/export/:format -- export as html or markdown.
 async fn export_document(
     State(state): State<AppState>,
@@ -1851,42 +1903,7 @@ async fn export_document(
     let _meta = get_verified_doc(&state, &id, &user_id).await?;
 
     let doc = load_current_doc_state(&state, &id).await?;
-
-    // Durable image references (Phase 2a Task 3 follow-up): every
-    // exporter below reads `Image.src` verbatim, and `export.rs`'s
-    // `is_safe_url` gate deliberately rejects the `ogre-blob:` scheme —
-    // without this, a Markdown export silently drops the image (alt
-    // text and all) and an HTML export emits an `<img>` with no `src`.
-    // Presign a fresh URL for every blob reference the doc actually
-    // contains (server-to-S3, so none of the Bearer-header-auth problem
-    // that rules out a live client-facing resolve route applies — see
-    // `frontend/src/editor/image_bridge.rs`) and rewrite them in place
-    // *before* any format-specific exporter runs, so every format
-    // (html/markdown/csv/xlsx/docx/pdf) benefits uniformly from the one
-    // rewrite rather than needing its own `ogre-blob:` awareness. Same
-    // 14400s TTL as the live per-image resolve path — this restores
-    // exact pre-regression parity (the export used to see a real,
-    // already-presigned URL because that's what `Image.src` held before
-    // durable references existed), not a new, longer-lived guarantee.
-    let blob_refs = blob_ref::collect_blob_refs(doc.inner());
-    if !blob_refs.is_empty() {
-        let mut resolved = std::collections::HashMap::new();
-        for (blob_id, key) in blob_refs {
-            // Defense in depth, mirroring `request_download_url`'s own
-            // prefix check: only presign keys that actually belong to
-            // this document. A blob ref naming a foreign doc/blob_id
-            // (malformed content, or a pasted/injected reference) is
-            // left as-is rather than handed a presigned URL.
-            let expected_prefix = format!("blobs/{id}/{blob_id}/");
-            if !key.starts_with(&expected_prefix) {
-                continue;
-            }
-            if let Ok(url) = state.doc_repo.s3().presigned_get_url(&key, 14400).await {
-                resolved.insert(blob_ref::blob_ref(&blob_id, &key), url);
-            }
-        }
-        blob_ref::rewrite_blob_refs(doc.inner(), &resolved);
-    }
+    resolve_blob_refs_for_export(&state, &doc, &id).await;
 
     match format.as_str() {
         "html" | "markdown" | "md" | "csv" => {
@@ -2961,6 +2978,11 @@ async fn try_export_one(
     let doc = load_current_doc_state(state, doc_id)
         .await
         .map_err(|e| BulkExportError::Internal(e.to_string()))?;
+    // Same durable-blob-reference resolve the single-doc export does —
+    // see `resolve_blob_refs_for_export`. Without it a bulk Markdown
+    // export drops every image and its alt text, and bulk HTML emits
+    // src-less `<img>`s.
+    resolve_blob_refs_for_export(state, &doc, doc_id).await;
     // Comment threads travel with each doc in the bulk archive too (#59 T-6).
     let comments = load_export_comments(state, doc_id).await;
     let body = match format {

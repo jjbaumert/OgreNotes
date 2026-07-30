@@ -348,21 +348,38 @@ fn convert_code_block(child: &web_sys::Node, el: &web_sys::Element) -> Node {
 /// Parse an <img> element into an Image node, validating the URL.
 #[cfg(target_arch = "wasm32")]
 fn convert_image(el: &web_sys::Element) -> Option<Node> {
-    let src = el.get_attribute("src").unwrap_or_default();
-    // `is_safe_url` deliberately rejects the `ogre-blob:` scheme — it's
-    // not a real URL, so it must never reach an `<img src>` set on
-    // arbitrary externally-sourced HTML. But `element_tags` above already
-    // substitutes a resolved `https://` URL for a durable reference when
-    // one's cached (the overwhelmingly common case, since the image was
-    // just rendered before being copied); this prefix check is only the
-    // fallback for the rare unresolved-at-copy-time case, and only
-    // matters for content this same editor produced (an in-app
-    // paste) — an `ogre-blob:` src pasted in from outside the app can't
-    // resolve to anything this workspace owns regardless.
-    let is_durable_ref = src.starts_with(super::blob_ref::BLOB_REF_PREFIX);
-    if !is_durable_ref && !super::view::is_safe_url(&src) {
-        return None;
-    }
+    // Prefer the durable `ogre-blob:` reference `element_tags` emits
+    // alongside the resolved URL (see the `NodeType::Image` arm there).
+    // An in-app copy/paste must put the durable reference back into the
+    // model, NOT the presigned URL sitting in `src` — storing that URL
+    // would freeze a 4-hour-lived link into the CRDT, which is the exact
+    // bug durable references exist to eliminate.
+    //
+    // Only a syntactically valid reference counts, so an external page
+    // can't smuggle an attacker-chosen `(blob_id, key)` in through this
+    // attribute; anything else falls through to the `src` path below.
+    let durable = el
+        .get_attribute("data-ogre-blob")
+        .filter(|r| super::blob_ref::parse_blob_ref(r).is_some());
+
+    let src = match durable {
+        Some(reference) => reference,
+        None => {
+            let src = el.get_attribute("src").unwrap_or_default();
+            // Unconditional: `is_safe_url` deliberately rejects the
+            // `ogre-blob:` scheme, and since our own serializer now
+            // carries the durable identity out-of-band there is no
+            // reason to widen this for it. External HTML never sets
+            // `data-ogre-blob`, so an `<img src="ogre-blob:…">` from an
+            // arbitrary page is rejected here rather than injecting a
+            // reference to a blob this workspace owns.
+            if !super::view::is_safe_url(&src) {
+                return None;
+            }
+            src
+        }
+    };
+
     let mut attrs = std::collections::HashMap::new();
     attrs.insert("src".to_string(), src);
     if let Some(alt) = el.get_attribute("alt") {
@@ -963,22 +980,40 @@ fn element_tags(
         NodeType::HorizontalRule => ("<hr />".into(), None),
         NodeType::HardBreak => ("<br />".into(), None),
         NodeType::Image => {
-            // Copy/cut only ever writes `text/html` (see the `copy`/`cut`
-            // listeners in `view.rs`), so an `ogre-blob:` reference (see
-            // `super::blob_ref`) must be substituted with its resolved
-            // `https://` URL here — otherwise the clipboard payload
-            // (both for an in-app paste and for pasting into an external
-            // app) carries a token that isn't a URL at all, and
-            // `convert_image` below would previously drop the node
-            // outright. The image was just rendered, so this is expected
-            // to be an `image_bridge` cache hit; if it somehow isn't
-            // (e.g. the resolve hadn't landed yet at copy time), fall
-            // back to the raw reference rather than dropping the image —
-            // `convert_image`'s widened gate lets an in-app paste still
-            // reconstruct the node, and it'll resolve normally the next
-            // time it's rendered.
-            let src = attrs
-                .get("src")
+            // An image whose `src` is a durable `ogre-blob:` reference
+            // (see `super::blob_ref`) serializes with BOTH halves, and
+            // each half has exactly one job:
+            //
+            // - `src` gets the *resolved* `https://` URL, so the image
+            //   is actually viewable when pasted into an external app
+            //   (`ogre-blob:` is not a URL — an external editor would
+            //   show a broken image). The image was just rendered, so
+            //   this is expected to be an `image_bridge` cache hit; on
+            //   a miss, fall back to the raw reference rather than
+            //   dropping the image.
+            // - `data-ogre-blob` carries the *durable* reference, and
+            //   `convert_image` below prefers it over `src`. Without
+            //   it, an in-app copy/paste (duplicating an image — a
+            //   common flow) would write the presigned URL back into
+            //   the CRDT, freezing a 4-hour-lived URL into the
+            //   document with no self-heal. That is precisely the bug
+            //   durable references exist to eliminate; reintroducing
+            //   it on the paste path would be a silent regression.
+            //
+            // External HTML never carries `data-ogre-blob`, so this
+            // attribute is also what lets `convert_image` keep an
+            // unconditional `is_safe_url` gate on `src`.
+            //
+            // Note the `copy`/`cut` listeners in `view.rs` write
+            // `text/plain` as well as `text/html`; that flavor is safe
+            // today only because `serialize_to_text` has no `Image`
+            // arm, so an image contributes nothing to it. Anyone adding
+            // one must make the same resolved-vs-durable decision here
+            // — a bare `ogre-blob:` token in the plain-text flavor is a
+            // dead string outside this app.
+            let raw_src = attrs.get("src");
+            let durable_ref = raw_src.filter(|s| super::blob_ref::parse_blob_ref(s).is_some());
+            let src = raw_src
                 .map(|s| {
                     let resolved = super::blob_ref::parse_blob_ref(s)
                         .and_then(|(blob_id, key)| super::image_bridge::peek(&blob_id, &key))
@@ -986,11 +1021,14 @@ fn element_tags(
                     format!(" src=\"{}\"", html_escape_attr(&resolved))
                 })
                 .unwrap_or_default();
+            let durable = durable_ref
+                .map(|r| format!(" data-ogre-blob=\"{}\"", html_escape_attr(r)))
+                .unwrap_or_default();
             let alt = attrs
                 .get("alt")
                 .map(|a| format!(" alt=\"{}\"", html_escape_attr(a)))
                 .unwrap_or_default();
-            (format!("<img{src}{alt} />"), None)
+            (format!("<img{src}{durable}{alt} />"), None)
         }
         NodeType::Table => ("<table>".into(), Some("</table>".into())),
         NodeType::TableRow => ("<tr>".into(), Some("</tr>".into())),
@@ -1904,12 +1942,19 @@ mod tests {
     }
 
     /// Regression: copying an image whose `src` is a durable
-    /// `ogre-blob:` reference (see `super::blob_ref`) must serialize the
-    /// clipboard HTML with the resolved `https://` URL, not the raw
-    /// token — `is_safe_url` rejects `ogre-blob:`, so leaving it in the
-    /// clipboard payload verbatim would make `convert_image`'s (widened,
-    /// but not THAT widened) gate the only thing standing between "image
-    /// survives copy/paste" and "image silently dropped on paste."
+    /// `ogre-blob:` reference (see `super::blob_ref`) must serialize
+    /// BOTH halves — a resolved `https://` `src` so the image is
+    /// viewable when pasted into an external app, AND a
+    /// `data-ogre-blob` attribute carrying the durable reference so an
+    /// in-app paste (`convert_image`) puts the reference, not the
+    /// 4-hour-lived presigned URL, back into the CRDT.
+    ///
+    /// Dropping the durable half is what made copy → paste silently
+    /// reintroduce the expiring-URL bug this whole change exists to
+    /// fix. The round trip through the parse half is pinned by
+    /// `frontend/tests/browser.rs::clipboard_image_round_trip_preserves_durable_blob_ref`
+    /// (the parse path is `wasm32`-only — see the note above the
+    /// DocMention tests).
     #[test]
     fn serialize_image_substitutes_cached_resolved_url_for_blob_ref() {
         let blob_id = "b-copy-test";
@@ -1951,14 +1996,48 @@ mod tests {
             html.contains(&format!("src=\"{resolved_url}\"")),
             "expected resolved URL in {html:?}"
         );
-        assert!(!html.contains("ogre-blob:"), "raw reference must not leak into the clipboard payload: {html}");
+        // The durable identity must ride along, out-of-band from `src`.
+        assert!(
+            html.contains(&format!(
+                "data-ogre-blob=\"{}\"",
+                html_escape_attr(&super::super::blob_ref::blob_ref(blob_id, key))
+            )),
+            "durable reference must survive alongside the resolved URL: {html}"
+        );
 
         super::super::image_bridge::set_resolver(None);
     }
 
+    /// A plain external image (no durable reference) must not grow a
+    /// `data-ogre-blob` attribute — the attribute is the in-app
+    /// identity marker, and emitting it for arbitrary URLs would make
+    /// `convert_image`'s preference for it meaningless.
+    #[test]
+    fn serialize_image_omits_durable_attribute_for_ordinary_urls() {
+        let mut attrs = HashMap::new();
+        attrs.insert("src".to_string(), "https://example.com/cat.png".to_string());
+        attrs.insert("alt".to_string(), "A cat".to_string());
+        let slice = Slice::new(
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::Image,
+                attrs,
+                Fragment::empty(),
+            )]),
+            0,
+            0,
+        );
+
+        let html = serialize_to_html(&slice);
+        assert!(html.contains("src=\"https://example.com/cat.png\""), "{html}");
+        assert!(!html.contains("data-ogre-blob"), "{html}");
+    }
+
     /// Cache miss at copy time (the resolve hadn't landed yet) must not
-    /// drop the image from the clipboard payload — the raw reference is
-    /// emitted instead, matching `convert_image`'s ogre-blob: fallback.
+    /// drop the image from the clipboard payload. `src` falls back to
+    /// the raw reference — a dead string for an external paste, but
+    /// better than no image at all — while `data-ogre-blob` is emitted
+    /// exactly as in the cache-hit case, so an in-app paste survives a
+    /// cache miss with its durable identity fully intact.
     #[test]
     fn serialize_image_falls_back_to_raw_ref_on_cache_miss() {
         let src = super::super::blob_ref::blob_ref("b-unresolved", "some/key.png");
@@ -1978,6 +2057,10 @@ mod tests {
         assert!(
             html.contains(&format!("src=\"{}\"", html_escape_attr(&src))),
             "raw ref must still be emitted, not dropped: {html}"
+        );
+        assert!(
+            html.contains(&format!("data-ogre-blob=\"{}\"", html_escape_attr(&src))),
+            "durable reference must be emitted even on a cache miss: {html}"
         );
     }
 

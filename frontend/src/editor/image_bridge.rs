@@ -14,11 +14,29 @@
 //! [`resolve`] for every `ogre-blob:` src it renders and never needs to
 //! know how the fetch happens.
 //!
-//! Resolved URLs are cached here, keyed by `(blob_id, key)`, for the
-//! page's lifetime — a document with N images issues at most N
-//! presigned-URL requests total, no matter how many times the editor
-//! re-renders (it does a full DOM rebuild on every dispatched
-//! transaction) while those N resolve.
+//! Resolved URLs are cached here, keyed by `(blob_id, key)` — a
+//! document with N images issues at most N presigned-URL requests, no
+//! matter how many times the editor re-renders (it does a full DOM
+//! rebuild on every dispatched transaction) while those N resolve.
+//!
+//! The cache is time-bounded, not page-lifetime: see
+//! [`CACHE_FRESH_MS`].
+//!
+//! ## Known hazards (deliberately not defended against here)
+//!
+//! Two failure modes are latent in the `WAITERS` bookkeeping and are
+//! documented rather than fixed, since neither is reachable from the
+//! resolver the document page actually installs:
+//!
+//! - A resolver that never invokes its completion callback leaves a
+//!   `WAITERS` entry in place forever, and every later [`resolve`] for
+//!   that key sees "already in flight" and does nothing. Recovery
+//!   today is a remount (`clear_resolver_if` clears the maps).
+//! - While a fetch is in flight, each re-render pushes another waiter
+//!   onto that key's list without bound. The list drains on
+//!   completion, so this is bounded by the fetch's duration, but a
+//!   very slow fetch in a document being typed into will accumulate
+//!   closures.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -34,6 +52,75 @@ type CacheKey = (String, String);
 /// Callbacks awaiting an in-flight resolution for one key.
 type WaiterList = Vec<Box<dyn FnOnce(String)>>;
 
+/// A resolved presigned URL plus the wall-clock instant it was minted.
+struct CacheEntry {
+    url: String,
+    resolved_at_ms: f64,
+}
+
+/// How long a cached presigned URL is treated as usable — half the
+/// server's 14400s (4-hour) presign TTL.
+///
+/// The cache must expire, not just fill: `EditorView::render()` rebuilds
+/// the whole DOM on every dispatched transaction, so a tab left open
+/// past the presign TTL would otherwise re-render every `<img>` with a
+/// URL that 403s on the next keystroke — the original
+/// image-breaks-after-4-hours symptom, merely re-keyed from document age
+/// to session length. Half the TTL leaves a wide margin for clock skew
+/// and for the interval between resolving a URL and the browser actually
+/// requesting it.
+const CACHE_FRESH_MS: f64 = 7_200_000.0;
+
+/// Wall clock in Unix milliseconds.
+///
+/// This module can't call `api::client::now_ms` — `crate::api` isn't
+/// part of the lib target (see the module doc) — so it mirrors that
+/// function's cfg split instead: a real clock under `wasm32`, and 0.0
+/// natively, where there's no `Date` and the cache never runs for real
+/// anyway.
+///
+/// Unit tests (on either architecture — the lib's `#[cfg(test)]` module
+/// compiles under `wasm-pack test` too) read a settable `TEST_NOW_MS`
+/// instead, so the freshness window is testable without waiting two
+/// hours. Integration tests in `frontend/tests/` link the lib built
+/// *without* `cfg(test)` and so get the real clock.
+fn now_ms() -> f64 {
+    #[cfg(test)]
+    {
+        TEST_NOW_MS.with(|c| c.get())
+    }
+    #[cfg(all(not(test), target_arch = "wasm32"))]
+    {
+        js_sys::Date::now()
+    }
+    #[cfg(all(not(test), not(target_arch = "wasm32")))]
+    {
+        0.0
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only clock, in Unix milliseconds. See `now_ms`.
+    static TEST_NOW_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+/// The cached URL for `cache_key` if one is present *and* still within
+/// [`CACHE_FRESH_MS`]. A stale entry is evicted on the way out, so the
+/// caller's next step (a fetch, for [`resolve`]) starts from a clean
+/// slate.
+fn take_fresh_cached(cache_key: &CacheKey) -> Option<String> {
+    CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        let entry = cache.get(cache_key)?;
+        if now_ms() - entry.resolved_at_ms < CACHE_FRESH_MS {
+            return Some(entry.url.clone());
+        }
+        cache.remove(cache_key);
+        None
+    })
+}
+
 /// How many further `resolve()` calls for a failed key are answered from
 /// the negative cache (no fetch) before the next call is allowed to retry.
 /// `EditorView::render()` fully rebuilds the DOM on every dispatched
@@ -47,7 +134,7 @@ const FAILURE_BACKOFF_CALLS: u32 = 20;
 
 thread_local! {
     static RESOLVER: RefCell<Option<Resolver>> = const { RefCell::new(None) };
-    static CACHE: RefCell<HashMap<CacheKey, String>> = RefCell::new(HashMap::new());
+    static CACHE: RefCell<HashMap<CacheKey, CacheEntry>> = RefCell::new(HashMap::new());
     // A non-empty entry means a fetch is already in flight for that key —
     // a second `resolve()` call for the same key while one is pending
     // queues its callback here instead of firing a second request.
@@ -100,20 +187,28 @@ pub fn clear_resolver_if(expected: &Resolver) {
 }
 
 /// Synchronous cache peek: the resolved URL for `(blob_id, key)` if one
-/// is already cached, without triggering a fetch or touching `WAITERS`/
-/// `FAILED`. Used by the clipboard HTML serializer
-/// (`clipboard.rs::element_tags`), which runs synchronously inside a
-/// `copy`/`cut` DOM event handler and can't await a fetch — since the
-/// image was just rendered, this is expected to be a cache hit.
+/// is cached and still fresh ([`CACHE_FRESH_MS`]), without triggering a
+/// fetch or touching `WAITERS`/`FAILED`. Used by the clipboard HTML
+/// serializer (`clipboard.rs::element_tags`), which runs synchronously
+/// inside a `copy`/`cut` DOM event handler and can't await a fetch —
+/// since the image was just rendered, this is expected to be a hit.
+///
+/// Applies the same freshness window as [`resolve`] rather than a
+/// looser one: handing a stale URL to the clipboard would put a link
+/// that's about to 403 into an external paste. On a miss the serializer
+/// falls back to emitting the raw reference, and the durable
+/// `data-ogre-blob` attribute it emits either way keeps an in-app paste
+/// lossless.
 pub fn peek(blob_id: &str, key: &str) -> Option<String> {
-    let cache_key: CacheKey = (blob_id.to_string(), key.to_string());
-    CACHE.with(|c| c.borrow().get(&cache_key).cloned())
+    take_fresh_cached(&(blob_id.to_string(), key.to_string()))
 }
 
 /// Resolve `(blob_id, key)` to a presigned download URL.
 ///
-/// - Cache hit: returns `Some(url)` synchronously; `on_ready` is not
-///   called.
+/// - Fresh cache hit: returns `Some(url)` synchronously; `on_ready` is
+///   not called. An entry older than [`CACHE_FRESH_MS`] is evicted and
+///   treated as a miss, so a long-lived tab re-resolves rather than
+///   re-rendering an expired URL.
 /// - Recently failed (within `FAILURE_BACKOFF_CALLS` calls of its last
 ///   failure): returns `None` immediately without fetching — see
 ///   `FAILURE_BACKOFF_CALLS`.
@@ -127,7 +222,7 @@ pub fn peek(blob_id: &str, key: &str) -> Option<String> {
 pub fn resolve(blob_id: &str, key: &str, on_ready: impl FnOnce(String) + 'static) -> Option<String> {
     let cache_key: CacheKey = (blob_id.to_string(), key.to_string());
 
-    if let Some(url) = CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
+    if let Some(url) = take_fresh_cached(&cache_key) {
         return Some(url);
     }
 
@@ -179,7 +274,13 @@ pub fn resolve(blob_id: &str, key: &str, on_ready: impl FnOnce(String) + 'static
                 .unwrap_or_default();
             if let Some(url) = result {
                 CACHE.with(|c| {
-                    c.borrow_mut().insert(done_key.clone(), url.clone());
+                    c.borrow_mut().insert(
+                        done_key.clone(),
+                        CacheEntry {
+                            url: url.clone(),
+                            resolved_at_ms: now_ms(),
+                        },
+                    );
                 });
                 for waiter in waiters {
                     waiter(url.clone());
@@ -212,6 +313,12 @@ mod tests {
         CACHE.with(|c| c.borrow_mut().clear());
         WAITERS.with(|w| w.borrow_mut().clear());
         FAILED.with(|f| f.borrow_mut().clear());
+        set_test_now_ms(0.0);
+    }
+
+    /// Move the test clock `now_ms` reads. See `now_ms`'s cfg split.
+    fn set_test_now_ms(ms: f64) {
+        TEST_NOW_MS.with(|c| c.set(ms));
     }
 
     #[test]
@@ -328,6 +435,70 @@ mod tests {
         // the expired backoff and starts the next attempt).
         assert_eq!(resolve("broken", "k", |_| {}), None);
         assert_eq!(fetch_count.get(), 2, "must retry after backoff elapses");
+        reset();
+    }
+
+    /// Regression: a tab left open past the presigned URL's TTL must
+    /// re-resolve, not keep serving the stale URL forever.
+    ///
+    /// `EditorView::render()` rebuilds the DOM on every dispatched
+    /// transaction, so an unconditional cache hit meant the next
+    /// keystroke after ~4 hours re-rendered every `<img>` with a URL
+    /// that 403s — the original "images break after 4 hours" symptom,
+    /// re-keyed from document age to session length.
+    #[test]
+    fn stale_cache_entry_is_refetched_after_the_freshness_window() {
+        reset();
+        let fetch_count = Rc::new(Cell::new(0));
+        let fetch_count_r = Rc::clone(&fetch_count);
+        set_resolver(Some(Rc::new(move |blob_id: String, key: String, cb| {
+            let n = fetch_count_r.get() + 1;
+            fetch_count_r.set(n);
+            cb(Some(format!("https://example.com/{blob_id}/{key}?sig={n}")));
+        })));
+
+        assert_eq!(resolve("b5", "k5", |_| {}), None, "first call fetches");
+        assert_eq!(fetch_count.get(), 1);
+        let first_url = "https://example.com/b5/k5?sig=1".to_string();
+        assert_eq!(resolve("b5", "k5", |_| {}), Some(first_url.clone()));
+        assert_eq!(fetch_count.get(), 1, "fresh entry must be served from cache");
+
+        // Just inside the window: still a hit.
+        set_test_now_ms(CACHE_FRESH_MS - 1.0);
+        assert_eq!(resolve("b5", "k5", |_| {}), Some(first_url.clone()));
+        assert_eq!(peek("b5", "k5"), Some(first_url));
+        assert_eq!(fetch_count.get(), 1, "must not refetch inside the window");
+
+        // Past the window: the entry is stale, so this call refetches.
+        // The refetching call itself returns `None` (the fetch is only
+        // synchronous because this test's resolver is), and the *next*
+        // call sees the freshly-minted URL.
+        set_test_now_ms(CACHE_FRESH_MS + 1.0);
+        assert_eq!(resolve("b5", "k5", |_| {}), None, "stale entry is a miss");
+        assert_eq!(fetch_count.get(), 2, "stale entry must trigger a refetch");
+        assert_eq!(
+            resolve("b5", "k5", |_| {}),
+            Some("https://example.com/b5/k5?sig=2".to_string()),
+            "the refreshed URL must now be cached"
+        );
+        assert_eq!(fetch_count.get(), 2);
+        reset();
+    }
+
+    /// `peek` applies the same freshness window as `resolve` — the
+    /// clipboard serializer must never put an about-to-403 URL into an
+    /// external paste.
+    #[test]
+    fn peek_treats_a_stale_entry_as_a_miss() {
+        reset();
+        set_resolver(Some(Rc::new(|blob_id: String, key: String, cb| {
+            cb(Some(format!("https://example.com/{blob_id}/{key}")));
+        })));
+        assert_eq!(resolve("b6", "k6", |_| {}), None);
+        assert_eq!(peek("b6", "k6"), Some("https://example.com/b6/k6".to_string()));
+
+        set_test_now_ms(CACHE_FRESH_MS + 1.0);
+        assert_eq!(peek("b6", "k6"), None, "stale entry must not be peeked");
         reset();
     }
 
