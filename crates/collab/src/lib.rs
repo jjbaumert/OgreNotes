@@ -11,6 +11,7 @@ pub mod import;
 pub mod import_docx;
 #[cfg(feature = "pdf")]
 pub mod import_pdf;
+pub mod import_quip;
 pub mod import_spreadsheet;
 pub mod mail_merge;
 pub mod protocol;
