@@ -4,9 +4,12 @@
 //!
 //! **Current contents:** just the durable blob-reference helpers
 //! (Phase 2a Task 3) — the `Image.src` form that survives longer than a
-//! presigned S3 URL's TTL. The Quip HTML walker (thread content →
-//! block-grammar conversion, mirroring `import_docx`/`import_pdf`) is a
-//! later Phase 2a task and lands in this same module.
+//! presigned S3 URL's TTL — and the doc-level collect/rewrite pair the
+//! export route uses to resolve those references back to real URLs
+//! before handing the doc to a format exporter. The Quip HTML walker
+//! (thread content → block-grammar conversion, mirroring
+//! `import_docx`/`import_pdf`) is a later Phase 2a task and lands in
+//! this same module.
 //!
 //! ## Why a stable `Image.src` form
 //!
@@ -20,6 +23,12 @@
 //! resolved URL isn't already cached for the page's lifetime.
 
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+
+use yrs::types::xml::{Xml, XmlFragment, XmlOut};
+use yrs::{Doc, ReadTxn, Transact, XmlElementRef};
+
+use crate::schema::NodeType;
 
 /// Prefix marking an `Image.src` value as a durable blob reference owned by
 /// this workspace, as opposed to a legacy or external absolute URL (which
@@ -53,6 +62,116 @@ pub fn parse_blob_ref(src: &str) -> Option<(String, String)> {
     }
     let key = percent_decode(encoded_key)?;
     Some((blob_id.to_string(), key))
+}
+
+/// Every `Image` node in `doc` whose `src` parses as a durable blob
+/// reference (see [`parse_blob_ref`]), as `(blob_id, key)` pairs,
+/// deduplicated and in document order.
+///
+/// Used by the export route (`crates/api/src/routes/documents.rs`) to
+/// presign fresh download URLs — server-to-S3, not `<img>`-to-server, so
+/// none of the Bearer-header-auth problem that rules out a live resolve
+/// route applies — before handing the doc to a format exporter. Without
+/// this, `export.rs`'s `is_safe_url` gate (by design) rejects the
+/// `ogre-blob:` scheme, so an exported Markdown doc silently drops the
+/// image (alt text and all) and an exported HTML doc emits an `<img>`
+/// with no `src` at all.
+pub fn collect_blob_refs(doc: &Doc) -> Vec<(String, String)> {
+    let txn = doc.transact();
+    let Some(fragment) = txn.get_xml_fragment("content") else {
+        return Vec::new();
+    };
+    let mut image_els = Vec::new();
+    collect_image_elements(&txn, &fragment, &mut image_els);
+
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut out = Vec::new();
+    for el in &image_els {
+        let Some(src) = el.get_attribute(&txn, "src") else {
+            continue;
+        };
+        let Some(pair) = parse_blob_ref(&src) else {
+            continue;
+        };
+        if seen.insert(pair.clone()) {
+            out.push(pair);
+        }
+    }
+    out
+}
+
+/// Rewrite every `Image.src` in `doc` that's a durable blob reference
+/// (see [`parse_blob_ref`]) whose *exact reference string* (as produced
+/// by [`blob_ref`]) is a key in `resolved`, replacing it with the mapped
+/// value in place. References not present in `resolved` — and any `src`
+/// that isn't a blob reference at all (legacy/external URLs) — are left
+/// untouched.
+///
+/// Two-phase, mirroring [`crate::mail_merge::substitute_ydoc`]: collect
+/// the element handles under a read transaction, then mutate them under
+/// a single write transaction, so the read and write borrows of `doc`
+/// never overlap.
+pub fn rewrite_blob_refs(doc: &Doc, resolved: &HashMap<String, String>) {
+    if resolved.is_empty() {
+        return;
+    }
+
+    let image_els: Vec<XmlElementRef> = {
+        let txn = doc.transact();
+        let Some(fragment) = txn.get_xml_fragment("content") else {
+            return;
+        };
+        let mut out = Vec::new();
+        collect_image_elements(&txn, &fragment, &mut out);
+        out
+    };
+    if image_els.is_empty() {
+        return;
+    }
+
+    let mut txn = doc.transact_mut();
+    for el in &image_els {
+        let Some(src) = el.get_attribute(&txn, "src") else {
+            continue;
+        };
+        if let Some(new_src) = resolved.get(&src) {
+            el.insert_attribute(&mut txn, "src", new_src.as_str());
+        }
+    }
+}
+
+/// Depth-first collection of every `Image` element anywhere in `fragment`
+/// (an `Image` can be nested arbitrarily — inside a table cell, list
+/// item, blockquote, etc.), shared by [`collect_blob_refs`] and
+/// [`rewrite_blob_refs`].
+fn collect_image_elements<T: ReadTxn>(
+    txn: &T,
+    fragment: &yrs::XmlFragmentRef,
+    out: &mut Vec<XmlElementRef>,
+) {
+    for i in 0..fragment.len(txn) {
+        if let Some(child) = fragment.get(txn, i) {
+            collect_image_elements_from_node(txn, &child, out);
+        }
+    }
+}
+
+fn collect_image_elements_from_node<T: ReadTxn>(
+    txn: &T,
+    node: &XmlOut,
+    out: &mut Vec<XmlElementRef>,
+) {
+    let XmlOut::Element(el) = node else {
+        return;
+    };
+    if el.tag().as_ref() == NodeType::Image.tag_name() {
+        out.push(el.clone());
+    }
+    for i in 0..el.len(txn) {
+        if let Some(child) = el.get(txn, i) {
+            collect_image_elements_from_node(txn, &child, out);
+        }
+    }
 }
 
 /// Minimal percent-encoding: escapes everything outside the RFC 3986
@@ -153,5 +272,117 @@ mod tests {
             blob_ref("blob-42", "a b/c%d#e?f&g.png"),
             "ogre-blob:blob-42/a%20b%2Fc%25d%23e%3Ff%26g.png"
         );
+    }
+
+    // ── collect_blob_refs / rewrite_blob_refs ─────────────────────
+
+    use yrs::types::xml::XmlElementPrelim;
+    use yrs::WriteTxn;
+
+    fn doc_with<F: FnOnce(&mut yrs::TransactionMut<'_>, &yrs::XmlFragmentRef)>(f: F) -> Doc {
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let fragment = txn.get_or_insert_xml_fragment("content");
+            f(&mut txn, &fragment);
+        }
+        doc
+    }
+
+    #[test]
+    fn collect_blob_refs_finds_top_level_and_nested_images_and_dedupes() {
+        let doc = doc_with(|txn, frag| {
+            let img1 = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Image.tag_name()));
+            img1.insert_attribute(txn, "src", &blob_ref("b1", "k1"));
+
+            // Nested: table > tableRow > tableCell > image — exercises the
+            // recursive walk, not just top-level fragment children.
+            let table = frag.insert(txn, 1, XmlElementPrelim::empty(NodeType::Table.tag_name()));
+            let row = table.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableRow.tag_name()));
+            let cell = row.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableCell.tag_name()));
+            let img2 = cell.insert(txn, 0, XmlElementPrelim::empty(NodeType::Image.tag_name()));
+            img2.insert_attribute(txn, "src", &blob_ref("b2", "k2"));
+
+            // Duplicate reference to b1/k1 — must be deduped.
+            let img3 = frag.insert(txn, 2, XmlElementPrelim::empty(NodeType::Image.tag_name()));
+            img3.insert_attribute(txn, "src", &blob_ref("b1", "k1"));
+
+            // Legacy absolute URL — must be ignored, not collected.
+            let img4 = frag.insert(txn, 3, XmlElementPrelim::empty(NodeType::Image.tag_name()));
+            img4.insert_attribute(txn, "src", "https://example.com/legacy.png");
+        });
+
+        let mut refs = collect_blob_refs(&doc);
+        refs.sort();
+        assert_eq!(
+            refs,
+            vec![
+                ("b1".to_string(), "k1".to_string()),
+                ("b2".to_string(), "k2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_blob_refs_empty_doc_returns_empty() {
+        let doc = Doc::new();
+        assert!(collect_blob_refs(&doc).is_empty());
+    }
+
+    #[test]
+    fn rewrite_blob_refs_replaces_matching_refs_and_leaves_the_rest() {
+        let ref1 = blob_ref("b1", "k1");
+        let ref2 = blob_ref("b2", "k2");
+        let doc = doc_with(|txn, frag| {
+            let img1 = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Image.tag_name()));
+            img1.insert_attribute(txn, "src", ref1.as_str());
+
+            // Not in the resolved map — must be left untouched.
+            let img2 = frag.insert(txn, 1, XmlElementPrelim::empty(NodeType::Image.tag_name()));
+            img2.insert_attribute(txn, "src", ref2.as_str());
+
+            // Legacy absolute URL — must be left untouched.
+            let img3 = frag.insert(txn, 2, XmlElementPrelim::empty(NodeType::Image.tag_name()));
+            img3.insert_attribute(txn, "src", "https://example.com/legacy.png");
+        });
+
+        let mut resolved = HashMap::new();
+        resolved.insert(ref1.clone(), "https://s3.example.com/fresh1?sig=1".to_string());
+
+        rewrite_blob_refs(&doc, &resolved);
+
+        let txn = doc.transact();
+        let fragment = txn.get_xml_fragment("content").unwrap();
+        let mut srcs = Vec::new();
+        for i in 0..fragment.len(&txn) {
+            if let Some(XmlOut::Element(el)) = fragment.get(&txn, i) {
+                srcs.push(el.get_attribute(&txn, "src").unwrap());
+            }
+        }
+        assert_eq!(
+            srcs,
+            vec![
+                "https://s3.example.com/fresh1?sig=1".to_string(),
+                ref2,
+                "https://example.com/legacy.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrite_blob_refs_empty_map_is_a_noop() {
+        let ref1 = blob_ref("b1", "k1");
+        let doc = doc_with(|txn, frag| {
+            let img = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Image.tag_name()));
+            img.insert_attribute(txn, "src", ref1.as_str());
+        });
+        rewrite_blob_refs(&doc, &HashMap::new());
+
+        let txn = doc.transact();
+        let fragment = txn.get_xml_fragment("content").unwrap();
+        let Some(XmlOut::Element(el)) = fragment.get(&txn, 0) else {
+            panic!("image missing");
+        };
+        assert_eq!(el.get_attribute(&txn, "src"), Some(ref1));
     }
 }
