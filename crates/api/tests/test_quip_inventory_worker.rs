@@ -23,7 +23,7 @@ use ogrenotes_quip_import::QuipToken;
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
 use ogrenotes_storage::models::import_inventory::{ThreadRow, ThreadState};
 use ogrenotes_worker::{Job, JobQueue};
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Wiremock Quip server serving `/1/folders/` (per-id) and `/1/threads/`
@@ -65,6 +65,16 @@ async fn quip_fixture_server() -> MockServer {
             "t1": {"thread": {"id": "t1", "title": "Doc A", "type": "document", "updated_usec": 111}},
             "t2": {"thread": {"id": "t2", "title": "Sheet", "type": "spreadsheet", "updated_usec": 222}}
         })))
+        .mount(&server)
+        .await;
+
+    // Phase 2a widened `StartQuipImport` to run the content pass in the same
+    // job (see `test_quip_content_worker.rs` for its own coverage), so an
+    // inventory-only fixture is no longer a complete fixture for this job.
+    // A trivial body for every thread keeps these tests focused on inventory.
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/2/threads/.+/html$"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<p>body</p>"))
         .mount(&server)
         .await;
 
@@ -178,8 +188,12 @@ async fn inventory_walk_persists_folders_and_threads_and_total() {
     assert_eq!(t1.title, "Doc A");
     assert_eq!(t1.thread_type, "document");
     assert_eq!(t1.updated_usec, 111);
-    assert_eq!(t1.state, ThreadState::Pending);
     assert_eq!(t1.owner_id, "owner1");
+    // Phase 2a: the same job now runs the content pass, so the thread this
+    // walk enqueued as Pending has already been converted by the time the
+    // job returns. Inventory's own contract — that it *discovers* the thread
+    // with the right metadata and folder membership — is what's asserted here.
+    assert_eq!(t1.state, ThreadState::ContentDone);
     // Shared thread lists both member folders; first_folder is the root.
     assert_eq!(t1.first_folder, "root");
     let mut mf = t1.member_folders.clone();
@@ -195,11 +209,12 @@ async fn inventory_walk_persists_folders_and_threads_and_total() {
         ["f2", "root"].iter().map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>()
     );
 
-    // Phase advanced + total recorded.
+    // Phase advanced + total recorded. Phase 2a: the job continues into the
+    // content pass, so it lands on phase 2 with both threads converted.
     let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
-    assert_eq!(rec.phase, 1);
+    assert_eq!(rec.phase, 2);
     let (total, done) = app.state.import_repo.count_threads_by_state(&import_id).await.unwrap();
-    assert_eq!((total, done), (2, 0));
+    assert_eq!((total, done), (2, 2));
 }
 
 #[tokio::test]
@@ -254,7 +269,7 @@ async fn inventory_is_idempotent_on_rerun() {
     assert_eq!(t1.ogre_doc_id.as_deref(), Some("ogre-doc-1"));
 
     let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
-    assert_eq!(rec.phase, 1);
+    assert_eq!(rec.phase, 2);
 }
 
 #[tokio::test]
@@ -328,7 +343,7 @@ async fn inventory_reclaims_stale_lease() {
     execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
 
     let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
-    assert_eq!(rec.phase, 1, "reclaimed run must reach phase 1");
+    assert_eq!(rec.phase, 2, "reclaimed run must reach phase 2 (inventory + content)");
     let (total, _) = app.state.import_repo.count_threads_by_state(&import_id).await.unwrap();
     assert_eq!(total, 2, "reclaimed run must persist the discovered threads");
 }

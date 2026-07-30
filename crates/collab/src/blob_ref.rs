@@ -142,10 +142,62 @@ pub fn rewrite_blob_refs(doc: &Doc, resolved: &HashMap<String, String>) {
     }
 }
 
+/// Set — or clear — `Image.src` for the images named by their `blockId`.
+///
+/// Where [`rewrite_blob_refs`] keys on the *current* `src` (it resolves
+/// references that are already durable), this keys on the block identity,
+/// because the caller that needs it — the Quip import's blob side-load
+/// (`worker_mode::import_one_thread`) — is *establishing* the durable
+/// reference: at that point the `src` still holds the raw Quip value and
+/// two different images can legitimately carry the same one.
+///
+/// A `Some(new_src)` value replaces the attribute. A `None` **removes** it:
+/// that is the disposition for an image whose bytes could not be fetched.
+/// The node stays in the document carrying its `alt` text rather than
+/// pointing at a URL that only resolves inside Quip — one unfetchable
+/// image must not cost the reader the rest of the document. Block ids with
+/// no matching image, and images with no entry, are left untouched.
+///
+/// Two-phase for the same borrow reason as [`rewrite_blob_refs`].
+pub fn set_image_srcs(doc: &Doc, by_block_id: &HashMap<String, Option<String>>) {
+    if by_block_id.is_empty() {
+        return;
+    }
+
+    let image_els: Vec<XmlElementRef> = {
+        let txn = doc.transact();
+        let Some(fragment) = txn.get_xml_fragment("content") else {
+            return;
+        };
+        let mut out = Vec::new();
+        collect_image_elements(&txn, &fragment, &mut out);
+        out
+    };
+    if image_els.is_empty() {
+        return;
+    }
+
+    let mut txn = doc.transact_mut();
+    for el in &image_els {
+        let Some(block_id) = el.get_attribute(&txn, "blockId") else {
+            continue;
+        };
+        match by_block_id.get(&block_id) {
+            Some(Some(new_src)) => {
+                el.insert_attribute(&mut txn, "src", new_src.as_str());
+            }
+            Some(None) => {
+                el.remove_attribute(&mut txn, &"src");
+            }
+            None => {}
+        }
+    }
+}
+
 /// Depth-first collection of every `Image` element anywhere in `fragment`
 /// (an `Image` can be nested arbitrarily — inside a table cell, list
-/// item, blockquote, etc.), shared by [`collect_blob_refs`] and
-/// [`rewrite_blob_refs`].
+/// item, blockquote, etc.), shared by [`collect_blob_refs`],
+/// [`rewrite_blob_refs`] and [`set_image_srcs`].
 fn collect_image_elements<T: ReadTxn>(
     txn: &T,
     fragment: &yrs::XmlFragmentRef,
@@ -368,6 +420,95 @@ mod tests {
                 ref2,
                 "https://example.com/legacy.png".to_string(),
             ]
+        );
+    }
+
+    // ── set_image_srcs ────────────────────────────────────────────
+
+    /// Reads back `(blockId, src)` for every top-level image, with `None`
+    /// for an image whose `src` attribute was removed.
+    fn top_level_image_srcs(doc: &Doc) -> Vec<(String, Option<String>)> {
+        let txn = doc.transact();
+        let fragment = txn.get_xml_fragment("content").unwrap();
+        let mut out = Vec::new();
+        for i in 0..fragment.len(&txn) {
+            if let Some(XmlOut::Element(el)) = fragment.get(&txn, i) {
+                out.push((
+                    el.get_attribute(&txn, "blockId").unwrap_or_default(),
+                    el.get_attribute(&txn, "src"),
+                ));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn set_image_srcs_sets_clears_and_leaves_unlisted_blocks_alone() {
+        let doc = doc_with(|txn, frag| {
+            for (idx, block) in ["blkA", "blkB", "blkC"].iter().enumerate() {
+                let img = frag.insert(
+                    txn,
+                    idx as u32,
+                    XmlElementPrelim::empty(NodeType::Image.tag_name()),
+                );
+                img.insert_attribute(txn, "blockId", *block);
+                img.insert_attribute(txn, "src", "/blob/t1/b9");
+                img.insert_attribute(txn, "alt", "pic");
+            }
+        });
+
+        let mut updates = HashMap::new();
+        updates.insert("blkA".to_string(), Some(blob_ref("b9", "blobs/d1/b9/pic")));
+        // blkB failed to side-load: the src is dropped, the node survives.
+        updates.insert("blkB".to_string(), None);
+        // blkC is absent from the map entirely — untouched.
+
+        set_image_srcs(&doc, &updates);
+
+        assert_eq!(
+            top_level_image_srcs(&doc),
+            vec![
+                ("blkA".to_string(), Some(blob_ref("b9", "blobs/d1/b9/pic"))),
+                ("blkB".to_string(), None),
+                ("blkC".to_string(), Some("/blob/t1/b9".to_string())),
+            ]
+        );
+
+        // The cleared image keeps its alt text — that's the whole point of
+        // dropping only the src.
+        let txn = doc.transact();
+        let fragment = txn.get_xml_fragment("content").unwrap();
+        let XmlOut::Element(blk_b) = fragment.get(&txn, 1).unwrap() else {
+            panic!("expected an element");
+        };
+        assert_eq!(blk_b.get_attribute(&txn, "alt").as_deref(), Some("pic"));
+    }
+
+    #[test]
+    fn set_image_srcs_reaches_nested_images_and_ignores_empty_maps() {
+        let doc = doc_with(|txn, frag| {
+            let table = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Table.tag_name()));
+            let row = table.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableRow.tag_name()));
+            let cell = row.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableCell.tag_name()));
+            let img = cell.insert(txn, 0, XmlElementPrelim::empty(NodeType::Image.tag_name()));
+            img.insert_attribute(txn, "blockId", "nested");
+            img.insert_attribute(txn, "src", "/blob/t1/b1");
+        });
+
+        set_image_srcs(&doc, &HashMap::new());
+        set_image_srcs(
+            &doc,
+            &HashMap::from([("nested".to_string(), Some("ogre-blob:b1/k".to_string()))]),
+        );
+
+        let txn = doc.transact();
+        let fragment = txn.get_xml_fragment("content").unwrap();
+        let mut found = Vec::new();
+        collect_image_elements(&txn, &fragment, &mut found);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].get_attribute(&txn, "src").as_deref(),
+            Some("ogre-blob:b1/k")
         );
     }
 
