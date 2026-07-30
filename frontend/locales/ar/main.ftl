@@ -934,3 +934,6 @@ quip-import-inventory-done = تم العثور على { $total } عنصر للا
 quip-import-estimate = حوالي { $minutes } دقيقة وفق حد معدل Quip
 quip-import-import-failed = فشل الاستيراد. يرجى المحاولة مرة أخرى.
 quip-import-token-expired = انتهت جلسة Quip الخاصة بك — يرجى إعادة الاتصال.
+quip-import-importing = جارٍ الاستيراد… { $done } من { $total }
+quip-import-content-done = تم استيراد { $total } عنصر
+quip-import-open-folder = فتح المجلد

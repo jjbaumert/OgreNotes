@@ -103,9 +103,12 @@ pub async fn start(
 /// Poll the current phase/progress of an in-flight import. During
 /// inventory (Phase 1), `progress.total` climbs as Quip threads are
 /// discovered while `progress.done` stays 0; `phase` flips to `1` once
-/// the inventory walk is complete. Phase 1 has no terminal "succeeded" —
-/// callers stop polling on `phase >= 1` or on a failure `status`
-/// (`failed` / `tokenrejected` / `cancelled`).
+/// the inventory walk is complete. During the content pass, `progress.done`
+/// climbs toward `progress.total` for free (threads move
+/// `Pending -> ContentDone`); `phase` flips to `2` once content is done.
+/// `status` stays `"running"` through both passes — Phase 2b is what sets
+/// a terminal `"succeeded"` — so callers stop polling on `phase >= 2` or
+/// on a failure `status` (`failed` / `tokenrejected` / `cancelled`).
 pub async fn get_status(import_id: &str) -> Result<StatusResponse, ApiClientError> {
     client::api_get(&format!("/imports/quip/{import_id}")).await
 }

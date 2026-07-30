@@ -284,7 +284,16 @@ pub fn QuipImportWizard(
                                     st.status.as_str(),
                                     "failed" | "tokenrejected" | "cancelled"
                                 );
-                                let inventory_done = st.phase >= 1;
+                                // Task 6 lands the content pass, which
+                                // advances threads Pending -> ContentDone
+                                // (and `record.phase` to `2`) after
+                                // inventory (`phase` `1`) completes.
+                                // `status` stays `"running"` through both
+                                // passes — nothing sets a terminal
+                                // `"succeeded"` until Phase 2b — so the
+                                // loop now keys completion off `phase >=
+                                // 2` instead of `phase >= 1`.
+                                let content_done = st.phase >= 2;
                                 if is_failure {
                                     set_terminal.set(Some(if st.status == "tokenrejected" {
                                         ImportTerminal::TokenExpired
@@ -296,7 +305,7 @@ pub fn QuipImportWizard(
                                     break;
                                 }
                                 set_progress.set(Some(st));
-                                if inventory_done {
+                                if content_done {
                                     set_polling.set(false);
                                     break;
                                 }
@@ -513,9 +522,46 @@ pub fn QuipImportWizard(
                                                             {crate::t!("quip-import-starting")}
                                                         </p>
                                                     }.into_any(),
+                                                    // phase >= 2: the content pass finished
+                                                    // (Task 6/7 — `status` stays `"running"`
+                                                    // here, so this is keyed off `phase`, not
+                                                    // a terminal status). The destination is
+                                                    // always the caller's Home folder (see the
+                                                    // module doc comment / `quip-import-target-
+                                                    // home` above) — Phase 1 deliberately skips
+                                                    // a destination picker, so "open folder"
+                                                    // always means Home.
+                                                    Some(st) if st.phase >= 2 => {
+                                                        let total = st.progress.total;
+                                                        view! {
+                                                            <p
+                                                                class="quip-import-progress-line"
+                                                                data-quip-import-total=total
+                                                                data-quip-import-content-done="true"
+                                                            >
+                                                                {crate::t!(
+                                                                    "quip-import-content-done",
+                                                                    total = total as i64,
+                                                                )}
+                                                            </p>
+                                                            <div class="confirm-actions">
+                                                                <button
+                                                                    class="btn btn-primary"
+                                                                    on:click=move |_| {
+                                                                        a11y::defer_close(on_close);
+                                                                        crate::commands::nav_bridge::go("/");
+                                                                    }
+                                                                >{crate::t!("quip-import-open-folder")}</button>
+                                                            </div>
+                                                        }.into_any()
+                                                    }
+                                                    // phase == 1: inventory is done and the
+                                                    // content pass is running — `done` climbs
+                                                    // toward `total` for free as threads move
+                                                    // Pending -> ContentDone (Task 6).
                                                     Some(st) if st.phase >= 1 => {
                                                         let total = st.progress.total;
-                                                        let minutes = total.div_ceil(45);
+                                                        let done = st.progress.done;
                                                         view! {
                                                             <p
                                                                 class="quip-import-progress-line"
@@ -529,8 +575,9 @@ pub fn QuipImportWizard(
                                                             </p>
                                                             <p class="quip-import-progress-estimate">
                                                                 {crate::t!(
-                                                                    "quip-import-estimate",
-                                                                    minutes = minutes as i64,
+                                                                    "quip-import-importing",
+                                                                    done = done as i64,
+                                                                    total = total as i64,
                                                                 )}
                                                             </p>
                                                         }.into_any()

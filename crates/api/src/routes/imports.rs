@@ -318,7 +318,11 @@ async fn get_status(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    let stage = if record.phase >= 1 { "inventory" } else { "scoping" };
+    let stage = match record.phase {
+        0 => "scoping",
+        1 => "inventory",
+        _ => "content",
+    };
 
     Ok(Json(StatusResponse {
         status: serde_json::to_string(&record.status)
