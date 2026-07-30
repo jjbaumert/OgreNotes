@@ -555,8 +555,9 @@ fn walk_element(
         }
         "img" => {
             // An image is a block node in this schema, so it closes any
-            // paragraph in progress. Marks/links around it are the next
-            // task's problem; the `src` stays the raw Quip value until
+            // paragraph in progress — marks covering it are therefore
+            // dropped, since a mark is a yrs *text* attribute and this
+            // is an element. The `src` stays the raw Quip value until
             // the blob side-load pass rewrites it.
             pending.flush(out, None);
             out.push(QuipBlock::Image {
@@ -611,14 +612,18 @@ fn walk_anchor(
     pending: &mut InlineBuf,
 ) {
     let href = attr(handle, "href").unwrap_or_default();
-    if let Some((thread_id, section_id)) = quip_thread_from_url(&href) {
+    if let Some(mention) = quip_thread_from_url(&href) {
         let (spans, rest) = walk_text_container(handle);
         let label: String = spans.iter().map(|s| s.text.as_str()).collect();
-        pending.push_mention(
-            QuipMention { thread_id, section_id, url: href },
-            label.trim().to_string(),
-        );
-        out.extend(rest);
+        pending.push_mention(mention, label.trim().to_string());
+        if !rest.is_empty() {
+            // Emitting a block closes the paragraph in progress first —
+            // the same move every other block-emitting arm makes (see
+            // the `img` and `p` arms). Without it the hoisted block
+            // lands *before* the text that preceded the link.
+            pending.flush(out, None);
+            out.extend(rest);
+        }
         return;
     }
     let mut inner = marks.clone();
@@ -880,34 +885,67 @@ fn section_id(handle: &markup5ever_rcdom::Handle) -> Option<String> {
 /// Assumed shape: `https://<subdomain>.quip.com/<THREAD_ID>/<slug>#<section>`
 /// — thread id is the first non-empty path segment, and the fragment
 /// (when present) is the target section anchor. `https://quip.com/ID`
-/// and a fragment-less URL are both accepted.
+/// and a fragment-less URL are both accepted, as is the **relative**
+/// form (`/AbCd1234/Some-Doc`): see [`resolve_href`].
+///
+/// The returned `QuipMention::url` is the **resolved absolute** URL,
+/// not the source href — see [`resolve_href`] for why that matters.
 ///
 /// Returns `None` for everything else, which is what makes an ordinary
-/// external link stay an ordinary link. Known non-handled cases, all
-/// of which degrade to "ordinary link" rather than to a wrong pending
-/// record:
-///
-///   - **Relative hrefs** (`/AbCd1234/Some-Doc`). Whether Quip's `/2`
-///     HTML emits absolute or relative links is unknown, and without a
-///     base URL a relative path can't be told apart from a link into
-///     our own app. Reconcile when real markup lands.
-///   - **A Quip host on a non-document path** (`/blob/...`), which has
-///     a first segment but is not a thread. Phase 2b's back-patch is
-///     keyed on the thread id existing in the inventory, so a bogus id
-///     resolves to nothing and the placeholder keeps its original url.
-fn quip_thread_from_url(href: &str) -> Option<(String, Option<String>)> {
-    let url = url::Url::parse(href.trim()).ok()?;
+/// external link stay an ordinary link. The one known imprecision:
+/// a **Quip host on a non-document path** (`/blob/...`) has a first
+/// path segment but is not a thread. Phase 2b's back-patch is keyed on
+/// the thread id existing in the inventory, so a bogus id resolves to
+/// nothing, gets *reported* as an unresolved link, and the placeholder
+/// keeps its url. That failure is loud, which is the property this
+/// helper optimizes for.
+fn quip_thread_from_url(href: &str) -> Option<QuipMention> {
+    let url = resolve_href(href)?;
     if !is_quip_host(url.host_str()?) {
         return None;
     }
-    let thread = url.path_segments()?.find(|s| !s.is_empty())?.to_string();
-    let section = url.fragment().filter(|f| !f.is_empty()).map(str::to_string);
-    Some((thread, section))
+    let thread_id = url.path_segments()?.find(|s| !s.is_empty())?.to_string();
+    let section_id = url.fragment().filter(|f| !f.is_empty()).map(str::to_string);
+    Some(QuipMention { thread_id, section_id, url: url.to_string() })
+}
+
+/// The base a *relative* href in a Quip thread body is relative to.
+///
+/// This is not a guess about the markup: `from_quip_html`'s input is a
+/// thread body fetched from Quip's `/2` API, so a relative href in it
+/// is relative to the Quip site by construction. There is no path
+/// through the importer by which `/AbCd1234/Some-Doc` could mean "a
+/// link into OgreNotes".
+const QUIP_BASE: &str = "https://quip.com/";
+
+/// Parse an href, falling back to resolution against [`QUIP_BASE`].
+///
+/// **Leaving a relative href unresolved is not the safe default.**
+/// `export::is_safe_url` (`export.rs:1572-1581`) explicitly accepts a
+/// leading `/`, so an unclassified relative Quip href would export as
+/// `<a href="/AbCd1234/Some-Doc">` — a live link into *OgreNotes' own
+/// origin* that 404s. Resolving it makes the worst case an
+/// over-classified pending link, which Phase 2b reports as unresolved.
+///
+/// The same reasoning is already baked into this changeset elsewhere:
+/// the design's image assumption is `<img src="/blob/{thread}/{blob}">`,
+/// also relative. Believing Quip relativizes blobs but not documents
+/// would be an unargued inconsistency inside one assumption set.
+fn resolve_href(href: &str) -> Option<url::Url> {
+    let href = href.trim();
+    if let Ok(absolute) = url::Url::parse(href) {
+        return Some(absolute);
+    }
+    let base = url::Url::parse(QUIP_BASE).ok()?;
+    url::Url::options().base_url(Some(&base)).parse(href).ok()
 }
 
 /// `quip.com` itself or any subdomain of it. Deliberately *not*
 /// `ends_with("quip.com")`, which would also accept `notquip.com` and
-/// hand an attacker-controlled host a pending-link record.
+/// hand an attacker-controlled host a pending-link record. Reading the
+/// host off a parsed `Url` (rather than string-matching the href) is
+/// also what defeats `https://quip.com@evil.example/` userinfo
+/// spoofing.
 fn is_quip_host(host: &str) -> bool {
     // A trailing dot is the fully-qualified form of the same host.
     let host = host.trim_end_matches('.').to_ascii_lowercase();
@@ -2007,19 +2045,28 @@ mod tests {
             ("https://quip.com/AbCd1234", Some("AbCd1234"), None),
             ("https://example.quip.com/AbCd1234/Doc#sec-77", Some("AbCd1234"), Some("sec-77")),
             ("https://EXAMPLE.QUIP.COM./AbCd1234/Doc", Some("AbCd1234"), None),
+            // Relative hrefs resolve against the Quip base: the input is
+            // a thread body fetched from Quip, so it can't be relative
+            // to anything else.
+            ("/AbCd1234/Some-Doc", Some("AbCd1234"), None),
+            ("/AbCd1234/Some-Doc#sec-9", Some("AbCd1234"), Some("sec-9")),
             // No path segment at all — nothing to key a back-patch on.
             ("https://example.quip.com/", None, None),
+            ("#sec-3", None, None),
+            ("", None, None),
             // Lookalike hosts a naive `ends_with` would have accepted.
             ("https://notquip.com/AbCd1234/Doc", None, None),
             ("https://evil.example/?u=quip.com", None, None),
-            // Relative hrefs are deliberately not classified (see the
-            // helper's doc comment).
-            ("/AbCd1234/Some-Doc", None, None),
+            // Userinfo spoofing: the *host* here is evil.example, which
+            // only parsing (not string-matching) reveals.
+            ("https://quip.com@evil.example/AbCd1234", None, None),
             ("https://elsewhere.example/page", None, None),
+            ("mailto:someone@example.org", None, None),
         ];
         for (href, thread, section) in cases {
-            let want = thread.map(|t| (t.to_string(), section.map(str::to_string)));
-            assert_eq!(quip_thread_from_url(href), want, "{href}");
+            let got = quip_thread_from_url(href);
+            assert_eq!(got.as_ref().map(|m| m.thread_id.as_str()), thread, "thread: {href}");
+            assert_eq!(got.as_ref().and_then(|m| m.section_id.as_deref()), section, "sec: {href}");
         }
     }
 
@@ -2029,6 +2076,67 @@ mod tests {
         assert!(out.pending_links.is_empty(), "lookalike host must stay an ordinary link");
         let html = crate::export::to_html(&out.doc);
         assert!(html.contains("https://notquip.com/AbCd1234/x"), "{html}");
+    }
+
+    #[test]
+    fn a_relative_quip_href_is_stored_resolved_not_same_origin() {
+        let out = from_quip_html("<p><a href=\"/AbCd1234/Some-Doc\">rel</a></p>");
+        assert_eq!(out.pending_links.len(), 1, "a relative Quip href is still intra-Quip");
+        assert_eq!(out.pending_links[0].target_quip_thread_id, "AbCd1234");
+        let html = crate::export::to_html(&out.doc);
+        // `export::is_safe_url` accepts a leading `/`, so storing the
+        // href unresolved would export a *live same-origin link that
+        // 404s* — not an inert one. The stored url must be absolute.
+        assert!(html.contains("href=\"https://quip.com/AbCd1234/Some-Doc\""), "{html}");
+        assert!(!html.contains("href=\"/AbCd1234/Some-Doc\""), "same-origin href leaked: {html}");
+    }
+
+    #[test]
+    fn hoisted_blocks_from_a_quip_link_keep_document_order() {
+        // The link's image must land *between* the text that preceded
+        // it and the text that follows, exactly as a bare `<img>` does.
+        // Wrapping in `<p>` hides this (`walk_text_container`
+        // re-partitions), so the repro is a transparent `<div>`.
+        let b = blocks(
+            "<div>a <a href=\"https://x.quip.com/T/D\">lbl<img src=\"i.png\"></a> b</div>",
+        );
+        let kinds: Vec<_> = b.iter().map(|x| x.node_type()).collect();
+        assert_eq!(
+            kinds,
+            vec![NodeType::Paragraph, NodeType::Image, NodeType::Paragraph],
+            "{b:?}"
+        );
+        let QuipBlock::Para { spans, .. } = &b[0] else { panic!("expected para: {b:?}") };
+        assert_eq!(spans_text(spans), "a lbl", "the chip stays with the text before it");
+        let QuipBlock::Para { spans, .. } = &b[2] else { panic!("expected para: {b:?}") };
+        assert_eq!(spans_text(spans), "b");
+    }
+
+    // ─── documented losses, pinned ───────────────────────────
+
+    #[test]
+    fn sub_sup_and_mark_keep_their_text_but_lose_their_formatting() {
+        // Assumption #21: `MarkType` has Subscript/Superscript, but no
+        // Quip spelling for them has been observed, so these three stay
+        // transparent passthrough. Pinned so the loss stays deliberate.
+        let out = from_quip_html("<p>H<sub>2</sub>O and x<sup>2</sup> and <mark>hi</mark></p>");
+        let html = crate::export::to_html(&out.doc);
+        assert!(html.contains("H2O and x2 and hi"), "text survives: {html}");
+        assert!(!html.contains("<sub"), "{html}");
+        assert!(!html.contains("<sup"), "{html}");
+        assert!(!html.contains("<mark"), "{html}");
+    }
+
+    #[test]
+    fn a_mark_wrapping_an_intra_quip_link_is_lost() {
+        // Inherent, not a bug: marks are yrs *text* attributes and the
+        // placeholder is an element leaf, so nothing can carry the bold
+        // across. Pinned so a later change can't alter it silently.
+        let out = from_quip_html("<p><b><a href=\"https://x.quip.com/T3/D\">lbl</a></b></p>");
+        assert_eq!(out.pending_links.len(), 1);
+        let html = crate::export::to_html(&out.doc);
+        assert!(html.contains("class=\"doc-mention\""), "{html}");
+        assert!(!html.contains("<strong>"), "the bold is dropped: {html}");
     }
 
     #[test]
