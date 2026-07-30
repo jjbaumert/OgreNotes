@@ -1,0 +1,20 @@
+<!-- UNVERIFIED MARKUP: every spelling of "checklist" the walker tolerates
+     (see checked_state / list_is_task in import_quip.rs). -->
+<ul>
+  <li><input type="checkbox" checked>done via input</li>
+  <li><input type="checkbox">todo via input</li>
+</ul>
+<ul>
+  <li class="checked">done via class</li>
+  <li class="unchecked">todo via class</li>
+</ul>
+<ul>
+  <li data-checked="true">done via data attr</li>
+  <li data-checked="false">todo via data attr</li>
+</ul>
+<ul class="checklist">
+  <li>list-level marker, item says nothing</li>
+</ul>
+<ul data-type="taskList">
+  <li>our own export's spelling</li>
+</ul>

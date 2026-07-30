@@ -24,6 +24,10 @@ rand = { workspace = true }
 # `generate_block_id`), which is what makes Quip section anchors
 # addressable after import.
 nanoid = { workspace = true }
+# Quip import — Phase 2a. Classifies an `<a href>` as intra-Quip
+# (host is quip.com or a subdomain) vs external, and splits out the
+# thread id / section fragment.
+url = { workspace = true }
 calamine = { version = "0.35", optional = true }
 rust_xlsxwriter = { version = "0.80", optional = true }
 # DOCX import — Phase 6 M-6.5 piece A. A .docx is a ZIP of OOXML; we

@@ -1,0 +1,52 @@
+<!-- UNVERIFIED MARKUP: every feature at once, including the nestings our
+     schema forbids (image in a list item, table in a cell, rule in a
+     quote) so the containment/hoisting pass is exercised too. -->
+<html><body>
+<div class="quip-thread">
+  <h1 id="SEC-title">Quarterly Plan</h1>
+  <p id="SEC-intro">An <b>important</b> <i>document</i> with <u>every</u>
+     <s>possible</s> <code>shape</code> in it.</p>
+
+  <h2 id="SEC-goals">Goals</h2>
+  <ul>
+    <li>Ship the <a href="https://acme.quip.com/AbCd1234/Importer">importer</a></li>
+    <li>Write the <a href="https://example.org/docs">external docs</a></li>
+    <li>Nested work
+      <ul><li>sub-task one</li><li>sub-task two</li></ul>
+    </li>
+  </ul>
+
+  <h2 id="SEC-tasks">Tasks</h2>
+  <ul class="checklist">
+    <li class="checked">design review</li>
+    <li class="unchecked">implementation<img src="/blob/THREAD9/blob-inline" alt="hoisted"></li>
+    <li data-checked="true">tests</li>
+  </ul>
+
+  <h2 id="SEC-notes">Notes</h2>
+  <blockquote>
+    <p>A quoted remark with a <a href="https://acme.quip.com/EfGh5678/Notes#SEC-3">deep link</a>.</p>
+    <table><tr><th>hoisted out of the quote</th></tr></table>
+  </blockquote>
+
+  <pre data-language="rust">fn convert(html: &amp;str) -&gt; QuipDocument {
+    from_quip_html(html)
+}</pre>
+
+  <table>
+    <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>Docs</td><td>1,204</td></tr>
+      <tr><td>Blobs</td><td><img src="/blob/THREAD9/blob-cell" alt="in a cell"></td></tr>
+    </tbody>
+  </table>
+
+  <p>An image of its own:</p>
+  <img src="/blob/THREAD9/blob-figure" alt="figure one">
+
+  <p>Line one<br>line two<br><br>line four after a blank</p>
+
+  <hr>
+  <p>Fin.</p>
+</div>
+</body></html>

@@ -35,6 +35,13 @@
 //!   - [`list_is_task`]   — a list being a checklist at all
 //!   - [`code_language`]  — code-block language tag
 //!   - [`section_id`]     — Quip section anchor id
+//!   - [`quip_thread_from_url`] — an `<a href>` being an intra-Quip
+//!     document link, and where the thread id / section anchor sit
+//!     inside it
+//!
+//! Inline *marks*, by contrast, are ordinary HTML (`<b>`, `<em>`,
+//! `<a href>`, …) and are read directly — with every spelling variant
+//! accepted (`b`/`strong`, `i`/`em`, `s`/`del`/`strike`).
 //!
 //! Everything else degrades gracefully by construction: unknown tags
 //! are transparent passthrough (their children are walked in the same
@@ -43,11 +50,12 @@
 use std::collections::{HashMap, HashSet};
 
 use yrs::{
-    Doc, Transact, WriteTxn, Xml, XmlElementRef,
-    types::xml::{XmlElementPrelim, XmlFragment, XmlTextPrelim},
+    Any, Doc, ReadTxn, Text, Transact, WriteTxn, Xml, XmlElementRef,
+    types::Attrs,
+    types::xml::{XmlElementPrelim, XmlFragment, XmlTextPrelim, XmlTextRef},
 };
 
-use crate::schema::NodeType;
+use crate::schema::{MarkType, NodeType};
 
 // ─── blockId minting ─────────────────────────────────────────────
 
@@ -99,28 +107,58 @@ pub struct QuipPendingLink {
     pub target_quip_section_id: Option<String>,
 }
 
-/// Import a Quip HTML body into a fresh `Doc`.
-///
-/// Phase 2a Task 1 populates `doc` only; `sections` / `images` /
-/// `pending_links` are filled in by the marks-and-anchors pass.
+/// Import a Quip HTML body into a fresh `Doc`, together with the
+/// side-tables the caller needs to finish the job.
 pub fn from_quip_html(html: &str) -> QuipDocument {
-    let blocks = parse_quip(html);
-    QuipDocument {
-        doc: materialize(&blocks),
-        sections: Vec::new(),
-        images: Vec::new(),
-        pending_links: Vec::new(),
-    }
+    materialize(&parse_quip(html))
 }
 
 // ─── intermediate block model ────────────────────────────────────
 
-/// A run of inline content. Task 1 carries text plus hard-break
-/// position only; the mark set is added by the marks pass, so the
-/// field name is stable.
+/// The inline formatting active over a run of text.
+///
+/// Deliberately a subset of `MarkType` (`schema.rs:311`): `subscript`,
+/// `superscript` and `mention` are absent because no Quip spelling for
+/// them has been observed. `<sub>` / `<sup>` / `<mark>` therefore stay
+/// transparent passthrough — their *text* survives, their formatting
+/// does not. That is a known, recorded loss, not an oversight.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct Marks {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+    pub code: bool,
+    /// `href` of an enclosing `<a>` that is *not* an intra-Quip link —
+    /// those become a `DocMention` placeholder instead (see
+    /// [`quip_thread_from_url`]).
+    pub link: Option<String>,
+}
+
+/// An intra-Quip document link. Materialized as a placeholder
+/// `DocMention` inline leaf whose `doc_id` is empty until Phase 2b
+/// learns the id of the OgreNotes document the target thread imported
+/// into, and recorded in `QuipDocument::pending_links` so that
+/// back-patch can find it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QuipMention {
+    pub thread_id: String,
+    pub section_id: Option<String>,
+    /// The original href. Kept on the placeholder so an un-back-patched
+    /// chip still links *somewhere* (back to Quip) rather than nowhere.
+    pub url: String,
+}
+
+/// A run of inline content: text plus the marks covering it, or — when
+/// `mention` is set — an intra-Quip link placeholder whose `text` is
+/// the anchor's label.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Span {
     pub text: String,
+    /// Inline formatting covering the whole run. A run is split
+    /// wherever the mark set changes, so this is uniform by
+    /// construction and materializes as a single yrs `format` call.
+    pub marks: Marks,
     /// Set when a `<br>` immediately precedes this run. `HardBreak` is
     /// an inline leaf (`NodeType::is_inline`, `schema.rs:184-186`), a
     /// category `NodeType::valid_children` never enumerates — it only
@@ -131,11 +169,14 @@ pub(crate) struct Span {
     /// `frontend/style/main.css:906-907`: a text node never carries a
     /// literal newline.
     pub hard_break_before: bool,
+    /// Set when this run *is* an intra-Quip link: it materializes as a
+    /// `DocMention` element, not as a text run.
+    pub mention: Option<QuipMention>,
 }
 
 impl Span {
     fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into(), hard_break_before: false }
+        Self { text: text.into(), ..Self::default() }
     }
 }
 
@@ -161,15 +202,14 @@ pub(crate) struct QuipItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum QuipBlock {
     Para {
-        // Read by the section-anchor (SECMAP) pass, which lands in the
-        // next task; captured here so that pass is purely additive.
-        #[allow(dead_code)]
+        /// Quip section anchor, if the source carried one. Read by the
+        /// SECMAP pass in `materialize`, which pairs it with the
+        /// blockId minted for this block.
         section_id: Option<String>,
         spans: Vec<Span>,
     },
     Heading {
         level: u8,
-        #[allow(dead_code)]
         section_id: Option<String>,
         spans: Vec<Span>,
     },
@@ -224,7 +264,8 @@ fn empty_para() -> QuipBlock {
 
 /// Tags ammonia lets through. The union of what the walker
 /// understands plus the inline tags whose *text* must survive even
-/// though Task 1 drops their marks. Deliberately wider than
+/// when their formatting has no mark to map onto (`sub`, `sup`,
+/// `mark`). Deliberately wider than
 /// `import::allowed_html_tags` (tables / images / checkbox inputs);
 /// deliberately still without `script`, `iframe`, `style`, `form`,
 /// `object`, `embed`.
@@ -239,7 +280,7 @@ fn allowed_tags() -> HashSet<&'static str> {
         "hr", "br", //
         "a", "img", "input", //
         "table", "thead", "tbody", "tfoot", "tr", "th", "td", //
-        "strong", "em", "b", "i", "u", "s", "del", "sub", "sup", "mark",
+        "strong", "em", "b", "i", "u", "s", "del", "strike", "sub", "sup", "mark",
     ]
     .into_iter()
     .collect()
@@ -290,7 +331,7 @@ pub(crate) fn parse_quip(html: &str) -> Vec<QuipBlock> {
 
     let mut out = Vec::new();
     let mut pending = InlineBuf::default();
-    walk_children(&dom.document, &mut out, &mut pending);
+    walk_children(&dom.document, &mut out, &Marks::default(), &mut pending);
     pending.flush(&mut out, None);
 
     enforce_containment(out, NodeType::Doc)
@@ -304,10 +345,15 @@ struct InlineBuf {
 }
 
 impl InlineBuf {
-    fn push_text(&mut self, s: &str) {
+    /// Append text carrying `marks`. Merges into the run in progress
+    /// only when the mark set is identical (and that run is real text,
+    /// not a mention placeholder) — that split-on-change is what makes
+    /// every `Span` uniformly formatted, so materializing is one yrs
+    /// `format` call per span.
+    fn push_text(&mut self, s: &str, marks: &Marks) {
         match self.spans.last_mut() {
-            Some(last) => last.text.push_str(s),
-            None => self.spans.push(Span::new(s)),
+            Some(last) if last.mention.is_none() && last.marks == *marks => last.text.push_str(s),
+            _ => self.spans.push(Span { text: s.to_string(), marks: marks.clone(), ..Span::default() }),
         }
     }
 
@@ -318,14 +364,22 @@ impl InlineBuf {
     /// which `materialize_block` turns into two distinct `HardBreak`
     /// elements — matching the real DOM's `<br><br>`.
     fn push_break(&mut self) {
-        self.spans.push(Span { text: String::new(), hard_break_before: true });
+        self.spans.push(Span { hard_break_before: true, ..Span::default() });
+    }
+
+    /// Record an intra-Quip link as its own run. `label` is the
+    /// anchor's text, which becomes the placeholder's `title`.
+    fn push_mention(&mut self, mention: QuipMention, label: String) {
+        self.spans.push(Span { text: label, mention: Some(mention), ..Span::default() });
     }
 
     /// Emit the buffer as a paragraph (dropping it when it holds only
-    /// whitespace) and reset.
+    /// whitespace) and reset. A mention placeholder counts as content
+    /// even when its label is empty — dropping the paragraph would take
+    /// the pending link with it.
     fn flush(&mut self, out: &mut Vec<QuipBlock>, section_id: Option<String>) {
         let spans = std::mem::take(&mut self.spans);
-        if spans.iter().all(|s| s.text.trim().is_empty()) {
+        if spans.iter().all(|s| s.text.trim().is_empty() && s.mention.is_none()) {
             return;
         }
         out.push(QuipBlock::Para { section_id, spans: trim_spans(spans) });
@@ -342,9 +396,10 @@ fn trim_spans(mut spans: Vec<Span>) -> Vec<Span> {
     if let Some(last) = spans.last_mut() {
         last.text = last.text.trim_end().to_string();
     }
-    // An empty span still marks a `<br>` — dropping it here would
-    // silently eat a leading/trailing hard break.
-    spans.retain(|s| !s.text.is_empty() || s.hard_break_before);
+    // An empty span still marks a `<br>` or an intra-Quip link —
+    // dropping it here would silently eat a hard break or a pending
+    // link with an empty label.
+    spans.retain(|s| !s.text.is_empty() || s.hard_break_before || s.mention.is_some());
     spans
 }
 
@@ -364,6 +419,7 @@ fn is_inline_tag(tag: &str) -> bool {
             | "u"
             | "s"
             | "del"
+            | "strike"
             | "code"
             | "sub"
             | "sup"
@@ -373,17 +429,27 @@ fn is_inline_tag(tag: &str) -> bool {
     )
 }
 
-fn walk_children(handle: &markup5ever_rcdom::Handle, out: &mut Vec<QuipBlock>, pending: &mut InlineBuf) {
+fn walk_children(
+    handle: &markup5ever_rcdom::Handle,
+    out: &mut Vec<QuipBlock>,
+    marks: &Marks,
+    pending: &mut InlineBuf,
+) {
     for child in handle.children.borrow().iter() {
-        walk_node(child, out, pending);
+        walk_node(child, out, marks, pending);
     }
 }
 
-fn walk_node(handle: &markup5ever_rcdom::Handle, out: &mut Vec<QuipBlock>, pending: &mut InlineBuf) {
+fn walk_node(
+    handle: &markup5ever_rcdom::Handle,
+    out: &mut Vec<QuipBlock>,
+    marks: &Marks,
+    pending: &mut InlineBuf,
+) {
     use markup5ever_rcdom::NodeData;
 
     match &handle.data {
-        NodeData::Document => walk_children(handle, out, pending),
+        NodeData::Document => walk_children(handle, out, marks, pending),
         NodeData::Text { contents } => {
             let s = contents.borrow();
             let raw = s.as_ref();
@@ -391,15 +457,15 @@ fn walk_node(handle: &markup5ever_rcdom::Handle, out: &mut Vec<QuipBlock>, pendi
                 // Whitespace between block tags is layout, not content
                 // — but whitespace *inside* a run separates words.
                 if !pending.spans.is_empty() && !raw.is_empty() {
-                    pending.push_text(" ");
+                    pending.push_text(" ", marks);
                 }
                 return;
             }
-            pending.push_text(raw);
+            pending.push_text(raw, marks);
         }
         NodeData::Element { name, .. } => {
             let tag = name.local.as_ref().to_ascii_lowercase();
-            walk_element(handle, &tag, out, pending);
+            walk_element(handle, &tag, out, marks, pending);
         }
         _ => {
             // Comments, doctype, processing instructions: dropped.
@@ -407,15 +473,29 @@ fn walk_node(handle: &markup5ever_rcdom::Handle, out: &mut Vec<QuipBlock>, pendi
     }
 }
 
+/// Descend into an inline element with one more mark switched on.
+fn walk_marked(
+    handle: &markup5ever_rcdom::Handle,
+    out: &mut Vec<QuipBlock>,
+    marks: &Marks,
+    pending: &mut InlineBuf,
+    set: impl FnOnce(&mut Marks),
+) {
+    let mut inner = marks.clone();
+    set(&mut inner);
+    walk_children(handle, out, &inner, pending);
+}
+
 fn walk_element(
     handle: &markup5ever_rcdom::Handle,
     tag: &str,
     out: &mut Vec<QuipBlock>,
+    marks: &Marks,
     pending: &mut InlineBuf,
 ) {
     match tag {
         // Scaffolding html5ever inserts — descend transparently.
-        "html" | "body" => walk_children(handle, out, pending),
+        "html" | "body" => walk_children(handle, out, marks, pending),
         // `<head>` holds no document content.
         "head" => {}
         "p" => {
@@ -454,7 +534,7 @@ fn walk_element(
             pending.flush(out, None);
             let mut inner = Vec::new();
             let mut buf = InlineBuf::default();
-            walk_children(handle, &mut inner, &mut buf);
+            walk_children(handle, &mut inner, &Marks::default(), &mut buf);
             buf.flush(&mut inner, None);
             out.push(QuipBlock::Quote { blocks: inner });
         }
@@ -498,12 +578,54 @@ fn walk_element(
         // A checkbox is consumed by `checked_state` on its `<li>`; it
         // contributes no text of its own.
         "input" => {}
-        _ if is_inline_tag(tag) => walk_children(handle, out, pending),
+        // ── inline marks ──
+        // Note `code` here is the *inline* one: `<pre><code>` never
+        // reaches this arm because the `pre` branch above consumes the
+        // subtree verbatim (a code block carries no marks by schema —
+        // `NodeType::is_code`).
+        "b" | "strong" => walk_marked(handle, out, marks, pending, |m| m.bold = true),
+        "i" | "em" => walk_marked(handle, out, marks, pending, |m| m.italic = true),
+        "u" => walk_marked(handle, out, marks, pending, |m| m.underline = true),
+        "s" | "del" | "strike" => walk_marked(handle, out, marks, pending, |m| m.strike = true),
+        "code" => walk_marked(handle, out, marks, pending, |m| m.code = true),
+        "a" => walk_anchor(handle, out, marks, pending),
+        _ if is_inline_tag(tag) => walk_children(handle, out, marks, pending),
         // Unknown / structural tag: transparent passthrough. The
         // children are walked in the *same* context, so a `<div>`
         // wrapper neither creates a block nor breaks a paragraph.
-        _ => walk_children(handle, out, pending),
+        _ => walk_children(handle, out, marks, pending),
     }
+}
+
+/// An `<a href>`: either an intra-Quip document link (→ a `DocMention`
+/// placeholder plus a pending-link record) or an ordinary link, which
+/// passes through untouched as a `Link` mark over its text.
+///
+/// An intra-Quip anchor's *block* children (an image inside a link,
+/// say) are hoisted out and kept exactly as `<p><img></p>` is; only its
+/// text collapses into the placeholder's label.
+fn walk_anchor(
+    handle: &markup5ever_rcdom::Handle,
+    out: &mut Vec<QuipBlock>,
+    marks: &Marks,
+    pending: &mut InlineBuf,
+) {
+    let href = attr(handle, "href").unwrap_or_default();
+    if let Some((thread_id, section_id)) = quip_thread_from_url(&href) {
+        let (spans, rest) = walk_text_container(handle);
+        let label: String = spans.iter().map(|s| s.text.as_str()).collect();
+        pending.push_mention(
+            QuipMention { thread_id, section_id, url: href },
+            label.trim().to_string(),
+        );
+        out.extend(rest);
+        return;
+    }
+    let mut inner = marks.clone();
+    if !href.trim().is_empty() {
+        inner.link = Some(href);
+    }
+    walk_children(handle, out, &inner, pending);
 }
 
 /// Walk a text container (`<p>`, `<h1>`…`<h6>`): all of its text folds
@@ -513,7 +635,7 @@ fn walk_element(
 fn walk_text_container(handle: &markup5ever_rcdom::Handle) -> (Vec<Span>, Vec<QuipBlock>) {
     let mut nested = Vec::new();
     let mut buf = InlineBuf::default();
-    walk_children(handle, &mut nested, &mut buf);
+    walk_children(handle, &mut nested, &Marks::default(), &mut buf);
     buf.flush(&mut nested, None);
 
     let mut spans: Vec<Span> = Vec::new();
@@ -576,7 +698,7 @@ fn collect_items(handle: &markup5ever_rcdom::Handle, items: &mut Vec<QuipItem>) 
 fn parse_item(handle: &markup5ever_rcdom::Handle) -> QuipItem {
     let mut blocks = Vec::new();
     let mut buf = InlineBuf::default();
-    walk_children(handle, &mut blocks, &mut buf);
+    walk_children(handle, &mut blocks, &Marks::default(), &mut buf);
     // A block child flushes the buffer as it goes, so the trailing
     // text is appended last and document order is preserved: an item
     // reading `a <ul>…</ul> b` keeps `b` after the nested list.
@@ -615,7 +737,7 @@ fn parse_row(handle: &markup5ever_rcdom::Handle) -> QuipRow {
         }
         let mut blocks = Vec::new();
         let mut buf = InlineBuf::default();
-        walk_children(child, &mut blocks, &mut buf);
+        walk_children(child, &mut blocks, &Marks::default(), &mut buf);
         buf.flush(&mut blocks, None);
         if blocks.is_empty() {
             // A cell must have a body — an empty one renders as a
@@ -750,6 +872,46 @@ fn section_id(handle: &markup5ever_rcdom::Handle) -> Option<String> {
         .or_else(|| attr(handle, "data-section-id"))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// **UNVERIFIED MARKUP.** Recognize an intra-Quip document link and
+/// split out `(thread_id, section_id)`.
+///
+/// Assumed shape: `https://<subdomain>.quip.com/<THREAD_ID>/<slug>#<section>`
+/// — thread id is the first non-empty path segment, and the fragment
+/// (when present) is the target section anchor. `https://quip.com/ID`
+/// and a fragment-less URL are both accepted.
+///
+/// Returns `None` for everything else, which is what makes an ordinary
+/// external link stay an ordinary link. Known non-handled cases, all
+/// of which degrade to "ordinary link" rather than to a wrong pending
+/// record:
+///
+///   - **Relative hrefs** (`/AbCd1234/Some-Doc`). Whether Quip's `/2`
+///     HTML emits absolute or relative links is unknown, and without a
+///     base URL a relative path can't be told apart from a link into
+///     our own app. Reconcile when real markup lands.
+///   - **A Quip host on a non-document path** (`/blob/...`), which has
+///     a first segment but is not a thread. Phase 2b's back-patch is
+///     keyed on the thread id existing in the inventory, so a bogus id
+///     resolves to nothing and the placeholder keeps its original url.
+fn quip_thread_from_url(href: &str) -> Option<(String, Option<String>)> {
+    let url = url::Url::parse(href.trim()).ok()?;
+    if !is_quip_host(url.host_str()?) {
+        return None;
+    }
+    let thread = url.path_segments()?.find(|s| !s.is_empty())?.to_string();
+    let section = url.fragment().filter(|f| !f.is_empty()).map(str::to_string);
+    Some((thread, section))
+}
+
+/// `quip.com` itself or any subdomain of it. Deliberately *not*
+/// `ends_with("quip.com")`, which would also accept `notquip.com` and
+/// hand an attacker-controlled host a pending-link record.
+fn is_quip_host(host: &str) -> bool {
+    // A trailing dot is the fully-qualified form of the same host.
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "quip.com" || host.ends_with(".quip.com")
 }
 
 // ─── DOM helpers ─────────────────────────────────────────────────
@@ -981,12 +1143,88 @@ fn insert_block(
     el
 }
 
-fn insert_text(txn: &mut yrs::TransactionMut<'_>, el: &XmlElementRef, text: &str) {
+/// Append `text` as a new text run. Returns the handle so the caller
+/// can format it; `None` for empty text (yrs would create an empty,
+/// unformattable node).
+fn insert_text(
+    txn: &mut yrs::TransactionMut<'_>,
+    el: &XmlElementRef,
+    text: &str,
+) -> Option<XmlTextRef> {
     if text.is_empty() {
-        return;
+        return None;
     }
     let pos = el.len(txn);
-    el.insert(txn, pos, XmlTextPrelim::new(text));
+    Some(el.insert(txn, pos, XmlTextPrelim::new(text)))
+}
+
+/// Apply `marks` across the whole of `text`.
+///
+/// Encoding is the one `export::to_html` decodes (`export.rs:752-776`,
+/// mirrored by `diff::attrs_to_marks`): a boolean mark is
+/// `Any::Bool(true)` under `MarkType::attr_name()`, and the link mark
+/// is a **JSON string** payload `{"href": "…"}`. Getting the shape
+/// wrong is silently lossy, so the round trip is asserted by test.
+///
+/// The range is always the entire node: `insert_spans` writes one text
+/// node per uniformly-marked run, so `0..len(txn)` needs no offset
+/// arithmetic and can't disagree with the document's offset kind.
+fn apply_marks(txn: &mut yrs::TransactionMut<'_>, text: &XmlTextRef, marks: &Marks) {
+    let mut attrs = Attrs::new();
+    for (on, mark) in [
+        (marks.bold, MarkType::Bold),
+        (marks.italic, MarkType::Italic),
+        (marks.underline, MarkType::Underline),
+        (marks.strike, MarkType::Strike),
+        (marks.code, MarkType::Code),
+    ] {
+        if on {
+            attrs.insert(std::sync::Arc::from(mark.attr_name()), Any::Bool(true));
+        }
+    }
+    if let Some(href) = &marks.link {
+        let payload = serde_json::json!({ "href": href }).to_string();
+        attrs.insert(std::sync::Arc::from(MarkType::Link.attr_name()), Any::String(payload.into()));
+    }
+    if attrs.is_empty() {
+        return;
+    }
+    let len = text.len(&*txn);
+    if len == 0 {
+        return;
+    }
+    text.format(txn, 0, len, attrs);
+}
+
+/// The blockId `insert_block` just minted for `el`. Read back rather
+/// than returned so the minting path itself stays untouched.
+fn block_id_of<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> String {
+    el.get_attribute(txn, "blockId").unwrap_or_default()
+}
+
+/// The side-tables accumulated while materializing: they can only be
+/// filled in once blockIds exist, which is inside the transaction.
+#[derive(Default)]
+struct SideTables {
+    sections: Vec<(String, String)>,
+    images: Vec<QuipImageRef>,
+    pending_links: Vec<QuipPendingLink>,
+}
+
+impl SideTables {
+    /// Pair a Quip section anchor with the blockId minted for the block
+    /// that carried it. `materialize_block` runs in document order, so
+    /// `sections` is in document order by construction.
+    fn record_section<T: ReadTxn>(
+        &mut self,
+        txn: &T,
+        el: &XmlElementRef,
+        section_id: Option<&String>,
+    ) {
+        if let Some(sid) = section_id {
+            self.sections.push((sid.clone(), block_id_of(txn, el)));
+        }
+    }
 }
 
 // Only test-side callers remain now that `materialize_block` splices
@@ -1001,30 +1239,88 @@ fn spans_text(spans: &[Span]) -> String {
 /// element wherever a span carries `hard_break_before` — mirrors
 /// `import.rs:198-208` inserting a `HardBreak` into the open paragraph,
 /// adapted for this walker's two-stage (parse-then-materialize)
-/// pipeline. `container` is `el`'s own `NodeType`, passed through only
-/// for `insert_block`'s containment check.
-fn insert_spans(txn: &mut yrs::TransactionMut<'_>, el: &XmlElementRef, container: NodeType, spans: &[Span]) {
+/// pipeline. A span carrying a `mention` becomes a `DocMention` inline
+/// leaf instead of a text run. `container` is `el`'s own `NodeType`,
+/// passed through only for `insert_block`'s containment check.
+fn insert_spans(
+    txn: &mut yrs::TransactionMut<'_>,
+    el: &XmlElementRef,
+    container: NodeType,
+    spans: &[Span],
+    side: &mut SideTables,
+) {
     let scope = XmlOpenable::Element(el.clone());
     for span in spans {
         if span.hard_break_before {
             insert_block(txn, &scope, container, NodeType::HardBreak);
         }
-        insert_text(txn, el, &span.text);
+        match &span.mention {
+            Some(mention) => insert_doc_mention(txn, &scope, container, &span.text, mention, side),
+            None => {
+                if let Some(text) = insert_text(txn, el, &span.text) {
+                    apply_marks(txn, &text, &span.marks);
+                }
+            }
+        }
     }
 }
 
-/// Build the yrs `Doc` from containment-clean blocks.
-fn materialize(blocks: &[QuipBlock]) -> Doc {
+/// Materialize an intra-Quip link as a placeholder `DocMention` and
+/// record the back-patch it needs.
+///
+/// `doc_id` is written empty on purpose: the OgreNotes document the
+/// target thread imports into may not exist yet (or at all). Phase 2b
+/// finds these by `source_block_id` and fills in `doc_id` /
+/// `target_block_id`. Until then the chip still carries the original
+/// Quip `url`, so an un-back-patched import degrades to a link back to
+/// Quip rather than to a dead chip.
+fn insert_doc_mention(
+    txn: &mut yrs::TransactionMut<'_>,
+    scope: &XmlOpenable<'_>,
+    container: NodeType,
+    label: &str,
+    mention: &QuipMention,
+    side: &mut SideTables,
+) {
+    let el = insert_block(txn, scope, container, NodeType::DocMention);
+    el.insert_attribute(txn, "doc_id", "");
+    el.insert_attribute(txn, "url", mention.url.clone());
+    if !label.is_empty() {
+        el.insert_attribute(txn, "title", label.to_string());
+    }
+    // The unresolved target, kept on the node as well as in the side
+    // table so a document that outlives this import run is still
+    // self-describing (a re-run of the back-patch needs no side car).
+    el.insert_attribute(txn, "pending_quip_thread", mention.thread_id.clone());
+    if let Some(section) = &mention.section_id {
+        el.insert_attribute(txn, "pending_quip_section", section.clone());
+    }
+    side.pending_links.push(QuipPendingLink {
+        source_block_id: block_id_of(&*txn, &el),
+        target_quip_thread_id: mention.thread_id.clone(),
+        target_quip_section_id: mention.section_id.clone(),
+    });
+}
+
+/// Build the yrs `Doc` from containment-clean blocks, collecting the
+/// side-tables (section map, images, pending links) as it goes.
+fn materialize(blocks: &[QuipBlock]) -> QuipDocument {
     let doc = Doc::new();
+    let mut side = SideTables::default();
     {
         let mut txn = doc.transact_mut();
         let fragment = txn.get_or_insert_xml_fragment("content");
         let root = XmlOpenable::Fragment(&fragment);
         for block in blocks {
-            materialize_block(&mut txn, &root, NodeType::Doc, block);
+            materialize_block(&mut txn, &root, NodeType::Doc, block, &mut side);
         }
     }
-    doc
+    QuipDocument {
+        doc,
+        sections: side.sections,
+        images: side.images,
+        pending_links: side.pending_links,
+    }
 }
 
 fn materialize_block(
@@ -1032,16 +1328,19 @@ fn materialize_block(
     parent: &XmlOpenable<'_>,
     parent_type: NodeType,
     block: &QuipBlock,
+    side: &mut SideTables,
 ) {
     match block {
-        QuipBlock::Para { spans, .. } => {
+        QuipBlock::Para { spans, section_id } => {
             let el = insert_block(txn, parent, parent_type, NodeType::Paragraph);
-            insert_spans(txn, &el, NodeType::Paragraph, spans);
+            side.record_section(&*txn, &el, section_id.as_ref());
+            insert_spans(txn, &el, NodeType::Paragraph, spans, side);
         }
-        QuipBlock::Heading { level, spans, .. } => {
+        QuipBlock::Heading { level, spans, section_id } => {
             let el = insert_block(txn, parent, parent_type, NodeType::Heading);
             el.insert_attribute(txn, "level", (*level).clamp(1, 6).to_string());
-            insert_spans(txn, &el, NodeType::Heading, spans);
+            side.record_section(&*txn, &el, section_id.as_ref());
+            insert_spans(txn, &el, NodeType::Heading, spans, side);
         }
         QuipBlock::List { task, items, .. } => {
             let list_type = block.node_type();
@@ -1054,7 +1353,7 @@ fn materialize_block(
                 }
                 let scope = XmlOpenable::Element(li);
                 for child in &item.blocks {
-                    materialize_block(txn, &scope, item_type, child);
+                    materialize_block(txn, &scope, item_type, child, side);
                 }
             }
         }
@@ -1062,7 +1361,7 @@ fn materialize_block(
             let el = insert_block(txn, parent, parent_type, NodeType::Blockquote);
             let scope = XmlOpenable::Element(el);
             for child in blocks {
-                materialize_block(txn, &scope, NodeType::Blockquote, child);
+                materialize_block(txn, &scope, NodeType::Blockquote, child, side);
             }
         }
         QuipBlock::Code { language, text } => {
@@ -1070,6 +1369,8 @@ fn materialize_block(
             if !language.is_empty() {
                 el.insert_attribute(txn, "language", language.clone());
             }
+            // A code block carries no marks (`NodeType::is_code`), so
+            // the returned text handle is deliberately unused.
             insert_text(txn, &el, text);
         }
         QuipBlock::Rule => {
@@ -1095,7 +1396,7 @@ fn materialize_block(
                     );
                     let scope = XmlOpenable::Element(cell_el);
                     for child in &cell.blocks {
-                        materialize_block(txn, &scope, cell_type, child);
+                        materialize_block(txn, &scope, cell_type, child, side);
                     }
                 }
             }
@@ -1103,11 +1404,17 @@ fn materialize_block(
         QuipBlock::Image { src, alt } => {
             let el = insert_block(txn, parent, parent_type, NodeType::Image);
             // Left as the raw Quip value on purpose — the blob
-            // side-load pass rewrites it to a durable blob reference.
+            // side-load pass rewrites it to a durable blob reference,
+            // keyed on the blockId recorded alongside it here.
             el.insert_attribute(txn, "src", src.clone());
             if !alt.is_empty() {
                 el.insert_attribute(txn, "alt", alt.clone());
             }
+            side.images.push(QuipImageRef {
+                block_id: block_id_of(&*txn, &el),
+                src: src.clone(),
+                alt: alt.clone(),
+            });
         }
     }
 }
@@ -1559,12 +1866,253 @@ mod tests {
         assert_eq!(frag.len(&txn), 0);
     }
 
+    // ─── inline marks ────────────────────────────────────────
+
     #[test]
-    fn side_tables_are_empty_in_this_slice() {
-        let out = from_quip_html("<p id=\"s1\">a</p><img src=\"i.png\">");
-        assert!(out.sections.is_empty());
-        assert!(out.images.is_empty());
-        assert!(out.pending_links.is_empty());
+    fn inline_marks_survive_the_round_trip() {
+        let out = from_quip_html(
+            "<p><b>bold</b> <i>it</i> <code>c</code> \
+             <a href=\"https://ok.example/x\">link</a></p>",
+        );
+        let html = crate::export::to_html(&out.doc);
+        assert!(html.contains("<strong>bold</strong>") || html.contains("<b>bold</b>"), "{html}");
+        assert!(html.contains("<em>it</em>") || html.contains("<i>it</i>"), "{html}");
+        assert!(html.contains("<code>c</code>"), "{html}");
+        assert!(html.contains("https://ok.example/x"), "link href preserved: {html}");
+    }
+
+    // ─── side tables ─────────────────────────────────────────
+
+    #[test]
+    fn section_ids_map_to_minted_block_ids() {
+        let out = from_quip_html("<p id=\"sec-abc\">one</p><h1 id=\"sec-def\">two</h1>");
+        let ids: Vec<&str> = out.sections.iter().map(|(q, _)| q.as_str()).collect();
+        assert_eq!(ids, vec!["sec-abc", "sec-def"]);
+        for (_, block_id) in &out.sections {
+            assert_eq!(block_id.len(), 10, "maps to a minted blockId");
+        }
+    }
+
+    #[test]
+    fn images_are_collected_with_their_block_ids() {
+        let out = from_quip_html("<p>x</p><img src=\"/blob/t1/b9\" alt=\"pic\">");
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].src, "/blob/t1/b9");
+        assert_eq!(out.images[0].alt, "pic");
+        assert_eq!(out.images[0].block_id.len(), 10);
+    }
+
+    #[test]
+    fn intra_quip_links_become_pending_not_plain_links() {
+        let out = from_quip_html(
+            "<p><a href=\"https://example.quip.com/AbCd1234/Some-Doc\">doc</a> \
+             <a href=\"https://elsewhere.example/page\">ext</a></p>",
+        );
+        assert_eq!(out.pending_links.len(), 1, "only the quip link is pending");
+        assert_eq!(out.pending_links[0].target_quip_thread_id, "AbCd1234");
+        assert!(out.pending_links[0].target_quip_section_id.is_none());
+        let html = crate::export::to_html(&out.doc);
+        assert!(html.contains("elsewhere.example/page"), "external link passes through: {html}");
+    }
+
+    #[test]
+    fn intra_quip_link_with_fragment_records_the_section() {
+        let out = from_quip_html(
+            "<p><a href=\"https://example.quip.com/AbCd1234/Doc#sec-77\">x</a></p>",
+        );
+        assert_eq!(out.pending_links[0].target_quip_section_id.as_deref(), Some("sec-77"));
+    }
+
+    #[test]
+    fn underline_and_strike_accept_their_spelling_variants() {
+        for (html, tag) in [
+            ("<p><u>x</u></p>", "<u>x</u>"),
+            ("<p><s>x</s></p>", "<s>x</s>"),
+            ("<p><del>x</del></p>", "<s>x</s>"),
+            ("<p><strike>x</strike></p>", "<s>x</s>"),
+            ("<p><strong>x</strong></p>", "<strong>x</strong>"),
+            ("<p><em>x</em></p>", "<em>x</em>"),
+        ] {
+            let exported = crate::export::to_html(&from_quip_html(html).doc);
+            assert!(exported.contains(tag), "{html} -> {exported}");
+        }
+    }
+
+    #[test]
+    fn nested_marks_combine_on_a_single_run() {
+        let out = from_quip_html("<p><b><i>both</i></b></p>");
+        let html = crate::export::to_html(&out.doc);
+        assert!(html.contains("<strong><em>both</em></strong>"), "{html}");
+    }
+
+    #[test]
+    fn a_mark_does_not_leak_onto_the_text_beside_it() {
+        let out = from_quip_html("<p>plain <b>bold</b> plain</p>");
+        let html = crate::export::to_html(&out.doc);
+        assert!(html.contains("plain <strong>bold</strong> plain"), "{html}");
+    }
+
+    #[test]
+    fn marks_apply_inside_headings_and_list_items() {
+        let out = from_quip_html("<h2><b>H</b></h2><ul><li><i>L</i></li></ul>");
+        let html = crate::export::to_html(&out.doc);
+        assert!(html.contains("<strong>H</strong>"), "{html}");
+        assert!(html.contains("<em>L</em>"), "{html}");
+    }
+
+    #[test]
+    fn a_link_mark_survives_a_hard_break() {
+        // Regression guard for the span-splitting interaction: the
+        // break must not swallow the following run's marks.
+        let out = from_quip_html("<p>a<br><a href=\"https://ok.example/y\">b</a></p>");
+        let html = crate::export::to_html(&out.doc);
+        assert!(html.contains("<br"), "{html}");
+        assert!(html.contains("<a href=\"https://ok.example/y\">b</a>"), "{html}");
+    }
+
+    #[test]
+    fn quip_placeholder_is_a_valid_inline_leaf_carrying_its_target() {
+        let out = from_quip_html("<p>see <a href=\"https://x.quip.com/T1/Doc#s9\">Doc</a></p>");
+        // Exercises the `is_inline()` exemption in `check_subtree`:
+        // `DocMention` is an inline leaf, a category
+        // `valid_children()` never enumerates.
+        assert_valid_tree(&out.doc);
+        let txn = out.doc.transact();
+        let frag = crate::document::get_content_fragment(&txn).expect("content fragment");
+        let Some(XmlOut::Element(para)) = frag.get(&txn, 0) else { panic!("expected an element") };
+        let mut found = false;
+        for i in 0..para.len(&txn) {
+            let Some(XmlOut::Element(el)) = para.get(&txn, i) else { continue };
+            assert_eq!(NodeType::from_tag(el.tag().as_ref()), Some(NodeType::DocMention));
+            found = true;
+            assert_eq!(el.get_attribute(&txn, "doc_id").as_deref(), Some(""), "unresolved");
+            assert_eq!(el.get_attribute(&txn, "title").as_deref(), Some("Doc"));
+            assert_eq!(el.get_attribute(&txn, "pending_quip_thread").as_deref(), Some("T1"));
+            assert_eq!(el.get_attribute(&txn, "pending_quip_section").as_deref(), Some("s9"));
+            assert_eq!(
+                el.get_attribute(&txn, "blockId").as_deref(),
+                Some(out.pending_links[0].source_block_id.as_str()),
+                "the placeholder's own blockId is the pending link's source"
+            );
+        }
+        assert!(found, "a DocMention placeholder was emitted");
+    }
+
+    #[test]
+    fn quip_thread_url_shapes() {
+        // (href, expected thread id — None means "not intra-Quip",
+        //  expected section anchor)
+        let cases = [
+            ("https://example.quip.com/AbCd1234/Some-Doc", Some("AbCd1234"), None),
+            ("https://quip.com/AbCd1234", Some("AbCd1234"), None),
+            ("https://example.quip.com/AbCd1234/Doc#sec-77", Some("AbCd1234"), Some("sec-77")),
+            ("https://EXAMPLE.QUIP.COM./AbCd1234/Doc", Some("AbCd1234"), None),
+            // No path segment at all — nothing to key a back-patch on.
+            ("https://example.quip.com/", None, None),
+            // Lookalike hosts a naive `ends_with` would have accepted.
+            ("https://notquip.com/AbCd1234/Doc", None, None),
+            ("https://evil.example/?u=quip.com", None, None),
+            // Relative hrefs are deliberately not classified (see the
+            // helper's doc comment).
+            ("/AbCd1234/Some-Doc", None, None),
+            ("https://elsewhere.example/page", None, None),
+        ];
+        for (href, thread, section) in cases {
+            let want = thread.map(|t| (t.to_string(), section.map(str::to_string)));
+            assert_eq!(quip_thread_from_url(href), want, "{href}");
+        }
+    }
+
+    #[test]
+    fn an_external_link_never_becomes_a_pending_link() {
+        let out = from_quip_html("<p><a href=\"https://notquip.com/AbCd1234/x\">n</a></p>");
+        assert!(out.pending_links.is_empty(), "lookalike host must stay an ordinary link");
+        let html = crate::export::to_html(&out.doc);
+        assert!(html.contains("https://notquip.com/AbCd1234/x"), "{html}");
+    }
+
+    #[test]
+    fn an_image_inside_a_quip_link_is_hoisted_not_dropped() {
+        let out = from_quip_html(
+            "<p><a href=\"https://x.quip.com/T2/D\">lbl<img src=\"i.png\"></a></p>",
+        );
+        assert_valid_tree(&out.doc);
+        assert_eq!(out.images.len(), 1, "the image survives the mention rewrite");
+        assert_eq!(out.pending_links.len(), 1);
+    }
+
+    #[test]
+    fn every_section_id_maps_to_an_element_that_really_exists() {
+        let out = from_quip_html(
+            "<h1 id=\"a\">T</h1><p id=\"b\">x</p><p data-section-id=\"c\">y</p>",
+        );
+        assert_eq!(
+            out.sections.iter().map(|(q, _)| q.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"],
+            "document order"
+        );
+        let txn = out.doc.transact();
+        let frag = crate::document::get_content_fragment(&txn).expect("content fragment");
+        let mut ids = std::collections::HashSet::new();
+        for_each_element(&txn, &frag, &mut |txn, el| {
+            ids.insert(el.get_attribute(txn, "blockId").unwrap_or_default());
+        });
+        for (section, block_id) in &out.sections {
+            assert!(ids.contains(block_id), "section {section} points at a live blockId");
+        }
+    }
+
+    // ─── converter fixture matrix ────────────────────────────
+
+    /// Every fixture must convert without panicking into a non-empty
+    /// document. The per-feature assertions live in the unit tests
+    /// above; this is the breadth net that catches a walker change
+    /// blowing up on a shape no single test covers.
+    #[test]
+    fn every_fixture_converts_to_a_non_empty_valid_document() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/quip");
+        let mut seen = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("fixture dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("html") {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+            let html = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let out = from_quip_html(&html);
+            assert_valid_tree(&out.doc);
+            let txn = out.doc.transact();
+            let frag = crate::document::get_content_fragment(&txn).expect("content fragment");
+            assert!(frag.len(&txn) > 0, "{name} produced an empty document");
+            seen.push(name);
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "checklists.html",
+                "code.html",
+                "headings.html",
+                "images.html",
+                "kitchen_sink.html",
+                "links.html",
+                "lists.html",
+                "marks.html",
+                "sections.html",
+                "tables.html",
+            ],
+            "the fixture matrix must stay complete"
+        );
+    }
+
+    #[test]
+    fn the_kitchen_sink_fixture_populates_every_side_table() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/quip/kitchen_sink.html");
+        let out = from_quip_html(&std::fs::read_to_string(path).expect("kitchen sink"));
+        assert!(!out.sections.is_empty(), "sections");
+        assert!(!out.images.is_empty(), "images");
+        assert!(!out.pending_links.is_empty(), "pending links");
     }
 
     // ─── helpers ─────────────────────────────────────────────
@@ -1610,8 +2158,14 @@ mod tests {
     fn check_subtree<T: ReadTxn>(txn: &T, el: &XmlElementRef, parent: NodeType) {
         let tag = el.tag().to_string();
         let nt = NodeType::from_tag(&tag).unwrap_or_else(|| panic!("unknown tag {tag}"));
+        // Same exemption `insert_block` makes, and for the same reason:
+        // `valid_children()` is a *block*-containment predicate and
+        // never enumerates inline leaves (`HardBreak`, `Mention`,
+        // `DocMention` — `schema.rs:184-186`). Without this an
+        // otherwise-valid document containing a `DocMention` would fail
+        // here spuriously.
         assert!(
-            parent.valid_children().contains(&nt),
+            nt.is_inline() || parent.valid_children().contains(&nt),
             "{nt:?} is not a legal child of {parent:?}"
         );
         assert!(

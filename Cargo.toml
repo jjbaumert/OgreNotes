@@ -77,6 +77,11 @@ hmac = "0.12"
 base64 = "0.22"
 rand = "0.9"
 urlencoding = "2"
+# URL parsing (WHATWG). Used by the Quip importer to classify an
+# `<a href>` as intra-Quip vs external — host/path/fragment splitting
+# that hand-rolled string matching gets wrong (userinfo, ports,
+# percent-encoding). Already in the lock file transitively.
+url = "2"
 # MFA (Phase 4 M-E3): TOTP for 6-digit codes, AES-GCM to encrypt the
 # stored secret at rest, bcrypt to hash single-use recovery codes.
 totp-rs = { version = "5", features = ["qr", "gen_secret"] }
