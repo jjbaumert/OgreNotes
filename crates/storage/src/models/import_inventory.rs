@@ -53,6 +53,58 @@ impl ThreadRow {
     }
 }
 
+/// Max `entries` per `SecMapRow` chunk, chosen to stay well under
+/// DynamoDB's 400 KB item cap. Task 6 (the content-pass caller) splits a
+/// thread's full section→block map into chunks of this size before
+/// calling `put_secmap` once per chunk.
+pub const SECMAP_CHUNK_ENTRIES: usize = 2_000;
+
+/// One chunk of a thread's section-id → block-id map, built during the
+/// Phase-2 content pass so later comment/link resolution can translate a
+/// Quip anchor (`#section-id`) into the Ogre block it landed on. SK =
+/// `SECMAP#<quip_thread_id>#<chunk>`. Chunked because a thread with many
+/// sections could otherwise blow the per-item size cap.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SecMapRow {
+    pub quip_thread_id: String,
+    pub chunk: u32,
+    pub owner_id: String,
+    /// `(quip_section_id, ogre_block_id)` pairs, in the order encountered.
+    pub entries: Vec<(String, String)>,
+}
+
+impl SecMapRow {
+    pub fn sk(&self) -> String {
+        format!("SECMAP#{}#{}", self.quip_thread_id, self.chunk)
+    }
+}
+
+/// One cross-thread link discovered in `source_quip_thread_id` whose
+/// target thread hadn't been imported yet at the time it was encountered.
+/// SK = `UNRESOLVED#<source_quip_thread_id>`. Consumed by a later pass
+/// (Phase 2b+) that revisits these once every thread has an `ogre_doc_id`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnresolvedRow {
+    pub source_quip_thread_id: String,
+    pub owner_id: String,
+    pub links: Vec<PendingLinkItem>,
+}
+
+impl UnresolvedRow {
+    pub fn sk(&self) -> String {
+        format!("UNRESOLVED#{}", self.source_quip_thread_id)
+    }
+}
+
+/// One link within an `UnresolvedRow`, naming the source block and the
+/// Quip thread (and optional in-thread section) it points at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingLinkItem {
+    pub source_block_id: String,
+    pub target_quip_thread_id: String,
+    pub target_quip_section_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

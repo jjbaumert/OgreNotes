@@ -14,7 +14,7 @@ use ogrenotes_common::id::new_id;
 use ogrenotes_common::time::now_usec;
 use ogrenotes_storage::dynamo::DynamoClient;
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
-use ogrenotes_storage::models::import_inventory::{ThreadRow, ThreadState};
+use ogrenotes_storage::models::import_inventory::{SecMapRow, ThreadRow, ThreadState};
 use ogrenotes_storage::repo::import_repo::ImportRepo;
 
 static INFRA_AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
@@ -403,4 +403,147 @@ async fn set_inventory_total_and_set_phase_persist() {
         raw.get("inventory_total").and_then(|v| v.as_n().ok()),
         Some(&"42".to_string())
     );
+}
+
+/// Phase-2 content-pass checkpoint: `put_secmap` chunks concatenate in
+/// numeric (not lexicographic) chunk order, and `set_thread_content_done`
+/// advances the `THREAD#` row and is safe to call twice. `content_s3_key`
+/// is a Phase-2-only attribute not modeled on `ThreadRow` (deliberately,
+/// same rationale as `inventory_total` not being on `ImportRecord` — see
+/// `set_inventory_total_and_set_phase_persist` above), so it's checked
+/// with a raw item read rather than through `list_threads`.
+#[tokio::test]
+async fn content_checkpoint_advances_thread_and_secmap_chunks_concatenate() {
+    require_infra!();
+    let (repo, table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    let thread = pending_thread("qt1", ThreadState::Pending);
+    repo.put_thread(&record.import_id, &thread)
+        .await
+        .expect("seed pending thread");
+
+    // Write chunk 1 before chunk 0, and enough chunks that lexicographic
+    // SK order ("#10" < "#2") would misorder them if get_secmap relied on
+    // it instead of sorting by the parsed `chunk` field.
+    for chunk in (0..12).rev() {
+        let row = SecMapRow {
+            quip_thread_id: "qt1".to_string(),
+            chunk,
+            owner_id: "u1".to_string(),
+            entries: vec![(format!("s{chunk}"), format!("b{chunk}"))],
+        };
+        repo.put_secmap(&record.import_id, &row)
+            .await
+            .expect("put_secmap");
+    }
+
+    let entries = repo
+        .get_secmap(&record.import_id, "qt1")
+        .await
+        .expect("get_secmap");
+    let expected: Vec<(String, String)> = (0..12).map(|c| (format!("s{c}"), format!("b{c}"))).collect();
+    assert_eq!(entries, expected, "chunks must concatenate in numeric chunk order");
+
+    // Advance the thread to ContentDone.
+    repo.set_thread_content_done(&record.import_id, "qt1", "doc-1", "s3://bucket/qt1.json")
+        .await
+        .expect("set_thread_content_done");
+
+    let rows = repo.list_threads(&record.import_id).await.expect("list_threads");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, ThreadState::ContentDone);
+    assert_eq!(rows[0].ogre_doc_id.as_deref(), Some("doc-1"));
+
+    let dynamo_config = aws_sdk_dynamodb::config::Builder::new()
+        .endpoint_url("http://127.0.0.1:8000")
+        .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+        .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+            "fakekey", "fakesecret", None, None, "test",
+        ))
+        .behavior_version_latest()
+        .build();
+    let client = aws_sdk_dynamodb::Client::from_conf(dynamo_config);
+    let raw = client
+        .get_item()
+        .table_name(&table)
+        .key("PK", aws_sdk_dynamodb::types::AttributeValue::S(format!("IMPORT#{}", record.import_id)))
+        .key("SK", aws_sdk_dynamodb::types::AttributeValue::S("THREAD#qt1".to_string()))
+        .send()
+        .await
+        .expect("raw get_item")
+        .item
+        .expect("item must exist");
+    assert_eq!(
+        raw.get("content_s3_key").and_then(|v| v.as_s().ok()),
+        Some(&"s3://bucket/qt1.json".to_string())
+    );
+
+    // Idempotent: calling it again must leave exactly one row, still
+    // ContentDone, values unchanged.
+    repo.set_thread_content_done(&record.import_id, "qt1", "doc-1", "s3://bucket/qt1.json")
+        .await
+        .expect("set_thread_content_done (second call)");
+    let rows = repo.list_threads(&record.import_id).await.expect("list_threads");
+    assert_eq!(rows.len(), 1, "second call must not create a duplicate row");
+    assert_eq!(rows[0].state, ThreadState::ContentDone);
+    assert_eq!(rows[0].ogre_doc_id.as_deref(), Some("doc-1"));
+}
+
+/// `set_thread_skipped` sets state only, leaving `ogre_doc_id` untouched
+/// (there is none for a skipped thread).
+#[tokio::test]
+async fn set_thread_skipped_marks_state_only() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    let thread = pending_thread("qt1", ThreadState::Pending);
+    repo.put_thread(&record.import_id, &thread)
+        .await
+        .expect("seed pending thread");
+
+    repo.set_thread_skipped(&record.import_id, "qt1")
+        .await
+        .expect("set_thread_skipped");
+
+    let rows = repo.list_threads(&record.import_id).await.expect("list_threads");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, ThreadState::Skipped);
+    assert_eq!(rows[0].ogre_doc_id, None);
+}
+
+/// `put_unresolved` / `list_unresolved` round-trip through live Dynamo,
+/// including the sparse-omitted `target_quip_section_id`.
+#[tokio::test]
+async fn unresolved_links_round_trip_through_live_dynamo() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    let row = ogrenotes_storage::models::import_inventory::UnresolvedRow {
+        source_quip_thread_id: "qt1".to_string(),
+        owner_id: "u1".to_string(),
+        links: vec![
+            ogrenotes_storage::models::import_inventory::PendingLinkItem {
+                source_block_id: "b1".to_string(),
+                target_quip_thread_id: "qt2".to_string(),
+                target_quip_section_id: Some("sec9".to_string()),
+            },
+            ogrenotes_storage::models::import_inventory::PendingLinkItem {
+                source_block_id: "b2".to_string(),
+                target_quip_thread_id: "qt3".to_string(),
+                target_quip_section_id: None,
+            },
+        ],
+    };
+    repo.put_unresolved(&record.import_id, &row)
+        .await
+        .expect("put_unresolved");
+
+    let rows = repo.list_unresolved(&record.import_id).await.expect("list_unresolved");
+    assert_eq!(rows, vec![row]);
 }

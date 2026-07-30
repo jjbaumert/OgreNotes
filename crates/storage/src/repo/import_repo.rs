@@ -5,8 +5,8 @@ use std::collections::HashMap;
 
 use crate::dynamo::DynamoClient;
 use crate::models::import::{ImportRecord, ImportStatus};
-use crate::models::import_inventory::{FolderRow, ThreadRow, ThreadState};
-use crate::repo::{RepoError, get_n, get_s};
+use crate::models::import_inventory::{FolderRow, PendingLinkItem, SecMapRow, ThreadRow, ThreadState, UnresolvedRow};
+use crate::repo::{RepoError, get_n, get_n_u64, get_s};
 
 /// Repository for the Quip import manifest (`IMPORT#<id>` / `META`).
 ///
@@ -143,6 +143,116 @@ impl ImportRepo {
         let total = rows.len();
         let done = rows.iter().filter(|r| r.state != ThreadState::Pending).count();
         Ok((total, done))
+    }
+
+    /// Write one chunk of a thread's section-id → block-id map. Chunks are
+    /// idempotent to re-write (same rationale as `put_folder`: a chunk
+    /// carries no progress state a re-run could downgrade), so a plain
+    /// `put_item` unconditionally upserts.
+    pub async fn put_secmap(&self, import_id: &str, row: &SecMapRow) -> Result<(), RepoError> {
+        let mut item = secmap_to_item(row);
+        item.insert("PK".to_string(), AttributeValue::S(format!("IMPORT#{import_id}")));
+        item.insert("SK".to_string(), AttributeValue::S(row.sk()));
+        self.db
+            .put_item(item)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Read a thread's full section-id → block-id map, concatenating all
+    /// `SECMAP#<thread>#<chunk>` rows in numeric chunk order. Must not
+    /// rely on the SK's lexicographic order — `#10` sorts before `#2` as
+    /// strings — so chunks are sorted by the parsed `chunk` field.
+    pub async fn get_secmap(
+        &self,
+        import_id: &str,
+        quip_thread_id: &str,
+    ) -> Result<Vec<(String, String)>, RepoError> {
+        let items = self
+            .db
+            .query(&format!("IMPORT#{import_id}"), Some(&format!("SECMAP#{quip_thread_id}#")))
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        let mut rows: Vec<SecMapRow> = items.iter().map(secmap_from_item).collect::<Result<_, _>>()?;
+        rows.sort_by_key(|r| r.chunk);
+        Ok(rows.into_iter().flat_map(|r| r.entries).collect())
+    }
+
+    /// Write the set of cross-thread links discovered in one source
+    /// thread that couldn't be resolved yet. Plain upsert, same rationale
+    /// as `put_secmap` — the caller passes the complete current set.
+    pub async fn put_unresolved(&self, import_id: &str, row: &UnresolvedRow) -> Result<(), RepoError> {
+        let mut item = unresolved_to_item(row);
+        item.insert("PK".to_string(), AttributeValue::S(format!("IMPORT#{import_id}")));
+        item.insert("SK".to_string(), AttributeValue::S(row.sk()));
+        self.db
+            .put_item(item)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// List every unresolved-link row recorded for this import.
+    pub async fn list_unresolved(&self, import_id: &str) -> Result<Vec<UnresolvedRow>, RepoError> {
+        let items = self
+            .db
+            .query(&format!("IMPORT#{import_id}"), Some("UNRESOLVED#"))
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        items.iter().map(unresolved_from_item).collect()
+    }
+
+    /// Advance a thread's `THREAD#` row to `ContentDone` and stamp the
+    /// resulting `ogre_doc_id` / `content_s3_key`. Plain `update_item` —
+    /// unlike `put_thread`'s insert-if-absent, the row already exists
+    /// from Phase 1's inventory, and this is a forward-only checkpoint a
+    /// re-run can safely repeat (idempotent: same final state either way).
+    pub async fn set_thread_content_done(
+        &self,
+        import_id: &str,
+        quip_thread_id: &str,
+        ogre_doc_id: &str,
+        content_s3_key: &str,
+    ) -> Result<(), RepoError> {
+        let pk = format!("IMPORT#{import_id}");
+        let mut values = HashMap::new();
+        values.insert(
+            ":state".to_string(),
+            AttributeValue::S(thread_state_to_str(ThreadState::ContentDone).to_string()),
+        );
+        values.insert(":doc".to_string(), AttributeValue::S(ogre_doc_id.to_string()));
+        values.insert(":key".to_string(), AttributeValue::S(content_s3_key.to_string()));
+        self.db
+            .update_item(
+                &pk,
+                &format!("THREAD#{quip_thread_id}"),
+                "SET #state = :state, ogre_doc_id = :doc, content_s3_key = :key",
+                values,
+                Some(HashMap::from([("#state".to_string(), "state".to_string())])),
+            )
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Mark a thread `Skipped` (e.g. unsupported thread type). Plain
+    /// `update_item`, same idempotency rationale as
+    /// `set_thread_content_done`.
+    pub async fn set_thread_skipped(&self, import_id: &str, quip_thread_id: &str) -> Result<(), RepoError> {
+        let pk = format!("IMPORT#{import_id}");
+        let mut values = HashMap::new();
+        values.insert(
+            ":state".to_string(),
+            AttributeValue::S(thread_state_to_str(ThreadState::Skipped).to_string()),
+        );
+        self.db
+            .update_item(
+                &pk,
+                &format!("THREAD#{quip_thread_id}"),
+                "SET #state = :state",
+                values,
+                Some(HashMap::from([("#state".to_string(), "state".to_string())])),
+            )
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
     /// Record the total thread count discovered by inventory BFS, on `META`.
@@ -511,6 +621,121 @@ fn thread_from_item(item: &HashMap<String, AttributeValue>) -> Result<ThreadRow,
     })
 }
 
+fn secmap_to_item(r: &SecMapRow) -> HashMap<String, AttributeValue> {
+    let mut item = HashMap::new();
+    item.insert(
+        "quip_thread_id".to_string(),
+        AttributeValue::S(r.quip_thread_id.clone()),
+    );
+    item.insert("chunk".to_string(), AttributeValue::N(r.chunk.to_string()));
+    item.insert("owner_id".to_string(), AttributeValue::S(r.owner_id.clone()));
+    item.insert(
+        "entries".to_string(),
+        AttributeValue::L(
+            r.entries
+                .iter()
+                .map(|(section, block)| {
+                    AttributeValue::M(HashMap::from([
+                        ("quip_section_id".to_string(), AttributeValue::S(section.clone())),
+                        ("ogre_block_id".to_string(), AttributeValue::S(block.clone())),
+                    ]))
+                })
+                .collect(),
+        ),
+    );
+    item
+}
+
+fn secmap_from_item(item: &HashMap<String, AttributeValue>) -> Result<SecMapRow, RepoError> {
+    let chunk = get_n_u64(item, "chunk")?;
+    let chunk = u32::try_from(chunk).map_err(|_| RepoError::MissingField("chunk".to_string()))?;
+    let entries = item
+        .get("entries")
+        .and_then(|v| v.as_l().ok())
+        .map(|l| {
+            l.iter()
+                .filter_map(|av| av.as_m().ok())
+                .map(|m| {
+                    let section = get_s(m, "quip_section_id")?;
+                    let block = get_s(m, "ogre_block_id")?;
+                    Ok((section, block))
+                })
+                .collect::<Result<Vec<_>, RepoError>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(SecMapRow {
+        quip_thread_id: get_s(item, "quip_thread_id")?,
+        chunk,
+        owner_id: get_s(item, "owner_id")?,
+        entries,
+    })
+}
+
+fn unresolved_to_item(r: &UnresolvedRow) -> HashMap<String, AttributeValue> {
+    let mut item = HashMap::new();
+    item.insert(
+        "source_quip_thread_id".to_string(),
+        AttributeValue::S(r.source_quip_thread_id.clone()),
+    );
+    item.insert("owner_id".to_string(), AttributeValue::S(r.owner_id.clone()));
+    item.insert(
+        "links".to_string(),
+        AttributeValue::L(
+            r.links
+                .iter()
+                .map(|link| {
+                    let mut m = HashMap::new();
+                    m.insert(
+                        "source_block_id".to_string(),
+                        AttributeValue::S(link.source_block_id.clone()),
+                    );
+                    m.insert(
+                        "target_quip_thread_id".to_string(),
+                        AttributeValue::S(link.target_quip_thread_id.clone()),
+                    );
+                    if let Some(ref target_quip_section_id) = link.target_quip_section_id {
+                        m.insert(
+                            "target_quip_section_id".to_string(),
+                            AttributeValue::S(target_quip_section_id.clone()),
+                        );
+                    }
+                    AttributeValue::M(m)
+                })
+                .collect(),
+        ),
+    );
+    item
+}
+
+fn unresolved_from_item(item: &HashMap<String, AttributeValue>) -> Result<UnresolvedRow, RepoError> {
+    let links = item
+        .get("links")
+        .and_then(|v| v.as_l().ok())
+        .map(|l| {
+            l.iter()
+                .filter_map(|av| av.as_m().ok())
+                .map(|m| {
+                    Ok(PendingLinkItem {
+                        source_block_id: get_s(m, "source_block_id")?,
+                        target_quip_thread_id: get_s(m, "target_quip_thread_id")?,
+                        target_quip_section_id: m
+                            .get("target_quip_section_id")
+                            .and_then(|v| v.as_s().ok())
+                            .cloned(),
+                    })
+                })
+                .collect::<Result<Vec<_>, RepoError>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(UnresolvedRow {
+        source_quip_thread_id: get_s(item, "source_quip_thread_id")?,
+        owner_id: get_s(item, "owner_id")?,
+        links,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +851,66 @@ mod tests {
         let item = thread_to_item(&t);
         assert!(!item.contains_key("token") && !item.contains_key("secret"));
         assert_eq!(thread_from_item(&item).expect("from_item"), t);
+    }
+
+    #[test]
+    fn secmap_row_round_trips_and_has_no_token() {
+        let r = SecMapRow {
+            quip_thread_id: "t1".into(),
+            chunk: 0,
+            owner_id: "u1".into(),
+            entries: vec![("s1".into(), "b1".into()), ("s2".into(), "b2".into())],
+        };
+        let item = secmap_to_item(&r);
+        assert!(!item.contains_key("token") && !item.contains_key("secret"));
+        assert_eq!(secmap_from_item(&item).expect("from_item"), r);
+    }
+
+    #[test]
+    fn unresolved_row_round_trips_with_optional_section() {
+        let r = UnresolvedRow {
+            source_quip_thread_id: "t1".into(),
+            owner_id: "u1".into(),
+            links: vec![
+                PendingLinkItem {
+                    source_block_id: "b1".into(),
+                    target_quip_thread_id: "t2".into(),
+                    target_quip_section_id: Some("s9".into()),
+                },
+                PendingLinkItem {
+                    source_block_id: "b2".into(),
+                    target_quip_thread_id: "t3".into(),
+                    target_quip_section_id: None,
+                },
+            ],
+        };
+        assert_eq!(unresolved_from_item(&unresolved_to_item(&r)).expect("from_item"), r);
+    }
+
+    #[test]
+    fn unresolved_row_has_no_token() {
+        let r = UnresolvedRow {
+            source_quip_thread_id: "t1".into(),
+            owner_id: "u1".into(),
+            links: vec![PendingLinkItem {
+                source_block_id: "b1".into(),
+                target_quip_thread_id: "t2".into(),
+                target_quip_section_id: None,
+            }],
+        };
+        let item = unresolved_to_item(&r);
+        assert!(!item.contains_key("token") && !item.contains_key("secret"));
+    }
+
+    #[test]
+    fn secmap_row_sk_formats() {
+        let r = SecMapRow { quip_thread_id: "t1".into(), chunk: 3, owner_id: "u1".into(), entries: vec![] };
+        assert_eq!(r.sk(), "SECMAP#t1#3");
+    }
+
+    #[test]
+    fn unresolved_row_sk_formats() {
+        let r = UnresolvedRow { source_quip_thread_id: "t1".into(), owner_id: "u1".into(), links: vec![] };
+        assert_eq!(r.sk(), "UNRESOLVED#t1");
     }
 }
