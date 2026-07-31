@@ -1120,22 +1120,33 @@ impl Transaction {
         let (block, pos) = resolve_block_for_edit(&self.doc, pos)
             .ok_or_else(|| StepError("cursor not in a block".into()))?;
 
-        let text: String = block.content.children.iter().map(|c| c.text_content()).collect();
+        // #146: walk the inline content, not its flattened text. `offset`
+        // is a *model* offset and counts inline atoms; `text_content()`
+        // drops them, so indexing the flattened text with `offset` used to
+        // run off the end and panic on any block ending in a `HardBreak`,
+        // `Mention` or `DocMention`.
+        let units = inline_units(&block.content);
         let offset = pos - block.content_start;
-        let chars: Vec<char> = text.chars().collect();
 
         if offset == 0 {
             // At start of block — try joining backward instead
             return self.join_backward();
         }
 
-        // Scan backward: skip whitespace, then skip word chars
-        let mut i = offset;
-        while i > 0 && chars[i - 1].is_whitespace() {
+        let mut i = offset.min(units.len());
+        if i > 0 && units[i - 1].is_none() {
+            // An inline atom: word deletion stops at it and removes just
+            // it, rather than swallowing the word on its far side.
             i -= 1;
-        }
-        while i > 0 && !chars[i - 1].is_whitespace() {
-            i -= 1;
+        } else {
+            // Scan backward: skip whitespace, then skip word chars. An
+            // atom is neither, so either loop halts on one.
+            while i > 0 && units[i - 1].is_some_and(char::is_whitespace) {
+                i -= 1;
+            }
+            while i > 0 && units[i - 1].is_some_and(|c| !c.is_whitespace()) {
+                i -= 1;
+            }
         }
 
         let delete_from = block.content_start + i;
@@ -1158,23 +1169,35 @@ impl Transaction {
         let (block, pos) = resolve_block_for_edit(&self.doc, pos)
             .ok_or_else(|| StepError("cursor not in a block".into()))?;
 
-        let text: String = block.content.children.iter().map(|c| c.text_content()).collect();
+        // #146: same model-offset-vs-character-offset mismatch as
+        // `delete_word_backward`. Here it never panicked — `offset >= len`
+        // bailed out early — but it made `len` too small, so a caret
+        // before a trailing atom looked like a caret at the block's end
+        // and Ctrl+Delete merged the next block in while leaving the atom
+        // stranded; and a scan that crossed an atom deleted the wrong
+        // range by exactly the number of atoms it crossed.
+        let units = inline_units(&block.content);
         let offset = pos - block.content_start;
-        let chars: Vec<char> = text.chars().collect();
-        let len = chars.len();
+        let len = units.len();
 
         if offset >= len {
             // At end of block — try joining forward instead
             return self.join_forward();
         }
 
-        // Scan forward: skip word chars, then skip whitespace
         let mut i = offset;
-        while i < len && !chars[i].is_whitespace() {
+        if units[i].is_none() {
+            // An inline atom: delete just it (mirror of the backward case).
             i += 1;
-        }
-        while i < len && chars[i].is_whitespace() {
-            i += 1;
+        } else {
+            // Scan forward: skip word chars, then skip whitespace. An atom
+            // is neither, so either loop halts on one.
+            while i < len && units[i].is_some_and(|c| !c.is_whitespace()) {
+                i += 1;
+            }
+            while i < len && units[i].is_some_and(char::is_whitespace) {
+                i += 1;
+            }
         }
 
         let delete_to = block.content_start + i;
@@ -1429,6 +1452,29 @@ fn last_textblock_in(node: &Node, offset: usize) -> Option<BlockInfo> {
         .iter()
         .rev()
         .find_map(|(o, c)| last_textblock_in(c, *o))
+}
+
+/// A textblock's inline content flattened to **one entry per model
+/// position**: `Some(ch)` for each character of a text node, `None` for
+/// each position an inline atom occupies (`HardBreak`, `Mention`,
+/// `DocMention`, inline images).
+///
+/// The point is the alignment. `Fragment::text_content()` concatenates
+/// only the text nodes, so a character index into it drifts from the
+/// model offset by one per atom to its left — index it with a model
+/// offset and you read the wrong character, or run off the end and panic
+/// (GitHub #146). Indices into this vector *are* model offsets relative
+/// to the block's `content_start`, and its length is exactly
+/// `content.size()`.
+fn inline_units(content: &Fragment) -> Vec<Option<char>> {
+    let mut units = Vec::with_capacity(content.size());
+    for child in &content.children {
+        match child {
+            Node::Text { text, .. } => units.extend(text.chars().map(Some)),
+            other => units.extend(std::iter::repeat_n(None, other.node_size())),
+        }
+    }
+    units
 }
 
 /// The textblock that forward-delete at `pos` should merge in, where
@@ -3450,6 +3496,191 @@ mod tests {
         assert_eq!(item.child(0).unwrap().text_content(), "");
         assert_eq!(item.child_count(), 2, "the sub-list is untouched");
         assert_eq!(item.child(1).unwrap().text_content(), "Child");
+    }
+
+    // ── #146: model offsets vs. character offsets ──
+
+    /// `doc > paragraph[ text("hello"), <atom> ]`. The paragraph's
+    /// content is 6 model positions wide but its `text_content()` is 5
+    /// characters, and the caret at the block's end sits at model
+    /// offset 6.
+    fn para_ending_in_atom(atom: NodeType) -> Node {
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![
+                    Node::text("hello"),
+                    Node::element(atom),
+                ]),
+            )]),
+        )
+    }
+
+    /// #146, the headline repro. `delete_word_backward` indexed
+    /// `text_content().chars()` — which drops inline atoms — with a
+    /// *model* offset, which counts them. With the caret at the end of a
+    /// paragraph that ends in a `HardBreak` (type, then Shift+Enter),
+    /// `offset` was 6 against a 5-element vector and `chars[i - 1]`
+    /// panicked with an out-of-bounds index.
+    ///
+    /// Walking the inline content instead makes the two offset spaces
+    /// agree, so the scan sees the atom for what it is and deletes just
+    /// it — word deletion stops at an atom rather than reaching through
+    /// it for the word beyond.
+    #[test]
+    fn delete_word_backward_over_a_trailing_inline_atom_deletes_the_atom() {
+        for atom in [NodeType::HardBreak, NodeType::Mention, NodeType::DocMention] {
+            let doc = para_ending_in_atom(atom);
+            let block = find_block_at(&doc, 7).expect("caret at the block's end");
+            let chars: usize = block
+                .content
+                .children
+                .iter()
+                .map(|c| c.text_content().chars().count())
+                .sum();
+            assert_eq!(
+                block.content.size() - chars,
+                1,
+                "precondition: {atom:?} occupies a model position but no character",
+            );
+
+            let state = at_cursor(doc, 7);
+            let txn = state
+                .transaction()
+                .delete_word_backward()
+                .expect("#146: must not panic");
+            let new_state = state.apply(txn);
+
+            assert_eq!(
+                shape(&new_state.doc),
+                "Doc[Paragraph[\"hello\"]]",
+                "{atom:?}: the atom goes, the word before it stays",
+            );
+            assert_eq!(new_state.selection.from(), 6);
+        }
+    }
+
+    /// The mirror on the forward side. This one never panicked —
+    /// `offset >= len` bailed out first — but the same undercounted
+    /// `len` made a caret *before* a trailing atom look like a caret at
+    /// the block's end, so Ctrl+Delete fell through to `join_forward`
+    /// and merged the next block in while the atom stayed put.
+    #[test]
+    fn delete_word_forward_before_a_trailing_inline_atom_deletes_the_atom() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![
+                        Node::text("hello"),
+                        Node::element(NodeType::HardBreak),
+                    ]),
+                ),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("next")]),
+                ),
+            ]),
+        );
+        // Model offset 5: after "hello", before the HardBreak.
+        let state = at_cursor(doc, 6);
+        let txn = state.transaction().delete_word_forward().unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(
+            shape(&new_state.doc),
+            "Doc[Paragraph[\"hello\"],Paragraph[\"next\"]]",
+            "the atom goes; the blocks do not merge",
+        );
+    }
+
+    /// An atom in the *middle* of a block shifted every character to its
+    /// right by one, so a forward scan that crossed it deleted a range
+    /// one position too wide per atom crossed — here it would have eaten
+    /// the break plus "worl" instead of "world".
+    #[test]
+    fn delete_word_forward_across_an_inline_atom_deletes_the_right_range() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![
+                    Node::text("hello "),
+                    Node::element(NodeType::HardBreak),
+                    Node::text("world"),
+                ]),
+            )]),
+        );
+        // Caret at the very start: "hello " is one word plus its space.
+        let state = at_cursor(doc.clone(), 1);
+        let after_first = state.clone().apply(
+            state.transaction().delete_word_forward().unwrap(),
+        );
+        assert_eq!(
+            shape(&after_first.doc),
+            "Doc[Paragraph[HardBreak,\"world\"]]",
+            "stops at the atom, does not consume it",
+        );
+
+        // And backwards from the end: the word, not the word plus a
+        // position stolen from the atom.
+        let end = at_cursor(doc, 13);
+        let after_back =
+            end.clone().apply(end.transaction().delete_word_backward().unwrap());
+        assert_eq!(
+            shape(&after_back.doc),
+            "Doc[Paragraph[\"hello \",HardBreak]]",
+        );
+    }
+
+    /// The panic was reachable from one caret position; nothing says it
+    /// was the only one. Sweep every position of a block stuffed with
+    /// atoms, in both directions, and require a result rather than a
+    /// crash.
+    #[test]
+    fn delete_word_never_panics_anywhere_in_a_block_full_of_atoms() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![
+                    Node::element(NodeType::Mention),
+                    Node::text("a b"),
+                    Node::element(NodeType::HardBreak),
+                    Node::element(NodeType::DocMention),
+                    Node::text(" c"),
+                    Node::element(NodeType::HardBreak),
+                ]),
+            )]),
+        );
+        for pos in 0..=doc.content_size() {
+            let state = at_cursor(doc.clone(), pos);
+            let _ = state.clone().transaction().delete_word_backward();
+            let _ = state.transaction().delete_word_forward();
+        }
+    }
+
+    /// `inline_units` is only useful if its indices *are* model offsets,
+    /// so pin the invariant its callers rely on.
+    #[test]
+    fn inline_units_has_one_entry_per_model_position() {
+        let content = Fragment::from(vec![
+            Node::text("héllo"),
+            Node::element(NodeType::HardBreak),
+            Node::element(NodeType::Mention),
+            Node::text("x"),
+        ]);
+        let units = inline_units(&content);
+        assert_eq!(units.len(), content.size());
+        assert_eq!(
+            units,
+            vec![
+                Some('h'), Some('é'), Some('l'), Some('l'), Some('o'),
+                None, None, Some('x'),
+            ],
+        );
     }
 
     /// Backspace's character-delete fallback (`view.rs` runs
