@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use super::model::{Mark, MarkType, Node, NodeType};
 
@@ -50,7 +51,33 @@ pub struct MarkSpec {
     pub excludes: Vec<MarkType>,
 }
 
+/// The default schema, built once. `default_schema()` allocates two
+/// `HashMap`s on every call, which is fine at editor-construction time
+/// but not inside a per-keystroke tree walk.
+static DEFAULT_SCHEMA: OnceLock<Schema> = OnceLock::new();
+
+/// Whether `node_type` is **isolating**: content may not be joined
+/// across its boundary in either direction. `TableCell` / `TableHeader`
+/// (a cell's paragraphs are not mergeable with the neighbouring cell's),
+/// `Kanban` and `Calendar` (cursor navigation must not drift into their
+/// internals).
+///
+/// Reads the `NodeSpec` table rather than restating it, so a node type
+/// added to or flipped in the schema is picked up automatically —
+/// `isolating_matches_the_node_spec_table` pins that.
+pub fn is_isolating(node_type: NodeType) -> bool {
+    DEFAULT_SCHEMA
+        .get_or_init(default_schema)
+        .is_isolating(node_type)
+}
+
 impl Schema {
+    /// Whether content may be joined across this node type's boundary.
+    /// See the free [`is_isolating`] for the default-schema shorthand.
+    pub fn is_isolating(&self, node_type: NodeType) -> bool {
+        self.node_spec(node_type).is_some_and(|spec| spec.isolating)
+    }
+
     /// Check if a sequence of child nodes is valid for a parent node type.
     pub fn content_matches(&self, parent_type: NodeType, children: &[&Node]) -> bool {
         let Some(spec) = self.nodes.get(&parent_type) else {
@@ -882,6 +909,48 @@ pub fn default_schema() -> Schema {
 mod tests {
     use super::*;
     use crate::editor::model::Fragment;
+
+    /// `is_isolating` must *read* the `NodeSpec` table, never restate
+    /// it — that is the whole reason `next_textblock_after` consults the
+    /// schema instead of keeping a container allow-list in `state.rs`.
+    /// If a node type is added or its `isolating` flag flipped, the
+    /// editor's join behaviour has to follow automatically.
+    #[test]
+    fn isolating_matches_the_node_spec_table() {
+        let s = default_schema();
+        for (node_type, spec) in &s.nodes {
+            assert_eq!(
+                super::is_isolating(*node_type),
+                spec.isolating,
+                "{node_type:?}",
+            );
+            assert_eq!(s.is_isolating(*node_type), spec.isolating, "{node_type:?}");
+        }
+        // The set the editor actually depends on, spelled out so a
+        // silent flip is visible in the diff.
+        assert!(super::is_isolating(NodeType::TableCell));
+        assert!(super::is_isolating(NodeType::TableHeader));
+        assert!(super::is_isolating(NodeType::Kanban));
+        assert!(super::is_isolating(NodeType::Calendar));
+        assert!(!super::is_isolating(NodeType::ListItem));
+        assert!(!super::is_isolating(NodeType::BulletList));
+        assert!(!super::is_isolating(NodeType::Blockquote));
+        // `Table` is isolating as well, so a join is refused at the
+        // table's own boundary and never reaches a row; `TableRow` is
+        // not, which is why the cell has to carry the flag too.
+        assert!(super::is_isolating(NodeType::Table));
+        assert!(!super::is_isolating(NodeType::TableRow));
+    }
+
+    /// An unknown node type must not read as isolating.
+    #[test]
+    fn is_isolating_is_false_for_a_type_absent_from_the_schema() {
+        let empty = Schema {
+            nodes: HashMap::new(),
+            marks: HashMap::new(),
+        };
+        assert!(!empty.is_isolating(NodeType::TableCell));
+    }
 
     fn schema() -> Schema {
         default_schema()
