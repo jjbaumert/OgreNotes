@@ -16,10 +16,12 @@
 
 mod common;
 
-use ogrenotes_api::worker_mode::{execute_start_quip_import, WorkerCtx};
-use ogrenotes_quip_import::QuipToken;
+use ogrenotes_api::worker_mode::{
+    build_folder_mapping, execute_start_quip_import, import_one_thread, WorkerCtx,
+};
+use ogrenotes_quip_import::{QuipClient, QuipToken};
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
-use ogrenotes_storage::models::import_inventory::ThreadState;
+use ogrenotes_storage::models::import_inventory::{ThreadRow, ThreadState};
 use ogrenotes_storage::models::DocType;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -340,4 +342,119 @@ async fn intra_quip_links_are_recorded_unresolved_for_phase_2b() {
         !unresolved.iter().any(|u| u.source_quip_thread_id == "t2"),
         "a link-free thread must not write an empty UNRESOLVED# row"
     );
+}
+
+/// Regression (I3): a finished import must reach a terminal
+/// `ImportStatus::Succeeded`.
+///
+/// Nothing used to set it — `run_content_pass` bumped `phase` to 2 and
+/// returned, so a completed import read `Running` forever. The wizard papered
+/// over that by keying on `phase >= 2`, but it left "finished" and "stranded
+/// mid-run" as the *same* record state, which is why no recovery sweep over
+/// `Running` imports could be written.
+#[tokio::test]
+async fn completed_content_pass_ends_succeeded() {
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.phase, 2, "precondition: the content pass ran to completion");
+    assert_eq!(
+        rec.status,
+        ImportStatus::Succeeded,
+        "a completed import must be terminally Succeeded, not indefinitely Running",
+    );
+
+    // The wizard's terminal-FAILURE set is {failed, tokenrejected, cancelled};
+    // `succeeded` must stay out of it, or a successful import would render as
+    // an error.
+    assert!(
+        !matches!(
+            rec.status,
+            ImportStatus::Failed | ImportStatus::TokenRejected | ImportStatus::Cancelled
+        ),
+        "succeeded must not collide with the wizard's terminal-failure statuses",
+    );
+}
+
+/// Regression (I1): an ordinary transient error *after* the document is
+/// created must not duplicate the user's document.
+///
+/// Steps 8/9/10 — `put_secmap`, `put_unresolved`, `set_thread_content_done` —
+/// each return `Transient` on failure and abort the pass while the thread is
+/// still `Pending`. The retry used to mint a **fresh** `doc_id`, so a single
+/// DynamoDB throttle deterministically produced a second document (up to four
+/// across `MAX_RETRIES`), violating the plan's "never create a duplicate
+/// document for one thread" invariant.
+///
+/// The retry's inputs are reconstructed exactly as DynamoDB holds them after
+/// such a failure: the document exists, its id is reserved on the `THREAD#`
+/// row, and the row is still `Pending` because the checkpoint never landed.
+/// Driving `import_one_thread` (the documented per-thread test seam) with that
+/// row is precisely what the queue's retry does.
+#[tokio::test]
+async fn retry_after_a_post_create_failure_creates_no_second_document() {
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    // Attempt 1 gets t1 all the way to a real document.
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+    let doc_id = doc_id_for(&app, &import_id, "t1").await.expect("t1 imported");
+    let before = app.state.doc_repo.query_docs_by_owner("owner1").await.unwrap();
+    assert_eq!(before.len(), 2, "precondition: one doc each for t1 and t2");
+
+    // Rewind to the state a step-8/9/10 failure leaves behind: everything up
+    // to and including `DocRepo::create` is durable, the `ContentDone`
+    // checkpoint is not.
+    let threads = app.state.import_repo.list_threads(&import_id).await.unwrap();
+    let t1 = threads.iter().find(|t| t.quip_thread_id == "t1").unwrap();
+    assert_eq!(
+        t1.ogre_doc_id.as_deref(),
+        Some(doc_id.as_str()),
+        "the doc id must be reserved on the manifest row — that reservation IS the fix",
+    );
+    let retry_row = ThreadRow { state: ThreadState::Pending, ..t1.clone() };
+
+    let record = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    let folders = build_folder_mapping(&ctx, &import_id, &record).await.unwrap();
+    let client = QuipClient::new(Some(server.uri()));
+    let token = QuipToken::new("tok".into());
+    import_one_thread(&ctx, &import_id, "owner1", &client, &token, &retry_row, &folders)
+        .await
+        .expect("the retry must complete, not fail on the already-created document");
+
+    // THE ASSERTION: exactly one document for this thread, still the same one.
+    let after = app.state.doc_repo.query_docs_by_owner("owner1").await.unwrap();
+    assert_eq!(
+        after.len(),
+        2,
+        "a retry must adopt its own earlier document, not mint a second: {after:?}",
+    );
+    assert_eq!(
+        doc_id_for(&app, &import_id, "t1").await.as_deref(),
+        Some(doc_id.as_str()),
+        "the manifest must still name the original document",
+    );
+
+    // ...and the retry finished the tail it had failed on.
+    let threads = app.state.import_repo.list_threads(&import_id).await.unwrap();
+    let t1 = threads.iter().find(|t| t.quip_thread_id == "t1").unwrap();
+    assert_eq!(t1.state, ThreadState::ContentDone, "the retry must land the checkpoint");
+
+    // The adopted document is intact — same title, same Quip timestamps, and a
+    // readable v1 snapshot (the retry re-asserts it rather than assuming the
+    // first attempt's S3 write landed).
+    let meta = app.state.doc_repo.get(&doc_id).await.unwrap().expect("document survives");
+    assert_eq!(meta.title, "Doc A");
+    assert_eq!(meta.created_at, 111, "Quip provenance preserved across the retry");
+    let snapshot = app.state.doc_repo.load_snapshot(&doc_id).await.unwrap();
+    assert!(snapshot.is_some_and(|s| !s.is_empty()), "the v1 snapshot must be readable");
 }

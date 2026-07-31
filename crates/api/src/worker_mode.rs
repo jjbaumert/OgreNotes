@@ -91,6 +91,42 @@ impl WorkerCtx {
     }
 }
 
+/// What [`execute`] decided about a claimed entry, over and above the
+/// `Result`'s success/failure axis.
+///
+/// The queue offers exactly two finalizations — ack (success) and
+/// retry-or-dead-letter (failure) — and a *multi-hour* job needs a third.
+/// The reaper reclaims any entry idle for [`REAPER_MIN_IDLE_MS`] (60s), so
+/// every real Quip content pass gets redelivered while its original consumer
+/// is still working. The redelivered run must be able to say "not mine, not
+/// finished, not broken" without the entry being acked out from under the
+/// worker that *is* doing the work.
+#[derive(Debug)]
+pub enum JobDisposition {
+    /// The work is finished. `result_json` is the ack payload handed to
+    /// pollers via `GET /jobs/{id}`.
+    Done(Option<String>),
+    /// Another **live** runner owns this unit of work and is still on it.
+    ///
+    /// Neither success nor failure: the entry is left **pending** in the
+    /// consumer group (no XACK, no retry XADD), so
+    ///
+    /// - the retry budget is untouched — "someone else has it" must never
+    ///   push a healthy import toward the dead-letter queue; and
+    /// - if the original worker then dies (deploy, SIGKILL, OOM) the entry
+    ///   is still there to be reclaimed. Its DynamoDB lease goes stale after
+    ///   [`CLAIM_STALE_MS`] (30s), which is below the reaper's 60s idle
+    ///   threshold, so the *next* redelivery reclaims it and resumes from
+    ///   the per-thread `ContentDone` checkpoints.
+    ///
+    /// The cost is a bounded re-execution: the reaper re-claims the entry
+    /// roughly once a minute for as long as the work runs, and each of those
+    /// runs is one conditional DynamoDB update (`claim_runner`) before it
+    /// returns here. That is not a storm — it is the same order of magnitude
+    /// as the lease heartbeat it is checking.
+    HeldByLiveRunner,
+}
+
 /// Retry budget shared across all job kinds in v1. Per-kind overrides
 /// could land in [`execute_and_finalize`] when DOCX / PDF arrive in
 /// M-6.5 / M-6.6, but a flat default keeps the v1 loop honest.
@@ -342,7 +378,18 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
         }
     };
     match result {
-        Ok(payload) => match queue.ack(&claimed, payload).await {
+        // Deliberately NOT an ack: see [`JobDisposition::HeldByLiveRunner`].
+        // Acking here would delete the only durable record that this work is
+        // outstanding, while the work is still in flight — so the original
+        // worker's death would strand the import with nothing to retry it.
+        Ok(JobDisposition::HeldByLiveRunner) => {
+            tracing::info!(
+                job_id,
+                attempt,
+                "job is held by a live runner; leaving the entry pending for redelivery",
+            );
+        }
+        Ok(JobDisposition::Done(payload)) => match queue.ack(&claimed, payload).await {
             Ok(()) => {
                 tracing::info!(job_id, attempt, "job succeeded");
                 // Terminal success: the staging upload is no longer
@@ -386,13 +433,13 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
 }
 
 /// Map a [`Job`] payload to its handler. New variants land here.
-async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<Option<String>, String> {
+async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<JobDisposition, String> {
     match payload {
         Job::Noop { label } => {
             tracing::info!(label, "noop executed");
-            Ok(Some(
+            Ok(JobDisposition::Done(Some(
                 serde_json::json!({ "label": label }).to_string(),
-            ))
+            )))
         }
         Job::ImportDocx {
             s3_key,
@@ -411,7 +458,9 @@ async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<Option<String>, Strin
             )
             .await?;
             tracing::info!(doc_id, owner_id, "docx imported");
-            Ok(Some(serde_json::json!({ "docId": doc_id }).to_string()))
+            Ok(JobDisposition::Done(Some(
+                serde_json::json!({ "docId": doc_id }).to_string(),
+            )))
         }
         #[cfg(feature = "pdf")]
         Job::ImportPdf {
@@ -431,13 +480,21 @@ async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<Option<String>, Strin
             )
             .await?;
             tracing::info!(doc_id, owner_id, "pdf imported");
-            Ok(Some(serde_json::json!({ "docId": doc_id }).to_string()))
+            Ok(JobDisposition::Done(Some(
+                serde_json::json!({ "docId": doc_id }).to_string(),
+            )))
         }
         #[cfg(not(feature = "pdf"))]
         Job::ImportPdf { .. } => Err("PDF import not compiled into this build".into()),
         Job::StartQuipImport { import_id, owner_id } => {
-            execute_start_quip_import(ctx, import_id, owner_id).await?;
-            Ok(Some(serde_json::json!({ "importId": import_id }).to_string()))
+            match execute_start_quip_import(ctx, import_id, owner_id).await? {
+                ImportRunOutcome::Ran => Ok(JobDisposition::Done(Some(
+                    serde_json::json!({ "importId": import_id }).to_string(),
+                ))),
+                // Not ours to ack — the lease-holder is still working. See
+                // [`JobDisposition::HeldByLiveRunner`].
+                ImportRunOutcome::HeldByLiveRunner => Ok(JobDisposition::HeldByLiveRunner),
+            }
         }
     }
 }
@@ -528,6 +585,7 @@ pub async fn execute_import_docx(
         now,
         now,
         &ogrenotes_common::id::new_id(),
+        OnExistingDoc::Reject,
     )
     .await
 }
@@ -573,8 +631,26 @@ pub async fn execute_import_pdf(
         now,
         now,
         &ogrenotes_common::id::new_id(),
+        OnExistingDoc::Reject,
     )
     .await
+}
+
+/// What a document already existing under the caller's `doc_id` means to
+/// [`persist_imported_document`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnExistingDoc {
+    /// The id was minted immediately before the call and handed to nobody,
+    /// so a collision is a nanoid collision or a caller bug — fail loudly.
+    /// DOCX and PDF imports.
+    Reject,
+    /// The id was **reserved** on durable state before the first create
+    /// attempt (the Quip content pass writes it to the `THREAD#` row), so a
+    /// document already sitting there is this thread's own earlier attempt.
+    /// Adopt it and carry on — minting a fresh id instead is precisely how a
+    /// single DynamoDB throttle at step 8/9/10 used to hand the user two
+    /// copies of one Quip document.
+    ReconcileReservedId,
 }
 
 /// Persist a freshly-parsed import as a new document: write the v=1
@@ -597,6 +673,9 @@ pub async fn execute_import_pdf(
 /// metadata; note that field alone does **not** create the folder→child
 /// rows, so this links `folder_id` *and* every additional folder via
 /// `add_child`.
+///
+/// `on_existing` decides what a *pre-existing* document under `doc_id`
+/// means — see [`OnExistingDoc`].
 #[allow(clippy::too_many_arguments)]
 async fn persist_imported_document(
     doc_repo: &DocRepo,
@@ -610,6 +689,7 @@ async fn persist_imported_document(
     created_at: i64,
     updated_at: i64,
     doc_id: &str,
+    on_existing: OnExistingDoc,
 ) -> Result<String, String> {
     use ogrenotes_storage::models::document::DocumentMeta;
     use ogrenotes_storage::models::folder::FolderChild;
@@ -634,10 +714,41 @@ async fn persist_imported_document(
         created_at,
         updated_at,
     };
-    doc_repo
-        .create(&meta, snapshot)
-        .await
-        .map_err(|e| format!("create document: {e}"))?;
+    if let Err(create_err) = doc_repo.create(&meta, snapshot).await {
+        // `create` is conditional on `attribute_not_exists(PK)`, and it does
+        // not distinguish "already there" from "DynamoDB said no" in its
+        // error type — so ask the table instead of parsing the message.
+        let existing = match on_existing {
+            OnExistingDoc::Reject => None,
+            OnExistingDoc::ReconcileReservedId => doc_repo
+                .get(doc_id)
+                .await
+                .map_err(|e| format!("read back reserved document: {e}"))?,
+        };
+        match existing {
+            None => return Err(format!("create document: {create_err}")),
+            Some(_) => {
+                // Our own earlier attempt got this far. Re-assert the v1
+                // snapshot rather than assuming it landed: `create` writes
+                // the metadata row BEFORE the S3 object, so the one failure
+                // that leaves a row without a snapshot is exactly the one
+                // that would otherwise become permanent now that the retry
+                // reuses the id instead of minting a new one. The bytes are
+                // re-derived from the same staged HTML, so this is a
+                // rewrite, not an edit.
+                tracing::info!(
+                    doc_id,
+                    error = %create_err,
+                    "import: document already exists under the reserved id; \
+                     reconciling instead of creating a duplicate",
+                );
+                doc_repo
+                    .save_snapshot(doc_id, snapshot, meta.snapshot_version, updated_at, owner_id)
+                    .await
+                    .map_err(|e| format!("re-assert reserved document snapshot: {e}"))?;
+            }
+        }
+    }
 
     for folder in std::iter::once(folder_id).chain(additional_folder_ids.iter().map(String::as_str))
     {
@@ -655,6 +766,20 @@ async fn persist_imported_document(
     Ok(doc_id.to_string())
 }
 
+/// How a `StartQuipImport` handler run ended, when it didn't error.
+///
+/// Distinct from "success" precisely because the queue must finalize the two
+/// differently — see [`JobDisposition`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ImportRunOutcome {
+    /// This worker held the lease and drove the import as far as it could:
+    /// through the content pass, or to a terminal non-retryable condition
+    /// such as a rejected token.
+    Ran,
+    /// Another live runner holds the lease; this run did nothing at all.
+    HeldByLiveRunner,
+}
+
 /// Phase 1 inventory handler for the `StartQuipImport` trigger.
 ///
 /// Claims the import's runner lease, re-reads the (token-free trigger's)
@@ -667,10 +792,10 @@ async fn persist_imported_document(
 ///
 /// The token is read here and NEVER logged or formatted. A revoked token
 /// (`Unauthorized`) is terminal for this run: status flips to
-/// `TokenRejected` and the handler returns `Ok(())` rather than burning the
-/// retry budget hammering Quip with a dead credential — the UI polls status
-/// and prompts a reconnect. Transient errors return `Err` so the queue's
-/// retry/reaper resumes the walk from scratch (cheap, thanks to
+/// `TokenRejected` and the handler returns [`ImportRunOutcome::Ran`] rather
+/// than burning the retry budget hammering Quip with a dead credential — the
+/// UI polls status and prompts a reconnect. Transient errors return `Err` so
+/// the queue's retry/reaper resumes the walk from scratch (cheap, thanks to
 /// insert-if-absent).
 ///
 /// `pub` so integration tests can drive it directly (the `execute_import_docx`
@@ -679,7 +804,7 @@ pub async fn execute_start_quip_import(
     ctx: &WorkerCtx,
     import_id: &str,
     owner_id: &str,
-) -> Result<(), String> {
+) -> Result<ImportRunOutcome, String> {
     let instance = worker_instance_id();
     let now_ms = ogrenotes_common::time::now_usec() / 1000;
 
@@ -695,8 +820,13 @@ pub async fn execute_start_quip_import(
         .await
         .map_err(|e| format!("claim runner: {e}"))?
     {
-        tracing::info!(import_id, "quip inventory: import held by a live runner; skipping");
-        return Ok(());
+        // NOT a success. Reporting it as one would let the caller ack the
+        // queue entry, and with Phase 2a's multi-hour pass this is the
+        // *guaranteed* case (the reaper reclaims after 60s idle), not a rare
+        // race — so acking here would routinely delete the only outstanding
+        // record of a running import. See [`JobDisposition::HeldByLiveRunner`].
+        tracing::info!(import_id, "quip import: held by a live runner; leaving the entry pending");
+        return Ok(ImportRunOutcome::HeldByLiveRunner);
     }
 
     // From here we OWN the lease. Clear it on EVERY exit — success OR error —
@@ -707,7 +837,7 @@ pub async fn execute_start_quip_import(
     // errors, now applied uniformly to DDB-error `?`-returns too.
     let result = run_inventory(ctx, import_id, owner_id, &instance).await;
     ctx.import_repo.clear_runner_claim(import_id).await.ok();
-    result
+    result.map(|()| ImportRunOutcome::Ran)
 }
 
 /// The owned-lease body of the inventory handler. Split out so
@@ -1024,6 +1154,18 @@ async fn run_content_pass(
         .set_phase(import_id, 2)
         .await
         .map_err(|e| format!("set phase: {e}"))?;
+    // Terminal success. Written AFTER the phase bump so the strongest claim
+    // lands last, and written at all because otherwise a finished import and
+    // a *stranded* one are the same record state (`Running`, phase 1-or-2) —
+    // which makes any recovery sweep over `Running` imports unwriteable, and
+    // leaves the wizard's "done" signal resting on `phase` alone. The wizard
+    // already terminates on `phase >= 2` and treats only
+    // `failed`/`tokenrejected`/`cancelled` as terminal *failures*, so
+    // `succeeded` is additive there.
+    ctx.import_repo
+        .set_status(import_id, ImportStatus::Succeeded)
+        .await
+        .map_err(|e| format!("set succeeded: {e}"))?;
     tracing::info!(import_id, threads = threads.len(), "quip content: phase 2 complete");
     Ok(())
 }
@@ -1033,12 +1175,23 @@ async fn run_content_pass(
 /// Ordered so that **every** failure leaves the thread retryable: nothing is
 /// checkpointed until the document, its section map and its unresolved links
 /// are all durable, and the checkpoint itself is the last write. A retry that
-/// lands after a partial run redoes the work from the fetch — which is safe
-/// because the only non-idempotent write, `DocRepo::create`, is keyed on a
-/// freshly minted `doc_id` each time. (The cost of that safety is that a
-/// crash between `create` and the checkpoint orphans one document and its
-/// blobs; a duplicate is strictly better than a thread silently skipped, and
-/// the manifest names the surviving one.)
+/// lands after a partial run redoes the work from the fetch.
+///
+/// Redoing it is safe — and, critically, *duplicate-free* — because the
+/// document id is **reserved on the `THREAD#` row before the first
+/// `DocRepo::create`**. Steps 8, 9 and 10 (section map, unresolved links,
+/// checkpoint) all return `Transient` on failure while the thread is still
+/// `Pending`, so retrying them is the ordinary case, not an exotic one: a
+/// single DynamoDB throttle would otherwise mint a fresh id and hand the user
+/// a second copy of the same document (up to four across `MAX_RETRIES`).
+/// With the reservation, the retry adopts its own earlier document
+/// ([`OnExistingDoc::ReconcileReservedId`]) and finishes the tail. The plan's
+/// invariant — never two documents for one thread — is therefore upheld for
+/// transient failures *and* for a hard crash, not just the latter.
+///
+/// Still orphaned by a crash: side-loaded blobs written under a `doc_id`
+/// whose reservation itself never landed. Cheap and bounded; S3 lifecycle
+/// work is tracked separately.
 ///
 /// `pub` for the same reason [`execute_import_docx`] is: it's the test seam
 /// for driving one thread without a consumer loop.
@@ -1093,9 +1246,24 @@ pub async fn import_one_thread(
     // 5. Walk it.
     let quip_doc = ogrenotes_collab::import_quip::from_quip_html(&html);
 
-    // 6. Side-load blobs. The document id is minted here, before the persist,
-    //    because every blob key embeds it and those keys go into the snapshot.
-    let doc_id = ogrenotes_common::id::new_id();
+    // 6. Settle this thread's document id BEFORE anything durable is written
+    //    under it. It has to be known early anyway — every side-loaded blob
+    //    key embeds it and those keys go into the snapshot — but it is also
+    //    *reserved* on the `THREAD#` row so a retry re-uses it instead of
+    //    minting a second document for the same thread. A row that already
+    //    carries one is a previous attempt's reservation; reuse it verbatim.
+    let doc_id = match &thread.ogre_doc_id {
+        Some(reserved) => reserved.clone(),
+        None => ctx
+            .import_repo
+            .reserve_thread_doc_id(
+                import_id,
+                &thread.quip_thread_id,
+                &ogrenotes_common::id::new_id(),
+            )
+            .await
+            .map_err(|e| ThreadImportError::Transient(format!("reserve doc id: {e}")))?,
+    };
     let src_updates =
         sideload_images(ctx, client, token, thread, &doc_id, &quip_doc.images).await?;
     ogrenotes_collab::blob_ref::set_image_srcs(&quip_doc.doc, &src_updates);
@@ -1117,6 +1285,7 @@ pub async fn import_one_thread(
         thread.updated_usec,
         thread.updated_usec,
         &doc_id,
+        OnExistingDoc::ReconcileReservedId,
     )
     .await
     .map_err(ThreadImportError::Transient)?;

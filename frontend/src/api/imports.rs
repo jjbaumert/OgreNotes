@@ -106,9 +106,12 @@ pub async fn start(
 /// the inventory walk is complete. During the content pass, `progress.done`
 /// climbs toward `progress.total` for free (threads move
 /// `Pending -> ContentDone`); `phase` flips to `2` once content is done.
-/// `status` stays `"running"` through both passes — Phase 2b is what sets
-/// a terminal `"succeeded"` — so callers stop polling on `phase >= 2` or
-/// on a failure `status` (`failed` / `tokenrejected` / `cancelled`).
+/// `status` stays `"running"` through both passes and flips to a terminal
+/// `"succeeded"` when the content pass completes (written just after
+/// `phase = 2`, so a poll can legitimately observe `phase == 2` while
+/// `status` is still `"running"`). Callers therefore stop polling on
+/// `phase >= 2` — not on `status` — or on a failure `status`
+/// (`failed` / `tokenrejected` / `cancelled`).
 pub async fn get_status(import_id: &str) -> Result<StatusResponse, ApiClientError> {
     client::api_get(&format!("/imports/quip/{import_id}")).await
 }

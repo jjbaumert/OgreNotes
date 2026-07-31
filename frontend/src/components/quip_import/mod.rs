@@ -287,12 +287,13 @@ pub fn QuipImportWizard(
                                 // Task 6 lands the content pass, which
                                 // advances threads Pending -> ContentDone
                                 // (and `record.phase` to `2`) after
-                                // inventory (`phase` `1`) completes.
-                                // `status` stays `"running"` through both
-                                // passes — nothing sets a terminal
-                                // `"succeeded"` until Phase 2b — so the
-                                // loop now keys completion off `phase >=
-                                // 2` instead of `phase >= 1`.
+                                // inventory (`phase` `1`) completes. The
+                                // worker writes a terminal `"succeeded"`
+                                // status right AFTER that phase bump, so a
+                                // poll can land between the two writes —
+                                // completion is keyed off `phase >= 2`,
+                                // never off `status`. `succeeded` is
+                                // deliberately absent from `is_failure`.
                                 let content_done = st.phase >= 2;
                                 if is_failure {
                                     set_terminal.set(Some(if st.status == "tokenrejected" {
@@ -522,10 +523,11 @@ pub fn QuipImportWizard(
                                                             {crate::t!("quip-import-starting")}
                                                         </p>
                                                     }.into_any(),
-                                                    // phase >= 2: the content pass finished
-                                                    // (Task 6/7 — `status` stays `"running"`
-                                                    // here, so this is keyed off `phase`, not
-                                                    // a terminal status). The destination is
+                                                    // phase >= 2: the content pass finished.
+                                                    // Keyed off `phase`, not `status`: the
+                                                    // terminal `"succeeded"` write lands just
+                                                    // after the phase bump, so `status` may
+                                                    // still read `"running"`. The destination is
                                                     // always the caller's Home folder (see the
                                                     // module doc comment / `quip-import-target-
                                                     // home` above) — Phase 1 deliberately skips

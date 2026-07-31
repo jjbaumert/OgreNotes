@@ -18,11 +18,13 @@ use std::sync::Arc;
 
 use fred::clients::RedisClient;
 use fred::prelude::*;
-use ogrenotes_api::worker_mode::{execute_and_finalize, execute_start_quip_import, WorkerCtx};
+use ogrenotes_api::worker_mode::{
+    execute_and_finalize, execute_start_quip_import, ImportRunOutcome, WorkerCtx,
+};
 use ogrenotes_quip_import::QuipToken;
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
 use ogrenotes_storage::models::import_inventory::{ThreadRow, ThreadState};
-use ogrenotes_worker::{Job, JobQueue};
+use ogrenotes_worker::{Job, JobQueue, JobStatus};
 use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -465,4 +467,100 @@ async fn dead_lettered_quip_import_ends_failed() {
         ImportStatus::Failed,
         "a dead-lettered Quip import must end Failed, not stay Running"
     );
+}
+
+/// Regression (C1/C2, the critical one): the reaper must NOT ack a job whose
+/// work is still in flight on another worker.
+///
+/// `REAPER_MIN_IDLE_MS` is 60s and a Phase-2a content pass runs for minutes to
+/// hours, so *every* real import gets its stream entry `XAUTOCLAIM`ed while the
+/// original consumer is still working. The redelivered handler hits the
+/// live-lease guard; if that reported success, `execute_and_finalize` would ack
+/// — deleting the only outstanding record of the work while the work runs. The
+/// original worker then dying (deploy, SIGKILL, OOM) would strand the import at
+/// `Running`/phase 1 with half its threads `ContentDone` and nothing to retry
+/// it. The reaper redelivery → stale lease → resume-from-checkpoints recovery
+/// is exactly what the ack disabled.
+///
+/// So: a redelivered run under a live lease must leave the entry **pending**,
+/// must not touch the retry budget, and must not report success.
+#[tokio::test]
+async fn live_lease_redelivery_leaves_the_entry_pending_instead_of_acking() {
+    common::require_infra!();
+    let server = quip_fixture_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1", &["root"]).await;
+    app.state
+        .quip_token_store
+        .put(&import_id, &QuipToken::new("tok".into()))
+        .await
+        .unwrap();
+
+    // Another worker is mid-import: it holds the lease with a FRESH heartbeat,
+    // so it is genuinely live (not the crashed-worker case, which
+    // `inventory_reclaims_stale_lease` covers).
+    let held = app
+        .state
+        .import_repo
+        .claim_runner(&import_id, "the-worker-actually-doing-it", now_ms(), CLAIM_STALE_MS)
+        .await
+        .unwrap();
+    assert!(held, "seed: the live runner takes the lease");
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    // The handler itself must classify this as "not mine", not as success.
+    let outcome = execute_start_quip_import(&ctx, &import_id, "owner1")
+        .await
+        .expect("a live lease is not an error");
+    assert_eq!(
+        outcome,
+        ImportRunOutcome::HeldByLiveRunner,
+        "a live lease must be its own disposition, distinct from success",
+    );
+
+    // ...and the queue must finalize it accordingly.
+    let queue = fresh_queue("live-lease").await;
+    let job_id = queue
+        .enqueue(Job::StartQuipImport {
+            import_id: import_id.clone(),
+            owner_id: "owner1".to_string(),
+        })
+        .await
+        .expect("enqueue");
+    let claimed = queue
+        .consume_next("redelivered-to-me", 1_000)
+        .await
+        .expect("consume")
+        .expect("the entry is claimable");
+    execute_and_finalize(&queue, claimed, &ctx).await;
+
+    // THE ASSERTION THAT MATTERS: the entry is still pending in the group, so
+    // it can be reclaimed once the live runner's lease goes stale. An ack
+    // (XACK + XDEL) would have removed it from the pending list entirely.
+    let still_pending = queue
+        .claim_stale("a-later-reaper", 0, 10)
+        .await
+        .expect("claim_stale");
+    assert_eq!(
+        still_pending.len(),
+        1,
+        "the entry must survive as pending — acking it strands the running import",
+    );
+    assert_eq!(still_pending[0].envelope.job_id, job_id);
+    assert_eq!(
+        still_pending[0].envelope.attempt, 0,
+        "\"held by a live runner\" must not burn the retry budget",
+    );
+
+    // It was not reported to pollers as finished either.
+    let status = queue.status(&job_id).await.expect("status");
+    assert!(
+        !matches!(status, JobStatus::Succeeded { .. }),
+        "a no-op run must not report Succeeded, got {status:?}",
+    );
+
+    // And it really did nothing: the import is untouched, still below phase 1.
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.phase, 0, "the no-op run must not have walked anything");
 }
