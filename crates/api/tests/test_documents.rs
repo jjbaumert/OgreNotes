@@ -925,6 +925,155 @@ async fn test_export_markdown_round_trips_text() {
     app.cleanup().await;
 }
 
+/// Build a doc whose sole content is one `Image` node carrying a durable
+/// `ogre-blob:` reference (see `ogrenotes_collab::blob_ref`). Used by
+/// the export-rewrite regression tests below.
+fn build_doc_with_blob_ref_image(doc_id: &str, blob_id: &str, alt: &str) -> (ogrenotes_collab::document::OgreDoc, String) {
+    use ogrenotes_collab::document::OgreDoc;
+    use ogrenotes_collab::blob_ref::blob_ref;
+    use ogrenotes_collab::schema::NodeType;
+    use yrs::types::xml::{Xml, XmlElementPrelim, XmlFragment};
+    use yrs::{Transact, WriteTxn};
+
+    let key = format!("blobs/{doc_id}/{blob_id}/photo.png");
+    let src = blob_ref(blob_id, &key);
+
+    let doc = OgreDoc::new();
+    {
+        let mut txn = doc.inner().transact_mut();
+        let frag = txn.get_or_insert_xml_fragment("content");
+        let n = frag.len(&txn);
+        if n > 0 {
+            frag.remove_range(&mut txn, 0, n);
+        }
+        let img = frag.insert(&mut txn, 0, XmlElementPrelim::empty(NodeType::Image.tag_name()));
+        img.insert_attribute(&mut txn, "src", src.as_str());
+        img.insert_attribute(&mut txn, "alt", alt);
+    }
+    (doc, src)
+}
+
+/// Regression (Task 3 follow-up): `Image.src` holding a durable
+/// `ogre-blob:` reference must be resolved to a real presigned URL
+/// during export — the exporters' `is_safe_url` gate rejects the
+/// `ogre-blob:` scheme by design, so before the export route rewrote
+/// these in place, a Markdown export silently dropped the image (alt
+/// text and all) and an HTML export emitted an `<img>` with no `src`.
+#[tokio::test]
+async fn test_export_resolves_blob_ref_images_to_real_urls() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("img-export@test.com").await;
+    let doc_id = app.create_doc(&token, "Doc With Blob Image", None).await;
+
+    let (doc, src) = build_doc_with_blob_ref_image(&doc_id, "b-export-1", "A resolved photo");
+    assert!(src.starts_with("ogre-blob:"));
+
+    let (status, _) = app
+        .bytes_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{doc_id}/content"),
+            Some(&token),
+            doc.to_state_bytes(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    // Markdown: the image must survive as `![alt](<presigned URL>)`, not
+    // vanish outright. The URL's scheme depends on the S3 endpoint (the
+    // local MinIO emulator serves plain http), so assert on the
+    // presigned-URL shape (an `X-Amz-Signature` query param over the
+    // expected key path) rather than on `https://` specifically.
+    let expected_key_path = format!("blobs/{doc_id}/b-export-1/photo.png");
+    let (status, bytes) = app
+        .bytes_request(
+            Method::GET,
+            &format!("/api/v1/documents/{doc_id}/export/markdown"),
+            Some(&token),
+            Vec::new(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 200);
+    let md = String::from_utf8(bytes).expect("markdown export is utf-8");
+    assert!(!md.contains("ogre-blob:"), "raw reference leaked into markdown export: {md:?}");
+    assert!(
+        md.contains("A resolved photo") && md.contains(&expected_key_path) && md.contains("X-Amz-Signature"),
+        "expected a resolved presigned link in markdown export: {md:?}"
+    );
+
+    // HTML: the `<img>` must carry a real `src`, not be missing one.
+    let (status, bytes) = app
+        .bytes_request(
+            Method::GET,
+            &format!("/api/v1/documents/{doc_id}/export/html"),
+            Some(&token),
+            Vec::new(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 200);
+    let html = String::from_utf8(bytes).expect("html export is utf-8");
+    assert!(!html.contains("ogre-blob:"), "raw reference leaked into html export: {html:?}");
+    assert!(
+        html.contains(&expected_key_path) && html.contains("X-Amz-Signature"),
+        "expected a resolved presigned src in html export: {html:?}"
+    );
+
+    app.cleanup().await;
+}
+
+/// A blob reference naming a foreign document's key (e.g. malformed or
+/// injected content) must NOT be handed a presigned URL for that
+/// mismatched key — it's left as the raw `ogre-blob:` token, same as an
+/// unresolved reference. Mirrors `request_download_url`'s own
+/// `blobs/{doc_id}/{blob_id}/` prefix check.
+#[tokio::test]
+async fn test_export_does_not_presign_blob_ref_for_a_foreign_document() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("img-export-2@test.com").await;
+    let doc_id = app.create_doc(&token, "Doc With Foreign Blob Ref", None).await;
+
+    // Key references a DIFFERENT doc_id than the one it's stored in.
+    let (doc, _src) = build_doc_with_blob_ref_image("some-other-doc-id", "b-foreign", "Foreign photo");
+
+    let (status, _) = app
+        .bytes_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{doc_id}/content"),
+            Some(&token),
+            doc.to_state_bytes(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let (status, bytes) = app
+        .bytes_request(
+            Method::GET,
+            &format!("/api/v1/documents/{doc_id}/export/markdown"),
+            Some(&token),
+            Vec::new(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 200);
+    let md = String::from_utf8(bytes).expect("markdown export is utf-8");
+    // Not resolved (foreign key), and the markdown exporter's
+    // `is_safe_url` gate drops anything that isn't a real URL — so the
+    // image is absent, not wrongly resolved to someone else's blob.
+    // Scheme-agnostic: assert no presigned URL was minted at all, rather
+    // than assuming `https://` (the local MinIO emulator serves `http://`).
+    assert!(
+        !md.contains("X-Amz-Signature"),
+        "must not have presigned a foreign-document key: {md:?}"
+    );
+
+    app.cleanup().await;
+}
+
 /// #59 T-6: a document's comment threads must appear in its exports.
 /// Import a doc, attach a document-level comment, then export as HTML and
 /// Markdown and assert the comment body + author + a "Comments" heading

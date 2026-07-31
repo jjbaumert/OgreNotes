@@ -18,12 +18,14 @@ use std::sync::Arc;
 
 use fred::clients::RedisClient;
 use fred::prelude::*;
-use ogrenotes_api::worker_mode::{execute_and_finalize, execute_start_quip_import, WorkerCtx};
+use ogrenotes_api::worker_mode::{
+    execute_and_finalize, execute_start_quip_import, ImportRunOutcome, WorkerCtx,
+};
 use ogrenotes_quip_import::QuipToken;
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
 use ogrenotes_storage::models::import_inventory::{ThreadRow, ThreadState};
-use ogrenotes_worker::{Job, JobQueue};
-use wiremock::matchers::{method, path, query_param};
+use ogrenotes_worker::{Job, JobQueue, JobStatus};
+use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Wiremock Quip server serving `/1/folders/` (per-id) and `/1/threads/`
@@ -65,6 +67,16 @@ async fn quip_fixture_server() -> MockServer {
             "t1": {"thread": {"id": "t1", "title": "Doc A", "type": "document", "updated_usec": 111}},
             "t2": {"thread": {"id": "t2", "title": "Sheet", "type": "spreadsheet", "updated_usec": 222}}
         })))
+        .mount(&server)
+        .await;
+
+    // Phase 2a widened `StartQuipImport` to run the content pass in the same
+    // job (see `test_quip_content_worker.rs` for its own coverage), so an
+    // inventory-only fixture is no longer a complete fixture for this job.
+    // A trivial body for every thread keeps these tests focused on inventory.
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/2/threads/.+/html$"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<p>body</p>"))
         .mount(&server)
         .await;
 
@@ -178,8 +190,12 @@ async fn inventory_walk_persists_folders_and_threads_and_total() {
     assert_eq!(t1.title, "Doc A");
     assert_eq!(t1.thread_type, "document");
     assert_eq!(t1.updated_usec, 111);
-    assert_eq!(t1.state, ThreadState::Pending);
     assert_eq!(t1.owner_id, "owner1");
+    // Phase 2a: the same job now runs the content pass, so the thread this
+    // walk enqueued as Pending has already been converted by the time the
+    // job returns. Inventory's own contract — that it *discovers* the thread
+    // with the right metadata and folder membership — is what's asserted here.
+    assert_eq!(t1.state, ThreadState::ContentDone);
     // Shared thread lists both member folders; first_folder is the root.
     assert_eq!(t1.first_folder, "root");
     let mut mf = t1.member_folders.clone();
@@ -195,11 +211,12 @@ async fn inventory_walk_persists_folders_and_threads_and_total() {
         ["f2", "root"].iter().map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>()
     );
 
-    // Phase advanced + total recorded.
+    // Phase advanced + total recorded. Phase 2a: the job continues into the
+    // content pass, so it lands on phase 2 with both threads converted.
     let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
-    assert_eq!(rec.phase, 1);
+    assert_eq!(rec.phase, 2);
     let (total, done) = app.state.import_repo.count_threads_by_state(&import_id).await.unwrap();
-    assert_eq!((total, done), (2, 0));
+    assert_eq!((total, done), (2, 2));
 }
 
 #[tokio::test]
@@ -254,7 +271,7 @@ async fn inventory_is_idempotent_on_rerun() {
     assert_eq!(t1.ogre_doc_id.as_deref(), Some("ogre-doc-1"));
 
     let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
-    assert_eq!(rec.phase, 1);
+    assert_eq!(rec.phase, 2);
 }
 
 #[tokio::test]
@@ -328,7 +345,7 @@ async fn inventory_reclaims_stale_lease() {
     execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
 
     let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
-    assert_eq!(rec.phase, 1, "reclaimed run must reach phase 1");
+    assert_eq!(rec.phase, 2, "reclaimed run must reach phase 2 (inventory + content)");
     let (total, _) = app.state.import_repo.count_threads_by_state(&import_id).await.unwrap();
     assert_eq!(total, 2, "reclaimed run must persist the discovered threads");
 }
@@ -450,4 +467,100 @@ async fn dead_lettered_quip_import_ends_failed() {
         ImportStatus::Failed,
         "a dead-lettered Quip import must end Failed, not stay Running"
     );
+}
+
+/// Regression (C1/C2, the critical one): the reaper must NOT ack a job whose
+/// work is still in flight on another worker.
+///
+/// `REAPER_MIN_IDLE_MS` is 60s and a Phase-2a content pass runs for minutes to
+/// hours, so *every* real import gets its stream entry `XAUTOCLAIM`ed while the
+/// original consumer is still working. The redelivered handler hits the
+/// live-lease guard; if that reported success, `execute_and_finalize` would ack
+/// — deleting the only outstanding record of the work while the work runs. The
+/// original worker then dying (deploy, SIGKILL, OOM) would strand the import at
+/// `Running`/phase 1 with half its threads `ContentDone` and nothing to retry
+/// it. The reaper redelivery → stale lease → resume-from-checkpoints recovery
+/// is exactly what the ack disabled.
+///
+/// So: a redelivered run under a live lease must leave the entry **pending**,
+/// must not touch the retry budget, and must not report success.
+#[tokio::test]
+async fn live_lease_redelivery_leaves_the_entry_pending_instead_of_acking() {
+    common::require_infra!();
+    let server = quip_fixture_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1", &["root"]).await;
+    app.state
+        .quip_token_store
+        .put(&import_id, &QuipToken::new("tok".into()))
+        .await
+        .unwrap();
+
+    // Another worker is mid-import: it holds the lease with a FRESH heartbeat,
+    // so it is genuinely live (not the crashed-worker case, which
+    // `inventory_reclaims_stale_lease` covers).
+    let held = app
+        .state
+        .import_repo
+        .claim_runner(&import_id, "the-worker-actually-doing-it", now_ms(), CLAIM_STALE_MS)
+        .await
+        .unwrap();
+    assert!(held, "seed: the live runner takes the lease");
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    // The handler itself must classify this as "not mine", not as success.
+    let outcome = execute_start_quip_import(&ctx, &import_id, "owner1")
+        .await
+        .expect("a live lease is not an error");
+    assert_eq!(
+        outcome,
+        ImportRunOutcome::HeldByLiveRunner,
+        "a live lease must be its own disposition, distinct from success",
+    );
+
+    // ...and the queue must finalize it accordingly.
+    let queue = fresh_queue("live-lease").await;
+    let job_id = queue
+        .enqueue(Job::StartQuipImport {
+            import_id: import_id.clone(),
+            owner_id: "owner1".to_string(),
+        })
+        .await
+        .expect("enqueue");
+    let claimed = queue
+        .consume_next("redelivered-to-me", 1_000)
+        .await
+        .expect("consume")
+        .expect("the entry is claimable");
+    execute_and_finalize(&queue, claimed, &ctx).await;
+
+    // THE ASSERTION THAT MATTERS: the entry is still pending in the group, so
+    // it can be reclaimed once the live runner's lease goes stale. An ack
+    // (XACK + XDEL) would have removed it from the pending list entirely.
+    let still_pending = queue
+        .claim_stale("a-later-reaper", 0, 10)
+        .await
+        .expect("claim_stale");
+    assert_eq!(
+        still_pending.len(),
+        1,
+        "the entry must survive as pending — acking it strands the running import",
+    );
+    assert_eq!(still_pending[0].envelope.job_id, job_id);
+    assert_eq!(
+        still_pending[0].envelope.attempt, 0,
+        "\"held by a live runner\" must not burn the retry budget",
+    );
+
+    // It was not reported to pollers as finished either.
+    let status = queue.status(&job_id).await.expect("status");
+    assert!(
+        !matches!(status, JobStatus::Succeeded { .. }),
+        "a no-op run must not report Succeeded, got {status:?}",
+    );
+
+    // And it really did nothing: the import is untouched, still below phase 1.
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.phase, 0, "the no-op run must not have walked anything");
 }

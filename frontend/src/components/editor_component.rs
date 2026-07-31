@@ -1737,13 +1737,12 @@ fn handle_image_upload(
                 return;
             }
 
-            let download_url = match blobs::request_download_url(&doc_id, &upload.blob_id, &upload.key).await {
-                Ok(u) => u,
-                Err(e) => {
-                    web_sys::console::error_1(&format!("Download URL failed: {e}").into());
-                    return;
-                }
-            };
+            // Store a durable blob reference, not the presigned download
+            // URL: that URL is a 4h-TTL S3 presign, and freezing it into
+            // the CRDT meant every inserted image 403'd four hours later.
+            // `editor::view`'s render path resolves `ogre-blob:...` refs
+            // to a fresh presigned URL on demand (see `image_bridge`).
+            let src = crate::editor::blob_ref::blob_ref(&upload.blob_id, &upload.key);
 
             // Insert image node after the current block
             let v = view_ref.borrow();
@@ -1751,7 +1750,7 @@ fn handle_image_upload(
             let state = v.state();
 
             let mut attrs = HashMap::new();
-            attrs.insert("src".to_string(), download_url);
+            attrs.insert("src".to_string(), src);
             attrs.insert("alt".to_string(), filename);
             let img = Node::element_with_attrs(NodeType::Image, attrs, Fragment::empty());
 
@@ -1785,6 +1784,45 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let container_ref = NodeRef::<leptos::html::Div>::new();
     let view_ref: Rc<RefCell<Option<EditorView>>> = Rc::new(RefCell::new(None));
     let history_ref: Rc<RefCell<HistoryPlugin>> = Rc::new(RefCell::new(HistoryPlugin::new()));
+
+    // Durable image references (fixes the 4h presigned-URL expiry) —
+    // install the resolver `editor::view`'s render path calls for every
+    // `ogre-blob:` src it renders (see `editor::image_bridge` for why the
+    // indirection: that module compiles into the lib target, where
+    // `crate::api` isn't visible). Closes over this mount's `doc_id`.
+    //
+    // `EditorComponent` remounts on document switch
+    // (`pages/document.rs`'s `<EditorComponent>` site), so an
+    // unconditional `set_resolver(None)` on cleanup would race a
+    // newer mount's install — if the new mount's setup runs before this
+    // one's `on_cleanup` fires, the unconditional clear would wipe the
+    // NEW resolver, leaving every image in the new document `src`-less
+    // until a full reload (see `image_bridge::clear_resolver_if`'s doc
+    // comment). `clear_resolver_if` only clears when the resolver it's
+    // holding is still (pointer-)identical to the one installed here —
+    // a superseded cleanup becomes a no-op instead of a wipe. The `Rc`
+    // rides in a `SendWrapper` so the `Send + Sync` `on_cleanup` closure
+    // can own it (safe: the wasm runtime is single-threaded) — same
+    // pattern as `pages/document.rs`'s `collab_for_unmount`.
+    {
+        let doc_id = props.doc_id.clone();
+        let resolver: crate::editor::image_bridge::Resolver = Rc::new(
+            move |blob_id: String, key: String, on_ready: Box<dyn FnOnce(Option<String>)>| {
+                let doc_id = doc_id.clone();
+                leptos::task::spawn_local(async move {
+                    let url = blobs::request_download_url(&doc_id, &blob_id, &key)
+                        .await
+                        .ok();
+                    on_ready(url);
+                });
+            },
+        );
+        crate::editor::image_bridge::set_resolver(Some(Rc::clone(&resolver)));
+        let resolver_for_cleanup = send_wrapper::SendWrapper::new(resolver);
+        on_cleanup(move || {
+            crate::editor::image_bridge::clear_resolver_if(&resolver_for_cleanup);
+        });
+    }
 
     // Mentions spec §5 (Task 3) — a lone same-origin doc-URL paste hands
     // its `PendingMentionPaste` out of `EditorView::on_paste` (plain

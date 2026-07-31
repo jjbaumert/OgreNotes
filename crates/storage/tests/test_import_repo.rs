@@ -14,7 +14,7 @@ use ogrenotes_common::id::new_id;
 use ogrenotes_common::time::now_usec;
 use ogrenotes_storage::dynamo::DynamoClient;
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
-use ogrenotes_storage::models::import_inventory::{ThreadRow, ThreadState};
+use ogrenotes_storage::models::import_inventory::{SecMapRow, ThreadRow, ThreadState};
 use ogrenotes_storage::repo::import_repo::ImportRepo;
 
 static INFRA_AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
@@ -55,9 +55,10 @@ macro_rules! require_infra {
     };
 }
 
-async fn test_repo() -> (ImportRepo, String) {
-    let table_name = format!("test-import-{}", new_id());
-
+/// A DynamoDB-Local SDK client. Factored out of [`test_repo`] so a test that
+/// needs to look at the *raw* rows a repo wrote (rather than the logical view
+/// the repo hands back) can build one against the same table.
+fn local_dynamo_client() -> aws_sdk_dynamodb::Client {
     let dynamo_config = aws_sdk_dynamodb::config::Builder::new()
         .endpoint_url("http://127.0.0.1:8000")
         .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
@@ -66,7 +67,12 @@ async fn test_repo() -> (ImportRepo, String) {
         ))
         .behavior_version_latest()
         .build();
-    let client = aws_sdk_dynamodb::Client::from_conf(dynamo_config);
+    aws_sdk_dynamodb::Client::from_conf(dynamo_config)
+}
+
+async fn test_repo() -> (ImportRepo, String) {
+    let table_name = format!("test-import-{}", new_id());
+    let client = local_dynamo_client();
 
     client
         .create_table()
@@ -336,10 +342,14 @@ async fn claim_runner_lease_contract() {
         "a stale claim must be takeable over"
     );
 
-    // Clearing the claim makes it immediately re-acquirable.
-    repo.clear_runner_claim(&record.import_id)
-        .await
-        .expect("clear_runner_claim");
+    // Clearing the claim (as its current holder, inst-B) makes it immediately
+    // re-acquirable.
+    assert!(
+        repo.clear_runner_claim(&record.import_id, "inst-B")
+            .await
+            .expect("clear_runner_claim"),
+        "the lease holder must be able to release its own lease"
+    );
     assert!(
         repo.claim_runner(&record.import_id, "inst-C", NOW_MS + STALE_MS + 2, STALE_MS)
             .await
@@ -403,4 +413,367 @@ async fn set_inventory_total_and_set_phase_persist() {
         raw.get("inventory_total").and_then(|v| v.as_n().ok()),
         Some(&"42".to_string())
     );
+}
+
+/// Phase-2 content-pass checkpoint: `put_secmap` chunks concatenate in
+/// numeric (not lexicographic) chunk order, and `set_thread_content_done`
+/// advances the `THREAD#` row and is safe to call twice. `content_s3_key`
+/// is a Phase-2-only attribute not modeled on `ThreadRow` (deliberately,
+/// same rationale as `inventory_total` not being on `ImportRecord` — see
+/// `set_inventory_total_and_set_phase_persist` above), so it's checked
+/// with a raw item read rather than through `list_threads`.
+#[tokio::test]
+async fn content_checkpoint_advances_thread_and_secmap_chunks_concatenate() {
+    require_infra!();
+    let (repo, table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    let thread = pending_thread("qt1", ThreadState::Pending);
+    repo.put_thread(&record.import_id, &thread)
+        .await
+        .expect("seed pending thread");
+
+    // Write chunk 1 before chunk 0, and enough chunks that lexicographic
+    // SK order ("#10" < "#2") would misorder them if get_secmap relied on
+    // it instead of sorting by the parsed `chunk` field.
+    for chunk in (0..12).rev() {
+        let row = SecMapRow {
+            quip_thread_id: "qt1".to_string(),
+            chunk,
+            owner_id: "u1".to_string(),
+            entries: vec![(format!("s{chunk}"), format!("b{chunk}"))],
+        };
+        repo.put_secmap(&record.import_id, &row)
+            .await
+            .expect("put_secmap");
+    }
+
+    let entries = repo
+        .get_secmap(&record.import_id, "qt1")
+        .await
+        .expect("get_secmap");
+    let expected: Vec<(String, String)> = (0..12).map(|c| (format!("s{c}"), format!("b{c}"))).collect();
+    assert_eq!(entries, expected, "chunks must concatenate in numeric chunk order");
+
+    // Advance the thread to ContentDone.
+    repo.set_thread_content_done(&record.import_id, "qt1", "doc-1", "s3://bucket/qt1.json")
+        .await
+        .expect("set_thread_content_done");
+
+    let rows = repo.list_threads(&record.import_id).await.expect("list_threads");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, ThreadState::ContentDone);
+    assert_eq!(rows[0].ogre_doc_id.as_deref(), Some("doc-1"));
+
+    let dynamo_config = aws_sdk_dynamodb::config::Builder::new()
+        .endpoint_url("http://127.0.0.1:8000")
+        .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+        .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+            "fakekey", "fakesecret", None, None, "test",
+        ))
+        .behavior_version_latest()
+        .build();
+    let client = aws_sdk_dynamodb::Client::from_conf(dynamo_config);
+    let raw = client
+        .get_item()
+        .table_name(&table)
+        .key("PK", aws_sdk_dynamodb::types::AttributeValue::S(format!("IMPORT#{}", record.import_id)))
+        .key("SK", aws_sdk_dynamodb::types::AttributeValue::S("THREAD#qt1".to_string()))
+        .send()
+        .await
+        .expect("raw get_item")
+        .item
+        .expect("item must exist");
+    assert_eq!(
+        raw.get("content_s3_key").and_then(|v| v.as_s().ok()),
+        Some(&"s3://bucket/qt1.json".to_string())
+    );
+
+    // Idempotent: calling it again must leave exactly one row, still
+    // ContentDone, values unchanged.
+    repo.set_thread_content_done(&record.import_id, "qt1", "doc-1", "s3://bucket/qt1.json")
+        .await
+        .expect("set_thread_content_done (second call)");
+    let rows = repo.list_threads(&record.import_id).await.expect("list_threads");
+    assert_eq!(rows.len(), 1, "second call must not create a duplicate row");
+    assert_eq!(rows[0].state, ThreadState::ContentDone);
+    assert_eq!(rows[0].ogre_doc_id.as_deref(), Some("doc-1"));
+}
+
+/// `set_thread_skipped` sets state only, leaving `ogre_doc_id` untouched
+/// (there is none for a skipped thread).
+#[tokio::test]
+async fn set_thread_skipped_marks_state_only() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    let thread = pending_thread("qt1", ThreadState::Pending);
+    repo.put_thread(&record.import_id, &thread)
+        .await
+        .expect("seed pending thread");
+
+    repo.set_thread_skipped(&record.import_id, "qt1")
+        .await
+        .expect("set_thread_skipped");
+
+    let rows = repo.list_threads(&record.import_id).await.expect("list_threads");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, ThreadState::Skipped);
+    assert_eq!(rows[0].ogre_doc_id, None);
+}
+
+/// `put_unresolved` / `list_unresolved` round-trip through live Dynamo,
+/// including the sparse-omitted `target_quip_section_id`.
+#[tokio::test]
+async fn unresolved_links_round_trip_through_live_dynamo() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    let row = ogrenotes_storage::models::import_inventory::UnresolvedRow {
+        source_quip_thread_id: "qt1".to_string(),
+        owner_id: "u1".to_string(),
+        links: vec![
+            ogrenotes_storage::models::import_inventory::PendingLinkItem {
+                source_block_id: "b1".to_string(),
+                target_quip_thread_id: "qt2".to_string(),
+                target_quip_section_id: Some("sec9".to_string()),
+            },
+            ogrenotes_storage::models::import_inventory::PendingLinkItem {
+                source_block_id: "b2".to_string(),
+                target_quip_thread_id: "qt3".to_string(),
+                target_quip_section_id: None,
+            },
+        ],
+    };
+    repo.put_unresolved(&record.import_id, &row)
+        .await
+        .expect("put_unresolved");
+
+    let rows = repo.list_unresolved(&record.import_id).await.expect("list_unresolved");
+    assert_eq!(rows, vec![row]);
+}
+
+/// Regression (I4): `UNRESOLVED#` used to be ONE unbounded item per source
+/// thread while `SECMAP#` was chunked for the same DynamoDB 400 KB item cap.
+/// A Quip index/directory page is exactly the link-dense case that blows it,
+/// and the overflow surfaced as a transient error — which, before the
+/// idempotency fix, also duplicated the document and burned a retry.
+///
+/// Two properties in one test:
+///  1. a link set larger than [`UNRESOLVED_CHUNK_LINKS`] is actually split
+///     across several `UNRESOLVED#<thread>#<chunk>` items, and
+///  2. reading it back concatenates them in **numeric** chunk order. Eleven
+///     chunks is the smallest count that catches a lexicographic sort
+///     (`#10` sorts before `#2`), the same trap `get_secmap` avoids.
+#[tokio::test]
+async fn unresolved_links_chunk_and_concatenate_in_numeric_order() {
+    use ogrenotes_storage::models::import_inventory::{
+        PendingLinkItem, UnresolvedRow, UNRESOLVED_CHUNK_LINKS,
+    };
+
+    require_infra!();
+    let (repo, table_name) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    // Eleven chunks' worth, plus a partial twelfth so the tail isn't a
+    // whole chunk either.
+    let total = UNRESOLVED_CHUNK_LINKS * 11 + 7;
+    let links: Vec<PendingLinkItem> = (0..total)
+        .map(|i| PendingLinkItem {
+            // Zero-padded so the *expected* order is unambiguous, and so a
+            // sort-by-content bug would be as visible as a sort-by-chunk one.
+            source_block_id: format!("b{i:06}"),
+            target_quip_thread_id: "qt2".to_string(),
+            target_quip_section_id: None,
+        })
+        .collect();
+    let row = UnresolvedRow {
+        source_quip_thread_id: "qt1".to_string(),
+        owner_id: "u1".to_string(),
+        links: links.clone(),
+    };
+    repo.put_unresolved(&record.import_id, &row)
+        .await
+        .expect("put_unresolved must chunk rather than reject an oversized set");
+
+    // (1) It really is stored as more than one item — a single 12k-link item
+    //     would exceed DynamoDB's 400 KB cap on realistic ids. Read the RAW
+    //     rows: the repo's own view deliberately hides the chunking.
+    let db = DynamoClient::new(local_dynamo_client(), table_name.clone());
+    let items = db
+        .query(&format!("IMPORT#{}", record.import_id), Some("UNRESOLVED#"))
+        .await
+        .expect("raw query");
+    let mut sks: Vec<String> = items
+        .iter()
+        .filter_map(|i| i.get("SK").and_then(|v| v.as_s().ok()).cloned())
+        .collect();
+    sks.sort();
+    assert_eq!(
+        sks.len(),
+        12,
+        "12 chunks expected for {total} links at {UNRESOLVED_CHUNK_LINKS}/chunk: {sks:?}"
+    );
+    assert!(sks.contains(&"UNRESOLVED#qt1#10".to_string()), "{sks:?}");
+
+    // (2) ...and it reads back as ONE logical row, in write order.
+    let rows = repo.list_unresolved(&record.import_id).await.expect("list_unresolved");
+    assert_eq!(rows.len(), 1, "chunks must merge into one row per source thread");
+    assert_eq!(rows[0].source_quip_thread_id, "qt1");
+    assert_eq!(rows[0].owner_id, "u1");
+    assert_eq!(
+        rows[0].links.len(),
+        total,
+        "every link must survive the chunk round-trip"
+    );
+    assert_eq!(
+        rows[0].links, links,
+        "chunks must concatenate in numeric chunk order, not lexicographic SK order",
+    );
+}
+
+/// Regression (FIX 2): the per-thread document id is reserved on the
+/// `THREAD#` row *before* the document is created, so a retry after a
+/// transient failure re-uses it instead of minting a second document.
+/// Reserving twice — which is exactly what attempt 1 and attempt 2 do — must
+/// return the SAME id, and must not overwrite the first reservation.
+#[tokio::test]
+async fn reserve_thread_doc_id_is_stable_across_retries() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+    repo.put_thread(&record.import_id, &pending_thread("qt1", ThreadState::Pending))
+        .await
+        .expect("seed pending thread");
+
+    let first = repo
+        .reserve_thread_doc_id(&record.import_id, "qt1", "doc-attempt-1")
+        .await
+        .expect("first reservation");
+    assert_eq!(first, "doc-attempt-1", "an unreserved thread takes the candidate");
+
+    let second = repo
+        .reserve_thread_doc_id(&record.import_id, "qt1", "doc-attempt-2")
+        .await
+        .expect("second reservation");
+    assert_eq!(
+        second, "doc-attempt-1",
+        "a retry must adopt the existing reservation, never mint a second document id",
+    );
+
+    // The reservation is durable on the row a retry actually reads.
+    let rows = repo.list_threads(&record.import_id).await.expect("list_threads");
+    assert_eq!(rows[0].ogre_doc_id.as_deref(), Some("doc-attempt-1"));
+    assert_eq!(
+        rows[0].state,
+        ThreadState::Pending,
+        "reserving an id must not advance the thread's progress state",
+    );
+}
+
+/// Regression: a runner that has been superseded must NOT clear the new
+/// holder's lease when it reaches its own exit path.
+///
+/// This is reachable, not theoretical. A runner whose heartbeat lapses past
+/// `stale_ms` — one slow thread, a paused container — is legitimately taken
+/// over by a redelivered run. The old runner then finishes or errors out and
+/// runs its clear-on-every-exit guard. Unconditionally, that wipes the *new*
+/// holder's claim and admits a third concurrent runner: exactly the
+/// mutual-exclusion the lease exists to provide, undone by the loser's
+/// cleanup. Only clear what you still own.
+#[tokio::test]
+async fn a_superseded_runner_cannot_clear_the_new_holders_lease() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    const NOW_MS: i64 = 5_000_000;
+    const STALE_MS: i64 = 30_000;
+
+    // inst-A takes the lease, then goes quiet long enough to look dead...
+    assert!(
+        repo.claim_runner(&record.import_id, "inst-A", NOW_MS, STALE_MS)
+            .await
+            .expect("claim by inst-A")
+    );
+    // ...so inst-B takes over.
+    assert!(
+        repo.claim_runner(&record.import_id, "inst-B", NOW_MS + STALE_MS + 1, STALE_MS)
+            .await
+            .expect("takeover by inst-B"),
+        "seed: a stale lease is takeable over"
+    );
+
+    // inst-A now reaches its exit path and tries to release "its" lease.
+    let cleared = repo
+        .clear_runner_claim(&record.import_id, "inst-A")
+        .await
+        .expect("clear attempt by the superseded runner");
+    assert!(
+        !cleared,
+        "a superseded runner must not clear a lease it no longer holds",
+    );
+
+    // THE POINT: inst-B still holds the lease, so a third runner is refused.
+    assert!(
+        !repo
+            .claim_runner(&record.import_id, "inst-C", NOW_MS + STALE_MS + 2, STALE_MS)
+            .await
+            .expect("claim attempt by inst-C"),
+        "inst-B's lease must survive inst-A's cleanup — otherwise a third \
+         runner joins and the import runs concurrently",
+    );
+
+    // And inst-B can still refresh and release its own.
+    repo.heartbeat_runner(&record.import_id, "inst-B", NOW_MS + STALE_MS + 3)
+        .await
+        .expect("inst-B heartbeat");
+    assert!(
+        repo.clear_runner_claim(&record.import_id, "inst-B")
+            .await
+            .expect("clear by inst-B"),
+        "the real holder can still release"
+    );
+}
+
+/// Regression: `set_phase` is forward-only.
+///
+/// The handler re-runs inventory from scratch on every retry, reaper
+/// redelivery, or manual replay and writes `phase = 1` when it completes — so
+/// an unconditional `SET` regressed a finished (phase 2) import back to 1 on
+/// every replay. It stayed benign only because the wizard breaks out of its
+/// poll the first time it sees `phase >= 2`; anything that polls later, or
+/// re-opens the wizard, would have seen a finished import claim it was still
+/// mid-content-pass.
+#[tokio::test]
+async fn set_phase_never_moves_backwards() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    repo.set_phase(&record.import_id, 1).await.expect("phase 1");
+    repo.set_phase(&record.import_id, 2).await.expect("phase 2");
+
+    // A replay's inventory pass writes phase 1 again. Must be a no-op, and
+    // must NOT surface as an error the handler would report as transient.
+    repo.set_phase(&record.import_id, 1)
+        .await
+        .expect("a backwards phase write must be a silent no-op, not an error");
+
+    let rec = repo.get(&record.import_id).await.expect("get").expect("record");
+    assert_eq!(rec.phase, 2, "a replay must not regress a finished import's phase");
+
+    // Forward still works.
+    repo.set_phase(&record.import_id, 3).await.expect("phase 3");
+    let rec = repo.get(&record.import_id).await.expect("get").expect("record");
+    assert_eq!(rec.phase, 3);
 }

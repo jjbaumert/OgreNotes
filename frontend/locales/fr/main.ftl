@@ -931,3 +931,6 @@ quip-import-inventory-done = { $total } éléments trouvés à importer
 quip-import-estimate = Environ { $minutes } min compte tenu de la limite de débit de Quip
 quip-import-import-failed = Échec de l'import. Veuillez réessayer.
 quip-import-token-expired = Votre session Quip a expiré — veuillez vous reconnecter.
+quip-import-importing = Import en cours… { $done } sur { $total }
+quip-import-content-done = { $total } éléments importés
+quip-import-open-folder = Ouvrir le dossier

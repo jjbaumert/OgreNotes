@@ -1402,7 +1402,30 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                 NodeType::Image => {
                     let el = doc.create_element("img").ok()?;
                     if let Some(src) = attrs.get("src") {
-                        if is_safe_url(src) {
+                        if let Some((blob_id, key)) = super::blob_ref::parse_blob_ref(src) {
+                            // Durable reference (fixes the 4h presigned-URL
+                            // expiry): resolve to a fresh presigned
+                            // URL. `resolve` returns synchronously on a
+                            // cache hit; otherwise the element is left
+                            // without a `src` until the async fetch (fired
+                            // at most once per (blob_id, key) for the
+                            // page's lifetime) calls back.
+                            match super::image_bridge::resolve(&blob_id, &key, {
+                                let el = el.clone();
+                                move |url| {
+                                    if is_safe_url(&url) {
+                                        let _ = el.set_attribute("src", &url);
+                                    }
+                                }
+                            }) {
+                                Some(url) if is_safe_url(&url) => {
+                                    el.set_attribute("src", &url).ok()?;
+                                }
+                                _ => {}
+                            }
+                        } else if is_safe_url(src) {
+                            // Legacy presigned URL or external absolute URL
+                            // — used verbatim (backward compatible).
                             el.set_attribute("src", src).ok()?;
                         }
                     }

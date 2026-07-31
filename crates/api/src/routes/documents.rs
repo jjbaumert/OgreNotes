@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use ogrenotes_collab::document::OgreDoc;
 use ogrenotes_collab::export;
+use ogrenotes_collab::blob_ref;
 use ogrenotes_collab::import_spreadsheet;
 use ogrenotes_common::id::new_id;
 use ogrenotes_common::metrics::{counter, histogram, MetricKey};
@@ -1850,6 +1851,42 @@ async fn export_document(
     let _meta = get_verified_doc(&state, &id, &user_id).await?;
 
     let doc = load_current_doc_state(&state, &id).await?;
+
+    // Durable image references (Phase 2a Task 3 follow-up): every
+    // exporter below reads `Image.src` verbatim, and `export.rs`'s
+    // `is_safe_url` gate deliberately rejects the `ogre-blob:` scheme —
+    // without this, a Markdown export silently drops the image (alt
+    // text and all) and an HTML export emits an `<img>` with no `src`.
+    // Presign a fresh URL for every blob reference the doc actually
+    // contains (server-to-S3, so none of the Bearer-header-auth problem
+    // that rules out a live client-facing resolve route applies — see
+    // `frontend/src/editor/image_bridge.rs`) and rewrite them in place
+    // *before* any format-specific exporter runs, so every format
+    // (html/markdown/csv/xlsx/docx/pdf) benefits uniformly from the one
+    // rewrite rather than needing its own `ogre-blob:` awareness. Same
+    // 14400s TTL as the live per-image resolve path — this restores
+    // exact pre-regression parity (the export used to see a real,
+    // already-presigned URL because that's what `Image.src` held before
+    // durable references existed), not a new, longer-lived guarantee.
+    let blob_refs = blob_ref::collect_blob_refs(doc.inner());
+    if !blob_refs.is_empty() {
+        let mut resolved = std::collections::HashMap::new();
+        for (blob_id, key) in blob_refs {
+            // Defense in depth, mirroring `request_download_url`'s own
+            // prefix check: only presign keys that actually belong to
+            // this document. A blob ref naming a foreign doc/blob_id
+            // (malformed content, or a pasted/injected reference) is
+            // left as-is rather than handed a presigned URL.
+            let expected_prefix = format!("blobs/{id}/{blob_id}/");
+            if !key.starts_with(&expected_prefix) {
+                continue;
+            }
+            if let Ok(url) = state.doc_repo.s3().presigned_get_url(&key, 14400).await {
+                resolved.insert(blob_ref::blob_ref(&blob_id, &key), url);
+            }
+        }
+        blob_ref::rewrite_blob_refs(doc.inner(), &resolved);
+    }
 
     match format.as_str() {
         "html" | "markdown" | "md" | "csv" => {

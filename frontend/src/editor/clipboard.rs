@@ -349,7 +349,18 @@ fn convert_code_block(child: &web_sys::Node, el: &web_sys::Element) -> Node {
 #[cfg(target_arch = "wasm32")]
 fn convert_image(el: &web_sys::Element) -> Option<Node> {
     let src = el.get_attribute("src").unwrap_or_default();
-    if !super::view::is_safe_url(&src) {
+    // `is_safe_url` deliberately rejects the `ogre-blob:` scheme — it's
+    // not a real URL, so it must never reach an `<img src>` set on
+    // arbitrary externally-sourced HTML. But `element_tags` above already
+    // substitutes a resolved `https://` URL for a durable reference when
+    // one's cached (the overwhelmingly common case, since the image was
+    // just rendered before being copied); this prefix check is only the
+    // fallback for the rare unresolved-at-copy-time case, and only
+    // matters for content this same editor produced (an in-app
+    // paste) — an `ogre-blob:` src pasted in from outside the app can't
+    // resolve to anything this workspace owns regardless.
+    let is_durable_ref = src.starts_with(super::blob_ref::BLOB_REF_PREFIX);
+    if !is_durable_ref && !super::view::is_safe_url(&src) {
         return None;
     }
     let mut attrs = std::collections::HashMap::new();
@@ -952,9 +963,28 @@ fn element_tags(
         NodeType::HorizontalRule => ("<hr />".into(), None),
         NodeType::HardBreak => ("<br />".into(), None),
         NodeType::Image => {
+            // Copy/cut only ever writes `text/html` (see the `copy`/`cut`
+            // listeners in `view.rs`), so an `ogre-blob:` reference (see
+            // `super::blob_ref`) must be substituted with its resolved
+            // `https://` URL here — otherwise the clipboard payload
+            // (both for an in-app paste and for pasting into an external
+            // app) carries a token that isn't a URL at all, and
+            // `convert_image` below would previously drop the node
+            // outright. The image was just rendered, so this is expected
+            // to be an `image_bridge` cache hit; if it somehow isn't
+            // (e.g. the resolve hadn't landed yet at copy time), fall
+            // back to the raw reference rather than dropping the image —
+            // `convert_image`'s widened gate lets an in-app paste still
+            // reconstruct the node, and it'll resolve normally the next
+            // time it's rendered.
             let src = attrs
                 .get("src")
-                .map(|s| format!(" src=\"{}\"", html_escape_attr(s)))
+                .map(|s| {
+                    let resolved = super::blob_ref::parse_blob_ref(s)
+                        .and_then(|(blob_id, key)| super::image_bridge::peek(&blob_id, &key))
+                        .unwrap_or_else(|| s.clone());
+                    format!(" src=\"{}\"", html_escape_attr(&resolved))
+                })
                 .unwrap_or_default();
             let alt = attrs
                 .get("alt")
@@ -1871,6 +1901,84 @@ mod tests {
             0, 0,
         );
         assert_eq!(serialize_to_html(&slice), "<blockquote><p>quoted</p></blockquote>");
+    }
+
+    /// Regression: copying an image whose `src` is a durable
+    /// `ogre-blob:` reference (see `super::blob_ref`) must serialize the
+    /// clipboard HTML with the resolved `https://` URL, not the raw
+    /// token — `is_safe_url` rejects `ogre-blob:`, so leaving it in the
+    /// clipboard payload verbatim would make `convert_image`'s (widened,
+    /// but not THAT widened) gate the only thing standing between "image
+    /// survives copy/paste" and "image silently dropped on paste."
+    #[test]
+    fn serialize_image_substitutes_cached_resolved_url_for_blob_ref() {
+        let blob_id = "b-copy-test";
+        let key = "blobs/d1/b-copy-test/photo.png";
+        let resolved_url = "https://s3.example.com/photo.png?sig=abc";
+
+        super::super::image_bridge::set_resolver(Some(std::rc::Rc::new({
+            let resolved_url = resolved_url.to_string();
+            move |_blob_id: String, _key: String, cb: Box<dyn FnOnce(Option<String>)>| {
+                cb(Some(resolved_url.clone()));
+            }
+        })));
+        // Prime the cache exactly like a render would.
+        assert_eq!(
+            super::super::image_bridge::resolve(blob_id, key, |_| {}),
+            None,
+            "first resolve goes through the resolver"
+        );
+        assert_eq!(
+            super::super::image_bridge::peek(blob_id, key),
+            Some(resolved_url.to_string()),
+            "cache must be warm before serialize runs"
+        );
+
+        let mut attrs = HashMap::new();
+        attrs.insert("src".to_string(), super::super::blob_ref::blob_ref(blob_id, key));
+        let slice = Slice::new(
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::Image,
+                attrs,
+                Fragment::empty(),
+            )]),
+            0,
+            0,
+        );
+
+        let html = serialize_to_html(&slice);
+        assert!(
+            html.contains(&format!("src=\"{resolved_url}\"")),
+            "expected resolved URL in {html:?}"
+        );
+        assert!(!html.contains("ogre-blob:"), "raw reference must not leak into the clipboard payload: {html}");
+
+        super::super::image_bridge::set_resolver(None);
+    }
+
+    /// Cache miss at copy time (the resolve hadn't landed yet) must not
+    /// drop the image from the clipboard payload — the raw reference is
+    /// emitted instead, matching `convert_image`'s ogre-blob: fallback.
+    #[test]
+    fn serialize_image_falls_back_to_raw_ref_on_cache_miss() {
+        let src = super::super::blob_ref::blob_ref("b-unresolved", "some/key.png");
+        let mut attrs = HashMap::new();
+        attrs.insert("src".to_string(), src.clone());
+        let slice = Slice::new(
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::Image,
+                attrs,
+                Fragment::empty(),
+            )]),
+            0,
+            0,
+        );
+
+        let html = serialize_to_html(&slice);
+        assert!(
+            html.contains(&format!("src=\"{}\"", html_escape_attr(&src))),
+            "raw ref must still be emitted, not dropped: {html}"
+        );
     }
 
     #[test]

@@ -53,6 +53,75 @@ impl ThreadRow {
     }
 }
 
+/// Max `entries` per `SecMapRow` chunk, chosen to stay well under
+/// DynamoDB's 400 KB item cap. Task 6 (the content-pass caller) splits a
+/// thread's full section→block map into chunks of this size before
+/// calling `put_secmap` once per chunk.
+pub const SECMAP_CHUNK_ENTRIES: usize = 2_000;
+
+/// One chunk of a thread's section-id → block-id map, built during the
+/// Phase-2 content pass so later comment/link resolution can translate a
+/// Quip anchor (`#section-id`) into the Ogre block it landed on. SK =
+/// `SECMAP#<quip_thread_id>#<chunk>`. Chunked because a thread with many
+/// sections could otherwise blow the per-item size cap.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SecMapRow {
+    pub quip_thread_id: String,
+    pub chunk: u32,
+    pub owner_id: String,
+    /// `(quip_section_id, ogre_block_id)` pairs, in the order encountered.
+    pub entries: Vec<(String, String)>,
+}
+
+impl SecMapRow {
+    pub fn sk(&self) -> String {
+        format!("SECMAP#{}#{}", self.quip_thread_id, self.chunk)
+    }
+}
+
+/// Max `links` per persisted `UNRESOLVED#` chunk, chosen for the same
+/// reason as [`SECMAP_CHUNK_ENTRIES`]: one DynamoDB item may not exceed
+/// 400 KB. A [`PendingLinkItem`] costs roughly 120 bytes on the wire
+/// (three ids plus their attribute names), so an unbounded row tops out
+/// near 3k links — and a Quip index/directory page is exactly that dense.
+/// 1 000 keeps a ~3x margin. Unlike `SECMAP#`, the caller does **not**
+/// chunk: `ImportRepo::put_unresolved` splits and
+/// `ImportRepo::list_unresolved` concatenates, so a source thread is one
+/// logical [`UnresolvedRow`] on both sides of the repo boundary.
+pub const UNRESOLVED_CHUNK_LINKS: usize = 1_000;
+
+/// Every cross-thread link discovered in `source_quip_thread_id` whose
+/// target thread hadn't been imported yet at the time it was encountered.
+/// Persisted as one or more chunks at SK =
+/// `UNRESOLVED#<source_quip_thread_id>#<chunk>`; the repo hides the
+/// chunking, so this struct is always the *whole* thread's link set.
+/// Consumed by a later pass (Phase 2b+) that revisits these once every
+/// thread has an `ogre_doc_id`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnresolvedRow {
+    pub source_quip_thread_id: String,
+    pub owner_id: String,
+    pub links: Vec<PendingLinkItem>,
+}
+
+impl UnresolvedRow {
+    /// SK of one persisted chunk. Chunk order is *numeric*, not the SK's
+    /// lexicographic order (`#10` sorts before `#2`), so readers sort on
+    /// the parsed chunk number — same rule as `SECMAP#`.
+    pub fn sk(&self, chunk: u32) -> String {
+        format!("UNRESOLVED#{}#{}", self.source_quip_thread_id, chunk)
+    }
+}
+
+/// One link within an `UnresolvedRow`, naming the source block and the
+/// Quip thread (and optional in-thread section) it points at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingLinkItem {
+    pub source_block_id: String,
+    pub target_quip_thread_id: String,
+    pub target_quip_section_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

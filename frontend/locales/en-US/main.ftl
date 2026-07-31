@@ -149,6 +149,9 @@ quip-import-inventory-done = Found { $total } items to import
 quip-import-estimate = About { $minutes } min at Quip's rate limit
 quip-import-import-failed = Import failed. Please try again.
 quip-import-token-expired = Your Quip session expired — please reconnect.
+quip-import-importing = Importing… { $done } of { $total }
+quip-import-content-done = Imported { $total } items
+quip-import-open-folder = Open folder
 
 # ─── Notification panel ─────────────────────────────────────────
 

@@ -1,11 +1,13 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
+pub mod blob_ref;
 pub mod blocks;
 pub mod clipboard;
 pub mod debug;
 pub mod commands;
 pub mod find;
 pub mod find_highlight;
+pub mod image_bridge;
 pub mod input_rules;
 pub mod keymap;
 pub mod markdown;

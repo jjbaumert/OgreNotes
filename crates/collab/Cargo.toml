@@ -19,6 +19,15 @@ fred = { workspace = true }
 tokio = { workspace = true }
 dashmap = { workspace = true }
 rand = { workspace = true }
+# Quip import — Phase 2a. Mints the 10-char [A-Za-z0-9] blockIds the
+# walker stamps on every element (same shape as the frontend's
+# `generate_block_id`), which is what makes Quip section anchors
+# addressable after import.
+nanoid = { workspace = true }
+# Quip import — Phase 2a. Classifies an `<a href>` as intra-Quip
+# (host is quip.com or a subdomain) vs external, and splits out the
+# thread id / section fragment.
+url = { workspace = true }
 calamine = { version = "0.35", optional = true }
 rust_xlsxwriter = { version = "0.80", optional = true }
 # DOCX import — Phase 6 M-6.5 piece A. A .docx is a ZIP of OOXML; we
@@ -67,7 +76,6 @@ required-features = ["replay"]
 
 [dev-dependencies]
 proptest = { workspace = true }
-nanoid = { workspace = true }
 # Phase 5 M-P9 piece D — perf benchmarks. HTML reports are off
 # (`html_reports` feature pulls in plotters + a long compile tail);
 # CI wants the JSON output only.

@@ -42,6 +42,7 @@ use ogrenotes_quip_import::{QuipClient, QuipError, QuipThread, QuipToken, TokenS
 use ogrenotes_storage::dynamo::DynamoClient;
 use ogrenotes_storage::models::import::ImportStatus;
 use ogrenotes_storage::models::import_inventory::{FolderRow, ThreadRow, ThreadState};
+use ogrenotes_storage::models::DocType;
 use ogrenotes_storage::repo::doc_repo::DocRepo;
 use ogrenotes_storage::repo::folder_repo::FolderRepo;
 use ogrenotes_storage::repo::import_repo::ImportRepo;
@@ -88,6 +89,42 @@ impl WorkerCtx {
     ) -> Self {
         Self { doc_repo, folder_repo, s3, import_repo, quip_token_store, quip_base }
     }
+}
+
+/// What [`execute`] decided about a claimed entry, over and above the
+/// `Result`'s success/failure axis.
+///
+/// The queue offers exactly two finalizations — ack (success) and
+/// retry-or-dead-letter (failure) — and a *multi-hour* job needs a third.
+/// The reaper reclaims any entry idle for [`REAPER_MIN_IDLE_MS`] (60s), so
+/// every real Quip content pass gets redelivered while its original consumer
+/// is still working. The redelivered run must be able to say "not mine, not
+/// finished, not broken" without the entry being acked out from under the
+/// worker that *is* doing the work.
+#[derive(Debug)]
+pub enum JobDisposition {
+    /// The work is finished. `result_json` is the ack payload handed to
+    /// pollers via `GET /jobs/{id}`.
+    Done(Option<String>),
+    /// Another **live** runner owns this unit of work and is still on it.
+    ///
+    /// Neither success nor failure: the entry is left **pending** in the
+    /// consumer group (no XACK, no retry XADD), so
+    ///
+    /// - the retry budget is untouched — "someone else has it" must never
+    ///   push a healthy import toward the dead-letter queue; and
+    /// - if the original worker then dies (deploy, SIGKILL, OOM) the entry
+    ///   is still there to be reclaimed. Its DynamoDB lease goes stale after
+    ///   [`CLAIM_STALE_MS`] (30s), which is below the reaper's 60s idle
+    ///   threshold, so the *next* redelivery reclaims it and resumes from
+    ///   the per-thread `ContentDone` checkpoints.
+    ///
+    /// The cost is a bounded re-execution: the reaper re-claims the entry
+    /// roughly once a minute for as long as the work runs, and each of those
+    /// runs is one conditional DynamoDB update (`claim_runner`) before it
+    /// returns here. That is not a storm — it is the same order of magnitude
+    /// as the lease heartbeat it is checking.
+    HeldByLiveRunner,
 }
 
 /// Retry budget shared across all job kinds in v1. Per-kind overrides
@@ -341,7 +378,18 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
         }
     };
     match result {
-        Ok(payload) => match queue.ack(&claimed, payload).await {
+        // Deliberately NOT an ack: see [`JobDisposition::HeldByLiveRunner`].
+        // Acking here would delete the only durable record that this work is
+        // outstanding, while the work is still in flight — so the original
+        // worker's death would strand the import with nothing to retry it.
+        Ok(JobDisposition::HeldByLiveRunner) => {
+            tracing::info!(
+                job_id,
+                attempt,
+                "job is held by a live runner; leaving the entry pending for redelivery",
+            );
+        }
+        Ok(JobDisposition::Done(payload)) => match queue.ack(&claimed, payload).await {
             Ok(()) => {
                 tracing::info!(job_id, attempt, "job succeeded");
                 // Terminal success: the staging upload is no longer
@@ -385,13 +433,13 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
 }
 
 /// Map a [`Job`] payload to its handler. New variants land here.
-async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<Option<String>, String> {
+async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<JobDisposition, String> {
     match payload {
         Job::Noop { label } => {
             tracing::info!(label, "noop executed");
-            Ok(Some(
+            Ok(JobDisposition::Done(Some(
                 serde_json::json!({ "label": label }).to_string(),
-            ))
+            )))
         }
         Job::ImportDocx {
             s3_key,
@@ -410,7 +458,9 @@ async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<Option<String>, Strin
             )
             .await?;
             tracing::info!(doc_id, owner_id, "docx imported");
-            Ok(Some(serde_json::json!({ "docId": doc_id }).to_string()))
+            Ok(JobDisposition::Done(Some(
+                serde_json::json!({ "docId": doc_id }).to_string(),
+            )))
         }
         #[cfg(feature = "pdf")]
         Job::ImportPdf {
@@ -430,13 +480,21 @@ async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<Option<String>, Strin
             )
             .await?;
             tracing::info!(doc_id, owner_id, "pdf imported");
-            Ok(Some(serde_json::json!({ "docId": doc_id }).to_string()))
+            Ok(JobDisposition::Done(Some(
+                serde_json::json!({ "docId": doc_id }).to_string(),
+            )))
         }
         #[cfg(not(feature = "pdf"))]
         Job::ImportPdf { .. } => Err("PDF import not compiled into this build".into()),
         Job::StartQuipImport { import_id, owner_id } => {
-            execute_start_quip_import(ctx, import_id, owner_id).await?;
-            Ok(Some(serde_json::json!({ "importId": import_id }).to_string()))
+            match execute_start_quip_import(ctx, import_id, owner_id).await? {
+                ImportRunOutcome::Ran => Ok(JobDisposition::Done(Some(
+                    serde_json::json!({ "importId": import_id }).to_string(),
+                ))),
+                // Not ours to ack — the lease-holder is still working. See
+                // [`JobDisposition::HeldByLiveRunner`].
+                ImportRunOutcome::HeldByLiveRunner => Ok(JobDisposition::HeldByLiveRunner),
+            }
         }
     }
 }
@@ -514,7 +572,22 @@ pub async fn execute_import_docx(
     let doc = ogrenotes_collab::import_docx::from_docx(&bytes)
         .map_err(|e| format!("parse docx: {e}"))?;
     let snapshot = ogrenotes_collab::snapshot::doc_to_bytes(&doc);
-    persist_imported_document(doc_repo, folder_repo, &snapshot, title, owner_id, folder).await
+    let now = ogrenotes_common::time::now_usec();
+    persist_imported_document(
+        doc_repo,
+        folder_repo,
+        &snapshot,
+        title,
+        owner_id,
+        folder,
+        DocType::Document,
+        &[],
+        now,
+        now,
+        &ogrenotes_common::id::new_id(),
+        OnExistingDoc::Reject,
+    )
+    .await
 }
 
 /// PDF counterpart of [`execute_import_docx`] (M-6.6). Same fetch →
@@ -545,13 +618,65 @@ pub async fn execute_import_pdf(
     let doc = ogrenotes_collab::import_pdf::from_pdf(&bytes)
         .map_err(|e| format!("parse pdf: {e}"))?;
     let snapshot = ogrenotes_collab::snapshot::doc_to_bytes(&doc);
-    persist_imported_document(doc_repo, folder_repo, &snapshot, title, owner_id, folder).await
+    let now = ogrenotes_common::time::now_usec();
+    persist_imported_document(
+        doc_repo,
+        folder_repo,
+        &snapshot,
+        title,
+        owner_id,
+        folder,
+        DocType::Document,
+        &[],
+        now,
+        now,
+        &ogrenotes_common::id::new_id(),
+        OnExistingDoc::Reject,
+    )
+    .await
+}
+
+/// What a document already existing under the caller's `doc_id` means to
+/// [`persist_imported_document`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnExistingDoc {
+    /// The id was minted immediately before the call and handed to nobody,
+    /// so a collision is a nanoid collision or a caller bug — fail loudly.
+    /// DOCX and PDF imports.
+    Reject,
+    /// The id was **reserved** on durable state before the first create
+    /// attempt (the Quip content pass writes it to the `THREAD#` row), so a
+    /// document already sitting there is this thread's own earlier attempt.
+    /// Adopt it and carry on — minting a fresh id instead is precisely how a
+    /// single DynamoDB throttle at step 8/9/10 used to hand the user two
+    /// copies of one Quip document.
+    ReconcileReservedId,
 }
 
 /// Persist a freshly-parsed import as a new document: write the v=1
-/// snapshot via the doc repo, then link it into its folder. Mirrors
+/// snapshot via the doc repo, then link it into its folder(s). Mirrors
 /// the synchronous `routes::documents::create_from_text` doc-creation
-/// shape; the PDF import (M-6.6) reuses this once its parser lands.
+/// shape; the PDF import (M-6.6) and the Quip content pass share it.
+///
+/// The caller mints `doc_id` rather than receiving one back, because the
+/// Quip content pass has to know the id *before* it persists: the S3 keys
+/// of the images it side-loads are `blobs/{doc_id}/...`, and those keys are
+/// baked into the snapshot's `Image.src` values. DOCX/PDF just pass a fresh
+/// [`new_id`](ogrenotes_common::id::new_id).
+///
+/// `created_at` / `updated_at` are caller-supplied so an import can preserve
+/// the *source* system's timestamps — a Quip doc last edited in 2019 must not
+/// come across looking like it was written today. DOCX/PDF pass `now_usec()`
+/// twice, which is what they did when the timestamps were hardcoded here.
+///
+/// `additional_folder_ids` records multi-folder membership on the document
+/// metadata; note that field alone does **not** create the folder→child
+/// rows, so this links `folder_id` *and* every additional folder via
+/// `add_child`.
+///
+/// `on_existing` decides what a *pre-existing* document under `doc_id`
+/// means — see [`OnExistingDoc`].
+#[allow(clippy::too_many_arguments)]
 async fn persist_imported_document(
     doc_repo: &DocRepo,
     folder_repo: &FolderRepo,
@@ -559,24 +684,25 @@ async fn persist_imported_document(
     title: &str,
     owner_id: &str,
     folder_id: &str,
+    doc_type: DocType,
+    additional_folder_ids: &[String],
+    created_at: i64,
+    updated_at: i64,
+    doc_id: &str,
+    on_existing: OnExistingDoc,
 ) -> Result<String, String> {
-    use ogrenotes_common::id::new_id;
-    use ogrenotes_common::time::now_usec;
     use ogrenotes_storage::models::document::DocumentMeta;
     use ogrenotes_storage::models::folder::FolderChild;
-    use ogrenotes_storage::models::{ChildType, DocType};
-
-    let doc_id = new_id();
-    let now = now_usec();
+    use ogrenotes_storage::models::ChildType;
 
     let meta = DocumentMeta {
-        doc_id: doc_id.clone(),
+        doc_id: doc_id.to_string(),
         title: title.to_string(),
         owner_id: owner_id.to_string(),
         folder_id: Some(folder_id.to_string()),
-        additional_folder_ids: Vec::new(),
+        additional_folder_ids: additional_folder_ids.to_vec(),
         workspace_id: None,
-        doc_type: DocType::Document,
+        doc_type,
         snapshot_version: 1,
         snapshot_s3_key: Some(format!("docs/{doc_id}/snapshots/1.bin")),
         is_deleted: false,
@@ -585,25 +711,142 @@ async fn persist_imported_document(
         link_view_options: ogrenotes_storage::models::ViewOptions::default(),
         locked: false,
         is_template: false,
-        created_at: now,
-        updated_at: now,
+        created_at,
+        updated_at,
     };
-    doc_repo
-        .create(&meta, snapshot)
-        .await
-        .map_err(|e| format!("create document: {e}"))?;
+    if let Err(create_err) = doc_repo.create(&meta, snapshot).await {
+        // `create` is conditional on `attribute_not_exists(PK)`, and it does
+        // not distinguish "already there" from "DynamoDB said no" in its
+        // error type — so ask the table instead of parsing the message.
+        let existing = match on_existing {
+            OnExistingDoc::Reject => None,
+            OnExistingDoc::ReconcileReservedId => doc_repo
+                .get(doc_id)
+                .await
+                .map_err(|e| format!("read back reserved document: {e}"))?,
+        };
+        match existing {
+            None => return Err(format!("create document: {create_err}")),
+            Some(_) => {
+                // Our own earlier attempt got this far. Adopt it.
+                tracing::info!(
+                    doc_id,
+                    error = %create_err,
+                    "import: document already exists under the reserved id; \
+                     reconciling instead of creating a duplicate",
+                );
+                reassert_imported_snapshot(doc_repo, doc_id, snapshot, &meta, updated_at, owner_id)
+                    .await?;
+            }
+        }
+    }
 
-    folder_repo
-        .add_child(&FolderChild {
-            folder_id: folder_id.to_string(),
-            child_id: doc_id.clone(),
-            child_type: ChildType::Doc,
-            added_at: now,
-        })
-        .await
-        .map_err(|e| format!("link to folder: {e}"))?;
+    for folder in std::iter::once(folder_id).chain(additional_folder_ids.iter().map(String::as_str))
+    {
+        folder_repo
+            .add_child(&FolderChild {
+                folder_id: folder.to_string(),
+                child_id: doc_id.to_string(),
+                child_type: ChildType::Doc,
+                added_at: updated_at,
+            })
+            .await
+            .map_err(|e| format!("link to folder: {e}"))?;
+    }
 
-    Ok(doc_id)
+    Ok(doc_id.to_string())
+}
+
+/// Re-write the initial snapshot of a document a previous import attempt
+/// already created, without clobbering anything written since.
+///
+/// Why re-write at all: `DocRepo::create` writes the metadata row BEFORE the
+/// S3 object, so a failure between the two leaves a row pointing at a snapshot
+/// that isn't there. Before the id was reserved, the retry minted a new id and
+/// that document was simply abandoned (a duplicate, but a readable one). Now
+/// the retry adopts the same id, so the unreadable state would become
+/// permanent unless the snapshot is re-asserted. The bytes are re-derived from
+/// the same staged source, so this is a rewrite, not an edit.
+///
+/// Why conditionally: if the document has been written since, re-asserting
+/// version 1 would silently discard that. Guarded by
+/// `save_snapshot_conditional`, whose `expected_version` check and version
+/// write are ONE conditional `UpdateItem` — a read-compare-write here would
+/// leave a window between the compare and the write.
+///
+/// # Known limitation — live editor edits are NOT detected
+///
+/// `snapshot_version` only advances when a *snapshot* is written. Edits made
+/// in the live editor persist as `UPDATE#` rows (see `routes::ws`) and do not
+/// bump it until compaction runs, so this function also refuses to re-assert
+/// when any `UPDATE#` row exists. That pair of checks covers both persistence
+/// shapes, but neither is atomic with respect to an edit landing *during* the
+/// re-assert: an update written between the check and the S3 put would be
+/// rebasing onto a Y.Doc whose client ids the re-write replaced. The exposure
+/// is one in-flight thread's document, seconds old, not yet surfaced to the
+/// user by the wizard — judged acceptable, and recorded here rather than left
+/// for the next reader to over-trust the version guard.
+async fn reassert_imported_snapshot(
+    doc_repo: &DocRepo,
+    doc_id: &str,
+    snapshot: &[u8],
+    meta: &ogrenotes_storage::models::document::DocumentMeta,
+    updated_at: i64,
+    owner_id: &str,
+) -> Result<(), String> {
+    // Any pending live-editor update means the document has content this
+    // snapshot doesn't know about. `1` is enough to answer "any?".
+    let pending = doc_repo
+        .get_pending_updates(doc_id, 1)
+        .await
+        .map_err(|e| format!("check reserved document for pending updates: {e}"))?;
+    if !pending.is_empty() {
+        tracing::warn!(
+            doc_id,
+            "import: reserved document has live edits pending; leaving its content alone",
+        );
+        return Ok(());
+    }
+
+    match doc_repo
+        .save_snapshot_conditional(
+            doc_id,
+            snapshot,
+            meta.snapshot_version,
+            meta.snapshot_version,
+            updated_at,
+            owner_id,
+        )
+        .await
+        .map_err(|e| format!("re-assert reserved document snapshot: {e}"))?
+    {
+        ogrenotes_storage::repo::doc_repo::SnapshotWrite::Committed => Ok(()),
+        // Someone advanced the version between the create attempt and here.
+        // Not an error — the document is further along than this import, which
+        // is exactly the state we refuse to overwrite.
+        ogrenotes_storage::repo::doc_repo::SnapshotWrite::VersionConflict => {
+            tracing::warn!(
+                doc_id,
+                "import: reserved document was written between attempts; \
+                 leaving its content alone",
+            );
+            Ok(())
+        }
+    }
+}
+
+/// How a `StartQuipImport` handler run ended, when it didn't error.
+///
+/// Distinct from "success" precisely because the queue must finalize the two
+/// differently — see [`JobDisposition`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ImportRunOutcome {
+    /// This worker held the lease and drove the import as far as it could:
+    /// through the content pass, or to a terminal non-retryable condition
+    /// such as a rejected token.
+    Ran,
+    /// Another live runner holds the lease; this run did nothing at all.
+    HeldByLiveRunner,
 }
 
 /// Phase 1 inventory handler for the `StartQuipImport` trigger.
@@ -618,10 +861,10 @@ async fn persist_imported_document(
 ///
 /// The token is read here and NEVER logged or formatted. A revoked token
 /// (`Unauthorized`) is terminal for this run: status flips to
-/// `TokenRejected` and the handler returns `Ok(())` rather than burning the
-/// retry budget hammering Quip with a dead credential — the UI polls status
-/// and prompts a reconnect. Transient errors return `Err` so the queue's
-/// retry/reaper resumes the walk from scratch (cheap, thanks to
+/// `TokenRejected` and the handler returns [`ImportRunOutcome::Ran`] rather
+/// than burning the retry budget hammering Quip with a dead credential — the
+/// UI polls status and prompts a reconnect. Transient errors return `Err` so
+/// the queue's retry/reaper resumes the walk from scratch (cheap, thanks to
 /// insert-if-absent).
 ///
 /// `pub` so integration tests can drive it directly (the `execute_import_docx`
@@ -630,7 +873,7 @@ pub async fn execute_start_quip_import(
     ctx: &WorkerCtx,
     import_id: &str,
     owner_id: &str,
-) -> Result<(), String> {
+) -> Result<ImportRunOutcome, String> {
     let instance = worker_instance_id();
     let now_ms = ogrenotes_common::time::now_usec() / 1000;
 
@@ -646,19 +889,95 @@ pub async fn execute_start_quip_import(
         .await
         .map_err(|e| format!("claim runner: {e}"))?
     {
-        tracing::info!(import_id, "quip inventory: import held by a live runner; skipping");
-        return Ok(());
+        // NOT a success. Reporting it as one would let the caller ack the
+        // queue entry, and with Phase 2a's multi-hour pass this is the
+        // *guaranteed* case (the reaper reclaims after 60s idle), not a rare
+        // race — so acking here would routinely delete the only outstanding
+        // record of a running import. See [`JobDisposition::HeldByLiveRunner`].
+        tracing::info!(import_id, "quip import: held by a live runner; leaving the entry pending");
+        return Ok(ImportRunOutcome::HeldByLiveRunner);
     }
 
-    // From here we OWN the lease. Clear it on EVERY exit — success OR error —
-    // so a mid-handler failure never leaves a held claim that would make the
-    // queue's retry (running under a *different* instance id) see a live
-    // lease, no-op, and get acked as success while the import stays stranded
-    // below phase 1. This mirrors what `mark_quip_failure` does for Quip
-    // errors, now applied uniformly to DDB-error `?`-returns too.
+    // From here we OWN the lease, and a background task refreshes it for
+    // exactly as long as we hold it (see [`LeaseHeartbeat`]).
+    let heartbeat = LeaseHeartbeat::spawn(Arc::clone(&ctx.import_repo), import_id, &instance);
+
+    // Clear the lease on EVERY exit — success OR error — so a mid-handler
+    // failure never leaves a held claim that would make the queue's retry
+    // (running under a *different* instance id) see a live lease, no-op, and
+    // leave the entry pending until the claim ages out. This mirrors what
+    // `mark_quip_failure` does for Quip errors, now applied uniformly to
+    // DDB-error `?`-returns too. Stop heartbeating FIRST, so a tick can't race
+    // in behind the clear and resurrect the lease.
     let result = run_inventory(ctx, import_id, owner_id, &instance).await;
-    ctx.import_repo.clear_runner_claim(import_id).await.ok();
-    result
+    drop(heartbeat);
+    match ctx.import_repo.clear_runner_claim(import_id, &instance).await {
+        // We were superseded mid-pass. Leaving the new holder's lease alone is
+        // the point of the owner check; say so, because it also means this
+        // run and another one overlapped.
+        Ok(false) => tracing::warn!(
+            import_id,
+            "quip import: lease was taken over mid-run; not clearing the new holder's claim",
+        ),
+        Ok(true) => {}
+        Err(e) => tracing::warn!(import_id, error = %e, "quip import: clearing the lease failed"),
+    }
+    result.map(|()| ImportRunOutcome::Ran)
+}
+
+/// Keeps the DynamoDB runner lease fresh for as long as the handler holds it,
+/// from a background task, and stops on drop.
+///
+/// The lease is what stops two workers running the same import concurrently,
+/// and it is only as good as its refresh interval. Heartbeating from the work
+/// loop — every N threads — ties liveness to the *slowest unit of work*: one
+/// image-heavy thread whose `sideload_images` runs past [`CLAIM_STALE_MS`]
+/// makes a perfectly healthy runner look dead. That was survivable when a
+/// redelivered entry got acked away after the first attempt; now that the
+/// entry stays reclaimable for the whole pass (see
+/// [`JobDisposition::HeldByLiveRunner`]), a multi-hour import would get ~180
+/// chances to hand a second runner the lease — doubling Quip API calls against
+/// the per-import 45/min throttle.
+///
+/// A timer that runs independently of the work is the only shape that makes
+/// the refresh interval a property of the *clock* rather than of the workload.
+/// Ticks are best-effort: `heartbeat_runner` is conditional on still owning the
+/// lease, so a superseded runner's ticks are no-ops rather than a way to steal
+/// it back.
+struct LeaseHeartbeat(tokio::task::JoinHandle<()>);
+
+/// How often the background task refreshes the lease. A third of
+/// [`CLAIM_STALE_MS`] leaves room for two consecutive failed ticks (a DynamoDB
+/// blip) before the lease looks stale.
+const LEASE_HEARTBEAT_MS: u64 = (CLAIM_STALE_MS as u64) / 3;
+
+impl LeaseHeartbeat {
+    fn spawn(import_repo: Arc<ImportRepo>, import_id: &str, instance: &str) -> Self {
+        let (import_id, instance) = (import_id.to_string(), instance.to_string());
+        Self(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(LEASE_HEARTBEAT_MS));
+            // The first tick fires immediately; the claim we just took is
+            // already fresh, so skip it.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                import_repo
+                    .heartbeat_runner(
+                        &import_id,
+                        &instance,
+                        ogrenotes_common::time::now_usec() / 1000,
+                    )
+                    .await
+                    .ok();
+            }
+        }))
+    }
+}
+
+impl Drop for LeaseHeartbeat {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// The owned-lease body of the inventory handler. Split out so
@@ -785,7 +1104,485 @@ async fn run_inventory(
         .await
         .map_err(|e| format!("set phase: {e}"))?;
     tracing::info!(import_id, total, "quip inventory: phase 1 complete");
+
+    // Phase 2 runs inside the same job, under the same lease and the same
+    // per-import client, so a single `StartQuipImport` carries an import all
+    // the way from "a list of Quip roots" to real documents.
+    run_content_pass(ctx, import_id, owner_id, &client, &token, &record).await
+}
+
+// ─── Phase 2a: the per-thread content pass ───────────────────────
+
+/// How one thread's import ended when it didn't succeed.
+///
+/// The two dispositions are genuinely different — one is terminal for the
+/// whole run, the other wants a queue retry — so they're an enum rather than
+/// a `String` the caller would have to sniff.
+#[derive(Debug)]
+pub enum ThreadImportError {
+    /// The stored token was rejected. Terminal for this run: every remaining
+    /// thread would fail the same way, so the caller stops, flips the import
+    /// to `TokenRejected`, and returns `Ok(())` instead of burning the retry
+    /// budget hammering Quip with a dead credential.
+    TokenRejected,
+    /// Anything else — a 5xx from Quip, a DynamoDB or S3 write failure. The
+    /// caller surfaces it as `Err` so the queue retries; the re-run resumes
+    /// at this thread because every earlier one is already `ContentDone`.
+    Transient(String),
+}
+
+impl std::fmt::Display for ThreadImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TokenRejected => write!(f, "quip token rejected"),
+            Self::Transient(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl From<QuipError> for ThreadImportError {
+    fn from(e: QuipError) -> Self {
+        match e {
+            QuipError::Unauthorized => Self::TokenRejected,
+            transient => Self::Transient(format!("quip: {transient}")),
+        }
+    }
+}
+
+/// Where an imported thread's document is filed.
+///
+/// `THREAD#` rows carry **Quip** folder ids; documents need OgreNotes ones.
+/// The intended mapping is each `FOLDER#` row's `ogre_folder_id` — but Phase 1
+/// writes `None` there for every folder (it inventories the Quip tree, it does
+/// not mirror it), so in practice every thread resolves to `fallback`, the
+/// import's `target_folder_id`, and an import lands flat in one folder.
+/// Building the mirrored tree is a Phase-2a follow-up, deliberately out of
+/// scope here; the lookup is written mapping-first so it starts honoring
+/// `ogre_folder_id` the moment something populates it.
+pub struct FolderMapping {
+    by_quip_id: std::collections::HashMap<String, String>,
+    fallback: String,
+}
+
+impl FolderMapping {
+    fn resolve(&self, quip_folder_id: &str) -> &str {
+        self.by_quip_id
+            .get(quip_folder_id)
+            .map(String::as_str)
+            .unwrap_or(&self.fallback)
+    }
+
+    /// `(primary, additional)` OgreNotes folders for a thread, deduplicated
+    /// and with the primary never repeated in `additional`. With the
+    /// `target_folder_id` fallback in play these collapse to one folder,
+    /// which is the correct (if flat) answer, not a bug.
+    fn folders_for(&self, thread: &ThreadRow) -> (String, Vec<String>) {
+        let primary = self.resolve(&thread.first_folder).to_string();
+        let mut additional: Vec<String> = Vec::new();
+        for quip_folder in &thread.member_folders {
+            let mapped = self.resolve(quip_folder);
+            if mapped != primary && !additional.iter().any(|f| f == mapped) {
+                additional.push(mapped.to_string());
+            }
+        }
+        (primary, additional)
+    }
+}
+
+/// Build the Quip-folder → OgreNotes-folder mapping for an import from its
+/// `FOLDER#` rows plus the `META` row's `target_folder_id`.
+///
+/// A missing `target_folder_id` is an error, not a guess: the worker has no
+/// auth context with which to invent a destination, exactly as
+/// [`execute_import_docx`] refuses a `None` folder.
+pub async fn build_folder_mapping(
+    ctx: &WorkerCtx,
+    import_id: &str,
+    record: &ogrenotes_storage::models::import::ImportRecord,
+) -> Result<FolderMapping, String> {
+    let fallback = record.target_folder_id.clone().ok_or_else(|| {
+        format!("import {import_id} has no target_folder_id; its destination was never chosen")
+    })?;
+    let folders = ctx
+        .import_repo
+        .list_folders(import_id)
+        .await
+        .map_err(|e| format!("list folders: {e}"))?;
+    let by_quip_id = folders
+        .into_iter()
+        .filter_map(|f| f.ogre_folder_id.map(|ogre| (f.quip_folder_id, ogre)))
+        .collect::<std::collections::HashMap<_, _>>();
+    if by_quip_id.is_empty() {
+        tracing::info!(
+            import_id,
+            target_folder_id = %fallback,
+            "quip content: no FOLDER# row carries an ogre_folder_id; \
+             every thread files into the import's target folder (flat import)",
+        );
+    }
+    Ok(FolderMapping { by_quip_id, fallback })
+}
+
+/// Phase 2 content pass: turn every `Pending` thread into a document.
+///
+/// Resumable by construction — the per-thread `ContentDone` checkpoint is the
+/// unit of progress, so a retry re-lists the manifest and skips finished
+/// threads *before* spending a Quip request on them. Errors map exactly as the
+/// inventory walk's do: a rejected token is terminal for the run (`Ok(())`
+/// after flipping the status), anything else returns `Err` so the queue
+/// retries.
+async fn run_content_pass(
+    ctx: &WorkerCtx,
+    import_id: &str,
+    owner_id: &str,
+    client: &QuipClient,
+    token: &QuipToken,
+    record: &ogrenotes_storage::models::import::ImportRecord,
+) -> Result<(), String> {
+    // The runner lease is refreshed by `LeaseHeartbeat` on a wall-clock timer
+    // for the whole handler, so this loop deliberately does no heartbeating of
+    // its own — tying liveness to a per-N-threads tick made one slow thread
+    // look like a dead worker.
+    let folders = build_folder_mapping(ctx, import_id, record).await?;
+
+    let mut threads = ctx
+        .import_repo
+        .list_threads(import_id)
+        .await
+        .map_err(|e| format!("list threads: {e}"))?;
+    // Stable order so a retry walks the manifest the same way twice and the
+    // logs of two runs line up. DynamoDB query order is already SK order, but
+    // sorting makes that a guarantee rather than an incidental property.
+    threads.sort_by(|a, b| a.quip_thread_id.cmp(&b.quip_thread_id));
+
+    for thread in &threads {
+        match import_one_thread(ctx, import_id, owner_id, client, token, thread, &folders).await {
+            Ok(()) => {}
+            Err(ThreadImportError::TokenRejected) => {
+                ctx.import_repo
+                    .set_status(import_id, ImportStatus::TokenRejected)
+                    .await
+                    .ok();
+                tracing::warn!(
+                    import_id,
+                    "quip content: token rejected (401/403); TokenRejected",
+                );
+                return Ok(());
+            }
+            Err(ThreadImportError::Transient(msg)) => {
+                tracing::warn!(
+                    import_id,
+                    thread = %thread.quip_thread_id,
+                    error = %msg,
+                    "quip content: transient failure; will retry",
+                );
+                return Err(format!("quip content transient error: {msg}"));
+            }
+        }
+    }
+
+    ctx.import_repo
+        .set_phase(import_id, 2)
+        .await
+        .map_err(|e| format!("set phase: {e}"))?;
+    // Terminal success. Written AFTER the phase bump so the strongest claim
+    // lands last, and written at all because otherwise a finished import and
+    // a *stranded* one are the same record state (`Running`, phase 1-or-2) —
+    // which makes any recovery sweep over `Running` imports unwriteable, and
+    // leaves the wizard's "done" signal resting on `phase` alone. The wizard
+    // already terminates on `phase >= 2` and treats only
+    // `failed`/`tokenrejected`/`cancelled` as terminal *failures*, so
+    // `succeeded` is additive there.
+    ctx.import_repo
+        .set_status(import_id, ImportStatus::Succeeded)
+        .await
+        .map_err(|e| format!("set succeeded: {e}"))?;
+    tracing::info!(import_id, threads = threads.len(), "quip content: phase 2 complete");
     Ok(())
+}
+
+/// Import one Quip thread into one OgreNotes document.
+///
+/// Ordered so that **every** failure leaves the thread retryable: nothing is
+/// checkpointed until the document, its section map and its unresolved links
+/// are all durable, and the checkpoint itself is the last write. A retry that
+/// lands after a partial run redoes the work from the fetch.
+///
+/// Redoing it is safe — and, critically, *duplicate-free* — because the
+/// document id is **reserved on the `THREAD#` row before the first
+/// `DocRepo::create`**. Steps 8, 9 and 10 (section map, unresolved links,
+/// checkpoint) all return `Transient` on failure while the thread is still
+/// `Pending`, so retrying them is the ordinary case, not an exotic one: a
+/// single DynamoDB throttle would otherwise mint a fresh id and hand the user
+/// a second copy of the same document (up to four across `MAX_RETRIES`).
+/// With the reservation, the retry adopts its own earlier document
+/// ([`OnExistingDoc::ReconcileReservedId`]) and finishes the tail. The plan's
+/// invariant — never two documents for one thread — is therefore upheld for
+/// transient failures *and* for a hard crash, not just the latter.
+///
+/// Still orphaned by a crash: side-loaded blobs written under a `doc_id`
+/// whose reservation itself never landed. Cheap and bounded; S3 lifecycle
+/// work is tracked separately.
+///
+/// `pub` for the same reason [`execute_import_docx`] is: it's the test seam
+/// for driving one thread without a consumer loop.
+pub async fn import_one_thread(
+    ctx: &WorkerCtx,
+    import_id: &str,
+    owner_id: &str,
+    client: &QuipClient,
+    token: &QuipToken,
+    thread: &ThreadRow,
+    folders: &FolderMapping,
+) -> Result<(), ThreadImportError> {
+    use ogrenotes_storage::models::import_inventory::{
+        PendingLinkItem, SecMapRow, UnresolvedRow, SECMAP_CHUNK_ENTRIES,
+    };
+
+    // 1. Already done (or deliberately skipped) — no refetch. This is the
+    //    resumability guarantee, and it must come before any network call.
+    if thread.state != ThreadState::Pending {
+        return Ok(());
+    }
+
+    // 2. Disposition by Quip thread type.
+    let doc_type = match thread.thread_type.as_str() {
+        "chat" => {
+            ctx.import_repo
+                .set_thread_skipped(import_id, &thread.quip_thread_id)
+                .await
+                .map_err(|e| ThreadImportError::Transient(format!("skip thread: {e}")))?;
+            tracing::info!(
+                import_id,
+                thread = %thread.quip_thread_id,
+                "quip content: chat thread skipped (chats are not documents)",
+            );
+            return Ok(());
+        }
+        "spreadsheet" => DocType::Spreadsheet,
+        _ => DocType::Document,
+    };
+
+    // 3. Fetch the section-id-bearing `/2` HTML.
+    let html = client.thread_html(token, &thread.quip_thread_id).await?;
+
+    // 4. Stage the raw HTML. Kept after the import so a conversion bug can be
+    //    diagnosed — and re-run — without going back to Quip.
+    let staged_key = format!("imports/{import_id}/threads/{}.html", thread.quip_thread_id);
+    ctx.s3
+        .put_object(&staged_key, html.clone().into_bytes())
+        .await
+        .map_err(|e| ThreadImportError::Transient(format!("stage html: {e}")))?;
+
+    // 5. Walk it.
+    let quip_doc = ogrenotes_collab::import_quip::from_quip_html(&html);
+
+    // 6. Settle this thread's document id BEFORE anything durable is written
+    //    under it. It has to be known early anyway — every side-loaded blob
+    //    key embeds it and those keys go into the snapshot — but it is also
+    //    *reserved* on the `THREAD#` row so a retry re-uses it instead of
+    //    minting a second document for the same thread. A row that already
+    //    carries one is a previous attempt's reservation; reuse it verbatim.
+    let doc_id = match &thread.ogre_doc_id {
+        Some(reserved) => reserved.clone(),
+        None => ctx
+            .import_repo
+            .reserve_thread_doc_id(
+                import_id,
+                &thread.quip_thread_id,
+                &ogrenotes_common::id::new_id(),
+            )
+            .await
+            .map_err(|e| ThreadImportError::Transient(format!("reserve doc id: {e}")))?,
+    };
+    let src_updates =
+        sideload_images(ctx, client, token, thread, &doc_id, &quip_doc.images).await?;
+    ogrenotes_collab::blob_ref::set_image_srcs(&quip_doc.doc, &src_updates);
+
+    // 7. Persist through the ordinary document-creation path, preserving
+    //    Quip's timestamps so an old document doesn't arrive looking new.
+    let snapshot = ogrenotes_collab::snapshot::doc_to_bytes(&quip_doc.doc);
+    let (folder_id, additional_folder_ids) = folders.folders_for(thread);
+    let title = if thread.title.trim().is_empty() { "Untitled" } else { thread.title.as_str() };
+    persist_imported_document(
+        &ctx.doc_repo,
+        &ctx.folder_repo,
+        &snapshot,
+        title,
+        owner_id,
+        &folder_id,
+        doc_type,
+        &additional_folder_ids,
+        thread.updated_usec,
+        thread.updated_usec,
+        &doc_id,
+        OnExistingDoc::ReconcileReservedId,
+    )
+    .await
+    .map_err(ThreadImportError::Transient)?;
+
+    // 8. Section map, chunked — a thread with thousands of anchors would
+    //    otherwise blow DynamoDB's per-item size cap.
+    for (chunk_index, entries) in quip_doc.sections.chunks(SECMAP_CHUNK_ENTRIES).enumerate() {
+        ctx.import_repo
+            .put_secmap(
+                import_id,
+                &SecMapRow {
+                    quip_thread_id: thread.quip_thread_id.clone(),
+                    chunk: chunk_index as u32,
+                    owner_id: owner_id.to_string(),
+                    entries: entries.to_vec(),
+                },
+            )
+            .await
+            .map_err(|e| ThreadImportError::Transient(format!("put secmap: {e}")))?;
+    }
+
+    // 9. Cross-thread links, for Phase 2b to back-patch. A link-free thread
+    //    writes no row at all rather than an empty one.
+    if !quip_doc.pending_links.is_empty() {
+        ctx.import_repo
+            .put_unresolved(
+                import_id,
+                &UnresolvedRow {
+                    source_quip_thread_id: thread.quip_thread_id.clone(),
+                    owner_id: owner_id.to_string(),
+                    links: quip_doc
+                        .pending_links
+                        .iter()
+                        .map(|l| PendingLinkItem {
+                            source_block_id: l.source_block_id.clone(),
+                            target_quip_thread_id: l.target_quip_thread_id.clone(),
+                            target_quip_section_id: l.target_quip_section_id.clone(),
+                        })
+                        .collect(),
+                },
+            )
+            .await
+            .map_err(|e| ThreadImportError::Transient(format!("put unresolved: {e}")))?;
+    }
+
+    // 10. Checkpoint last — this is what a re-run reads to skip the thread.
+    ctx.import_repo
+        .set_thread_content_done(import_id, &thread.quip_thread_id, &doc_id, &staged_key)
+        .await
+        .map_err(|e| ThreadImportError::Transient(format!("checkpoint thread: {e}")))?;
+
+    tracing::info!(
+        import_id,
+        thread = %thread.quip_thread_id,
+        doc_id,
+        images = quip_doc.images.len(),
+        sections = quip_doc.sections.len(),
+        pending_links = quip_doc.pending_links.len(),
+        "quip content: thread imported",
+    );
+    Ok(())
+}
+
+/// Copy every image the thread references out of Quip and into this
+/// document's blob prefix, returning the `blockId -> new Image.src` map
+/// [`ogrenotes_collab::blob_ref::set_image_srcs`] applies.
+///
+/// One unfetchable image must not cost the reader the whole document, so a
+/// failure maps that block to `None` (drop the `src`, keep the node and its
+/// `alt`) and the pass continues. The single exception is `Unauthorized`:
+/// that isn't "this image is broken", it's "the credential is dead", and
+/// every remaining fetch in the import would fail the same way — so it
+/// propagates and stops the run.
+async fn sideload_images(
+    ctx: &WorkerCtx,
+    client: &QuipClient,
+    token: &QuipToken,
+    thread: &ThreadRow,
+    doc_id: &str,
+    images: &[ogrenotes_collab::import_quip::QuipImageRef],
+) -> Result<std::collections::HashMap<String, Option<String>>, ThreadImportError> {
+    let mut updates = std::collections::HashMap::new();
+    for image in images {
+        let Some((blob_thread_id, blob_id)) = quip_blob_ref(&image.src) else {
+            tracing::warn!(
+                thread = %thread.quip_thread_id,
+                "quip content: image src is not a Quip blob; dropping the src",
+            );
+            updates.insert(image.block_id.clone(), None);
+            continue;
+        };
+        let bytes = match client.blob(token, blob_thread_id, blob_id).await {
+            Ok(bytes) => bytes,
+            Err(QuipError::Unauthorized) => return Err(ThreadImportError::TokenRejected),
+            Err(e) => {
+                tracing::warn!(
+                    thread = %thread.quip_thread_id,
+                    blob_id,
+                    error = %e,
+                    "quip content: blob fetch failed; keeping the image's alt text only",
+                );
+                updates.insert(image.block_id.clone(), None);
+                continue;
+            }
+        };
+        let key = format!("blobs/{doc_id}/{blob_id}/{}", blob_filename(&image.alt, blob_id));
+        match ctx.s3.put_object(&key, bytes).await {
+            Ok(()) => {
+                updates.insert(
+                    image.block_id.clone(),
+                    Some(ogrenotes_collab::blob_ref::blob_ref(blob_id, &key)),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    thread = %thread.quip_thread_id,
+                    blob_id,
+                    error = %e,
+                    "quip content: blob upload failed; keeping the image's alt text only",
+                );
+                updates.insert(image.block_id.clone(), None);
+            }
+        }
+    }
+    Ok(updates)
+}
+
+/// Split a Quip image `src` into `(thread_id, blob_id)`.
+///
+/// Quip spells an attachment as `/blob/<thread_id>/<blob_id>`, either
+/// relative (what the walker sees in a `/2` body) or absolute on a quip.com
+/// host. The thread id is read from the `src` rather than assumed to be the
+/// containing thread's, because a copied Quip block can reference another
+/// thread's blob.
+///
+/// Returns `None` for anything else — an external image URL, a `data:` URI,
+/// or a blob id carrying characters that have no business in an S3 key
+/// segment (`/` and `.` in particular, which would let a crafted `src` write
+/// outside the document's blob prefix and defeat the ownership check the
+/// download route performs on that same prefix).
+fn quip_blob_ref(src: &str) -> Option<(&str, &str)> {
+    let path = src.split(['?', '#']).next()?;
+    let (_, rest) = path.rsplit_once("/blob/")?;
+    let (thread_id, blob_id) = rest.split_once('/')?;
+    let ok = |s: &str| {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    };
+    (ok(thread_id) && ok(blob_id)).then_some((thread_id, blob_id))
+}
+
+/// Filename segment for a side-loaded blob's S3 key. Quip's `src` carries no
+/// filename, so the alt text stands in when it survives the same sanitizing
+/// the upload route applies (`routes::documents::request_upload_url`);
+/// otherwise the blob id does. Purely cosmetic — the blob is addressed by
+/// the full key — but it makes a bucket listing readable.
+fn blob_filename(alt: &str, blob_id: &str) -> String {
+    let safe: String = alt
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .take(64)
+        .collect();
+    if safe.is_empty() || safe.starts_with('.') {
+        blob_id.to_string()
+    } else {
+        safe
+    }
 }
 
 /// Map a [`QuipError`] hit during the inventory walk to the handler's
@@ -891,4 +1688,106 @@ async fn await_shutdown_signal() {
 #[cfg(not(unix))]
 async fn await_shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn thread(first: &str, members: &[&str]) -> ThreadRow {
+        ThreadRow {
+            quip_thread_id: "t1".into(),
+            owner_id: "u1".into(),
+            title: "Doc".into(),
+            thread_type: "document".into(),
+            updated_usec: 111,
+            member_folders: members.iter().map(|s| s.to_string()).collect(),
+            first_folder: first.into(),
+            state: ThreadState::Pending,
+            ogre_doc_id: None,
+        }
+    }
+
+    fn mapping(pairs: &[(&str, &str)], fallback: &str) -> FolderMapping {
+        FolderMapping {
+            by_quip_id: pairs
+                .iter()
+                .map(|(q, o)| (q.to_string(), o.to_string()))
+                .collect(),
+            fallback: fallback.to_string(),
+        }
+    }
+
+    #[test]
+    fn quip_blob_ref_accepts_relative_and_absolute_quip_srcs() {
+        assert_eq!(quip_blob_ref("/blob/t1/b9"), Some(("t1", "b9")));
+        assert_eq!(
+            quip_blob_ref("https://acme.quip.com/blob/THREAD_1/blob-9"),
+            Some(("THREAD_1", "blob-9"))
+        );
+        // Query strings and fragments are not part of the id.
+        assert_eq!(quip_blob_ref("/blob/t1/b9?s=200"), Some(("t1", "b9")));
+        assert_eq!(quip_blob_ref("/blob/t1/b9#x"), Some(("t1", "b9")));
+        // A blob the src names in ANOTHER thread is honored as written — a
+        // copied Quip block can legitimately reference one.
+        assert_eq!(quip_blob_ref("/blob/other/b1"), Some(("other", "b1")));
+    }
+
+    /// The blob id becomes an S3 key segment inside `blobs/{doc_id}/{blob_id}/`,
+    /// and the download route authorizes on exactly that prefix — so anything
+    /// that could escape it (a slash, a dot segment) must not parse at all.
+    #[test]
+    fn quip_blob_ref_rejects_non_blob_and_key_escaping_srcs() {
+        assert_eq!(quip_blob_ref("https://example.com/cat.png"), None);
+        assert_eq!(quip_blob_ref("data:image/png;base64,AAAA"), None);
+        assert_eq!(quip_blob_ref(""), None);
+        // No blob id segment at all.
+        assert_eq!(quip_blob_ref("/blob/t1"), None);
+        assert_eq!(quip_blob_ref("/blob/t1/"), None);
+        // Path traversal / extra segments in either id.
+        assert_eq!(quip_blob_ref("/blob/t1/../../secret"), None);
+        assert_eq!(quip_blob_ref("/blob/t1/b9/extra"), None);
+        assert_eq!(quip_blob_ref("/blob/../t1/b9"), None);
+    }
+
+    #[test]
+    fn blob_filename_sanitizes_alt_text_and_falls_back_to_the_blob_id() {
+        assert_eq!(blob_filename("pic.png", "b9"), "pic.png");
+        assert_eq!(blob_filename("my photo/../x.png", "b9"), "myphoto..x.png");
+        // Nothing usable survives sanitizing → the blob id stands in.
+        assert_eq!(blob_filename("", "b9"), "b9");
+        assert_eq!(blob_filename("///", "b9"), "b9");
+        // A leading dot would make a hidden/relative-looking segment.
+        assert_eq!(blob_filename(".hidden", "b9"), "b9");
+        // Long alt text is truncated rather than becoming an unbounded key.
+        assert_eq!(blob_filename(&"a".repeat(200), "b9").len(), 64);
+    }
+
+    #[test]
+    fn folders_for_maps_quip_folders_and_never_repeats_the_primary() {
+        let m = mapping(&[("qf1", "of1"), ("qf2", "of2")], "target");
+        let (primary, additional) = m.folders_for(&thread("qf1", &["qf1", "qf2"]));
+        assert_eq!(primary, "of1");
+        assert_eq!(additional, vec!["of2".to_string()]);
+    }
+
+    /// Phase 1 writes no `ogre_folder_id`, so every Quip folder resolves to the
+    /// import's target folder and a thread's multi-folder membership collapses
+    /// to a single destination. Flat, but correct — and pinned so the day
+    /// something populates `ogre_folder_id`, the change is visible here.
+    #[test]
+    fn folders_for_collapses_to_the_target_folder_when_nothing_is_mapped() {
+        let m = mapping(&[], "target");
+        let (primary, additional) = m.folders_for(&thread("qf1", &["qf1", "qf2"]));
+        assert_eq!(primary, "target");
+        assert!(additional.is_empty(), "{additional:?}");
+    }
+
+    #[test]
+    fn folders_for_dedupes_repeated_member_folders() {
+        let m = mapping(&[("qf1", "of1"), ("qf2", "of2"), ("qf3", "of2")], "target");
+        let (primary, additional) = m.folders_for(&thread("qf1", &["qf1", "qf2", "qf3", "qf2"]));
+        assert_eq!(primary, "of1");
+        assert_eq!(additional, vec!["of2".to_string()], "of2 appears once");
+    }
 }

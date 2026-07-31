@@ -1,0 +1,16 @@
+<!-- UNVERIFIED MARKUP: intra-Quip link shape is assumed to be
+     https://<sub>.quip.com/<THREAD_ID>/<slug>#<section>
+     (see quip_thread_from_url in import_quip.rs). -->
+<p>An ordinary external link: <a href="https://example.org/page">example</a></p>
+<p>A mailto link: <a href="mailto:someone@example.org">mail</a></p>
+<p>An intra-Quip link: <a href="https://acme.quip.com/AbCd1234/Project-Plan">Project Plan</a></p>
+<p>With a section anchor:
+  <a href="https://acme.quip.com/AbCd1234/Project-Plan#SECTION7">that section</a></p>
+<p>Bare quip.com host: <a href="https://quip.com/EfGh5678">another thread</a></p>
+<p>A relative intra-Quip href, resolved against the Quip base:
+  <a href="/MnOp3456/Relative-Doc">relative thread</a></p>
+<p>A fragment-only href, which is not a thread link:
+  <a href="#SECTION2">jump within this doc</a></p>
+<p>A lookalike host that must stay external:
+  <a href="https://notquip.com/AbCd1234/x">not quip</a></p>
+<p>A <b><a href="https://acme.quip.com/IjKl9012/Doc">bold intra-Quip link</a></b></p>

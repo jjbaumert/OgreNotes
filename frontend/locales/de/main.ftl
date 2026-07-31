@@ -931,3 +931,6 @@ quip-import-inventory-done = { $total } zu importierende Elemente gefunden
 quip-import-estimate = Etwa { $minutes } Min. wegen Quips Ratenlimit
 quip-import-import-failed = Import fehlgeschlagen. Bitte versuche es erneut.
 quip-import-token-expired = Deine Quip-Sitzung ist abgelaufen — bitte erneut verbinden.
+quip-import-importing = Import läuft… { $done } von { $total }
+quip-import-content-done = { $total } Elemente importiert
+quip-import-open-folder = Ordner öffnen
