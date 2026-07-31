@@ -345,8 +345,25 @@ impl Transaction {
             return Ok(self);
         }
 
-        let from = self.selection.from();
-        let to = self.selection.to();
+        // #143: a collapsed caret can sit on a structural seam — between
+        // a list item's paragraph and its nested sub-list, between two
+        // sibling items, or before a container's first child. Inserting
+        // there splices a bare text node in as a direct child of the
+        // list (the undeletable-orphan corruption class), so snap the
+        // caret into the adjacent block first. A caret already inside a
+        // block resolves to itself, so normal typing is unchanged. Only
+        // collapsed carets are snapped: a range selection means
+        // replace-what-is-selected, and both endpoints must stay put.
+        let raw_from = self.selection.from();
+        let raw_to = self.selection.to();
+        let (from, to) = if raw_from == raw_to {
+            match resolve_block_for_edit(&self.doc, raw_from) {
+                Some((_, resolved)) => (resolved, resolved),
+                None => (raw_from, raw_to),
+            }
+        } else {
+            (raw_from, raw_to)
+        };
 
         // Build text node with appropriate marks:
         // - Some(marks): use explicitly set stored marks (from toggle commands)
@@ -426,7 +443,13 @@ impl Transaction {
         // still fails via find_block_at, which is correct.
         let max = txn.doc.content_size();
         let pos = txn.selection.from().min(max.saturating_sub(1));
-        let block = find_block_at(&txn.doc, pos)
+        // #143: the caret can also land on a *structural seam* well
+        // inside the doc — between a list item's paragraph and its
+        // nested sub-list, or between two sibling items. No block
+        // contains those positions, so `find_block_at` alone made Enter
+        // inert. `resolve_block_for_edit` snaps a seam back to the end
+        // of the block that precedes it.
+        let (block, pos) = resolve_block_for_edit(&txn.doc, pos)
             .ok_or_else(|| StepError("cursor not in a block".into()))?;
 
         let inner_pos = pos - block.content_start;
@@ -724,8 +747,10 @@ impl Transaction {
     /// Used when backspace is pressed at the start of a block.
     /// Merges the current block's content into the end of the previous block.
     pub fn join_backward(self) -> Result<Self, StepError> {
-        let pos = self.selection.from();
-        let block = find_block_at(&self.doc, pos)
+        // #143: a seam position resolves back to the end of the block
+        // before it, so Backspace there deletes inside that block
+        // rather than doing nothing.
+        let (block, pos) = resolve_block_for_edit(&self.doc, self.selection.from())
             .ok_or_else(|| StepError("cursor not in a block".into()))?;
 
         // Only join if cursor is at the very start of the block's content
@@ -963,8 +988,13 @@ impl Transaction {
     /// Used when delete forward is pressed at the end of a block.
     /// Merges the next block's content into the end of the current block.
     pub fn join_forward(self) -> Result<Self, StepError> {
-        let pos = self.selection.from();
-        let block = find_block_at(&self.doc, pos)
+        // #143: resolve a structural-seam caret to the end of the block
+        // before it, so forward-delete there behaves exactly like
+        // forward-delete at that block's end. The `next` lookup below
+        // is deliberately left on `find_block_at` — it asks a different
+        // question ("which block starts here") and widening it is a
+        // separate change.
+        let (block, pos) = resolve_block_for_edit(&self.doc, self.selection.from())
             .ok_or_else(|| StepError("cursor not in a block".into()))?;
 
         let block_content_end = block.offset + block.node_size - 1;
@@ -1046,7 +1076,10 @@ impl Transaction {
             return self.delete(pos, to);
         }
 
-        let block = find_block_at(&self.doc, pos)
+        // #143: a structural-seam caret resolves to the end of the
+        // preceding block, so Ctrl+Backspace eats that block's last word
+        // instead of doing nothing.
+        let (block, pos) = resolve_block_for_edit(&self.doc, pos)
             .ok_or_else(|| StepError("cursor not in a block".into()))?;
 
         let text: String = block.content.children.iter().map(|c| c.text_content()).collect();
@@ -1082,7 +1115,9 @@ impl Transaction {
             return self.delete(pos, to);
         }
 
-        let block = find_block_at(&self.doc, pos)
+        // #143: mirror of `delete_word_backward` — resolve a seam caret
+        // into the block that precedes it.
+        let (block, pos) = resolve_block_for_edit(&self.doc, pos)
             .ok_or_else(|| StepError("cursor not in a block".into()))?;
 
         let text: String = block.content.children.iter().map(|c| c.text_content()).collect();
@@ -1193,6 +1228,210 @@ fn find_block_in_children(
             }
         }
         offset += child_size;
+    }
+    None
+}
+
+/// Resolve an *editing* position to the block that should receive the
+/// edit, plus the position **within that block** to act on.
+///
+/// [`find_block_at`] is deliberately partial: it answers "which block
+/// *contains* this position", and several callers (comment anchoring,
+/// selection remapping) depend on that exactness. But a child at offset
+/// `o` of size `s` only claims `[o+1, o+s-1]`, so `o+s` — the seam
+/// between one child's close token and the next sibling's open token —
+/// belongs to no block at all. Nested lists are full of those seams,
+/// because a `ListItem` holds both a `Paragraph` and a nested
+/// `BulletList`; so are the boundaries between sibling list items, and
+/// the "before the first child" position of any container. Browsers
+/// hand us exactly these positions: a DOM caret reported as
+/// `(element, childIndex)` maps through `dom_to_model_walk` to the sum
+/// of the preceding children's sizes, which is a seam by construction.
+///
+/// Edit commands can't work with "no block": they either fail outright
+/// (Enter used to be inert — GitHub #143) or splice content in at the
+/// structural level and orphan a bare text node inside a list. This
+/// helper makes the *edit* paths total without touching
+/// `find_block_at`'s contract:
+///
+/// 1. If `pos` is inside a block, return it unchanged — the
+///    overwhelmingly common case, byte-identical to before.
+/// 2. Otherwise resolve **backwards**: the deepest last textblock among
+///    the nodes whose span ends at or before `pos`, with `pos` clamped
+///    to that block's content end. A seam right after a list item's
+///    paragraph therefore behaves as if the caret sat at the end of
+///    that paragraph — which is what a user pressing Enter after a
+///    bullet intends. Container atoms (`Kanban`, `Calendar`) whose
+///    children are all leaves resolve this way too: nothing inside them
+///    is a textblock, so the position falls back to the block before
+///    the board.
+/// 3. If nothing at all precedes `pos` (a caret at the very start of
+///    the first container, e.g. DOM `(ul, 0)`), resolve **forwards** to
+///    the first textblock at or after `pos`, at its content start.
+/// 4. Only a document with no textblock anywhere yields `None`.
+pub(crate) fn resolve_block_for_edit(doc: &Node, pos: usize) -> Option<(BlockInfo, usize)> {
+    if let Some(block) = find_block_at(doc, pos) {
+        return Some((block, pos));
+    }
+    let Node::Element { content, .. } = doc else {
+        return None;
+    };
+    let block = resolve_block_in_children(&content.children, pos, 0)
+        .or_else(|| first_textblock_at_or_after(&content.children, pos, 0))?;
+    let content_end = block.content_start + block.content.size();
+    let resolved = pos.clamp(block.content_start, content_end);
+    Some((block, resolved))
+}
+
+/// Build a [`BlockInfo`] for `node` sitting at absolute `offset`.
+/// Returns `None` for text nodes and leaf elements.
+fn block_info_for(node: &Node, offset: usize) -> Option<BlockInfo> {
+    let Node::Element {
+        node_type,
+        attrs,
+        content,
+        ..
+    } = node
+    else {
+        return None;
+    };
+    if node_type.is_leaf() {
+        return None;
+    }
+    Some(BlockInfo {
+        offset,
+        node_size: node.node_size(),
+        content_start: offset + 1,
+        node_type: *node_type,
+        attrs: attrs.clone(),
+        content: content.clone(),
+    })
+}
+
+/// Backwards half of [`resolve_block_for_edit`]: the deepest last
+/// textblock among `children` whose span ends at or before `pos`.
+///
+/// Unlike [`find_block_in_children`] this does **not** abort when a
+/// recursive descent comes up empty — a container that can't resolve
+/// `pos` internally (all-leaf children, or `pos` preceding its first
+/// child) falls back to whatever precedes the container itself.
+fn resolve_block_in_children(
+    children: &[Node],
+    pos: usize,
+    base: usize,
+) -> Option<BlockInfo> {
+    // Children that end at or before `pos`, nearest-last.
+    let mut preceding: Vec<(usize, &Node)> = Vec::new();
+    let mut offset = base;
+    for child in children {
+        let child_offset = offset;
+        let child_end = child_offset + child.node_size();
+        offset = child_end;
+
+        if let Node::Element {
+            node_type, content, ..
+        } = child
+        {
+            // A non-leaf child's open token sits at `child_offset` and
+            // its close token at `child_end - 1`, so it *contains*
+            // exactly the open interval between them.
+            let inside = !node_type.is_leaf()
+                && pos > child_offset
+                && pos < child_end;
+            if inside {
+                // A textblock here means `find_block_at` would have
+                // matched already, but keep the branch so this function
+                // stands alone.
+                if node_type.is_textblock() {
+                    return block_info_for(child, child_offset);
+                }
+                if let Some(inner) =
+                    resolve_block_in_children(&content.children, pos, child_offset + 1)
+                {
+                    return Some(inner);
+                }
+                // The container couldn't resolve internally — fall back
+                // to whatever precedes the container itself.
+                break;
+            }
+        }
+        if child_end <= pos {
+            preceding.push((child_offset, child));
+        }
+    }
+    preceding
+        .iter()
+        .rev()
+        .find_map(|(o, c)| last_textblock_in(c, *o))
+}
+
+/// The last textblock in `node`'s subtree (including `node` itself),
+/// with its absolute offset. `None` for leaves and for containers whose
+/// subtree holds no textblock (a `Kanban` board, for instance).
+fn last_textblock_in(node: &Node, offset: usize) -> Option<BlockInfo> {
+    let Node::Element {
+        node_type, content, ..
+    } = node
+    else {
+        return None;
+    };
+    if node_type.is_leaf() {
+        return None;
+    }
+    if node_type.is_textblock() {
+        return block_info_for(node, offset);
+    }
+    let mut child_offsets: Vec<(usize, &Node)> = Vec::new();
+    let mut child_offset = offset + 1;
+    for child in &content.children {
+        child_offsets.push((child_offset, child));
+        child_offset += child.node_size();
+    }
+    child_offsets
+        .iter()
+        .rev()
+        .find_map(|(o, c)| last_textblock_in(c, *o))
+}
+
+/// Forwards half of [`resolve_block_for_edit`]: the first textblock in
+/// **document order** whose span has not already ended before `pos`.
+///
+/// "First in document order", not "nearest" — this walks forward from
+/// the start of `children` and returns the first match, so it makes no
+/// adjacency guarantee. The two coincide for every position this is
+/// reachable from, because it is only consulted when *nothing* precedes
+/// `pos`: every candidate therefore lies at or after `pos`, and the
+/// first one found is the closest. Don't lean on it as a general
+/// "nearest textblock after a position" query.
+fn first_textblock_at_or_after(
+    children: &[Node],
+    pos: usize,
+    base: usize,
+) -> Option<BlockInfo> {
+    let mut offset = base;
+    for child in children {
+        let child_offset = offset;
+        offset += child.node_size();
+        if offset <= pos {
+            continue;
+        }
+        let Node::Element {
+            node_type, content, ..
+        } = child
+        else {
+            continue;
+        };
+        if node_type.is_leaf() {
+            continue;
+        }
+        if node_type.is_textblock() {
+            return block_info_for(child, child_offset);
+        }
+        if let Some(inner) =
+            first_textblock_at_or_after(&content.children, pos, child_offset + 1)
+        {
+            return Some(inner);
+        }
     }
     None
 }
@@ -2581,6 +2820,595 @@ mod tests {
         let block = find_block_at(&doc, 3).unwrap();
         assert_eq!(block.node_type, NodeType::Paragraph);
         assert_eq!(block.content_start, 2);
+    }
+
+    // ── #143: structural seams in (nested) lists ──
+    //
+    // A child at offset `o` of size `s` is only *inside* `[o+1, o+s-1]`.
+    // The position `o+s` — between that child's close token and the next
+    // sibling's open token — belongs to no block. `ListItem` holds both
+    // a `Paragraph` and a nested `BulletList`, so ordinary nested
+    // note-taking is full of these seams, and browsers hand them to us
+    // whenever a DOM caret is reported as `(element, childIndex)`.
+
+    /// doc > bulletList > listItem[ paragraph("Parent"), bulletList >
+    /// listItem > paragraph("Child") ]
+    ///
+    /// Offsets: outer list open 0, outer item open 1, "Parent" paragraph
+    /// 2..10 (content 3..9), nested list 10..21, nested item 11..20,
+    /// "Child" paragraph 12..19. **Position 10 is the seam** between the
+    /// item's paragraph and its sub-list.
+    fn nested_list_doc() -> Node {
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::ListItem,
+                    Fragment::from(vec![
+                        Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("Parent")]),
+                        ),
+                        Node::element_with_content(
+                            NodeType::BulletList,
+                            Fragment::from(vec![Node::element_with_content(
+                                NodeType::ListItem,
+                                Fragment::from(vec![Node::element_with_content(
+                                    NodeType::Paragraph,
+                                    Fragment::from(vec![Node::text("Child")]),
+                                )]),
+                            )]),
+                        ),
+                    ]),
+                )]),
+            )]),
+        )
+    }
+
+    /// doc > bulletList > [ listItem > paragraph("A"),
+    ///                      listItem > paragraph("B") ]
+    ///
+    /// Offsets: list open 0, item1 1..6 ("A" content 3..4), item2 6..11
+    /// ("B" content 8..9). **Position 6 is the seam** between the two
+    /// sibling items.
+    fn sibling_items_doc() -> Node {
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("A")]),
+                        )]),
+                    ),
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("B")]),
+                        )]),
+                    ),
+                ]),
+            )]),
+        )
+    }
+
+    fn at_cursor(doc: Node, pos: usize) -> EditorState {
+        let state = EditorState::create_default(doc);
+        EditorState {
+            selection: Selection::cursor(pos),
+            ..state
+        }
+    }
+
+    /// Node types + text, without attrs. `create_default` stamps a
+    /// random `blockId` on every element, so two structurally identical
+    /// documents never compare equal with `==`.
+    fn shape(node: &Node) -> String {
+        match node {
+            Node::Text { text, .. } => format!("{text:?}"),
+            Node::Element {
+                node_type, content, ..
+            } => {
+                if node_type.is_leaf() || content.children.is_empty() {
+                    format!("{node_type:?}")
+                } else {
+                    let inner: Vec<String> =
+                        content.children.iter().map(shape).collect();
+                    format!("{node_type:?}[{}]", inner.join(","))
+                }
+            }
+        }
+    }
+
+    /// The reported bug (#143): pressing Enter with the caret on the
+    /// seam between a list item's own paragraph and its nested sub-list
+    /// used to fail with "cursor not in a block" and leave the keypress
+    /// completely inert. It must now split exactly as if the caret had
+    /// been at the end of that paragraph.
+    #[test]
+    fn split_block_at_seam_between_item_paragraph_and_nested_sublist() {
+        let state = at_cursor(nested_list_doc(), 10);
+        assert!(
+            find_block_at(&state.doc, 10).is_none(),
+            "precondition: position 10 is a structural seam owned by no block",
+        );
+
+        let txn = state.transaction().split_block().unwrap();
+        let new_state = state.apply(txn);
+
+        let list = new_state.doc.child(0).unwrap();
+        assert_eq!(list.node_type(), Some(NodeType::BulletList));
+        assert_eq!(list.child_count(), 2, "the item split into two items");
+
+        // First item keeps "Parent" and nothing else.
+        let first = list.child(0).unwrap();
+        assert_eq!(first.node_type(), Some(NodeType::ListItem));
+        assert_eq!(first.child_count(), 1);
+        assert_eq!(first.child(0).unwrap().text_content(), "Parent");
+
+        // Second item is the new empty bullet; the sub-list rides along
+        // with it, exactly as it does when the caret sits at position 9.
+        let second = list.child(1).unwrap();
+        assert_eq!(second.node_type(), Some(NodeType::ListItem));
+        assert_eq!(second.child_count(), 2);
+        assert_eq!(
+            second.child(0).unwrap().node_type(),
+            Some(NodeType::Paragraph)
+        );
+        assert_eq!(second.child(0).unwrap().text_content(), "");
+        assert_eq!(
+            second.child(1).unwrap().node_type(),
+            Some(NodeType::BulletList)
+        );
+        assert_eq!(second.child(1).unwrap().text_content(), "Child");
+
+        // Caret lands inside the new empty paragraph.
+        assert_eq!(new_state.selection.from(), 13);
+        assert!(new_state.selection.empty());
+    }
+
+    /// The seam must produce *exactly* the same document as pressing
+    /// Enter one position earlier (the end of the paragraph's content),
+    /// which is the position the resolution rule snaps it to.
+    #[test]
+    fn split_block_at_seam_matches_split_at_preceding_block_end() {
+        let seam = at_cursor(nested_list_doc(), 10);
+        let end = at_cursor(nested_list_doc(), 9);
+        let from_seam = seam.clone().apply(seam.transaction().split_block().unwrap());
+        let from_end = end.clone().apply(end.transaction().split_block().unwrap());
+        assert_eq!(shape(&from_seam.doc), shape(&from_end.doc));
+        assert_eq!(from_seam.selection.from(), from_end.selection.from());
+    }
+
+    /// The other seam nested lists produce in quantity: the boundary
+    /// between two sibling list items.
+    #[test]
+    fn split_block_at_boundary_between_sibling_list_items() {
+        let state = at_cursor(sibling_items_doc(), 6);
+        assert!(
+            find_block_at(&state.doc, 6).is_none(),
+            "precondition: position 6 is a structural seam owned by no block",
+        );
+
+        let txn = state.transaction().split_block().unwrap();
+        let new_state = state.apply(txn);
+
+        let list = new_state.doc.child(0).unwrap();
+        assert_eq!(list.child_count(), 3, "a new empty bullet in the middle");
+        assert_eq!(list.child(0).unwrap().text_content(), "A");
+        assert_eq!(list.child(1).unwrap().text_content(), "");
+        assert_eq!(
+            list.child(1).unwrap().node_type(),
+            Some(NodeType::ListItem),
+            "the inserted node is a real item, not an orphan",
+        );
+        assert_eq!(list.child(2).unwrap().text_content(), "B");
+        assert_eq!(new_state.selection.from(), 8);
+    }
+
+    // ── resolve_block_for_edit ──
+
+    #[test]
+    fn resolve_block_for_edit_is_identity_inside_a_block() {
+        let doc = nested_list_doc();
+        // Every position that `find_block_at` owns must resolve to
+        // itself and to the same block — the helper is additive, it
+        // never re-points a caret that was already valid.
+        for pos in 0..=doc.content_size() {
+            if let Some(found) = find_block_at(&doc, pos) {
+                let (resolved_block, resolved_pos) =
+                    resolve_block_for_edit(&doc, pos).unwrap();
+                assert_eq!(resolved_pos, pos, "position {pos} was moved");
+                assert_eq!(resolved_block.offset, found.offset, "block at {pos}");
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_block_for_edit_at_seam_snaps_to_end_of_preceding_block() {
+        let doc = nested_list_doc();
+        let (block, pos) = resolve_block_for_edit(&doc, 10).unwrap();
+        assert_eq!(block.node_type, NodeType::Paragraph);
+        assert_eq!(block.offset, 2);
+        assert_eq!(block.content.size(), 6); // "Parent"
+        assert_eq!(pos, 9, "end of the paragraph's content");
+    }
+
+    #[test]
+    fn resolve_block_for_edit_at_sibling_seam_snaps_backwards() {
+        let doc = sibling_items_doc();
+        let (block, pos) = resolve_block_for_edit(&doc, 6).unwrap();
+        assert_eq!(block.content_start, 3, "the first item's paragraph");
+        assert_eq!(pos, 4, "end of \"A\"");
+    }
+
+    /// Nothing precedes the caret (DOM reports `(ul, 0)` / `(li, 0)` for
+    /// a click at the very start of the first bullet), so the backwards
+    /// rule has no answer. Resolve forwards to the start of the first
+    /// textblock instead of failing — otherwise typing there splices a
+    /// bare text node in as a direct child of the list.
+    #[test]
+    fn resolve_block_for_edit_before_all_content_resolves_forwards() {
+        let doc = sibling_items_doc();
+        for seam in [0, 1, 2] {
+            assert!(find_block_at(&doc, seam).is_none(), "precondition {seam}");
+            let (block, pos) = resolve_block_for_edit(&doc, seam).unwrap();
+            assert_eq!(block.content_start, 3, "seam {seam}");
+            assert_eq!(pos, 3, "seam {seam}: start of the first paragraph");
+        }
+    }
+
+    /// doc > [ paragraph("A"), kanban > kanbanColumn > kanbanCard,
+    ///         paragraph("B") ]
+    ///
+    /// `find_block_in_children` skips leaf children before their span is
+    /// ever considered, and every `Kanban`/`Calendar` descendant bottoms
+    /// out in leaves (`KanbanCard`, `CalendarEvent`) — so *every*
+    /// position inside a board resolves to no block. Both boards are
+    /// `isolating: true`, so this should be unreachable in practice, but
+    /// it is the same defect: resolve to the block before the board.
+    fn kanban_doc() -> Node {
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("A")]),
+                ),
+                Node::element_with_content(
+                    NodeType::Kanban,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::KanbanColumn,
+                        Fragment::from(vec![Node::element(NodeType::KanbanCard)]),
+                    )]),
+                ),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("B")]),
+                ),
+            ]),
+        )
+    }
+
+    #[test]
+    fn resolve_block_for_edit_inside_container_atom_falls_back_to_block_before() {
+        let doc = kanban_doc();
+        // Paragraph("A") 0..3, Kanban 3..8, Paragraph("B") 8..11.
+        for inside in [4, 5, 6, 7] {
+            assert!(
+                find_block_at(&doc, inside).is_none(),
+                "precondition: position {inside} inside the board owns no block",
+            );
+            let (block, pos) = resolve_block_for_edit(&doc, inside).unwrap();
+            assert_eq!(block.offset, 0, "position {inside}");
+            assert_eq!(pos, 2, "position {inside}: end of the paragraph before");
+        }
+    }
+
+    /// A document whose only content is a container atom has no
+    /// textblock anywhere — neither direction can resolve, and the edit
+    /// paths must still fail rather than guess.
+    #[test]
+    fn resolve_block_for_edit_returns_none_without_any_textblock() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Kanban,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::KanbanColumn,
+                    Fragment::from(vec![Node::element(NodeType::KanbanCard)]),
+                )]),
+            )]),
+        );
+        for pos in 0..=doc.content_size() {
+            assert!(resolve_block_for_edit(&doc, pos).is_none(), "pos {pos}");
+        }
+        let state = at_cursor(doc, 2);
+        assert!(state.transaction().split_block().is_err());
+    }
+
+    // ── #143 boundary sweep: the other keys at the same seams ──
+
+    /// Typing at a seam used to splice a bare text node in as a direct
+    /// child of the ListItem — the undeletable-orphan corruption class.
+    #[test]
+    fn insert_text_at_nested_seam_lands_in_the_paragraph_not_as_an_orphan() {
+        let state = at_cursor(nested_list_doc(), 10);
+        let txn = state.transaction().insert_text("X").unwrap();
+        let new_state = state.apply(txn);
+
+        let item = new_state.doc.child(0).unwrap().child(0).unwrap();
+        assert_eq!(item.child_count(), 2, "still paragraph + sub-list only");
+        assert_eq!(
+            item.child(0).unwrap().node_type(),
+            Some(NodeType::Paragraph)
+        );
+        assert_eq!(item.child(0).unwrap().text_content(), "ParentX");
+        assert_eq!(
+            item.child(1).unwrap().node_type(),
+            Some(NodeType::BulletList)
+        );
+        // Caret affinity: it lands after the typed character, inside
+        // the paragraph — not back on the seam.
+        assert_eq!(new_state.selection.from(), 10);
+        assert!(find_block_at(&new_state.doc, new_state.selection.from()).is_some());
+    }
+
+    #[test]
+    fn insert_text_at_sibling_seam_lands_in_the_preceding_item() {
+        let state = at_cursor(sibling_items_doc(), 6);
+        let txn = state.transaction().insert_text("X").unwrap();
+        let new_state = state.apply(txn);
+
+        let list = new_state.doc.child(0).unwrap();
+        assert_eq!(list.child_count(), 2, "no orphan spliced into the list");
+        for i in 0..list.child_count() {
+            assert_eq!(
+                list.child(i).unwrap().node_type(),
+                Some(NodeType::ListItem),
+                "child {i} is still a list item",
+            );
+        }
+        assert_eq!(list.child(0).unwrap().text_content(), "AX");
+        assert_eq!(list.child(1).unwrap().text_content(), "B");
+        assert_eq!(new_state.selection.from(), 5);
+        assert!(find_block_at(&new_state.doc, new_state.selection.from()).is_some());
+    }
+
+    #[test]
+    fn insert_text_before_the_first_item_lands_at_its_start() {
+        let state = at_cursor(sibling_items_doc(), 1);
+        let txn = state.transaction().insert_text("X").unwrap();
+        let new_state = state.apply(txn);
+
+        let list = new_state.doc.child(0).unwrap();
+        assert_eq!(list.child_count(), 2);
+        assert_eq!(
+            list.child(0).unwrap().node_type(),
+            Some(NodeType::ListItem)
+        );
+        assert_eq!(list.child(0).unwrap().text_content(), "XA");
+        assert_eq!(new_state.selection.from(), 4);
+        assert!(find_block_at(&new_state.doc, new_state.selection.from()).is_some());
+    }
+
+    /// A range selection is "replace what is selected" — both endpoints
+    /// must stay exactly where the caller put them even if one of them
+    /// happens to be a seam.
+    #[test]
+    fn insert_text_over_a_range_selection_is_not_snapped() {
+        let state = EditorState::create_default(simple_doc());
+        let state = EditorState {
+            selection: Selection::text(1, 6),
+            ..state
+        };
+        let txn = state.transaction().insert_text("Bye").unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "Bye world");
+    }
+
+    /// Ctrl+Backspace at a seam: eats the last word of the block the
+    /// seam resolves back into, instead of erroring out.
+    #[test]
+    fn delete_word_backward_at_seam_eats_the_preceding_blocks_word() {
+        let state = at_cursor(nested_list_doc(), 10);
+        let txn = state.transaction().delete_word_backward().unwrap();
+        let new_state = state.apply(txn);
+
+        let item = new_state.doc.child(0).unwrap().child(0).unwrap();
+        assert_eq!(item.child(0).unwrap().text_content(), "");
+        assert_eq!(item.child_count(), 2, "the sub-list is untouched");
+        assert_eq!(item.child(1).unwrap().text_content(), "Child");
+    }
+
+    /// Backspace's character-delete fallback (`view.rs` runs
+    /// `delete(pos - 1, pos)` after `join_backward` declines). At a raw
+    /// seam that range straddles a close boundary and changes nothing —
+    /// the keypress was inert. With the caret snapped first it deletes
+    /// the last character of the preceding block.
+    #[test]
+    fn backspace_fallback_at_seam_deletes_the_preceding_blocks_last_char() {
+        let doc = nested_list_doc();
+        let before = at_cursor(doc.clone(), 10);
+        let unsnapped = before
+            .clone()
+            .apply(before.transaction().delete(9, 10).unwrap());
+        assert_eq!(
+            unsnapped.doc, doc,
+            "precondition: deleting across the raw seam is a no-op",
+        );
+
+        let (_, snapped) = resolve_block_for_edit(&doc, 10).unwrap();
+        let state = at_cursor(doc, snapped);
+        let txn = state.transaction().delete(snapped - 1, snapped).unwrap();
+        let new_state = state.apply(txn);
+        let item = new_state.doc.child(0).unwrap().child(0).unwrap();
+        assert_eq!(item.child(0).unwrap().text_content(), "Paren");
+        assert_eq!(item.child_count(), 2);
+    }
+
+    /// Forward-delete at a seam behaves as forward-delete at the end of
+    /// the block the seam resolves into. In this shape that is a no-op
+    /// (`join_forward`'s *next*-block lookup can't see across two
+    /// container open tokens — a separate, pre-existing limitation), but
+    /// the two positions must agree.
+    #[test]
+    fn join_forward_at_seam_matches_join_forward_at_preceding_block_end() {
+        // `two_para_doc` = doc[paragraph("Hello"), paragraph("World")].
+        // Paragraph 1 spans 0..7, so position 7 is the seam between the
+        // two blocks — resolved back to position 6, paragraph 1's
+        // content end, which is where forward-delete merges from.
+        assert!(find_block_at(&two_para_doc(), 7).is_none(), "precondition");
+
+        let seam = at_cursor(two_para_doc(), 7);
+        let end = at_cursor(two_para_doc(), 6);
+        let merged_from_seam = seam
+            .clone()
+            .apply(seam.transaction().join_forward().unwrap());
+        let merged_from_end = end
+            .clone()
+            .apply(end.transaction().join_forward().unwrap());
+
+        assert_eq!(merged_from_seam.doc.child_count(), 1);
+        assert_eq!(
+            merged_from_seam.doc.child(0).unwrap().text_content(),
+            "HelloWorld",
+        );
+        assert_eq!(shape(&merged_from_seam.doc), shape(&merged_from_end.doc));
+        assert_eq!(
+            merged_from_seam.selection.from(),
+            merged_from_end.selection.from(),
+        );
+    }
+
+    /// The nested-list shape, where forward-delete is a no-op for a
+    /// *different* reason: `join_forward`'s next-block probe is
+    /// `find_block_at(block_end + 1)`, whose `+1` assumes a single open
+    /// token between the caret's block and the next textblock. With a
+    /// sub-list below, the next textblock is two opens away, so the
+    /// probe lands on another seam and the whole command declines —
+    /// at the ordinary in-block position 9 just as much as at the seam.
+    /// Filed separately (#145); pinned here so a future fix moves the
+    /// seam and the block end together.
+    #[test]
+    fn join_forward_declines_equally_at_seam_and_block_end_in_nested_list() {
+        let seam = at_cursor(nested_list_doc(), 10);
+        let end = at_cursor(nested_list_doc(), 9);
+        assert!(end.transaction().join_forward().is_err(), "pre-existing #145");
+        assert_eq!(
+            seam.transaction().join_forward().is_err(),
+            end.transaction().join_forward().is_err(),
+        );
+    }
+
+    /// The one behavioural change this fix makes to `join_backward`,
+    /// pinned deliberately rather than left riding on "the suite is
+    /// green".
+    ///
+    /// With the caret at `doc.content_size()` and an *empty* trailing
+    /// block, the resolved position equals that block's `content_start`,
+    /// so the `pos != block.content_start` gate now passes and the empty
+    /// block merges upward. Previously `find_block_at` returned `None`,
+    /// `join_backward` errored, and `view.rs` fell through to
+    /// `delete(pos - 1, pos)` — a range straddling the paragraph's close
+    /// token, which changes nothing. Backspace at the end of a document
+    /// ending in a blank line was inert; now it removes the blank line
+    /// and leaves the caret at the end of the text above.
+    ///
+    /// This is the *only* delta: at a mid-document seam the resolved
+    /// position is the preceding block's content **end**, which still
+    /// fails the same gate.
+    #[test]
+    fn join_backward_at_content_size_merges_an_empty_trailing_block() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("A")]),
+                ),
+                Node::element(NodeType::Paragraph),
+            ]),
+        );
+        // Paragraph("A") 0..3, empty paragraph 3..5, content_size 5.
+        assert_eq!(doc.content_size(), 5);
+        assert!(find_block_at(&doc, 5).is_none(), "precondition: past the end");
+
+        let state = at_cursor(doc, 5);
+        let txn = state.transaction().join_backward().unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(new_state.doc.child_count(), 1, "blank line removed");
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "A");
+        assert_eq!(new_state.selection.from(), 2, "caret at the end of \"A\"");
+        assert!(find_block_at(&new_state.doc, new_state.selection.from()).is_some());
+    }
+
+    /// The mirror of the above: at a *mid-document* seam the resolved
+    /// position is a content **end**, so `join_backward` still declines
+    /// and Backspace stays on its character-delete fallback. No
+    /// accidental block merges were introduced.
+    #[test]
+    fn join_backward_at_a_mid_document_seam_still_declines() {
+        for (doc, seam) in [(nested_list_doc(), 10), (sibling_items_doc(), 6)] {
+            assert!(find_block_at(&doc, seam).is_none(), "precondition {seam}");
+            assert!(
+                at_cursor(doc, seam).transaction().join_backward().is_err(),
+                "seam {seam} must not merge blocks",
+            );
+        }
+    }
+
+    /// Enter at a seam whose preceding block is a heading (the shape in
+    /// the #143 report: a heading above a bulleted list) resolves back
+    /// into the heading and splits it there.
+    #[test]
+    fn split_block_at_seam_between_heading_and_list() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Heading,
+                    Fragment::from(vec![Node::text("Title")]),
+                ),
+                Node::element_with_content(
+                    NodeType::BulletList,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("item")]),
+                        )]),
+                    )]),
+                ),
+            ]),
+        );
+        // Heading 0..7, list 7..17. Position 7 is the seam.
+        let state = at_cursor(doc, 7);
+        assert!(find_block_at(&state.doc, 7).is_none(), "precondition");
+        let txn = state.transaction().split_block().unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(new_state.doc.child_count(), 3);
+        assert_eq!(
+            new_state.doc.child(0).unwrap().node_type(),
+            Some(NodeType::Heading)
+        );
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "Title");
+        assert_eq!(
+            new_state.doc.child(1).unwrap().node_type(),
+            Some(NodeType::Paragraph)
+        );
+        assert_eq!(new_state.doc.child(1).unwrap().text_content(), "");
+        assert_eq!(
+            new_state.doc.child(2).unwrap().node_type(),
+            Some(NodeType::BulletList)
+        );
     }
 
     #[test]

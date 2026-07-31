@@ -4448,6 +4448,38 @@ mod tests {
         )
     }
 
+    /// #143 boundary sweep — Tab at the seam between two sibling list
+    /// items. `find_item_at` doesn't own that position either, so
+    /// `sink_list_item` declines and `tab_command` falls through to its
+    /// literal-tab branch. That branch used to splice a bare `text("\t")`
+    /// node in as a direct child of the BulletList — the undeletable
+    /// orphan class. It must land inside a list item's paragraph
+    /// instead. (Indenting the *following* item would be nicer still,
+    /// but that needs `find_item_at` to resolve seams, which is a
+    /// separate contract.)
+    #[test]
+    fn tab_at_sibling_item_seam_does_not_orphan_a_text_node() {
+        let doc = two_item_list_doc();
+        // ListItem1 spans 1..10; position 10 is the seam before ListItem2.
+        let state = EditorState {
+            selection: Selection::cursor(10),
+            ..EditorState::create_default(doc)
+        };
+        let (handled, new_state) = apply_captured(&state, tab_command);
+        assert!(handled);
+
+        let list = new_state.doc.child(0).unwrap();
+        assert_eq!(list.node_type(), Some(NodeType::BulletList));
+        for i in 0..list.child_count() {
+            assert_eq!(
+                list.child(i).unwrap().node_type(),
+                Some(NodeType::ListItem),
+                "list child {i} must still be a list item, not a bare text node",
+            );
+        }
+        assert_eq!(new_state.doc.text_content(), "first\tsecond");
+    }
+
     #[test]
     fn sink_list_item_not_applicable_outside_list() {
         let state = EditorState::create_default(simple_doc());
