@@ -79,10 +79,24 @@ impl SecMapRow {
     }
 }
 
-/// One cross-thread link discovered in `source_quip_thread_id` whose
+/// Max `links` per persisted `UNRESOLVED#` chunk, chosen for the same
+/// reason as [`SECMAP_CHUNK_ENTRIES`]: one DynamoDB item may not exceed
+/// 400 KB. A [`PendingLinkItem`] costs roughly 120 bytes on the wire
+/// (three ids plus their attribute names), so an unbounded row tops out
+/// near 3k links — and a Quip index/directory page is exactly that dense.
+/// 1 000 keeps a ~3x margin. Unlike `SECMAP#`, the caller does **not**
+/// chunk: `ImportRepo::put_unresolved` splits and
+/// `ImportRepo::list_unresolved` concatenates, so a source thread is one
+/// logical [`UnresolvedRow`] on both sides of the repo boundary.
+pub const UNRESOLVED_CHUNK_LINKS: usize = 1_000;
+
+/// Every cross-thread link discovered in `source_quip_thread_id` whose
 /// target thread hadn't been imported yet at the time it was encountered.
-/// SK = `UNRESOLVED#<source_quip_thread_id>`. Consumed by a later pass
-/// (Phase 2b+) that revisits these once every thread has an `ogre_doc_id`.
+/// Persisted as one or more chunks at SK =
+/// `UNRESOLVED#<source_quip_thread_id>#<chunk>`; the repo hides the
+/// chunking, so this struct is always the *whole* thread's link set.
+/// Consumed by a later pass (Phase 2b+) that revisits these once every
+/// thread has an `ogre_doc_id`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnresolvedRow {
     pub source_quip_thread_id: String,
@@ -91,8 +105,11 @@ pub struct UnresolvedRow {
 }
 
 impl UnresolvedRow {
-    pub fn sk(&self) -> String {
-        format!("UNRESOLVED#{}", self.source_quip_thread_id)
+    /// SK of one persisted chunk. Chunk order is *numeric*, not the SK's
+    /// lexicographic order (`#10` sorts before `#2`), so readers sort on
+    /// the parsed chunk number — same rule as `SECMAP#`.
+    pub fn sk(&self, chunk: u32) -> String {
+        format!("UNRESOLVED#{}#{}", self.source_quip_thread_id, chunk)
     }
 }
 

@@ -55,9 +55,10 @@ macro_rules! require_infra {
     };
 }
 
-async fn test_repo() -> (ImportRepo, String) {
-    let table_name = format!("test-import-{}", new_id());
-
+/// A DynamoDB-Local SDK client. Factored out of [`test_repo`] so a test that
+/// needs to look at the *raw* rows a repo wrote (rather than the logical view
+/// the repo hands back) can build one against the same table.
+fn local_dynamo_client() -> aws_sdk_dynamodb::Client {
     let dynamo_config = aws_sdk_dynamodb::config::Builder::new()
         .endpoint_url("http://127.0.0.1:8000")
         .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
@@ -66,7 +67,12 @@ async fn test_repo() -> (ImportRepo, String) {
         ))
         .behavior_version_latest()
         .build();
-    let client = aws_sdk_dynamodb::Client::from_conf(dynamo_config);
+    aws_sdk_dynamodb::Client::from_conf(dynamo_config)
+}
+
+async fn test_repo() -> (ImportRepo, String) {
+    let table_name = format!("test-import-{}", new_id());
+    let client = local_dynamo_client();
 
     client
         .create_table()
@@ -546,4 +552,124 @@ async fn unresolved_links_round_trip_through_live_dynamo() {
 
     let rows = repo.list_unresolved(&record.import_id).await.expect("list_unresolved");
     assert_eq!(rows, vec![row]);
+}
+
+/// Regression (I4): `UNRESOLVED#` used to be ONE unbounded item per source
+/// thread while `SECMAP#` was chunked for the same DynamoDB 400 KB item cap.
+/// A Quip index/directory page is exactly the link-dense case that blows it,
+/// and the overflow surfaced as a transient error — which, before the
+/// idempotency fix, also duplicated the document and burned a retry.
+///
+/// Two properties in one test:
+///  1. a link set larger than [`UNRESOLVED_CHUNK_LINKS`] is actually split
+///     across several `UNRESOLVED#<thread>#<chunk>` items, and
+///  2. reading it back concatenates them in **numeric** chunk order. Eleven
+///     chunks is the smallest count that catches a lexicographic sort
+///     (`#10` sorts before `#2`), the same trap `get_secmap` avoids.
+#[tokio::test]
+async fn unresolved_links_chunk_and_concatenate_in_numeric_order() {
+    use ogrenotes_storage::models::import_inventory::{
+        PendingLinkItem, UnresolvedRow, UNRESOLVED_CHUNK_LINKS,
+    };
+
+    require_infra!();
+    let (repo, table_name) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    // Eleven chunks' worth, plus a partial twelfth so the tail isn't a
+    // whole chunk either.
+    let total = UNRESOLVED_CHUNK_LINKS * 11 + 7;
+    let links: Vec<PendingLinkItem> = (0..total)
+        .map(|i| PendingLinkItem {
+            // Zero-padded so the *expected* order is unambiguous, and so a
+            // sort-by-content bug would be as visible as a sort-by-chunk one.
+            source_block_id: format!("b{i:06}"),
+            target_quip_thread_id: "qt2".to_string(),
+            target_quip_section_id: None,
+        })
+        .collect();
+    let row = UnresolvedRow {
+        source_quip_thread_id: "qt1".to_string(),
+        owner_id: "u1".to_string(),
+        links: links.clone(),
+    };
+    repo.put_unresolved(&record.import_id, &row)
+        .await
+        .expect("put_unresolved must chunk rather than reject an oversized set");
+
+    // (1) It really is stored as more than one item — a single 12k-link item
+    //     would exceed DynamoDB's 400 KB cap on realistic ids. Read the RAW
+    //     rows: the repo's own view deliberately hides the chunking.
+    let db = DynamoClient::new(local_dynamo_client(), table_name.clone());
+    let items = db
+        .query(&format!("IMPORT#{}", record.import_id), Some("UNRESOLVED#"))
+        .await
+        .expect("raw query");
+    let mut sks: Vec<String> = items
+        .iter()
+        .filter_map(|i| i.get("SK").and_then(|v| v.as_s().ok()).cloned())
+        .collect();
+    sks.sort();
+    assert_eq!(
+        sks.len(),
+        12,
+        "12 chunks expected for {total} links at {UNRESOLVED_CHUNK_LINKS}/chunk: {sks:?}"
+    );
+    assert!(sks.contains(&"UNRESOLVED#qt1#10".to_string()), "{sks:?}");
+
+    // (2) ...and it reads back as ONE logical row, in write order.
+    let rows = repo.list_unresolved(&record.import_id).await.expect("list_unresolved");
+    assert_eq!(rows.len(), 1, "chunks must merge into one row per source thread");
+    assert_eq!(rows[0].source_quip_thread_id, "qt1");
+    assert_eq!(rows[0].owner_id, "u1");
+    assert_eq!(
+        rows[0].links.len(),
+        total,
+        "every link must survive the chunk round-trip"
+    );
+    assert_eq!(
+        rows[0].links, links,
+        "chunks must concatenate in numeric chunk order, not lexicographic SK order",
+    );
+}
+
+/// Regression (FIX 2): the per-thread document id is reserved on the
+/// `THREAD#` row *before* the document is created, so a retry after a
+/// transient failure re-uses it instead of minting a second document.
+/// Reserving twice — which is exactly what attempt 1 and attempt 2 do — must
+/// return the SAME id, and must not overwrite the first reservation.
+#[tokio::test]
+async fn reserve_thread_doc_id_is_stable_across_retries() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+    repo.put_thread(&record.import_id, &pending_thread("qt1", ThreadState::Pending))
+        .await
+        .expect("seed pending thread");
+
+    let first = repo
+        .reserve_thread_doc_id(&record.import_id, "qt1", "doc-attempt-1")
+        .await
+        .expect("first reservation");
+    assert_eq!(first, "doc-attempt-1", "an unreserved thread takes the candidate");
+
+    let second = repo
+        .reserve_thread_doc_id(&record.import_id, "qt1", "doc-attempt-2")
+        .await
+        .expect("second reservation");
+    assert_eq!(
+        second, "doc-attempt-1",
+        "a retry must adopt the existing reservation, never mint a second document id",
+    );
+
+    // The reservation is durable on the row a retry actually reads.
+    let rows = repo.list_threads(&record.import_id).await.expect("list_threads");
+    assert_eq!(rows[0].ogre_doc_id.as_deref(), Some("doc-attempt-1"));
+    assert_eq!(
+        rows[0].state,
+        ThreadState::Pending,
+        "reserving an id must not advance the thread's progress state",
+    );
 }
