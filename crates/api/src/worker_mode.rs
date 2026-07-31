@@ -1143,7 +1143,10 @@ impl std::fmt::Display for ThreadImportError {
 impl From<QuipError> for ThreadImportError {
     fn from(e: QuipError) -> Self {
         match e {
-            QuipError::Unauthorized => Self::TokenRejected,
+            // TODO(#141 Task 4): Forbidden should become a thread-skip, not
+            // a run-terminal TokenRejected. Behavior-preserving for now —
+            // Task 1 only splits the error type, disposition is Task 4's.
+            QuipError::Unauthorized | QuipError::Forbidden => Self::TokenRejected,
             transient => Self::Transient(format!("quip: {transient}")),
         }
     }
@@ -1510,7 +1513,11 @@ async fn sideload_images(
         };
         let bytes = match client.blob(token, blob_thread_id, blob_id).await {
             Ok(bytes) => bytes,
-            Err(QuipError::Unauthorized) => return Err(ThreadImportError::TokenRejected),
+            // TODO(#141 Task 4): Forbidden should skip the image, not kill
+            // the thread's import. Behavior-preserving for now.
+            Err(QuipError::Unauthorized) | Err(QuipError::Forbidden) => {
+                return Err(ThreadImportError::TokenRejected);
+            }
             Err(e) => {
                 tracing::warn!(
                     thread = %thread.quip_thread_id,
@@ -1594,6 +1601,10 @@ fn blob_filename(alt: &str, blob_id: &str) -> String {
 ///   on retry. Flip status to `TokenRejected` and return `Ok(())` — terminal
 ///   for this run; the UI prompts a reconnect. Returning `Err` here would
 ///   burn the retry budget hammering Quip with a dead token.
+/// - `Forbidden` → treated the same as `Unauthorized` for now (see
+///   `QuipError::Forbidden`'s doc comment and issue #141 Task 4, which will
+///   give this a per-thread disposition instead during the content pass;
+///   the inventory walk itself has no per-thread granularity yet).
 /// - transient (`RateLimited`/`Http`/`Api`/`Parse`) → return `Err` so the
 ///   queue's retry/reaper resumes the job. The walk restarts from scratch,
 ///   which insert-if-absent makes cheap and safe.
@@ -1605,7 +1616,7 @@ async fn mark_quip_failure(
     err: &QuipError,
 ) -> Result<(), String> {
     match err {
-        QuipError::Unauthorized => {
+        QuipError::Unauthorized | QuipError::Forbidden => {
             ctx.import_repo
                 .set_status(import_id, ImportStatus::TokenRejected)
                 .await

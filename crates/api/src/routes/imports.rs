@@ -80,6 +80,14 @@ struct RootFolderDto {
 ///   token") — deliberately NOT 401, which is reserved for OUR auth on
 ///   this endpoint (a bad Quip token is a bad *request*, not a failure
 ///   to authenticate the caller against OgreNotes).
+/// - `QuipError::Forbidden` -> `400 Bad Request` ("invalid Quip token"),
+///   same as `Unauthorized`. At `connect` time the only Quip call made is
+///   `/1/users/current`; a 403 there means the token itself lacks the
+///   access needed to use the importer at all (not "this one thread is
+///   restricted" — there's no thread yet), so it reads to the caller the
+///   same as a bad token. The per-thread/blob meaning of `Forbidden`
+///   distinct from `Unauthorized` only shows up later, in the content
+///   pass (`worker_mode.rs`, issue #141 Task 4).
 /// - `QuipError::RateLimited | Http | Api | Parse` -> `503 Service
 ///   Unavailable` ("Quip API error").
 async fn connect(
@@ -193,7 +201,14 @@ async fn rollback_stashed_token(state: &AppState, import_id: &str) {
 /// underlying cause.
 fn map_quip_error(err: QuipError) -> ApiError {
     match err {
-        QuipError::Unauthorized => ApiError::BadRequest("invalid Quip token".to_string()),
+        // `Forbidden` (403) is folded in with `Unauthorized` (401) here
+        // deliberately: at `connect` time the only Quip call is
+        // `/1/users/current`, so a 403 means the token lacks the access
+        // needed to use the importer, not "one thread is restricted" —
+        // see this function's doc comment.
+        QuipError::Unauthorized | QuipError::Forbidden => {
+            ApiError::BadRequest("invalid Quip token".to_string())
+        }
         // Routine throttling — no server log; the caller already gets a 503.
         QuipError::RateLimited { .. } => ApiError::ServiceUnavailable("Quip API error".to_string()),
         // Unexpected Quip-side failure (transport, unexpected status/body,
