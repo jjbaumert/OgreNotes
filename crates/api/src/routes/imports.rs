@@ -81,12 +81,16 @@ struct RootFolderDto {
 ///   this endpoint (a bad Quip token is a bad *request*, not a failure
 ///   to authenticate the caller against OgreNotes).
 /// - `QuipError::Forbidden` -> `400 Bad Request` ("invalid Quip token"),
-///   same as `Unauthorized`. At `connect` time the only Quip call made is
-///   `/1/users/current`; a 403 there means the token itself lacks the
-///   access needed to use the importer at all (not "this one thread is
-///   restricted" — there's no thread yet), so it reads to the caller the
-///   same as a bad token. The per-thread/blob meaning of `Forbidden`
-///   distinct from `Unauthorized` only shows up later, in the content
+///   same as `Unauthorized`. `connect` makes two Quip calls —
+///   `/1/users/current` and then `folders()` over the caller's own private
+///   + shared root folder ids — and both route through this mapping. A 403
+///   from either still means the token itself lacks the access it needs:
+///   `folders()` here is scoped to the caller's *own* roots, not to any
+///   particular document, so this isn't "one document is restricted" the
+///   way a per-thread 403 is later — there's no specific document in play
+///   yet. It reads to the caller the same as a bad token. The per-thread/
+///   blob meaning of `Forbidden` distinct from `Unauthorized` only shows
+///   up later, in the content
 ///   pass (`worker_mode.rs`, issue #141 Task 4).
 /// - `QuipError::RateLimited | Http | Api | Parse` -> `503 Service
 ///   Unavailable` ("Quip API error").
@@ -202,10 +206,11 @@ async fn rollback_stashed_token(state: &AppState, import_id: &str) {
 fn map_quip_error(err: QuipError) -> ApiError {
     match err {
         // `Forbidden` (403) is folded in with `Unauthorized` (401) here
-        // deliberately: at `connect` time the only Quip call is
-        // `/1/users/current`, so a 403 means the token lacks the access
-        // needed to use the importer, not "one thread is restricted" —
-        // see this function's doc comment.
+        // deliberately: both Quip calls `connect` makes (`current_user`,
+        // then `folders()` over the caller's own root folder ids) are
+        // scoped to the caller, not to any particular document, so a 403
+        // from either means the token lacks the access it needs — not
+        // "one thread is restricted" — see this function's doc comment.
         QuipError::Unauthorized | QuipError::Forbidden => {
             ApiError::BadRequest("invalid Quip token".to_string())
         }
