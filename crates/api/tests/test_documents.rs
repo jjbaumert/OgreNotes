@@ -1152,6 +1152,184 @@ async fn test_bulk_export_resolves_blob_ref_images_to_real_urls() {
     app.cleanup().await;
 }
 
+// ─── #140: images must survive a document copy ─────────────────
+
+/// Read back the single durable blob reference in a document's stored
+/// content, as `(blob_id, key)`. Panics if the doc doesn't hold exactly
+/// one — the copy tests below all stage exactly one image.
+async fn only_blob_ref(app: &common::TestApp, token: &str, doc_id: &str) -> (String, String) {
+    let (status, bytes) = app
+        .bytes_request(
+            Method::GET,
+            &format!("/api/v1/documents/{doc_id}/content"),
+            Some(token),
+            Vec::new(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 200, "content fetch for {doc_id}");
+    let doc = OgreDoc::from_state_bytes(&bytes).expect("stored content is a valid Y.Doc");
+    let mut refs = ogrenotes_collab::blob_ref::collect_blob_refs(doc.inner());
+    assert_eq!(refs.len(), 1, "expected exactly one blob reference in {doc_id}: {refs:?}");
+    refs.pop().unwrap()
+}
+
+/// Regression (#140): copying a document must re-home its image blobs
+/// under the **copy's** own `blobs/{doc_id}/` prefix.
+///
+/// Blob read authorization is keyed on the doc id embedded in the key
+/// (`request_download_url`'s `blobs/{id}/{blob_id}/` prefix test), so a
+/// copy that carried the source's keys forward had every image rejected
+/// at read time and rendered blank — acutely so for the templates
+/// gallery, which exists to be copied. This asserts all three links of
+/// that chain: the reference names the copy's prefix, the S3 object
+/// actually exists there, and the copy's own download endpoint (the
+/// guard that was failing) now hands back a presigned URL.
+#[tokio::test]
+async fn test_copy_document_rehomes_image_blobs_under_the_copy() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("copy-blob@test.com").await;
+    let src_id = app.create_doc(&token, "Source With Image", None).await;
+
+    let blob_id = "b-copy-1";
+    let src_key = format!("blobs/{src_id}/{blob_id}/photo.png");
+    app.s3_client()
+        .put_object()
+        .bucket(&app.bucket)
+        .key(&src_key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(
+            b"PNG-BYTES-FOR-COPY".to_vec(),
+        ))
+        .send()
+        .await
+        .expect("stage the source blob object");
+
+    let (doc, _src) = build_doc_with_blob_ref_image(&src_id, blob_id, "A copied photo");
+    let (status, _) = app
+        .bytes_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{src_id}/content"),
+            Some(&token),
+            doc.to_state_bytes(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let (status, body) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/documents/{src_id}/copy"),
+            Some(&token),
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, 201, "copy should succeed: {body}");
+    let new_id = body["id"].as_str().expect("copy returns an id").to_string();
+    assert_ne!(new_id, src_id);
+
+    // (1) The copy's reference names the copy's own prefix.
+    let (copied_blob_id, copied_key) = only_blob_ref(&app, &token, &new_id).await;
+    assert_eq!(copied_blob_id, blob_id, "blob id is carried over");
+    let expected_key = format!("blobs/{new_id}/{blob_id}/photo.png");
+    assert_eq!(
+        copied_key, expected_key,
+        "copied doc must reference its OWN blob prefix, not the source's",
+    );
+
+    // (2) The object really is there — a rewritten reference pointing at
+    //     a key that was never copied would still render blank.
+    let head = app
+        .s3_client()
+        .head_object()
+        .bucket(&app.bucket)
+        .key(&expected_key)
+        .send()
+        .await;
+    assert!(
+        head.is_ok(),
+        "S3 object missing at the copy's key {expected_key}: {:?}",
+        head.err(),
+    );
+
+    // (3) End to end: the guard that was rejecting the read now passes.
+    let (status, dl) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/documents/{new_id}/blobs/{blob_id}?key={expected_key}"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "download URL for the copy's blob: {dl}");
+    assert!(
+        dl["downloadUrl"].as_str().is_some_and(|u| u.contains(&expected_key)),
+        "expected a presigned URL over the copy's key: {dl}"
+    );
+
+    // The source is untouched — a copy must not move the original's bytes.
+    let (src_blob_id, src_ref_key) = only_blob_ref(&app, &token, &src_id).await;
+    assert_eq!((src_blob_id.as_str(), src_ref_key.as_str()), (blob_id, src_key.as_str()));
+
+    app.cleanup().await;
+}
+
+/// #140 partial-failure disposition: a blob that cannot be copied must
+/// not fail the document copy. The copied doc keeps the *source's*
+/// reference — status quo for that one image (it renders blank), and
+/// recoverable, since the source object is still where it always was.
+/// Dropping the image node instead would destroy the author's alt text
+/// and layout unrecoverably.
+///
+/// Staged by referencing a blob whose S3 object was never uploaded, so
+/// `CopyObject` fails with NoSuchKey.
+#[tokio::test]
+async fn test_copy_document_survives_an_uncopyable_blob() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("copy-blob-missing@test.com").await;
+    let src_id = app.create_doc(&token, "Source With Missing Blob", None).await;
+
+    // Note: no put_object — the key the reference names does not exist.
+    let blob_id = "b-copy-missing";
+    let src_key = format!("blobs/{src_id}/{blob_id}/photo.png");
+
+    let (doc, _src) = build_doc_with_blob_ref_image(&src_id, blob_id, "A missing photo");
+    let (status, _) = app
+        .bytes_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{src_id}/content"),
+            Some(&token),
+            doc.to_state_bytes(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let (status, body) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/documents/{src_id}/copy"),
+            Some(&token),
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, 201, "one uncopyable blob must not fail the copy: {body}");
+    let new_id = body["id"].as_str().unwrap().to_string();
+
+    // The image node survives with its alt text, still carrying the
+    // source reference (unrewritten) rather than a dangling new key.
+    let (kept_blob_id, kept_key) = only_blob_ref(&app, &token, &new_id).await;
+    assert_eq!(kept_blob_id, blob_id);
+    assert_eq!(
+        kept_key, src_key,
+        "an uncopyable blob keeps the source reference; the node is never dropped",
+    );
+
+    app.cleanup().await;
+}
+
 /// #59 T-6: a document's comment threads must appear in its exports.
 /// Import a doc, attach a document-level comment, then export as HTML and
 /// Markdown and assert the comment body + author + a "Comments" heading

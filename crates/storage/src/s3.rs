@@ -172,6 +172,37 @@ impl S3Client {
         Ok(())
     }
 
+    /// Server-side copy of one object to another key in the same bucket.
+    ///
+    /// This is S3's `CopyObject` — the bytes never travel through this
+    /// process, which matters because the callers copy user-uploaded
+    /// images that can be tens of megabytes. Used by the document-copy
+    /// path (`routes::documents::copy_document`) to re-home a source
+    /// document's blobs under the *copy's* `blobs/{doc_id}/` prefix, since
+    /// blob read authorization is keyed on the doc id embedded in the key.
+    ///
+    /// `CopySource` is a `bucket/key` path that S3 parses as a URL, so the
+    /// key half is percent-encoded here (see [`encode_copy_source_key`]);
+    /// the SDK does not do it for you, and a key containing a space or a
+    /// `+` would otherwise name a different — usually nonexistent —
+    /// object.
+    pub async fn copy_object(&self, src_key: &str, dest_key: &str) -> Result<(), S3Error> {
+        let copy_source = format!(
+            "{}/{}",
+            self.bucket,
+            encode_copy_source_key(src_key)
+        );
+        self.client
+            .copy_object()
+            .bucket(&self.bucket)
+            .copy_source(copy_source)
+            .key(dest_key)
+            .send()
+            .await
+            .map_err(|e| S3Error::Operation(e.into_service_error().to_string()))?;
+        Ok(())
+    }
+
     /// Check if an object exists.
     pub async fn object_exists(&self, key: &str) -> Result<bool, S3Error> {
         match self
@@ -195,6 +226,25 @@ impl S3Client {
     }
 }
 
+/// Percent-encode the key half of a `CopySource` header value.
+///
+/// Everything outside the RFC 3986 "unreserved" set is escaped, except
+/// `/` — the key's own path separators must survive as separators, and
+/// the `bucket/key` split happens before this is applied so an encoded
+/// slash here would corrupt the key rather than protect it.
+fn encode_copy_source_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    for byte in key.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum S3Error {
     #[error("presigning error: {0}")]
@@ -202,4 +252,23 @@ pub enum S3Error {
 
     #[error("S3 operation error: {0}")]
     Operation(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_copy_source_key;
+
+    #[test]
+    fn copy_source_key_encodes_specials_but_keeps_path_separators() {
+        assert_eq!(
+            encode_copy_source_key("blobs/doc-1/b_2/photo.png"),
+            "blobs/doc-1/b_2/photo.png",
+            "an already-safe key must pass through unchanged",
+        );
+        assert_eq!(
+            encode_copy_source_key("blobs/d/b/my photo+1.png"),
+            "blobs/d/b/my%20photo%2B1.png",
+            "space and plus must not be left to S3's URL parsing",
+        );
+    }
 }
