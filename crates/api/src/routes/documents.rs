@@ -1945,13 +1945,20 @@ async fn rehome_blob_refs_for_copy(
         return;
     }
     let mut rewritten = std::collections::HashMap::new();
+    let mut expected_gone: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     for (blob_id, key) in blob_refs {
         let src_prefix = format!("blobs/{src_doc_id}/{blob_id}/");
         let Some(filename) = key.strip_prefix(&src_prefix) else {
+            counter::inc(MetricKey::new(
+                "doc.copy_blob_skipped_total",
+                &[("reason", "foreign_prefix")],
+            ));
             tracing::warn!(
                 src_doc_id,
                 new_doc_id,
                 blob_id,
+                key = %key,
                 "copy: blob reference names a foreign prefix; left as-is (it was \
                  already unreadable) rather than copied into the new document",
             );
@@ -1967,12 +1974,20 @@ async fn rehome_blob_refs_for_copy(
                     blob_ref::blob_ref(&blob_id, &key),
                     blob_ref::blob_ref(&blob_id, &new_key),
                 );
+                expected_gone.insert((blob_id.clone(), key.clone()));
+                counter::inc(MetricKey::new("doc.copy_blob_copied_total", &[]));
             }
             Err(e) => {
+                counter::inc(MetricKey::new(
+                    "doc.copy_blob_skipped_total",
+                    &[("reason", "s3_copy_failed")],
+                ));
                 tracing::warn!(
                     src_doc_id,
                     new_doc_id,
                     blob_id,
+                    key = %key,
+                    new_key = %new_key,
                     error = %e,
                     "copy: S3 blob copy failed; the copied document keeps the source \
                      reference and that one image will not render",
@@ -1981,6 +1996,44 @@ async fn rehome_blob_refs_for_copy(
         }
     }
     blob_ref::rewrite_blob_refs(doc.inner(), &rewritten);
+
+    // `rewrite_blob_refs` matches on the *exact* `Image.src` string, and
+    // the keys above are rebuilt from the parsed halves rather than
+    // carried through from the document — `collect_blob_refs` returns
+    // `(blob_id, key)` and discards the original. That is sound only
+    // while every stored reference is canonically encoded, which holds
+    // for anything this system produced (`blob_ref` is the sole producer
+    // on both sides, and the frontend mirror is pinned to identical
+    // output by parity tests). It is not something we can *assume*,
+    // though: `put_content` accepts client-supplied Y.Doc bytes, and a
+    // hand-crafted `ogre-blob:b1/…%2f…` (lowercase escape) parses fine
+    // yet re-encodes to a different string — the object would be copied
+    // and the reference left pointing at the source, i.e. a blank image
+    // plus an orphan object.
+    //
+    // So rather than assume, verify: every reference we believed we
+    // rewrote must be gone from the document afterwards. Cheap (one
+    // in-memory walk, only when something was rewritten) and it turns a
+    // silent miss into a signal a repair job can act on.
+    if !expected_gone.is_empty() {
+        for (blob_id, key) in blob_ref::collect_blob_refs(doc.inner()) {
+            if expected_gone.contains(&(blob_id.clone(), key.clone())) {
+                counter::inc(MetricKey::new(
+                    "doc.copy_blob_skipped_total",
+                    &[("reason", "rewrite_missed")],
+                ));
+                tracing::warn!(
+                    src_doc_id,
+                    new_doc_id,
+                    blob_id,
+                    key = %key,
+                    "copy: blob object was copied but its reference did not rewrite \
+                     (non-canonically encoded Image.src); that image will not render \
+                     and the copied object is orphaned",
+                );
+            }
+        }
+    }
 }
 
 /// GET /documents/:id/export/:format -- export as html or markdown.
@@ -3829,15 +3882,6 @@ async fn copy_document(
         ogrenotes_collab::mail_merge::substitute_ydoc(og.inner_mut(), values);
     }
 
-    // The new id is minted here rather than just before `DocumentMeta`
-    // because the blob re-homing below has to know the destination prefix
-    // *before* the snapshot is encoded — the rewritten `Image.src` values
-    // are part of the bytes we persist. #140.
-    let new_doc_id = new_id();
-    rehome_blob_refs_for_copy(&state, &og, &src_id, &new_doc_id).await;
-
-    let snapshot = og.to_state_bytes();
-
     // Resolve destination: explicit folder gets the standard Edit check;
     // absent defaults to the caller's Private folder (per design-doc behavior).
     let user = state
@@ -3852,6 +3896,22 @@ async fn copy_document(
         }
         None => user.private_folder_id,
     };
+
+    // Everything above this line is authorization; everything below it
+    // writes. The new id is minted here — later than the rest of the
+    // metadata needs it — because blob re-homing has to know the
+    // destination prefix *before* the snapshot is encoded (the rewritten
+    // `Image.src` values are part of the bytes we persist), and re-homing
+    // is the first side effect this handler has on S3. Minting it any
+    // earlier puts `CopyObject` calls in front of `check_folder_access`,
+    // which lets a caller who will end up with a 403 duplicate every
+    // source blob into a prefix no document will ever reference — and
+    // nothing garbage-collects `blobs/`, so those objects are permanent.
+    // Keep the mint, the re-home, and `to_state_bytes` together and after
+    // the last authorization check. #140.
+    let new_doc_id = new_id();
+    rehome_blob_refs_for_copy(&state, &og, &src_id, &new_doc_id).await;
+    let snapshot = og.to_state_bytes();
 
     let now = now_usec();
     let title = req
