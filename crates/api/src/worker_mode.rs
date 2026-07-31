@@ -41,7 +41,7 @@ use ogrenotes_common::config::AppConfig;
 use ogrenotes_quip_import::{QuipClient, QuipError, QuipThread, QuipToken, TokenStore, walk_inventory};
 use ogrenotes_storage::dynamo::DynamoClient;
 use ogrenotes_storage::models::import::ImportStatus;
-use ogrenotes_storage::models::import_inventory::{FolderRow, ThreadRow, ThreadState};
+use ogrenotes_storage::models::import_inventory::{FolderRow, ReportNote, ThreadRow, ThreadState};
 use ogrenotes_storage::models::DocType;
 use ogrenotes_storage::repo::doc_repo::DocRepo;
 use ogrenotes_storage::repo::folder_repo::FolderRepo;
@@ -1036,7 +1036,7 @@ async fn run_inventory(
     .await
     {
         Ok(inv) => inv,
-        Err(e) => return mark_quip_failure(ctx, import_id, &e).await,
+        Err(e) => return mark_quip_failure(ctx, import_id, owner_id, &e).await,
     };
 
     // Heartbeat between the folder walk and the thread-meta fetch so a
@@ -1067,7 +1067,7 @@ async fn run_inventory(
     // (insert-if-absent → a re-run never downgrades an advanced thread).
     let meta = match fetch_thread_meta(&client, &token, &inv, ctx, import_id, instance).await {
         Ok(m) => m,
-        Err(e) => return mark_quip_failure(ctx, import_id, &e).await,
+        Err(e) => return mark_quip_failure(ctx, import_id, owner_id, &e).await,
     };
     for t in &inv.threads {
         let m = meta.get(&t.quip_thread_id);
@@ -1115,29 +1115,162 @@ async fn run_inventory(
 
 // ─── Phase 2a: the per-thread content pass ───────────────────────
 
+/// How many *observed, thread-attributable* failures one thread gets before
+/// the content pass marks it `Failed` and moves on (issue #142).
+///
+/// Sits deliberately below the job-level [`MAX_RETRIES`] budget. The queue
+/// gives a `StartQuipImport` job four runs (attempt 0 plus three retries);
+/// a bad thread is charged one attempt per run, so it is resolved on run 3
+/// and the fourth run is slack. Raising this past `MAX_RETRIES` would put the
+/// give-up decision *after* the dead-letter, which is #142 renamed rather
+/// than fixed.
+const MAX_THREAD_ATTEMPTS: u32 = 3;
+
+/// Consecutive [`ThreadImportError::Transient`] thread failures — with no
+/// intervening success or decided outcome — that convince the pass it is
+/// looking at a broken *Quip*, not a broken thread, and that it should stop
+/// and let the queue's backoff run.
+///
+/// Without this, a Quip-wide 5xx outage would walk the entire manifest
+/// charging an attempt to every thread, and three such runs would mark a
+/// 10 000-thread import `Failed` thread by thread over an outage that lasted
+/// an hour. The breaker bounds that blast radius to a handful of threads
+/// while leaving the scattered-bad-thread case (#142's actual shape, where
+/// good threads sit between bad ones and reset the counter) untouched.
+const MAX_CONSECUTIVE_THREAD_FAILURES: usize = 5;
+
+/// The complete set of `REPORT` row keys this worker writes.
+///
+/// One module so the set is countable by reading one place.
+/// [`ReportNote::kind`] is a free-form `String` budgeted at
+/// `REPORT_MAX_NOTE_KINDS` (8) **distinct kinds per import** — past that a new
+/// kind's notes are dropped outright, not merely truncated — so a kind names
+/// an *outcome*, never a cause, and the cause lives in `detail`. Splitting
+/// `image_dropped` into `image_dropped_403` / `image_dropped_too_large` twice
+/// over is all it would take to silently starve the kind whose job is to name
+/// the lost documents. Three kinds here leaves headroom for the passes still
+/// to come (link fallbacks, section-map losses).
+///
+/// Counters are uncapped in value and bounded only by the number of distinct
+/// keys, which is this compile-time set.
+mod report {
+    /// One note kind per outcome. Cause goes in `ReportNote::detail`.
+    pub const KIND_THREAD_SKIPPED: &str = "thread_skipped";
+    pub const KIND_THREAD_FAILED: &str = "thread_failed";
+    pub const KIND_IMAGE_DROPPED: &str = "image_dropped";
+
+    pub const THREADS_IMPORTED: &str = "threads_imported";
+    pub const THREADS_SKIPPED_CHAT: &str = "threads_skipped_chat";
+    pub const THREADS_SKIPPED_FORBIDDEN: &str = "threads_skipped_forbidden";
+    pub const THREADS_FAILED: &str = "threads_failed";
+    pub const IMAGES_DROPPED: &str = "images_dropped";
+    pub const FOLDERS_FORBIDDEN: &str = "folders_forbidden";
+}
+
+/// Write one outcome to the import's `REPORT` row.
+///
+/// **Advisory by construction: this returns nothing, so it cannot enter the
+/// import's control flow.** A report describes an import; it must never be
+/// able to stop one. The failure this guards against is not hypothetical — a
+/// `REPORT` row whose `counters` map has been written with a non-numeric
+/// value fails `report_from_item` on *every* subsequent read, so both
+/// `bump_report_counter` and `append_report_note` fail permanently for that
+/// import. Propagating that would halt a migration over its own bookkeeping:
+/// an import that dies because it could not write a note about a dying import
+/// is the worst outcome available. So each half is attempted independently
+/// (a poisoned counter must not also cost the note) and both are logged.
+async fn record_report(
+    ctx: &WorkerCtx,
+    import_id: &str,
+    owner_id: &str,
+    counter: &str,
+    note: Option<ReportNote>,
+) {
+    if let Err(e) = ctx.import_repo.bump_report_counter(import_id, owner_id, counter, 1).await {
+        tracing::warn!(
+            import_id,
+            counter,
+            error = %e,
+            "quip import: report counter write failed; the import continues",
+        );
+    }
+    let Some(note) = note else { return };
+    if let Err(e) = ctx.import_repo.append_report_note(import_id, owner_id, note).await {
+        tracing::warn!(
+            import_id,
+            error = %e,
+            "quip import: report note write failed; the import continues",
+        );
+    }
+}
+
+/// A short, class-only description of a [`QuipError`], safe to persist in a
+/// user-visible `THREAD#.reason` or [`ReportNote::detail`].
+///
+/// Deliberately **not** the error's `Display`. Two variants carry text this
+/// codebase did not author: `Api::message` is Quip's raw response body, and
+/// `Parse` / `Http` wrap reqwest's own message (which embeds the request
+/// URL). Neither can be shown to be free of a credential or a user
+/// identifier, and both would land in DynamoDB and from there in the
+/// frontend's report. The status code is the part that is simultaneously safe
+/// and diagnostic, so it is the only part that survives into durable state;
+/// the full `Display` still goes to the process log, which is where an
+/// operator debugging one import looks.
+///
+/// `Unauthorized` and `Forbidden` never carry any text at all — asserted in
+/// `quip-import`'s client tests — but they are spelled out here rather than
+/// borrowed from `Display` so that no future variant can quietly inherit the
+/// permissive branch.
+fn safe_quip_reason(e: &QuipError) -> String {
+    match e {
+        QuipError::Unauthorized => "Quip rejected the import's credential (HTTP 401)".to_string(),
+        QuipError::Forbidden => "Quip denied access to this content (HTTP 403)".to_string(),
+        QuipError::RateLimited { .. } => "Quip rate-limited the import".to_string(),
+        QuipError::Http(_) => "the request to Quip failed (network error or timeout)".to_string(),
+        QuipError::Api { status, .. } => format!("Quip returned HTTP {status}"),
+        QuipError::Parse(_) => "Quip returned a response this import could not read".to_string(),
+    }
+}
+
 /// How one thread's import ended when it didn't succeed.
 ///
-/// The two dispositions are genuinely different — one is terminal for the
-/// whole run, the other wants a queue retry — so they're an enum rather than
-/// a `String` the caller would have to sniff.
+/// Four dispositions, because every failure has to answer two independent
+/// questions — *is the run still viable?* and *is this thread still viable?* —
+/// and a `String` would make the caller sniff for both.
 #[derive(Debug)]
 pub enum ThreadImportError {
-    /// The stored token was rejected. Terminal for this run: every remaining
-    /// thread would fail the same way, so the caller stops, flips the import
-    /// to `TokenRejected`, and returns `Ok(())` instead of burning the retry
-    /// budget hammering Quip with a dead credential.
+    /// HTTP 401 — the stored credential is dead, so every remaining thread
+    /// would fail identically. Terminal for this run: the caller flips it to
+    /// `TokenRejected` and returns `Ok(())` instead of burning the retry
+    /// budget hammering Quip with a revoked token.
     TokenRejected,
-    /// Anything else — a 5xx from Quip, a DynamoDB or S3 write failure. The
-    /// caller surfaces it as `Err` so the queue retries; the re-run resumes
-    /// at this thread because every earlier one is already `ContentDone`.
+    /// HTTP 403 on the thread itself. **Not** a dead credential — one
+    /// access-restricted document in an otherwise-readable account. This
+    /// is issue #141: mapping it to `TokenRejected` halted the whole import
+    /// and told the user to reconnect a token that was never the problem, so
+    /// the reconnect changed nothing and the re-run wedged on the same thread.
+    /// The thread is marked `Skipped` with this reason and the pass moves on;
+    /// no retry could change the answer.
+    Forbidden(String),
+    /// A failure this thread might survive on a later attempt — a Quip 5xx, a
+    /// timeout, an unreadable body. Charged to the thread's attempt counter;
+    /// past [`MAX_THREAD_ATTEMPTS`] the thread is marked `Failed` and the pass
+    /// moves on rather than stalling the other 999 documents behind it
+    /// (issue #142). The string is token-free — see [`safe_quip_reason`].
     Transient(String),
+    /// Not attributable to this thread at all: a DynamoDB or S3 failure, or
+    /// Quip throttling the whole import. Aborts the pass with `Err` so the
+    /// queue retries the job — the pre-#141 behavior, deliberately unchanged —
+    /// and deliberately **not** charged to the thread's attempt budget, which
+    /// would otherwise let a storage blip condemn an innocent thread.
+    RunFailure(String),
 }
 
 impl std::fmt::Display for ThreadImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TokenRejected => write!(f, "quip token rejected"),
-            Self::Transient(m) => write!(f, "{m}"),
+            Self::Forbidden(m) | Self::Transient(m) | Self::RunFailure(m) => write!(f, "{m}"),
         }
     }
 }
@@ -1145,11 +1278,14 @@ impl std::fmt::Display for ThreadImportError {
 impl From<QuipError> for ThreadImportError {
     fn from(e: QuipError) -> Self {
         match e {
-            // TODO(#141 Task 4): Forbidden should become a thread-skip, not
-            // a run-terminal TokenRejected. Behavior-preserving for now —
-            // Task 1 only splits the error type, disposition is Task 4's.
-            QuipError::Unauthorized | QuipError::Forbidden => Self::TokenRejected,
-            transient => Self::Transient(format!("quip: {transient}")),
+            QuipError::Unauthorized => Self::TokenRejected,
+            QuipError::Forbidden => Self::Forbidden(safe_quip_reason(&QuipError::Forbidden)),
+            // Throttling is never one thread's fault, and walking to the next
+            // thread would only spend more of the same exhausted budget.
+            // Abort and let the queue's backoff do the waiting — which is
+            // exactly what this did before #141, so nothing regresses.
+            e @ QuipError::RateLimited { .. } => Self::RunFailure(safe_quip_reason(&e)),
+            e => Self::Transient(safe_quip_reason(&e)),
         }
     }
 }
@@ -1232,10 +1368,35 @@ pub async fn build_folder_mapping(
 ///
 /// Resumable by construction — the per-thread `ContentDone` checkpoint is the
 /// unit of progress, so a retry re-lists the manifest and skips finished
-/// threads *before* spending a Quip request on them. Errors map exactly as the
-/// inventory walk's do: a rejected token is terminal for the run (`Ok(())`
-/// after flipping the status), anything else returns `Err` so the queue
-/// retries.
+/// threads *before* spending a Quip request on them.
+///
+/// **One bad thread must not cost the import.** The dispositions are:
+///
+/// | condition | disposition |
+/// |---|---|
+/// | 401 | run-terminal: status `TokenRejected`, `Ok(())` |
+/// | 403 on a thread | `Skipped` + report note, **continue** (#141) |
+/// | transient, under budget | charge an attempt, **continue**, `Err` at the end |
+/// | transient, over budget | `Failed` + report note, **continue** (#142) |
+/// | storage / S3 / rate limit | run-terminal: `Err`, queue retries |
+///
+/// The load-bearing subtlety is *why the pass continues after an under-budget
+/// transient failure instead of returning `Err` on the spot*, which is what it
+/// did before #142. The queue gives this job four runs ([`MAX_RETRIES`] plus
+/// the first attempt), and an abort-on-first-bad-thread run advances exactly
+/// **one** thread's attempt counter per run. One bad thread would resolve in
+/// three runs; *two* would need five, and the import would dead-letter with
+/// the second one still `Pending` — #142 renamed rather than fixed. By
+/// continuing, a single run charges an attempt to *every* bad thread it meets,
+/// so any number of them resolve within [`MAX_THREAD_ATTEMPTS`] runs and the
+/// job-level budget is never the binding constraint. The `Err` still happens,
+/// just at the end of the pass, so "a transient failure retries the job" is
+/// preserved exactly.
+///
+/// The counterweight is [`MAX_CONSECUTIVE_THREAD_FAILURES`]: continuing is
+/// right when the bad threads are scattered, and wrong when *everything* is
+/// failing, so a run of back-to-back transient failures stops the pass instead
+/// of charging an attempt to the whole manifest during a Quip outage.
 async fn run_content_pass(
     ctx: &WorkerCtx,
     import_id: &str,
@@ -1260,9 +1421,17 @@ async fn run_content_pass(
     // sorting makes that a guarantee rather than an incidental property.
     threads.sort_by(|a, b| a.quip_thread_id.cmp(&b.quip_thread_id));
 
+    // Set by the first under-budget transient failure and returned as `Err`
+    // once the whole manifest has been walked, so the queue still retries the
+    // job without the remaining threads paying for this one.
+    let mut retry_after_pass: Option<String> = None;
+    // Reset by any thread that reaches a *decided* outcome — imported,
+    // skipped, or given up on. Only unresolved failures accumulate.
+    let mut consecutive_failures: usize = 0;
+
     for thread in &threads {
         match import_one_thread(ctx, import_id, owner_id, client, token, thread, &folders).await {
-            Ok(()) => {}
+            Ok(()) => consecutive_failures = 0,
             Err(ThreadImportError::TokenRejected) => {
                 ctx.import_repo
                     .set_status(import_id, ImportStatus::TokenRejected)
@@ -1270,20 +1439,126 @@ async fn run_content_pass(
                     .ok();
                 tracing::warn!(
                     import_id,
-                    "quip content: token rejected (401/403); TokenRejected",
+                    thread = %thread.quip_thread_id,
+                    "quip content: credential rejected (401); TokenRejected",
                 );
                 return Ok(());
             }
-            Err(ThreadImportError::Transient(msg)) => {
+            // #141: one inaccessible document, not a dead credential. Skip it
+            // by name and keep importing — a retry could never widen the
+            // user's Quip permissions, so there is nothing to retry.
+            Err(ThreadImportError::Forbidden(reason)) => {
+                consecutive_failures = 0;
+                ctx.import_repo
+                    .set_thread_skipped(import_id, &thread.quip_thread_id, &reason)
+                    .await
+                    .map_err(|e| format!("skip forbidden thread: {e}"))?;
+                record_report(
+                    ctx,
+                    import_id,
+                    owner_id,
+                    report::THREADS_SKIPPED_FORBIDDEN,
+                    Some(ReportNote {
+                        quip_thread_id: thread.quip_thread_id.clone(),
+                        kind: report::KIND_THREAD_SKIPPED.to_string(),
+                        detail: reason.clone(),
+                    }),
+                )
+                .await;
+                tracing::info!(
+                    import_id,
+                    thread = %thread.quip_thread_id,
+                    "quip content: thread skipped (403); the import continues",
+                );
+            }
+            // Not this thread's fault. Unchanged from before #141: stop and
+            // let the queue retry the job.
+            Err(ThreadImportError::RunFailure(msg)) => {
                 tracing::warn!(
                     import_id,
                     thread = %thread.quip_thread_id,
                     error = %msg,
-                    "quip content: transient failure; will retry",
+                    "quip content: run-level failure; will retry",
                 );
                 return Err(format!("quip content transient error: {msg}"));
             }
+            Err(ThreadImportError::Transient(reason)) => {
+                // The counter lives on the `THREAD#` row (an atomic DynamoDB
+                // `ADD`), not in this loop, so it survives a worker restart,
+                // a lease takeover, and the queue's own redelivery.
+                let attempts = ctx
+                    .import_repo
+                    .bump_thread_attempts(import_id, &thread.quip_thread_id)
+                    .await
+                    .map_err(|e| format!("bump thread attempts: {e}"))?;
+                if attempts >= MAX_THREAD_ATTEMPTS {
+                    // #142: give up on the thread, NOT on the import. This
+                    // path deliberately does not return `Err`, so the job's
+                    // own retry budget is untouched and the pass can still
+                    // finish — "999 documents and a report line" rather than
+                    // "nothing after t0042".
+                    consecutive_failures = 0;
+                    let detail = format!("{reason}; gave up after {attempts} attempts");
+                    ctx.import_repo
+                        .set_thread_failed(import_id, &thread.quip_thread_id, &detail)
+                        .await
+                        .map_err(|e| format!("fail thread: {e}"))?;
+                    record_report(
+                        ctx,
+                        import_id,
+                        owner_id,
+                        report::THREADS_FAILED,
+                        Some(ReportNote {
+                            quip_thread_id: thread.quip_thread_id.clone(),
+                            kind: report::KIND_THREAD_FAILED.to_string(),
+                            detail,
+                        }),
+                    )
+                    .await;
+                    tracing::warn!(
+                        import_id,
+                        thread = %thread.quip_thread_id,
+                        attempts,
+                        error = %reason,
+                        "quip content: thread failed too many times; marked Failed and skipped",
+                    );
+                } else {
+                    consecutive_failures += 1;
+                    tracing::warn!(
+                        import_id,
+                        thread = %thread.quip_thread_id,
+                        attempts,
+                        error = %reason,
+                        "quip content: thread failed; will retry it on a later run",
+                    );
+                    retry_after_pass.get_or_insert(format!(
+                        "thread {} failed ({reason}); attempt {attempts} of {MAX_THREAD_ATTEMPTS}",
+                        thread.quip_thread_id,
+                    ));
+                    if consecutive_failures >= MAX_CONSECUTIVE_THREAD_FAILURES {
+                        tracing::warn!(
+                            import_id,
+                            consecutive_failures,
+                            "quip content: too many consecutive thread failures; \
+                             treating this as a Quip-wide outage and retrying the job",
+                        );
+                        return Err(format!(
+                            "quip content transient error: {consecutive_failures} consecutive \
+                             thread failures (last: {reason})",
+                        ));
+                    }
+                }
+            }
         }
+    }
+
+    // Every thread was reached, but at least one is still `Pending` and under
+    // its attempt budget. Fail the job so the queue retries it; the re-run
+    // skips everything already `ContentDone`/`Skipped`/`Failed` without a
+    // single Quip call and picks up exactly where this one left off.
+    if let Some(reason) = retry_after_pass {
+        tracing::warn!(import_id, reason = %reason, "quip content: pass incomplete; will retry");
+        return Err(format!("quip content transient error: {reason}"));
     }
 
     ctx.import_repo
@@ -1344,8 +1619,9 @@ pub async fn import_one_thread(
         PendingLinkItem, SecMapRow, UnresolvedRow, SECMAP_CHUNK_ENTRIES,
     };
 
-    // 1. Already done (or deliberately skipped) — no refetch. This is the
-    //    resumability guarantee, and it must come before any network call.
+    // 1. Already done (or deliberately skipped, or given up on) — no refetch.
+    //    This is the resumability guarantee, and it must come before any
+    //    network call.
     if thread.state != ThreadState::Pending {
         return Ok(());
     }
@@ -1356,7 +1632,12 @@ pub async fn import_one_thread(
             ctx.import_repo
                 .set_thread_skipped(import_id, &thread.quip_thread_id, "chat thread")
                 .await
-                .map_err(|e| ThreadImportError::Transient(format!("skip thread: {e}")))?;
+                .map_err(|e| ThreadImportError::RunFailure(format!("skip thread: {e}")))?;
+            // Counted but not *named*: chats are an expected bulk category, and
+            // a chat-heavy import would otherwise spend the whole
+            // `thread_skipped` note budget on them and name none of the
+            // documents it actually lost.
+            record_report(ctx, import_id, owner_id, report::THREADS_SKIPPED_CHAT, None).await;
             tracing::info!(
                 import_id,
                 thread = %thread.quip_thread_id,
@@ -1377,7 +1658,7 @@ pub async fn import_one_thread(
     ctx.s3
         .put_object(&staged_key, html.clone().into_bytes())
         .await
-        .map_err(|e| ThreadImportError::Transient(format!("stage html: {e}")))?;
+        .map_err(|e| ThreadImportError::RunFailure(format!("stage html: {e}")))?;
 
     // 5. Walk it.
     let quip_doc = ogrenotes_collab::import_quip::from_quip_html(&html);
@@ -1398,10 +1679,19 @@ pub async fn import_one_thread(
                 &ogrenotes_common::id::new_id(),
             )
             .await
-            .map_err(|e| ThreadImportError::Transient(format!("reserve doc id: {e}")))?,
+            .map_err(|e| ThreadImportError::RunFailure(format!("reserve doc id: {e}")))?,
     };
-    let src_updates =
-        sideload_images(ctx, client, token, thread, &doc_id, &quip_doc.images).await?;
+    let src_updates = sideload_images(
+        ctx,
+        import_id,
+        owner_id,
+        client,
+        token,
+        thread,
+        &doc_id,
+        &quip_doc.images,
+    )
+    .await?;
     ogrenotes_collab::blob_ref::set_image_srcs(&quip_doc.doc, &src_updates);
 
     // 7. Persist through the ordinary document-creation path, preserving
@@ -1424,7 +1714,7 @@ pub async fn import_one_thread(
         OnExistingDoc::ReconcileReservedId,
     )
     .await
-    .map_err(ThreadImportError::Transient)?;
+    .map_err(ThreadImportError::RunFailure)?;
 
     // 8. Section map, chunked — a thread with thousands of anchors would
     //    otherwise blow DynamoDB's per-item size cap.
@@ -1440,7 +1730,7 @@ pub async fn import_one_thread(
                 },
             )
             .await
-            .map_err(|e| ThreadImportError::Transient(format!("put secmap: {e}")))?;
+            .map_err(|e| ThreadImportError::RunFailure(format!("put secmap: {e}")))?;
     }
 
     // 9. Cross-thread links, for Phase 2b to back-patch. A link-free thread
@@ -1464,14 +1754,16 @@ pub async fn import_one_thread(
                 },
             )
             .await
-            .map_err(|e| ThreadImportError::Transient(format!("put unresolved: {e}")))?;
+            .map_err(|e| ThreadImportError::RunFailure(format!("put unresolved: {e}")))?;
     }
 
     // 10. Checkpoint last — this is what a re-run reads to skip the thread.
     ctx.import_repo
         .set_thread_content_done(import_id, &thread.quip_thread_id, &doc_id, &staged_key)
         .await
-        .map_err(|e| ThreadImportError::Transient(format!("checkpoint thread: {e}")))?;
+        .map_err(|e| ThreadImportError::RunFailure(format!("checkpoint thread: {e}")))?;
+
+    record_report(ctx, import_id, owner_id, report::THREADS_IMPORTED, None).await;
 
     tracing::info!(
         import_id,
@@ -1491,12 +1783,26 @@ pub async fn import_one_thread(
 ///
 /// One unfetchable image must not cost the reader the whole document, so a
 /// failure maps that block to `None` (drop the `src`, keep the node and its
-/// `alt`) and the pass continues. The single exception is `Unauthorized`:
-/// that isn't "this image is broken", it's "the credential is dead", and
-/// every remaining fetch in the import would fail the same way — so it
-/// propagates and stops the run.
+/// `alt`), records the loss on the report, and the pass continues. The single
+/// exception is `Unauthorized`: that isn't "this image is broken", it's "the
+/// credential is dead", and every remaining fetch in the import would fail the
+/// same way — so it propagates and stops the run.
+///
+/// **A 403 is an image-drop, not a thread-skip.** It is tempting to treat
+/// blob-403 the way thread-403 is treated (#141's table reads that way), but
+/// the thread's HTML already came back `200`: the user can have this document,
+/// just not this one picture. Skipping the whole thread would lose strictly
+/// more than the policy every *other* blob failure already follows, and would
+/// make an attachment the user never had permission to see cost them the
+/// document they did.
+// `import_id`/`owner_id` ride along purely so an image drop can be recorded
+// on the REPORT row at the point the loss actually happens; same precedent as
+// `persist_imported_document` above.
+#[allow(clippy::too_many_arguments)]
 async fn sideload_images(
     ctx: &WorkerCtx,
+    import_id: &str,
+    owner_id: &str,
     client: &QuipClient,
     token: &QuipToken,
     thread: &ThreadRow,
@@ -1511,15 +1817,13 @@ async fn sideload_images(
                 "quip content: image src is not a Quip blob; dropping the src",
             );
             updates.insert(image.block_id.clone(), None);
+            drop_image(ctx, import_id, owner_id, thread, "the image was not a Quip attachment")
+                .await;
             continue;
         };
         let bytes = match client.blob(token, blob_thread_id, blob_id).await {
             Ok(bytes) => bytes,
-            // TODO(#141 Task 4): Forbidden should skip the image, not kill
-            // the thread's import. Behavior-preserving for now.
-            Err(QuipError::Unauthorized) | Err(QuipError::Forbidden) => {
-                return Err(ThreadImportError::TokenRejected);
-            }
+            Err(QuipError::Unauthorized) => return Err(ThreadImportError::TokenRejected),
             Err(e) => {
                 tracing::warn!(
                     thread = %thread.quip_thread_id,
@@ -1528,6 +1832,11 @@ async fn sideload_images(
                     "quip content: blob fetch failed; keeping the image's alt text only",
                 );
                 updates.insert(image.block_id.clone(), None);
+                // `safe_quip_reason`, not `e` — `QuipError::Api` carries
+                // Quip's raw response body, and this string becomes a durable,
+                // user-visible `ReportNote::detail`.
+                let detail = format!("image {blob_id}: {}", safe_quip_reason(&e));
+                drop_image(ctx, import_id, owner_id, thread, &detail).await;
                 continue;
             }
         };
@@ -1547,10 +1856,46 @@ async fn sideload_images(
                     "quip content: blob upload failed; keeping the image's alt text only",
                 );
                 updates.insert(image.block_id.clone(), None);
+                drop_image(
+                    ctx,
+                    import_id,
+                    owner_id,
+                    thread,
+                    &format!("image {blob_id}: it could not be stored"),
+                )
+                .await;
             }
         }
     }
     Ok(updates)
+}
+
+/// Record one dropped attachment on the report. Advisory, like every other
+/// [`record_report`] call — an image that could not be copied must not also
+/// take down the document it belonged to.
+///
+/// `detail` must be caller-authored or [`safe_quip_reason`]-derived text: it
+/// is persisted and shown to the user, so a raw `QuipError`/S3 error string
+/// (which can carry a response body or a signed URL) must never reach it.
+async fn drop_image(
+    ctx: &WorkerCtx,
+    import_id: &str,
+    owner_id: &str,
+    thread: &ThreadRow,
+    detail: &str,
+) {
+    record_report(
+        ctx,
+        import_id,
+        owner_id,
+        report::IMAGES_DROPPED,
+        Some(ReportNote {
+            quip_thread_id: thread.quip_thread_id.clone(),
+            kind: report::KIND_IMAGE_DROPPED.to_string(),
+            detail: detail.to_string(),
+        }),
+    )
+    .await;
 }
 
 /// Split a Quip image `src` into `(thread_id, blob_id)`.
@@ -1603,10 +1948,13 @@ fn blob_filename(alt: &str, blob_id: &str) -> String {
 ///   on retry. Flip status to `TokenRejected` and return `Ok(())` — terminal
 ///   for this run; the UI prompts a reconnect. Returning `Err` here would
 ///   burn the retry budget hammering Quip with a dead token.
-/// - `Forbidden` → treated the same as `Unauthorized` for now (see
-///   `QuipError::Forbidden`'s doc comment and issue #141 Task 4, which will
-///   give this a per-thread disposition instead during the content pass;
-///   the inventory walk itself has no per-thread granularity yet).
+/// - `Forbidden` → the credential is fine; a *selected root* is not readable.
+///   Still terminal for this run — `walk_inventory` fails a whole BFS level at
+///   once, so there is no per-folder granularity to skip with, and the content
+///   pass has nothing to run against. But it is terminal as `Failed`, **not**
+///   as `TokenRejected`: telling the user to reconnect a working token is
+///   issue #141's misleading diagnosis, and the reconnect wedges on the same
+///   folder. A report note names the cause instead.
 /// - transient (`RateLimited`/`Http`/`Api`/`Parse`) → return `Err` so the
 ///   queue's retry/reaper resumes the job. The walk restarts from scratch,
 ///   which insert-if-absent makes cheap and safe.
@@ -1615,15 +1963,44 @@ fn blob_filename(alt: &str, blob_id: &str) -> String {
 async fn mark_quip_failure(
     ctx: &WorkerCtx,
     import_id: &str,
+    owner_id: &str,
     err: &QuipError,
 ) -> Result<(), String> {
     match err {
-        QuipError::Unauthorized | QuipError::Forbidden => {
+        QuipError::Unauthorized => {
             ctx.import_repo
                 .set_status(import_id, ImportStatus::TokenRejected)
                 .await
                 .ok();
-            tracing::warn!(import_id, "quip inventory: token rejected (401/403); TokenRejected");
+            tracing::warn!(import_id, "quip inventory: credential rejected (401); TokenRejected");
+            Ok(())
+        }
+        QuipError::Forbidden => {
+            record_report(
+                ctx,
+                import_id,
+                owner_id,
+                report::FOLDERS_FORBIDDEN,
+                Some(ReportNote {
+                    // No single thread is to blame — the whole BFS level was
+                    // refused. The empty id is what "not thread-scoped" looks
+                    // like on a `ReportNote`.
+                    quip_thread_id: String::new(),
+                    kind: report::KIND_THREAD_SKIPPED.to_string(),
+                    detail: format!(
+                        "{}; a selected folder could not be read, so the import could not be \
+                         scoped",
+                        safe_quip_reason(err),
+                    ),
+                }),
+            )
+            .await;
+            ctx.import_repo.set_status(import_id, ImportStatus::Failed).await.ok();
+            tracing::warn!(
+                import_id,
+                "quip inventory: a selected root is not readable (403); Failed (not TokenRejected \
+                 — the credential is valid, so a reconnect would not help)",
+            );
             Ok(())
         }
         transient => {
