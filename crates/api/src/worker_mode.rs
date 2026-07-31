@@ -727,25 +727,40 @@ async fn persist_imported_document(
         };
         match existing {
             None => return Err(format!("create document: {create_err}")),
-            Some(_) => {
-                // Our own earlier attempt got this far. Re-assert the v1
-                // snapshot rather than assuming it landed: `create` writes
-                // the metadata row BEFORE the S3 object, so the one failure
-                // that leaves a row without a snapshot is exactly the one
-                // that would otherwise become permanent now that the retry
-                // reuses the id instead of minting a new one. The bytes are
-                // re-derived from the same staged HTML, so this is a
-                // rewrite, not an edit.
+            Some(existing) => {
+                // Our own earlier attempt got this far. Adopt it.
                 tracing::info!(
                     doc_id,
                     error = %create_err,
                     "import: document already exists under the reserved id; \
                      reconciling instead of creating a duplicate",
                 );
-                doc_repo
-                    .save_snapshot(doc_id, snapshot, meta.snapshot_version, updated_at, owner_id)
-                    .await
-                    .map_err(|e| format!("re-assert reserved document snapshot: {e}"))?;
+                // Re-assert the initial snapshot rather than assuming it
+                // landed: `create` writes the metadata row BEFORE the S3
+                // object, so the one failure that leaves a row without a
+                // readable snapshot is exactly the one that would become
+                // permanent now that the retry reuses the id. The bytes are
+                // re-derived from the same staged source, so this is a
+                // rewrite, not an edit.
+                //
+                // Unless the document has moved on: a version past the one
+                // this import writes means something edited it between the
+                // attempts, and re-asserting v1 would silently discard that.
+                // A duplicate is the bug being fixed; eating a user's edit
+                // would be a worse one.
+                if existing.snapshot_version > meta.snapshot_version {
+                    tracing::warn!(
+                        doc_id,
+                        version = existing.snapshot_version,
+                        "import: reserved document was edited between attempts; \
+                         leaving its content alone",
+                    );
+                } else {
+                    doc_repo
+                        .save_snapshot(doc_id, snapshot, meta.snapshot_version, updated_at, owner_id)
+                        .await
+                        .map_err(|e| format!("re-assert reserved document snapshot: {e}"))?;
+                }
             }
         }
     }
