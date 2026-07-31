@@ -729,6 +729,7 @@ dependencies = [
  "pin-utils",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3925,8 +3926,11 @@ dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
+ "aws-smithy-runtime",
+ "aws-smithy-types",
  "base64 0.22.1",
  "chrono",
+ "http 1.4.0",
  "ogrenotes-common",
  "proptest",
  "serde",

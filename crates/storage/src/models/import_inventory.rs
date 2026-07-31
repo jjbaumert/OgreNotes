@@ -155,7 +155,45 @@ pub struct PendingLinkItem {
 /// Unlike `SECMAP#`/`UNRESOLVED#` this row is deliberately **not** chunked.
 /// A bounded list is the right shape for something a human reads: nobody
 /// scrolls 10 000 failure lines, and the counters carry the true totals.
+///
+/// This is the hard item-size backstop. What actually binds first is the
+/// per-kind budget below — see [`REPORT_MAX_NOTES_PER_KIND`].
 pub const REPORT_MAX_NOTES: usize = 200;
+
+/// How many distinct [`ReportNote::kind`]s may claim a budget on one
+/// report. `kind` is a free-form `String`, so without this a caller bug
+/// (a thread id leaking into the kind) would mint unbounded budgets and
+/// walk the row straight back into the 400 KB failure this module exists
+/// to prevent. Notes whose kind arrives after the limit is reached are
+/// dropped and counted, like any other over-budget note.
+pub const REPORT_MAX_NOTE_KINDS: usize = 8;
+
+/// How many notes each distinct `kind` may occupy.
+///
+/// **The per-kind budget is what stops one noisy kind from starving the
+/// rest.** A flat first-come cap is monopolizable: an import that drops
+/// 500 images before it reaches its first inaccessible thread would spend
+/// every slot on `image_dropped` notes, and the artifact whose job is to
+/// name the lost *documents* would name none.
+///
+/// The budget is **fixed and non-transferable — an unused budget stays
+/// unused.** That is deliberate, not an oversight: lending spare capacity
+/// to whichever kind shows up first is exactly what would starve a kind
+/// that appears late, and lateness is the normal case (image drops happen
+/// throughout; a thread-level failure may not happen until the last
+/// thread). Guaranteeing a floor for a kind you have not seen yet is only
+/// possible if you refuse to give its slots away. The cost is that a
+/// single-kind import shows 25 examples rather than 200; the counters,
+/// which are uncapped, still carry the true totals.
+pub const REPORT_MAX_NOTES_PER_KIND: usize = 25;
+
+// The per-kind budgets must fit inside the item-size cap; otherwise the
+// budgets would be the thing that blows the 400 KB item. Compile-time so
+// that retuning any of the three constants can't silently break it.
+const _: () = assert!(
+    REPORT_MAX_NOTE_KINDS * REPORT_MAX_NOTES_PER_KIND <= REPORT_MAX_NOTES,
+    "per-kind note budgets must fit within REPORT_MAX_NOTES"
+);
 
 /// The import's accumulating outcome report: counters plus a bounded list
 /// of named losses and fallbacks. SK = `REPORT`, one row per import.
@@ -209,16 +247,43 @@ impl ReportRow {
         }
     }
 
-    /// Record one note, honoring the cap: past [`REPORT_MAX_NOTES`] the
-    /// note is discarded and only `notes_dropped` advances. Keeping this
-    /// decision in Rust (rather than in a DynamoDB condition expression)
-    /// is what makes the bound testable without live infrastructure.
+    /// Record one note, honoring the budgets. A note is kept only if all
+    /// three hold; otherwise it is discarded and `notes_dropped` advances:
+    ///
+    /// 1. its kind is under [`REPORT_MAX_NOTES_PER_KIND`] — no kind may
+    ///    starve another (this is the one that normally binds),
+    /// 2. its kind is already present, or there is room for a new one under
+    ///    [`REPORT_MAX_NOTE_KINDS`],
+    /// 3. the row is under [`REPORT_MAX_NOTES`] overall — the item-size
+    ///    backstop, unreachable while (1) and (2) hold given the current
+    ///    constants, and kept precisely so that retuning them can never
+    ///    make the 400 KB bound the thing that gives way.
+    ///
+    /// Keeping this decision in Rust (rather than in a DynamoDB condition
+    /// expression) is what makes the bounds testable without live
+    /// infrastructure.
     pub fn push_note(&mut self, note: ReportNote) {
-        if self.notes.len() >= REPORT_MAX_NOTES {
+        let same_kind = self.notes.iter().filter(|n| n.kind == note.kind).count();
+        let over_budget = same_kind >= REPORT_MAX_NOTES_PER_KIND
+            || (same_kind == 0 && self.distinct_kinds() >= REPORT_MAX_NOTE_KINDS)
+            || self.notes.len() >= REPORT_MAX_NOTES;
+        if over_budget {
             self.notes_dropped = self.notes_dropped.saturating_add(1);
             return;
         }
         self.notes.push(note);
+    }
+
+    /// Number of distinct `kind`s currently represented in `notes`. Linear
+    /// over a list bounded at [`REPORT_MAX_NOTES`], so the cost is a
+    /// few-hundred-element scan per note — irrelevant next to the DynamoDB
+    /// round trip that follows it.
+    fn distinct_kinds(&self) -> usize {
+        self.notes
+            .iter()
+            .map(|n| n.kind.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
     }
 
     /// Add `by` to `key`, creating it at zero first. Saturating: a counter
@@ -267,27 +332,39 @@ mod tests {
         assert_eq!(ReportRow::sk(), "REPORT");
     }
 
-    /// The load-bearing bound: past [`REPORT_MAX_NOTES`] the note list
-    /// stops growing (so the item can't outgrow DynamoDB's 400 KB cap and
-    /// take the whole report down with it) while the counters keep the
-    /// true total — that's what lets the report say "and N more".
+    fn note(kind: &str, i: usize) -> ReportNote {
+        ReportNote {
+            quip_thread_id: format!("qt{i:04}"),
+            kind: kind.to_string(),
+            detail: "403 forbidden".into(),
+        }
+    }
+
+    fn count_kind(row: &ReportRow, kind: &str) -> usize {
+        row.notes.iter().filter(|n| n.kind == kind).count()
+    }
+
+    /// The load-bearing bound: past its budget a kind's note list stops
+    /// growing (so the item can't outgrow DynamoDB's 400 KB cap and take
+    /// the whole report down with it) while the counters keep the true
+    /// total — that's what lets the report say "and N more".
     #[test]
     fn notes_truncate_at_the_cap_while_counters_keep_counting() {
         const OVERFLOW: usize = 50;
         let mut row = ReportRow::new("u1");
-        for i in 0..REPORT_MAX_NOTES + OVERFLOW {
-            row.push_note(ReportNote {
-                quip_thread_id: format!("qt{i}"),
-                kind: "failed".into(),
-                detail: "403 forbidden".into(),
-            });
+        for i in 0..REPORT_MAX_NOTES_PER_KIND + OVERFLOW {
+            row.push_note(note("failed", i));
             row.bump_counter("threads_failed", 1);
         }
 
-        assert_eq!(row.notes.len(), REPORT_MAX_NOTES, "notes must stop at the cap");
+        assert_eq!(
+            row.notes.len(),
+            REPORT_MAX_NOTES_PER_KIND,
+            "notes must stop at the kind's budget"
+        );
         assert_eq!(
             row.counters.get("threads_failed"),
-            Some(&((REPORT_MAX_NOTES + OVERFLOW) as u64)),
+            Some(&((REPORT_MAX_NOTES_PER_KIND + OVERFLOW) as u64)),
             "the counter must keep counting past the cap",
         );
         assert!(
@@ -301,26 +378,104 @@ mod tests {
         );
         // The retained notes are the FIRST ones, not the last: the earliest
         // failures are the ones a user debugs from.
-        assert_eq!(row.notes[0].quip_thread_id, "qt0");
+        assert_eq!(row.notes[0].quip_thread_id, "qt0000");
         assert_eq!(
-            row.notes[REPORT_MAX_NOTES - 1].quip_thread_id,
-            format!("qt{}", REPORT_MAX_NOTES - 1)
+            row.notes[REPORT_MAX_NOTES_PER_KIND - 1].quip_thread_id,
+            format!("qt{:04}", REPORT_MAX_NOTES_PER_KIND - 1)
         );
     }
 
-    /// Below the cap, nothing is dropped and no truncation is claimed.
+    /// Below the budget, nothing is dropped and no truncation is claimed.
     #[test]
     fn notes_below_the_cap_are_all_kept_and_not_marked_truncated() {
         let mut row = ReportRow::new("u1");
-        for i in 0..REPORT_MAX_NOTES {
-            row.push_note(ReportNote {
-                quip_thread_id: format!("qt{i}"),
-                kind: "skipped".into(),
-                detail: "chat thread".into(),
-            });
+        for i in 0..REPORT_MAX_NOTES_PER_KIND {
+            row.push_note(note("skipped", i));
         }
-        assert_eq!(row.notes.len(), REPORT_MAX_NOTES);
-        assert_eq!(row.notes_dropped, 0, "an exactly-full list is not truncated");
+        assert_eq!(row.notes.len(), REPORT_MAX_NOTES_PER_KIND);
+        assert_eq!(row.notes_dropped, 0, "an exactly-full budget is not truncated");
+    }
+
+    /// The starvation case, and the reason the budget is per-kind rather
+    /// than first-come: an import drops a pile of images long before it
+    /// reaches its first inaccessible document. Under a flat cap the
+    /// images take every slot and the report — whose whole job is to name
+    /// the *documents* you lost — names none of them.
+    #[test]
+    fn a_noisy_kind_cannot_starve_the_notes_that_name_lost_documents() {
+        let mut row = ReportRow::new("u1");
+        // Far more image drops than the whole row could ever hold, all
+        // arriving before the first thread-level failure.
+        for i in 0..REPORT_MAX_NOTES * 3 {
+            row.push_note(note("image_dropped", i));
+        }
+        row.push_note(note("skipped", 9_000));
+        row.push_note(note("failed", 9_001));
+
+        assert_eq!(
+            count_kind(&row, "image_dropped"),
+            REPORT_MAX_NOTES_PER_KIND,
+            "a noisy kind is held to its own budget",
+        );
+        assert_eq!(
+            count_kind(&row, "skipped"),
+            1,
+            "a thread-level note arriving after the flood must still land",
+        );
+        assert_eq!(count_kind(&row, "failed"), 1);
+    }
+
+    /// Budgets are non-transferable in the other direction too: a kind
+    /// that never appears does not lend its slots to one that does.
+    #[test]
+    fn an_unused_budget_is_not_lent_to_a_noisy_kind() {
+        let mut row = ReportRow::new("u1");
+        for i in 0..REPORT_MAX_NOTES * 2 {
+            row.push_note(note("image_dropped", i));
+        }
+        assert_eq!(
+            row.notes.len(),
+            REPORT_MAX_NOTES_PER_KIND,
+            "one kind alone fills only its own budget, never the whole row",
+        );
+    }
+
+    /// `kind` is a free-form String, so a caller bug that mints a new kind
+    /// per note must not mint unbounded budgets with it. The row stays
+    /// inside the item-size cap and the overflow is counted.
+    #[test]
+    fn unbounded_distinct_kinds_cannot_grow_the_row_past_the_item_cap() {
+        let mut row = ReportRow::new("u1");
+        const ATTEMPTS: usize = 5_000;
+        for i in 0..ATTEMPTS {
+            // The pathological shape: the thread id leaks into the kind.
+            row.push_note(note(&format!("failed_qt{i}"), i));
+        }
+        assert_eq!(
+            row.notes.len(),
+            REPORT_MAX_NOTE_KINDS,
+            "only the first budgeted kinds get a slot",
+        );
+        assert!(row.notes.len() <= REPORT_MAX_NOTES);
+        assert_eq!(row.notes_dropped, (ATTEMPTS - REPORT_MAX_NOTE_KINDS) as u64);
+    }
+
+    /// The global item-size backstop is reachable when every budgeted kind
+    /// spends its full allowance: the row holds exactly the cap, no more.
+    #[test]
+    fn every_kind_at_full_budget_fills_the_row_to_exactly_the_item_cap() {
+        let mut row = ReportRow::new("u1");
+        for k in 0..REPORT_MAX_NOTE_KINDS {
+            for i in 0..REPORT_MAX_NOTES_PER_KIND {
+                row.push_note(note(&format!("kind{k}"), i));
+            }
+        }
+        assert_eq!(row.notes.len(), REPORT_MAX_NOTE_KINDS * REPORT_MAX_NOTES_PER_KIND);
+        assert!(
+            row.notes.len() <= REPORT_MAX_NOTES,
+            "the budgets must never sum past the item-size cap",
+        );
+        assert_eq!(row.notes_dropped, 0);
     }
 
     #[test]

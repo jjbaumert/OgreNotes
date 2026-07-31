@@ -15,7 +15,7 @@ use ogrenotes_common::time::now_usec;
 use ogrenotes_storage::dynamo::DynamoClient;
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
 use ogrenotes_storage::models::import_inventory::{
-    ReportNote, ReportRow, SecMapRow, ThreadRow, ThreadState, REPORT_MAX_NOTES,
+    ReportNote, ReportRow, SecMapRow, ThreadRow, ThreadState, REPORT_MAX_NOTES_PER_KIND,
 };
 use ogrenotes_storage::repo::import_repo::ImportRepo;
 
@@ -890,7 +890,7 @@ async fn report_notes_truncate_at_the_cap_while_counters_keep_counting() {
     repo.create(&record).await.expect("create");
     let owner = &record.owner_id;
 
-    for i in 0..REPORT_MAX_NOTES + OVERFLOW {
+    for i in 0..REPORT_MAX_NOTES_PER_KIND + OVERFLOW {
         repo.append_report_note(
             &record.import_id,
             owner,
@@ -906,6 +906,19 @@ async fn report_notes_truncate_at_the_cap_while_counters_keep_counting() {
             .await
             .expect("bump threads_failed");
     }
+    // A rare kind arriving after the flood must still land — the per-kind
+    // budget, end to end through Dynamo.
+    repo.append_report_note(
+        &record.import_id,
+        owner,
+        ReportNote {
+            quip_thread_id: "qt-late".to_string(),
+            kind: "skipped".to_string(),
+            detail: "chat thread".to_string(),
+        },
+    )
+    .await
+    .expect("append_report_note (late rare kind)");
 
     let row = repo
         .get_report(&record.import_id)
@@ -913,10 +926,19 @@ async fn report_notes_truncate_at_the_cap_while_counters_keep_counting() {
         .expect("get_report")
         .expect("row must exist");
 
-    assert_eq!(row.notes.len(), REPORT_MAX_NOTES, "the note list must stop at the cap");
+    assert_eq!(
+        row.notes.iter().filter(|n| n.kind == "failed").count(),
+        REPORT_MAX_NOTES_PER_KIND,
+        "the note list must stop at the kind's budget",
+    );
+    assert_eq!(
+        row.notes.iter().filter(|n| n.kind == "skipped").count(),
+        1,
+        "a noisy kind must not spend a rarer kind's budget",
+    );
     assert_eq!(
         row.counters["threads_failed"],
-        (REPORT_MAX_NOTES + OVERFLOW) as u64,
+        (REPORT_MAX_NOTES_PER_KIND + OVERFLOW) as u64,
         "the counter must keep counting past the cap",
     );
     assert!(

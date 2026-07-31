@@ -449,14 +449,39 @@ impl ImportRepo {
     /// `Ok(None)` when the import has nothing to report yet — the row is
     /// written lazily on the first counter or note, so its absence is the
     /// normal state of a clean import, not an error.
+    ///
+    /// **Strongly consistent**, unlike every other read in this repo.
+    /// `DynamoClient::get_item` never sets `ConsistentRead`, and the
+    /// default eventually-consistent read can serve a replica that has not
+    /// yet seen the last write — which would make
+    /// [`mutate_report`](Self::mutate_report)'s read-modify-write lose
+    /// increments *with no concurrency at all*: two `bump_report_counter`
+    /// calls milliseconds apart from the same single runner are enough. So
+    /// this reaches through `DynamoClient::inner()` for a raw builder, the
+    /// same escape hatch [`bump_thread_attempts`](Self::bump_thread_attempts)
+    /// uses.
+    ///
+    /// The consistency is on *this* method rather than only on the RMW
+    /// path deliberately: a second, quietly eventually-consistent reader
+    /// would be a loaded gun for the next person to build a mutation on
+    /// top of. One read path, correct by construction. The cost is one
+    /// extra RCU per read of a single small item — read once per counter
+    /// bump or note and once per wizard poll, which is nothing against the
+    /// per-thread Quip API calls happening alongside it.
     pub async fn get_report(&self, import_id: &str) -> Result<Option<ReportRow>, RepoError> {
         let pk = format!("IMPORT#{import_id}");
-        let item = self
+        let result = self
             .db
-            .get_item(&pk, ReportRow::sk())
+            .inner()
+            .get_item()
+            .table_name(self.db.table_name())
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S(ReportRow::sk().to_string()))
+            .consistent_read(true)
+            .send()
             .await
-            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
-        item.as_ref().map(report_from_item).transpose()
+            .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+        result.item.as_ref().map(report_from_item).transpose()
     }
 
     /// Add `by` to the named counter on the `REPORT` row, creating the row
@@ -464,6 +489,13 @@ impl ImportRepo {
     /// quotes; unlike `notes` they are unbounded in value and bounded only
     /// by the number of distinct keys the callers use, which is a small
     /// compile-time set.
+    ///
+    /// **Callers must treat a failure here as advisory.** The report
+    /// describes an import; it must never be able to *stop* one. A
+    /// corrupt or unwritable report row that propagated into the content
+    /// pass's control flow would halt a migration over its own bookkeeping
+    /// — the failure mode this whole row exists to remove. Log and carry
+    /// on. (Same for [`append_report_note`](Self::append_report_note).)
     pub async fn bump_report_counter(
         &self,
         import_id: &str,
@@ -478,14 +510,18 @@ impl ImportRepo {
     /// Append one named loss/fallback to the `REPORT` row, creating the row
     /// if needed.
     ///
-    /// Silently capped at
+    /// Silently budgeted, per `kind`, at
+    /// [`REPORT_MAX_NOTES_PER_KIND`](crate::models::import_inventory::REPORT_MAX_NOTES_PER_KIND)
+    /// and globally at
     /// [`REPORT_MAX_NOTES`](crate::models::import_inventory::REPORT_MAX_NOTES):
-    /// past the cap the note is dropped and only `notes_dropped` advances,
+    /// over budget the note is dropped and only `notes_dropped` advances,
     /// so a pathological import (every thread inaccessible) can't grow this
-    /// item past DynamoDB's 400 KB cap and lose the whole report. Callers
-    /// that need the true total must also
+    /// item past DynamoDB's 400 KB cap and lose the whole report, and a
+    /// high-frequency kind can't spend the slots a rarer one needs.
+    /// Callers that need the true total must also
     /// [`bump_report_counter`](Self::bump_report_counter) — the note list is
-    /// a sample, the counters are the tally.
+    /// a sample, the counters are the tally. Failures here are advisory,
+    /// exactly as for `bump_report_counter`.
     pub async fn append_report_note(
         &self,
         import_id: &str,
@@ -513,11 +549,22 @@ impl ImportRepo {
     ///
     /// Two caveats worth knowing even today. First, lease takeover after a
     /// stale heartbeat can briefly overlap two runners (see
-    /// `clear_runner_claim`'s owner check); a report write lost in that
-    /// window costs one line of an advisory report, never document data.
-    /// Second, this rewrites the whole item, so a mutation must never be
-    /// built from a stale in-memory `ReportRow` — always go through these
-    /// methods, which re-read first.
+    /// `clear_runner_claim`'s owner check — the superseded runner is still
+    /// executing and nothing revokes its ability to write; there is no
+    /// fencing token). What a lost update costs in that window is **not**
+    /// one line: this writes the whole item, so the loser's *entire*
+    /// mutation is dropped — every note **and every counter increment**
+    /// the other writer committed between our read and our put. The
+    /// counters are the worse half. They are what "…and 9 800 more" is
+    /// computed from, so a lost increment makes the report silently
+    /// **under-report** the losses — the exact failure this row exists to
+    /// prevent, arriving quietly and looking like good news. It is still
+    /// never document data: the report is derived from the `THREAD#` rows,
+    /// which are written by their own conditional/forward-only paths.
+    ///
+    /// Second, and for the same reason, a mutation must never be built
+    /// from a stale in-memory `ReportRow` — always go through these
+    /// methods, which re-read (consistently) first.
     async fn mutate_report(
         &self,
         import_id: &str,
@@ -1170,6 +1217,7 @@ fn report_from_item(item: &HashMap<String, AttributeValue>) -> Result<ReportRow,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_smithy_runtime::client::http::test_util::StaticReplayClient;
 
     fn record_fixture() -> ImportRecord {
         ImportRecord {
@@ -1472,10 +1520,10 @@ mod tests {
     /// that has to say "and N more".
     #[test]
     fn report_row_truncation_marker_survives_the_item_round_trip() {
-        use crate::models::import_inventory::REPORT_MAX_NOTES;
+        use crate::models::import_inventory::REPORT_MAX_NOTES_PER_KIND;
 
         let mut r = ReportRow::new("u1");
-        for i in 0..REPORT_MAX_NOTES + 3 {
+        for i in 0..REPORT_MAX_NOTES_PER_KIND + 3 {
             r.push_note(ReportNote {
                 quip_thread_id: format!("qt{i}"),
                 kind: "failed".into(),
@@ -1484,9 +1532,45 @@ mod tests {
             r.bump_counter("threads_failed", 1);
         }
         let back = report_from_item(&report_to_item(&r)).expect("from_item");
-        assert_eq!(back.notes.len(), REPORT_MAX_NOTES);
+        assert_eq!(back.notes.len(), REPORT_MAX_NOTES_PER_KIND);
         assert_eq!(back.notes_dropped, 3);
-        assert_eq!(back.counters["threads_failed"], (REPORT_MAX_NOTES + 3) as u64);
+        assert_eq!(
+            back.counters["threads_failed"],
+            (REPORT_MAX_NOTES_PER_KIND + 3) as u64
+        );
+    }
+
+    /// The per-kind budget has to survive the wire too: a reader that only
+    /// ever sees the persisted row must still find the rare kind's notes
+    /// among the noisy kind's.
+    #[test]
+    fn report_row_keeps_every_kind_across_the_item_round_trip() {
+        use crate::models::import_inventory::REPORT_MAX_NOTES_PER_KIND;
+
+        let mut r = ReportRow::new("u1");
+        for i in 0..REPORT_MAX_NOTES_PER_KIND * 4 {
+            r.push_note(ReportNote {
+                quip_thread_id: format!("qt{i}"),
+                kind: "image_dropped".into(),
+                detail: "blob 403".into(),
+            });
+        }
+        r.push_note(ReportNote {
+            quip_thread_id: "qt-late".into(),
+            kind: "skipped".into(),
+            detail: "403 forbidden".into(),
+        });
+
+        let back = report_from_item(&report_to_item(&r)).expect("from_item");
+        assert_eq!(
+            back.notes.iter().filter(|n| n.kind == "image_dropped").count(),
+            REPORT_MAX_NOTES_PER_KIND
+        );
+        assert_eq!(
+            back.notes.iter().filter(|n| n.kind == "skipped").count(),
+            1,
+            "the late, rare kind must still be on the persisted row"
+        );
     }
 
     /// A corrupt counter value must surface as a named `MissingField`
@@ -1508,6 +1592,110 @@ mod tests {
             }
             other => panic!("expected MissingField, got {other:?}"),
         }
+    }
+
+    /// A `DynamoClient` whose HTTP layer replays canned responses and
+    /// records the requests the SDK actually emitted. Lets a test assert on
+    /// request *shape* — the only way to pin `ConsistentRead`, since
+    /// DynamoDB Local serves every read from one store and so behaves
+    /// identically with and without it.
+    fn replaying_repo(responses: Vec<&str>) -> (ImportRepo, StaticReplayClient) {
+        use aws_smithy_runtime::client::http::test_util::ReplayEvent;
+        use aws_smithy_types::body::SdkBody;
+
+        let replay = StaticReplayClient::new(
+            responses
+                .into_iter()
+                .map(|body| {
+                    ReplayEvent::new(
+                        http::Request::builder()
+                            .uri("http://localhost/")
+                            .body(SdkBody::from("{}"))
+                            .unwrap(),
+                        http::Response::builder()
+                            .status(200)
+                            .body(SdkBody::from(body))
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+        );
+        let conf = aws_sdk_dynamodb::config::Builder::new()
+            .endpoint_url("http://localhost:9999")
+            .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+                "k", "s", None, None, "test",
+            ))
+            .http_client(replay.clone())
+            .behavior_version_latest()
+            .build();
+        let repo = ImportRepo::new(crate::dynamo::DynamoClient::new(
+            aws_sdk_dynamodb::Client::from_conf(conf),
+            "test-table".to_string(),
+        ));
+        (repo, replay)
+    }
+
+    /// The report's read-modify-write is only correct if its read is
+    /// **strongly consistent**. `DynamoClient::get_item` never sets
+    /// `ConsistentRead`, and under the default eventually-consistent read
+    /// two `bump_report_counter` calls milliseconds apart *from the same
+    /// single runner* can lose an increment: the second read may be served
+    /// by a replica that hasn't seen the first write. That is a lost update
+    /// with **no concurrency at all** — not the lease-overlap case — and a
+    /// lost counter increment makes the report silently under-report the
+    /// losses it exists to name.
+    ///
+    /// DynamoDB Local cannot express the difference (it serves every read
+    /// from one store), so the live integration tests pass either way. This
+    /// asserts the request the SDK actually puts on the wire instead.
+    #[tokio::test]
+    async fn the_report_read_modify_write_reads_consistently() {
+        let (repo, replay) = replaying_repo(vec![
+            // The existing row the RMW reads back...
+            r#"{"Item":{"owner_id":{"S":"u1"},"counters":{"M":{"threads_failed":{"N":"4"}}}}}"#,
+            // ...and the PutItem response.
+            "{}",
+        ]);
+
+        repo.bump_report_counter("imp1", "u1", "threads_failed", 1)
+            .await
+            .expect("bump_report_counter");
+
+        // Everything is read off the captured requests inline: they are
+        // smithy's own `Request` type, which this crate has no direct
+        // dependency on to name in a helper's signature.
+        let reqs: Vec<_> = replay.actual_requests().collect();
+        assert_eq!(reqs.len(), 2, "an RMW is exactly one read then one write");
+        let read_target = reqs[0].headers().get("x-amz-target").unwrap_or_default();
+        let read_body =
+            String::from_utf8(reqs[0].body().bytes().expect("in-memory body").to_vec())
+                .expect("utf-8 body");
+        let write_target = reqs[1].headers().get("x-amz-target").unwrap_or_default();
+        let write_body =
+            String::from_utf8(reqs[1].body().bytes().expect("in-memory body").to_vec())
+                .expect("utf-8 body");
+
+        assert!(
+            read_target.ends_with("GetItem"),
+            "first call must be the read: {read_target}"
+        );
+        assert!(
+            read_body.contains(r#""ConsistentRead":true"#),
+            "the RMW's read must be strongly consistent, else an increment can \
+             be lost with no concurrency at all: {read_body}",
+        );
+
+        // ...and the write really did merge what the read returned, rather
+        // than starting from an empty row.
+        assert!(
+            write_target.ends_with("PutItem"),
+            "second call must be the write: {write_target}"
+        );
+        assert!(
+            write_body.contains(r#""threads_failed":{"N":"5"}"#),
+            "the write must carry 4 + 1: {write_body}",
+        );
     }
 
     #[test]

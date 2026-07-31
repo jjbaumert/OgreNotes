@@ -22,3 +22,11 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Captures the HTTP requests the DynamoDB SDK actually emits, so a test can
+# assert on request *shape* — specifically that the REPORT read sets
+# ConsistentRead. DynamoDB Local can't express that difference (it serves
+# every read from one store), so this is the only way to pin it.
+aws-smithy-runtime = { version = "1", features = ["test-util", "client"] }
+aws-smithy-types = "1"
+http = "1"
+
