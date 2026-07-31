@@ -628,6 +628,12 @@ impl EditorView {
                     // Shift+Enter: insert a hard break (<br>) without splitting the block
                     event.prevent_default();
                     if let Some(sel) = read_dom_selection_from(&container2) {
+                        // #143: this arm splices the HardBreak in at a raw
+                        // position. At a structural seam `replace_in_doc`
+                        // can't descend into either neighbour and lands the
+                        // break as a direct child of the ListItem — the same
+                        // undeletable-orphan class as typing and paste.
+                        let sel = snap_selection_for_edit(&current_state.doc, sel);
                         let state_with_sel = EditorState {
                             selection: sel,
                             ..current_state
@@ -2139,6 +2145,132 @@ fn snap_selection_for_edit(doc: &super::model::Node, sel: Selection) -> Selectio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::model::Slice;
+
+    // ── #143: snap_selection_for_edit ──
+
+    /// doc > bulletList > listItem[ paragraph("Parent"), bulletList >
+    /// listItem > paragraph("Child") ]. Position 10 is the structural
+    /// seam between the item's paragraph (2..10) and its sub-list
+    /// (10..21); position 5 is ordinary text inside "Parent".
+    fn nested_list_doc() -> Node {
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::ListItem,
+                    Fragment::from(vec![
+                        Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("Parent")]),
+                        ),
+                        Node::element_with_content(
+                            NodeType::BulletList,
+                            Fragment::from(vec![Node::element_with_content(
+                                NodeType::ListItem,
+                                Fragment::from(vec![Node::element_with_content(
+                                    NodeType::Paragraph,
+                                    Fragment::from(vec![Node::text("Child")]),
+                                )]),
+                            )]),
+                        ),
+                    ]),
+                )]),
+            )]),
+        )
+    }
+
+    #[test]
+    fn snap_selection_for_edit_leaves_a_range_selection_alone() {
+        let doc = nested_list_doc();
+        // Even with one endpoint on the seam: a range means
+        // "replace what is selected", and both endpoints must stay put.
+        let sel = Selection::text(5, 10);
+        let snapped = snap_selection_for_edit(&doc, sel);
+        assert_eq!(snapped.anchor(), 5);
+        assert_eq!(snapped.head(), 10);
+    }
+
+    #[test]
+    fn snap_selection_for_edit_leaves_an_in_block_caret_alone() {
+        let doc = nested_list_doc();
+        for pos in [3, 5, 9, 13] {
+            let snapped = snap_selection_for_edit(&doc, Selection::cursor(pos));
+            assert_eq!(snapped.from(), pos, "caret at {pos} was moved");
+            assert!(snapped.empty());
+        }
+    }
+
+    #[test]
+    fn snap_selection_for_edit_snaps_a_seam_caret_into_the_preceding_block() {
+        let doc = nested_list_doc();
+        let snapped = snap_selection_for_edit(&doc, Selection::cursor(10));
+        assert_eq!(snapped.from(), 9, "end of the paragraph's content");
+        assert!(snapped.empty());
+    }
+
+    /// #143 sweep gap caught in review: `insertLineBreak` /
+    /// `insertSoftLineBreak` (Shift+Enter) was the only `beforeinput`
+    /// arm still splicing content in at a raw DOM position. At a seam
+    /// `replace_in_doc` can descend into neither neighbour, so the
+    /// HardBreak landed as a direct child of the ListItem. This mirrors
+    /// what that arm does, snap included.
+    #[test]
+    fn hard_break_at_nested_seam_stays_inside_the_paragraph() {
+        let hard_break = || {
+            Slice::new(
+                Fragment::from(vec![Node::element(NodeType::HardBreak)]),
+                0,
+                0,
+            )
+        };
+        let item_of = |state: &EditorState| {
+            state
+                .doc
+                .child(0)
+                .unwrap()
+                .child(0)
+                .unwrap()
+                .clone()
+        };
+
+        // Precondition: unsnapped, the break orphans into the ListItem.
+        let raw = EditorState::create_default(nested_list_doc());
+        let txn = raw.transaction().replace(10, 10, hard_break()).unwrap();
+        let orphaned = raw.clone().apply(txn);
+        assert_eq!(
+            item_of(&orphaned).child_count(),
+            3,
+            "precondition: a raw seam insert splices a bare HardBreak into the ListItem",
+        );
+
+        // Snapped, as the handler now does.
+        let state = EditorState::create_default(nested_list_doc());
+        let sel = snap_selection_for_edit(&state.doc, Selection::cursor(10));
+        let state = EditorState { selection: sel, ..state };
+        let from = state.selection.from();
+        let to = state.selection.to();
+        let txn = state
+            .transaction()
+            .replace(from, to, hard_break())
+            .unwrap();
+        let fixed = state.clone().apply(txn);
+
+        let item = item_of(&fixed);
+        assert_eq!(item.child_count(), 2, "paragraph + sub-list only");
+        let para = item.child(0).unwrap();
+        assert_eq!(para.node_type(), Some(NodeType::Paragraph));
+        assert_eq!(para.child_count(), 2, "text + the hard break");
+        assert_eq!(
+            para.child(1).unwrap().node_type(),
+            Some(NodeType::HardBreak)
+        );
+        assert_eq!(
+            item.child(1).unwrap().node_type(),
+            Some(NodeType::BulletList)
+        );
+    }
 
     #[test]
     fn is_safe_url_rejects_protocol_relative() {

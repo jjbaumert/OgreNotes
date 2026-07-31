@@ -1394,8 +1394,15 @@ fn last_textblock_in(node: &Node, offset: usize) -> Option<BlockInfo> {
 }
 
 /// Forwards half of [`resolve_block_for_edit`]: the first textblock in
-/// document order whose span has not already ended before `pos`. Only
-/// used when nothing precedes `pos` at all.
+/// **document order** whose span has not already ended before `pos`.
+///
+/// "First in document order", not "nearest" — this walks forward from
+/// the start of `children` and returns the first match, so it makes no
+/// adjacency guarantee. The two coincide for every position this is
+/// reachable from, because it is only consulted when *nothing* precedes
+/// `pos`: every candidate therefore lies at or after `pos`, and the
+/// first one found is the closest. Don't lean on it as a general
+/// "nearest textblock after a position" query.
 fn first_textblock_at_or_after(
     children: &[Node],
     pos: usize,
@@ -3252,12 +3259,109 @@ mod tests {
     /// the two positions must agree.
     #[test]
     fn join_forward_at_seam_matches_join_forward_at_preceding_block_end() {
+        // `two_para_doc` = doc[paragraph("Hello"), paragraph("World")].
+        // Paragraph 1 spans 0..7, so position 7 is the seam between the
+        // two blocks — resolved back to position 6, paragraph 1's
+        // content end, which is where forward-delete merges from.
+        assert!(find_block_at(&two_para_doc(), 7).is_none(), "precondition");
+
+        let seam = at_cursor(two_para_doc(), 7);
+        let end = at_cursor(two_para_doc(), 6);
+        let merged_from_seam = seam
+            .clone()
+            .apply(seam.transaction().join_forward().unwrap());
+        let merged_from_end = end
+            .clone()
+            .apply(end.transaction().join_forward().unwrap());
+
+        assert_eq!(merged_from_seam.doc.child_count(), 1);
+        assert_eq!(
+            merged_from_seam.doc.child(0).unwrap().text_content(),
+            "HelloWorld",
+        );
+        assert_eq!(shape(&merged_from_seam.doc), shape(&merged_from_end.doc));
+        assert_eq!(
+            merged_from_seam.selection.from(),
+            merged_from_end.selection.from(),
+        );
+    }
+
+    /// The nested-list shape, where forward-delete is a no-op for a
+    /// *different* reason: `join_forward`'s next-block probe is
+    /// `find_block_at(block_end + 1)`, whose `+1` assumes a single open
+    /// token between the caret's block and the next textblock. With a
+    /// sub-list below, the next textblock is two opens away, so the
+    /// probe lands on another seam and the whole command declines —
+    /// at the ordinary in-block position 9 just as much as at the seam.
+    /// Filed separately (#145); pinned here so a future fix moves the
+    /// seam and the block end together.
+    #[test]
+    fn join_forward_declines_equally_at_seam_and_block_end_in_nested_list() {
         let seam = at_cursor(nested_list_doc(), 10);
         let end = at_cursor(nested_list_doc(), 9);
+        assert!(end.transaction().join_forward().is_err(), "pre-existing #145");
         assert_eq!(
             seam.transaction().join_forward().is_err(),
             end.transaction().join_forward().is_err(),
         );
+    }
+
+    /// The one behavioural change this fix makes to `join_backward`,
+    /// pinned deliberately rather than left riding on "the suite is
+    /// green".
+    ///
+    /// With the caret at `doc.content_size()` and an *empty* trailing
+    /// block, the resolved position equals that block's `content_start`,
+    /// so the `pos != block.content_start` gate now passes and the empty
+    /// block merges upward. Previously `find_block_at` returned `None`,
+    /// `join_backward` errored, and `view.rs` fell through to
+    /// `delete(pos - 1, pos)` — a range straddling the paragraph's close
+    /// token, which changes nothing. Backspace at the end of a document
+    /// ending in a blank line was inert; now it removes the blank line
+    /// and leaves the caret at the end of the text above.
+    ///
+    /// This is the *only* delta: at a mid-document seam the resolved
+    /// position is the preceding block's content **end**, which still
+    /// fails the same gate.
+    #[test]
+    fn join_backward_at_content_size_merges_an_empty_trailing_block() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("A")]),
+                ),
+                Node::element(NodeType::Paragraph),
+            ]),
+        );
+        // Paragraph("A") 0..3, empty paragraph 3..5, content_size 5.
+        assert_eq!(doc.content_size(), 5);
+        assert!(find_block_at(&doc, 5).is_none(), "precondition: past the end");
+
+        let state = at_cursor(doc, 5);
+        let txn = state.transaction().join_backward().unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(new_state.doc.child_count(), 1, "blank line removed");
+        assert_eq!(new_state.doc.child(0).unwrap().text_content(), "A");
+        assert_eq!(new_state.selection.from(), 2, "caret at the end of \"A\"");
+        assert!(find_block_at(&new_state.doc, new_state.selection.from()).is_some());
+    }
+
+    /// The mirror of the above: at a *mid-document* seam the resolved
+    /// position is a content **end**, so `join_backward` still declines
+    /// and Backspace stays on its character-delete fallback. No
+    /// accidental block merges were introduced.
+    #[test]
+    fn join_backward_at_a_mid_document_seam_still_declines() {
+        for (doc, seam) in [(nested_list_doc(), 10), (sibling_items_doc(), 6)] {
+            assert!(find_block_at(&doc, seam).is_none(), "precondition {seam}");
+            assert!(
+                at_cursor(doc, seam).transaction().join_backward().is_err(),
+                "seam {seam} must not merge blocks",
+            );
+        }
     }
 
     /// Enter at a seam whose preceding block is a heading (the shape in
