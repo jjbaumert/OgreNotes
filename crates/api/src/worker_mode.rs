@@ -727,7 +727,7 @@ async fn persist_imported_document(
         };
         match existing {
             None => return Err(format!("create document: {create_err}")),
-            Some(existing) => {
+            Some(_) => {
                 // Our own earlier attempt got this far. Adopt it.
                 tracing::info!(
                     doc_id,
@@ -735,32 +735,8 @@ async fn persist_imported_document(
                     "import: document already exists under the reserved id; \
                      reconciling instead of creating a duplicate",
                 );
-                // Re-assert the initial snapshot rather than assuming it
-                // landed: `create` writes the metadata row BEFORE the S3
-                // object, so the one failure that leaves a row without a
-                // readable snapshot is exactly the one that would become
-                // permanent now that the retry reuses the id. The bytes are
-                // re-derived from the same staged source, so this is a
-                // rewrite, not an edit.
-                //
-                // Unless the document has moved on: a version past the one
-                // this import writes means something edited it between the
-                // attempts, and re-asserting v1 would silently discard that.
-                // A duplicate is the bug being fixed; eating a user's edit
-                // would be a worse one.
-                if existing.snapshot_version > meta.snapshot_version {
-                    tracing::warn!(
-                        doc_id,
-                        version = existing.snapshot_version,
-                        "import: reserved document was edited between attempts; \
-                         leaving its content alone",
-                    );
-                } else {
-                    doc_repo
-                        .save_snapshot(doc_id, snapshot, meta.snapshot_version, updated_at, owner_id)
-                        .await
-                        .map_err(|e| format!("re-assert reserved document snapshot: {e}"))?;
-                }
+                reassert_imported_snapshot(doc_repo, doc_id, snapshot, &meta, updated_at, owner_id)
+                    .await?;
             }
         }
     }
@@ -779,6 +755,84 @@ async fn persist_imported_document(
     }
 
     Ok(doc_id.to_string())
+}
+
+/// Re-write the initial snapshot of a document a previous import attempt
+/// already created, without clobbering anything written since.
+///
+/// Why re-write at all: `DocRepo::create` writes the metadata row BEFORE the
+/// S3 object, so a failure between the two leaves a row pointing at a snapshot
+/// that isn't there. Before the id was reserved, the retry minted a new id and
+/// that document was simply abandoned (a duplicate, but a readable one). Now
+/// the retry adopts the same id, so the unreadable state would become
+/// permanent unless the snapshot is re-asserted. The bytes are re-derived from
+/// the same staged source, so this is a rewrite, not an edit.
+///
+/// Why conditionally: if the document has been written since, re-asserting
+/// version 1 would silently discard that. Guarded by
+/// `save_snapshot_conditional`, whose `expected_version` check and version
+/// write are ONE conditional `UpdateItem` — a read-compare-write here would
+/// leave a window between the compare and the write.
+///
+/// # Known limitation — live editor edits are NOT detected
+///
+/// `snapshot_version` only advances when a *snapshot* is written. Edits made
+/// in the live editor persist as `UPDATE#` rows (see `routes::ws`) and do not
+/// bump it until compaction runs, so this function also refuses to re-assert
+/// when any `UPDATE#` row exists. That pair of checks covers both persistence
+/// shapes, but neither is atomic with respect to an edit landing *during* the
+/// re-assert: an update written between the check and the S3 put would be
+/// rebasing onto a Y.Doc whose client ids the re-write replaced. The exposure
+/// is one in-flight thread's document, seconds old, not yet surfaced to the
+/// user by the wizard — judged acceptable, and recorded here rather than left
+/// for the next reader to over-trust the version guard.
+async fn reassert_imported_snapshot(
+    doc_repo: &DocRepo,
+    doc_id: &str,
+    snapshot: &[u8],
+    meta: &ogrenotes_storage::models::document::DocumentMeta,
+    updated_at: i64,
+    owner_id: &str,
+) -> Result<(), String> {
+    // Any pending live-editor update means the document has content this
+    // snapshot doesn't know about. `1` is enough to answer "any?".
+    let pending = doc_repo
+        .get_pending_updates(doc_id, 1)
+        .await
+        .map_err(|e| format!("check reserved document for pending updates: {e}"))?;
+    if !pending.is_empty() {
+        tracing::warn!(
+            doc_id,
+            "import: reserved document has live edits pending; leaving its content alone",
+        );
+        return Ok(());
+    }
+
+    match doc_repo
+        .save_snapshot_conditional(
+            doc_id,
+            snapshot,
+            meta.snapshot_version,
+            meta.snapshot_version,
+            updated_at,
+            owner_id,
+        )
+        .await
+        .map_err(|e| format!("re-assert reserved document snapshot: {e}"))?
+    {
+        ogrenotes_storage::repo::doc_repo::SnapshotWrite::Committed => Ok(()),
+        // Someone advanced the version between the create attempt and here.
+        // Not an error — the document is further along than this import, which
+        // is exactly the state we refuse to overwrite.
+        ogrenotes_storage::repo::doc_repo::SnapshotWrite::VersionConflict => {
+            tracing::warn!(
+                doc_id,
+                "import: reserved document was written between attempts; \
+                 leaving its content alone",
+            );
+            Ok(())
+        }
+    }
 }
 
 /// How a `StartQuipImport` handler run ended, when it didn't error.
@@ -844,15 +898,86 @@ pub async fn execute_start_quip_import(
         return Ok(ImportRunOutcome::HeldByLiveRunner);
     }
 
-    // From here we OWN the lease. Clear it on EVERY exit — success OR error —
-    // so a mid-handler failure never leaves a held claim that would make the
-    // queue's retry (running under a *different* instance id) see a live
-    // lease, no-op, and get acked as success while the import stays stranded
-    // below phase 1. This mirrors what `mark_quip_failure` does for Quip
-    // errors, now applied uniformly to DDB-error `?`-returns too.
+    // From here we OWN the lease, and a background task refreshes it for
+    // exactly as long as we hold it (see [`LeaseHeartbeat`]).
+    let heartbeat = LeaseHeartbeat::spawn(Arc::clone(&ctx.import_repo), import_id, &instance);
+
+    // Clear the lease on EVERY exit — success OR error — so a mid-handler
+    // failure never leaves a held claim that would make the queue's retry
+    // (running under a *different* instance id) see a live lease, no-op, and
+    // leave the entry pending until the claim ages out. This mirrors what
+    // `mark_quip_failure` does for Quip errors, now applied uniformly to
+    // DDB-error `?`-returns too. Stop heartbeating FIRST, so a tick can't race
+    // in behind the clear and resurrect the lease.
     let result = run_inventory(ctx, import_id, owner_id, &instance).await;
-    ctx.import_repo.clear_runner_claim(import_id).await.ok();
+    drop(heartbeat);
+    match ctx.import_repo.clear_runner_claim(import_id, &instance).await {
+        // We were superseded mid-pass. Leaving the new holder's lease alone is
+        // the point of the owner check; say so, because it also means this
+        // run and another one overlapped.
+        Ok(false) => tracing::warn!(
+            import_id,
+            "quip import: lease was taken over mid-run; not clearing the new holder's claim",
+        ),
+        Ok(true) => {}
+        Err(e) => tracing::warn!(import_id, error = %e, "quip import: clearing the lease failed"),
+    }
     result.map(|()| ImportRunOutcome::Ran)
+}
+
+/// Keeps the DynamoDB runner lease fresh for as long as the handler holds it,
+/// from a background task, and stops on drop.
+///
+/// The lease is what stops two workers running the same import concurrently,
+/// and it is only as good as its refresh interval. Heartbeating from the work
+/// loop — every N threads — ties liveness to the *slowest unit of work*: one
+/// image-heavy thread whose `sideload_images` runs past [`CLAIM_STALE_MS`]
+/// makes a perfectly healthy runner look dead. That was survivable when a
+/// redelivered entry got acked away after the first attempt; now that the
+/// entry stays reclaimable for the whole pass (see
+/// [`JobDisposition::HeldByLiveRunner`]), a multi-hour import would get ~180
+/// chances to hand a second runner the lease — doubling Quip API calls against
+/// the per-import 45/min throttle.
+///
+/// A timer that runs independently of the work is the only shape that makes
+/// the refresh interval a property of the *clock* rather than of the workload.
+/// Ticks are best-effort: `heartbeat_runner` is conditional on still owning the
+/// lease, so a superseded runner's ticks are no-ops rather than a way to steal
+/// it back.
+struct LeaseHeartbeat(tokio::task::JoinHandle<()>);
+
+/// How often the background task refreshes the lease. A third of
+/// [`CLAIM_STALE_MS`] leaves room for two consecutive failed ticks (a DynamoDB
+/// blip) before the lease looks stale.
+const LEASE_HEARTBEAT_MS: u64 = (CLAIM_STALE_MS as u64) / 3;
+
+impl LeaseHeartbeat {
+    fn spawn(import_repo: Arc<ImportRepo>, import_id: &str, instance: &str) -> Self {
+        let (import_id, instance) = (import_id.to_string(), instance.to_string());
+        Self(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(LEASE_HEARTBEAT_MS));
+            // The first tick fires immediately; the claim we just took is
+            // already fresh, so skip it.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                import_repo
+                    .heartbeat_runner(
+                        &import_id,
+                        &instance,
+                        ogrenotes_common::time::now_usec() / 1000,
+                    )
+                    .await
+                    .ok();
+            }
+        }))
+    }
+}
+
+impl Drop for LeaseHeartbeat {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// The owned-lease body of the inventory handler. Split out so
@@ -983,16 +1108,10 @@ async fn run_inventory(
     // Phase 2 runs inside the same job, under the same lease and the same
     // per-import client, so a single `StartQuipImport` carries an import all
     // the way from "a list of Quip roots" to real documents.
-    run_content_pass(ctx, import_id, owner_id, &client, &token, instance, &record).await
+    run_content_pass(ctx, import_id, owner_id, &client, &token, &record).await
 }
 
 // ─── Phase 2a: the per-thread content pass ───────────────────────
-
-/// Threads processed between runner-lease heartbeats during the content
-/// pass. Each thread is at least one Quip round-trip plus several writes, so
-/// a batch of ten is well under [`CLAIM_STALE_MS`] in practice while keeping
-/// the extra DynamoDB write off the per-thread path.
-const CONTENT_HEARTBEAT_EVERY: usize = 10;
 
 /// How one thread's import ended when it didn't succeed.
 ///
@@ -1118,9 +1237,12 @@ async fn run_content_pass(
     owner_id: &str,
     client: &QuipClient,
     token: &QuipToken,
-    instance: &str,
     record: &ogrenotes_storage::models::import::ImportRecord,
 ) -> Result<(), String> {
+    // The runner lease is refreshed by `LeaseHeartbeat` on a wall-clock timer
+    // for the whole handler, so this loop deliberately does no heartbeating of
+    // its own — tying liveness to a per-N-threads tick made one slow thread
+    // look like a dead worker.
     let folders = build_folder_mapping(ctx, import_id, record).await?;
 
     let mut threads = ctx
@@ -1133,7 +1255,7 @@ async fn run_content_pass(
     // sorting makes that a guarantee rather than an incidental property.
     threads.sort_by(|a, b| a.quip_thread_id.cmp(&b.quip_thread_id));
 
-    for (i, thread) in threads.iter().enumerate() {
+    for thread in &threads {
         match import_one_thread(ctx, import_id, owner_id, client, token, thread, &folders).await {
             Ok(()) => {}
             Err(ThreadImportError::TokenRejected) => {
@@ -1156,12 +1278,6 @@ async fn run_content_pass(
                 );
                 return Err(format!("quip content transient error: {msg}"));
             }
-        }
-        if (i + 1) % CONTENT_HEARTBEAT_EVERY == 0 {
-            ctx.import_repo
-                .heartbeat_runner(import_id, instance, ogrenotes_common::time::now_usec() / 1000)
-                .await
-                .ok();
         }
     }
 

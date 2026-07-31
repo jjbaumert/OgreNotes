@@ -385,7 +385,16 @@ impl ImportRepo {
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
-    /// Advance the import's phase counter on `META`.
+    /// Advance the import's phase counter on `META`. **Forward-only**: a
+    /// write that would move `phase` backwards (or leave it unchanged) is a
+    /// no-op, not an error.
+    ///
+    /// The handler re-runs inventory from scratch on every retry, reaper
+    /// redelivery, or manual replay, and writes `phase = 1` when it finishes —
+    /// so an unconditional `SET` would regress a phase-2 import to 1 every
+    /// time it was replayed. Nothing reads `phase` as a *decreasing* signal, so
+    /// clamping it here removes the whole class rather than asking each caller
+    /// to check first.
     pub async fn set_phase(&self, import_id: &str, phase: u8) -> Result<(), RepoError> {
         let pk = format!("IMPORT#{import_id}");
         let mut values = HashMap::new();
@@ -394,15 +403,19 @@ impl ImportRepo {
             ":updated_at".to_string(),
             AttributeValue::N(ogrenotes_common::time::now_usec().to_string()),
         );
+        // A condition failure means the import is already at or past this
+        // phase — the desired end state either way.
         self.db
-            .update_item(
+            .update_item_conditional(
                 &pk,
                 ImportRecord::sk(),
                 "SET phase = :phase, updated_at = :updated_at",
+                "attribute_not_exists(phase) OR phase < :phase",
                 values,
                 None,
             )
             .await
+            .map(|_| ())
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
@@ -501,15 +514,30 @@ impl ImportRepo {
     }
 
     /// Release the lease (e.g. worker exiting cleanly) so the next claim
-    /// doesn't need to wait out `stale_ms`.
-    pub async fn clear_runner_claim(&self, import_id: &str) -> Result<(), RepoError> {
+    /// doesn't need to wait out `stale_ms`. **Only clears a lease this
+    /// instance still holds**; returns `false` when the lease has since been
+    /// taken over by someone else.
+    ///
+    /// The owner check is load-bearing, not defensive. A runner whose lease
+    /// went stale mid-pass (one slow thread, a paused container) can be
+    /// legitimately superseded by a redelivered run, and would then reach its
+    /// own exit path and — unconditionally — wipe the *new* holder's lease,
+    /// admitting a third concurrent runner. Only clear what you still own.
+    pub async fn clear_runner_claim(
+        &self,
+        import_id: &str,
+        instance_id: &str,
+    ) -> Result<bool, RepoError> {
         let pk = format!("IMPORT#{import_id}");
+        let mut values = HashMap::new();
+        values.insert(":inst".to_string(), AttributeValue::S(instance_id.to_string()));
         self.db
-            .update_item(
+            .update_item_conditional(
                 &pk,
                 ImportRecord::sk(),
                 "REMOVE runner_instance, runner_heartbeat_ms",
-                HashMap::new(),
+                "runner_instance = :inst",
+                values,
                 None,
             )
             .await

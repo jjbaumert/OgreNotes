@@ -416,11 +416,12 @@ async fn retry_after_a_post_create_failure_creates_no_second_document() {
     // checkpoint is not.
     let threads = app.state.import_repo.list_threads(&import_id).await.unwrap();
     let t1 = threads.iter().find(|t| t.quip_thread_id == "t1").unwrap();
-    assert_eq!(
-        t1.ogre_doc_id.as_deref(),
-        Some(doc_id.as_str()),
-        "the doc id must be reserved on the manifest row — that reservation IS the fix",
-    );
+    // NOTE: this row's `ogre_doc_id` was written by attempt 1's *checkpoint*,
+    // not by step 6's reservation — so this test pins only the RECONCILE half
+    // of the fix. `reserve_before_the_first_durable_write_survives_a_failed_attempt`
+    // below covers the reservation half, which is the part a real step-8
+    // failure depends on.
+    assert_eq!(t1.ogre_doc_id.as_deref(), Some(doc_id.as_str()));
     let retry_row = ThreadRow { state: ThreadState::Pending, ..t1.clone() };
 
     let record = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
@@ -457,4 +458,87 @@ async fn retry_after_a_post_create_failure_creates_no_second_document() {
     assert_eq!(meta.created_at, 111, "Quip provenance preserved across the retry");
     let snapshot = app.state.doc_repo.load_snapshot(&doc_id).await.unwrap();
     assert!(snapshot.is_some_and(|s| !s.is_empty()), "the v1 snapshot must be readable");
+}
+
+/// Wiremock Quip server identical to [`quip_content_server`] except that the
+/// FIRST fetch of t1's blob 401s. That aborts t1's import at `sideload_images`
+/// — after step 6 has settled the document id, before any document exists —
+/// which is the shape of every real post-reservation failure. Every later
+/// request succeeds, so the same server serves the retry.
+async fn quip_server_failing_the_first_blob_fetch() -> MockServer {
+    let server = quip_content_server().await;
+    // Higher priority (lower number) than the 200 already mounted, and usable
+    // exactly once; after that wiremock falls through to the 200.
+    Mock::given(method("GET"))
+        .and(path("/1/blob/t1/b9"))
+        .respond_with(ResponseTemplate::new(401))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Regression (I1, the reservation half): the document id is settled on the
+/// `THREAD#` row **before** anything durable is written under it.
+///
+/// This is the half a real step-8/9/10 failure depends on. Without it, an
+/// attempt that dies after `DocRepo::create` leaves a `Pending` row with no id
+/// on it, the retry mints a fresh one, and the user gets two documents — and
+/// crucially, a test that seeds the row from a *successful* attempt can't tell
+/// the difference, because `set_thread_content_done` writes `ogre_doc_id` too.
+///
+/// So this drives a genuine mid-thread failure (a 401 on the image blob, which
+/// lands between the reservation and the persist) and checks the manifest in
+/// that intermediate state: an id present, `Pending` still, and no document
+/// under it yet. Then it lets the retry run and confirms it adopts that exact
+/// id.
+#[tokio::test]
+async fn reserve_before_the_first_durable_write_survives_a_failed_attempt() {
+    common::require_infra!();
+    let server = quip_server_failing_the_first_blob_fetch().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    // Attempt 1: t1 dies on its image blob. (A 401 is terminal for the run, so
+    // the pass stops at t1 — which is exactly the state we want to inspect.)
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let threads = app.state.import_repo.list_threads(&import_id).await.unwrap();
+    let t1 = threads.iter().find(|t| t.quip_thread_id == "t1").unwrap();
+    let reserved = t1
+        .ogre_doc_id
+        .clone()
+        .expect("the doc id must be RESERVED on the row before any durable write");
+    assert_eq!(
+        t1.state,
+        ThreadState::Pending,
+        "the thread must still be Pending — a reservation is not progress",
+    );
+    assert!(
+        app.state.doc_repo.get(&reserved).await.unwrap().is_none(),
+        "nothing may exist under the reserved id yet; that is what makes it a reservation",
+    );
+    let after_failure = app.state.doc_repo.query_docs_by_owner("owner1").await.unwrap();
+    assert!(
+        after_failure.is_empty(),
+        "the failed attempt must have created no document at all: {after_failure:?}",
+    );
+
+    // Attempt 2 (the queue's retry): the blob now serves, and the thread must
+    // be imported under the id reserved by attempt 1.
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    assert_eq!(
+        doc_id_for(&app, &import_id, "t1").await.as_deref(),
+        Some(reserved.as_str()),
+        "the retry must import under the RESERVED id, not a freshly minted one",
+    );
+    let docs = app.state.doc_repo.query_docs_by_owner("owner1").await.unwrap();
+    assert_eq!(docs.len(), 2, "one document per non-chat thread, no duplicates: {docs:?}");
+    assert!(
+        docs.iter().any(|d| d.doc_id == reserved && d.title == "Doc A"),
+        "t1's document is the reserved one: {docs:?}",
+    );
 }

@@ -342,10 +342,14 @@ async fn claim_runner_lease_contract() {
         "a stale claim must be takeable over"
     );
 
-    // Clearing the claim makes it immediately re-acquirable.
-    repo.clear_runner_claim(&record.import_id)
-        .await
-        .expect("clear_runner_claim");
+    // Clearing the claim (as its current holder, inst-B) makes it immediately
+    // re-acquirable.
+    assert!(
+        repo.clear_runner_claim(&record.import_id, "inst-B")
+            .await
+            .expect("clear_runner_claim"),
+        "the lease holder must be able to release its own lease"
+    );
     assert!(
         repo.claim_runner(&record.import_id, "inst-C", NOW_MS + STALE_MS + 2, STALE_MS)
             .await
@@ -672,4 +676,104 @@ async fn reserve_thread_doc_id_is_stable_across_retries() {
         ThreadState::Pending,
         "reserving an id must not advance the thread's progress state",
     );
+}
+
+/// Regression: a runner that has been superseded must NOT clear the new
+/// holder's lease when it reaches its own exit path.
+///
+/// This is reachable, not theoretical. A runner whose heartbeat lapses past
+/// `stale_ms` — one slow thread, a paused container — is legitimately taken
+/// over by a redelivered run. The old runner then finishes or errors out and
+/// runs its clear-on-every-exit guard. Unconditionally, that wipes the *new*
+/// holder's claim and admits a third concurrent runner: exactly the
+/// mutual-exclusion the lease exists to provide, undone by the loser's
+/// cleanup. Only clear what you still own.
+#[tokio::test]
+async fn a_superseded_runner_cannot_clear_the_new_holders_lease() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    const NOW_MS: i64 = 5_000_000;
+    const STALE_MS: i64 = 30_000;
+
+    // inst-A takes the lease, then goes quiet long enough to look dead...
+    assert!(
+        repo.claim_runner(&record.import_id, "inst-A", NOW_MS, STALE_MS)
+            .await
+            .expect("claim by inst-A")
+    );
+    // ...so inst-B takes over.
+    assert!(
+        repo.claim_runner(&record.import_id, "inst-B", NOW_MS + STALE_MS + 1, STALE_MS)
+            .await
+            .expect("takeover by inst-B"),
+        "seed: a stale lease is takeable over"
+    );
+
+    // inst-A now reaches its exit path and tries to release "its" lease.
+    let cleared = repo
+        .clear_runner_claim(&record.import_id, "inst-A")
+        .await
+        .expect("clear attempt by the superseded runner");
+    assert!(
+        !cleared,
+        "a superseded runner must not clear a lease it no longer holds",
+    );
+
+    // THE POINT: inst-B still holds the lease, so a third runner is refused.
+    assert!(
+        !repo
+            .claim_runner(&record.import_id, "inst-C", NOW_MS + STALE_MS + 2, STALE_MS)
+            .await
+            .expect("claim attempt by inst-C"),
+        "inst-B's lease must survive inst-A's cleanup — otherwise a third \
+         runner joins and the import runs concurrently",
+    );
+
+    // And inst-B can still refresh and release its own.
+    repo.heartbeat_runner(&record.import_id, "inst-B", NOW_MS + STALE_MS + 3)
+        .await
+        .expect("inst-B heartbeat");
+    assert!(
+        repo.clear_runner_claim(&record.import_id, "inst-B")
+            .await
+            .expect("clear by inst-B"),
+        "the real holder can still release"
+    );
+}
+
+/// Regression: `set_phase` is forward-only.
+///
+/// The handler re-runs inventory from scratch on every retry, reaper
+/// redelivery, or manual replay and writes `phase = 1` when it completes — so
+/// an unconditional `SET` regressed a finished (phase 2) import back to 1 on
+/// every replay. It stayed benign only because the wizard breaks out of its
+/// poll the first time it sees `phase >= 2`; anything that polls later, or
+/// re-opens the wizard, would have seen a finished import claim it was still
+/// mid-content-pass.
+#[tokio::test]
+async fn set_phase_never_moves_backwards() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    repo.set_phase(&record.import_id, 1).await.expect("phase 1");
+    repo.set_phase(&record.import_id, 2).await.expect("phase 2");
+
+    // A replay's inventory pass writes phase 1 again. Must be a no-op, and
+    // must NOT surface as an error the handler would report as transient.
+    repo.set_phase(&record.import_id, 1)
+        .await
+        .expect("a backwards phase write must be a silent no-op, not an error");
+
+    let rec = repo.get(&record.import_id).await.expect("get").expect("record");
+    assert_eq!(rec.phase, 2, "a replay must not regress a finished import's phase");
+
+    // Forward still works.
+    repo.set_phase(&record.import_id, 3).await.expect("phase 3");
+    let rec = repo.get(&record.import_id).await.expect("get").expect("record");
+    assert_eq!(rec.phase, 3);
 }
