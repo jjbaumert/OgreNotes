@@ -14,7 +14,9 @@ use ogrenotes_common::id::new_id;
 use ogrenotes_common::time::now_usec;
 use ogrenotes_storage::dynamo::DynamoClient;
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
-use ogrenotes_storage::models::import_inventory::{SecMapRow, ThreadRow, ThreadState};
+use ogrenotes_storage::models::import_inventory::{
+    ReportNote, ReportRow, SecMapRow, ThreadRow, ThreadState, REPORT_MAX_NOTES,
+};
 use ogrenotes_storage::repo::import_repo::ImportRepo;
 
 static INFRA_AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
@@ -807,6 +809,140 @@ async fn a_superseded_runner_cannot_clear_the_new_holders_lease() {
             .expect("clear by inst-B"),
         "the real holder can still release"
     );
+}
+
+/// An import with nothing to report has no `REPORT` row at all, and
+/// reading it is a clean `None` — not an error the worker would have to
+/// special-case, and not an empty row it has to pre-create.
+#[tokio::test]
+async fn get_report_is_none_when_nothing_has_been_reported() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    assert!(
+        repo.get_report(&record.import_id).await.expect("get_report").is_none(),
+        "a clean import must not need a REPORT row to exist"
+    );
+    // And an import that was never created at all is also None, not an error.
+    assert!(repo.get_report(&new_id()).await.expect("get_report").is_none());
+}
+
+/// Counters accumulate across separate `bump_report_counter` calls (each
+/// one a read-modify-write against the live row), and notes and counters
+/// written by different calls coexist on the one row.
+#[tokio::test]
+async fn report_counters_accumulate_across_calls() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+    let owner = &record.owner_id;
+
+    for _ in 0..3 {
+        repo.bump_report_counter(&record.import_id, owner, "threads_imported", 1)
+            .await
+            .expect("bump threads_imported");
+    }
+    repo.bump_report_counter(&record.import_id, owner, "images_dropped", 5)
+        .await
+        .expect("bump images_dropped");
+    repo.append_report_note(
+        &record.import_id,
+        owner,
+        ReportNote {
+            quip_thread_id: "qt1".to_string(),
+            kind: "skipped".to_string(),
+            detail: "403 forbidden".to_string(),
+        },
+    )
+    .await
+    .expect("append_report_note");
+
+    let row = repo
+        .get_report(&record.import_id)
+        .await
+        .expect("get_report")
+        .expect("row must exist after the first bump");
+    assert_eq!(row.owner_id, *owner, "every manifest row is owner-gated");
+    assert_eq!(row.counters["threads_imported"], 3, "bumps must accumulate, not overwrite");
+    assert_eq!(row.counters["images_dropped"], 5);
+    assert_eq!(row.notes.len(), 1, "a counter bump must not clobber the notes");
+    assert_eq!(row.notes[0].quip_thread_id, "qt1");
+    assert_eq!(row.notes_dropped, 0);
+}
+
+/// The load-bearing bound, end to end through Dynamo: an import that loses
+/// far more threads than the note cap keeps a bounded list *and* an
+/// accurate count, so the report can say "…and N more" instead of either
+/// lying or failing to write at all (a 400 KB overflow would take the whole
+/// report down — the one artifact that tells the user what was dropped).
+///
+/// Also the no-token guard for this row, mirroring
+/// `import_record_never_carries_a_token_field`.
+#[tokio::test]
+async fn report_notes_truncate_at_the_cap_while_counters_keep_counting() {
+    require_infra!();
+    const OVERFLOW: usize = 3;
+    let (repo, table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+    let owner = &record.owner_id;
+
+    for i in 0..REPORT_MAX_NOTES + OVERFLOW {
+        repo.append_report_note(
+            &record.import_id,
+            owner,
+            ReportNote {
+                quip_thread_id: format!("qt{i:04}"),
+                kind: "failed".to_string(),
+                detail: "403 forbidden after 3 attempts".to_string(),
+            },
+        )
+        .await
+        .expect("append_report_note");
+        repo.bump_report_counter(&record.import_id, owner, "threads_failed", 1)
+            .await
+            .expect("bump threads_failed");
+    }
+
+    let row = repo
+        .get_report(&record.import_id)
+        .await
+        .expect("get_report")
+        .expect("row must exist");
+
+    assert_eq!(row.notes.len(), REPORT_MAX_NOTES, "the note list must stop at the cap");
+    assert_eq!(
+        row.counters["threads_failed"],
+        (REPORT_MAX_NOTES + OVERFLOW) as u64,
+        "the counter must keep counting past the cap",
+    );
+    assert!(
+        row.counters["threads_failed"] > row.notes.len() as u64,
+        "the true total must exceed the retained list",
+    );
+    assert_eq!(
+        row.notes_dropped, OVERFLOW as u64,
+        "the truncation marker must survive the wire and name the exact shortfall",
+    );
+    assert_eq!(row.notes[0].quip_thread_id, "qt0000", "the earliest losses are kept");
+
+    // No manifest row may carry the Quip credential — checked on the raw
+    // item, since a stray attribute wouldn't appear in the decoded struct.
+    let raw = local_dynamo_client()
+        .get_item()
+        .table_name(&table)
+        .key("PK", aws_sdk_dynamodb::types::AttributeValue::S(record.pk()))
+        .key("SK", aws_sdk_dynamodb::types::AttributeValue::S(ReportRow::sk().to_string()))
+        .send()
+        .await
+        .expect("raw get_item")
+        .item
+        .expect("REPORT item must exist");
+    assert!(!raw.contains_key("token"));
+    assert!(!raw.contains_key("secret"));
 }
 
 /// Regression: `set_phase` is forward-only.

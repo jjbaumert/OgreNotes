@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use crate::dynamo::DynamoClient;
 use crate::models::import::{ImportRecord, ImportStatus};
 use crate::models::import_inventory::{
-    FolderRow, PendingLinkItem, SecMapRow, ThreadRow, ThreadState, UnresolvedRow,
-    UNRESOLVED_CHUNK_LINKS,
+    FolderRow, PendingLinkItem, ReportNote, ReportRow, SecMapRow, ThreadRow, ThreadState,
+    UnresolvedRow, UNRESOLVED_CHUNK_LINKS,
 };
 use crate::repo::{RepoError, get_n, get_n_u64, get_s};
 
@@ -442,6 +442,101 @@ impl ImportRepo {
             .and_then(|v| v.as_n().ok())
             .and_then(|n| n.parse::<u32>().ok())
             .ok_or_else(|| RepoError::MissingField("attempts".to_string()))
+    }
+
+    /// Read this import's accumulating `REPORT` row.
+    ///
+    /// `Ok(None)` when the import has nothing to report yet — the row is
+    /// written lazily on the first counter or note, so its absence is the
+    /// normal state of a clean import, not an error.
+    pub async fn get_report(&self, import_id: &str) -> Result<Option<ReportRow>, RepoError> {
+        let pk = format!("IMPORT#{import_id}");
+        let item = self
+            .db
+            .get_item(&pk, ReportRow::sk())
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        item.as_ref().map(report_from_item).transpose()
+    }
+
+    /// Add `by` to the named counter on the `REPORT` row, creating the row
+    /// (and the counter) if needed. Counters are the totals the report
+    /// quotes; unlike `notes` they are unbounded in value and bounded only
+    /// by the number of distinct keys the callers use, which is a small
+    /// compile-time set.
+    pub async fn bump_report_counter(
+        &self,
+        import_id: &str,
+        owner_id: &str,
+        key: &str,
+        by: u64,
+    ) -> Result<(), RepoError> {
+        self.mutate_report(import_id, owner_id, |row| row.bump_counter(key, by))
+            .await
+    }
+
+    /// Append one named loss/fallback to the `REPORT` row, creating the row
+    /// if needed.
+    ///
+    /// Silently capped at
+    /// [`REPORT_MAX_NOTES`](crate::models::import_inventory::REPORT_MAX_NOTES):
+    /// past the cap the note is dropped and only `notes_dropped` advances,
+    /// so a pathological import (every thread inaccessible) can't grow this
+    /// item past DynamoDB's 400 KB cap and lose the whole report. Callers
+    /// that need the true total must also
+    /// [`bump_report_counter`](Self::bump_report_counter) — the note list is
+    /// a sample, the counters are the tally.
+    pub async fn append_report_note(
+        &self,
+        import_id: &str,
+        owner_id: &str,
+        note: ReportNote,
+    ) -> Result<(), RepoError> {
+        self.mutate_report(import_id, owner_id, |row| row.push_note(note))
+            .await
+    }
+
+    /// Shared read-modify-write body for the `REPORT` mutators.
+    ///
+    /// **This is a plain read-modify-write, and it is only safe because of
+    /// the `runner_claim` lease.** The content pass is single-writer per
+    /// import — `claim_runner`/`heartbeat_runner` admit one runner at a time
+    /// — so no second writer can interleave between the read and the write.
+    /// A future caller that writes the report from *outside* that lease
+    /// (an API handler, a second worker pass, a parallel per-thread task)
+    /// turns this into a lost-update bug: the loser's counters and notes
+    /// vanish silently. If that day comes, the fix is to make each mutation
+    /// atomic on the server — `ADD` for the counters (mirroring
+    /// [`bump_thread_attempts`](Self::bump_thread_attempts)) and a
+    /// `list_append` guarded by `size(notes) < :cap` for the notes — not to
+    /// add a lock here.
+    ///
+    /// Two caveats worth knowing even today. First, lease takeover after a
+    /// stale heartbeat can briefly overlap two runners (see
+    /// `clear_runner_claim`'s owner check); a report write lost in that
+    /// window costs one line of an advisory report, never document data.
+    /// Second, this rewrites the whole item, so a mutation must never be
+    /// built from a stale in-memory `ReportRow` — always go through these
+    /// methods, which re-read first.
+    async fn mutate_report(
+        &self,
+        import_id: &str,
+        owner_id: &str,
+        mutate: impl FnOnce(&mut ReportRow),
+    ) -> Result<(), RepoError> {
+        let mut row = self
+            .get_report(import_id)
+            .await?
+            .unwrap_or_else(|| ReportRow::new(owner_id));
+        mutate(&mut row);
+
+        let mut item = report_to_item(&row);
+        item.insert("PK".to_string(), AttributeValue::S(format!("IMPORT#{import_id}")));
+        item.insert("SK".to_string(), AttributeValue::S(ReportRow::sk().to_string()));
+        self.db
+            .put_item(item)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
     /// Record the total thread count discovered by inventory BFS, on `META`.
@@ -978,6 +1073,100 @@ fn unresolved_from_item(item: &HashMap<String, AttributeValue>) -> Result<Unreso
     })
 }
 
+fn report_to_item(r: &ReportRow) -> HashMap<String, AttributeValue> {
+    let mut item = HashMap::new();
+    item.insert("owner_id".to_string(), AttributeValue::S(r.owner_id.clone()));
+    // Counters/notes are sparse-omitted when empty, same convention as
+    // `selected_roots` on `META` — an import with nothing to report writes
+    // the smallest possible row.
+    if !r.counters.is_empty() {
+        item.insert(
+            "counters".to_string(),
+            AttributeValue::M(
+                r.counters
+                    .iter()
+                    .map(|(k, v)| (k.clone(), AttributeValue::N(v.to_string())))
+                    .collect(),
+            ),
+        );
+    }
+    if !r.notes.is_empty() {
+        item.insert(
+            "notes".to_string(),
+            AttributeValue::L(
+                r.notes
+                    .iter()
+                    .map(|n| {
+                        AttributeValue::M(HashMap::from([
+                            (
+                                "quip_thread_id".to_string(),
+                                AttributeValue::S(n.quip_thread_id.clone()),
+                            ),
+                            ("kind".to_string(), AttributeValue::S(n.kind.clone())),
+                            ("detail".to_string(), AttributeValue::S(n.detail.clone())),
+                        ]))
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if r.notes_dropped > 0 {
+        item.insert(
+            "notes_dropped".to_string(),
+            AttributeValue::N(r.notes_dropped.to_string()),
+        );
+    }
+    item
+}
+
+fn report_from_item(item: &HashMap<String, AttributeValue>) -> Result<ReportRow, RepoError> {
+    let counters = item
+        .get("counters")
+        .and_then(|v| v.as_m().ok())
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    let n = v
+                        .as_n()
+                        .ok()
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .ok_or_else(|| RepoError::MissingField(format!("counters.{k}")))?;
+                    Ok((k.clone(), n))
+                })
+                .collect::<Result<_, RepoError>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let notes = item
+        .get("notes")
+        .and_then(|v| v.as_l().ok())
+        .map(|l| {
+            l.iter()
+                .filter_map(|av| av.as_m().ok())
+                .map(|m| {
+                    Ok(ReportNote {
+                        quip_thread_id: get_s(m, "quip_thread_id")?,
+                        kind: get_s(m, "kind")?,
+                        detail: get_s(m, "detail")?,
+                    })
+                })
+                .collect::<Result<Vec<_>, RepoError>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(ReportRow {
+        owner_id: get_s(item, "owner_id")?,
+        counters,
+        notes,
+        // Absent means nothing was ever dropped — the list is complete.
+        notes_dropped: item
+            .get("notes_dropped")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1229,6 +1418,96 @@ mod tests {
         };
         let item = unresolved_to_item(&r);
         assert!(!item.contains_key("token") && !item.contains_key("secret"));
+    }
+
+    fn report_fixture() -> ReportRow {
+        let mut r = ReportRow::new("u1");
+        r.bump_counter("threads_imported", 7);
+        r.bump_counter("threads_skipped", 2);
+        r.push_note(ReportNote {
+            quip_thread_id: "qt1".into(),
+            kind: "skipped".into(),
+            detail: "403 forbidden".into(),
+        });
+        r.push_note(ReportNote {
+            quip_thread_id: "qt2".into(),
+            kind: "image_dropped".into(),
+            detail: "blob too large".into(),
+        });
+        r
+    }
+
+    #[test]
+    fn report_row_round_trips_and_has_no_token() {
+        let r = report_fixture();
+        let item = report_to_item(&r);
+        // Same guard as every other manifest row: no durable row in the
+        // import partition may carry the Quip credential.
+        assert!(!item.contains_key("token") && !item.contains_key("secret"));
+        assert_eq!(report_from_item(&item).expect("from_item"), r);
+    }
+
+    /// A report with nothing in it writes the smallest possible row (no
+    /// `counters`/`notes`/`notes_dropped` attributes) and reads back as an
+    /// empty report rather than erroring — the shape every import has
+    /// before its first loss.
+    #[test]
+    fn report_row_empty_is_sparse_and_decodes_clean() {
+        let r = ReportRow::new("u1");
+        let item = report_to_item(&r);
+        assert!(!item.contains_key("counters"));
+        assert!(!item.contains_key("notes"));
+        assert!(
+            !item.contains_key("notes_dropped"),
+            "an untruncated report must not claim a truncation"
+        );
+        let back = report_from_item(&item).expect("from_item");
+        assert_eq!(back, r);
+        assert!(back.counters.is_empty() && back.notes.is_empty());
+        assert_eq!(back.notes_dropped, 0);
+    }
+
+    /// The truncation marker must survive the wire, not just live in
+    /// memory: a reader that only ever sees the persisted row is the one
+    /// that has to say "and N more".
+    #[test]
+    fn report_row_truncation_marker_survives_the_item_round_trip() {
+        use crate::models::import_inventory::REPORT_MAX_NOTES;
+
+        let mut r = ReportRow::new("u1");
+        for i in 0..REPORT_MAX_NOTES + 3 {
+            r.push_note(ReportNote {
+                quip_thread_id: format!("qt{i}"),
+                kind: "failed".into(),
+                detail: "boom".into(),
+            });
+            r.bump_counter("threads_failed", 1);
+        }
+        let back = report_from_item(&report_to_item(&r)).expect("from_item");
+        assert_eq!(back.notes.len(), REPORT_MAX_NOTES);
+        assert_eq!(back.notes_dropped, 3);
+        assert_eq!(back.counters["threads_failed"], (REPORT_MAX_NOTES + 3) as u64);
+    }
+
+    /// A corrupt counter value must surface as a named `MissingField`
+    /// rather than silently decoding as zero — a report that under-counts
+    /// is worse than one that fails loudly.
+    #[test]
+    fn report_row_rejects_a_non_numeric_counter() {
+        let mut item = report_to_item(&report_fixture());
+        item.insert(
+            "counters".to_string(),
+            AttributeValue::M(HashMap::from([(
+                "threads_imported".to_string(),
+                AttributeValue::S("lots".to_string()),
+            )])),
+        );
+        match report_from_item(&item) {
+            Err(RepoError::MissingField(msg)) => {
+                assert!(msg.contains("threads_imported"), "must name the counter: {msg}")
+            }
+            other => panic!("expected MissingField, got {other:?}"),
+        }
     }
 
     #[test]
