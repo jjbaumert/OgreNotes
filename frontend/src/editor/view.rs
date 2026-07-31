@@ -451,6 +451,7 @@ impl EditorView {
                 "deleteContentBackward" => {
                     event.prevent_default();
                     if let Some(sel) = read_dom_selection_from(&container2) {
+                        let sel = snap_selection_for_edit(&current_state.doc, sel);
                         let state_with_sel = EditorState {
                             selection: sel,
                             ..current_state.clone()
@@ -551,6 +552,7 @@ impl EditorView {
                 "deleteContentForward" => {
                     event.prevent_default();
                     if let Some(sel) = read_dom_selection_from(&container2) {
+                        let sel = snap_selection_for_edit(&current_state.doc, sel);
                         let state_with_sel = EditorState {
                             selection: sel,
                             ..current_state.clone()
@@ -816,6 +818,11 @@ impl EditorView {
             let Some(sel) = read_dom_selection_from(&container_paste) else { return };
 
             let state = state_paste.borrow().clone();
+            // #143: a paste with the caret on a structural seam either
+            // dropped silently (the block-paste branch needs a
+            // `find_block_at` hit) or spliced inline content in as a
+            // bare child of the list. Snap first.
+            let sel = snap_selection_for_edit(&state.doc, sel);
             let state_with_sel = EditorState {
                 selection: sel,
                 ..state
@@ -2097,6 +2104,33 @@ fn read_dom_selection_from(container: &HtmlElement) -> Option<Selection> {
         Some(Selection::cursor(anchor_pos))
     } else {
         Some(Selection::text(anchor_pos, focus_pos))
+    }
+}
+
+/// #143: snap a collapsed caret that landed on a **structural seam**
+/// into the block it should edit.
+///
+/// A DOM caret reported as `(element, childIndex)` — which browsers do
+/// routinely for `<li>`/`<ul>` boundaries — maps through
+/// `dom_to_model_walk` to the sum of the preceding children's sizes.
+/// That is a position between one child's close token and the next
+/// child's open token, which no block contains. Edit handlers that work
+/// from a raw position either no-op (`delete(pos - 1, pos)` across a
+/// close boundary changes nothing) or splice content in at the
+/// structural level, orphaning bare nodes inside a list.
+///
+/// Deliberately NOT applied inside `read_dom_selection_from`: that
+/// function also feeds `selectionchange`, comment anchoring, and
+/// copy/cut, which want the position exactly as the DOM reported it.
+/// Only the editing handlers opt in.
+fn snap_selection_for_edit(doc: &super::model::Node, sel: Selection) -> Selection {
+    if !sel.empty() {
+        return sel;
+    }
+    let pos = sel.from();
+    match super::state::resolve_block_for_edit(doc, pos) {
+        Some((_, resolved)) if resolved != pos => Selection::cursor(resolved),
+        _ => sel,
     }
 }
 
