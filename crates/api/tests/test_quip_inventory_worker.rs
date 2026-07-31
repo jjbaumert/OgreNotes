@@ -248,6 +248,8 @@ async fn inventory_is_idempotent_on_rerun() {
                 first_folder: "root".into(),
                 state: ThreadState::ContentDone,
                 ogre_doc_id: Some("ogre-doc-1".into()),
+                reason: None,
+                attempts: 0,
             },
         )
         .await

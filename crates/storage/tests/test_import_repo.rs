@@ -263,6 +263,8 @@ fn pending_thread(quip_thread_id: &str, state: ThreadState) -> ThreadRow {
         first_folder: "qf1".to_string(),
         state,
         ogre_doc_id: None,
+        reason: None,
+        attempts: 0,
     }
 }
 
@@ -515,7 +517,7 @@ async fn set_thread_skipped_marks_state_only() {
         .await
         .expect("seed pending thread");
 
-    repo.set_thread_skipped(&record.import_id, "qt1")
+    repo.set_thread_skipped(&record.import_id, "qt1", "chat thread")
         .await
         .expect("set_thread_skipped");
 
@@ -523,6 +525,69 @@ async fn set_thread_skipped_marks_state_only() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].state, ThreadState::Skipped);
     assert_eq!(rows[0].ogre_doc_id, None);
+    assert_eq!(rows[0].reason.as_deref(), Some("chat thread"));
+}
+
+/// `set_thread_failed` sets state and reason and is readable via
+/// `list_threads` — the same shape as `set_thread_skipped`, exercised
+/// against live Dynamo to pin the wire round trip.
+#[tokio::test]
+async fn set_thread_failed_sets_state_and_reason() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    let thread = pending_thread("qt1", ThreadState::Pending);
+    repo.put_thread(&record.import_id, &thread)
+        .await
+        .expect("seed pending thread");
+
+    repo.set_thread_failed(&record.import_id, "qt1", "403 forbidden after 3 attempts")
+        .await
+        .expect("set_thread_failed");
+
+    let rows = repo.list_threads(&record.import_id).await.expect("list_threads");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, ThreadState::Failed);
+    assert_eq!(rows[0].reason.as_deref(), Some("403 forbidden after 3 attempts"));
+}
+
+/// `bump_thread_attempts` is atomic and increments across repeated calls,
+/// surviving in the row (not worker memory) so a process restart doesn't
+/// lose the count.
+#[tokio::test]
+async fn bump_thread_attempts_increments_across_calls() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    let thread = pending_thread("qt1", ThreadState::Pending);
+    repo.put_thread(&record.import_id, &thread)
+        .await
+        .expect("seed pending thread");
+
+    let first = repo
+        .bump_thread_attempts(&record.import_id, "qt1")
+        .await
+        .expect("bump 1");
+    assert_eq!(first, 1);
+
+    let second = repo
+        .bump_thread_attempts(&record.import_id, "qt1")
+        .await
+        .expect("bump 2");
+    assert_eq!(second, 2);
+
+    let third = repo
+        .bump_thread_attempts(&record.import_id, "qt1")
+        .await
+        .expect("bump 3");
+    assert_eq!(third, 3);
+
+    let rows = repo.list_threads(&record.import_id).await.expect("list_threads");
+    assert_eq!(rows[0].attempts, 3);
 }
 
 /// `put_unresolved` / `list_unresolved` round-trip through live Dynamo,

@@ -1084,6 +1084,8 @@ async fn run_inventory(
                     first_folder: t.first_folder.clone(),
                     state: ThreadState::Pending,
                     ogre_doc_id: None,
+                    reason: None,
+                    attempts: 0,
                 },
             )
             .await
@@ -1352,7 +1354,7 @@ pub async fn import_one_thread(
     let doc_type = match thread.thread_type.as_str() {
         "chat" => {
             ctx.import_repo
-                .set_thread_skipped(import_id, &thread.quip_thread_id)
+                .set_thread_skipped(import_id, &thread.quip_thread_id, "chat thread")
                 .await
                 .map_err(|e| ThreadImportError::Transient(format!("skip thread: {e}")))?;
             tracing::info!(
@@ -1716,6 +1718,8 @@ mod tests {
             first_folder: first.into(),
             state: ThreadState::Pending,
             ogre_doc_id: None,
+            reason: None,
+            attempts: 0,
         }
     }
 

@@ -12,6 +12,11 @@ pub enum ThreadState {
     ContentDone,
     CommentsDone,
     Skipped,
+    /// A thread that failed deterministically enough times (Task 4's `N`
+    /// retry budget) that the content pass gave up on it and moved on.
+    /// Distinct from `Skipped` (a deliberate disposition, e.g. chat
+    /// threads) — `Failed` means the pass *tried* and lost.
+    Failed,
 }
 
 /// One folder discovered during inventory BFS. SK = `FOLDER#<quip_folder_id>`.
@@ -45,6 +50,18 @@ pub struct ThreadRow {
     pub first_folder: String,
     pub state: ThreadState,
     pub ogre_doc_id: Option<String>,
+    /// Why the thread is `Skipped` or `Failed` (e.g. `"chat thread"`,
+    /// `"403 forbidden after 3 attempts"`). `None` for `Pending` /
+    /// `ContentDone` / `CommentsDone`, and for rows written before this
+    /// field existed — sparse-omitted on write, defaults to `None` on
+    /// read so pre-existing rows decode unchanged.
+    pub reason: Option<String>,
+    /// Number of content-pass attempts made on this thread so far. Lives
+    /// on the row (not in worker memory) so it survives a process
+    /// restart; Task 4 reads it to decide when a thread has failed enough
+    /// times to give up. Rows written before this field existed have no
+    /// `attempts` attribute and decode as `0`.
+    pub attempts: u32,
 }
 
 impl ThreadRow {
@@ -133,6 +150,7 @@ mod tests {
             (ThreadState::ContentDone, "contentdone"),
             (ThreadState::CommentsDone, "commentsdone"),
             (ThreadState::Skipped, "skipped"),
+            (ThreadState::Failed, "failed"),
         ] {
             let j = serde_json::to_string(&s).unwrap();
             assert_eq!(j.trim_matches('"'), tok);
@@ -149,7 +167,7 @@ mod tests {
         let t = ThreadRow { quip_thread_id: "qt1".into(), owner_id: "u1".into(),
             title: "Doc".into(), thread_type: "document".into(), updated_usec: 5,
             member_folders: vec!["qf1".into()], first_folder: "qf1".into(),
-            state: ThreadState::Pending, ogre_doc_id: None };
+            state: ThreadState::Pending, ogre_doc_id: None, reason: None, attempts: 0 };
         assert_eq!(t.sk(), "THREAD#qt1");
     }
 }

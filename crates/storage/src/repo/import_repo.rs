@@ -339,26 +339,109 @@ impl ImportRepo {
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
-    /// Mark a thread `Skipped` (e.g. unsupported thread type). Plain
+    /// Mark a thread `Skipped` (e.g. unsupported thread type, or a 403
+    /// after Task 4 decides the thread is inaccessible) with a
+    /// human-readable `reason`. Plain `update_item`, same idempotency
+    /// rationale as `set_thread_content_done`.
+    pub async fn set_thread_skipped(
+        &self,
+        import_id: &str,
+        quip_thread_id: &str,
+        reason: &str,
+    ) -> Result<(), RepoError> {
+        self.set_thread_disposition(import_id, quip_thread_id, ThreadState::Skipped, reason)
+            .await
+    }
+
+    /// Mark a thread `Failed` (the content pass retried it and gave up)
+    /// with a human-readable `reason`. Same shape as `set_thread_skipped`
+    /// — the two states differ in *why* the pass stopped trying, not in
+    /// how the row is written.
+    pub async fn set_thread_failed(
+        &self,
+        import_id: &str,
+        quip_thread_id: &str,
+        reason: &str,
+    ) -> Result<(), RepoError> {
+        self.set_thread_disposition(import_id, quip_thread_id, ThreadState::Failed, reason)
+            .await
+    }
+
+    /// Shared body for `set_thread_skipped` / `set_thread_failed`: set
+    /// `state` and `reason` on an existing `THREAD#` row. Plain
     /// `update_item`, same idempotency rationale as
-    /// `set_thread_content_done`.
-    pub async fn set_thread_skipped(&self, import_id: &str, quip_thread_id: &str) -> Result<(), RepoError> {
+    /// `set_thread_content_done` — the row already exists from Phase 1's
+    /// inventory, and this is a forward-only checkpoint a re-run can
+    /// safely repeat.
+    async fn set_thread_disposition(
+        &self,
+        import_id: &str,
+        quip_thread_id: &str,
+        state: ThreadState,
+        reason: &str,
+    ) -> Result<(), RepoError> {
         let pk = format!("IMPORT#{import_id}");
         let mut values = HashMap::new();
         values.insert(
             ":state".to_string(),
-            AttributeValue::S(thread_state_to_str(ThreadState::Skipped).to_string()),
+            AttributeValue::S(thread_state_to_str(state).to_string()),
         );
+        values.insert(":reason".to_string(), AttributeValue::S(reason.to_string()));
         self.db
             .update_item(
                 &pk,
                 &format!("THREAD#{quip_thread_id}"),
-                "SET #state = :state",
+                "SET #state = :state, reason = :reason",
                 values,
                 Some(HashMap::from([("#state".to_string(), "state".to_string())])),
             )
             .await
             .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Atomically increment the per-thread attempt counter and return the
+    /// new count. Task 4 reads this to decide when a thread has failed
+    /// deterministically enough times (`N`) to be marked `Failed` and
+    /// skipped rather than retried forever.
+    ///
+    /// Uses a raw `ADD attempts :inc` (mirrors `ThreadRepo::add_reaction`'s
+    /// pattern for reaching through `DynamoClient::inner()`) rather than a
+    /// read-modify-write: `update_item`/`update_item_conditional` on
+    /// `DynamoClient` don't expose `ReturnValues`, so this goes straight to
+    /// the SDK builder with `ReturnValue::UpdatedNew` to read the
+    /// post-increment value back in the same round trip — atomic even
+    /// under concurrent callers, unlike a get-then-set.
+    pub async fn bump_thread_attempts(
+        &self,
+        import_id: &str,
+        quip_thread_id: &str,
+    ) -> Result<u32, RepoError> {
+        let pk = format!("IMPORT#{import_id}");
+        let sk = format!("THREAD#{quip_thread_id}");
+        let mut values = HashMap::new();
+        values.insert(":inc".to_string(), AttributeValue::N("1".to_string()));
+
+        let result = self
+            .db
+            .inner()
+            .update_item()
+            .table_name(self.db.table_name())
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S(sk))
+            .update_expression("ADD attempts :inc")
+            .set_expression_attribute_values(Some(values))
+            .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+            .send()
+            .await
+            .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+
+        result
+            .attributes
+            .as_ref()
+            .and_then(|a| a.get("attempts"))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u32>().ok())
+            .ok_or_else(|| RepoError::MissingField("attempts".to_string()))
     }
 
     /// Record the total thread count discovered by inventory BFS, on `META`.
@@ -688,6 +771,7 @@ fn thread_state_to_str(s: ThreadState) -> &'static str {
         ThreadState::ContentDone => "contentdone",
         ThreadState::CommentsDone => "commentsdone",
         ThreadState::Skipped => "skipped",
+        ThreadState::Failed => "failed",
     }
 }
 
@@ -734,6 +818,10 @@ fn thread_to_item(t: &ThreadRow) -> HashMap<String, AttributeValue> {
     if let Some(ref ogre_doc_id) = t.ogre_doc_id {
         item.insert("ogre_doc_id".to_string(), AttributeValue::S(ogre_doc_id.clone()));
     }
+    if let Some(ref reason) = t.reason {
+        item.insert("reason".to_string(), AttributeValue::S(reason.clone()));
+    }
+    item.insert("attempts".to_string(), AttributeValue::N(t.attempts.to_string()));
     item
 }
 
@@ -752,6 +840,15 @@ fn thread_from_item(item: &HashMap<String, AttributeValue>) -> Result<ThreadRow,
         first_folder: get_s(item, "first_folder")?,
         state: thread_state_from_item(item)?,
         ogre_doc_id: item.get("ogre_doc_id").and_then(|v| v.as_s().ok()).cloned(),
+        reason: item.get("reason").and_then(|v| v.as_s().ok()).cloned(),
+        // Rows written before `attempts` existed have no such attribute —
+        // decode as 0, the correct "never attempted under the new
+        // counter" value, rather than erroring on a mid-flight import.
+        attempts: item
+            .get("attempts")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(0),
     })
 }
 
@@ -992,10 +1089,97 @@ mod tests {
         let t = ThreadRow { quip_thread_id: "qt1".into(), owner_id: "u1".into(),
             title: "Doc".into(), thread_type: "document".into(), updated_usec: 42,
             member_folders: vec!["qf1".into(), "qf2".into()], first_folder: "qf1".into(),
-            state: ThreadState::Pending, ogre_doc_id: None };
+            state: ThreadState::Pending, ogre_doc_id: None, reason: None, attempts: 0 };
         let item = thread_to_item(&t);
         assert!(!item.contains_key("token") && !item.contains_key("secret"));
         assert_eq!(thread_from_item(&item).expect("from_item"), t);
+    }
+
+    fn thread_fixture(state: ThreadState, reason: Option<&str>, attempts: u32) -> ThreadRow {
+        ThreadRow {
+            quip_thread_id: "qt1".into(),
+            owner_id: "u1".into(),
+            title: "Doc".into(),
+            thread_type: "document".into(),
+            updated_usec: 42,
+            member_folders: vec!["qf1".into()],
+            first_folder: "qf1".into(),
+            state,
+            ogre_doc_id: None,
+            reason: reason.map(str::to_string),
+            attempts,
+        }
+    }
+
+    /// `Failed` and `Skipped` round-trip with and without a `reason`, and
+    /// carry no token/secret — same guard as the plain-`Pending` case
+    /// above, extended to the new variant and field (Task 2 of the
+    /// open-failures remediation plan).
+    #[test]
+    fn thread_row_failed_and_skipped_round_trip_with_and_without_reason() {
+        for state in [ThreadState::Failed, ThreadState::Skipped] {
+            for reason in [Some("403 forbidden"), None] {
+                let t = thread_fixture(state, reason, 2);
+                let item = thread_to_item(&t);
+                assert!(!item.contains_key("token") && !item.contains_key("secret"));
+                assert_eq!(
+                    item.contains_key("reason"),
+                    reason.is_some(),
+                    "reason must be sparse-omitted when None (state={state:?})"
+                );
+                assert_eq!(thread_from_item(&item).expect("from_item"), t, "state={state:?} reason={reason:?}");
+            }
+        }
+    }
+
+    /// `attempts` round-trips when present, and a row that never went
+    /// through the new write path (attribute absent entirely) decodes as
+    /// `0` rather than erroring — the load-bearing backward-compat case:
+    /// an import mid-flight across the deploy that adds this field.
+    #[test]
+    fn thread_row_attempts_present_and_backward_compat_absent() {
+        let t = thread_fixture(ThreadState::Pending, None, 5);
+        let item = thread_to_item(&t);
+        assert_eq!(item.get("attempts").and_then(|v| v.as_n().ok()), Some(&"5".to_string()));
+        assert_eq!(thread_from_item(&item).expect("from_item"), t);
+
+        // Simulate a pre-Task-2 row: no `attempts`, no `reason` attribute
+        // at all (not even sparse-omitted-and-present-as-null — genuinely
+        // absent, as a row written by the old `thread_to_item` would be).
+        let mut legacy_item = item.clone();
+        legacy_item.remove("attempts");
+        legacy_item.remove("reason");
+        let decoded = thread_from_item(&legacy_item).expect("from_item on legacy row");
+        assert_eq!(decoded.attempts, 0);
+        assert_eq!(decoded.reason, None);
+    }
+
+    /// Backward-compat decode of a hand-built item map that never had
+    /// `reason`/`attempts` at all (the exact shape of a `THREAD#` row
+    /// written before this change) — must decode cleanly, not error.
+    #[test]
+    fn thread_row_decodes_pre_task2_item_without_reason_or_attempts() {
+        let mut item = HashMap::new();
+        item.insert("quip_thread_id".to_string(), AttributeValue::S("qt1".into()));
+        item.insert("owner_id".to_string(), AttributeValue::S("u1".into()));
+        item.insert("title".to_string(), AttributeValue::S("Doc".into()));
+        item.insert("thread_type".to_string(), AttributeValue::S("document".into()));
+        item.insert("updated_usec".to_string(), AttributeValue::N("42".into()));
+        item.insert(
+            "member_folders".to_string(),
+            AttributeValue::L(vec![AttributeValue::S("qf1".into())]),
+        );
+        item.insert("first_folder".to_string(), AttributeValue::S("qf1".into()));
+        item.insert("state".to_string(), AttributeValue::S("contentdone".into()));
+        item.insert("ogre_doc_id".to_string(), AttributeValue::S("doc-1".into()));
+        // Deliberately no "reason", no "attempts" — this is what every
+        // THREAD# row written before Task 2 looks like.
+
+        let decoded = thread_from_item(&item).expect("must decode a pre-Task-2 row without error");
+        assert_eq!(decoded.state, ThreadState::ContentDone);
+        assert_eq!(decoded.ogre_doc_id.as_deref(), Some("doc-1"));
+        assert_eq!(decoded.reason, None);
+        assert_eq!(decoded.attempts, 0);
     }
 
     #[test]
