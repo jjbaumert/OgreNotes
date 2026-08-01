@@ -189,6 +189,31 @@ fn find_frame_index(frames: &[DeckFrame], block_id: &str) -> Option<usize> {
     frames.iter().position(|f| f.block_id == block_id)
 }
 
+/// Task 11 review, Finding 2 — whether the frame named by `editing_id`
+/// (the embedded editor's currently-open frame, if any) is still part
+/// of the *active* slide's frame list. `None` (nothing being edited)
+/// is trivially "still visible" — there's nothing to close.
+///
+/// Every slide-strip mutation that can change which slide is active
+/// (`add_with_preset`, `duplicate_at`, `delete_at`, `select_slide`)
+/// calls this *after* applying its own mutation and settling
+/// `active_slide`, and closes the editor when it comes back `false`.
+/// A blanket "always close on any slide-strip action" would be wrong
+/// in the opposite direction — re-clicking the *already*-active
+/// slide's own thumbnail (a no-op `select_slide`) must not spuriously
+/// kick the user out of an open editor — and it would also miss a
+/// subtler case: `delete_at` only clamps `active_slide` when it goes
+/// *out of bounds*, so deleting a slide *before* the active one shifts
+/// every later slide's index down by one without moving
+/// `active_slide` itself, silently swapping in a different slide
+/// underneath the same index. Re-deriving visibility from the live
+/// `Deck` after the mutation (rather than reasoning about *why* the
+/// active slide might have changed) handles both cases uniformly.
+fn editing_frame_still_visible(deck: &Deck, active_slide_idx: usize, editing_id: Option<&str>) -> bool {
+    let Some(id) = editing_id else { return true };
+    deck.slides.get(active_slide_idx).is_some_and(|s| s.frames.iter().any(|f| f.block_id == id))
+}
+
 /// Insert a fresh frame into `slide`, placed above every existing
 /// frame (`z` = current max + 1, so a newly added frame never renders
 /// underneath earlier ones), and return its new `block_id`.
@@ -367,9 +392,18 @@ pub fn DeckView(
     /// wires this from the page's `list_threads` fetch; for now the
     /// page passes an empty signal.
     frame_threads: ReadSignal<Vec<String>>,
+    /// Shared page-level toolbar-command channel (Task 11 review,
+    /// Finding 3) — the same `toolbar_command`/`set_toolbar_command`
+    /// pair `document.rs` already threads into `SpreadsheetView`. The
+    /// page's `<Toolbar>` writes into it; DeckView forwards it
+    /// straight through as the currently-open frame editor's own
+    /// `command_signal` (see `frame_body` below) — nothing else reads
+    /// it while no frame is being edited, since no `EditorComponent`
+    /// is mounted to consume it.
+    toolbar_command: ReadSignal<Option<ToolbarCommand>>,
+    set_toolbar_command: WriteSignal<Option<ToolbarCommand>>,
 ) -> impl IntoView {
     ensure_presentation_css();
-    let _ = doc_id; // not yet consumed directly — plumbed through for parity with SpreadsheetView
 
     let deck = RwSignal::new(Deck {
         theme: crate::presentation::model::DEFAULT_THEME.to_string(),
@@ -388,6 +422,36 @@ pub fn DeckView(
     // window-level listener below), a slide switch, or the frame
     // itself vanishing from a remote update (the resync Effect).
     let (editing_frame, set_editing_frame) = signal::<Option<String>>(None);
+
+    // Unconditionally close the embedded frame editor (Escape, an
+    // outside pointerdown, or the edited frame vanishing under a
+    // remote delete — every case where we already *know* it should
+    // close, not just suspect it). Also drops any toolbar command that
+    // arrived for this editor but hasn't been consumed yet (Task 11
+    // review, Finding 3): a stale `Some` left in `toolbar_command`
+    // here would otherwise get picked up by whichever frame editor
+    // opens next, applying a Bold/Italic/etc. the user aimed at a
+    // frame that isn't open anymore.
+    let close_frame_editor = move || {
+        set_editing_frame.set(None);
+        set_toolbar_command.set(None);
+    };
+
+    // Task 11 review, Finding 2 — every slide-strip mutation that can
+    // change which slide is active calls this *after* applying its own
+    // mutation and settling `active_slide`, instead of unconditionally
+    // closing the editor the way `select_slide` used to. See
+    // `editing_frame_still_visible`'s doc comment for why "did the
+    // active slide change" isn't the right question to ask.
+    let close_frame_editor_if_hidden = move || {
+        let Some(id) = editing_frame.get_untracked() else { return };
+        let idx = active_slide.get_untracked();
+        let still_visible = deck.with_untracked(|d| editing_frame_still_visible(d, idx, Some(&id)));
+        if !still_visible {
+            close_frame_editor();
+        }
+    };
+
     // Feedback-loop guard: set immediately before persist() emits its
     // editor_state change, cleared by the very next run of the doc→model
     // resync Effect below. Mirrors `spreadsheet_view.rs:1357`/`:2363`.
@@ -531,7 +595,7 @@ pub fn DeckView(
         if let Some(id) = &editing {
             let still_exists = merged.slides.iter().any(|s| s.frames.iter().any(|f| &f.block_id == id));
             if !still_exists {
-                set_editing_frame.set(None);
+                close_frame_editor();
             }
         }
         deck.set(merged);
@@ -576,7 +640,7 @@ pub fn DeckView(
                 .and_then(|el| el.get_attribute(FRAME_BLOCK_ID_ATTR))
                 .is_some_and(|id| id == editing_id);
             if !inside {
-                set_editing_frame.set(None);
+                close_frame_editor();
             }
         });
         on_cleanup(move || handle.remove());
@@ -592,6 +656,10 @@ pub fn DeckView(
             let idx = add_slide(d, after, preset);
             set_active_slide.set(idx);
         });
+        // Task 11 review, Finding 2 — this always selects the freshly
+        // inserted slide, so any editor open on the *previous* active
+        // slide's frame just scrolled out of view.
+        close_frame_editor_if_hidden();
         persist();
     };
 
@@ -608,6 +676,9 @@ pub fn DeckView(
             let dup_idx = duplicate_slide(d, idx);
             set_active_slide.set(dup_idx);
         });
+        // Task 11 review, Finding 2 — same reasoning as `add_with_preset`:
+        // this always selects the duplicate, a different slide.
+        close_frame_editor_if_hidden();
         persist();
     };
 
@@ -620,6 +691,16 @@ pub fn DeckView(
         if active_slide.get_untracked() >= len {
             set_active_slide.set(len.saturating_sub(1));
         }
+        // Task 11 review, Finding 2 — unlike add/duplicate, `active_slide`
+        // often does NOT change here (it's only clamped when it goes out
+        // of bounds), so a blanket close would be wrong; but deleting a
+        // slide *before* the active one shifts every later slide's index
+        // down by one, swapping in a different slide at the same index
+        // without moving `active_slide` at all. `close_frame_editor_if_hidden`
+        // re-derives visibility from the live deck rather than reasoning
+        // about whether `active_slide` itself moved, so it catches that
+        // case too — see `editing_frame_still_visible`'s doc comment.
+        close_frame_editor_if_hidden();
         persist();
     };
 
@@ -631,16 +712,16 @@ pub fn DeckView(
         // the newly-active slide's canvas, which has nothing to do
         // with the pending nudge).
         flush_nudge();
-        // A frame editor is scoped to the slide it's on, the same way
-        // a pending nudge is — switching away from it is an implicit
-        // "outside click" that the per-frame outside-click listener
-        // below can't see (the editing frame's row unmounts as part of
-        // the slide switch, but `editing_frame` itself doesn't clear
-        // on its own).
-        set_editing_frame.set(None);
         if let Some(idx) = deck.with_untracked(|d| find_slide_index(&d.slides, block_id)) {
             set_active_slide.set(idx);
         }
+        // Task 11 review, Finding 2 — checked *after* resolving the
+        // target slide (not unconditionally before, the way this used
+        // to work): re-clicking the already-active slide's own thumbnail
+        // doesn't actually change anything and must leave an open editor
+        // alone; switching to a genuinely different slide closes it,
+        // since the edited frame's row just unmounted.
+        close_frame_editor_if_hidden();
     };
 
     let on_theme_change = move |ev: web_sys::Event| {
@@ -1318,7 +1399,6 @@ pub fn DeckView(
                                                 })
                                                 .unwrap_or_else(|| fallback_content.clone());
                                             let inner_doc = Node::element_with_content(NodeType::Doc, current_content);
-                                            let (inner_toolbar_cmd, _) = signal::<Option<ToolbarCommand>>(None);
                                             let (inner_remote, _) = signal::<Option<EditorState>>(None);
                                             let on_state_change_block_id = block_id.clone();
                                             vec![
@@ -1340,7 +1420,19 @@ pub fn DeckView(
                                                             });
                                                             persist();
                                                         }),
-                                                        command_signal: inner_toolbar_cmd,
+                                                        // Task 11 review, Finding 3 — the page-level
+                                                        // `toolbar_command` signal, forwarded straight
+                                                        // through. There's nothing else to gate this on:
+                                                        // this `EditorComponent` only exists while
+                                                        // `editing_frame == Some(block_id)` in the first
+                                                        // place (this whole branch is the mount), so the
+                                                        // signal only ever reaches a live consumer while
+                                                        // this frame is the one being edited — the same
+                                                        // way the page's own top-level `<EditorComponent>`
+                                                        // mount (document.rs) wires `toolbar_command`
+                                                        // straight into `command_signal` with no extra
+                                                        // gating.
+                                                        command_signal: toolbar_command,
                                                         // Always `None` — remote merge for this frame is
                                                         // handled at the deck level by `merge_remote_deck`
                                                         // in the resync Effect, not by feeding the inner
@@ -1416,7 +1508,7 @@ pub fn DeckView(
                                             }
                                             if ev.key() == "Escape" {
                                                 ev.prevent_default();
-                                                set_editing_frame.set(None);
+                                                close_frame_editor();
                                             }
                                             ev.stop_propagation();
                                         }
@@ -1436,6 +1528,25 @@ pub fn DeckView(
                                         }
                                         on:dblclick=move |ev: web_sys::MouseEvent| {
                                             if readonly {
+                                                return;
+                                            }
+                                            // Task 11 review, Finding 1 — word-select
+                                            // (double-click inside the open
+                                            // contenteditable's own text, a normal
+                                            // editing gesture) fires this same
+                                            // `dblclick`. Without this guard it would
+                                            // re-set `editing_frame` to the id it's
+                                            // already set to, which the row's
+                                            // `frame_body` closure can't tell apart
+                                            // from a *fresh* open — it would rebuild
+                                            // `inner_doc` from `deck` and remount a
+                                            // brand-new `EditorComponent`, dropping
+                                            // the very selection the double-click was
+                                            // trying to make (plus focus and undo
+                                            // history). Already-editing-this-frame is
+                                            // a no-op here; the browser's own
+                                            // word-select still happens untouched.
+                                            if editing_frame.get_untracked().as_deref() == Some(block_id_dblclick.as_str()) {
                                                 return;
                                             }
                                             ev.stop_propagation();
@@ -1833,5 +1944,94 @@ mod tests {
     fn find_frame_index_missing_block_id_is_none() {
         let slide = simple_slide();
         assert_eq!(find_frame_index(&slide.frames, "not-a-real-id"), None);
+    }
+
+    // ─── Frame-editor lifecycle (Task 11 review, Finding 2) ─
+    //
+    // `editing_frame_still_visible` is the pure decision `close_frame_editor_if_hidden`
+    // (a `DeckView`-internal closure, not testable without the reactive
+    // runtime) delegates to. These tests cover the decision function's
+    // contract directly; the DOM-level wiring that calls it from
+    // `add_with_preset`/`duplicate_at`/`delete_at`/`select_slide` — and
+    // Finding 1's dblclick guard, and Finding 3's `command_signal`
+    // forwarding — has no pure boundary to test against and is left to
+    // manual/browser verification (`trunk build` + the existing
+    // `frontend-doctor` scenarios cover presentation docs already).
+
+    #[test]
+    fn editing_frame_still_visible_true_when_nothing_is_being_edited() {
+        let deck = fixture_deck_two_slides();
+        assert!(editing_frame_still_visible(&deck, 0, None));
+        // Even an out-of-range slide index is fine — there's nothing to
+        // look up when `editing_id` is `None`.
+        assert!(editing_frame_still_visible(&deck, 99, None));
+    }
+
+    #[test]
+    fn editing_frame_still_visible_true_when_frame_is_on_the_active_slide() {
+        let deck = fixture_deck_two_slides();
+        let id = deck.slides[0].frames[0].block_id.clone();
+        assert!(editing_frame_still_visible(&deck, 0, Some(&id)));
+    }
+
+    #[test]
+    fn editing_frame_still_visible_false_when_frame_is_on_a_different_slide() {
+        // The scenario behind `add_with_preset`/`duplicate_at`: the frame
+        // being edited lived on slide 0, but the active slide moved to 1.
+        let deck = fixture_deck_two_slides();
+        let id = deck.slides[0].frames[0].block_id.clone();
+        assert!(!editing_frame_still_visible(&deck, 1, Some(&id)));
+    }
+
+    #[test]
+    fn editing_frame_still_visible_false_when_frame_no_longer_exists() {
+        let deck = fixture_deck_two_slides();
+        assert!(!editing_frame_still_visible(&deck, 0, Some("deleted-frame-id")));
+    }
+
+    #[test]
+    fn editing_frame_still_visible_false_when_active_slide_index_is_out_of_range() {
+        let deck = fixture_deck_two_slides();
+        let id = deck.slides[0].frames[0].block_id.clone();
+        assert!(!editing_frame_still_visible(&deck, 99, Some(&id)));
+    }
+
+    /// The `delete_at` scenario the review flagged directly: deleting an
+    /// *earlier* slide shifts every later slide's index down by one
+    /// without `active_slide` (a raw index, unadjusted unless it goes
+    /// out of bounds) moving at all — so the same numeric index now
+    /// refers to a different slide, one that doesn't have the
+    /// previously-edited frame.
+    #[test]
+    fn editing_frame_still_visible_false_after_earlier_slide_shifts_active_index() {
+        let mut deck = Deck {
+            theme: DEFAULT_THEME.to_string(),
+            slide_size: "16:9".to_string(),
+            slides: vec![simple_slide(), simple_slide(), simple_slide()],
+        };
+        let edited_id = deck.slides[1].frames[0].block_id.clone();
+        // Editing a frame on the slide at index 1 (active_slide == 1).
+        assert!(editing_frame_still_visible(&deck, 1, Some(&edited_id)));
+
+        // A concurrent delete removes slide 0. `delete_slide` only
+        // clamps `active_slide` when it goes *out of bounds*
+        // (`delete_at`'s own logic) — deleting an earlier slide doesn't
+        // trigger that, so a caller that doesn't separately re-derive
+        // visibility would leave `active_slide` sitting at 1, which now
+        // names a *different* slide (the one that used to be at index 2).
+        delete_slide(&mut deck, 0);
+        assert_eq!(deck.slides.len(), 2);
+        assert_ne!(
+            deck.slides[1].frames[0].block_id, edited_id,
+            "index 1 now refers to the slide that used to be at index 2, not the edited frame's slide"
+        );
+        assert!(
+            !editing_frame_still_visible(&deck, 1, Some(&edited_id)),
+            "the edited frame's slide shifted to index 0; index 1 no longer has it"
+        );
+        assert!(
+            editing_frame_still_visible(&deck, 0, Some(&edited_id)),
+            "the edited frame is still in the deck, just at a different index"
+        );
     }
 }

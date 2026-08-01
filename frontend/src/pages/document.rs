@@ -3171,6 +3171,12 @@ pub fn DocumentPage() -> impl IntoView {
                                     // an always-empty thread list.
                                     on_request_frame_comment=Callback::new(|_: String| {})
                                     frame_threads=frame_threads_placeholder
+                                    // Task 11 review, Finding 3 — the same shared
+                                    // toolbar-command channel `<Toolbar>` (mounted
+                                    // unconditionally above, for every doc_type)
+                                    // and `SpreadsheetView` already use.
+                                    toolbar_command=toolbar_command
+                                    set_toolbar_command=set_toolbar_command
                                 />
                             }.into_any();
                         }
