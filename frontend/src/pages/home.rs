@@ -250,6 +250,74 @@ pub fn HomePage() -> impl IntoView {
         }
     }
 
+    // #174: show one specific folder, by id. The folder view has no route of
+    // its own — it is in-memory state on this page — so this is the only way
+    // a surface outside the page (the Quip import wizard's "Open folder",
+    // mounted in the shell) can land the user in a folder. Registered into
+    // `ctx.open_folder` below and used by the mount path for a request that
+    // arrived before this page existed.
+    //
+    // The trail is rebuilt as Home → <folder> rather than appended to (which
+    // is `on_navigate_folder`'s job): the target is not a child of whatever
+    // the user last happened to be looking at, so pushing onto the current
+    // trail would draw a parentage that isn't real.
+    let show_folder = Callback::new(move |folder_id: String| {
+        let home_id = home_folder_id.get_untracked();
+        let trash_id = trash_folder_id.get_untracked();
+        let private_id = private_folder_id.get_untracked();
+        leptos::task::spawn_local(async move {
+            match folders::get_folder(&folder_id).await {
+                Ok(mut f) => {
+                    if let (Some(home), Some(trash)) = (&home_id, &trash_id) {
+                        if &f.id == home {
+                            f = splice_trash_row(f, trash);
+                            if let Some(private) = &private_id {
+                                f = splice_private_row(f, private);
+                            }
+                        }
+                    }
+                    set_breadcrumbs.update(|b| {
+                        b.truncate(1);
+                        // Home itself (where a pre-#172 Quip import's
+                        // documents landed) is the trail's root, not a second
+                        // crumb underneath it.
+                        if b.first().map(|c| c.id.as_str()) != Some(f.id.as_str()) {
+                            b.push(Crumb {
+                                id: f.id.clone(),
+                                title: f.title.clone(),
+                            });
+                        }
+                    });
+                    set_folder.set(Some(f));
+                }
+                Err(e) => set_error.set(Some(e.to_string())),
+            }
+        });
+    });
+
+    // #174: consume any pending "open this folder" request HERE, in
+    // straight-line setup, BEFORE the mount task below is spawned — not at the
+    // point of use inside it.
+    //
+    // Taking it up front is what keeps a *failed* mount from stranding the
+    // request. The mount's fetches (`/users/me`, then the folder) can both
+    // fail transiently; if the request were only consumed on the success path,
+    // a network blip during an "Open folder" navigation would leave it armed
+    // indefinitely, and the next, entirely unrelated visit to Home would
+    // silently open that folder — a "why am I in here?" with no action of the
+    // user's connecting the two. Consumed here, a failed mount just drops it:
+    // the user gets the error banner and no phantom navigation later.
+    //
+    // `FolderRequest::take` clears as it reads, so there is no early return,
+    // `?`, or error branch anywhere below that can skip the clear.
+    let requested_folder = ctx.requested_folder.take();
+    // #174: an explicit Home click while the mount is still fetching is a
+    // NEWER intent than the folder request this mount is carrying. `home_reset`
+    // bumps this tick; the task compares it before descending, and stands down
+    // rather than yanking the user back out of the Home they just asked for.
+    let (home_nav_tick, set_home_nav_tick) = signal(0u32);
+    let mount_nav_tick = home_nav_tick.get_untracked();
+
     // Load user info and home folder on mount.
     {
         let set_folder = set_folder.clone();
@@ -291,6 +359,19 @@ pub fn HomePage() -> impl IntoView {
                                 splice_private_row(f, &user.private_folder_id)
                             };
                             set_folder.set(Some(f));
+                            // #174: a shell surface asked for a specific
+                            // folder before this page existed (the Quip
+                            // import wizard's "Open folder", fired from
+                            // another route). The request was already taken
+                            // — and cleared — in setup above; this is the one
+                            // path that *acts* on it, after Home has seeded
+                            // the trail so it reads Home → <folder>. A Home
+                            // click during the fetches supersedes it.
+                            if let Some(folder_id) = requested_folder {
+                                if home_nav_tick.get_untracked() == mount_nav_tick {
+                                    show_folder.run(folder_id);
+                                }
+                            }
                         }
                         Err(e) => set_error.set(Some(e.to_string())),
                     }
@@ -574,6 +655,11 @@ pub fn HomePage() -> impl IntoView {
     // sidebar).
     let nav_home = use_navigate();
     let home_reset = Callback::new(move |()| {
+        // #174: record the click BEFORE doing anything else. A mount task
+        // still resolving its fetches may be carrying a queued "open this
+        // folder" request; this tick is how it learns the user has since asked
+        // for Home outright, so it stands down instead of overriding them.
+        set_home_nav_tick.update(|t| *t = t.wrapping_add(1));
         let on_root_url = web_sys::window()
             .and_then(|w| w.location().pathname().ok())
             .map(|p| p == "/")
@@ -624,6 +710,28 @@ pub fn HomePage() -> impl IntoView {
     // from other pages.
     ctx.home_reset.set(Some(home_reset));
     on_cleanup(move || ctx.home_reset.set(None));
+
+    // #174: same registration shape as the Home reset above — while this page
+    // is the active outlet it owns the folder view, so a shell surface opens
+    // a folder through it rather than through a route change. Under /trash
+    // the URL genuinely has to change first (the route decides which folder
+    // this page opens on mount), so that case hands off through
+    // `requested_folder` exactly like a caller on another page would.
+    let nav_for_folder = use_navigate();
+    ctx.open_folder
+        .set(Some(Callback::new(move |folder_id: String| {
+            let on_root_url = web_sys::window()
+                .and_then(|w| w.location().pathname().ok())
+                .map(|p| p == "/")
+                .unwrap_or(false);
+            if on_root_url {
+                show_folder.run(folder_id);
+            } else {
+                ctx.requested_folder.set(folder_id);
+                nav_for_folder("/", Default::default());
+            }
+        })));
+    on_cleanup(move || ctx.open_folder.set(None));
 
     // Phase 6 M-6.2 piece C: install the ask_bridge so the
     // Global-scoped `ask.open` palette command can flip the dialog

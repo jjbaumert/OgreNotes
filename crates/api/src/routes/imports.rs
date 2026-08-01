@@ -425,6 +425,25 @@ struct StatusResponse {
     status: String,
     phase: u8,
     progress: Progress,
+    /// The OgreNotes folder this import's documents land in — what the
+    /// wizard's "Open folder" button opens (#174), or `null` when the
+    /// import has no destination yet.
+    ///
+    /// This is the **effective** destination, `ImportRecord::target_folder_id`,
+    /// not `import_folder_id`. The two agree for every import started since
+    /// #172 (`start` records the dedicated per-import folder as the effective
+    /// target, and the content pass reads its destination from
+    /// `target_folder_id` — see `worker_mode`'s `destination_for`). They
+    /// differ only for an import started *before* #172, which has no import
+    /// folder at all but did land its documents somewhere: the parent the
+    /// user picked. Projecting `import_folder_id` would report `null` for
+    /// those runs even though a real destination exists, so the button would
+    /// dead-end on precisely the imports whose documents are hardest to find.
+    ///
+    /// `null` therefore means "no destination was ever chosen" — an import
+    /// still in `Scoping`, which has not been started. A client must fall
+    /// back (the wizard sends the user to Home) rather than assume an id.
+    destination_folder_id: Option<String>,
     /// The import's outcome report, or `null` while no `REPORT` row exists
     /// yet (the worker creates it lazily on the first counted outcome).
     ///
@@ -558,9 +577,11 @@ fn project_report(row: ReportRow) -> ReportDto {
 /// for the wizard. A different user (or a nonexistent id) gets 404, never
 /// 403 — same existence-hiding convention as `start`.
 ///
-/// Also carries the import's outcome report (counters + the bounded note
-/// list) so the wizard's completion state can say what the run *lost*, not
-/// just what it finished. The report read is a single consistent `get_item`
+/// Also carries the import's destination folder (`destinationFolderId`, #174)
+/// so the wizard's "Open folder" button can land the user where the
+/// documents actually went, and the import's outcome report (counters + the
+/// bounded note list) so the wizard's completion state can say what the run
+/// *lost*, not just what it finished. The report read is a single consistent `get_item`
 /// on one small row — `ImportRepo::get_report`'s own doc comment budgets
 /// for exactly this, one read per wizard poll.
 ///
@@ -626,6 +647,9 @@ async fn get_status(
             total,
             stage: stage.to_string(),
         },
+        // The effective destination, not the raw `import_folder_id` — see
+        // `StatusResponse::destination_folder_id`.
+        destination_folder_id: record.target_folder_id,
         report,
     }))
 }

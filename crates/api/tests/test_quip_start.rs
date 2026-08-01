@@ -289,6 +289,152 @@ async fn get_status_returns_progress_and_is_owner_gated() {
     app.cleanup().await;
 }
 
+/// #174: the status poll carries the folder the documents land in, so the
+/// wizard's "Open folder" button can go there instead of dumping the user on
+/// Home to hunt for it.
+///
+/// The value is the *effective* destination — since #172 that is the
+/// dedicated per-import folder, not the parent the wizard sent. Asserting
+/// against the parent as well is the point: a response that echoed
+/// `targetFolderId` as the user picked it would send the user one level too
+/// high, which is the original bug with an extra step.
+///
+/// Doubles as the no-token guard for a *populated* destination field
+/// (`report_response_never_carries_a_token_field` covers the same walk with
+/// the field null), because a live token is stashed for this import.
+#[tokio::test]
+async fn get_status_carries_the_destination_folder_of_a_started_import() {
+    common::require_infra!();
+
+    let app = common::TestApp::new().await;
+    let (user_id, token) = app.create_user("owner1@test.com").await;
+    let parent = app.create_folder(&token, "Dest", None).await;
+    let import_id = seed_scoping_import(&app, &user_id, &[]).await;
+
+    const SECRET: &str = "QUIPTOKENsentinel-must-never-be-returned-0xfeedface";
+    app.state
+        .quip_token_store
+        .put(&import_id, &ogrenotes_quip_import::QuipToken::new(SECRET.to_string()))
+        .await
+        .expect("stash token");
+
+    let (status, body) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/imports/quip/{import_id}/start"),
+            Some(&token),
+            Some(serde_json::json!({
+                "selectedRootFolderIds": ["root"],
+                "targetFolderId": parent,
+            })),
+        )
+        .await;
+    assert_eq!(status, 202, "start failed: {body}");
+
+    let import_folder = app
+        .state
+        .import_repo
+        .get(&import_id)
+        .await
+        .unwrap()
+        .expect("record exists")
+        .import_folder_id
+        .expect("start records an import folder");
+
+    let body = get_report_status(&app, &import_id, &token).await;
+    assert_eq!(
+        body["destinationFolderId"], import_folder,
+        "the status must name the folder the documents land in: {body}",
+    );
+    assert_ne!(
+        body["destinationFolderId"], serde_json::Value::String(parent),
+        "the destination is the dedicated import folder, not the picked parent: {body}",
+    );
+
+    // The new field must not have opened a credential path (same two checks
+    // as `report_response_never_carries_a_token_field`, here with the
+    // destination actually populated).
+    let serialized = body.to_string();
+    assert!(
+        !serialized.contains(SECRET),
+        "the stashed Quip token must never appear in the status response",
+    );
+    let mut offending = Vec::new();
+    collect_secret_keys(&body, &mut offending);
+    assert!(
+        offending.is_empty(),
+        "status response exposes credential-shaped fields {offending:?}: {serialized}",
+    );
+
+    app.cleanup().await;
+}
+
+/// An import that was never started has no destination at all, and the
+/// response says so with `null` rather than inventing one. The wizard's
+/// button falls back to Home on `null`, so a wrong guess here would be a
+/// silent misnavigation instead of a visible absence.
+#[tokio::test]
+async fn get_status_reports_a_null_destination_before_the_import_is_started() {
+    common::require_infra!();
+
+    let app = common::TestApp::new().await;
+    let (owner_id, owner_token) = app.create_user("owner1@test.com").await;
+    let import_id = seed_scoping_import(&app, &owner_id, &[]).await;
+
+    let body = get_report_status(&app, &import_id, &owner_token).await;
+    assert!(
+        body["destinationFolderId"].is_null(),
+        "a Scoping import has no destination yet: {body}",
+    );
+
+    app.cleanup().await;
+}
+
+/// An import started *before* #172 has no `import_folder_id` — but its
+/// documents did land somewhere: the parent the user picked, recorded as
+/// `target_folder_id`. The response projects that, so the button still opens
+/// a real folder for those runs.
+///
+/// This is the test that pins the choice of field: projecting
+/// `import_folder_id` instead would report `null` here.
+#[tokio::test]
+async fn get_status_falls_back_to_the_picked_parent_for_a_pre_import_folder_run() {
+    common::require_infra!();
+
+    let app = common::TestApp::new().await;
+    let (owner_id, owner_token) = app.create_user("owner1@test.com").await;
+    let import_id = seed_scoping_import(&app, &owner_id, &[]).await;
+
+    // Exactly the shape a pre-#172 start left behind: a recorded destination
+    // (the parent the user picked) and no import folder. `set_scope` is the
+    // write that start used then, and still uses now — it never touches
+    // `import_folder_id`.
+    app.state
+        .import_repo
+        .set_scope(&import_id, &["root".to_string()], "legacy-destination")
+        .await
+        .expect("record the legacy destination");
+    let record = app
+        .state
+        .import_repo
+        .get(&import_id)
+        .await
+        .unwrap()
+        .expect("record exists");
+    assert!(
+        record.import_folder_id.is_none(),
+        "the fixture must be a pre-#172 import: no import folder",
+    );
+
+    let body = get_report_status(&app, &import_id, &owner_token).await;
+    assert_eq!(
+        body["destinationFolderId"], "legacy-destination",
+        "a pre-#172 import must still report the folder its documents went to: {body}",
+    );
+
+    app.cleanup().await;
+}
+
 // ─── Task 5: the outcome report on the status poll ─────────────
 
 /// GET the status endpoint as `token`'s owner, asserting 200.
