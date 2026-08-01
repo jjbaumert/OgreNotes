@@ -1447,7 +1447,9 @@ fn find_descendant(
 }
 
 /// Verbatim text of a subtree — used for `<pre>`, where interior
-/// whitespace is content.
+/// whitespace is content. `<br>` becomes `\n`, including a trailing
+/// one: that blank last line is authored, unlike the leading newline
+/// html5ever inserts after `<pre>` (stripped below).
 fn raw_text(handle: &markup5ever_rcdom::Handle) -> String {
     use markup5ever_rcdom::NodeData;
     let mut out = String::new();
@@ -1455,6 +1457,15 @@ fn raw_text(handle: &markup5ever_rcdom::Handle) -> String {
         use markup5ever_rcdom::NodeData;
         match &handle.data {
             NodeData::Text { contents } => out.push_str(contents.borrow().as_ref()),
+            // Quip separates code-block lines with `<br>` elements, not
+            // literal newlines. A `<br>` carries no text and no children,
+            // so without this arm every line of a code block collapses
+            // onto one. Unlike the walker's `"br"` arm, a code block has
+            // no inline layer to hang a `HardBreak` on — inside `<pre>`
+            // the newline *is* the text.
+            NodeData::Element { name, .. } if name.local.as_ref().eq_ignore_ascii_case("br") => {
+                out.push('\n');
+            }
             _ => {
                 for child in handle.children.borrow().iter() {
                     go(child, out);
@@ -2671,6 +2682,91 @@ mod tests {
         let b = blocks("<pre><code>let a = 1;\nlet b = 2;</code></pre>");
         let QuipBlock::Code { text, .. } = &b[0] else { panic!("expected code") };
         assert_eq!(text, "let a = 1;\nlet b = 2;");
+    }
+
+    /// #184: Quip writes code-block line breaks as `<br>` elements,
+    /// never as literal newlines. This markup is verbatim from the
+    /// staged corpus (`imports/*/threads/aLeAAAuK0hD.html`), down to
+    /// the NBSP indentation Quip emits and the `&lt;`/`&gt;` entities.
+    #[test]
+    fn code_block_br_separated_lines_keep_breaks_and_indentation() {
+        let html = "<pre id='temp:C:aLe6d44fc8fe4b74926a3ecbbf35' class='prettyprint'>\
+            #[derive(Serialize, Deserialize, Clone)]<br>\
+            pub struct Lobby {<br>\
+            \u{a0}\u{a0} \u{a0}pub lobby_id: String,<br>\
+            \u{a0}\u{a0} \u{a0}pub game_type: String,<br>\
+            \u{a0}\u{a0} \u{a0}pub host_user_id: String,<br>\
+            \u{a0}\u{a0} \u{a0}pub players: Vec&lt;Player&gt;,<br>\
+            \u{a0}\u{a0} \u{a0}pub max_players: usize,<br>\
+            \u{a0}\u{a0} \u{a0}pub status: String,<br>\
+            \u{a0}\u{a0} \u{a0}pub chat_history: Vec&lt;ChatMessage&gt;,<br>\
+            \u{a0}\u{a0} \u{a0}pub created_at: u64,<br>\
+            \u{a0}\u{a0} \u{a0}pub updated_at: u64,<br>\
+            }<br>\
+            <br>\
+            #[derive(Serialize, Deserialize, Clone)]<br>\
+            pub struct Player {<br>\
+            \u{a0}\u{a0} \u{a0}pub user_id: String,<br>\
+            \u{a0}\u{a0} \u{a0}pub user_name: String,<br>\
+            \u{a0}\u{a0} \u{a0}pub status: String, \u{a0}// \"ready\" | \"not_ready\"<br>\
+            }<br>\
+            <br>\
+            #[derive(Serialize, Deserialize, Clone)]<br>\
+            pub struct ChatMessage {<br>\
+            \u{a0}\u{a0} \u{a0}pub user_id: String,<br>\
+            \u{a0}\u{a0} \u{a0}pub message: String,<br>\
+            \u{a0}\u{a0} \u{a0}pub timestamp: u64,<br>\
+            }</pre>";
+        let b = blocks(html);
+        let QuipBlock::Code { text, .. } = &b[0] else { panic!("expected code: {b:?}") };
+        assert_eq!(
+            text,
+            "#[derive(Serialize, Deserialize, Clone)]\n\
+            pub struct Lobby {\n\
+            \u{a0}\u{a0} \u{a0}pub lobby_id: String,\n\
+            \u{a0}\u{a0} \u{a0}pub game_type: String,\n\
+            \u{a0}\u{a0} \u{a0}pub host_user_id: String,\n\
+            \u{a0}\u{a0} \u{a0}pub players: Vec<Player>,\n\
+            \u{a0}\u{a0} \u{a0}pub max_players: usize,\n\
+            \u{a0}\u{a0} \u{a0}pub status: String,\n\
+            \u{a0}\u{a0} \u{a0}pub chat_history: Vec<ChatMessage>,\n\
+            \u{a0}\u{a0} \u{a0}pub created_at: u64,\n\
+            \u{a0}\u{a0} \u{a0}pub updated_at: u64,\n\
+            }\n\
+            \n\
+            #[derive(Serialize, Deserialize, Clone)]\n\
+            pub struct Player {\n\
+            \u{a0}\u{a0} \u{a0}pub user_id: String,\n\
+            \u{a0}\u{a0} \u{a0}pub user_name: String,\n\
+            \u{a0}\u{a0} \u{a0}pub status: String, \u{a0}// \"ready\" | \"not_ready\"\n\
+            }\n\
+            \n\
+            #[derive(Serialize, Deserialize, Clone)]\n\
+            pub struct ChatMessage {\n\
+            \u{a0}\u{a0} \u{a0}pub user_id: String,\n\
+            \u{a0}\u{a0} \u{a0}pub message: String,\n\
+            \u{a0}\u{a0} \u{a0}pub timestamp: u64,\n\
+            }"
+        );
+        assert_eq!(text.lines().count(), 26, "one line per <br>");
+    }
+
+    /// A `<br>` immediately before `</pre>` is authored content — the
+    /// blank last line the writer typed — so it is kept, unlike the
+    /// leading newline html5ever inserts after `<pre>`. Markup verbatim
+    /// from `imports/*/threads/SVbAAAXPtZK.html`.
+    #[test]
+    fn code_block_trailing_br_keeps_the_blank_last_line() {
+        let html = "<pre id='temp:C:SVbd79494ad826748a3b95756e53' class='prettyprint'>\
+            GAME # game-name -&gt; { game-id }<br>\
+            game-id # STATUS # game-status -&gt; { change-log... }<br></pre>";
+        let b = blocks(html);
+        let QuipBlock::Code { text, .. } = &b[0] else { panic!("expected code: {b:?}") };
+        assert_eq!(
+            text,
+            "GAME # game-name -> { game-id }\n\
+             game-id # STATUS # game-status -> { change-log... }\n"
+        );
     }
 
     #[test]
