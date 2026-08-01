@@ -165,12 +165,26 @@ proptest! {
             .map_err(|_| TestCaseError::fail(format!("from_quip_html panicked on {html:?}")))?;
     }
 
-    /// The Quip importer's ammonia allowlist is *wider* than
-    /// `import::from_html`'s — it has to admit tables, images and checkbox
-    /// inputs — so the XSS boundary is a genuinely different one and needs
-    /// its own property rather than inheriting the narrower parser's.
+    /// Pins the **materialization path**, NOT the sanitizer allowlist.
+    ///
+    /// Read what this can actually observe before trusting it: `assert_no_xss`
+    /// walks the materialized yrs document, whose element names come from the
+    /// closed `NodeType` enum. It therefore cannot fail on anything the
+    /// ammonia allowlist admits — widening `allowed_tags()` with `iframe` and
+    /// `allowed_attributes()` with `onclick` leaves this test green, because
+    /// materialization was never going to emit either one. The `javascript:`
+    /// href arm is weaker still: hrefs become text *marks*, which this never
+    /// inspects.
+    ///
+    /// What it does pin is real but narrow — that the block walker and
+    /// `materialize` cannot be talked into emitting a forbidden element or an
+    /// `on*` attribute even when handed one. **The allowlist itself is
+    /// guarded by `import_quip`'s own unit tests**
+    /// (`the_allowlist_admits_no_script_framing_or_event_handler` and
+    /// `sanitize_strips_script_framing_and_event_handlers`), which live beside
+    /// `sanitize()` because that is the only place it is reachable.
     #[test]
-    fn from_quip_html_strips_all_xss_vectors(
+    fn from_quip_html_materialization_emits_no_xss_vectors(
         payload in "[a-z0-9 ='\"();]{0,40}",
         tag in prop::sample::select(vec!["script", "iframe", "object", "embed", "style", "form", "link"]),
     ) {

@@ -1577,6 +1577,87 @@ fn materialize_block(
 mod tests {
     use super::*;
     use yrs::ReadTxn;
+
+    // ─── the sanitizer allowlist (the actual XSS boundary) ───────
+    //
+    // These live HERE, next to `allowed_tags`/`allowed_attributes`, rather
+    // than in `tests/import_fuzz.rs`, for a reason worth stating: the fuzz
+    // suite can only observe the **materialized yrs document**, whose element
+    // names come from the closed `NodeType` enum. A doc-level assertion
+    // therefore cannot fail no matter what the allowlist admits — widen
+    // `allowed_tags()` with `iframe` and a doc-level "no iframe survived"
+    // property still passes, because materialization was never going to emit
+    // one. The boundary that actually decides what a `<script>` in a Quip
+    // document does is `sanitize()`, and the only place `sanitize()` is
+    // reachable is here.
+
+    /// Tags that must never be admitted: script execution, framing, and
+    /// external-resource loading.
+    const NEVER_ALLOWED_TAGS: &[&str] =
+        &["script", "iframe", "object", "embed", "style", "form", "link", "base", "meta"];
+
+    /// The allowlist sets themselves — the sharpest possible failure, naming
+    /// the exact entry someone added.
+    #[test]
+    fn the_allowlist_admits_no_script_framing_or_event_handler() {
+        let tags = allowed_tags();
+        for forbidden in NEVER_ALLOWED_TAGS {
+            assert!(
+                !tags.contains(forbidden),
+                "{forbidden:?} must never be an allowed tag — it is script/framing/resource-loading",
+            );
+        }
+        let attrs = allowed_attributes();
+        for attr in &attrs {
+            assert!(
+                !attr.to_ascii_lowercase().starts_with("on"),
+                "{attr:?} is an event-handler attribute and must not be allowlisted",
+            );
+            assert_ne!(attr.to_ascii_lowercase(), "style", "inline style is a payload vector");
+        }
+    }
+
+    /// The same guarantee behaviorally, through `sanitize` — which also
+    /// covers the parts the set assertions cannot see: the `data-` attribute
+    /// *prefix* allowance, and ammonia's own URL-scheme filtering.
+    #[test]
+    fn sanitize_strips_script_framing_and_event_handlers() {
+        for tag in NEVER_ALLOWED_TAGS {
+            let html = format!("<p>keep</p><{tag}>payload()</{tag}><p>keep2</p>");
+            let out = sanitize(&html).to_ascii_lowercase();
+            assert!(
+                !out.contains(&format!("<{tag}")),
+                "sanitize admitted <{tag}>: {out:?}",
+            );
+            assert!(out.contains("keep"), "sanitize must keep ordinary content: {out:?}");
+        }
+
+        // Event handlers, on both an allowed tag and an allowed-with-content
+        // one. `img` and `td` are in the Quip allowlist precisely because
+        // this importer needs them, which is what makes them the interesting
+        // carriers.
+        let out = sanitize(
+            "<img src=x onerror='steal()' alt=a>             <table><tr><td onclick='steal()'>c</td></tr></table>             <p onmouseover='steal()'>t</p>",
+        )
+        .to_ascii_lowercase();
+        for handler in ["onerror", "onclick", "onmouseover"] {
+            assert!(!out.contains(handler), "sanitize admitted {handler}: {out:?}");
+        }
+
+        // Script-bearing URL schemes on the tags that carry URLs.
+        let out = sanitize(
+            "<a href=\"javascript:steal()\">x</a><img src=\"javascript:steal()\">             <a href=\"data:text/html;base64,PHNjcmlwdD4=\">y</a>",
+        )
+        .to_ascii_lowercase();
+        assert!(!out.contains("javascript:"), "sanitize admitted a javascript: URL: {out:?}");
+        assert!(!out.contains("data:text/html"), "sanitize admitted a data: HTML URL: {out:?}");
+
+        // The `data-` prefix allowance must not become an `on*` allowance.
+        let out = sanitize("<p data-section-id=s1 onfocus='steal()'>t</p>").to_ascii_lowercase();
+        assert!(out.contains("data-section-id"), "data-* hints must survive: {out:?}");
+        assert!(!out.contains("onfocus"), "the data- prefix must not admit handlers: {out:?}");
+    }
+
     use yrs::types::GetString;
     use yrs::types::xml::XmlOut;
 
