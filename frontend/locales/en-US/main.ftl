@@ -1180,3 +1180,12 @@ deck-theme-ocean-label = Ocean
 
 deck-new = New Presentation
 deck-doc-type-label = Presentation
+
+# ─── Presentations P1 (deck foundation, Task 9) ──────────────────
+# DeckView: slide strip + canvas + theme picker chrome.
+
+deck-add-slide = Add Slide
+deck-duplicate-slide = Duplicate slide
+deck-delete-slide = Delete slide
+deck-theme-label = Theme
+deck-frame-comment = Comment on this frame

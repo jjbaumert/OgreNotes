@@ -21,6 +21,7 @@ use crate::components::find_replace_bar::FindReplaceBar;
 use crate::components::folder_picker::FolderPickerDialog;
 use crate::components::selection_toolbar::{SelectionToolbar, SelectionCommand};
 use crate::components::cursor_overlay::CursorOverlay;
+use crate::components::deck_view::DeckView;
 use crate::components::document_details::DocumentDetailsDialog;
 use crate::components::editor_gutter::EditorGutterOverlay;
 use crate::components::history_viewer::HistoryViewer;
@@ -465,6 +466,11 @@ pub fn DocumentPage() -> impl IntoView {
     // cell, and opens its popup.
     let (focus_cell, set_focus_cell) =
         signal::<Option<crate::components::spreadsheet_view::CellFocus>>(None);
+    // Frame-anchored comment threads for DeckView (Task 9 skeleton — always
+    // empty; Task 12 wires this to the same list_threads fetch that
+    // populates `inline_threads`/`cell_threads`, keyed by frame block_id).
+    let (frame_threads_placeholder, _set_frame_threads_placeholder) =
+        signal::<Vec<String>>(Vec::new());
     let (comment_count, set_comment_count) = signal(0usize);
     // Bumped each time a peer's REST write changes a comment thread on this
     // doc (see CollabClient::set_on_comment_event below). The thread-load
@@ -1204,18 +1210,21 @@ pub fn DocumentPage() -> impl IntoView {
         ));
     });
 
-    // Forward remote updates to editor_state for spreadsheet mode.
-    // EditorComponent handles remote_state internally; SpreadsheetView reads editor_state,
-    // so we bridge the two signals here.
+    // Forward remote updates to editor_state for spreadsheet/presentation
+    // mode. EditorComponent handles remote_state internally; SpreadsheetView
+    // and DeckView both read editor_state, so we bridge the two signals here.
     let remote_flag_for_spreadsheet = std::rc::Rc::clone(&remote_update_flag);
     Effect::new(move |_| {
-        if doc_type.get() != "spreadsheet" { return; }
+        if !matches!(doc_type.get().as_str(), "spreadsheet" | "presentation") { return; }
         let Some(state) = remote_state.get() else { return; };
         // Don't let the post-handshake remote callback for a still-empty
         // server ydoc (decoded as a bare-Paragraph fallback) clobber the
         // locally-initialized table — see remote_doc_degrades_spreadsheet.
+        // Presentation docs have no analogous "degrades" risk (an empty
+        // deck bootstraps its own blank slide via DeckView's resync
+        // Effect), so this guard only fires for spreadsheet.
         let current = editor_state.get_untracked();
-        if remote_doc_degrades_spreadsheet(
+        if doc_type.get_untracked() == "spreadsheet" && remote_doc_degrades_spreadsheet(
             current.as_ref().map(|s| &s.doc),
             &state.doc,
         ) {
@@ -1225,14 +1234,14 @@ pub fn DocumentPage() -> impl IntoView {
         set_editor_state.set(Some(state));
     });
 
-    // Initialize the spreadsheet EditorState once content has loaded.
-    // Must run as an Effect, not inside the view closure: writing a signal
-    // during a reactive render stalls the closure before it returns the view,
-    // leaving the page on "Loading document..." forever.
+    // Initialize the spreadsheet/presentation EditorState once content has
+    // loaded. Must run as an Effect, not inside the view closure: writing a
+    // signal during a reactive render stalls the closure before it returns
+    // the view, leaving the page on "Loading document..." forever.
     let spreadsheet_initialized: std::rc::Rc<std::cell::RefCell<String>> =
         std::rc::Rc::new(std::cell::RefCell::new(String::new()));
     Effect::new(move |_| {
-        if !content_loaded.get() || doc_type.get() != "spreadsheet" {
+        if !content_loaded.get() || !matches!(doc_type.get().as_str(), "spreadsheet" | "presentation") {
             return;
         }
         let id = current_id.get_untracked();
@@ -1244,8 +1253,19 @@ pub fn DocumentPage() -> impl IntoView {
         }
         *spreadsheet_initialized.borrow_mut() = id;
 
+        // Presentations skip the has_table/create_default_spreadsheet_doc
+        // branch below entirely — DeckView's own doc→model resync Effect
+        // detects a slide-less doc and backfills + persists one blank
+        // slide, so this Effect only needs to hand it *some* decoded Doc
+        // (or the bare-paragraph empty_doc fallback) to read from.
+        let is_presentation = doc_type.get_untracked() == "presentation";
         let content = initial_content.get_untracked();
-        let doc = if let Some(ref bytes) = content {
+        let doc = if is_presentation {
+            content
+                .as_ref()
+                .and_then(|bytes| crate::editor::yrs_bridge::ydoc_bytes_to_doc(bytes).ok())
+                .unwrap_or_else(crate::editor::model::Node::empty_doc)
+        } else if let Some(ref bytes) = content {
             let decoded = crate::editor::yrs_bridge::ydoc_bytes_to_doc(bytes)
                 .unwrap_or_else(|_| crate::editor::model::Node::empty_doc());
             if has_table(&decoded) {
@@ -1587,9 +1607,12 @@ pub fn DocumentPage() -> impl IntoView {
         set_editor_state.set(Some(state.clone()));
 
         // For documents, derive the title from the first block's text content.
-        // Spreadsheets keep their explicit title (editable in the header).
+        // Spreadsheets and presentations keep their explicit title (editable
+        // in the header) — a presentation's first doc child is a Slide, not
+        // prose, so deriving a title from its text_content() would be
+        // meaningless even if the gate let it through.
         let Some(current_dt) = doc_type.try_get_untracked() else { return };
-        if current_dt != "spreadsheet" {
+        if !matches!(current_dt.as_str(), "spreadsheet" | "presentation") {
             let first_text = state.doc.child(0).map(|n| n.text_content()).unwrap_or_default();
             // Short-circuit if the first block's text hasn't changed.
             // This covers all selection-only dispatches and any edit
@@ -2488,14 +2511,14 @@ pub fn DocumentPage() -> impl IntoView {
             DocAction::MoveToFolder => {
                 set_move_picker_visible.set(true);
             }
-            // #146: rename. A spreadsheet carries an explicit title, so we
-            // prompt and set it (the debounced title-save Effect persists it).
-            // A document's title IS its first line (derived in
+            // #146: rename. A spreadsheet or presentation carries an explicit
+            // title, so we prompt and set it (the debounced title-save Effect
+            // persists it). A document's title IS its first line (derived in
             // `on_state_change`), so a prompt-set would just be overwritten on
             // the next keystroke — instead we focus the editor and select that
             // first line for the user to retype.
             DocAction::RenameDocument => {
-                if doc_type.get_untracked() == "spreadsheet" {
+                if matches!(doc_type.get_untracked().as_str(), "spreadsheet" | "presentation") {
                     if let Some(window) = web_sys::window() {
                         let current = title.get_untracked();
                         if let Ok(Some(entered)) = window.prompt_with_message_and_default(
@@ -2812,7 +2835,7 @@ pub fn DocumentPage() -> impl IntoView {
                         on:click=move |_| set_mobile_sidebar_open.update(|v| *v = !*v)
                     >"\u{2630}"</button>
                     {move || {
-                        if doc_type.get() == "spreadsheet" {
+                        if matches!(doc_type.get().as_str(), "spreadsheet" | "presentation") {
                             view! {
                                 <input
                                     type="text"
@@ -3131,6 +3154,26 @@ pub fn DocumentPage() -> impl IntoView {
                 >
                 {move || {
                     if content_loaded.get() {
+                        if doc_type.get() == "presentation" {
+                            // EditorState is initialized by the Effect above (shared
+                            // with the spreadsheet init path); DeckView renders its
+                            // slide strip/canvas from editor_state and bootstraps a
+                            // blank first slide itself if the doc arrives empty.
+                            return view! {
+                                <DeckView
+                                    editor_state=editor_state
+                                    on_state_change=on_state_change.clone()
+                                    on_change=on_change_ss.clone()
+                                    doc_id=doc_id()
+                                    readonly=!can_edit.get()
+                                    // Task 12 wires the frame-comment popup; until
+                                    // then the page hands DeckView a no-op sink and
+                                    // an always-empty thread list.
+                                    on_request_frame_comment=Callback::new(|_: String| {})
+                                    frame_threads=frame_threads_placeholder
+                                />
+                            }.into_any();
+                        }
                         if doc_type.get() == "spreadsheet" {
                             // EditorState is initialized by the Effect above;
                             // SpreadsheetView renders its grid from editor_state.

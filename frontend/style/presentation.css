@@ -233,3 +233,147 @@
   --deck-text-color: #9dccd2;
   --deck-accent: #2fc0d3;
 }
+
+/* ─── DeckView chrome (Task 9) ──────────────────────────────────
+ *
+ * Slide-strip mutation affordances, the read-only frame-content
+ * placeholder box, the frame comment button, and the theme picker.
+ * Frame geometry itself is still inline style from `DeckFrame.rect`
+ * (see the file-header comment); everything here is cosmetic. */
+
+.deck-slide-thumb__actions {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+
+.deck-slide-thumb:hover .deck-slide-thumb__actions {
+  opacity: 1;
+}
+
+.deck-slide-thumb__duplicate,
+.deck-slide-thumb__delete {
+  width: 20px;
+  height: 20px;
+  line-height: 1;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.deck-slide-thumb__delete:hover {
+  background: var(--color-error);
+}
+
+.deck-slide-thumb__duplicate:hover {
+  background: var(--color-primary);
+}
+
+.deck-view__add-slide {
+  position: relative;
+}
+
+.deck-add-slide-btn {
+  width: 100%;
+  padding: var(--space-sm);
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+
+.deck-add-slide-btn:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+.deck-preset-picker {
+  position: absolute;
+  z-index: 20;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  overflow: hidden;
+}
+
+.deck-preset-picker__item {
+  padding: var(--space-sm);
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  color: var(--color-text);
+}
+
+.deck-preset-picker__item:hover {
+  background: var(--color-bg-hover);
+}
+
+/* Read-only placeholder for a frame's block content that this task
+ * doesn't render faithfully (tables, code blocks, embeds, kanban,
+ * calendar, mermaid, …). Labeled with the block's `NodeType` debug
+ * name so it's obvious what real editing (Task 11) will replace it
+ * with, not just a blank box. */
+.deck-frame-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  border: 1px dashed var(--deck-accent);
+  border-radius: var(--radius-sm);
+  font-size: 0.85em;
+  opacity: 0.75;
+}
+
+.deck-frame__comment-btn {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 20px;
+  height: 20px;
+  line-height: 1;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.35);
+  color: #fff;
+  cursor: pointer;
+  font-size: 11px;
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+
+.deck-frame:hover .deck-frame__comment-btn,
+.deck-frame__comment-btn--active {
+  opacity: 1;
+}
+
+.deck-theme-picker {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs, 4px);
+  font-size: 0.85em;
+  color: var(--color-text-secondary);
+}
+
+.deck-theme-select {
+  padding: var(--space-sm);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+}

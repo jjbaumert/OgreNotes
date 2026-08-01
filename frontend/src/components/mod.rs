@@ -15,6 +15,7 @@ pub mod comment_highlights;
 pub mod comment_popup;
 pub mod confirm_dialog;
 pub mod cursor_overlay;
+pub mod deck_view;
 pub mod diff_block_view;
 pub mod dom_position;
 pub mod conversation_pane;
