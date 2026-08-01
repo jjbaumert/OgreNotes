@@ -343,6 +343,7 @@ async fn main() {
                         state.folder_repo.clone(),
                         state.doc_repo.s3().clone(),
                         state.import_repo.clone(),
+                        state.user_repo.clone(),
                         state.quip_token_store.clone(),
                         None,
                     ));

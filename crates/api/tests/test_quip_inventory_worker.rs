@@ -175,6 +175,7 @@ fn worker_ctx_with_quip(app: &common::TestApp, quip_base: String) -> WorkerCtx {
         app.state.folder_repo.clone(),
         app.state.doc_repo.s3().clone(),
         app.state.import_repo.clone(),
+        app.state.user_repo.clone(),
         app.state.quip_token_store.clone(),
         Some(quip_base),
     )
