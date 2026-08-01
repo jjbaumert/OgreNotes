@@ -621,6 +621,11 @@ pub fn DocumentPage() -> impl IntoView {
                 Ok(doc) => {
                     set_title.set(doc.title);
                     set_folder_id.set(doc.folder_id);
+                    // Finding M1: tell the RUM sampler which kind of
+                    // document just resolved, so a `/d/...` beacon
+                    // classifies as editor/spreadsheet/presentation
+                    // instead of always "editor".
+                    crate::rum::set_page_hint(&doc.doc_type);
                     set_doc_type.set(doc.doc_type);
                     set_is_trashed.set(doc.is_deleted);
                     set_can_request_access.set(doc.can_request_access);

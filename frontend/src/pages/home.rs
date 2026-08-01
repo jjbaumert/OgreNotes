@@ -692,8 +692,17 @@ pub fn HomePage() -> impl IntoView {
                         <button class="btn btn-primary" on:click=on_create_spreadsheet>
                             {crate::t!("home-new-spreadsheet")}
                         </button>
+                        // Minor M6: was `{"+ "}{crate::t!("deck-new")}` — a
+                        // hardcoded "+ " concatenated onto the sidebar's
+                        // (unprefixed) "New Presentation" menu-entry string.
+                        // Every sibling new-* button here bakes its "+"
+                        // into its own dedicated `home-new-*` key instead,
+                        // so a translator can relocate/drop the prefix per
+                        // locale and RTL layout the same way they can for
+                        // document/spreadsheet/folder. This is visually
+                        // identical for en-US but structurally consistent.
                         <button class="btn btn-primary" on:click=on_create_presentation>
-                            {"+ "}{crate::t!("deck-new")}
+                            {crate::t!("home-new-presentation")}
                         </button>
                         <button class="btn btn-secondary" on:click=on_create_folder>
                             {crate::t!("home-new-folder")}

@@ -248,9 +248,12 @@
  * canvas by scaling a fixed-size copy of the canvas subtree down
  * with `transform: scale()` — cheaper than a second render path,
  * and it stays byte-identical to the real canvas since it's the
- * same DOM, just shrunk. `--deck-thumb-scale` is set inline per
- * thumbnail by the canvas component (thumb width / reference
- * width). */
+ * same DOM, just shrunk. `--deck-thumb-scale` is never actually set
+ * inline by the canvas component (Minor M3) -- the rule below's
+ * `0.2` fallback is what applies unconditionally today. A
+ * variable-width thumb strip would need to set the custom property
+ * per thumbnail (960px reference width / actual thumb width) for
+ * this to track it. */
 .deck-slide-thumb {
   position: relative;
   aspect-ratio: 16 / 9;

@@ -392,6 +392,7 @@ document-restore-folder-title = Restore to folder
 home-new-document = + New Document
 home-new-from-template = + New from Template
 home-new-spreadsheet = + New Spreadsheet
+home-new-presentation = + New Presentation
 home-new-folder = + New Folder
 
 # ─── Folder management (#150) ───────────────────────────────────
