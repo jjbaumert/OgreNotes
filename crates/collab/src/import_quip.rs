@@ -23,16 +23,22 @@
 //!      `enforce_containment` then hoists anything the schema forbids;
 //!      `materialize` builds the yrs `Doc`.
 //!
-//! ## The markup shape is an educated guess
+//! ## The markup shape started as an educated guess
 //!
 //! No sample of a real `/2/threads/{id}/html` response was available
 //! when this was written. Every assumption about how Quip spells a
 //! feature is therefore isolated behind a small named helper carrying
 //! an `UNVERIFIED MARKUP` note — those helpers are the reconciliation
-//! checklist when real markup arrives:
+//! checklist as real markup arrives:
 //!
-//!   - [`checked_state`]  — checklist item checked/unchecked
-//!   - [`list_is_task`]   — a list being a checklist at all
+//!   - [`parse_list`] / [`list_is_task`] — a list being numbered or a
+//!     checklist at all. **RECONCILED**: real Quip emits a bare `<ul>`
+//!     for bullet, numbered *and* checklist alike, and puts the only
+//!     discriminator — `data-section-style` — on the wrapping `<div>`.
+//!     See the vocabulary table above [`SECTION_STYLE_ORDERED`].
+//!   - [`checked_state`]  — checklist item checked/unchecked.
+//!     **STILL UNVERIFIED**: the staged corpus contains no checked
+//!     item, so no marker for one has ever been seen.
 //!   - [`code_language`]  — code-block language tag
 //!   - [`section_id`]     — Quip section anchor id
 //!   - [`quip_thread_from_url`] — an `<a href>` being an intra-Quip
@@ -772,16 +778,27 @@ fn walk_text_container(handle: &markup5ever_rcdom::Handle) -> (Vec<Span>, Vec<Qu
     (trim_spans(spans), rest)
 }
 
-fn parse_list(handle: &markup5ever_rcdom::Handle, ordered: bool) -> QuipBlock {
+/// Build a list block. `tag_is_ol` is what the *tag* said; the list
+/// kind is not decided by the tag alone, because Quip spells all three
+/// kinds of list as a bare `<ul>` and puts the discriminator on the
+/// wrapping section `<div>` instead (see the section-style table above
+/// [`SECTION_STYLE_ORDERED`]).
+fn parse_list(handle: &markup5ever_rcdom::Handle, tag_is_ol: bool) -> QuipBlock {
     let mut items = Vec::new();
     collect_items(handle, &mut items);
 
+    // One ancestor walk answers both questions. A section style is a
+    // single value, so "numbered" and "checklist" are mutually
+    // exclusive by construction — no precedence rule needed.
+    let section = enclosing_section_style(handle);
+    let ordered = tag_is_ol || section.as_deref() == Some(SECTION_STYLE_ORDERED);
+
     // A list is a checklist if any item carries real checked state, or
-    // if the list itself is marked as one — except for `<ol>`, where a
-    // checklist-ish class alone is more likely styling on a numbered
-    // list, so per-item state is required.
+    // if the list itself is marked as one — except for an ordered list,
+    // where a checklist-ish class alone is more likely styling on a
+    // numbered list, so per-item state is required.
     let has_item_state = items.iter().any(|i| i.checked.is_some());
-    let task = has_item_state || (!ordered && list_is_task(handle));
+    let task = has_item_state || (!ordered && list_is_task(handle, section.as_deref()));
     if task {
         // A list marked as a checklist whose items say nothing: the
         // items default to unchecked.
@@ -874,7 +891,8 @@ fn parse_row(handle: &markup5ever_rcdom::Handle) -> QuipRow {
 // they are the only places that need to change when a real `/2` HTML
 // sample lands.
 
-/// **UNVERIFIED MARKUP.** Checked state of a checklist item. Accepts:
+/// **UNVERIFIED MARKUP — still unverified after the first real corpus.**
+/// Checked state of a checklist item. Accepts:
 ///
 ///   - `<li><input type="checkbox" checked>` (presence of the
 ///     attribute means checked, per the HTML spec)
@@ -884,6 +902,21 @@ fn parse_row(handle: &markup5ever_rcdom::Handle) -> QuipRow {
 ///
 /// Returns `None` when the item carries no checklist signal at all —
 /// that's what makes an ordinary bullet stay an ordinary bullet.
+///
+/// Unlike [`list_is_task`], this one could **not** be reconciled against
+/// the 56 staged `/2` documents: the corpus holds exactly one checklist
+/// (`data-section-style='7'`) and every one of its four items is
+/// *unchecked*. A search of all 56 documents finds no `<input>` element,
+/// no `checked` attribute, and no `check`-ish class token anywhere. So
+/// how Quip spells a **checked** item remains unknown, and none of the
+/// three spellings above has been seen in the wild.
+///
+/// The consequence is deliberate: a real Quip checklist imports with
+/// every item unchecked, because [`parse_list`] defaults a
+/// section-marked checklist's items to `false`. Guessing a marker here
+/// would silently mis-import task state, which is worse than uniformly
+/// unchecked — do not add one without a sample that contains a ticked
+/// item.
 fn checked_state(li: &markup5ever_rcdom::Handle) -> Option<bool> {
     if let Some(v) = attr(li, "data-checked") {
         return Some(!matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | ""));
@@ -931,11 +964,71 @@ fn find_checkbox(handle: &markup5ever_rcdom::Handle) -> Option<markup5ever_rcdom
     None
 }
 
-/// **UNVERIFIED MARKUP.** Whether a `<ul>` / `<ol>` is a checklist
-/// independent of its items. Accepts a `checklist` / `task-list` /
-/// `tasklist` / `todo` class token, or `data-type="taskList"` (the
-/// spelling our own HTML export uses).
-fn list_is_task(list: &markup5ever_rcdom::Handle) -> bool {
+// ─── the Quip `data-section-style` vocabulary ────────────────────
+//
+// Quip wraps each document *section* in a `<div data-section-style='N'>`.
+// For lists that number is the **only** discriminator: a bullet list, a
+// numbered list, and a checklist all emit the identical inner markup —
+// a bare `<ul>` of `<li id=… class='' style='' value='1'><span>`, with
+// no `<ol>`, no `<input type="checkbox">`, no class token, and no
+// `data-type`. `value='1'` is boilerplate on the first item of every
+// list of every style (60/60, 565/565, 2/2 in the corpus), so it
+// carries no ordering information and there is no `start` to honour.
+//
+// Counted across the 57 real `/2/threads/{id}/html` documents the
+// import worker staged to S3 (`imports/*/threads/*.html`):
+//
+//   | value | wraps     | count | reading                  | status    |
+//   |-------|-----------|-------|--------------------------|-----------|
+//   | `5`   | `<ul>`    | 565   | bullet list              | CONFIRMED |
+//   | `6`   | `<ul>`    | 60    | numbered list            | CONFIRMED |
+//   | `7`   | `<ul>`    | 2     | checklist                | CONFIRMED |
+//   | `11`  | `<img>`   | 27    | image section            | observed  |
+//   | `13`  | `<table>` | 46    | table section            | observed  |
+//   | `22`  | `<div>`   | 1     | slide/presentation title | observed  |
+//   | `24`  | `<div>`   | 1     | slide/presentation wrap  | observed  |
+//
+// CONFIRMED means the rendered source text was read back against the
+// staged HTML for that value: `6` against a section whose source reads
+// `1. Public ownership of infrastructure…` (`CXdAAA3rE44`), `5` against
+// one reading `* **Decentralization**: …`, `7` against the stock
+// "Welcome to Quip" checklist. Corroborated by content: all 13
+// multi-item `6` sections read as ordered sequences (protocol steps,
+// game-turn phases, an auth lifecycle) and none reads as an unordered
+// bullet list.
+//
+// `observed` means the value was seen in the corpus and its wrapped
+// element noted, but the walker does not act on it and no source text
+// was read back — those three readings are inference from the wrapped
+// element alone. Values absent from the table were not seen at all;
+// do not invent readings for them.
+
+/// Section style of a **numbered** list. Its `<ul>` is indistinguishable
+/// from a bullet list's — see the table above.
+const SECTION_STYLE_ORDERED: &str = "6";
+
+/// Section style of a **checklist**. Its `<ul>` is indistinguishable
+/// from a bullet list's — see the table above.
+const SECTION_STYLE_CHECKLIST: &str = "7";
+
+/// Whether a list is a checklist independent of its items. `section` is
+/// the nearest enclosing `data-section-style`, already resolved by
+/// [`parse_list`].
+///
+/// The load-bearing signal is **confirmed**: the nearest enclosing
+/// section wrapper carries [`SECTION_STYLE_CHECKLIST`]. Resolving the
+/// *nearest* wrapper is what makes nesting behave — a `5` section inside
+/// a `7` section is still a bullet list.
+///
+/// **UNVERIFIED MARKUP** (retained, additive): a `checklist` /
+/// `task-list` / `tasklist` / `todo` class token, or
+/// `data-type="taskList"` (the spelling our own HTML export uses). No
+/// Quip document in the corpus spells it either way, but keeping them
+/// costs nothing and covers other Quip versions and re-imported exports.
+fn list_is_task(list: &markup5ever_rcdom::Handle, section: Option<&str>) -> bool {
+    if section == Some(SECTION_STYLE_CHECKLIST) {
+        return true;
+    }
     if let Some(t) = attr(list, "data-type")
         && t.eq_ignore_ascii_case("tasklist")
     {
@@ -944,6 +1037,49 @@ fn list_is_task(list: &markup5ever_rcdom::Handle) -> bool {
     classes(list).iter().any(|c| {
         matches!(c.as_str(), "checklist" | "task-list" | "tasklist" | "task_list" | "todo" | "todo-list")
     })
+}
+
+/// The `data-section-style` of the nearest section wrapper at or above
+/// `handle`, or `None` if no ancestor carries one.
+///
+/// Walking *up* is what keeps this proportionate: the alternative —
+/// threading the section style down as a walker parameter — would touch
+/// every `walk_*` signature and every recursion site for one attribute
+/// that only [`parse_list`] reads.
+///
+/// The walk stops at the first ancestor bearing the attribute (so the
+/// innermost section governs), at a non-element node (the document root),
+/// or after [`MAX_NESTING_DEPTH`] hops — the same liveness bound the
+/// downward walk uses, since the ancestor chain is third-party markup too.
+fn enclosing_section_style(handle: &markup5ever_rcdom::Handle) -> Option<String> {
+    use markup5ever_rcdom::NodeData;
+    let mut node = Some(handle.clone());
+    for _ in 0..MAX_NESTING_DEPTH {
+        let current = node?;
+        if !matches!(current.data, NodeData::Element { .. }) {
+            return None;
+        }
+        if let Some(style) = attr(&current, "data-section-style")
+            && !style.trim().is_empty()
+        {
+            return Some(style.trim().to_string());
+        }
+        node = parent_of(&current);
+    }
+    None
+}
+
+/// The parent node of `handle`, if it still has one.
+///
+/// `markup5ever_rcdom` keeps the parent link in a `Cell<Option<Weak<_>>>`,
+/// which has no `get` because `Weak` is not `Copy`. Take-then-put-back is
+/// how rcdom itself reads the field; nothing runs between the two halves,
+/// so the cell is never observed empty.
+fn parent_of(handle: &markup5ever_rcdom::Handle) -> Option<markup5ever_rcdom::Handle> {
+    let weak = handle.parent.take();
+    let parent = weak.as_ref().and_then(std::rc::Weak::upgrade);
+    handle.parent.set(weak);
+    parent
 }
 
 /// **UNVERIFIED MARKUP.** Language tag of a `<pre>` code block.
@@ -1859,6 +1995,181 @@ mod tests {
         let QuipBlock::List { task, items, .. } = &b[0] else { panic!("expected list") };
         assert!(!*task);
         assert_eq!(items[0].checked, None);
+    }
+
+    // ─── real Quip section markup ────────────────────────────
+    //
+    // The fixtures below are copied verbatim out of the HTML the import
+    // worker staged to S3 (`imports/*/threads/*.html`), not simplified —
+    // the whole bug class this guards against came from inventing a
+    // shape that did not match reality.
+
+    /// The checklist section of the stock "Welcome to Quip" document,
+    /// exactly as `/2/threads/{id}/html` returns it. The `<div>`'s
+    /// `data-section-style='7'` is the *only* checklist signal: the
+    /// `<ul>` and `<li>`s are indistinguishable from a bullet list.
+    const REAL_CHECKLIST_SECTION: &str = "<div data-section-style='7' class=\"\" style=\"\">\
+         <ul id='SSfACAKV4zR'>\
+         <li id='SSfACA046uk' class='' style='' value='1'>\
+         <span id='SSfACA046uk'>Check off these items in this interactive list as you go.</span>\
+         <br/></li>\
+         <li id='SSfACASS8II' class='' style=''>\
+         <span id='SSfACASS8II'>Click on this line and then click on the comment icon to add \
+         comments.</span>\
+         <br/></li>\
+         </ul></div>";
+
+    /// A bullet section from a different real document in the same
+    /// account. Structurally identical to the checklist above apart
+    /// from the section-style number.
+    const REAL_BULLET_SECTION_5: &str = "<div data-section-style='5' class=\"\" style=\"\">\
+         <ul id='temp:C:AAMe9d2056e1b0147cba5889c08b'>\
+         <li id='temp:C:AAMb20d17ce24b7405eab4a62b1d' class='' style='' value='1'>\
+         <span id='temp:C:AAMb20d17ce24b7405eab4a62b1d'><b>Framework</b>: React.js with \
+         TypeScript</span>\
+         <br/></li>\
+         <li id='temp:C:AAM82481f948c87415b92702a9cc' class='' style=''>\
+         <span id='temp:C:AAM82481f948c87415b92702a9cc'><b>State Management</b>: TanStack \
+         Query</span>\
+         <br/></li>\
+         </ul></div>";
+
+    /// A **numbered** section from a third real document — the one whose
+    /// source text was read back as `1. Public ownership of
+    /// infrastructure…`. Note it is a `<ul>`, not an `<ol>`: only
+    /// `data-section-style='6'` says this list is numbered.
+    const REAL_ORDERED_SECTION_6: &str = "<div data-section-style='6' class=\"\" style=\"\">\
+         <ul id='temp:C:CXdbd91aeab18a64bb9a191e8ff3'>\
+         <li id='temp:C:CXd2e8b30bb043c45909e45b2a4a' class='' style='' value='1'>\
+         <span id='temp:C:CXd2e8b30bb043c45909e45b2a4a'>Public ownership of infrastructure to \
+         avoid de-platforming and complicate regulatory interference</span>\
+         <br/></li>\
+         <li id='temp:C:CXd20e128a9c8634c12acbd1e584' class='' style=''>\
+         <span id='temp:C:CXd20e128a9c8634c12acbd1e584'>End-user controlled trust \
+         relationships</span>\
+         <br/></li>\
+         </ul></div>";
+
+    /// The same numbered style, but with the extra `<ul>` Quip interposes
+    /// for an indent level — which puts two hops between the parsed list
+    /// and the section wrapper.
+    const REAL_ORDERED_SECTION_6_INDENTED: &str =
+        "<div data-section-style='6' class=\"\" style=\"\">\
+         <ul id='temp:C:AAMba25b35f15e54908801e80b9f'><ul>\
+         <li id='temp:C:AAM7cc8c0e0f47640129a85c85ab' class='' style='' value='1'>\
+         <span id='temp:C:AAM7cc8c0e0f47640129a85c85ab'>Client connects with JWT in query \
+         param</span>\
+         <br/></li>\
+         </ul></ul></div>";
+
+    #[test]
+    fn a_real_quip_checklist_section_is_a_task_list() {
+        let b = blocks(REAL_CHECKLIST_SECTION);
+        let QuipBlock::List { ordered, task, items } = &b[0] else {
+            panic!("expected a list, got {b:?}")
+        };
+        assert!(!*ordered);
+        assert!(*task, "data-section-style='7' on the wrapping div means checklist: {b:?}");
+        assert_eq!(items.len(), 2, "{b:?}");
+        // Checked state stays uniformly false: no sample of a *checked*
+        // Quip item exists, so `checked_state` finds nothing and
+        // `parse_list` defaults a section-marked checklist to unchecked.
+        assert_eq!(items[0].checked, Some(false));
+        assert_eq!(items[1].checked, Some(false));
+    }
+
+    #[test]
+    fn a_real_quip_bullet_section_stays_a_bullet_list() {
+        // The regression that matters: widening list detection must not
+        // sweep in the 565 `5` sections that share the shape.
+        let b = blocks(REAL_BULLET_SECTION_5);
+        let QuipBlock::List { ordered, task, items } = &b[0] else {
+            panic!("expected a list, got {b:?}")
+        };
+        assert!(!*ordered, "data-section-style='5' is a bullet list: {b:?}");
+        assert!(!*task, "data-section-style='5' is not a checklist: {b:?}");
+        assert!(items.iter().all(|i| i.checked.is_none()), "{b:?}");
+    }
+
+    #[test]
+    fn a_real_quip_numbered_section_is_an_ordered_list() {
+        for (label, html) in [
+            ("flat", REAL_ORDERED_SECTION_6),
+            ("indented", REAL_ORDERED_SECTION_6_INDENTED),
+        ] {
+            let b = blocks(html);
+            let QuipBlock::List { ordered, task, items } = &b[0] else {
+                panic!("expected a list for {label}, got {b:?}")
+            };
+            assert!(*ordered, "{label}: data-section-style='6' means numbered: {b:?}");
+            assert!(!*task, "{label}: a numbered list is not a checklist: {b:?}");
+            assert!(items.iter().all(|i| i.checked.is_none()), "{label}: {b:?}");
+        }
+    }
+
+    #[test]
+    fn an_ol_tag_stays_ordered_inside_a_bullet_section() {
+        // The tag is still authoritative when it says `<ol>`; the
+        // section style only ever *adds* orderedness.
+        let b = blocks("<div data-section-style='5'><ol><li>a</li></ol></div>");
+        let QuipBlock::List { ordered, .. } = &b[0] else { panic!("expected list: {b:?}") };
+        assert!(*ordered, "{b:?}");
+    }
+
+    #[test]
+    fn the_nearest_section_wrapper_decides_the_list_kind() {
+        // A bullet section nested inside a checklist section: the inner
+        // `data-section-style` governs, so walking up must stop at the
+        // first ancestor that carries one.
+        let html = "<div data-section-style='7'><ul><li>outer\
+                    <div data-section-style='5'><ul><li>inner</li></ul></div>\
+                    </li></ul></div>";
+        let b = blocks(html);
+        let QuipBlock::List { task, items, .. } = &b[0] else {
+            panic!("expected outer list, got {b:?}")
+        };
+        assert!(*task, "the outer list is inside the '7' section: {b:?}");
+        let Some(QuipBlock::List { task: inner_task, .. }) =
+            items[0].blocks.iter().find(|blk| matches!(blk, QuipBlock::List { .. }))
+        else {
+            panic!("expected a nested list inside the item: {b:?}")
+        };
+        assert!(!*inner_task, "the nested '5' section is a bullet list: {b:?}");
+    }
+
+    #[test]
+    fn the_nearest_section_wrapper_decides_orderedness_too() {
+        // The mirror of the checklist nesting case, both directions:
+        // a bullet section inside a numbered one and the reverse. The
+        // *inner* `data-section-style` governs each list.
+        for (label, html, outer_ordered) in [
+            (
+                "'5' inside '6'",
+                "<div data-section-style='6'><ul><li>outer\
+                 <div data-section-style='5'><ul><li>inner</li></ul></div>\
+                 </li></ul></div>",
+                true,
+            ),
+            (
+                "'6' inside '5'",
+                "<div data-section-style='5'><ul><li>outer\
+                 <div data-section-style='6'><ul><li>inner</li></ul></div>\
+                 </li></ul></div>",
+                false,
+            ),
+        ] {
+            let b = blocks(html);
+            let QuipBlock::List { ordered, items, .. } = &b[0] else {
+                panic!("expected outer list for {label}, got {b:?}")
+            };
+            assert_eq!(*ordered, outer_ordered, "{label} outer: {b:?}");
+            let Some(QuipBlock::List { ordered: inner_ordered, .. }) =
+                items[0].blocks.iter().find(|blk| matches!(blk, QuipBlock::List { .. }))
+            else {
+                panic!("expected a nested list inside the item for {label}: {b:?}")
+            };
+            assert_eq!(*inner_ordered, !outer_ordered, "{label} inner: {b:?}");
+        }
     }
 
     #[test]
