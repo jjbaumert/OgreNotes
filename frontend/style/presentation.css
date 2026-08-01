@@ -200,6 +200,36 @@
   touch-action: auto;
 }
 
+/* P1 followup — the embedded EditorComponent ships the document page's
+ * card chrome: `.editor-container` (paper background, 32px/24px
+ * padding) wrapping `.editor-content` (white card, 32px padding,
+ * 1080px max-width, radius + shadow, 16px base font). Inside a frame
+ * that chrome is wrong twice over: it paints an opaque card over the
+ * themed slide, and its intrinsic size ignores the frame box — a
+ * heading frame (~12% of the canvas) got a 173px-tall card spilling
+ * out of a 55px frame. Flatten both wrappers to a transparent,
+ * frame-filling text surface so editing inherits the frame's own
+ * padding/typography exactly like the read-only render; long content
+ * scrolls within the frame instead of overflowing the slide. */
+.deck-frame--editing .editor-container {
+  height: 100%;
+  padding: 0;
+  background: transparent;
+  overflow: auto;
+  font-size: inherit;
+}
+
+.deck-frame--editing .editor-content {
+  padding: 0;
+  background: transparent;
+  max-width: none;
+  min-height: 100%;
+  border-radius: 0;
+  box-shadow: none;
+  font-size: inherit;
+  color: var(--deck-text-color);
+}
+
 .deck-frame :is(h1, h2, h3, h4, h5, h6) {
   color: var(--deck-heading-color);
   margin: 0 0 0.3em 0;
