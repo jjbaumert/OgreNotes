@@ -41,6 +41,13 @@ const T2_HTML: &str = r#"<p>numbers</p>"#;
 /// bytes land in S3 under the document's blob prefix.
 const BLOB_BYTES: &[u8] = b"\x89PNG\r\n\x1a\nnot-really-a-png";
 
+/// Wrap a bare HTML body in the JSON envelope `GET /2/threads/{id}/html`
+/// actually returns (#169): `{ "html": "...", "response_metadata":
+/// { "next_cursor": "" } }`. A single-page (empty-cursor) response.
+fn html_envelope(html: &str) -> serde_json::Value {
+    serde_json::json!({ "html": html, "response_metadata": { "next_cursor": "" } })
+}
+
 /// Wiremock Quip server serving the Phase-1 inventory endpoints plus the
 /// Phase-2a content endpoints.
 async fn quip_content_server() -> MockServer {
@@ -80,15 +87,18 @@ async fn quip_content_server() -> MockServer {
         .mount(&server)
         .await;
 
+    // The real `/2/threads/{id}/html` returns a JSON envelope, not bare HTML
+    // (#169). The fixture serves that exact shape so the mock matches reality;
+    // serving bare HTML here is what let the garbling bug ship.
     Mock::given(method("GET"))
         .and(path("/2/threads/t1/html"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(T1_HTML))
+        .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(T1_HTML)))
         .mount(&server)
         .await;
 
     Mock::given(method("GET"))
         .and(path("/2/threads/t2/html"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(T2_HTML))
+        .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(T2_HTML)))
         .mount(&server)
         .await;
 
@@ -216,6 +226,88 @@ async fn content_pass_creates_documents_with_quip_timestamps_and_folders() {
     // The import advanced to phase 2.
     let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
     assert_eq!(rec.phase, 2, "content pass must advance the import to phase 2");
+}
+
+/// Rich body for the #169 block-structure test: an `<h1>`, a `<p>`, and a
+/// `<ul><li>` — three distinct block kinds. Fed through the JSON envelope so
+/// the whole content pass (client parse → walker → snapshot) is exercised.
+const T1_RICH_HTML: &str = concat!(
+    "<h1 id=\"sec-1\">Heading One</h1>",
+    "<p id=\"sec-2\">A paragraph of prose.</p>",
+    "<ul><li>first item</li><li>second item</li></ul>",
+);
+
+/// [`quip_content_server`] with t1's HTML fetch overridden to a rich JSON
+/// envelope (heading + paragraph + list). Higher priority (lower number) than
+/// the 200 already mounted underneath.
+async fn quip_server_with_rich_t1_envelope() -> MockServer {
+    let server = quip_content_server().await;
+    Mock::given(method("GET"))
+        .and(path("/2/threads/t1/html"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(T1_RICH_HTML)))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// #169 — the regression this whole fix exists for. Serving the realistic JSON
+/// envelope, the imported document must have REAL block structure — a heading,
+/// a paragraph, and a list — not one text node holding the JSON wrapper.
+///
+/// This is the assertion that would have caught the bug: a byte-count or
+/// "not empty" check passes just as happily on a document whose entire body is
+/// the literal string `{"html":"<h1 ...","response_metadata":...}`. Before the
+/// fix, `thread_html` returned that JSON verbatim, every `<` was escaped, and
+/// html5ever collapsed the document into a single text node.
+#[tokio::test]
+async fn content_pass_parses_the_json_envelope_into_real_block_structure() {
+    common::require_infra!();
+    let server = quip_server_with_rich_t1_envelope().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let doc_id = doc_id_for(&app, &import_id, "t1").await.expect("t1 imported");
+    let snapshot = app
+        .state
+        .doc_repo
+        .load_snapshot(&doc_id)
+        .await
+        .unwrap()
+        .expect("snapshot exists");
+    let doc = ogrenotes_collab::snapshot::deserialize(&snapshot).expect("decode snapshot");
+
+    // THE ASSERTION: three top-level blocks (heading, paragraph, list), not
+    // the single text node the JSON-garbling bug produced.
+    {
+        use yrs::types::xml::XmlFragment;
+        use yrs::Transact;
+        let txn = doc.inner().transact();
+        let frag =
+            ogrenotes_collab::document::get_content_fragment(&txn).expect("content fragment");
+        assert_eq!(
+            frag.len(&txn),
+            3,
+            "heading + paragraph + list are three real blocks, not one JSON text node",
+        );
+    }
+
+    let html = ogrenotes_collab::export::to_html(doc.inner());
+    assert!(html.contains("<h1"), "a real heading block must survive: {html}");
+    assert!(html.contains("Heading One"), "the heading text must survive: {html}");
+    assert!(
+        html.contains("<ul") && html.contains("<li"),
+        "a real list must survive: {html}",
+    );
+    // The JSON envelope's own keys must never appear as document text — their
+    // presence is exactly the #169 garbling (the wrapper became the body).
+    assert!(
+        !html.contains("response_metadata") && !html.contains("next_cursor"),
+        "the JSON wrapper must not have leaked into the document body: {html}",
+    );
 }
 
 #[tokio::test]
