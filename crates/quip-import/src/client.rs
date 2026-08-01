@@ -36,6 +36,13 @@ pub enum QuipError {
     #[error("unauthorized")]
     Unauthorized,
 
+    /// 403 from Quip: a per-thread/blob access-restriction, not a dead
+    /// credential. Distinct from [`Self::Unauthorized`] so callers can
+    /// choose a per-thread-skip disposition instead of a run-terminal one
+    /// (see issue #141) — never carries the token, same as `Unauthorized`.
+    #[error("forbidden")]
+    Forbidden,
+
     #[error("API error {status}: {message}")]
     Api { status: u16, message: String },
 
@@ -258,8 +265,11 @@ impl QuipClient {
             return Ok(Checked(resp));
         }
 
-        if status.as_u16() == 401 || status.as_u16() == 403 {
+        if status.as_u16() == 401 {
             return Err(QuipError::Unauthorized);
+        }
+        if status.as_u16() == 403 {
+            return Err(QuipError::Forbidden);
         }
         if status.as_u16() == 503 {
             return Err(QuipError::RateLimited {
@@ -398,6 +408,26 @@ mod tests {
         assert!(matches!(
             c.current_user(&QuipToken::new("x".into())).await,
             Err(QuipError::Unauthorized)
+        ));
+        // token never leaks into the error text:
+        let e = c
+            .current_user(&QuipToken::new("SEEKRET".into()))
+            .await
+            .unwrap_err();
+        assert!(!format!("{e}").contains("SEEKRET"));
+    }
+
+    #[tokio::test]
+    async fn forbidden_maps_to_forbidden_without_leaking_the_token() {
+        let server = MockServer::start().await;
+        Mock::given(path("/1/users/current"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let c = QuipClient::new(Some(server.uri()));
+        assert!(matches!(
+            c.current_user(&QuipToken::new("x".into())).await,
+            Err(QuipError::Forbidden)
         ));
         // token never leaks into the error text:
         let e = c

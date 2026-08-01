@@ -14,9 +14,10 @@
 
 use proptest::prelude::*;
 use yrs::types::xml::{Xml, XmlElementRef, XmlFragment, XmlOut};
-use yrs::{Doc, ReadTxn, Transact};
+use yrs::{Doc, GetString, ReadTxn, Transact};
 
 use ogrenotes_collab::import::{from_html, from_markdown};
+use ogrenotes_collab::import_quip::from_quip_html;
 
 /// Recursively collect every element tag name and attribute name in a
 /// document's `content` fragment.
@@ -98,6 +99,102 @@ proptest! {
         );
         let doc = from_html(&html);
         assert_no_xss(&doc, &html)?;
+    }
+
+    /// Arbitrary text through the **Quip** importer never panics.
+    ///
+    /// This parser is the newest of the four and the only one whose input is
+    /// authored entirely by a third party — the worker feeds it whatever
+    /// `/2/threads/{id}/html` returns, with no opportunity for a user to
+    /// notice the document is malformed first. The content pass now catches a
+    /// panic here and charges it to the thread's attempt budget rather than
+    /// dead-lettering the import, but that is a containment net; this is the
+    /// property that says the net should stay unused.
+    #[test]
+    fn from_quip_html_never_panics(s in "\\PC*") {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| from_quip_html(&s)))
+            .map_err(|_| TestCaseError::fail("from_quip_html panicked"))?;
+    }
+
+    /// The same property against input actually shaped like markup.
+    ///
+    /// `\\PC*` almost never produces a well-formed tag, so it exercises the
+    /// sanitizer and little of the walker behind it. This generator emits
+    /// nested Quip-shaped elements — the tables, images, checkbox inputs and
+    /// section-anchored headings that `from_quip_html` handles and
+    /// `from_html` deliberately does not — so the recursive block walker,
+    /// `enforce_containment` and `materialize` are the code under test.
+    #[test]
+    fn from_quip_html_never_panics_on_quip_shaped_markup(
+        tags in prop::collection::vec(
+            prop::sample::select(vec![
+                "h1", "h6", "p", "ul", "ol", "li", "table", "tr", "td", "th",
+                "blockquote", "pre", "code", "b", "a", "img", "input", "div", "span",
+            ]),
+            0..12,
+        ),
+        attrs in prop::collection::vec(
+            prop::sample::select(vec![
+                "", " id=\"sec-1\"", " href=\"https://acme.quip.com/t1/X#sec-2\"",
+                " src=\"/blob/t1/b9\"", " type=\"checkbox\" checked",
+                " data-section-id=\"s\"", " class=\"\"", " alt=\"\"",
+            ]),
+            0..12,
+        ),
+        text in "[a-z <>&\"/=]{0,24}",
+    ) {
+        // Generated nesting is bounded well under `MAX_NESTING_DEPTH` on
+        // purpose. Unbounded nesting does not *panic* the walker — it
+        // exhausts the stack, and stack exhaustion ABORTS the process rather
+        // than unwinding, so proptest would kill the test runner instead of
+        // shrinking a failing case. The depth cap gets its own deterministic
+        // test below; this property stays in panic-land where catch_unwind
+        // can actually report.
+        // Interleave opens, text and (deliberately unbalanced) closes: real
+        // Quip HTML is well-formed, so mismatched nesting is exactly the case
+        // no example-based test covers.
+        let mut html = String::new();
+        for (i, t) in tags.iter().enumerate() {
+            let a = attrs.get(i).copied().unwrap_or("");
+            html.push_str(&format!("<{t}{a}>{text}"));
+            if i % 3 == 2 {
+                html.push_str(&format!("</{t}>"));
+            }
+        }
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| from_quip_html(&html)))
+            .map_err(|_| TestCaseError::fail(format!("from_quip_html panicked on {html:?}")))?;
+    }
+
+    /// Pins the **materialization path**, NOT the sanitizer allowlist.
+    ///
+    /// Read what this can actually observe before trusting it: `assert_no_xss`
+    /// walks the materialized yrs document, whose element names come from the
+    /// closed `NodeType` enum. It therefore cannot fail on anything the
+    /// ammonia allowlist admits — widening `allowed_tags()` with `iframe` and
+    /// `allowed_attributes()` with `onclick` leaves this test green, because
+    /// materialization was never going to emit either one. The `javascript:`
+    /// href arm is weaker still: hrefs become text *marks*, which this never
+    /// inspects.
+    ///
+    /// What it does pin is real but narrow — that the block walker and
+    /// `materialize` cannot be talked into emitting a forbidden element or an
+    /// `on*` attribute even when handed one. **The allowlist itself is
+    /// guarded by `import_quip`'s own unit tests**
+    /// (`the_allowlist_admits_no_script_framing_or_event_handler` and
+    /// `sanitize_strips_script_framing_and_event_handlers`), which live beside
+    /// `sanitize()` because that is the only place it is reachable.
+    #[test]
+    fn from_quip_html_materialization_emits_no_xss_vectors(
+        payload in "[a-z0-9 ='\"();]{0,40}",
+        tag in prop::sample::select(vec!["script", "iframe", "object", "embed", "style", "form", "link"]),
+    ) {
+        let html = format!(
+            "<p>before</p><{tag}>{payload}</{tag}><img src=x onerror='{payload}'>\
+             <table><tr><td onclick='{payload}'>c</td></tr></table>\
+             <a href=\"javascript:{payload}\">x</a><p>after</p>"
+        );
+        let out = from_quip_html(&html);
+        assert_no_xss(&out.doc, &html)?;
     }
 
     /// Raw HTML embedded in markdown is dropped in v1 — so the same
@@ -190,4 +287,127 @@ mod binary {
                 .map_err(|_| TestCaseError::fail("from_docx panicked on zip-with-garbage-document"))?;
         }
     }
+}
+
+// ─── Nesting depth: an abort, not a panic ───────────────────────
+//
+// The properties above all wrap the parser in `catch_unwind`, which is the
+// right net for a panic (an unwrap, an index, a bad slice boundary) and is
+// *no* net at all for stack exhaustion: Rust aborts the process on stack
+// overflow, so there is nothing to catch. Deeply-nested third-party HTML is
+// therefore a liveness bug that the fuzz net above cannot see, and it needs a
+// deterministic test with a concrete depth rather than a generator.
+//
+// Before `MAX_NESTING_DEPTH`, `from_quip_html` aborted at ~1 050 levels of
+// nested `<div>`/`<span>`/`<blockquote>` on the 2 MiB stack that tokio worker
+// threads and Rust test threads both get. On the shared import worker that
+// killed every concurrent job, and the retry reached the same document and
+// died again — a permanent wedge that charged no attempt and marked no thread
+// failed, because the process never got to run that code.
+
+/// Past the cap, but deliberately **below** the ~1 050-level depth at which
+/// the uncapped walker aborted. A regression here therefore fails *cleanly*
+/// on the truncation assertion instead of killing the runner — which is the
+/// signal you want in CI for the ordinary mistake (cap raised, cap removed).
+const PAST_CAP: usize = 500;
+
+/// Past the depth at which the uncapped walker exhausted a 2 MiB stack, and
+/// far below `ammonia::clean`'s own (upstream, unfixed) limit around 120 000.
+const PAST_STACK_LIMIT: usize = 4_000;
+
+fn nested(tag: &str, depth: usize) -> String {
+    format!(
+        "<p>top</p>{}deep-content{}",
+        format!("<{tag}>").repeat(depth),
+        format!("</{tag}>").repeat(depth),
+    )
+}
+
+/// Nesting past the cap is flattened and *recorded*, not silently accepted.
+///
+/// This is the behavioral half, pinned at a depth the uncapped walker
+/// survived, so removing or raising the cap fails this assertion cleanly
+/// rather than aborting the process.
+#[test]
+fn nesting_past_the_cap_is_truncated_and_reported() {
+    for tag in ["div", "span", "blockquote"] {
+        let out = from_quip_html(&nested(tag, PAST_CAP));
+        assert!(
+            out.deep_nesting_truncated > 0,
+            "<{tag}> nested {PAST_CAP} deep must be recorded as truncated, not silently accepted",
+        );
+        // Failing SOFT is the point: dropping the subtree would silently
+        // delete the deepest content of a document, and erroring would wedge
+        // the thread on every retry.
+        let text = doc_text(&out.doc);
+        assert!(text.contains("top"), "content above the cap must survive: {text:?}");
+        assert!(
+            text.contains("deep-content"),
+            "the text below the cap must survive the flattening: {text:?}",
+        );
+    }
+}
+
+/// The liveness half: nesting past the *stack* limit does not abort.
+///
+/// There is no way to make this one fail gracefully — if the cap is gone the
+/// process dies here rather than returning a failure — but the runner names
+/// the test in `fatal runtime error: stack overflow`, so the signal is
+/// unambiguous even at its ugliest. Kept separate from the behavioral test
+/// above precisely so the common regression is caught by *that* one first.
+#[test]
+fn nesting_past_the_stack_limit_does_not_abort_the_process() {
+    for tag in ["div", "span", "blockquote"] {
+        let out = from_quip_html(&nested(tag, PAST_STACK_LIMIT));
+        assert!(out.deep_nesting_truncated > 0, "<{tag}> must be truncated");
+        assert!(
+            doc_text(&out.doc).contains("deep-content"),
+            "the text must survive even at {PAST_STACK_LIMIT} levels",
+        );
+    }
+}
+
+/// The cap must not touch documents that stay under it — a real Quip document
+/// nests around a dozen levels, so a cap that truncated ordinary content
+/// would be a worse bug than the one it fixes.
+#[test]
+fn ordinary_nesting_is_not_truncated() {
+    let depth = 16;
+    let html = format!(
+        "{}<p>nested</p>{}",
+        "<blockquote>".repeat(depth),
+        "</blockquote>".repeat(depth),
+    );
+    let out = from_quip_html(&html);
+    assert_eq!(
+        out.deep_nesting_truncated, 0,
+        "{depth} levels is ordinary document structure and must pass through untouched",
+    );
+    assert!(doc_text(&out.doc).contains("nested"));
+}
+
+/// Flattened text of a document's `content` fragment.
+fn doc_text(doc: &Doc) -> String {
+    fn walk_text<T: ReadTxn>(el: &XmlElementRef, txn: &T, out: &mut String) {
+        for i in 0..el.len(txn) {
+            match el.get(txn, i) {
+                Some(XmlOut::Element(child)) => walk_text(&child, txn, out),
+                Some(XmlOut::Text(t)) => {
+                    out.push(' ');
+                    out.push_str(&t.get_string(txn));
+                }
+                _ => {}
+            }
+        }
+    }
+    let txn = doc.transact();
+    let mut out = String::new();
+    if let Some(fragment) = txn.get_xml_fragment("content") {
+        for i in 0..fragment.len(&txn) {
+            if let Some(XmlOut::Element(el)) = fragment.get(&txn, i) {
+                walk_text(&el, &txn, &mut out);
+            }
+        }
+    }
+    out
 }

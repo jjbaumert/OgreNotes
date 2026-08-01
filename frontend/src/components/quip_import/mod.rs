@@ -55,6 +55,118 @@ enum ImportTerminal {
     TokenExpired,
 }
 
+/// Everything the completion state renders, derived from one poll's
+/// report. Extracted as a plain value (rather than computed inline in
+/// the `view!`) so the "a run that lost documents does not look like a
+/// clean run" property is testable natively — same shape as
+/// `sync_indicator`'s `compute_state`.
+///
+/// Built only from a report the server actually sent; see
+/// [`Completion::from_report`] and the `None` fallback at its call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Completion {
+    /// Documents that landed. From the report's counter, **not** from
+    /// `progress.total` — `progress.total` is every thread the inventory
+    /// *discovered*, which includes the ones that were skipped or failed.
+    /// Labelling that "Imported N" is precisely the claim this feature
+    /// exists to stop making.
+    imported: u64,
+    /// Documents Quip refused to serve. `None` when there were none —
+    /// an absent section renders nothing at all, which is what makes a
+    /// lossy run visibly different from a clean one.
+    skipped: Option<Section>,
+    /// Documents the importer tried and gave up on.
+    failed: Option<Section>,
+    /// Chat threads, which are counted but never named.
+    chat_skipped: u64,
+}
+
+/// Which outcome a [`Section`] is describing.
+///
+/// An enum rather than a pair of key strings threaded through
+/// `section_view`: the two sections differ in wording and in their
+/// test-automation anchor, and both differences belong in one place where
+/// adding a third outcome is a compile error at every site that matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutcomeKind {
+    /// Quip refused to serve these. The reader may be able to get access.
+    Skipped,
+    /// The importer tried, retried, and gave up. Retrying already happened.
+    Failed,
+}
+
+impl OutcomeKind {
+    /// Stable `data-quip-import-outcome` value — a test/automation anchor,
+    /// never shown to the user (the visible label is [`Self::label`]).
+    fn anchor(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// The section's visible heading, localized.
+    fn label(self, count: u64) -> String {
+        match self {
+            Self::Skipped => crate::t!("quip-import-report-skipped", count = count as i64),
+            Self::Failed => crate::t!("quip-import-report-failed", count = count as i64),
+        }
+    }
+}
+
+/// One expandable outcome section: how many, which ones we can name, and
+/// how many we cannot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Section {
+    /// The true total, from the server's uncapped counter.
+    total: u64,
+    /// `(quip_thread_id, detail)` — a bounded prefix of `total`. Both are
+    /// plain text and are rendered through text nodes.
+    named: Vec<(String, String)>,
+    /// `total - named.len()`: how many are in the total but unnamed. Any
+    /// non-zero value **must** be rendered ("…and N more"); a list that
+    /// silently stopped at the note budget would put the original bug
+    /// back, one layer up.
+    hidden: u64,
+}
+
+impl Section {
+    /// `None` for an empty outcome, so a clean run has no section to draw.
+    fn new(outcome: &imports::Outcome) -> Option<Self> {
+        if outcome.total == 0 && outcome.notes.is_empty() {
+            return None;
+        }
+        Some(Self {
+            total: outcome.total,
+            named: outcome
+                .notes
+                .iter()
+                .map(|n| (n.quip_thread_id.clone(), n.detail.clone()))
+                .collect(),
+            hidden: outcome.hidden(),
+        })
+    }
+}
+
+impl Completion {
+    fn from_report(report: &imports::ImportReport) -> Self {
+        Self {
+            imported: report.imported,
+            skipped: Section::new(&report.skipped),
+            failed: Section::new(&report.failed),
+            chat_skipped: report.chat_threads_skipped,
+        }
+    }
+
+    /// True when the run finished with nothing to report beyond the
+    /// documents it imported. Drives nothing on its own — it exists so
+    /// the difference between a clean run and a lossy one is a single
+    /// assertable predicate rather than an eyeball over the `view!`.
+    fn is_clean(&self) -> bool {
+        self.skipped.is_none() && self.failed.is_none() && self.chat_skipped == 0
+    }
+}
+
 #[component]
 pub fn QuipImportWizard(
     /// Visibility flag — the parent (the shell) owns it and flips it
@@ -535,17 +647,32 @@ pub fn QuipImportWizard(
                                                     // always means Home.
                                                     Some(st) if st.phase >= 2 => {
                                                         let total = st.progress.total;
+                                                        // The report is what turns "Imported N
+                                                        // items" (N = every thread *discovered*,
+                                                        // skipped ones included) into an honest
+                                                        // account. When the server has no REPORT
+                                                        // row the breakdown genuinely isn't known,
+                                                        // so the pre-report line is kept rather
+                                                        // than inventing a zero.
+                                                        let done = st.report
+                                                            .as_ref()
+                                                            .map(Completion::from_report);
                                                         view! {
-                                                            <p
-                                                                class="quip-import-progress-line"
-                                                                data-quip-import-total=total
-                                                                data-quip-import-content-done="true"
-                                                            >
-                                                                {crate::t!(
-                                                                    "quip-import-content-done",
-                                                                    total = total as i64,
-                                                                )}
-                                                            </p>
+                                                            {match done {
+                                                                None => view! {
+                                                                    <p
+                                                                        class="quip-import-progress-line"
+                                                                        data-quip-import-total=total
+                                                                        data-quip-import-content-done="true"
+                                                                    >
+                                                                        {crate::t!(
+                                                                            "quip-import-content-done",
+                                                                            total = total as i64,
+                                                                        )}
+                                                                    </p>
+                                                                }.into_any(),
+                                                                Some(c) => completion_view(c).into_any(),
+                                                            }}
                                                             <div class="confirm-actions">
                                                                 <button
                                                                     class="btn btn-primary"
@@ -612,6 +739,89 @@ pub fn QuipImportWizard(
     }
 }
 
+/// The completion state's body: what landed, then — only when there is
+/// something to say — what did not.
+///
+/// Skips and failures get their own sections rather than one "problems"
+/// list because the two ask different things of the reader: a skip means
+/// Quip refused access, which the reader may be able to fix and re-run;
+/// a failure means the importer already retried and lost, which they
+/// cannot. Chat threads get a third, count-only line — they are not
+/// documents, and folding them into "skipped" would inflate a number the
+/// reader is meant to act on.
+fn completion_view(c: Completion) -> impl IntoView {
+    let imported = c.imported;
+    let chat = c.chat_skipped;
+    view! {
+        <p
+            class="quip-import-progress-line"
+            data-quip-import-content-done="true"
+            data-quip-import-imported=imported
+        >
+            {crate::t!("quip-import-report-imported", imported = imported as i64)}
+        </p>
+        {c.skipped.map(|s| section_view(s, OutcomeKind::Skipped))}
+        {c.failed.map(|s| section_view(s, OutcomeKind::Failed))}
+        {(chat > 0).then(|| view! {
+            <p class="quip-import-report-chat" data-quip-import-chat-skipped=chat>
+                {crate::t!("quip-import-report-chat", count = chat as i64)}
+            </p>
+        })}
+    }
+}
+
+/// One collapsed-by-default outcome section.
+///
+/// Native `<details>`/`<summary>`: keyboard- and screen-reader-accessible
+/// with no script and no bundle cost, and collapsed by default so a
+/// 25-line list doesn't bury the headline.
+///
+/// The two strings a note carries — the Quip thread id and the server's
+/// `detail` — are interpolated as Leptos child expressions, which become
+/// **text nodes**. They are never fed to `inner_html`: `detail` is
+/// server-authored prose about a failure and must not be able to inject
+/// markup, however sanitized it already is upstream.
+fn section_view(s: Section, kind: OutcomeKind) -> impl IntoView {
+    let total = s.total;
+    let hidden = s.hidden;
+    view! {
+        <details
+            class="quip-import-report-section"
+            data-quip-import-outcome=kind.anchor()
+            data-quip-import-outcome-total=total
+        >
+            <summary class="quip-import-report-summary">{kind.label(total)}</summary>
+            <ul class="quip-import-report-list">
+                {s.named.into_iter().map(|(id, detail)| view! {
+                    <li class="quip-import-report-note">
+                        {if id.is_empty() {
+                            crate::t!("quip-import-report-note-general", detail = detail.as_str())
+                        } else {
+                            crate::t!(
+                                "quip-import-report-note",
+                                id = id.as_str(),
+                                detail = detail.as_str(),
+                            )
+                        }}
+                    </li>
+                }).collect::<Vec<_>>()}
+                // The truncation line. Driven by the server's uncapped
+                // counter minus what it could name — never by the note
+                // list's own length, which stops at a storage budget and
+                // would otherwise let the list read as complete.
+                {(hidden > 0).then(|| view! {
+                    <li
+                        class="quip-import-report-more"
+                        data-quip-import-outcome-hidden=hidden
+                    >
+                        {crate::t!("quip-import-report-and-more", count = hidden as i64)}
+                    </li>
+                })}
+            </ul>
+        </details>
+    }
+}
+
 /// `event_target_value` (checkbox flavor) isn't in `leptos::prelude` —
 /// same local helper pattern as `calendar_modal.rs` /
 /// `spreadsheet_view/sort_dialog.rs`.
@@ -620,4 +830,177 @@ fn event_target_checked(e: &web_sys::Event) -> bool {
         .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
         .map(|el| el.checked())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::imports::{ImportReport, Outcome, ReportNote};
+
+    /// The catalog this component reads its wording from. Asserted against
+    /// directly (rather than through `t!`) because `i18n::init` touches
+    /// `document` and cannot run in a native test.
+    const EN_US: &str = include_str!("../../../locales/en-US/main.ftl");
+
+    fn note(id: &str, detail: &str) -> ReportNote {
+        ReportNote {
+            quip_thread_id: id.to_string(),
+            detail: detail.to_string(),
+        }
+    }
+
+    fn outcome(total: u64, notes: Vec<ReportNote>) -> Outcome {
+        Outcome { total, notes }
+    }
+
+    fn clean_report() -> ImportReport {
+        ImportReport {
+            imported: 47,
+            ..ImportReport::default()
+        }
+    }
+
+    /// **The deliverable.** A run that dropped documents must not summarize
+    /// the same as one that dropped none — if the two are indistinguishable,
+    /// the whole unit is invisible and the user is told "Imported 47" while
+    /// three documents silently vanished.
+    #[test]
+    fn a_run_with_skips_does_not_summarize_like_a_clean_run() {
+        let clean = Completion::from_report(&clean_report());
+        let lossy = Completion::from_report(&ImportReport {
+            imported: 47,
+            skipped: outcome(3, vec![note("qt1", "Quip denied access (HTTP 403)")]),
+            ..ImportReport::default()
+        });
+
+        assert!(clean.is_clean(), "a report with only imports is clean");
+        assert!(!lossy.is_clean(), "a report naming a skipped thread is not");
+        assert_ne!(clean, lossy);
+        // Same headline number, different body: the difference is entirely
+        // the section a clean run does not draw.
+        assert_eq!(clean.imported, lossy.imported);
+        assert!(clean.skipped.is_none());
+        assert!(lossy.skipped.is_some());
+    }
+
+    /// A failure is not a skip. They render as separate sections with
+    /// separate wording and separate anchors, because the reader's options
+    /// differ: a skip may be fixable by getting access in Quip, a failure
+    /// has already been retried to exhaustion.
+    #[test]
+    fn skips_and_failures_do_not_collapse_into_one_bucket() {
+        let c = Completion::from_report(&ImportReport {
+            imported: 10,
+            skipped: outcome(2, vec![note("qt1", "Quip denied access (HTTP 403)")]),
+            failed: outcome(1, vec![note("qt9", "Quip returned HTTP 500; gave up")]),
+            ..ImportReport::default()
+        });
+
+        let skipped = c.skipped.expect("skipped section");
+        let failed = c.failed.expect("failed section");
+        assert_eq!(skipped.total, 2);
+        assert_eq!(failed.total, 1);
+        assert_eq!(skipped.named[0].0, "qt1");
+        assert_eq!(failed.named[0].0, "qt9");
+        assert_ne!(OutcomeKind::Skipped.anchor(), OutcomeKind::Failed.anchor());
+    }
+
+    /// The single most important property: the counter is the total, the
+    /// note list is a sample. 10 000 inaccessible threads yield 25 notes and
+    /// a "…and 9 975 more" line — never a 25-item list that reads complete.
+    #[test]
+    fn a_truncated_note_list_never_reads_as_complete() {
+        let named: Vec<ReportNote> = (0..25)
+            .map(|i| note(&format!("qt{i:04}"), "Quip denied access (HTTP 403)"))
+            .collect();
+        let c = Completion::from_report(&ImportReport {
+            imported: 0,
+            skipped: outcome(10_000, named),
+            ..ImportReport::default()
+        });
+
+        let s = c.skipped.expect("skipped section");
+        assert_eq!(s.total, 10_000, "the total comes from the uncapped counter");
+        assert_eq!(s.named.len(), 25, "the note list stops at the storage budget");
+        assert_eq!(
+            s.hidden, 9_975,
+            "the unnamed remainder must be stated, not swallowed",
+        );
+        assert!(
+            s.hidden > 0,
+            "with more skips than notes there is always something to disclose",
+        );
+    }
+
+    /// The complement: when every skip is named, nothing extra is claimed.
+    #[test]
+    fn a_complete_note_list_claims_no_hidden_remainder() {
+        let c = Completion::from_report(&ImportReport {
+            skipped: outcome(2, vec![note("qt1", "403"), note("qt2", "403")]),
+            ..ImportReport::default()
+        });
+        assert_eq!(c.skipped.expect("skipped section").hidden, 0);
+    }
+
+    /// A server that ever sent more notes than its counter must not wrap the
+    /// remainder into a nonsense total. (`Outcome::hidden` saturates; the
+    /// API's `max(counter, notes.len())` makes it unreachable from our own
+    /// server, but the client does not get to assume that.)
+    #[test]
+    fn more_notes_than_the_counter_yields_no_negative_remainder() {
+        let c = Completion::from_report(&ImportReport {
+            skipped: outcome(0, vec![note("", "a selected folder could not be read")]),
+            ..ImportReport::default()
+        });
+        let s = c.skipped.expect("a note alone is enough to draw the section");
+        assert_eq!(s.hidden, 0);
+        assert_eq!(s.total, 0);
+        assert_eq!(s.named[0].0, "", "a folder-level loss names no thread");
+    }
+
+    /// Chat threads are counted, never named, and never folded into
+    /// `skipped` — inflating an actionable number with content that was
+    /// never in scope would make the skip count useless.
+    #[test]
+    fn chat_threads_are_counted_separately_from_skips() {
+        let c = Completion::from_report(&ImportReport {
+            imported: 5,
+            chat_threads_skipped: 12,
+            ..ImportReport::default()
+        });
+        assert_eq!(c.chat_skipped, 12);
+        assert!(c.skipped.is_none(), "chats are not access-denied skips");
+        assert!(!c.is_clean(), "12 unimported chat threads is worth saying");
+    }
+
+    /// Every string this component renders must exist in the catalog with
+    /// the argument name the component actually passes — a mismatched
+    /// placeable renders as the raw key or drops the number.
+    #[test]
+    fn every_report_string_exists_with_the_argument_it_is_given() {
+        for (key, arg) in [
+            ("quip-import-report-imported", "$imported"),
+            ("quip-import-report-skipped", "$count"),
+            ("quip-import-report-failed", "$count"),
+            ("quip-import-report-and-more", "$count"),
+            ("quip-import-report-chat", "$count"),
+            ("quip-import-report-note", "$detail"),
+            ("quip-import-report-note-general", "$detail"),
+        ] {
+            let line = EN_US
+                .lines()
+                .find(|l| l.starts_with(&format!("{key} =")))
+                .unwrap_or_else(|| panic!("en-US catalog is missing {key}"));
+            assert!(
+                line.contains(arg),
+                "{key} must interpolate {arg}; got {line:?}",
+            );
+        }
+        // The id-bearing note form needs both placeables.
+        let note_line = EN_US
+            .lines()
+            .find(|l| l.starts_with("quip-import-report-note ="))
+            .expect("quip-import-report-note");
+        assert!(note_line.contains("$id"), "got {note_line:?}");
+    }
 }

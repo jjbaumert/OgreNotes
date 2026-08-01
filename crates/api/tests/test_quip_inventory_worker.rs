@@ -94,6 +94,18 @@ async fn quip_unauthorized_server() -> MockServer {
     server
 }
 
+/// Wiremock Quip server whose `/1/folders/` always 403s — a *valid* token
+/// whose owner cannot read a selected root.
+async fn quip_forbidden_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/1/folders/"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+    server
+}
+
 /// Wiremock Quip server whose `/1/folders/` always 503s — a transient
 /// (rate-limit-class) error that the handler must surface as `Err` for the
 /// queue to retry.
@@ -248,6 +260,8 @@ async fn inventory_is_idempotent_on_rerun() {
                 first_folder: "root".into(),
                 state: ThreadState::ContentDone,
                 ogre_doc_id: Some("ogre-doc-1".into()),
+                reason: None,
+                attempts: 0,
             },
         )
         .await
@@ -563,4 +577,51 @@ async fn live_lease_redelivery_leaves_the_entry_pending_instead_of_acking() {
     // And it really did nothing: the import is untouched, still below phase 1.
     let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
     assert_eq!(rec.phase, 0, "the no-op run must not have walked anything");
+}
+
+/// Regression (#141, the inventory half): a 403 on a selected root is still
+/// terminal for the run — `walk_inventory` fails a whole BFS level at once, so
+/// there is no per-folder granularity to skip with — but it is terminal as
+/// `Failed`, **not** as `TokenRejected`.
+///
+/// The credential is valid. Telling the user it expired sends them to
+/// reconnect a working token, and the re-run reaches the same unreadable
+/// folder and says the same thing: the permanent wedge behind a misleading
+/// diagnosis that #141 is about. The report row carries the real cause.
+#[tokio::test]
+async fn inventory_forbidden_root_fails_without_blaming_the_token() {
+    common::require_infra!();
+    let server = quip_forbidden_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1", &["root"]).await;
+    app.state
+        .quip_token_store
+        .put(&import_id, &QuipToken::new("perfectly-good".into()))
+        .await
+        .unwrap();
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    // Terminal for the run, so `Ok` — the queue must not retry a 403 that
+    // cannot change.
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ImportStatus::Failed);
+    assert_ne!(
+        rec.status,
+        ImportStatus::TokenRejected,
+        "the token is valid; a reconnect prompt would wedge the user in a loop",
+    );
+
+    let report = app
+        .state
+        .import_repo
+        .get_report(&import_id)
+        .await
+        .expect("report read")
+        .expect("the report must say why the import could not be scoped");
+    assert_eq!(report.counters.get("folders_forbidden"), Some(&1));
+    let note = report.notes.first().expect("a note names the cause");
+    assert!(note.detail.contains("403"), "{note:?}");
+    assert!(note.detail.contains("folder"), "{note:?}");
 }
