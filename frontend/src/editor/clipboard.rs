@@ -1224,6 +1224,37 @@ fn element_tags(
                 None,
             )
         }
+        // design/presentations.md — decks have no dedicated
+        // clipboard render pipeline yet (they don't render through
+        // the flow editor at all); this minimal shape mirrors
+        // Kanban's container treatment so a copy still emits
+        // structured, paste-recoverable HTML rather than nothing.
+        NodeType::Slide => {
+            let layout = attrs.get("layout").map(String::as_str).unwrap_or("blank");
+            (
+                format!(
+                    "<div class=\"slide-block\" data-layout=\"{}\">",
+                    html_escape_attr(layout),
+                ),
+                Some("</div>".into()),
+            )
+        }
+        NodeType::Frame => {
+            let x = attrs.get("x").map(String::as_str).unwrap_or("0");
+            let y = attrs.get("y").map(String::as_str).unwrap_or("0");
+            let w = attrs.get("w").map(String::as_str).unwrap_or("1");
+            let h = attrs.get("h").map(String::as_str).unwrap_or("1");
+            (
+                format!(
+                    "<div class=\"frame-block\" data-x=\"{}\" data-y=\"{}\" data-w=\"{}\" data-h=\"{}\">",
+                    html_escape_attr(x),
+                    html_escape_attr(y),
+                    html_escape_attr(w),
+                    html_escape_attr(h),
+                ),
+                Some("</div>".into()),
+            )
+        }
     }
 }
 

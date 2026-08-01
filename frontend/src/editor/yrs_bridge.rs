@@ -666,11 +666,21 @@ fn sync_block_content<C: XmlFragment>(
     // to an existing block updated the local model but NEVER
     // reached yrs, so refresh restored the pre-add state.
     // Observed on doc `5xBzUM-KS8u_bi8XPcPzN`.
+    //
+    // Slide/Frame have the identical shape: a Frame's authoritative
+    // state (`x`/`y`/`w`/`h`/`z`) lives in its own attributes, which
+    // `text_and_marks_match` never looks at (it only compares
+    // collected leaf text). Without listing Slide here, moving or
+    // resizing a Frame nested two levels under Doc (Doc > Slide >
+    // Frame) would report "unchanged" at the Slide hop and the
+    // attribute edit would never reach yrs — the same class of bug
+    // as the Kanban/Calendar one above, just one container deeper.
     let is_container = matches!(model_type,
         NodeType::BulletList | NodeType::OrderedList | NodeType::TaskList |
         NodeType::Blockquote | NodeType::ListItem | NodeType::TaskItem |
         NodeType::Table | NodeType::TableRow | NodeType::TableCell | NodeType::TableHeader |
-        NodeType::Calendar | NodeType::Kanban | NodeType::KanbanColumn
+        NodeType::Calendar | NodeType::Kanban | NodeType::KanbanColumn |
+        NodeType::Slide | NodeType::Frame
     );
 
     if is_container {
@@ -888,6 +898,10 @@ fn node_type_to_tag(nt: NodeType) -> &'static str {
         // so both sides of the yrs bridge speak the same wire.
         NodeType::DocMention => "doc_mention",
         NodeType::Mermaid => "mermaid",
+        // design/presentations.md — matches
+        // `crates/collab/src/schema.rs::NodeType::Slide/Frame::tag_name`.
+        NodeType::Slide => "slide",
+        NodeType::Frame => "frame",
     }
 }
 
@@ -919,6 +933,8 @@ fn tag_to_node_type(tag: &str) -> Option<NodeType> {
         "mention" => Some(NodeType::Mention),
         "doc_mention" => Some(NodeType::DocMention),
         "mermaid" => Some(NodeType::Mermaid),
+        "slide" => Some(NodeType::Slide),
+        "frame" => Some(NodeType::Frame),
         _ => None,
     }
 }
@@ -1367,6 +1383,49 @@ mod tests {
             restored.child(1).unwrap().node_type(),
             Some(NodeType::HorizontalRule)
         );
+    }
+
+    /// design/presentations.md — a deck (Doc > Slide > Frame > blocks)
+    /// must round-trip through the yrs bridge exactly like any other
+    /// document, and Slide/Frame must come back with real blockIds
+    /// (the bridge's `find_match` relies on them; see
+    /// `NodeType::needs_block_id`).
+    #[test]
+    fn deck_doc_roundtrips_through_ydoc() {
+        let frame = Node::element_with_attrs(
+            NodeType::Frame,
+            [("x", "0.1"), ("y", "0.2"), ("w", "0.5"), ("h", "0.3"), ("z", "1"), ("role", "content")]
+                .iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph, Fragment::from(vec![Node::text("hello deck")]),
+            )]),
+        );
+        let slide = Node::element_with_attrs(
+            NodeType::Slide,
+            [("layout", "blank")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            Fragment::from(vec![frame]),
+        );
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![slide]));
+        let bytes = doc_to_ydoc_bytes(&doc);
+        let back = ydoc_bytes_to_doc(&bytes).unwrap();
+        // normalize strips nothing from a deck (empty-slide carve-out):
+        assert_eq!(back.attrs(), doc.attrs());
+        let slide_back = match &back { Node::Element { content, .. } => &content.children[0], _ => panic!() };
+        assert_eq!(slide_back.node_type(), Some(NodeType::Slide));
+        assert!(slide_back.block_id().is_some(), "slides must carry blockIds");
+    }
+
+    /// design/presentations.md — `normalize_doc` must not strip an
+    /// empty `Slide` the way it strips an empty `BulletList`/`Table`;
+    /// a freshly inserted slide with no frames yet is a normal
+    /// mid-authoring state.
+    #[test]
+    fn empty_slide_survives_normalize() {
+        let slide = Node::element(NodeType::Slide);
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![slide]));
+        let n = crate::editor::model::normalize_doc(&doc);
+        let count = match &n { Node::Element { content, .. } => content.children.len(), _ => 0 };
+        assert_eq!(count, 1, "normalize_doc must not strip empty slides");
     }
 
     #[test]
@@ -2553,6 +2612,114 @@ mod tests {
         // Convergence is primary. Both a type change (remove+insert) and text edit
         // happened concurrently on the same block.
         assert!(result.child_count() >= 1);
+    }
+
+    // ─── design/presentations.md: deck concurrent move/resize ──────
+
+    fn make_frame(block_id: &str, x: &str, y: &str, w: &str, h: &str) -> Node {
+        Node::element_with_attrs(
+            NodeType::Frame,
+            [
+                ("blockId".to_string(), block_id.to_string()),
+                ("x".to_string(), x.to_string()),
+                ("y".to_string(), y.to_string()),
+                ("w".to_string(), w.to_string()),
+                ("h".to_string(), h.to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            Fragment::empty(),
+        )
+    }
+
+    fn make_slide(block_id: &str, frame: Node) -> Node {
+        Node::element_with_attrs(
+            NodeType::Slide,
+            [("blockId".to_string(), block_id.to_string())]
+                .into_iter()
+                .collect(),
+            Fragment::from(vec![frame]),
+        )
+    }
+
+    /// Two peers concurrently edit disjoint attributes of the same
+    /// `Frame`: A moves it (x/y), B resizes it (w/h). Since the two
+    /// edits touch different attribute keys on the same yrs
+    /// XmlElement, both must survive the merge — this is the
+    /// deck-editor analogue of `concurrent_edit_different_blocks`,
+    /// one level of nesting (Doc > Slide > Frame) deeper, and it's
+    /// what the `is_container` fix for Slide/Frame (this file,
+    /// `sync_block_content`) exists to make possible: without it,
+    /// the attribute edit never reaches yrs at all.
+    #[test]
+    fn concurrent_move_and_resize_converge() {
+        let initial = make_doc(vec![make_slide(
+            "s1",
+            make_frame("f1", "0.0", "0.0", "0.5", "0.5"),
+        )]);
+        let pair = make_client_pair(&initial);
+
+        // A moves the frame; w/h stay put.
+        let model_a = make_doc(vec![make_slide(
+            "s1",
+            make_frame("f1", "0.1", "0.2", "0.5", "0.5"),
+        )]);
+        sync_model_to_ydoc(&pair.doc_a, &model_a);
+
+        // B resizes the frame; x/y stay put.
+        let model_b = make_doc(vec![make_slide(
+            "s1",
+            make_frame("f1", "0.0", "0.0", "0.6", "0.4"),
+        )]);
+        sync_model_to_ydoc(&pair.doc_b, &model_b);
+
+        exchange_updates(&pair);
+        let (result, _) = assert_convergence(&pair);
+
+        let frame = result.child(0).unwrap().child(0).unwrap();
+        assert_eq!(frame.attrs().get("x").map(String::as_str), Some("0.1"), "A's move must survive");
+        assert_eq!(frame.attrs().get("y").map(String::as_str), Some("0.2"), "A's move must survive");
+        assert_eq!(frame.attrs().get("w").map(String::as_str), Some("0.6"), "B's resize must survive");
+        assert_eq!(frame.attrs().get("h").map(String::as_str), Some("0.4"), "B's resize must survive");
+    }
+
+    /// Two peers concurrently move the *same* Frame to different
+    /// positions (both write `x`/`y`). Unlike the disjoint-attrs case
+    /// above, this is a genuine conflict on the same attribute key;
+    /// yrs's last-writer-wins rule picks one deterministically, but
+    /// both peers must land on the *same* one — a divergent pick
+    /// would mean two collaborators see their frame in different
+    /// places forever.
+    #[test]
+    fn concurrent_same_frame_move_converges_to_single_value() {
+        let initial = make_doc(vec![make_slide(
+            "s1",
+            make_frame("f1", "0.0", "0.0", "0.5", "0.5"),
+        )]);
+        let pair = make_client_pair(&initial);
+
+        let model_a = make_doc(vec![make_slide(
+            "s1",
+            make_frame("f1", "0.1", "0.1", "0.5", "0.5"),
+        )]);
+        sync_model_to_ydoc(&pair.doc_a, &model_a);
+
+        let model_b = make_doc(vec![make_slide(
+            "s1",
+            make_frame("f1", "0.9", "0.9", "0.5", "0.5"),
+        )]);
+        sync_model_to_ydoc(&pair.doc_b, &model_b);
+
+        exchange_updates(&pair);
+        // Primary assertion: A and B converge to one identical tree.
+        let (result, _) = assert_convergence(&pair);
+
+        let frame = result.child(0).unwrap().child(0).unwrap();
+        let x = frame.attrs().get("x").cloned();
+        assert!(
+            x == Some("0.1".to_string()) || x == Some("0.9".to_string()),
+            "must land on one of the two candidate values, not a corrupted/missing one: {x:?}"
+        );
     }
 
     #[test]

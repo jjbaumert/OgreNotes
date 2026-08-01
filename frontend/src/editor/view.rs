@@ -1797,6 +1797,12 @@ fn node_type_to_tag(nt: NodeType) -> &'static str {
         // override (Task 2), same as Mention above.
         NodeType::DocMention => "span",
         NodeType::Mermaid => "div",
+        // design/presentations.md — decks never render through the
+        // flow editor (a separate deck-canvas view owns Slide/Frame
+        // rendering), but the match must stay total. `section`/`div`
+        // are placeholders only.
+        NodeType::Slide => "section",
+        NodeType::Frame => "div",
     }
 }
 
