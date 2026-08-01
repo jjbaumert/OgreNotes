@@ -1171,3 +1171,12 @@ deck-theme-midnight-label = Midnight
 deck-theme-ember-label = Ember
 deck-theme-forest-label = Forest
 deck-theme-ocean-label = Ocean
+
+# ─── Presentations P1 (deck foundation, Task 8) ──────────────────
+# `deck-new` is the "New presentation" creation-menu/button label;
+# `deck-doc-type-label` is the display name for the presentation
+# doc type, reused everywhere a doc-type badge/label is rendered
+# (document details panel, file browser type column).
+
+deck-new = New Presentation
+deck-doc-type-label = Presentation

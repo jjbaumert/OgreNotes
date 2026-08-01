@@ -3424,7 +3424,7 @@ pub fn DocumentPage() -> impl IntoView {
                 on_confirm=Callback::new(move |(new_name, folder): (String, String)| {
                     set_duplicate_dialog_visible.set(false);
                     let old_id = current_id.get_untracked();
-                    let is_spreadsheet = doc_type.get_untracked() == "spreadsheet";
+                    let source_doc_type = doc_type.get_untracked();
                     // Snapshot the *current in-memory* content. get_content(old_id)
                     // races the source's async WS persistence and could return
                     // content without the just-typed edits (duplicateCopiedContent
@@ -3433,10 +3433,14 @@ pub fn DocumentPage() -> impl IntoView {
                         .get_untracked()
                         .map(|s| crate::editor::yrs_bridge::doc_to_ydoc_bytes(&s.doc));
                     leptos::task::spawn_local(async move {
-                        let created = if is_spreadsheet {
-                            documents::create_spreadsheet(&new_name, Some(&folder)).await
-                        } else {
-                            documents::create_document(&new_name, Some(&folder)).await
+                        let created = match source_doc_type.as_str() {
+                            "spreadsheet" => {
+                                documents::create_spreadsheet(&new_name, Some(&folder)).await
+                            }
+                            "presentation" => {
+                                documents::create_presentation(&new_name, Some(&folder)).await
+                            }
+                            _ => documents::create_document(&new_name, Some(&folder)).await,
                         };
                         match created {
                             Ok(doc) => {

@@ -562,6 +562,14 @@ pub async fn create_spreadsheet(
     create_document_with_type(title, folder_id, Some("spreadsheet")).await
 }
 
+/// #Task 8: presentation-deck sibling of `create_spreadsheet`.
+pub async fn create_presentation(
+    title: &str,
+    folder_id: Option<&str>,
+) -> Result<DocumentResponse, ApiClientError> {
+    create_document_with_type(title, folder_id, Some("presentation")).await
+}
+
 async fn create_document_with_type(
     title: &str,
     folder_id: Option<&str>,

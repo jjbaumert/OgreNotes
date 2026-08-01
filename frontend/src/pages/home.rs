@@ -369,6 +369,28 @@ pub fn HomePage() -> impl IntoView {
         }
     };
 
+    let on_create_presentation = {
+        let navigate = navigate.clone();
+        move |_| {
+            let navigate = navigate.clone();
+            leptos::task::spawn_local(async move {
+                match documents::create_presentation("Untitled Presentation", None).await {
+                    Ok(doc) => {
+                        navigate(
+                            &format!("/d/{}/untitled-presentation", doc.id),
+                            Default::default(),
+                        );
+                    }
+                    Err(e) => {
+                        web_sys::console::error_1(
+                            &format!("Failed to create presentation: {e}").into(),
+                        );
+                    }
+                }
+            });
+        }
+    };
+
     let on_create_folder = {
         let refresh = refresh_folder.clone();
         move |_| {
@@ -669,6 +691,9 @@ pub fn HomePage() -> impl IntoView {
                         </button>
                         <button class="btn btn-primary" on:click=on_create_spreadsheet>
                             {crate::t!("home-new-spreadsheet")}
+                        </button>
+                        <button class="btn btn-primary" on:click=on_create_presentation>
+                            {"+ "}{crate::t!("deck-new")}
                         </button>
                         <button class="btn btn-secondary" on:click=on_create_folder>
                             {crate::t!("home-new-folder")}
