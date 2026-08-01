@@ -74,6 +74,37 @@ pub struct QuipUser {
     pub shared_folder_ids: Vec<String>,
 }
 
+/// The subset of **another** user's Quip profile the importer needs, to
+/// map a person mention onto an OgreNotes account.
+///
+/// Deliberately not [`QuipUser`]: that type is shaped for
+/// `/1/users/current` and requires `private_folder_id`, which Quip has no
+/// reason to return for somebody else — a missing field there would fail
+/// the whole batch. Every field here is optional, so a thin profile
+/// degrades to "no email, no match" instead of an error.
+///
+/// **`Debug` is redacted.** `emails` is the first personally-identifying
+/// data to reach the import worker, and the worker's rule is that an email
+/// never reaches a log, a `ReportNote`, a thread `reason`, or the imported
+/// document. A derived `Debug` would make one stray `{:?}` a breach; this
+/// one cannot.
+#[derive(Clone, Deserialize)]
+pub struct QuipUserRef {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub emails: Vec<String>,
+}
+
+impl std::fmt::Debug for QuipUserRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuipUserRef")
+            .field("name", &"[redacted]")
+            .field("emails", &format_args!("[{} redacted]", self.emails.len()))
+            .finish()
+    }
+}
+
 /// The subset of Quip's folder object we need.
 #[derive(Debug, Clone, Deserialize)]
 pub struct QuipFolder {
@@ -233,6 +264,61 @@ impl QuipClient {
             self.observe_and_check(resp).await?.json_body().await?;
 
         Ok(body.into_values().map(|env| env.thread).collect())
+    }
+
+    /// `GET /1/users/?ids=<comma-joined>` — look several Quip people up at
+    /// once, keyed by the id that was asked for.
+    ///
+    /// **Batched on purpose.** Quip allows 50 requests/minute per token; a
+    /// per-mention lookup would spend an import's entire budget on one
+    /// chatty document. Callers should also cache across threads — see
+    /// `worker_mode::PersonDirectory`. Chunking is the caller's job so this
+    /// stays a thin transport method; keep chunks modest (the ids ride in a
+    /// query string).
+    ///
+    /// **Endpoint shape, stated honestly.** The *single*-user form
+    /// `GET /1/users/{id}` is verified against Quip's own reference client
+    /// (`quip/quip-api`'s `get_user` → `users/<id>`). The *batch* form is
+    /// **assumed**: the reference client spells its batch calls as form
+    /// posts, but this codebase already ships and runs the `?ids=` GET
+    /// variant for `/1/folders/` and `/1/threads/`, and `/1/users/` is
+    /// documented as taking the same comma-joined id list. If the
+    /// assumption is wrong the call errors, every mention in the thread
+    /// degrades to a named placeholder, and the import still succeeds —
+    /// the failure is bounded by design, not by luck.
+    ///
+    /// The response is read shape-tolerantly (bare user object, or one
+    /// wrapped under a `user` key like `/1/threads/` wraps its threads) so
+    /// the residual uncertainty about the envelope cannot silently cost a
+    /// mention.
+    pub async fn users(
+        &self,
+        t: &QuipToken,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, QuipUserRef>, QuipError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        self.throttle.acquire().await;
+
+        let resp = self
+            .http
+            .get(format!("{}/1/users/", self.base))
+            .bearer_auth(t.expose())
+            .query(&[("ids", ids.join(","))])
+            .send()
+            .await?;
+
+        let body: std::collections::HashMap<String, serde_json::Value> =
+            self.observe_and_check(resp).await?.json_body().await?;
+
+        Ok(body
+            .into_iter()
+            .filter_map(|(id, value)| {
+                let inner = value.get("user").cloned().unwrap_or(value);
+                serde_json::from_value::<QuipUserRef>(inner).ok().map(|u| (id, u))
+            })
+            .collect())
     }
 
     /// `GET /2/threads/{id}/html` — the section-id-bearing HTML used to
@@ -571,6 +657,81 @@ mod tests {
         assert_eq!(ts[0].id, "t1");
         assert_eq!(ts[0].thread_type, "document");
         assert_eq!(ts[1].updated_usec, 222);
+    }
+
+    #[tokio::test]
+    async fn users_batches_ids_into_one_request_and_parses_both_envelope_shapes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/1/users/"))
+            .and(header("authorization", "Bearer tok-u"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                // Bare user object under its id — the documented shape.
+                "u1": {"name": "Joel", "emails": ["joel@example.com"]},
+                // ...and the `{"user": {...}}` envelope the sibling batch
+                // endpoints use, which this reader also tolerates.
+                "u2": {"user": {"name": "Bea", "emails": ["bea@example.com"]}},
+                // A profile with no visible email still parses; it simply
+                // cannot be matched.
+                "u3": {"name": "Ghost"}
+            })))
+            .mount(&server)
+            .await;
+        let c = QuipClient::new(Some(server.uri()));
+        let users = c
+            .users(
+                &QuipToken::new("tok-u".into()),
+                &["u1".into(), "u2".into(), "u3".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(users.len(), 3);
+        assert_eq!(users["u1"].emails, vec!["joel@example.com"]);
+        assert_eq!(users["u2"].name, "Bea");
+        assert!(users["u3"].emails.is_empty());
+
+        // One request for three people — the rate-limit property.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "three ids must cost one request");
+        assert_eq!(requests[0].url.query(), Some("ids=u1%2Cu2%2Cu3"));
+    }
+
+    #[tokio::test]
+    async fn users_with_no_ids_makes_no_request() {
+        let server = MockServer::start().await;
+        let c = QuipClient::new(Some(server.uri()));
+        assert!(c.users(&QuipToken::new("t".into()), &[]).await.unwrap().is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// The email guard at its source: a `QuipUserRef` cannot print an email
+    /// through `Debug`, so no `{:?}` anywhere downstream can leak one.
+    #[test]
+    fn quip_user_ref_debug_redacts_the_email_and_the_name() {
+        let u = QuipUserRef {
+            name: "Joel Baumert".into(),
+            emails: vec!["joel@example.com".into()],
+        };
+        let rendered = format!("{u:?}");
+        assert!(!rendered.contains("joel@example.com"), "{rendered}");
+        assert!(!rendered.contains("Baumert"), "{rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn users_401_maps_to_unauthorized_without_leaking_the_token() {
+        let server = MockServer::start().await;
+        Mock::given(path("/1/users/"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let c = QuipClient::new(Some(server.uri()));
+        let e = c
+            .users(&QuipToken::new("SEEKRET".into()), &["u1".into()])
+            .await
+            .unwrap_err();
+        assert!(matches!(e, QuipError::Unauthorized));
+        assert!(!format!("{e}").contains("SEEKRET"));
     }
 
     #[tokio::test]
