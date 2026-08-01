@@ -33,8 +33,20 @@ pub const DEFAULT_THEME: &str = "slate";
 /// `slideSize` used when a Doc has no `slideSize` attr.
 const DEFAULT_SLIDE_SIZE: &str = "16:9";
 
-/// Layout preset used when a Slide has no `layout` attr.
+/// Layout preset used when a Slide has no `layout` attr, or has one
+/// that isn't in `LAYOUTS`.
 const DEFAULT_LAYOUT: &str = "blank";
+
+/// Valid `layout` preset ids. Mirrors `LAYOUTS` in
+/// `crates/collab/src/blocks/presentation.rs` (`validate_slide_attrs`)
+/// — the server rejects any other value, so a reader that lets an
+/// unrecognized layout through would produce a `Deck` that
+/// `deck_to_doc` can't legally persist.
+const LAYOUTS: &[&str] = &["title", "title-content", "two-column", "blank"];
+
+/// Max `background` length in chars. Mirrors `BACKGROUND_MAX_LEN` in
+/// `crates/collab/src/blocks/presentation.rs`.
+const BACKGROUND_MAX_LEN: usize = 200;
 
 /// Minimum frame width/height (normalized 0..1). A frame can never
 /// clamp down to a zero-area rect — that would make it unselectable
@@ -146,8 +158,21 @@ pub fn deck_from_doc(doc: &Node) -> Deck {
 
 fn slide_from_node(attrs: &HashMap<String, String>, content: &Fragment) -> DeckSlide {
     let block_id = attrs.get("blockId").cloned().unwrap_or_default();
-    let layout = attrs.get("layout").cloned().unwrap_or_else(|| DEFAULT_LAYOUT.to_string());
-    let background = attrs.get("background").cloned();
+    // Unrecognized layout ids (missing, or not in the server's allowlist)
+    // read as the default — never pass through verbatim, or deck_to_doc
+    // would re-emit a value the server's validate_slide_attrs rejects.
+    let layout = match attrs.get("layout") {
+        Some(v) if LAYOUTS.contains(&v.as_str()) => v.clone(),
+        _ => DEFAULT_LAYOUT.to_string(),
+    };
+    // An over-length background is garbage, not a style choice — drop it
+    // rather than truncate. Truncating would silently mutate the value,
+    // which defeats "readers clamp/reject, they never rewrite"; dropping
+    // instead falls back to the same `None` that a missing attr produces.
+    let background = attrs
+        .get("background")
+        .cloned()
+        .filter(|v| v.len() <= BACKGROUND_MAX_LEN); // byte len, matches the server's `v.len()` check
 
     let frames = content
         .children
@@ -300,7 +325,11 @@ mod tests {
         );
         let slide = Node::element_with_attrs(
             crate::editor::model::NodeType::Slide,
-            HashMap::from([("blockId".to_string(), "slide1".to_string())]),
+            HashMap::from([
+                ("blockId".to_string(), "slide1".to_string()),
+                ("layout".to_string(), "pyramid".to_string()), // not in LAYOUTS
+                ("background".to_string(), "x".repeat(300)), // over BACKGROUND_MAX_LEN
+            ]),
             Fragment::from(vec![frame_no_geometry, frame_garbage]),
         );
         Node::element_with_attrs(
@@ -328,11 +357,24 @@ mod tests {
     #[test]
     fn deck_from_doc_defaults_missing_attrs() {
         // A Frame with no geometry attrs reads as x=0,y=0,w=1,h=1,z=0,role=content;
-        // a Doc with no theme reads as DEFAULT_THEME; garbage numbers clamp.
+        // a Doc with no theme reads as DEFAULT_THEME; garbage numbers clamp;
+        // a Slide with an unrecognized layout reads as "blank"; a Slide with
+        // an over-length background reads as None (dropped, not truncated).
         let doc = fixture_doc_with_missing_and_garbage_attrs();
         let deck = deck_from_doc(&doc);
         assert_eq!(deck.theme, DEFAULT_THEME);
         assert_eq!(deck.slides[0].frames[0].rect, Rect::clamped(0.0, 0.0, 1.0, 1.0));
+        assert_eq!(deck.slides[0].layout, "blank");
+        assert_eq!(deck.slides[0].background, None);
+
+        // The second frame's every attr is garbage in a different way
+        // (unparseable x, NaN y, out-of-range w/h, non-integer z, unknown
+        // role) — assert the fully-clamped/defaulted result, not just that
+        // it doesn't panic.
+        let garbage_frame = &deck.slides[0].frames[1];
+        assert_eq!(garbage_frame.rect, Rect { x: 0.0, y: 0.0, w: 1.0, h: MIN_FRAME_DIM });
+        assert_eq!(garbage_frame.z, 0);
+        assert_eq!(garbage_frame.role, FrameRole::Content);
     }
 
     #[test]
