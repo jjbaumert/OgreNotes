@@ -1136,17 +1136,27 @@ async fn run_inventory(
 /// than fixed.
 const MAX_THREAD_ATTEMPTS: u32 = 3;
 
-/// Consecutive [`ThreadImportError::Transient`] thread failures — with no
-/// intervening success or decided outcome — that convince the pass it is
-/// looking at a broken *Quip*, not a broken thread, and that it should stop
-/// and let the queue's backoff run.
+/// Consecutive **first-time** [`ThreadImportError::Transient`] thread failures
+/// that convince the pass it is looking at a broken *Quip*, not a broken
+/// thread, and that it should stop and let the queue's backoff run.
 ///
 /// Without this, a Quip-wide 5xx outage would walk the entire manifest
 /// charging an attempt to every thread, and three such runs would mark a
 /// 10 000-thread import `Failed` thread by thread over an outage that lasted
-/// an hour. The breaker bounds that blast radius to a handful of threads
-/// while leaving the scattered-bad-thread case (#142's actual shape, where
-/// good threads sit between bad ones and reset the counter) untouched.
+/// an hour. The breaker bounds that blast radius to a handful of threads.
+///
+/// **Only a thread's first-ever failure counts** (see the `else` arm in
+/// [`run_content_pass`]). Re-counting a known-bad thread's later failures is
+/// what let a run of `MAX_CONSECUTIVE_THREAD_FAILURES + 1` sort-adjacent
+/// deterministic failures dead-letter the import: the breaker re-tripped at
+/// the same offset every run, so threads past it never accumulated attempts.
+/// Counting only first failures keeps the breaker firing on the *leading
+/// edge* of not-yet-charged threads — which is exactly where an outage lives,
+/// and exactly what a still-climbing cluster has already moved past — so an
+/// outage is still contained while an adjacent cluster resolves. The
+/// resolvable cluster size is bounded (see `run_content_pass`); the residual
+/// beyond it degrades to a *retriable* dead-letter, never to marking good
+/// documents `Failed`.
 const MAX_CONSECUTIVE_THREAD_FAILURES: usize = 5;
 
 /// Durable, user-visible reason for a thread whose import panicked. Authored
@@ -1435,8 +1445,58 @@ pub async fn build_folder_mapping(
 ///
 /// The counterweight is [`MAX_CONSECUTIVE_THREAD_FAILURES`]: continuing is
 /// right when the bad threads are scattered, and wrong when *everything* is
-/// failing, so a run of back-to-back transient failures stops the pass instead
-/// of charging an attempt to the whole manifest during a Quip outage.
+/// failing, so a run of back-to-back **first-time** transient failures stops
+/// the pass instead of charging an attempt to the whole manifest during a Quip
+/// outage.
+///
+/// ## Why the breaker counts only *first-time* failures
+///
+/// A naive "any consecutive failure trips it" breaker reintroduces the
+/// dead-letter it exists to prevent. With a run of `N` sort-adjacent
+/// deterministic failures, the breaker trips at offset
+/// `MAX_CONSECUTIVE_THREAD_FAILURES` **every run** and returns `Err` before
+/// the walk ever reaches thread `N`; threads past the trip point never get a
+/// first attempt, so they never climb to `Failed`, and the job dead-letters
+/// with them still `Pending`. It is #142 in miniature — bounded to `N > 5`
+/// instead of `N > 1`, but the same bug.
+///
+/// Counting only a thread's *first* failure fixes it. A known-bad thread
+/// (`attempts > 1`) is already climbing toward its own give-up — forward
+/// progress, not new outage evidence — so it no longer re-arms the breaker.
+/// The breaker therefore fires only on the **leading edge** of not-yet-charged
+/// threads, and each run that edge advances by up to
+/// `MAX_CONSECUTIVE_THREAD_FAILURES` threads while the ones behind it climb in
+/// parallel. Concretely, with the constants here (`MAX_THREAD_ATTEMPTS = 3`,
+/// four job runs, threshold 5) an adjacent cluster of up to
+/// `2 * MAX_CONSECUTIVE_THREAD_FAILURES` threads is fully marked `Failed`
+/// inside the budget and the import *completes*.
+///
+/// **The two invariants this preserves:**
+///
+/// - *Progress.* Every deterministically-failing thread within
+///   `2 * MAX_CONSECUTIVE_THREAD_FAILURES` positions of a success is charged
+///   to give-up within the job budget, so no realistic bad-thread cluster
+///   dead-letters the import.
+/// - *Outage containment.* In a Quip-wide outage nothing succeeds, so the
+///   walk never advances past its leading edge — those threads are always on
+///   their *first* failure — and the breaker still trips after
+///   `MAX_CONSECUTIVE_THREAD_FAILURES` fresh failures **every run**, bounding
+///   per-run Quip calls to ≈ threshold rather than the whole manifest. This is
+///   the property the fix had to not break: first-time-only does **not** blind
+///   the breaker to a sustained outage, precisely because a tripping breaker
+///   never lets the walk get far enough ahead for the deep threads to reach a
+///   second attempt.
+///
+/// The residual: an adjacent run of more than `2 *
+/// MAX_CONSECUTIVE_THREAD_FAILURES` deterministically-failing threads still
+/// exhausts the job budget and dead-letters — but that is a *retriable*
+/// dead-letter over threads that genuinely fail, strictly better than the
+/// pre-fix behavior and categorically better than marking a manifest of good
+/// documents `Failed` over a transient outage. Resolving it fully is not
+/// possible within a fixed retry budget: charging a huge cluster's attempts is
+/// byte-for-byte the same operation as walking an outage, so no in-pass signal
+/// can separate them — the only lever is how large a cluster the pass spends
+/// resources resolving before it concludes "outage" and bails.
 async fn run_content_pass(
     ctx: &WorkerCtx,
     import_id: &str,
@@ -1598,29 +1658,53 @@ async fn run_content_pass(
                         "quip content: thread failed too many times; marked Failed and skipped",
                     );
                 } else {
-                    consecutive_failures += 1;
-                    tracing::warn!(
-                        import_id,
-                        thread = %thread.quip_thread_id,
-                        attempts,
-                        error = %reason,
-                        "quip content: thread failed; will retry it on a later run",
-                    );
                     retry_after_pass.get_or_insert(format!(
                         "thread {} failed ({reason}); attempt {attempts} of {MAX_THREAD_ATTEMPTS}",
                         thread.quip_thread_id,
                     ));
-                    if consecutive_failures >= MAX_CONSECUTIVE_THREAD_FAILURES {
+                    // Only a thread's FIRST-EVER failure arms the breaker. A
+                    // thread we have already seen fail (`attempts > 1`) is
+                    // known-bad and climbing toward its own give-up — it is
+                    // making forward progress, not evidence that the outage is
+                    // spreading — so re-counting it would let a cluster of bad
+                    // threads keep re-tripping the breaker at the same point
+                    // and starve every thread past it of attempts. That is the
+                    // dead-letter this branch was reworked to close: see
+                    // `run_content_pass`'s doc for the arithmetic and the
+                    // outage invariant that survives it.
+                    if attempts == 1 {
+                        consecutive_failures += 1;
                         tracing::warn!(
                             import_id,
-                            consecutive_failures,
-                            "quip content: too many consecutive thread failures; \
-                             treating this as a Quip-wide outage and retrying the job",
+                            thread = %thread.quip_thread_id,
+                            attempts,
+                            error = %reason,
+                            "quip content: thread failed for the first time; will retry it",
                         );
-                        return Err(format!(
-                            "quip content transient error: {consecutive_failures} consecutive \
-                             thread failures (last: {reason})",
-                        ));
+                        if consecutive_failures >= MAX_CONSECUTIVE_THREAD_FAILURES {
+                            tracing::warn!(
+                                import_id,
+                                consecutive_failures,
+                                "quip content: too many first-time thread failures in a row; \
+                                 treating this as a Quip-wide outage and retrying the job",
+                            );
+                            return Err(format!(
+                                "quip content transient error: {consecutive_failures} consecutive \
+                                 first-time thread failures (last: {reason})",
+                            ));
+                        }
+                    } else {
+                        // Known-bad, still under budget: does not arm the
+                        // breaker, but does not disarm it either (leaving
+                        // `consecutive_failures` untouched), so a run of fresh
+                        // failures on either side of it still accumulates.
+                        tracing::warn!(
+                            import_id,
+                            thread = %thread.quip_thread_id,
+                            attempts,
+                            error = %reason,
+                            "quip content: known-bad thread failed again; will retry it",
+                        );
                     }
                 }
             }

@@ -1040,3 +1040,148 @@ async fn consecutive_thread_failures_stop_the_pass_instead_of_condemning_the_man
         "an aborted pass must not claim success",
     );
 }
+
+/// #142 residual: MORE than `MAX_CONSECUTIVE_THREAD_FAILURES` sort-adjacent
+/// deterministically-failing threads must NOT dead-letter the import.
+///
+/// The circuit breaker trips at 5 consecutive failures. The pre-fix breaker
+/// counted *every* failure, so with 6+ adjacent bad threads it re-tripped at
+/// the same offset on every run and returned `Err` before the walk ever
+/// reached the threads past the trip point — those never got a first attempt,
+/// never climbed to `Failed`, and the job dead-lettered with them still
+/// `Pending`. That is #142 in miniature (bounded to N > 5 rather than N > 1,
+/// but the same bug).
+///
+/// The fix counts only a thread's *first* failure toward the breaker, so a
+/// known-bad thread stops re-arming it and the walk advances past the cluster
+/// across runs. Seven adjacent failures (comfortably past the threshold of 5)
+/// must now all reach `Failed` and the import must complete.
+///
+/// Seven, not more, because sort order is lexicographic: t1, t2, t3 … t9 stay
+/// adjacent, but t10 would sort between t1 and t2. Seven is enough to prove
+/// the property (> 5); the resolvable bound is 2× the threshold, documented on
+/// `run_content_pass`.
+#[tokio::test]
+async fn more_than_five_adjacent_deterministic_failures_do_not_dead_letter() {
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    // t3..t9: seven adjacent threads with no `/2/threads/{id}/html` mock, so
+    // each 404s -> Api{404} -> Transient, deterministically, every run.
+    let failing: Vec<String> = (3..=9).map(|i| format!("t{i}")).collect();
+    assert!(
+        failing.len() > MAX_CONSECUTIVE_THREAD_FAILURES,
+        "the fixture must exceed the breaker threshold to exercise the residual",
+    );
+    for t in &failing {
+        seed_extra_thread(&app, &import_id, t).await;
+    }
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    // Panics (naming the dead-letter) if the import doesn't complete inside the
+    // queue's real 4-run budget — which is exactly what the pre-fix breaker
+    // did here.
+    let runs = run_like_the_queue(&ctx, &import_id, "owner1").await;
+    assert!(runs <= QUEUE_RUNS, "must complete within the job budget (took {runs} runs)");
+
+    // Every one of the seven is marked Failed — the pass reached and gave up
+    // on all of them, none left stranded Pending.
+    for t in &failing {
+        let row = thread_row(&app, &import_id, t).await;
+        assert_eq!(
+            row.state,
+            ThreadState::Failed,
+            "{t} must be given up on, not stranded Pending (the dead-letter symptom)",
+        );
+        assert_eq!(row.attempts, 3, "{t} must have exhausted its per-thread budget");
+    }
+
+    // The healthy threads still imported — the whole point of not
+    // dead-lettering.
+    for t in ["t1", "t2"] {
+        assert_eq!(thread_row(&app, &import_id, t).await.state, ThreadState::ContentDone);
+    }
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.phase, 2, "the pass must run to completion");
+    assert_eq!(
+        rec.status,
+        ImportStatus::Succeeded,
+        "a cluster of bad threads must not fail the whole import",
+    );
+}
+
+/// The property the first-attempt-only breaker had to NOT break: a *sustained*
+/// Quip outage — one spanning multiple runs, so the leading threads are
+/// already on attempt 2+ — must still trip the breaker every run and keep the
+/// walk bounded, rather than walking the whole manifest charging attempts.
+///
+/// This is the exact regression the reviewer flagged as the risk of counting
+/// only first failures: if attempt-2+ failures no longer arm the breaker, does
+/// run 2 of an outage still stop early? It does — because a tripping breaker
+/// never lets the walk get ahead of its leading edge, so on run 2 the deep
+/// threads are still on their *first* failure and re-arm it. The known-bad
+/// leading threads don't, but they aren't what an outage's blast radius is
+/// made of; the fresh leading edge is.
+///
+/// Twelve adjacent bad threads (u03..u14, zero-padded so they sort adjacently
+/// and after the fixture's t-threads). Run 1 trips after 5 fresh failures
+/// (u03..u07); run 2's leading five (u03..u07) are now attempt-2 and do NOT
+/// arm the breaker, yet run 2 still trips — on the next five fresh threads
+/// (u08..u12) — leaving u13/u14 untouched. That is containment surviving into
+/// a sustained outage.
+#[tokio::test]
+async fn a_sustained_outage_still_trips_the_breaker_on_the_second_run() {
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    let bad: Vec<String> = (3..=14).map(|i| format!("u{i:02}")).collect(); // u03..u14
+    for t in &bad {
+        seed_extra_thread(&app, &import_id, t).await;
+    }
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    // Run 1: trips on the first five fresh failures.
+    execute_start_quip_import(&ctx, &import_id, "owner1")
+        .await
+        .expect_err("run 1 must trip the breaker");
+    for t in &bad[..MAX_CONSECUTIVE_THREAD_FAILURES] {
+        assert_eq!(thread_row(&app, &import_id, t).await.attempts, 1, "{t} charged in run 1");
+    }
+    assert_eq!(
+        thread_row(&app, &import_id, "u08").await.attempts,
+        0,
+        "run 1 must have stopped before the sixth bad thread",
+    );
+
+    // Run 2: the leading five are now attempt-2 (known-bad, do NOT arm the
+    // breaker), yet the run must STILL trip — on the next five fresh threads.
+    execute_start_quip_import(&ctx, &import_id, "owner1")
+        .await
+        .expect_err("run 2 must still trip during a sustained outage, not walk the whole manifest");
+
+    // The already-charged leading threads advanced (attempt 2), proving they
+    // were re-walked but did not, by themselves, trip the breaker.
+    for t in &bad[..MAX_CONSECUTIVE_THREAD_FAILURES] {
+        assert_eq!(thread_row(&app, &import_id, t).await.attempts, 2, "{t} re-charged in run 2");
+    }
+    // The next five fresh threads got their first attempt and tripped it.
+    for t in &bad[MAX_CONSECUTIVE_THREAD_FAILURES..2 * MAX_CONSECUTIVE_THREAD_FAILURES] {
+        assert_eq!(thread_row(&app, &import_id, t).await.attempts, 1, "{t} first-charged in run 2");
+    }
+    // THE ASSERTION: the walk stayed bounded — the twelfth thread was never
+    // reached in either run, so run 2 did not walk the whole manifest.
+    assert_eq!(
+        thread_row(&app, &import_id, "u14").await.attempts,
+        0,
+        "a sustained outage must not walk the whole manifest — u14 must be untouched",
+    );
+    assert_eq!(
+        hits(&server, "/2/threads/u14/html").await,
+        0,
+        "no Quip call may be spent on threads past the breaking point",
+    );
+}

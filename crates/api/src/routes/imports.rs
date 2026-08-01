@@ -470,12 +470,27 @@ async fn get_status(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    let report = state
-        .import_repo
-        .get_report(&import_id)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .map(project_report);
+    // The report is ADVISORY on the read side too. A corrupt or un-decodable
+    // `REPORT` row — a permanently poisoned counter is a real reachable state,
+    // documented on `ImportRepo::bump_report_counter` — must not 500 the poll
+    // the wizard runs every second: that would take down the read side over
+    // the exact bookkeeping the write side is hardened never to fail an import
+    // over. A failed read degrades to `report: None`, which the wizard already
+    // renders (its pre-report wording), and the rest of the status — status,
+    // phase, progress — returns normally. The error is logged, never
+    // surfaced; it carries no token (`ReportRow` has no token field) and its
+    // text is a DynamoDB decode message, not user or Quip content.
+    let report = match state.import_repo.get_report(&import_id).await {
+        Ok(row) => row.map(project_report),
+        Err(e) => {
+            tracing::warn!(
+                import_id,
+                error = %e,
+                "quip status: report read failed; returning status without a report",
+            );
+            None
+        }
+    };
 
     let stage = match record.phase {
         0 => "scoping",

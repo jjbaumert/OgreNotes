@@ -410,3 +410,66 @@ fn collect_secret_keys(v: &serde_json::Value, out: &mut Vec<String>) {
         _ => {}
     }
 }
+
+/// A corrupt `REPORT` row must degrade the poll to `report: null`, never 500
+/// it. Report writes are advisory by construction on the WRITE side
+/// (`worker_mode::record_report` returns nothing, so a poisoned counter can
+/// never halt an import); this pins the same principle on the READ side, which
+/// used to propagate a decode error as `ApiError::Internal` and 500 every
+/// wizard poll — taking down the read path over the exact bookkeeping the
+/// write path is hardened against.
+///
+/// A permanently poisoned counter is a real reachable state, documented on
+/// `ImportRepo::bump_report_counter`: a `counters` map value that is not a
+/// number fails `report_from_item` on every subsequent read. This seeds
+/// exactly that and asserts the poll still returns 200 with the rest of the
+/// status intact.
+#[tokio::test]
+async fn a_corrupt_report_row_degrades_to_null_rather_than_500ing_the_poll() {
+    common::require_infra!();
+    use aws_sdk_dynamodb::types::AttributeValue;
+
+    let app = common::TestApp::new().await;
+    let (owner_id, owner_token) = app.create_user("owner1@test.com").await;
+    let import_id = seed_scoping_import(&app, &owner_id, &[]).await;
+
+    // Poison the REPORT row: `counters.threads_imported` is a string where the
+    // decoder requires a number, so every `get_report` for this import now
+    // errors. Written straight to DynamoDB — the repo's own writers would
+    // never produce this, which is the point.
+    app.dynamo_client()
+        .put_item()
+        .table_name(&app.table_name)
+        .item("PK", AttributeValue::S(format!("IMPORT#{import_id}")))
+        .item("SK", AttributeValue::S("REPORT".to_string()))
+        .item("owner_id", AttributeValue::S(owner_id.clone()))
+        .item(
+            "counters",
+            AttributeValue::M(std::collections::HashMap::from([(
+                "threads_imported".to_string(),
+                AttributeValue::S("not-a-number".to_string()),
+            )])),
+        )
+        .send()
+        .await
+        .expect("seed a poisoned REPORT row");
+    assert!(
+        app.state.import_repo.get_report(&import_id).await.is_err(),
+        "precondition: the report read genuinely fails for this import",
+    );
+
+    // The poll must still succeed. `get_report_status` asserts 200 internally.
+    let body = get_report_status(&app, &import_id, &owner_token).await;
+
+    assert!(
+        body["report"].is_null(),
+        "a corrupt report must degrade to null, not 500 the poll: {body}",
+    );
+    // The rest of the status is unaffected — the report is advisory, the
+    // status is not.
+    assert_eq!(body["status"], "scoping", "status must still return: {body}");
+    assert_eq!(body["phase"], 0, "phase must still return: {body}");
+    assert!(body["progress"].is_object(), "progress must still return: {body}");
+
+    app.cleanup().await;
+}
