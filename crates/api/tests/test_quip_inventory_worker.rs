@@ -74,9 +74,15 @@ async fn quip_fixture_server() -> MockServer {
     // job (see `test_quip_content_worker.rs` for its own coverage), so an
     // inventory-only fixture is no longer a complete fixture for this job.
     // A trivial body for every thread keeps these tests focused on inventory.
+    // NOTE: `/2/threads/{id}/html` returns a JSON envelope, not bare HTML
+    // (#169) — the content pass now parses it strictly, so the mock must send
+    // the real shape or every content pass in this job fails to read it.
     Mock::given(method("GET"))
         .and(path_regex(r"^/2/threads/.+/html$"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("<p>body</p>"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "html": "<p>body</p>",
+            "response_metadata": { "next_cursor": "" }
+        })))
         .mount(&server)
         .await;
 

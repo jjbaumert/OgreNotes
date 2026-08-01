@@ -23,6 +23,14 @@ const DEFAULT_BASE: &str = "https://platform.quip.com";
 /// same posture as `import_pdf.rs`, given Quip is a fixed trusted host.
 const MAX_BLOB_BYTES: usize = 32 * 1024 * 1024;
 
+/// Upper bound on the number of `/2/threads/{id}/html` pages fetched for a
+/// single document. The v2 HTML endpoint paginates long documents via
+/// `response_metadata.next_cursor`; this cap stops a misbehaving or looping
+/// cursor from spinning forever. Hitting it is surfaced as an error (a
+/// document we cannot fetch in full is a failure, not something to truncate
+/// silently) rather than returning a partial body.
+const MAX_HTML_PAGES: usize = 100;
+
 // ─── Error ─────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +130,26 @@ struct ThreadEnvelope {
     thread: QuipThread,
 }
 
+/// One page of the paginated `GET /2/threads/{id}/html` response. The v2
+/// HTML endpoint returns a JSON envelope, NOT bare HTML: the document body
+/// is the `html` field (serde unescapes it automatically), and long
+/// documents are split across pages driven by `response_metadata.next_cursor`
+/// (see #169 — the previous `text_body()` read returned this whole JSON
+/// wrapper verbatim, so html5ever saw a single escaped text node).
+#[derive(Debug, Deserialize)]
+struct ThreadHtmlPage {
+    #[serde(default)]
+    html: String,
+    #[serde(default)]
+    response_metadata: ResponseMetadata,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ResponseMetadata {
+    #[serde(default)]
+    next_cursor: String,
+}
+
 // ─── Client ────────────────────────────────────────────────────
 
 pub struct QuipClient {
@@ -209,17 +237,58 @@ impl QuipClient {
 
     /// `GET /2/threads/{id}/html` — the section-id-bearing HTML used to
     /// carry over Quip's per-section anchors during import.
+    ///
+    /// The endpoint returns a JSON envelope (`{ "html": "...",
+    /// "response_metadata": { "next_cursor": "..." } }`), not bare HTML, and
+    /// paginates long documents via `next_cursor`. We parse the envelope with
+    /// `json_body()` (the same typed path the sibling methods use — serde
+    /// unescapes the HTML for us; no hand-unescaping) and concatenate each
+    /// page's `html` fragment in order until the cursor is empty. A
+    /// single-page document (empty `next_cursor`, the common case) costs
+    /// exactly one request. See #169.
+    ///
+    /// The next-page cursor is passed as the `cursor` query parameter
+    /// (`GET /2/threads/{id}/html?cursor=<next_cursor>`). NOTE: `cursor` is the
+    /// ASSUMED Quip v2 pagination param name — it was not confirmed against the
+    /// live API reference (the reference page is JS-rendered and could not be
+    /// fetched), and there is no other v2 paginated endpoint in this client to
+    /// corroborate against. If the name is wrong, the failure is loud, not
+    /// silent: the cursor never empties, so the loop runs to `MAX_HTML_PAGES`
+    /// and returns a `Parse` error rather than a truncated document. Single-page
+    /// documents (empty `next_cursor`, the common case) are unaffected either
+    /// way. See #169's report.
     pub async fn thread_html(&self, t: &QuipToken, thread_id: &str) -> Result<String, QuipError> {
-        self.throttle.acquire().await;
+        let mut html = String::new();
+        let mut cursor = String::new();
 
-        let resp = self
-            .http
-            .get(format!("{}/2/threads/{thread_id}/html", self.base))
-            .bearer_auth(t.expose())
-            .send()
-            .await?;
+        for _ in 0..MAX_HTML_PAGES {
+            self.throttle.acquire().await;
 
-        self.observe_and_check(resp).await?.text_body().await
+            let mut req = self
+                .http
+                .get(format!("{}/2/threads/{thread_id}/html", self.base))
+                .bearer_auth(t.expose());
+            if !cursor.is_empty() {
+                req = req.query(&[("cursor", cursor.as_str())]);
+            }
+            let resp = req.send().await?;
+
+            let page: ThreadHtmlPage = self.observe_and_check(resp).await?.json_body().await?;
+            html.push_str(&page.html);
+
+            cursor = page.response_metadata.next_cursor;
+            if cursor.is_empty() {
+                return Ok(html);
+            }
+        }
+
+        // The cursor never emptied within the cap. Truncating silently would
+        // corrupt a long document (the #169 failure mode we are fixing), so
+        // this is a hard error the caller can report/retry on instead.
+        Err(QuipError::Parse(format!(
+            "thread HTML exceeded the {MAX_HTML_PAGES}-page fetch cap; \
+             refusing to return a truncated document"
+        )))
     }
 
     /// `GET /1/blob/{thread_id}/{blob_id}` — raw attachment bytes. Refuses
@@ -371,7 +440,7 @@ fn header_reset_ms(resp: &reqwest::Response, name: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -547,11 +616,17 @@ mod tests {
 
     #[tokio::test]
     async fn thread_html_fetches_the_v2_html_endpoint() {
+        // The real `/2/threads/{id}/html` returns a JSON envelope, not bare
+        // HTML (#169). The mock must serve exactly that shape, and the client
+        // must return the EXTRACTED, unescaped HTML — never the JSON wrapper.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/2/threads/t1/html"))
             .and(header("authorization", "Bearer tok-h"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("<p id=\"s1\">hi</p>"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "html": "<p id=\"s1\">hi</p>",
+                "response_metadata": { "next_cursor": "" }
+            })))
             .mount(&server)
             .await;
         let c = QuipClient::new(Some(server.uri()));
@@ -559,7 +634,69 @@ mod tests {
             .thread_html(&QuipToken::new("tok-h".into()), "t1")
             .await
             .unwrap();
-        assert!(html.contains("id=\"s1\""));
+        // The extracted, unescaped HTML — literally the `html` field's value.
+        assert_eq!(html, "<p id=\"s1\">hi</p>");
+        // And crucially NOT the JSON envelope the pre-#169 code returned.
+        assert!(!html.contains("response_metadata"), "must not return the JSON wrapper: {html}");
+        assert!(!html.contains("\"html\""), "must not return the JSON wrapper: {html}");
+        // A single-page doc (empty next_cursor) costs exactly one request.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "an empty next_cursor must not trigger a second fetch");
+    }
+
+    #[tokio::test]
+    async fn thread_html_paginates_and_concatenates_via_next_cursor() {
+        // A long document is split across pages driven by
+        // `response_metadata.next_cursor` (#169). The first page carries a
+        // non-empty cursor and a partial body; the second (carrying that
+        // cursor as `?cursor=`) has the rest and an empty cursor. The returned
+        // HTML is the two fragments concatenated in order.
+        let server = MockServer::start().await;
+
+        // Page 2 — matched only when the `cursor` query param is present. Must
+        // be mounted at higher priority so it wins over the page-1 matcher.
+        Mock::given(method("GET"))
+            .and(path("/2/threads/t1/html"))
+            .and(query_param("cursor", "CURSOR-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "html": "<p id=\"s2\">world</p>",
+                "response_metadata": { "next_cursor": "" }
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Page 1 — the cursorless first fetch; hands back CURSOR-2.
+        Mock::given(method("GET"))
+            .and(path("/2/threads/t1/html"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "html": "<p id=\"s1\">hello</p>",
+                "response_metadata": { "next_cursor": "CURSOR-2" }
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let c = QuipClient::new(Some(server.uri()));
+        let html = c
+            .thread_html(&QuipToken::new("tok-h".into()), "t1")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            html, "<p id=\"s1\">hello</p><p id=\"s2\">world</p>",
+            "the two page fragments must be concatenated in order"
+        );
+
+        // Two requests total, and the SECOND actually carried the cursor.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "one fetch per page");
+        assert_eq!(requests[0].url.query(), None, "the first fetch is cursorless");
+        assert_eq!(
+            requests[1].url.query(),
+            Some("cursor=CURSOR-2"),
+            "the second fetch must carry the cursor from page 1",
+        );
     }
 
     #[tokio::test]

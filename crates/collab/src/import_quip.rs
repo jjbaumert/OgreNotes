@@ -2062,6 +2062,48 @@ mod tests {
         assert!(!html.contains("a\nb"), "no literal newline leaked into the exported text: {html}");
     }
 
+    /// #169, pinned as a pure unit test: the *extracted* Quip HTML parses to
+    /// clean block structure, whereas the *raw JSON envelope* — what the pre-fix
+    /// client mistakenly returned — imports garbled, with the JSON scaffolding
+    /// (`response_metadata`, `next_cursor`, the `{"html":"` wrapper) leaking in
+    /// as visible document text. This is the exact failure mode the
+    /// `thread_html` JSON-parse fix removes upstream.
+    ///
+    /// NOTE: the raw envelope uses the REAL Quip escaping — JSON escapes `"`
+    /// (to `\"`) and `\`, but NOT `<`/`>`, so the tags stay literal. That means
+    /// html5ever still sees *some* markup (so the result is a garbled multi-node
+    /// mess, not the "single escaped text node" the #169 brief imprecisely
+    /// described) — but it is unmistakably corrupt: the JSON wrapper is now part
+    /// of the document body.
+    #[test]
+    fn extracted_html_yields_clean_blocks_but_the_raw_json_envelope_is_garbled() {
+        let inner_html = "<h1>Creating a New Social Media</h1><p>body</p>";
+        // Exactly how Quip serializes it: literal `<`/`>`, escaped `"`.
+        let raw_envelope = concat!(
+            r#"{"html":"<h1>Creating a New Social Media</h1><p>body</p>","#,
+            r#""response_metadata":{"next_cursor":""}}"#,
+        );
+
+        // The extracted HTML → clean block structure, no JSON scaffolding.
+        let good = from_quip_html(inner_html);
+        let good_txn = good.doc.transact();
+        let good_frag = crate::document::get_content_fragment(&good_txn).expect("fragment");
+        assert_eq!(good_frag.len(&good_txn), 2, "heading + paragraph are two real blocks");
+        let good_html = crate::export::to_html(&good.doc);
+        assert!(
+            !good_html.contains("response_metadata") && !good_html.contains("next_cursor"),
+            "no JSON scaffolding may appear in a clean import: {good_html}",
+        );
+
+        // The raw JSON envelope → garbled: the wrapper leaked into the body.
+        let bad = from_quip_html(raw_envelope);
+        let bad_html = crate::export::to_html(&bad.doc);
+        assert!(
+            bad_html.contains("response_metadata") || bad_html.contains("next_cursor"),
+            "the raw JSON envelope must leak its wrapper into document text — the #169 garbling: {bad_html}",
+        );
+    }
+
     #[test]
     fn every_element_gets_a_block_id() {
         let out = from_quip_html("<p>a</p><h1>b</h1><ul><li>c</li></ul>");
