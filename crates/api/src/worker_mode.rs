@@ -1182,7 +1182,7 @@ const PANIC_REASON: &str = "this document could not be converted (the importer f
 /// an *outcome*, never a cause, and the cause lives in `detail`. Splitting
 /// `image_dropped` into `image_dropped_403` / `image_dropped_too_large` twice
 /// over is all it would take to silently starve the kind whose job is to name
-/// the lost documents. Three kinds here leaves headroom for the passes still
+/// the lost documents. Five kinds here leaves headroom for the passes still
 /// to come (link fallbacks, section-map losses).
 ///
 /// Counters are uncapped in value and bounded only by the number of distinct
@@ -1198,6 +1198,9 @@ pub(crate) mod report {
     pub const KIND_THREAD_FAILED: &str = "thread_failed";
     pub const KIND_IMAGE_DROPPED: &str = "image_dropped";
     pub const KIND_CONTENT_TRUNCATED: &str = "content_truncated";
+    /// One outcome: mentions in this import lost their link. `detail` names
+    /// the cause, per the "kind names an outcome, never a cause" rule above.
+    pub const KIND_MENTIONS_DEGRADED: &str = "mentions_degraded";
 
     pub const THREADS_IMPORTED: &str = "threads_imported";
     pub const THREADS_SKIPPED_CHAT: &str = "threads_skipped_chat";
@@ -1206,6 +1209,10 @@ pub(crate) mod report {
     pub const IMAGES_DROPPED: &str = "images_dropped";
     pub const THREADS_TRUNCATED: &str = "threads_deep_nesting_truncated";
     pub const FOLDERS_FORBIDDEN: &str = "folders_forbidden";
+    /// Threads in which at least one person mention lost its link and became
+    /// plain text. Counts *documents*, like the other `THREADS_*` keys, so a
+    /// chatty document cannot dominate the number.
+    pub const THREADS_MENTIONS_DEGRADED: &str = "threads_mentions_degraded";
 }
 
 /// Write one outcome to the import's `REPORT` row.
@@ -1380,22 +1387,35 @@ pub struct PersonDirectory {
     /// Decided answers only. Absent = not yet known, or a lookup failed and
     /// so stays retryable.
     known: std::collections::HashMap<String, PersonFact>,
-    /// Set once `/1/users/` has answered with a **permanent** 4xx — a wrong
-    /// endpoint shape, not an outage. Re-asking cannot change that answer, so
-    /// the whole run stops asking: without this the doomed request is
+    /// Set once `/1/users/` has answered in a way no retry can change. The
+    /// whole run then stops asking: without this the doomed request is
     /// re-issued once per mention-bearing thread, and on a 1 000-thread
     /// import that is 1 000 calls against the 50 requests/minute budget the
     /// batching exists to protect.
     endpoint_dead: bool,
+    /// How many chunks have come back with a **request-shaped** 4xx
+    /// (400/422 — "I understood you and the request is wrong").
+    ///
+    /// Deliberately not fatal on the first one. A 400 on a batch is
+    /// ambiguous: it can mean the `?ids=` shape is wrong, or that *one*
+    /// malformed id in a chunk of fifty poisoned the request. Killing the
+    /// endpoint on the first 400 would let a single bad id silently degrade
+    /// every mention in the import. So a request-shaped 4xx decides only its
+    /// own chunk, and only a run of [`MAX_PERMANENT_CHUNK_FAILURES`] of them
+    /// is taken as evidence about the endpoint itself. A *path*-shaped 4xx
+    /// (404/405/501) is unambiguous — no id in a query string can cause it —
+    /// and kills the endpoint immediately.
+    permanent_chunk_failures: usize,
 }
 
-/// What [`PersonDirectory::resolve`] learned about the ids it was asked for.
+/// Request-shaped 4xx responses tolerated before the person-lookup endpoint
+/// is presumed wrong rather than the ids being wrong.
 ///
-/// The split matters because the two outcomes have opposite dispositions:
-/// a person we *decided* has no OgreNotes account degrades permanently and
-/// silently (correct — no retry widens that), while a person we *failed* to
-/// decide must not be checkpointed, or the thread is permanently and
-/// invisibly degraded by a blip. See [`import_one_thread`] step 6b.
+/// Bounds the waste at three doomed requests per run while keeping one bad
+/// id from mass-degrading an import. See
+/// [`PersonDirectory::permanent_chunk_failures`].
+const MAX_PERMANENT_CHUNK_FAILURES: usize = 3;
+
 /// One decided answer about a Quip person id.
 ///
 /// The `NotAPerson` case exists because `<control>` is not exclusive to
@@ -1426,13 +1446,66 @@ impl From<&PersonFact> for ogrenotes_collab::import_quip::PersonOutcome {
     }
 }
 
+/// What [`PersonDirectory::resolve`] learned about the ids it was asked for.
 struct PersonResolution {
     /// Every id the caller asked about that reached a decision.
     decided: std::collections::HashMap<String, ogrenotes_collab::import_quip::PersonOutcome>,
-    /// How many of the requested ids reached no decision at all, because a
-    /// lookup *failed*. A permanent endpoint 4xx is a decision (there is
-    /// nothing left to learn), so it does not count here.
-    undecided: usize,
+    /// The disposition for ids that reached no decision, or `None` when
+    /// every id was decided.
+    ///
+    /// A decided negative degrades permanently and silently (correct — no
+    /// retry widens it). A *failure* must not be checkpointed, or the thread
+    /// is permanently and invisibly degraded by a blip — but **which**
+    /// failure it was decides who pays. See [`LookupFault`].
+    fault: Option<LookupFault>,
+    /// True only on the call that concluded the endpoint is unusable, so the
+    /// caller writes the durable report note exactly once per run.
+    endpoint_just_died: bool,
+}
+
+/// Why some ids reached no decision — and therefore who is charged for it.
+///
+/// This mirrors the dispositions [`ThreadImportError`] already documents
+/// rather than inventing a parallel policy: throttling is never one thread's
+/// fault, a dead credential is run-terminal, and a storage blip must not be
+/// allowed to condemn an innocent thread to `Failed`. Ordered by severity so
+/// a mixed batch reports the disposition that protects the most.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum LookupFault {
+    /// Quip could not answer (5xx, timeout, unreadable body). Attributable
+    /// to the attempt, so the thread's own retry budget applies.
+    Quip,
+    /// The **identity store** could not answer. Not attributable to this
+    /// thread at all: charging it would let a DynamoDB blip spend a good
+    /// document's three attempts and mark it `Failed`. Aborts the pass so
+    /// the queue retries the job, exactly as a `put secmap` failure does.
+    Storage,
+    /// Quip is throttling. Never one thread's fault, and walking to the next
+    /// thread would only spend more of the same exhausted budget.
+    RateLimited,
+    /// The credential is dead. Run-terminal.
+    TokenRejected,
+}
+
+impl LookupFault {
+    /// The disposition this fault carries, per the policy on
+    /// [`ThreadImportError`]'s variants.
+    fn into_thread_error(self) -> ThreadImportError {
+        match self {
+            Self::Quip => ThreadImportError::transient("person lookup failed"),
+            // `RunFailure`, not `Transient`: never charged to the thread, and
+            // its payload never reaches durable state, so a storage error's
+            // text — which is built from an *email* lookup key — cannot leak
+            // into a `reason` or a `ReportNote`.
+            Self::Storage => {
+                ThreadImportError::RunFailure("person lookup: identity store unavailable".into())
+            }
+            Self::RateLimited => {
+                ThreadImportError::RunFailure("person lookup: quip rate limited".into())
+            }
+            Self::TokenRejected => ThreadImportError::TokenRejected,
+        }
+    }
 }
 
 impl PersonDirectory {
@@ -1478,15 +1551,20 @@ impl PersonDirectory {
                 .collect()
         };
 
+        let mut fault: Option<LookupFault> = None;
+        let mut endpoint_just_died = false;
+
         for chunk in missing.chunks(USER_LOOKUP_BATCH) {
             if self.endpoint_dead {
-                // Asked once this run, answered permanently. Degrade the rest
-                // for free rather than re-buying the same 4xx per thread.
+                // Already answered unusably this run. Degrade the rest for
+                // free rather than re-buying the same 4xx per thread.
                 //
                 // `NoAccount`, not `NotAPerson`: with the endpoint down we
                 // learned nothing about *which* of the two an id is, and
                 // plain `@Name` text is the answer that is never actively
-                // wrong. Calling a real colleague a missing document is.
+                // wrong. Calling a real colleague a missing document is —
+                // and a `DocMention` would additionally persist that
+                // person's Quip id into the stored document.
                 for id in chunk {
                     self.known.insert(id.clone(), PersonFact::NoAccount);
                 }
@@ -1494,29 +1572,61 @@ impl PersonDirectory {
             }
             let profiles = match client.users(token, chunk).await {
                 Ok(profiles) => profiles,
-                Err(e) if is_permanent_lookup_failure(&e) => {
-                    // The endpoint itself is wrong (a 404/400 on `?ids=`),
-                    // not unavailable. Decide the chunk negative, stop
-                    // asking, and let every mention degrade to a name once.
-                    self.endpoint_dead = true;
+                // 403: the token may not read these profiles. The 403
+                // doctrine this worker already applies is "no retry could
+                // widen the user's Quip permissions", so decide them — but
+                // as `NoAccount`, never as a thread skip. The *document* is
+                // readable; losing it over an invisible profile would be a
+                // far worse trade than a name in plain text.
+                Err(QuipError::Forbidden) => {
                     for id in chunk {
                         self.known.insert(id.clone(), PersonFact::NoAccount);
+                    }
+                    tracing::warn!(
+                        import_id,
+                        people = chunk.len(),
+                        "quip content: the token may not read these profiles; \
+                         they degrade to names",
+                    );
+                    continue;
+                }
+                Err(e) if is_permanent_lookup_failure(&e) => {
+                    // Whatever else is true, this chunk will never be
+                    // answered. Decide it so the mentions degrade once.
+                    for id in chunk {
+                        self.known.insert(id.clone(), PersonFact::NoAccount);
+                    }
+                    self.permanent_chunk_failures += 1;
+                    // A path-shaped 4xx indicts the endpoint immediately; a
+                    // request-shaped one only after it has happened enough
+                    // times to rule out "one malformed id in the batch".
+                    if is_endpoint_shape_failure(&e)
+                        || self.permanent_chunk_failures >= MAX_PERMANENT_CHUNK_FAILURES
+                    {
+                        self.endpoint_dead = true;
+                        endpoint_just_died = true;
                     }
                     // Class only, never the error's own text — `QuipError`
                     // carries Quip's raw body and reqwest's URL.
                     tracing::warn!(
                         import_id,
                         people = chunk.len(),
+                        endpoint_dead = self.endpoint_dead,
                         error = %safe_quip_reason(&e),
-                        "quip content: the person-lookup endpoint answered permanently; \
-                         every mention in this import degrades to a name and no further \
-                         lookup will be attempted",
+                        "quip content: the person-lookup endpoint rejected a batch permanently; \
+                         these mentions degrade to names",
                     );
                     continue;
                 }
                 Err(e) => {
-                    // Left *uncached*: undecided, so the caller retries the
-                    // thread rather than checkpointing a recoverable loss.
+                    // Left *uncached*: undecided, so the caller retries
+                    // rather than checkpointing a recoverable loss. The
+                    // fault class decides who pays for that retry.
+                    fault = fault.max(Some(match e {
+                        QuipError::Unauthorized => LookupFault::TokenRejected,
+                        QuipError::RateLimited { .. } => LookupFault::RateLimited,
+                        _ => LookupFault::Quip,
+                    }));
                     tracing::warn!(
                         import_id,
                         people = chunk.len(),
@@ -1558,12 +1668,16 @@ impl PersonDirectory {
                     // Deliberately logged WITHOUT the error's text: the
                     // lookup key is an email address, and a DynamoDB error
                     // message is not something this code can prove is free
-                    // of it. Left uncached — this one is genuinely transient.
-                    Err(_) => tracing::warn!(
-                        import_id,
-                        "quip content: identity lookup failed for a mention; \
-                         the thread stays retryable",
-                    ),
+                    // of it. Left uncached, and charged to the *run* rather
+                    // than to this thread — see [`LookupFault::Storage`].
+                    Err(_) => {
+                        fault = fault.max(Some(LookupFault::Storage));
+                        tracing::warn!(
+                            import_id,
+                            "quip content: identity lookup failed for a mention; \
+                             not charged to the thread",
+                        );
+                    }
                 }
             }
         }
@@ -1573,22 +1687,33 @@ impl PersonDirectory {
                 .iter()
                 .filter_map(|id| Some((id.clone(), self.known.get(id)?.into())))
                 .collect(),
-            // Anything still absent from the cache reached no decision.
-            undecided: wanted.iter().filter(|id| !self.known.contains_key(*id)).count(),
+            // A fault only matters if it actually cost us an answer: an id
+            // decided by an earlier call is not owed a retry.
+            fault: fault.filter(|_| wanted.iter().any(|id| !self.known.contains_key(id))),
+            endpoint_just_died,
         }
     }
 }
 
 /// Whether a `/1/users/` failure is one no retry can fix.
 ///
-/// A 4xx other than 429 means Quip understood the request and rejected it —
-/// on this endpoint that is overwhelmingly "the `?ids=` batch shape is wrong",
-/// which is an *assumption* this client documents openly. 401 and 403 are
-/// deliberately excluded: they arrive as their own [`QuipError`] variants and
-/// describe the credential, not the URL, so they stay retryable (and the run
-/// halts on the next `thread_html` anyway).
+/// A 4xx other than 429 means Quip understood the request and rejected it.
+/// 401 and 403 are deliberately excluded: they arrive as their own
+/// [`QuipError`] variants and describe the credential, not the request.
 fn is_permanent_lookup_failure(e: &QuipError) -> bool {
     matches!(e, QuipError::Api { status, .. } if (400..500).contains(status) && *status != 429)
+}
+
+/// Whether a permanent failure indicts the **endpoint** rather than the ids.
+///
+/// 404/405/501 are answers about the path and the method: no value in a
+/// query string can produce them, so one of these settles the `?ids=` batch
+/// shape — an *assumption* this client documents openly — on the spot. A
+/// 400/422 cannot be attributed that way, because a single malformed id in a
+/// batch of fifty produces the same status; those are counted instead, and
+/// only [`MAX_PERMANENT_CHUNK_FAILURES`] of them indict the endpoint.
+fn is_endpoint_shape_failure(e: &QuipError) -> bool {
+    matches!(e, QuipError::Api { status, .. } if matches!(status, 404 | 405 | 501))
 }
 
 /// Where an imported thread's document is filed.
@@ -2155,6 +2280,28 @@ pub async fn import_one_thread(
         let wanted: Vec<String> =
             quip_doc.person_mentions.iter().map(|m| m.quip_user_id.clone()).collect();
         let outcome = people.resolve(ctx, import_id, client, token, &wanted).await;
+        // The lookup endpoint just proved unusable for the whole run. Say so
+        // once, durably — a `tracing::warn!` is invisible to the person who
+        // ran the import, and this degrades every mention in every remaining
+        // document. Written before the bail below so it lands even if the
+        // same call also produced a fault.
+        if outcome.endpoint_just_died {
+            record_report(
+                ctx,
+                import_id,
+                owner_id,
+                report::THREADS_MENTIONS_DEGRADED,
+                Some(ReportNote {
+                    quip_thread_id: thread.quip_thread_id.clone(),
+                    kind: report::KIND_MENTIONS_DEGRADED.to_string(),
+                    detail: "the Quip person-lookup endpoint rejected this import's requests; \
+                             @mentions from here on are imported as plain text names rather \
+                             than links, in this and every remaining document"
+                        .to_string(),
+                }),
+            )
+            .await;
+        }
         // A person we could not even *decide* about must not be checkpointed.
         // Step 10 marks the thread `ContentDone` unconditionally and a re-run
         // skips a `ContentDone` thread with zero Quip calls, so a Quip 5xx or
@@ -2166,16 +2313,16 @@ pub async fn import_one_thread(
         // *without* an account is a decision, not a failure, and does not
         // come through here — it degrades permanently and silently, which is
         // correct.
-        if outcome.undecided > 0 {
+        if let Some(fault) = outcome.fault {
             tracing::warn!(
                 import_id,
                 thread = %thread.quip_thread_id,
                 mentions = mention_count,
-                undecided = outcome.undecided,
-                "quip content: person lookup undecided; retrying the thread rather than \
-                 checkpointing it with unrecoverable placeholders",
+                fault = ?fault,
+                "quip content: person lookup undecided; retrying rather than checkpointing \
+                 the thread with unrecoverable placeholders",
             );
-            return Err(ThreadImportError::transient("person lookup failed"));
+            return Err(fault.into_thread_error());
         }
         let rewritten = ogrenotes_collab::import_quip::resolve_person_mentions(
             &quip_doc.doc,
@@ -2187,6 +2334,15 @@ pub async fn import_one_thread(
         // or Phase 2b will never see it.
         let doc_links = rewritten.doc_links.len();
         quip_doc.pending_links.extend(rewritten.doc_links);
+        // Every mention that lost its link is a named loss in the user's
+        // report, exactly as a dropped image is. Counted per *document* so a
+        // chatty one cannot dominate; the systemic cause, when there is one,
+        // is the note written above.
+        // `!endpoint_just_died` because the note written above already bumped
+        // this counter for this thread, and the counter counts documents.
+        if rewritten.degraded > 0 && !outcome.endpoint_just_died {
+            record_report(ctx, import_id, owner_id, report::THREADS_MENTIONS_DEGRADED, None).await;
+        }
         // Counts only. A mention's *subject* — their name, and above all
         // the email the match was made on — is not something this worker
         // writes to a log or to any durable row.

@@ -1708,6 +1708,70 @@ async fn a_control_wrapped_non_person_stays_a_back_patchable_document_link() {
     assert!(!html.contains(QUIP_PERSON_ID), "no Quip person id survives: {html}");
 }
 
+/// A repeated **storage** failure in the identity lookup must never mark the
+/// thread `Failed`.
+///
+/// The dispositions on `ThreadImportError` are explicit that a DynamoDB or S3
+/// failure is "not attributable to this thread at all", and deliberately not
+/// charged to the thread's attempt budget, "which would otherwise let a
+/// storage blip condemn an innocent thread". Routing every undecided lookup
+/// to a thread-charged `Transient` would break exactly that: `MAX_THREAD_ATTEMPTS`
+/// runs of a DynamoDB outage would mark a perfectly good document `Failed`
+/// and lose it, over something that was never about the document.
+///
+/// The `UserRepo` here points at a table that does not exist, so every
+/// `get_by_email` errors — the shape of a real outage, held for longer than
+/// the thread's whole budget.
+///
+/// Mutation check: map `LookupFault::Storage` to `transient(...)` and this
+/// goes red — attempts climb and the thread ends `Failed`.
+#[tokio::test]
+async fn a_repeated_identity_store_failure_never_marks_the_thread_failed() {
+    common::require_infra!();
+    let server = quip_mention_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    app.create_user(QUIP_PERSON_EMAIL).await;
+    let import_id = seed_mention_import(&app, "owner1").await;
+
+    // A UserRepo bound to a table that does not exist: every read errors.
+    let broken_users = std::sync::Arc::new(ogrenotes_storage::repo::user_repo::UserRepo::new(
+        ogrenotes_storage::dynamo::DynamoClient::new(
+            app.dynamo_client().clone(),
+            "ogrenotes-no-such-table".to_string(),
+        ),
+    ));
+    let ctx = WorkerCtx::new(
+        app.state.doc_repo.clone(),
+        app.state.folder_repo.clone(),
+        app.state.doc_repo.s3().clone(),
+        app.state.import_repo.clone(),
+        broken_users,
+        app.state.quip_token_store.clone(),
+        Some(server.uri()),
+    );
+
+    // Run the pass more times than the thread's own attempt budget.
+    // Deliberately no per-iteration assertion: the state after the outage is
+    // what matters, and asserting it last keeps the failure message pointed
+    // at the property rather than at an intermediate.
+    let mut last_failed = false;
+    for _ in 0..5 {
+        last_failed = execute_start_quip_import(&ctx, &import_id, "owner1").await.is_err();
+    }
+
+    let threads = app.state.import_repo.list_threads(&import_id).await.unwrap();
+    let tm = threads.iter().find(|t| t.quip_thread_id == "tm").unwrap();
+    assert_ne!(
+        tm.state,
+        ThreadState::Failed,
+        "a storage outage must never condemn a thread (attempts={})",
+        tm.attempts,
+    );
+    assert_eq!(tm.state, ThreadState::Pending, "it stays retryable");
+    assert_eq!(tm.attempts, 0, "and is not charged a single attempt");
+    assert!(last_failed, "the job keeps failing so the queue keeps retrying it");
+}
+
 /// A **transient** person-lookup failure must not be checkpointed.
 ///
 /// Step 10 marks a thread `ContentDone` unconditionally and a re-run skips a
@@ -1854,6 +1918,33 @@ async fn a_permanently_wrong_user_endpoint_is_asked_once_per_run_not_once_per_th
         assert!(html.contains("@Ann") && html.contains("@Bob"), "degraded to names: {html}");
         assert!(!html.contains("class=\"mention\""), "{html}");
     }
+
+    // And the loss is DISCOVERABLE. A run-wide degradation behind a
+    // `tracing::warn!` alone is invisible to the person who ran the import —
+    // the same undiscoverability that makes a silent `ContentDone`
+    // checkpoint wrong. It must reach the report the user reads.
+    let report = app.state.import_repo.get_report(&import_id).await.unwrap().expect("a report");
+    assert!(
+        report.counters.get("threads_mentions_degraded").copied().unwrap_or(0) > 0,
+        "the degraded mentions must be counted: {:?}",
+        report.counters,
+    );
+    let note = report
+        .notes
+        .iter()
+        .find(|n| n.kind == "mentions_degraded")
+        .expect("a note naming the systemic cause");
+    assert!(
+        note.detail.contains("plain text"),
+        "the note must say what the user actually lost: {:?}",
+        note.detail,
+    );
+    assert_eq!(
+        report.notes.iter().filter(|n| n.kind == "mentions_degraded").count(),
+        1,
+        "the run-wide cause is named once, not once per thread",
+    );
+
     let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
     assert_eq!(rec.status, ImportStatus::Succeeded, "the import still succeeds");
 }

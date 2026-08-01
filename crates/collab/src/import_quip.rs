@@ -1844,6 +1844,17 @@ pub enum PersonOutcome {
     NoAccount,
     /// Quip returned no profile for the id — it is a folder or a thread that
     /// happened to be wrapped in `<control>`.
+    ///
+    /// **KNOWN GAP (ticketed).** "Quip showed us no profile" is not only
+    /// true of non-people: a **deactivated, cross-org, or token-invisible
+    /// person** is omitted the same way, and lands here — becoming a
+    /// missing-document chip titled with their name, which is the literal
+    /// symptom #175 exists to fix. The two are separable with one extra
+    /// batched request per run: ask `/1/threads/?ids=` about the omitted
+    /// ids; an id that *is* a thread is a document, and an id that is
+    /// neither a user nor a thread is an invisible person and should degrade
+    /// to plain text. Deliberately not done on this branch — it is new API
+    /// surface, and shipping the verified part first was the call.
     NotAPerson,
 }
 
@@ -2923,6 +2934,32 @@ mod tests {
         let exported = crate::export::to_html(&out.doc);
         assert!(exported.contains("data-user-id=\"ogre-user-7\""), "{exported}");
         assert!(!exported.contains("XYJAEA0Sgev"), "the Quip id must not survive: {exported}");
+
+        // At BYTE level, not just in the export. `render_html_attrs` is a
+        // per-node-type allowlist, so an attribute the schema does not know
+        // is invisible to every HTML-level assertion above while still being
+        // written into the snapshot — and both pending attributes carry the
+        // Quip person id. These are the assertions that make deleting either
+        // `remove_attribute` on the matched path go red.
+        //
+        // Asserted on the attribute **values**, not the key names. A removed
+        // attribute's *content* is garbage-collected out of the encoded
+        // update, but its key string stays interned in the update's key
+        // table for as long as the element lives — so `pending_quip_user`
+        // itself is still greppable here, and always will be. That name is a
+        // compile-time constant carrying nothing about anyone; the id and the
+        // url are the payload, and they are what must not survive.
+        let bytes = crate::snapshot::doc_to_bytes(&out.doc);
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(
+            !raw.contains("XYJAEA0Sgev"),
+            "the Quip person id must not reach the snapshot — it rides on BOTH \
+             pending attributes, so either removal going missing shows up here",
+        );
+        assert!(
+            !raw.contains("quip.com"),
+            "the Quip url must not reach the snapshot (pending_quip_url not removed?)",
+        );
     }
 
     /// No matching OgreNotes account: the chip degrades to the person's
@@ -3110,6 +3147,14 @@ mod tests {
         assert!(!html.contains("EMPTYONE") && !html.contains("SECOND"), "{html}");
         let bytes = crate::snapshot::doc_to_bytes(&out.doc);
         let raw = String::from_utf8_lossy(&bytes);
+        assert!(
+            !raw.contains("EMPTYONE") && !raw.contains("SECOND") && !raw.contains("quip.com"),
+            "no Quip identifier may reach the snapshot",
+        );
+        // Here the whole element is deleted, so even the interned attribute
+        // key goes with it — unlike the matched branch, where the element
+        // survives and its removed keys stay in the update's key table. See
+        // `resolve_person_mentions_finishes_a_matched_chip`.
         assert!(
             !raw.contains(PENDING_QUIP_USER_ATTR) && !raw.contains(PENDING_QUIP_URL_ATTR),
             "no transient attribute may reach the snapshot",
