@@ -2335,6 +2335,87 @@ async fn test_link_settings_patch_on_trashed_doc_rejected() {
 
 // ─── Import endpoint ───────────────────────────────────────────
 
+/// #158 regression — deeply-nested HTML through `POST /documents/import`
+/// must return a response instead of killing the process.
+///
+/// `format: "html"` routes straight into `ogrenotes_collab::import::from_html`,
+/// whose walker recursed once per DOM level and exhausted the 2 MiB stack a
+/// tokio worker thread gets at ~3 000 levels (2 400 still parsed). Stack
+/// exhaustion **aborts** — it is not a panic, so neither the panic handler
+/// nor any `catch_unwind` could contain it, and the abort took down every
+/// in-flight request and open WebSocket on the API task with it. Auth is a
+/// plain `AuthUser`, the body needed is ~30 KB against a 10 MiB limit, and
+/// one request sufficed, so the rate limiter was no mitigation either.
+///
+/// The unit tests in `crates/collab` pin the cap; this one pins the
+/// *exposure* — that the endpoint as wired is no longer a remote kill switch.
+/// If it regresses, the whole test binary dies rather than this assertion
+/// failing, which is exactly why the cheap, clean-failing coverage lives
+/// beside the parser and only the reported shape lives here.
+#[tokio::test]
+async fn test_import_deeply_nested_html_does_not_kill_the_process() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("alice@test.com").await;
+
+    // 4 000 levels — past the measured abort threshold, ~30 KB on the wire.
+    let depth = 4_000;
+    let content = format!(
+        "<p>top</p>{}deep-content{}",
+        "<div>".repeat(depth),
+        "</div>".repeat(depth),
+    );
+
+    let (status, json) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/documents/import",
+            Some(&token),
+            Some(serde_json::json!({
+                "format": "html",
+                "title": "Deeply nested",
+                "content": content,
+            })),
+        )
+        .await;
+    assert_eq!(status, 201, "deeply-nested HTML import should succeed: {json}");
+    let doc_id = json["id"].as_str().expect("import returns doc id").to_string();
+
+    // The process is still serving: a follow-up request on the same task
+    // answers normally. (An abort would have taken the test binary with it
+    // long before this line.)
+    let (status, _json) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/documents/{doc_id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "the API must still be answering after the import");
+
+    // Failing soft: the over-deep nesting is flattened, but the text on both
+    // sides of the cap survives into the document.
+    let (status, bytes) = app
+        .bytes_request(
+            Method::GET,
+            &format!("/api/v1/documents/{doc_id}/export/markdown"),
+            Some(&token),
+            Vec::new(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 200);
+    let text = String::from_utf8(bytes).expect("markdown export is utf-8");
+    assert!(text.contains("top"), "content above the cap missing: {text:?}");
+    assert!(
+        text.contains("deep-content"),
+        "content below the cap must survive the flattening: {text:?}",
+    );
+
+    app.cleanup().await;
+}
+
 #[tokio::test]
 async fn test_import_csv_happy_path() {
     common::require_infra!();
