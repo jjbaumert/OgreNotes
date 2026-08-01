@@ -234,6 +234,59 @@ fn slide_to_node(slide: &DeckSlide) -> Node {
     Node::element_with_attrs(NodeType::Slide, attrs, Fragment::from(frames))
 }
 
+/// Replace the content of the frame identified by `frame_id` with
+/// `content`, searching every slide (frame `block_id`s are unique
+/// across the whole deck, never just within one slide). Returns
+/// whether a matching frame was found; `false` is a no-op — e.g. a
+/// stale `block_id` captured by an in-flight frame-edit whose frame
+/// was deleted (locally or by a concurrent remote peer) before the
+/// edit's `on_state_change` fired.
+pub fn replace_frame_content(deck: &mut Deck, frame_id: &str, content: Fragment) -> bool {
+    for slide in deck.slides.iter_mut() {
+        if let Some(frame) = slide.frames.iter_mut().find(|f| f.block_id == frame_id) {
+            frame.content = content;
+            return true;
+        }
+    }
+    false
+}
+
+/// Merge an incoming remote `Deck` (freshly decoded from the doc the
+/// resync Effect just observed) with the locally-held `Deck`, while a
+/// frame-text editor may be open. Every field of `remote` wins over
+/// `local` — this *is* the remote sync — with one carve-out: if
+/// `editing` names a frame currently being edited in the embedded
+/// editor, that frame's `content` is taken from `local` instead, so a
+/// concurrent remote edit never overwrites keystrokes the embedded
+/// editor hasn't persisted yet. This mirrors `persist_origin`'s
+/// purpose (don't let sync clobber an in-flight local write) but
+/// scoped to a single frame's content rather than the whole deck:
+/// the edited frame's rect/z/role and every other frame's every field
+/// still take the remote value, since only the *content* actually has
+/// an editor mid-keystroke. Last write wins on the edited frame once
+/// editing ends (`editing_frame` back to `None`), the same way
+/// `SpreadsheetView`'s cell editor resolves a concurrent edit to the
+/// same cell.
+///
+/// If `editing` is `None`, or the named frame no longer exists in
+/// `local` (its content has nothing to preserve), `remote` passes
+/// through unchanged.
+pub fn merge_remote_deck(local: &Deck, mut remote: Deck, editing: Option<&str>) -> Deck {
+    let Some(editing_id) = editing else { return remote };
+    let Some(local_content) =
+        local.slides.iter().flat_map(|s| s.frames.iter()).find(|f| f.block_id == editing_id).map(|f| f.content.clone())
+    else {
+        return remote;
+    };
+    for slide in remote.slides.iter_mut() {
+        if let Some(frame) = slide.frames.iter_mut().find(|f| f.block_id == editing_id) {
+            frame.content = local_content;
+            break;
+        }
+    }
+    remote
+}
+
 fn frame_to_node(frame: &DeckFrame) -> Node {
     let mut attrs = HashMap::new();
     attrs.insert("blockId".to_string(), frame.block_id.clone());
@@ -375,6 +428,56 @@ mod tests {
         assert_eq!(garbage_frame.rect, Rect { x: 0.0, y: 0.0, w: 1.0, h: MIN_FRAME_DIM });
         assert_eq!(garbage_frame.z, 0);
         assert_eq!(garbage_frame.role, FrameRole::Content);
+    }
+
+    fn simple_slide_with_frame() -> DeckSlide {
+        DeckSlide {
+            block_id: generate_block_id(),
+            layout: "blank".to_string(),
+            background: None,
+            frames: vec![DeckFrame {
+                block_id: generate_block_id(),
+                rect: Rect::clamped(0.0, 0.0, 1.0, 1.0),
+                z: 0,
+                role: FrameRole::Content,
+                content: Fragment::empty(),
+            }],
+        }
+    }
+
+    fn fixture_deck_two_slides() -> Deck {
+        Deck {
+            theme: DEFAULT_THEME.to_string(),
+            slide_size: "16:9".to_string(),
+            slides: vec![simple_slide_with_frame(), simple_slide_with_frame()],
+        }
+    }
+
+    #[test]
+    fn replace_frame_content_swaps_only_that_frame() {
+        let mut deck = fixture_deck_two_slides();
+        let target = deck.slides[1].frames[0].block_id.clone();
+        let new_content = Fragment::from(vec![Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("edited")]),
+        )]);
+        assert!(replace_frame_content(&mut deck, &target, new_content.clone()));
+        assert_eq!(deck.slides[1].frames[0].content, new_content);
+        assert_ne!(deck.slides[0].frames[0].content, new_content);
+        assert!(!replace_frame_content(&mut deck, "missing-id", Fragment::empty()));
+    }
+
+    #[test]
+    fn resync_from_doc_preserves_edited_frame() {
+        // merge_remote_deck(local, remote, editing: Some(frame_id)) keeps the
+        // local content of the edited frame but adopts remote everything-else.
+        let local = fixture_deck_two_slides();
+        let mut remote = local.clone();
+        remote.slides[0].frames[0].rect = Rect::clamped(0.5, 0.5, 0.4, 0.3);
+        let editing = local.slides[1].frames[0].block_id.clone();
+        let merged = merge_remote_deck(&local, remote.clone(), Some(&editing));
+        assert_eq!(merged.slides[0].frames[0].rect, remote.slides[0].frames[0].rect);
+        assert_eq!(merged.slides[1].frames[0].content, local.slides[1].frames[0].content);
     }
 
     #[test]

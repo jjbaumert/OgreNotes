@@ -27,10 +27,25 @@ use wasm_bindgen::JsCast;
 
 use crate::editor::model::{generate_block_id, Fragment, Node, NodeType};
 use crate::editor::state::EditorState;
+use crate::editor::yrs_bridge::doc_to_ydoc_bytes;
 use crate::presentation::geometry::{self, Axis, Corner, DragKind, Guide};
-use crate::presentation::model::{deck_from_doc, deck_to_doc, Deck, DeckFrame, DeckSlide, FrameRole, Rect};
+use crate::presentation::model::{
+    deck_from_doc, deck_to_doc, merge_remote_deck, replace_frame_content, Deck, DeckFrame, DeckSlide, FrameRole, Rect,
+};
 use crate::presentation::presets::{instantiate, LayoutPreset, LAYOUT_PRESETS};
 use crate::presentation::themes::{theme_class, DECK_THEMES};
+
+use super::editor_component::{EditorComponent, EditorProps};
+use super::toolbar::ToolbarCommand;
+
+/// DOM attribute carrying a frame's `block_id`, set on every
+/// `.deck-frame` div. Two independent mechanisms key off it: the
+/// global outside-click listener (below) walks up from
+/// `ev.target()` via `.closest("[data-deck-frame-block-id]")` to
+/// decide whether a pointerdown landed inside the frame currently
+/// being edited, and it doubles as a stable per-frame DOM hook for
+/// any future test/automation selector.
+const FRAME_BLOCK_ID_ATTR: &str = "data-deck-frame-block-id";
 
 /// Snap-attraction distance in normalized (0..1) slide fractions —
 /// how close a frame edge/center has to get to a guide line before
@@ -363,6 +378,16 @@ pub fn DeckView(
     });
     let (active_slide, set_active_slide) = signal(0usize);
     let (selected_frame, set_selected_frame) = signal::<Option<String>>(None);
+    // Task 11 — the frame currently mounting a scoped `EditorComponent`
+    // for in-place text editing, `None` when every frame renders
+    // read-only. At most one frame can ever match, since `block_id`s
+    // are unique across the whole deck (`generate_block_id()`), so no
+    // path can mount two editors at once. Entry points (double-click,
+    // Enter on a selected frame) both no-op under `readonly`. Exit
+    // points: Escape, a pointerdown outside the editing frame (the
+    // window-level listener below), a slide switch, or the frame
+    // itself vanishing from a remote update (the resync Effect).
+    let (editing_frame, set_editing_frame) = signal::<Option<String>>(None);
     // Feedback-loop guard: set immediately before persist() emits its
     // editor_state change, cleared by the very next run of the doc→model
     // resync Effect below. Mirrors `spreadsheet_view.rs:1357`/`:2363`.
@@ -482,13 +507,34 @@ pub fn DeckView(
         // overwrite (Task 10 review, Finding 2).
         flush_nudge();
 
-        let mut new_deck = deck_from_doc(&state.doc);
-        let bootstrap = bootstrap_blank_slide(new_deck.slides.is_empty(), readonly);
+        let mut remote_deck = deck_from_doc(&state.doc);
+        let bootstrap = bootstrap_blank_slide(remote_deck.slides.is_empty(), readonly);
         let should_persist = bootstrap.is_some();
         if let Some(slide) = bootstrap {
-            new_deck.slides.push(slide);
+            remote_deck.slides.push(slide);
         }
-        deck.set(new_deck);
+        // Task 11 — a frame text editor may be open, mid-keystroke,
+        // when a genuinely remote update lands. `merge_remote_deck`
+        // takes every field of `remote_deck` except the *content* of
+        // the frame named by `editing_frame` (if any), which stays
+        // `local` so the incoming update can never clobber
+        // unpersisted keystrokes. `get_untracked` deliberately: this
+        // Effect must re-run when a new `editor_state` arrives, not
+        // merely because `editing_frame` toggled.
+        let editing = editing_frame.get_untracked();
+        let merged = deck.with_untracked(|local| merge_remote_deck(local, remote_deck, editing.as_deref()));
+        // If the frame being edited was deleted by this same remote
+        // update (a concurrent peer's delete raced the open editor),
+        // `merged` no longer has it — drop the dangling `editing_frame`
+        // so no row can try to keep mounting an editor for a frame
+        // that no longer exists.
+        if let Some(id) = &editing {
+            let still_exists = merged.slides.iter().any(|s| s.frames.iter().any(|f| &f.block_id == id));
+            if !still_exists {
+                set_editing_frame.set(None);
+            }
+        }
+        deck.set(merged);
         if should_persist {
             crate::a11y::defer(persist);
         }
@@ -500,6 +546,41 @@ pub fn DeckView(
     // frame mid-nudge would drop the last keydown's worth of movement
     // silently, the same way a blur or slide-switch would.
     on_cleanup(move || flush_nudge());
+
+    // ─── Frame-editor outside-click close (Task 11) ─────────
+    //
+    // Hazard: the canvas's own keydown/paste handlers (below) already
+    // stop-propagate while a frame is being edited, so Delete/Backspace
+    // typed *inside* the editor can never reach `on_canvas_keydown` and
+    // delete the frame out from under the caret. That doesn't cover a
+    // pointerdown *outside* the editing frame's DOM, though — the
+    // canvas has no single listener that sees every possible outside
+    // target (toolbar, theme picker, slide strip, blank canvas). A
+    // window-level listener does, mirroring the slide-strip drag's use
+    // of `document.element_from_point` elsewhere in this file for the
+    // same "read real DOM geometry, don't trust `ev.target()` alone"
+    // reason — here it's `.closest()` walking from the real click
+    // target up to the nearest `[data-deck-frame-block-id]`, which is
+    // `None` (blank canvas / other chrome) or a *different* frame's id
+    // whenever the click wasn't inside the editing frame's own
+    // subtree. `get_untracked`: this is a native DOM callback, not a
+    // reactive computation — it must read the *current* value on each
+    // real pointerdown, not re-run because `editing_frame` changed.
+    {
+        let handle = window_event_listener_untyped("pointerdown", move |ev: web_sys::Event| {
+            let Some(editing_id) = editing_frame.get_untracked() else { return };
+            let inside = ev
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                .and_then(|el| el.closest(&format!("[{FRAME_BLOCK_ID_ATTR}]")).ok().flatten())
+                .and_then(|el| el.get_attribute(FRAME_BLOCK_ID_ATTR))
+                .is_some_and(|id| id == editing_id);
+            if !inside {
+                set_editing_frame.set(None);
+            }
+        });
+        on_cleanup(move || handle.remove());
+    }
 
     // ─── Slide-strip mutation handlers ─────────────────────
 
@@ -550,6 +631,13 @@ pub fn DeckView(
         // the newly-active slide's canvas, which has nothing to do
         // with the pending nudge).
         flush_nudge();
+        // A frame editor is scoped to the slide it's on, the same way
+        // a pending nudge is — switching away from it is an implicit
+        // "outside click" that the per-frame outside-click listener
+        // below can't see (the editing frame's row unmounts as part of
+        // the slide switch, but `editing_frame` itself doesn't clear
+        // on its own).
+        set_editing_frame.set(None);
         if let Some(idx) = deck.with_untracked(|d| find_slide_index(&d.slides, block_id)) {
             set_active_slide.set(idx);
         }
@@ -761,12 +849,15 @@ pub fn DeckView(
                     set_selected_frame.set(None);
                 }
             }
-            // Real edit mode lands in the frame-editing task; for now
-            // Enter on a selected frame is a no-op stub (the frame is
-            // already selected — nothing further happens yet).
+            // Enter on a selected frame opens the embedded editor —
+            // this handler itself stops firing for further keydowns
+            // once `editing_frame` is set (see the "Scoped while
+            // editing" comment on the frame render below), so a held
+            // Enter can't re-trigger this arm mid-edit.
             "Enter" => {
-                if selected_frame.get_untracked().is_some() {
+                if let Some(id) = selected_frame.get_untracked() {
                     ev.prevent_default();
+                    set_editing_frame.set(Some(id));
                 }
             }
             "Delete" | "Backspace" => {
@@ -1078,159 +1169,360 @@ pub fn DeckView(
 
             <div class="deck-view__canvas-wrap">
                 <div class="deck-view__canvas-column">
-                    {move || {
-                        let d = deck.get();
-                        let idx = active_slide.get().min(d.slides.len().saturating_sub(1));
-                        let Some(slide) = d.slides.get(idx).cloned() else {
-                            return view! { <div class="deck-canvas"></div> }.into_any();
-                        };
-                        let theme = d.theme.clone();
-                        // `role=notes` frames never render on the canvas itself
-                        // (design doc, "Canvas keymap matrix") — they surface
-                        // only in the collapsed drawer below. Content frames
-                        // sort by `z` for paint order (later z on top).
-                        let mut frames: Vec<_> =
-                            slide.frames.iter().filter(|f| f.role == FrameRole::Content).cloned().collect();
-                        frames.sort_by_key(|f| f.z);
-                        let canvas_class = format!("deck-canvas {}", theme_class(&theme));
-                        // Transient drag state is read here (not just inside a
-                        // per-frame reactive prop) so the dragged frame's
-                        // geometry — and the snap guides overlay — update on
-                        // every pointermove, matching how a plain (non-drag)
-                        // geometry mutation already needs this closure to
-                        // re-run: `left`/`top`/`width`/`height` are computed
-                        // once per run, not as their own reactive closures.
-                        let dragging = frame_drag.get();
-                        let preview = drag_preview.get();
-                        let guides = drag_guides.get();
-                        view! {
-                            <div
-                                class=canvas_class
-                                tabindex="0"
-                                node_ref=canvas_ref
-                                on:keydown=on_canvas_keydown
-                                on:keyup=on_canvas_keyup
-                                on:blur=move |_| flush_nudge()
-                                on:paste=on_canvas_paste
-                                on:pointermove=on_canvas_pointermove
-                                on:pointerup=on_canvas_pointerup
-                                on:pointercancel=on_canvas_pointercancel
-                            >
-                                {frames
-                                    .into_iter()
-                                    .map(|frame| {
-                                        let block_id = frame.block_id.clone();
-                                        let block_id_pointerdown = block_id.clone();
-                                        let block_id_comment = block_id.clone();
-                                        let is_selected = {
-                                            let block_id = block_id.clone();
-                                            move || selected_frame.get().as_deref() == Some(block_id.as_str())
-                                        };
-                                        // A second, independently-reactive closure over the
-                                        // same block_id (not a plain bool computed once per
-                                        // outer rebuild): Escape / Tab-Shift-Tab / a plain
-                                        // click-to-select change `selected_frame` without
-                                        // touching `deck`/`frame_drag`/`drag_preview`, so the
-                                        // outer per-slide closure this frame is built inside
-                                        // won't itself re-run — the handles' visibility has to
-                                        // track selection via `<Show>`'s own reactivity instead.
-                                        let is_selected_for_handles = {
-                                            let block_id = block_id.clone();
-                                            move || selected_frame.get().as_deref() == Some(block_id.as_str())
-                                        };
-                                        let has_thread = {
-                                            let block_id = block_id_comment.clone();
-                                            move || frame_threads.get().iter().any(|t| t == &block_id)
-                                        };
-                                        let effective_rect = if dragging.as_ref().is_some_and(|s| s.block_id == block_id) {
-                                            preview.unwrap_or(frame.rect)
+                    // Task 11 hazard 2: this div — and, critically, the `<For>`
+                    // of frames inside it — used to live inside a single
+                    // `{move || {...}}` closure that re-ran (tearing down and
+                    // rebuilding *every* frame's DOM from scratch) on any
+                    // change to `deck`, `frame_drag`, `drag_preview`, or
+                    // `drag_guides`. That's fine for read-only content, but
+                    // fatal for a mounted `EditorComponent`: any unrelated
+                    // deck mutation (a remote peer nudging a *different*
+                    // frame, a local drag anywhere on the slide) would
+                    // remount the editor mid-keystroke, dropping focus, the
+                    // caret, and the undo stack. Hoisting the canvas div and
+                    // the `<For>` out of that closure — reactive attributes
+                    // (`class=`, `node_ref`) instead of a reactive subtree —
+                    // is what makes `<For>`'s keyed reconciliation apply:
+                    // frames whose `block_id` persists keep their DOM/mounted
+                    // component across a `deck` update; only frames that are
+                    // actually inserted/removed/reordered get torn down or
+                    // moved. The guides overlay and the notes drawer stay as
+                    // their own independent reactive fragments (siblings of
+                    // the `<For>`, not wrapping it) for the same reason.
+                    <div
+                        class=move || format!("deck-canvas {}", theme_class(&deck.with(|d| d.theme.clone())))
+                        tabindex="0"
+                        node_ref=canvas_ref
+                        on:keydown=on_canvas_keydown
+                        on:keyup=on_canvas_keyup
+                        on:blur=move |_| flush_nudge()
+                        on:paste=on_canvas_paste
+                        on:pointermove=on_canvas_pointermove
+                        on:pointerup=on_canvas_pointerup
+                        on:pointercancel=on_canvas_pointercancel
+                    >
+                        <For
+                            each=move || {
+                                // `role=notes` frames never render on the canvas
+                                // itself (design doc, "Canvas keymap matrix") —
+                                // they surface only in the collapsed drawer
+                                // below. Content frames sort by `z` for paint
+                                // order (later z on top); `<For>` reorders
+                                // existing rows' DOM position to match rather
+                                // than rebuilding them when only `z` changes.
+                                let idx = active_slide.get().min(deck.with(|d| d.slides.len().saturating_sub(1)));
+                                deck.with(|d| {
+                                    d.slides
+                                        .get(idx)
+                                        .map(|s| {
+                                            let mut v: Vec<DeckFrame> =
+                                                s.frames.iter().filter(|f| f.role == FrameRole::Content).cloned().collect();
+                                            v.sort_by_key(|f| f.z);
+                                            v
+                                        })
+                                        .unwrap_or_default()
+                                })
+                            }
+                            key=|f: &DeckFrame| f.block_id.clone()
+                            children=move |frame: DeckFrame| {
+                                let block_id = frame.block_id.clone();
+                                // `children` is an `Fn` closure invoked once per
+                                // row (not consumed after the first row), so
+                                // `doc_id` — owned, not `Copy` — has to be
+                                // re-cloned from the outer capture on every
+                                // invocation rather than moved once; the clone
+                                // is what `frame_body` below then moves into its
+                                // own `move ||` closure.
+                                let doc_id = doc_id.clone();
+                                let is_selected = {
+                                    let block_id = block_id.clone();
+                                    move || selected_frame.get().as_deref() == Some(block_id.as_str())
+                                };
+                                // A second, independently-reactive closure over the
+                                // same block_id (not a plain bool computed once):
+                                // Escape / Tab-Shift-Tab / a plain click-to-select
+                                // change `selected_frame` without touching `deck` —
+                                // the handles' visibility tracks selection via
+                                // `<Show>`'s own reactivity.
+                                let is_selected_for_handles = {
+                                    let block_id = block_id.clone();
+                                    move || selected_frame.get().as_deref() == Some(block_id.as_str())
+                                };
+                                let is_editing = {
+                                    let block_id = block_id.clone();
+                                    move || editing_frame.get().as_deref() == Some(block_id.as_str())
+                                };
+                                let has_thread = {
+                                    let block_id = block_id.clone();
+                                    move || frame_threads.get().iter().any(|t| t == &block_id)
+                                };
+                                // Reactive per-row geometry: the live rect from
+                                // `deck` (tracking this frame's own remote/local
+                                // moves even while some *other* row is mid-drag or
+                                // mid-edit), overridden by the transient
+                                // drag-preview only while *this* frame is the one
+                                // being dragged. `fallback` only matters in the
+                                // vanishingly unlikely window where this row's
+                                // block_id has just been removed from `deck` but
+                                // `<For>` hasn't unmounted it yet.
+                                let live_rect = {
+                                    let block_id = block_id.clone();
+                                    let fallback = frame.rect;
+                                    move || -> Rect {
+                                        let idx = active_slide.get();
+                                        let current = deck
+                                            .with(|d| {
+                                                d.slides
+                                                    .get(idx)
+                                                    .and_then(|s| s.frames.iter().find(|f| f.block_id == block_id))
+                                                    .map(|f| f.rect)
+                                            })
+                                            .unwrap_or(fallback);
+                                        if frame_drag.get().as_ref().is_some_and(|s| s.block_id == block_id) {
+                                            drag_preview.get().unwrap_or(current)
                                         } else {
-                                            frame.rect
-                                        };
-                                        let left = format!("{:.2}%", effective_rect.x * 100.0);
-                                        let top = format!("{:.2}%", effective_rect.y * 100.0);
-                                        let width = format!("{:.2}%", effective_rect.w * 100.0);
-                                        let height = format!("{:.2}%", effective_rect.h * 100.0);
-                                        view! {
-                                            <div
-                                                class="deck-frame"
-                                                class:deck-frame--selected=is_selected
-                                                class:deck-frame--readonly=readonly
-                                                style:left=left
-                                                style:top=top
-                                                style:width=width
-                                                style:height=height
-                                                on:pointerdown=move |ev: web_sys::PointerEvent| {
-                                                    start_frame_drag(block_id_pointerdown.clone(), DragKind::Move, ev);
+                                            current
+                                        }
+                                    }
+                                };
+                                let left = { let live_rect = live_rect.clone(); move || format!("{:.2}%", live_rect().x * 100.0) };
+                                let top = { let live_rect = live_rect.clone(); move || format!("{:.2}%", live_rect().y * 100.0) };
+                                let width = { let live_rect = live_rect.clone(); move || format!("{:.2}%", live_rect().w * 100.0) };
+                                let height = { let live_rect = live_rect.clone(); move || format!("{:.2}%", live_rect().h * 100.0) };
+
+                                // Task 11: either the read-only render (tracks
+                                // `deck` reactively, same as before) or a scoped
+                                // `EditorComponent` mounted over a synthetic Doc
+                                // wrapping just this frame's content. The editing
+                                // branch reads `deck` *untracked* — on purpose:
+                                // once mounted, this closure must only re-run when
+                                // `editing_frame` itself changes (entering or
+                                // leaving edit mode), never because `deck` changed
+                                // for any other reason, or the editor would remount
+                                // mid-keystroke (hazard 2, see the comment above
+                                // this `<For>`). Every keystroke already reaches
+                                // `deck` via `on_state_change` below without this
+                                // closure re-running at all.
+                                let frame_body = {
+                                    let block_id = block_id.clone();
+                                    let fallback_content = frame.content.clone();
+                                    move || -> Vec<AnyView> {
+                                        if editing_frame.get().as_deref() == Some(block_id.as_str()) {
+                                            let idx = active_slide.get_untracked();
+                                            let current_content = deck
+                                                .with_untracked(|d| {
+                                                    d.slides
+                                                        .get(idx)
+                                                        .and_then(|s| s.frames.iter().find(|f| f.block_id == block_id))
+                                                        .map(|f| f.content.clone())
+                                                })
+                                                .unwrap_or_else(|| fallback_content.clone());
+                                            let inner_doc = Node::element_with_content(NodeType::Doc, current_content);
+                                            let (inner_toolbar_cmd, _) = signal::<Option<ToolbarCommand>>(None);
+                                            let (inner_remote, _) = signal::<Option<EditorState>>(None);
+                                            let on_state_change_block_id = block_id.clone();
+                                            vec![
+                                                view! {
+                                                    <EditorComponent props=EditorProps {
+                                                        initial_content: Some(doc_to_ydoc_bytes(&inner_doc)),
+                                                        // The outer `persist()` (below) handles transport —
+                                                        // the inner editor's own `on_change` (yrs-bytes-only,
+                                                        // meant for a standalone doc's REST fallback) has
+                                                        // nothing to do here.
+                                                        on_change: Callback::new(|_: Vec<u8>| {}),
+                                                        on_state_change: Callback::new(move |st: EditorState| {
+                                                            let content = match &st.doc {
+                                                                Node::Element { content, .. } => content.clone(),
+                                                                _ => return,
+                                                            };
+                                                            deck.update(|d| {
+                                                                replace_frame_content(d, &on_state_change_block_id, content);
+                                                            });
+                                                            persist();
+                                                        }),
+                                                        command_signal: inner_toolbar_cmd,
+                                                        // Always `None` — remote merge for this frame is
+                                                        // handled at the deck level by `merge_remote_deck`
+                                                        // in the resync Effect, not by feeding the inner
+                                                        // editor its own remote-state stream.
+                                                        remote_state: inner_remote,
+                                                        doc_id: doc_id.clone(),
+                                                        on_scroll: None,
+                                                        on_mapping: None,
+                                                        // Frame comments come from the frame chrome's own
+                                                        // comment button (Task 12), not the inner editor's
+                                                        // right-click menu.
+                                                        on_request_comment: None,
+                                                        readonly: false,
+                                                    } />
                                                 }
-                                            >
-                                                {render_frame_content(&frame.content)}
-                                                <button
-                                                    class="deck-frame__comment-btn"
-                                                    class:deck-frame__comment-btn--active=has_thread
-                                                    title=crate::t!("deck-frame-comment")
-                                                    aria-label=crate::t!("deck-frame-comment")
-                                                    on:pointerdown=|ev: web_sys::PointerEvent| ev.stop_propagation()
-                                                    on:click=move |ev: web_sys::MouseEvent| {
-                                                        ev.stop_propagation();
-                                                        on_request_frame_comment.run(block_id_comment.clone());
-                                                    }
-                                                >"\u{1F4AC}"</button>
-                                                <Show when=move || is_selected_for_handles() && !readonly>
-                                                    {
+                                                .into_any(),
+                                            ]
+                                        } else {
+                                            let idx = active_slide.get();
+                                            let content = deck
+                                                .with(|d| {
+                                                    d.slides
+                                                        .get(idx)
+                                                        .and_then(|s| s.frames.iter().find(|f| f.block_id == block_id))
+                                                        .map(|f| f.content.clone())
+                                                })
+                                                .unwrap_or_else(|| fallback_content.clone());
+                                            render_frame_content(&content)
+                                        }
+                                    }
+                                };
+
+                                let block_id_pointerdown = block_id.clone();
+                                let block_id_comment = block_id.clone();
+                                let block_id_dblclick = block_id.clone();
+                                let block_id_keydown = block_id.clone();
+                                let block_id_paste = block_id.clone();
+                                let block_id_data_attr = block_id.clone();
+                                view! {
+                                    <div
+                                        class="deck-frame"
+                                        class:deck-frame--selected=is_selected
+                                        class:deck-frame--editing=is_editing
+                                        class:deck-frame--readonly=readonly
+                                        style:left=left
+                                        style:top=top
+                                        style:width=width
+                                        style:height=height
+                                        attr:data-deck-frame-block-id=block_id_data_attr
+                                        // Hazard 1 (keydown): while this frame is
+                                        // being edited, a keydown that bubbles up
+                                        // from the embedded editor's contenteditable
+                                        // — Delete/Backspace, arrows, Tab — must
+                                        // never reach `on_canvas_keydown` above,
+                                        // which would delete/nudge/reselect the
+                                        // very frame being typed in. Stopping
+                                        // propagation *here*, at the frame div that
+                                        // sits between the editor and the canvas in
+                                        // the DOM, is the mechanism; Escape is the
+                                        // one key this handler acts on itself
+                                        // (closing the editor) before stopping it.
+                                        // The `is_none()`/no-op guard covers the case
+                                        // where this listener fires from something
+                                        // other than the editing frame (shouldn't
+                                        // normally happen — nothing here is
+                                        // focusable while read-only — but a stray
+                                        // event should never accidentally eat a
+                                        // canvas-level keydown for a frame that
+                                        // isn't being edited).
+                                        on:keydown=move |ev: web_sys::KeyboardEvent| {
+                                            if editing_frame.get_untracked().as_deref() != Some(block_id_keydown.as_str()) {
+                                                return;
+                                            }
+                                            if ev.key() == "Escape" {
+                                                ev.prevent_default();
+                                                set_editing_frame.set(None);
+                                            }
+                                            ev.stop_propagation();
+                                        }
+                                        // Hazard 1 (paste): same reasoning as
+                                        // keydown above — the embedded editor's own
+                                        // paste handler already reads/consumes the
+                                        // clipboard event; without stopping
+                                        // propagation here it would go on to reach
+                                        // `on_canvas_paste`, which creates a whole
+                                        // new centered frame from the same
+                                        // clipboard text.
+                                        on:paste=move |ev: web_sys::Event| {
+                                            if editing_frame.get_untracked().as_deref() != Some(block_id_paste.as_str()) {
+                                                return;
+                                            }
+                                            ev.stop_propagation();
+                                        }
+                                        on:dblclick=move |ev: web_sys::MouseEvent| {
+                                            if readonly {
+                                                return;
+                                            }
+                                            ev.stop_propagation();
+                                            set_selected_frame.set(Some(block_id_dblclick.clone()));
+                                            set_editing_frame.set(Some(block_id_dblclick.clone()));
+                                        }
+                                        on:pointerdown=move |ev: web_sys::PointerEvent| {
+                                            // A click *inside* the frame currently
+                                            // being edited (to reposition the caret)
+                                            // must not also start a Move-drag
+                                            // gesture — `start_frame_drag` captures
+                                            // the pointer, which would fight the
+                                            // browser's own click-to-place-caret
+                                            // handling inside the contenteditable.
+                                            if editing_frame.get_untracked().as_deref() == Some(block_id_pointerdown.as_str()) {
+                                                return;
+                                            }
+                                            start_frame_drag(block_id_pointerdown.clone(), DragKind::Move, ev);
+                                        }
+                                    >
+                                        {frame_body}
+                                        <button
+                                            class="deck-frame__comment-btn"
+                                            class:deck-frame__comment-btn--active=has_thread
+                                            title=crate::t!("deck-frame-comment")
+                                            aria-label=crate::t!("deck-frame-comment")
+                                            on:pointerdown=|ev: web_sys::PointerEvent| ev.stop_propagation()
+                                            on:click=move |ev: web_sys::MouseEvent| {
+                                                ev.stop_propagation();
+                                                on_request_frame_comment.run(block_id_comment.clone());
+                                            }
+                                        >"\u{1F4AC}"</button>
+                                        <Show when=move || is_selected_for_handles() && !readonly>
+                                            {
+                                                let block_id = block_id.clone();
+                                                [Corner::Nw, Corner::Ne, Corner::Sw, Corner::Se]
+                                                    .into_iter()
+                                                    .map(|corner| {
                                                         let block_id = block_id.clone();
-                                                        [Corner::Nw, Corner::Ne, Corner::Sw, Corner::Se]
-                                                            .into_iter()
-                                                            .map(|corner| {
-                                                                let block_id = block_id.clone();
-                                                                let class = format!(
-                                                                    "deck-frame-handle deck-frame-handle--{}",
-                                                                    match corner {
-                                                                        Corner::Nw => "nw",
-                                                                        Corner::Ne => "ne",
-                                                                        Corner::Sw => "sw",
-                                                                        Corner::Se => "se",
-                                                                    }
-                                                                );
-                                                                view! {
-                                                                    <div
-                                                                        class=class
-                                                                        on:pointerdown=move |ev: web_sys::PointerEvent| {
-                                                                            start_frame_drag(
-                                                                                block_id.clone(),
-                                                                                DragKind::Resize(corner),
-                                                                                ev,
-                                                                            );
-                                                                        }
-                                                                    ></div>
+                                                        let class = format!(
+                                                            "deck-frame-handle deck-frame-handle--{}",
+                                                            match corner {
+                                                                Corner::Nw => "nw",
+                                                                Corner::Ne => "ne",
+                                                                Corner::Sw => "sw",
+                                                                Corner::Se => "se",
+                                                            }
+                                                        );
+                                                        view! {
+                                                            <div
+                                                                class=class
+                                                                on:pointerdown=move |ev: web_sys::PointerEvent| {
+                                                                    start_frame_drag(
+                                                                        block_id.clone(),
+                                                                        DragKind::Resize(corner),
+                                                                        ev,
+                                                                    );
                                                                 }
-                                                            })
-                                                            .collect::<Vec<_>>()
-                                                    }
-                                                </Show>
-                                            </div>
-                                        }
-                                    })
-                                    .collect::<Vec<_>>()}
-                                {guides
-                                    .into_iter()
-                                    .map(|g| match g.axis {
-                                        Axis::X => {
-                                            let left = format!("{:.4}%", g.at * 100.0);
-                                            view! { <div class="deck-snap-guide deck-snap-guide--x" style:left=left></div> }
-                                                .into_any()
-                                        }
-                                        Axis::Y => {
-                                            let top = format!("{:.4}%", g.at * 100.0);
-                                            view! { <div class="deck-snap-guide deck-snap-guide--y" style:top=top></div> }
-                                                .into_any()
-                                        }
-                                    })
-                                    .collect::<Vec<_>>()}
-                            </div>
-                        }
-                            .into_any()
-                    }}
+                                                            ></div>
+                                                        }
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            }
+                                        </Show>
+                                    </div>
+                                }
+                            }
+                        />
+                        {move || {
+                            drag_guides
+                                .get()
+                                .into_iter()
+                                .map(|g| match g.axis {
+                                    Axis::X => {
+                                        let left = format!("{:.4}%", g.at * 100.0);
+                                        view! { <div class="deck-snap-guide deck-snap-guide--x" style:left=left></div> }
+                                            .into_any()
+                                    }
+                                    Axis::Y => {
+                                        let top = format!("{:.4}%", g.at * 100.0);
+                                        view! { <div class="deck-snap-guide deck-snap-guide--y" style:top=top></div> }
+                                            .into_any()
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        }}
+                    </div>
                     <Show when=move || {
                         deck.with(|d| {
                             let idx = active_slide.get().min(d.slides.len().saturating_sub(1));
