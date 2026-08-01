@@ -113,9 +113,11 @@ pub async fn sweep(state: &AppState, cutoff_usec: i64) -> Result<(), String> {
             continue;
         }
         // hard_delete owns its own S3 sweep: BOTH prefixes a document
-        // owns — `docs/<id>/` (snapshots, staged import payloads) and
-        // `blobs/<id>/` (user-uploaded images) — are removed alongside
-        // the DDB rows. #151: this used to say only `docs/<id>/`, and
+        // owns — `docs/<id>/` (snapshots and oversized update payloads)
+        // and `blobs/<id>/` (user-uploaded images) — are removed alongside
+        // the DDB rows. (Import staging under `imports/...` is job-owned,
+        // not document-owned, and is NOT touched here.)
+        // #151: this used to say only `docs/<id>/`, and
         // it was describing the code accurately — the blobs really
         // were left behind, so a purge reported success while every
         // image survived.

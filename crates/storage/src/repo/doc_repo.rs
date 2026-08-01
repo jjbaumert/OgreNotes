@@ -730,8 +730,12 @@ impl DocRepo {
 
     /// Hard delete a document and all associated DynamoDB rows (METADATA,
     /// MEMBER#*, OPEN#*, UPDATE#*, REL#*, RREL#*), plus **both** of the S3
-    /// prefixes a document owns: `docs/<id>/` (snapshots, staged import
-    /// payloads) and `blobs/<id>/` (user-uploaded images). Reverse-
+    /// prefixes a document owns: `docs/<id>/` (snapshots and oversized
+    /// update payloads, `docs/<id>/updates/<clock>.bin`) and `blobs/<id>/`
+    /// (user-uploaded images). Import staging blobs live under
+    /// `imports/...`, are owned by a job rather than a document, and are
+    /// cleaned up by their own job lifecycle — this sweep does not touch
+    /// them. Reverse-
     /// relationships on other docs must be cleaned up separately by the
     /// caller (use `list_reverse_relationships` + `delete_relationship`) so
     /// the forward side on the other doc is also removed.
