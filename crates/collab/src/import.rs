@@ -318,6 +318,10 @@ fn code_block_language(kind: pulldown_cmark::CodeBlockKind<'_>) -> Option<String
 /// default for `<div>` / `<section>` / etc. that the export side
 /// never emits but a third-party HTML source might.
 ///
+/// Nesting deeper than [`MAX_NESTING_DEPTH`] is flattened before the
+/// walk — see that constant for why the bound is a liveness
+/// requirement, not a formatting preference.
+///
 /// Same v1 limitation as `from_markdown`: inline marks (bold,
 /// italic, code, link) are dropped. Pre-existing
 /// `inline_emphasis_drops_marks_keeps_text` test pins the contract.
@@ -327,14 +331,8 @@ pub fn from_html(html: &str) -> Doc {
     use html5ever::tendril::TendrilSink;
     use markup5ever_rcdom::RcDom;
 
-    // Stage 1: sanitize. ammonia's default Builder is conservative —
-    // a whitelist of safe tags + attribute filtering — which is
-    // exactly the posture we want for an import endpoint that may
-    // receive third-party HTML.
-    let safe = ammonia::Builder::default()
-        .tags(allowed_html_tags())
-        .clean(html)
-        .to_string();
+    // Stage 1: sanitize.
+    let safe = sanitize(html);
 
     // Stage 2: parse to DOM.
     let dom: RcDom = html5ever::parse_document(
@@ -345,6 +343,21 @@ pub fn from_html(html: &str) -> Doc {
     .read_from(&mut safe.as_bytes())
     .expect("html5ever parse is infallible on bytes");
 
+    // Stage 2b: bound the tree BEFORE the recursive walk, rather than
+    // threading a depth counter through `walk_html`'s four recursion
+    // sites. The guarantee is then structural: whatever the walker
+    // receives is already shallower than MAX_NESTING_DEPTH, so every
+    // recursive pass over it is bounded by the same constant for
+    // free, and no future recursive pass can forget to check.
+    let truncated = flatten_below_depth(&dom.document);
+    if truncated > 0 {
+        tracing::warn!(
+            truncated,
+            max_depth = MAX_NESTING_DEPTH,
+            "html import flattened subtrees nested past the depth cap",
+        );
+    }
+
     // Stage 3: walk + materialize.
     let doc = Doc::new();
     {
@@ -353,6 +366,143 @@ pub fn from_html(html: &str) -> Doc {
         walk_html(&mut txn, &dom.document, &XmlOpenable::Fragment(&fragment));
     }
     doc
+}
+
+/// Stage 1 of [`from_html`] on its own: ammonia's default Builder,
+/// narrowed to [`allowed_html_tags`].
+///
+/// ammonia's default posture is what we want for an import endpoint
+/// that may receive third-party HTML — a tag whitelist, an attribute
+/// whitelist, and URL-scheme filtering — and we narrow only the tag
+/// set. Everything else (no `generic_attributes`, no
+/// `generic_attribute_prefixes`, default `url_schemes`) is left at
+/// ammonia's defaults *deliberately*: each of those knobs widens the
+/// boundary, and `sanitize_*` in the test module below pins the
+/// resulting behavior rather than the call shape.
+///
+/// Factored out of `from_html` so those tests can exercise the
+/// boundary directly. It stays private — the walker-and-materializer
+/// property in `tests/import_fuzz.rs` cannot observe this layer (the
+/// yrs tree it inspects can only carry `NodeType` tag names), and
+/// making the sanitizer `pub` to work around that would export an
+/// internal stage as API.
+fn sanitize(html: &str) -> String {
+    ammonia::Builder::default()
+        .tags(allowed_html_tags())
+        .clean(html)
+        .to_string()
+}
+
+/// Deepest element nesting the HTML walker is ever allowed to
+/// descend.
+///
+/// **This is a process-liveness bound, not a formatting
+/// preference.** `walk_html` recurses once per DOM level over HTML
+/// that arrives straight from `POST /documents/import` with nothing
+/// but an `AuthUser` check in front of it. Exhaust the thread stack
+/// and Rust **aborts the process** — stack overflow is not a panic,
+/// so no `catch_unwind` anywhere can contain it, and the abort takes
+/// down every in-flight request and open WebSocket sharing that
+/// process, not just the offending import.
+///
+/// Measured on the 2 MiB stack tokio worker threads and Rust test
+/// threads both get (no `stack_size` / `RUST_MIN_STACK` / `ulimit -s`
+/// override exists anywhere in the Rust code, the CDK app, the
+/// Dockerfile or the compose file, so 2 MiB is what production runs):
+/// nested `<div>` / `<span>` / `<blockquote>` parsed at 2 400 levels
+/// and aborted at 3 000. A ~30 KB body was enough. `ammonia::clean`
+/// and html5ever themselves survive 50 000+ — the recursion that
+/// fails is ours.
+///
+/// 128 leaves roughly 20x headroom against that measured threshold,
+/// which absorbs a smaller stack, a deeper call path above the
+/// walker, or a debug build's fatter frames. It is deliberately the
+/// same number the Quip walker caps at for the same class of bug, so
+/// this crate's two HTML walkers give a reader one number to learn
+/// rather than two (they are independent constants — neither parser
+/// reads the other's). Authored documents are nowhere near it: our
+/// own HTML export tops out in the tens even for deeply nested lists,
+/// and paste-artifact wrapper accumulation runs to tens, not
+/// hundreds.
+pub const MAX_NESTING_DEPTH: usize = 128;
+
+/// Replace every subtree rooted deeper than [`MAX_NESTING_DEPTH`]
+/// with a single text node holding that subtree's flattened text,
+/// returning how many subtrees were flattened.
+///
+/// **Fails soft: text survives, only the nesting is lost.** Dropping
+/// the subtree would silently delete the deepest content of a
+/// document, and rejecting the import would turn a formatting quirk
+/// into a failed request — so the content is kept and the loss is
+/// logged.
+///
+/// **Iterative, with an explicit stack, in both halves.** A recursive
+/// implementation of the guard against unbounded recursion would
+/// abort on exactly the input it exists to survive.
+///
+/// Depth is counted from the document node, so the
+/// `<html>`/`<body>` scaffold html5ever always inserts spends three
+/// levels of the budget. That is the conservative direction and the
+/// margin swallows it.
+fn flatten_below_depth(document: &markup5ever_rcdom::Handle) -> usize {
+    use markup5ever_rcdom::{Node, NodeData};
+
+    let mut truncated = 0usize;
+    // (node, depth) pairs still to inspect.
+    let mut stack: Vec<(markup5ever_rcdom::Handle, usize)> = vec![(document.clone(), 0)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth >= MAX_NESTING_DEPTH {
+            let children = std::mem::take(&mut *node.children.borrow_mut());
+            if children.is_empty() {
+                continue;
+            }
+            truncated += 1;
+            let text = collect_text(&children);
+            if !text.is_empty() {
+                // The replacement's `parent` is left unset. That is
+                // fine: `walk_html` reaches every node through
+                // `children` and never reads `parent`.
+                let replacement = Node::new(NodeData::Text {
+                    contents: std::cell::RefCell::new(text.into()),
+                });
+                node.children.borrow_mut().push(replacement);
+            }
+            // `children` drops here, taking the over-deep subtree
+            // with it. Safe at any depth: markup5ever_rcdom's `Drop`
+            // for `Node` is a worklist loop, not a recursive one.
+            continue;
+        }
+        for child in node.children.borrow().iter() {
+            stack.push((child.clone(), depth + 1));
+        }
+    }
+    truncated
+}
+
+/// Concatenate every text node in `roots` and their descendants,
+/// separated by single spaces. Iterative for the same reason
+/// [`flatten_below_depth`] is.
+fn collect_text(roots: &[markup5ever_rcdom::Handle]) -> String {
+    use markup5ever_rcdom::NodeData;
+
+    let mut text = String::new();
+    let mut stack: Vec<markup5ever_rcdom::Handle> = roots.iter().rev().cloned().collect();
+    while let Some(node) = stack.pop() {
+        if let NodeData::Text { contents } = &node.data {
+            let borrowed = contents.borrow();
+            let chunk = borrowed.as_ref().trim();
+            if !chunk.is_empty() {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(chunk);
+            }
+        }
+        for child in node.children.borrow().iter().rev() {
+            stack.push(child.clone());
+        }
+    }
+    text
 }
 
 /// Set of HTML tags ammonia is allowed to pass through. Everything
@@ -732,6 +882,159 @@ mod tests {
             panic!();
         };
         assert_eq!(el.tag().as_ref(), "horizontal_rule");
+    }
+
+    // ─── The sanitizer boundary (#160) ───────────────────────────
+    //
+    // `tests/import_fuzz.rs` has a property that *reads* as the XSS
+    // guard for `from_html`. It cannot be: it inspects the
+    // materialized yrs document, whose element names come from the
+    // closed `NodeType` enum, so no allowlist mistake could ever make
+    // an `<iframe>` appear there. Widening `allowed_html_tags` leaves
+    // it green. These tests are the actual boundary, in two layers —
+    // a direct assertion on the set (which names the offending entry
+    // outright) and a behavioral pass through `sanitize` (which
+    // covers what a set assertion structurally cannot: the ammonia
+    // knobs *around* the set).
+
+    /// Tags that must never be in the allowlist. Script execution,
+    /// framing/embedding, style injection, credential-phishing form
+    /// posts, and `<link>`/`<base>` resource hijacking.
+    const FORBIDDEN_TAGS: &[&str] = &[
+        "script", "iframe", "object", "embed", "style", "form", "link", "base", "meta", "svg",
+        "math", "applet", "frame", "frameset", "noscript", "template", "input", "button",
+    ];
+
+    /// Layer 1 — assert the set itself. The sharpest possible
+    /// failure: it names the exact entry someone added.
+    #[test]
+    fn allowed_html_tags_admits_no_forbidden_tag() {
+        let allowed = allowed_html_tags();
+        for tag in FORBIDDEN_TAGS {
+            assert!(
+                !allowed.contains(tag),
+                "<{tag}> must never be in the HTML import allowlist — it is an \
+                 execution/framing/injection vector, and nothing downstream of \
+                 the sanitizer re-checks the tag set",
+            );
+        }
+    }
+
+    /// Layer 2 — behavior through `sanitize`, with positive controls
+    /// so a negative assertion can't pass because the whole input was
+    /// dropped for an unrelated reason.
+    #[test]
+    fn sanitize_drops_forbidden_tags_and_keeps_ordinary_ones() {
+        for tag in FORBIDDEN_TAGS {
+            let out = sanitize(&format!("<p>before</p><{tag}>payload</{tag}><p>after</p>"));
+            assert!(
+                !out.contains(&format!("<{tag}")),
+                "<{tag}> survived sanitize: {out:?}",
+            );
+            // Positive control: the surrounding document is intact,
+            // so the assertion above is about the tag and not about
+            // sanitize having eaten everything.
+            assert!(out.contains("before") && out.contains("after"), "{out:?}");
+        }
+    }
+
+    /// Event-handler attributes die at the sanitizer, on tags that
+    /// are otherwise perfectly allowed.
+    #[test]
+    fn sanitize_strips_event_handler_attributes() {
+        let out = sanitize(
+            "<p onclick=\"steal()\">a</p>\
+             <a href=\"https://example.com\" onmouseover=\"steal()\">b</a>\
+             <blockquote onerror=\"steal()\">c</blockquote>",
+        );
+        let lower = out.to_ascii_lowercase();
+        for handler in ["onclick", "onmouseover", "onerror"] {
+            assert!(!lower.contains(handler), "{handler} survived sanitize: {out:?}");
+        }
+        // Positive controls: the elements and their legitimate
+        // attribute survived, so the handlers were stripped rather
+        // than the tags being dropped wholesale.
+        assert!(lower.contains("<p"), "{out:?}");
+        assert!(lower.contains("href=\"https://example.com\""), "{out:?}");
+    }
+
+    /// No attribute *prefix* is allowed through — the hazard a set
+    /// assertion structurally cannot see.
+    ///
+    /// `import_quip`'s sanitizer allows the `data-` prefix because
+    /// its walker reads Quip hints out of `data-*`. This one allows
+    /// no prefix at all, and that is worth pinning: a
+    /// `generic_attribute_prefixes` call added here later would be
+    /// invisible to `allowed_html_tags_admits_no_forbidden_tag`, and
+    /// the prefix `"on"` would re-admit every event handler in one
+    /// line. If a future reader needs `data-*` on this path, this
+    /// test is the place that makes them say so out loud.
+    #[test]
+    fn sanitize_allows_no_attribute_prefix() {
+        let out = sanitize("<p data-anything=\"x\" onbeforeinput=\"steal()\">text</p>");
+        assert!(
+            !out.contains("data-anything"),
+            "no attribute prefix is allowed on this path; a prefix allowlist was added: {out:?}",
+        );
+        assert!(!out.to_ascii_lowercase().contains("onbeforeinput"), "{out:?}");
+        assert!(out.contains("text"), "positive control: {out:?}");
+    }
+
+    /// ammonia's URL-scheme filtering, pinned behaviorally. The tag
+    /// (`a`) and the attribute (`href`) are both allowed — only the
+    /// *scheme* makes this dangerous, which is exactly the kind of
+    /// thing no tag/attribute set assertion can express.
+    #[test]
+    fn sanitize_rejects_script_bearing_url_schemes() {
+        for scheme in ["javascript:alert(1)", "data:text/html;base64,PHNjcmlwdD4="] {
+            let out = sanitize(&format!("<a href=\"{scheme}\">click</a>"));
+            assert!(
+                !out.contains(scheme),
+                "{scheme} survived sanitize as an href: {out:?}",
+            );
+            assert!(out.contains("click"), "positive control: {out:?}");
+        }
+        // Positive control on the same shape: an ordinary link keeps
+        // its href, so the assertions above are about the scheme.
+        let ok = sanitize("<a href=\"https://example.com/x\">click</a>");
+        assert!(ok.contains("https://example.com/x"), "{ok:?}");
+    }
+
+    // ─── Nesting depth (#158) ────────────────────────────────────
+    //
+    // The deterministic cap tests live in `tests/import_fuzz.rs`,
+    // next to the fuzz net that structurally cannot catch this class
+    // (stack exhaustion aborts; a panic net has nothing to catch).
+    // What belongs here is the unit-level shape of the pruning pass.
+
+    #[test]
+    fn flatten_below_depth_leaves_ordinary_nesting_alone() {
+        let html = format!(
+            "{}<p>nested</p>{}",
+            "<blockquote>".repeat(16),
+            "</blockquote>".repeat(16),
+        );
+        let doc = from_html(&html);
+        let txn = doc.transact();
+        let fragment = txn.get_xml_fragment("content").unwrap();
+        // 16 blockquotes then the paragraph — untouched.
+        let mut depth = 0;
+        let mut node = match fragment.get(&txn, 0).unwrap() {
+            XmlOut::Element(el) => el,
+            _ => panic!("expected an element"),
+        };
+        loop {
+            depth += 1;
+            match node.get(&txn, 0) {
+                Some(XmlOut::Element(child)) => node = child,
+                _ => break,
+            }
+        }
+        assert_eq!(
+            depth, 17,
+            "16 blockquotes + 1 paragraph is ordinary document structure and \
+             must pass through the depth cap untouched",
+        );
     }
 
     #[test]
