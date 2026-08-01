@@ -16,6 +16,14 @@
  */
 
 .deck-view {
+  /* The deck root is a flex item inside `.editor-with-panels` (a
+   * flex row). Without `flex: 1` it shrink-wraps to max-content —
+   * the 1fr canvas track collapses to the wrap's padding and the
+   * canvas renders 0×0 (the P1 launch bug). `min-width: 0` lets the
+   * grid shrink below max-content on narrow viewports instead of
+   * overflowing. Same pattern as `.spreadsheet-wrapper`. */
+  flex: 1;
+  min-width: 0;
   display: grid;
   grid-template-columns: 200px 1fr 280px;
   grid-template-areas: "strip canvas pane";
