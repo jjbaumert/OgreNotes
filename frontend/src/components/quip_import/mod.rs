@@ -4,11 +4,21 @@
 // POST it to `/imports/quip/connect`, and on success show the
 // connected profile + a checklist of the caller's root Quip folders
 // (Phase 0). Step 2 (this task): "Continue" persists the checked
-// scope + the user's Home folder as the destination via
+// scope + the user's Home folder as the destination *parent* via
 // `POST /imports/quip/{id}/start`, then Step 3 polls
 // `GET /imports/quip/{id}` on an interval and shows live inventory
 // progress until the walk completes (`phase >= 1`) or the run hits a
 // terminal failure status.
+//
+// DESTINATION: Home is the *parent* this wizard sends, not where the
+// documents end up. The server creates one dedicated
+// `Quip Import — <date>` folder under it per import and lands every
+// document in that folder (#172), so undoing a bad import is deleting
+// one folder rather than hand-picking documents out of Home. That
+// subfolder is what the status poll names (`destinationFolderId`) and
+// what the completion step's "Open folder" button opens (#174), and
+// it is what `quip-import-target-home` promises the user — Home alone
+// would be a false promise.
 //
 // Mirrors `template_picker_modal.rs` for the modal skeleton (backdrop
 // + `<Show when=visible>` + per-open reset) and `share_dialog.rs` for
@@ -16,7 +26,8 @@
 // mirrors the `UserMeResponse` local-struct pattern in
 // `folder_picker.rs` / `duplicate_dialog.rs` — Phase 1 deliberately
 // skips a destination picker (nesting `FolderPickerDialog` inside
-// this modal risks focus-trap conflicts) and always targets Home.
+// this modal risks focus-trap conflicts), so the parent is always
+// Home.
 //
 // SECURITY: the token field is `type="password"` and its value is
 // never passed to `console.*`/`web_sys::console::*` — only
@@ -191,8 +202,9 @@ pub fn QuipImportWizard(
     // scope for the actual import.
     let selected: RwSignal<HashMap<String, bool>> = RwSignal::new(HashMap::new());
 
-    // Phase 1 state: the destination (always the user's Home folder —
-    // see the module doc comment), the start-in-flight flag, whether
+    // Phase 1 state: the destination *parent* (always the user's Home
+    // folder; the server files the documents into a dedicated subfolder
+    // of it — see the module doc comment), the start-in-flight flag, whether
     // we've moved into the progress step, the latest poll result, and
     // a terminal outcome if the run failed / the token was rejected.
     let (home_folder_id, set_home_folder_id) = signal::<Option<String>>(None);
@@ -317,7 +329,7 @@ pub fn QuipImportWizard(
     };
 
     // Kick off the actual import: persist the checked scope + Home as
-    // the destination, then switch into the progress step and start
+    // the destination parent, then switch into the progress step and start
     // polling. `start`'s failure path reuses the same `error` signal
     // + `quip-import-error` banner the connect step already uses —
     // `ApiClientError::Display` is opaque by construction (see
@@ -875,7 +887,7 @@ fn open_folder_destination(status: &imports::StatusResponse) -> Option<String> {
 ///
 /// The folder view has no route of its own (folders are in-memory state on
 /// the home page), so this goes through the shell's `open_folder` /
-/// `pending_folder` channel: run the home page's registered opener when that
+/// `requested_folder` channel: run the home page's registered opener when that
 /// page is the active outlet, else hand the id over and navigate to `/` so
 /// the mounting page opens it. Home — a plain navigate to `/` — is the
 /// fallback for every case where we have no folder to open, which is exactly
@@ -888,7 +900,7 @@ fn open_import_folder(
         (Some(ctx), Some(folder_id)) => match ctx.open_folder.get_untracked() {
             Some(open) => open.run(folder_id),
             None => {
-                ctx.pending_folder.set(Some(folder_id));
+                ctx.requested_folder.set(folder_id);
                 crate::commands::nav_bridge::go("/");
             }
         },

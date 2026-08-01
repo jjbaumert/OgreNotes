@@ -75,19 +75,58 @@ pub struct ShellCtx {
     /// shell-owned surface (the Quip import wizard's "Open folder") cannot
     /// reach one with a URL. Registered by the home page while it is the
     /// active outlet, exactly like [`Self::home_reset`], and cleared on its
-    /// unmount; a caller that finds it `None` uses [`Self::pending_folder`]
+    /// unmount; a caller that finds it `None` arms [`Self::requested_folder`]
     /// instead.
     pub open_folder: RwSignal<Option<Callback<String>>>,
-    /// #174: the folder id the home page should open on its NEXT mount,
-    /// consumed exactly once.
+    /// #174: the folder the home page should open on its NEXT mount.
     ///
     /// The hand-off for the case [`Self::open_folder`] cannot cover: the home
     /// page is not mounted (the wizard opens from any page, so "Open folder"
     /// can fire from a document), or it is mounted under `/trash` and needs a
-    /// real route change first. The caller sets this and then navigates to
+    /// real route change first. The caller arms this and then navigates to
     /// `/`; the mounting page takes the value and opens that folder instead
-    /// of Home.
-    pub pending_folder: RwSignal<Option<String>>,
+    /// of Home. See [`FolderRequest`] for why it is a type and not a signal.
+    pub requested_folder: FolderRequest,
+}
+
+/// #174: the one-shot "open this folder when the home page next mounts"
+/// channel.
+///
+/// A type rather than a bare `RwSignal<Option<String>>` so that reading and
+/// clearing cannot come apart: [`Self::take`] is the only way to see the
+/// value, and it always empties the slot. A consumer able to *peek* could
+/// read the id, then fail its own work and return without clearing — leaving
+/// the request armed for the next, entirely unrelated Home mount, which would
+/// silently drop the user into a folder no action of theirs asked for, with
+/// nothing connecting the two. Fusing the read to the clear retires that whole
+/// class of leak at the type level instead of by discipline at each call site.
+#[derive(Clone, Copy)]
+pub struct FolderRequest(RwSignal<Option<String>>);
+
+impl FolderRequest {
+    fn new() -> Self {
+        Self(RwSignal::new(None))
+    }
+
+    /// Arm the request: ask the home page to open `folder_id` when it next
+    /// mounts. The caller navigates to `/` right after. A second arm before
+    /// the first is consumed replaces it — the newest ask is the live one.
+    pub fn set(&self, folder_id: String) {
+        self.0.set(Some(folder_id));
+    }
+
+    /// Take the armed request, clearing it in the same step. `None` when
+    /// nothing is armed.
+    ///
+    /// Clearing is not the caller's job and cannot be skipped by an early
+    /// return, a `?`, or an error branch. Consumers should take the request in
+    /// straight-line setup code, *before* any fallible work, so that a mount
+    /// which then fails simply drops it rather than stranding it.
+    pub fn take(&self) -> Option<String> {
+        let mut taken = None;
+        self.0.update(|slot| taken = slot.take());
+        taken
+    }
 }
 
 impl ShellCtx {
@@ -109,7 +148,7 @@ impl ShellCtx {
             show_page_breaks: RwSignal::new(load_bool_pref(PREF_PAGE_BREAKS)),
             home_reset: RwSignal::new(None),
             open_folder: RwSignal::new(None),
-            pending_folder: RwSignal::new(None),
+            requested_folder: FolderRequest::new(),
         }
     }
 }
@@ -186,5 +225,73 @@ pub fn AppShell() -> impl IntoView {
                 on_close=Callback::new(move |_| ctx.quip_import_open.set(false))
             />
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The #174 follow-up regression.** A Home mount consumes the pending
+    /// folder request up front and then does fallible work (`/users/me`, then
+    /// the folder fetch). When that work fails the request is simply dropped —
+    /// it must NOT survive to be picked up by the next, unrelated Home mount,
+    /// which would silently drop the user into a folder with no action of
+    /// theirs connecting the two.
+    ///
+    /// The failed mount is modelled by taking the request and never using it,
+    /// which is exactly what the mount does on its error paths: it takes the
+    /// request in straight-line setup, then its fetches fail and the value is
+    /// dropped.
+    ///
+    /// (`ShellCtx::new` can't be built in a native test — it reads a
+    /// localStorage pref — which is the other reason this channel is its own
+    /// type: the invariant is testable without a browser.)
+    #[test]
+    fn a_mount_that_never_uses_the_request_leaves_nothing_armed() {
+        let request = FolderRequest::new();
+        request.set("folder-quip-import-1".to_string());
+
+        // Mount #1: takes the request, then fails before it can act on it.
+        let taken = request.take();
+        assert_eq!(taken.as_deref(), Some("folder-quip-import-1"));
+        drop(taken);
+
+        // Mount #2 — an ordinary, unrelated visit to Home — must find nothing.
+        assert_eq!(
+            request.take(),
+            None,
+            "a failed mount must not leave a folder request armed for the next one",
+        );
+    }
+
+    /// One request, one mount: consuming it twice cannot open the folder twice
+    /// (a re-mount within a session is routine).
+    #[test]
+    fn a_request_is_consumed_exactly_once() {
+        let request = FolderRequest::new();
+        request.set("f1".to_string());
+
+        assert_eq!(request.take().as_deref(), Some("f1"));
+        assert_eq!(request.take(), None);
+    }
+
+    /// Nothing armed reads as nothing — the ordinary Home visit, which must
+    /// not be perturbed by this channel existing at all.
+    #[test]
+    fn an_unarmed_request_hands_back_nothing() {
+        assert_eq!(FolderRequest::new().take(), None);
+    }
+
+    /// Two "Open folder" clicks before the page mounts: the newest ask wins,
+    /// and the older one does not linger behind it.
+    #[test]
+    fn the_newest_request_replaces_an_unconsumed_older_one() {
+        let request = FolderRequest::new();
+        request.set("older".to_string());
+        request.set("newer".to_string());
+
+        assert_eq!(request.take().as_deref(), Some("newer"));
+        assert_eq!(request.take(), None);
     }
 }

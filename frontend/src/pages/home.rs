@@ -295,6 +295,29 @@ pub fn HomePage() -> impl IntoView {
         });
     });
 
+    // #174: consume any pending "open this folder" request HERE, in
+    // straight-line setup, BEFORE the mount task below is spawned — not at the
+    // point of use inside it.
+    //
+    // Taking it up front is what keeps a *failed* mount from stranding the
+    // request. The mount's fetches (`/users/me`, then the folder) can both
+    // fail transiently; if the request were only consumed on the success path,
+    // a network blip during an "Open folder" navigation would leave it armed
+    // indefinitely, and the next, entirely unrelated visit to Home would
+    // silently open that folder — a "why am I in here?" with no action of the
+    // user's connecting the two. Consumed here, a failed mount just drops it:
+    // the user gets the error banner and no phantom navigation later.
+    //
+    // `FolderRequest::take` clears as it reads, so there is no early return,
+    // `?`, or error branch anywhere below that can skip the clear.
+    let requested_folder = ctx.requested_folder.take();
+    // #174: an explicit Home click while the mount is still fetching is a
+    // NEWER intent than the folder request this mount is carrying. `home_reset`
+    // bumps this tick; the task compares it before descending, and stands down
+    // rather than yanking the user back out of the Home they just asked for.
+    let (home_nav_tick, set_home_nav_tick) = signal(0u32);
+    let mount_nav_tick = home_nav_tick.get_untracked();
+
     // Load user info and home folder on mount.
     {
         let set_folder = set_folder.clone();
@@ -339,13 +362,15 @@ pub fn HomePage() -> impl IntoView {
                             // #174: a shell surface asked for a specific
                             // folder before this page existed (the Quip
                             // import wizard's "Open folder", fired from
-                            // another route). Taken exactly once, and only
-                            // after Home has seeded the trail, so the trail
-                            // reads Home → <folder>.
-                            let mut requested = None;
-                            ctx.pending_folder.update(|p| requested = p.take());
-                            if let Some(folder_id) = requested {
-                                show_folder.run(folder_id);
+                            // another route). The request was already taken
+                            // — and cleared — in setup above; this is the one
+                            // path that *acts* on it, after Home has seeded
+                            // the trail so it reads Home → <folder>. A Home
+                            // click during the fetches supersedes it.
+                            if let Some(folder_id) = requested_folder {
+                                if home_nav_tick.get_untracked() == mount_nav_tick {
+                                    show_folder.run(folder_id);
+                                }
                             }
                         }
                         Err(e) => set_error.set(Some(e.to_string())),
@@ -630,6 +655,11 @@ pub fn HomePage() -> impl IntoView {
     // sidebar).
     let nav_home = use_navigate();
     let home_reset = Callback::new(move |()| {
+        // #174: record the click BEFORE doing anything else. A mount task
+        // still resolving its fetches may be carrying a queued "open this
+        // folder" request; this tick is how it learns the user has since asked
+        // for Home outright, so it stands down instead of overriding them.
+        set_home_nav_tick.update(|t| *t = t.wrapping_add(1));
         let on_root_url = web_sys::window()
             .and_then(|w| w.location().pathname().ok())
             .map(|p| p == "/")
@@ -686,7 +716,7 @@ pub fn HomePage() -> impl IntoView {
     // a folder through it rather than through a route change. Under /trash
     // the URL genuinely has to change first (the route decides which folder
     // this page opens on mount), so that case hands off through
-    // `pending_folder` exactly like a caller on another page would.
+    // `requested_folder` exactly like a caller on another page would.
     let nav_for_folder = use_navigate();
     ctx.open_folder
         .set(Some(Callback::new(move |folder_id: String| {
@@ -697,7 +727,7 @@ pub fn HomePage() -> impl IntoView {
             if on_root_url {
                 show_folder.run(folder_id);
             } else {
-                ctx.pending_folder.set(Some(folder_id));
+                ctx.requested_folder.set(folder_id);
                 nav_for_folder("/", Default::default());
             }
         })));
