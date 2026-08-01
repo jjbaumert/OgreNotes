@@ -107,6 +107,85 @@ async fn sweep_hard_deletes_eligible_doc_and_writes_audit() {
     app.cleanup().await;
 }
 
+/// Regression (#151): the worker is the *other* purge path, and it must
+/// erase images too.
+///
+/// `purge_document` and this sweep are the only two callers of
+/// `hard_delete`, and the worker is the one that runs unattended — a
+/// document nobody purged by hand is destroyed here 30 days after it was
+/// trashed. A fix that landed only on the interactive route would leave
+/// the bug shipping on the path that handles the bulk of the volume, so
+/// this asserts the blob erasure through the worker's own entry point
+/// rather than trusting that both callers share an implementation.
+#[tokio::test]
+async fn sweep_erases_image_blobs_not_just_snapshots() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (_user_id, token) = app.create_user("trash-sweep-blob@test.com").await;
+    let doc_id = app.create_doc(&token, "Trashed With Image", None).await;
+
+    let blob_key = format!("blobs/{doc_id}/b-sweep-1/photo.png");
+    app.s3_client()
+        .put_object()
+        .bucket(&app.bucket)
+        .key(&blob_key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(
+            b"PNG-BYTES-FOR-SWEEP".to_vec(),
+        ))
+        .send()
+        .await
+        .expect("stage the doc's image object");
+
+    let (status, _) = app
+        .json_request(
+            Method::DELETE,
+            &format!("/api/v1/documents/{doc_id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let cutoff = ogrenotes_common::time::now_usec() + 60_000_000;
+    wait_for_gsi(&app, &doc_id, cutoff).await;
+
+    ogrenotes_api::trash_cleanup::sweep(&app.state, cutoff)
+        .await
+        .unwrap();
+
+    assert!(
+        app.state.doc_repo.get(&doc_id).await.unwrap().is_none(),
+        "precondition: the sweep must have purged the doc",
+    );
+
+    // `HeadObject` must report the object gone. A non-404 error is a
+    // panic, not a pass — reading a transport failure as an erasure
+    // would make this test green for the wrong reason.
+    match app
+        .s3_client()
+        .head_object()
+        .bucket(&app.bucket)
+        .key(&blob_key)
+        .send()
+        .await
+    {
+        Ok(_) => panic!(
+            "the worker's purge left the image behind at {blob_key} — \
+             a 'purged' audit row was written while the data survived"
+        ),
+        Err(e) => {
+            let svc = e.into_service_error();
+            assert!(
+                svc.is_not_found(),
+                "head_object({blob_key}) failed for a reason other than 404: {svc:?}"
+            );
+        }
+    }
+
+    app.cleanup().await;
+}
+
 #[tokio::test]
 async fn sweep_dry_run_skips_destructive_ops() {
     common::require_infra!();
