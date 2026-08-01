@@ -1365,6 +1365,8 @@ fn node_type_to_html_tag(nt: NodeType) -> &'static str {
         // special-case in `render_node_html`.
         NodeType::DocMention => "a",
         NodeType::Mermaid => "div",
+        // temporary — replaced by the deck export task
+        NodeType::Slide | NodeType::Frame => "div",
     }
 }
 
