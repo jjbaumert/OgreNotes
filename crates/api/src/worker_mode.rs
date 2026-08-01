@@ -46,6 +46,7 @@ use ogrenotes_storage::models::DocType;
 use ogrenotes_storage::repo::doc_repo::DocRepo;
 use ogrenotes_storage::repo::folder_repo::FolderRepo;
 use ogrenotes_storage::repo::import_repo::ImportRepo;
+use ogrenotes_storage::repo::user_repo::UserRepo;
 use ogrenotes_storage::s3::S3Client;
 use ogrenotes_worker::{ClaimedJob, Job, JobQueue, RetryOutcome};
 use tokio::sync::watch;
@@ -69,6 +70,11 @@ pub struct WorkerCtx {
     /// Quip import manifest repo — the durable, token-free checkpoint the
     /// inventory handler reads scope from and writes FOLDER#/THREAD# rows to.
     import_repo: Arc<ImportRepo>,
+    /// Read-only here, and used for exactly one thing: turning a Quip
+    /// person's email into an OgreNotes user id so an imported `@mention`
+    /// points at a real account ([`PersonDirectory`]). Nothing on this path
+    /// writes a user, and no email it reads is ever logged or stored.
+    user_repo: Arc<UserRepo>,
     /// Where the per-import Quip token lives (SSM in prod, in-process in
     /// dev). The `StartQuipImport` trigger is token-free; the handler
     /// re-reads the token from here and never logs it.
@@ -84,10 +90,11 @@ impl WorkerCtx {
         folder_repo: Arc<FolderRepo>,
         s3: S3Client,
         import_repo: Arc<ImportRepo>,
+        user_repo: Arc<UserRepo>,
         quip_token_store: Arc<dyn TokenStore>,
         quip_base: Option<String>,
     ) -> Self {
-        Self { doc_repo, folder_repo, s3, import_repo, quip_token_store, quip_base }
+        Self { doc_repo, folder_repo, s3, import_repo, user_repo, quip_token_store, quip_base }
     }
 }
 
@@ -213,11 +220,13 @@ pub async fn run(config: AppConfig) {
         ))
     };
 
+    let user_repo = Arc::new(UserRepo::new(dynamo.clone()));
     let ctx = Arc::new(WorkerCtx::new(
         Arc::new(DocRepo::new(dynamo.clone(), s3.clone())),
         Arc::new(FolderRepo::new(dynamo)),
         s3,
         import_repo,
+        user_repo,
         quip_token_store,
         None,
     ));
@@ -1340,6 +1349,133 @@ impl From<QuipError> for ThreadImportError {
     }
 }
 
+/// How many Quip person ids ride in one `/1/users/?ids=` request.
+///
+/// Quip's ids are short, so 50 of them is a query string of a few hundred
+/// bytes — comfortably inside any URL limit — while keeping a
+/// mention-heavy import to a single-digit number of requests against a
+/// **50 requests/minute** budget.
+const USER_LOOKUP_BATCH: usize = 50;
+
+/// Quip person id → OgreNotes user id, resolved once per import.
+///
+/// **This exists to make mention resolution cost O(distinct people), not
+/// O(mentions).** Quip's Automation API allows 50 requests per minute per
+/// token; a naive per-mention lookup would spend an import's whole budget
+/// on a single chatty document and then stall every remaining thread. So
+/// lookups are batched ([`USER_LOOKUP_BATCH`]) *and* memoized for the
+/// lifetime of the content pass: the tenth document that mentions the same
+/// colleague costs nothing.
+///
+/// **Negative answers are cached too.** An outside collaborator with no
+/// OgreNotes account is the common case in a real migration, and re-asking
+/// Quip about them once per document is the same rate-limit hazard as
+/// re-asking about a match.
+///
+/// **Emails never leave this type.** An address is read from Quip, handed
+/// straight to `UserRepo::get_by_email`, and dropped; what is cached, and
+/// all that any caller can observe, is an OgreNotes user id.
+#[derive(Default)]
+pub struct PersonDirectory {
+    /// `Some(user_id)` = matched. `None` = looked up, decided, no match.
+    /// Absent = not yet known (or a lookup failed, so it stays retryable).
+    known: std::collections::HashMap<String, Option<String>>,
+}
+
+impl PersonDirectory {
+    /// Resolve `wanted` Quip person ids to OgreNotes user ids, consulting
+    /// the cache first and asking Quip only about the remainder.
+    ///
+    /// **Infallible on purpose.** Every failure — Quip erroring, a person
+    /// Quip will not show us, a profile with no visible email, a DynamoDB
+    /// blip on the email pointer — yields *no entry* for that person, which
+    /// [`ogrenotes_collab::import_quip::resolve_person_mentions`] turns into
+    /// a named plain-text placeholder. A mention we cannot resolve must
+    /// never cost the reader the document it appears in, so there is no
+    /// error for the caller to accidentally propagate.
+    ///
+    /// That includes a **401**, which [`sideload_images`] by contrast
+    /// propagates. The asymmetry is deliberate: an image is content the
+    /// reader loses outright, while a mention degrades to a name that is
+    /// still readable. The cost is that a credential dying exactly here
+    /// leaves this one thread checkpointed with named placeholders (a
+    /// re-run skips a `ContentDone` thread), and the run still halts on the
+    /// next thread's `thread_html` fetch. One thread's chips is the smaller
+    /// loss, and it is the behavior the feature was specified with.
+    async fn resolve(
+        &mut self,
+        ctx: &WorkerCtx,
+        import_id: &str,
+        client: &QuipClient,
+        token: &QuipToken,
+        wanted: &[String],
+    ) -> std::collections::HashMap<String, String> {
+        let missing: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            wanted
+                .iter()
+                .filter(|id| !self.known.contains_key(*id) && seen.insert((*id).clone()))
+                .cloned()
+                .collect()
+        };
+
+        for chunk in missing.chunks(USER_LOOKUP_BATCH) {
+            let profiles = match client.users(token, chunk).await {
+                Ok(profiles) => profiles,
+                Err(e) => {
+                    // Class only, never the error's own text — `QuipError`
+                    // carries Quip's raw body and reqwest's URL. Left
+                    // *uncached* so a later thread can try again.
+                    tracing::warn!(
+                        import_id,
+                        people = chunk.len(),
+                        error = %safe_quip_reason(&e),
+                        "quip content: person lookup failed; these mentions degrade to names",
+                    );
+                    continue;
+                }
+            };
+            for id in chunk {
+                // Quip did not return this person (no such user, or the
+                // token cannot see them). No retry widens that, so decide it.
+                let Some(profile) = profiles.get(id) else {
+                    self.known.insert(id.clone(), None);
+                    continue;
+                };
+                // EXACT email only. Matching on display name is what the
+                // design's Phase-3 identity confirm gate exists to prevent:
+                // two people called "Joel" would silently swap mentions.
+                let Some(email) = profile.emails.iter().find(|e| !e.trim().is_empty()) else {
+                    self.known.insert(id.clone(), None);
+                    continue;
+                };
+                match ctx.user_repo.get_by_email(email).await {
+                    Ok(found) => {
+                        self.known.insert(id.clone(), found.map(|u| u.user_id));
+                    }
+                    // Deliberately logged WITHOUT the error's text: the
+                    // lookup key is an email address, and a DynamoDB error
+                    // message is not something this code can prove is free
+                    // of it. Left uncached — this one is genuinely transient.
+                    Err(_) => tracing::warn!(
+                        import_id,
+                        "quip content: identity lookup failed for a mention; \
+                         it degrades to a name and stays retryable",
+                    ),
+                }
+            }
+        }
+
+        wanted
+            .iter()
+            .filter_map(|id| {
+                let user_id = self.known.get(id)?.clone()?;
+                Some((id.clone(), user_id))
+            })
+            .collect()
+    }
+}
+
 /// Where an imported thread's document is filed.
 ///
 /// `THREAD#` rows carry **Quip** folder ids; documents need OgreNotes ones.
@@ -1528,6 +1664,10 @@ async fn run_content_pass(
     // Reset by any thread that reaches a *decided* outcome — imported,
     // skipped, or given up on. Only unresolved failures accumulate.
     let mut consecutive_failures: usize = 0;
+    // Person-mention identities, memoized across the whole manifest: the
+    // same handful of colleagues is mentioned throughout a real import, and
+    // Quip's rate limit does not tolerate re-asking per document.
+    let mut people = PersonDirectory::default();
 
     for thread in &threads {
         // A panic in the per-thread work is contained HERE, not at
@@ -1549,7 +1689,7 @@ async fn run_content_pass(
         // [`MAX_CONSECUTIVE_THREAD_FAILURES`] trips and retries the job
         // rather than condemning the whole manifest — the two guards compose.
         let outcome = std::panic::AssertUnwindSafe(import_one_thread(
-            ctx, import_id, owner_id, client, token, thread, &folders,
+            ctx, import_id, owner_id, client, token, thread, &folders, &mut people,
         ))
         .catch_unwind()
         .await
@@ -1765,6 +1905,11 @@ async fn run_content_pass(
 ///
 /// `pub` for the same reason [`execute_import_docx`] is: it's the test seam
 /// for driving one thread without a consumer loop.
+///
+/// `people` is the pass-wide identity cache for person mentions; it is
+/// `&mut` because resolving one thread's mentions makes the next thread's
+/// cheaper (see [`PersonDirectory`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn import_one_thread(
     ctx: &WorkerCtx,
     import_id: &str,
@@ -1773,6 +1918,7 @@ pub async fn import_one_thread(
     token: &QuipToken,
     thread: &ThreadRow,
     folders: &FolderMapping,
+    people: &mut PersonDirectory,
 ) -> Result<(), ThreadImportError> {
     use ogrenotes_storage::models::import_inventory::{
         PendingLinkItem, SecMapRow, UnresolvedRow, SECMAP_CHUNK_ENTRIES,
@@ -1877,6 +2023,36 @@ pub async fn import_one_thread(
     )
     .await?;
     ogrenotes_collab::blob_ref::set_image_srcs(&quip_doc.doc, &src_updates);
+
+    // 6b. Give every person mention an identity — or a name.
+    //
+    //     The walker leaves each `<control>`-wrapped mention as an
+    //     unfinished `Mention` leaf carrying the *Quip* person id; only a
+    //     network + DynamoDB round trip can turn that into an OgreNotes
+    //     user, so it happens here. `resolve_person_mentions` is total over
+    //     the document, which is why this runs unconditionally on any
+    //     thread that had mentions: a chip that reached the snapshot still
+    //     pointing at a Quip id would be a mention of nobody.
+    //
+    //     This must land BEFORE the snapshot is taken in step 7.
+    let mention_count = quip_doc.person_mentions.len();
+    if mention_count > 0 {
+        let wanted: Vec<String> =
+            quip_doc.person_mentions.iter().map(|m| m.quip_user_id.clone()).collect();
+        let resolved = people.resolve(ctx, import_id, client, token, &wanted).await;
+        let degraded =
+            ogrenotes_collab::import_quip::resolve_person_mentions(&quip_doc.doc, &resolved);
+        // Counts only. A mention's *subject* — their name, and above all
+        // the email the match was made on — is not something this worker
+        // writes to a log or to any durable row.
+        tracing::info!(
+            import_id,
+            thread = %thread.quip_thread_id,
+            mentions = mention_count,
+            degraded,
+            "quip content: person mentions resolved",
+        );
+    }
 
     // 7. Persist through the ordinary document-creation path, preserving
     //    Quip's timestamps so an old document doesn't arrive looking new.

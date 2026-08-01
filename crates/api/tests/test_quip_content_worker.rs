@@ -18,7 +18,7 @@ mod common;
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use ogrenotes_api::worker_mode::{
-    build_folder_mapping, execute_start_quip_import, import_one_thread, WorkerCtx,
+    build_folder_mapping, execute_start_quip_import, import_one_thread, PersonDirectory, WorkerCtx,
 };
 use ogrenotes_quip_import::{QuipClient, QuipToken};
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
@@ -142,6 +142,7 @@ fn worker_ctx_with_quip(app: &common::TestApp, quip_base: String) -> WorkerCtx {
         app.state.folder_repo.clone(),
         app.state.doc_repo.s3().clone(),
         app.state.import_repo.clone(),
+        app.state.user_repo.clone(),
         app.state.quip_token_store.clone(),
         Some(quip_base),
     )
@@ -522,9 +523,18 @@ async fn retry_after_a_post_create_failure_creates_no_second_document() {
     let folders = build_folder_mapping(&ctx, &import_id, &record).await.unwrap();
     let client = QuipClient::new(Some(server.uri()));
     let token = QuipToken::new("tok".into());
-    import_one_thread(&ctx, &import_id, "owner1", &client, &token, &retry_row, &folders)
-        .await
-        .expect("the retry must complete, not fail on the already-created document");
+    import_one_thread(
+        &ctx,
+        &import_id,
+        "owner1",
+        &client,
+        &token,
+        &retry_row,
+        &folders,
+        &mut PersonDirectory::default(),
+    )
+    .await
+    .expect("the retry must complete, not fail on the already-created document");
 
     // THE ASSERTION: exactly one document for this thread, still the same one.
     let after = app.state.doc_repo.query_docs_by_owner("owner1").await.unwrap();
@@ -1277,4 +1287,350 @@ async fn a_sustained_outage_still_trips_the_breaker_on_the_second_run() {
         0,
         "no Quip call may be spent on threads past the breaking point",
     );
+}
+
+// ─── person mentions: a Quip @person becomes a real OgreNotes mention ───
+//
+// The markup below is copied verbatim from a real staged `/2` thread body.
+// That matters more here than anywhere else in this file: a person mention
+// and a folder link reach the walker as anchors at *identically shaped* Quip
+// URLs, and the only thing separating them is the `<control>` wrapper. A
+// hand-simplified fixture is precisely the tool that cannot notice when the
+// wrapper stops surviving the sanitizer — which is the bug these tests pin.
+
+/// One document carrying all three shapes: a `<control>`-wrapped person
+/// mention, a **bare** folder link, and an empty `<control>` (a Quip date,
+/// which the client renders and the export therefore does not carry).
+const TM_HTML: &str = concat!(
+    r#"<p id="sec-m">Assign tasks by mentioning someone: "#,
+    r#"<control data-remapped="true" id="SSfACAGTvYT">"#,
+    r#"<a href="https://quip.com/XYJAEA0Sgev">Joel</a></control>.</p>"#,
+    r#"<p>When you're done, check out your folder: "#,
+    r#"<a href="https://quip.com/JAdAOAxYGcQ">Family</a></p>"#,
+    r#"<p>Complete by <control data-remapped="true" id="SSfACAsTxeJ"></control>.</p>"#,
+);
+
+/// The Quip person's id, as it appears in the mention anchor's href.
+const QUIP_PERSON_ID: &str = "XYJAEA0Sgev";
+
+/// The email Quip reports for that person. Whether an OgreNotes account
+/// exists for it is the single variable between the two tests below — and
+/// this string must never appear in anything the import writes.
+const QUIP_PERSON_EMAIL: &str = "joel.quip.person@example.com";
+
+/// A wiremock Quip serving one folder with one mention-bearing thread, plus
+/// the `/1/users/` batch lookup answering with the person's real profile.
+async fn quip_mention_server() -> MockServer {
+    quip_mention_server_with_users(ResponseTemplate::new(200).set_body_json(
+        serde_json::json!({ QUIP_PERSON_ID: {"name": "Joel", "emails": [QUIP_PERSON_EMAIL]} }),
+    ))
+    .await
+}
+
+/// [`quip_mention_server`] with the `/1/users/` response under the caller's
+/// control. Wiremock resolves mocks in **mount order**, so a later mock
+/// cannot override an earlier one — the response has to be chosen here.
+async fn quip_mention_server_with_users(users_response: ResponseTemplate) -> MockServer {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/1/folders/"))
+        .and(query_param("ids", "mroot"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "mroot": {
+                "folder": {"id": "mroot", "title": "Root"},
+                "children": [ {"thread_id": "tm"} ]
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/1/threads/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tm": {"thread": {"id": "tm", "title": "Mentions", "type": "document", "updated_usec": 999}}
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/2/threads/tm/html"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(TM_HTML)))
+        .mount(&server)
+        .await;
+
+    // The person lookup: Quip keys the batch response by the requested id.
+    Mock::given(method("GET"))
+        .and(path("/1/users/"))
+        .respond_with(users_response)
+        .mount(&server)
+        .await;
+
+    server
+}
+
+/// [`seed_scoping_import`] scoped to the mention fixture's root folder.
+async fn seed_mention_import(app: &common::TestApp, owner: &str) -> String {
+    let import_id = format!("imp-{}", nanoid::nanoid!(8));
+    let now = ogrenotes_common::time::now_usec();
+    let record = ImportRecord {
+        import_id: import_id.clone(),
+        owner_id: owner.to_string(),
+        status: ImportStatus::Scoping,
+        phase: 0,
+        quip_user_id: None,
+        target_folder_id: Some("target-folder".to_string()),
+        import_folder_id: None,
+        selected_roots: vec!["mroot".to_string()],
+        created_at: now,
+        updated_at: now,
+    };
+    app.state.import_repo.create(&record).await.expect("seed import record");
+    app.state
+        .quip_token_store
+        .put(&import_id, &QuipToken::new("tok".into()))
+        .await
+        .expect("seed token");
+    import_id
+}
+
+/// The stored document, rendered back to HTML — the shape a reader sees.
+async fn imported_html(app: &common::TestApp, doc_id: &str) -> String {
+    let snapshot = app.state.doc_repo.load_snapshot(doc_id).await.unwrap().expect("snapshot");
+    let doc = ogrenotes_collab::snapshot::deserialize(&snapshot).expect("decode snapshot");
+    ogrenotes_collab::export::to_html(doc.inner())
+}
+
+#[tokio::test]
+async fn a_person_mention_matching_an_ogrenotes_email_becomes_a_real_mention() {
+    common::require_infra!();
+    let server = quip_mention_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    // The OgreNotes account whose email is the one Quip reports.
+    let (matched_user_id, _) = app.create_user(QUIP_PERSON_EMAIL).await;
+    let import_id = seed_mention_import(&app, "owner1").await;
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let doc_id = doc_id_for(&app, &import_id, "tm").await.expect("tm imported");
+    let html = imported_html(&app, &doc_id).await;
+
+    // THE ASSERTION: a real mention of the matched OgreNotes user.
+    assert!(
+        html.contains(&format!("data-user-id=\"{matched_user_id}\"")),
+        "the mention must reference the matched OgreNotes user: {html}",
+    );
+    assert!(html.contains("class=\"mention\""), "rendered as a mention chip: {html}");
+    assert!(html.contains("Joel"), "the person's name survives: {html}");
+    assert!(
+        !html.contains(QUIP_PERSON_ID),
+        "the Quip person id must not survive into the document: {html}",
+    );
+
+    // The bare folder link in the same document is untouched — still the
+    // ordinary intra-Quip document-link placeholder.
+    assert!(html.contains("doc-mention"), "the folder link is still a doc link: {html}");
+    let unresolved = app.state.import_repo.list_unresolved(&import_id).await.unwrap();
+    let links: Vec<String> = unresolved
+        .iter()
+        .flat_map(|u| u.links.iter().map(|l| l.target_quip_thread_id.clone()))
+        .collect();
+    assert_eq!(
+        links,
+        vec!["JAdAOAxYGcQ".to_string()],
+        "only the bare anchor may be recorded as a pending document link",
+    );
+
+    // The empty `<control>` left its sentence alone.
+    assert!(html.contains("Complete by ."), "{html}");
+
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ImportStatus::Succeeded);
+}
+
+#[tokio::test]
+async fn an_unmatched_person_mention_degrades_to_the_name_and_the_import_succeeds() {
+    common::require_infra!();
+    let server = quip_mention_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    // No OgreNotes account carries `QUIP_PERSON_EMAIL` — but one carries the
+    // same *display name*. Matching is exact-email-only precisely so this
+    // person is NOT mistaken for the Quip "Joel": a mention attributed to
+    // the wrong human is worse than an unresolved one, which is why the
+    // design gates fuzzy identity behind a Phase-3 confirm step.
+    let (decoy_user_id, _) =
+        app.create_user_with_name("joel.someone.else@example.com", "Joel").await;
+    let import_id = seed_mention_import(&app, "owner1").await;
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let threads = app.state.import_repo.list_threads(&import_id).await.unwrap();
+    let tm = threads.iter().find(|t| t.quip_thread_id == "tm").unwrap();
+    assert_eq!(tm.state, ThreadState::ContentDone, "an unresolvable mention never fails a thread");
+
+    let doc_id = tm.ogre_doc_id.clone().expect("tm imported");
+    let html = imported_html(&app, &doc_id).await;
+
+    // THE ASSERTION: the person's NAME, not a mention of nobody and not a
+    // "Missing document" chip.
+    assert!(html.contains("@Joel"), "the person's name survives as text: {html}");
+    assert!(
+        !html.contains("class=\"mention\""),
+        "no mention chip may be emitted without a real user: {html}",
+    );
+    assert!(!html.contains("data-user-id"), "{html}");
+    assert!(!html.contains(QUIP_PERSON_ID), "{html}");
+    assert!(
+        !html.contains(&decoy_user_id),
+        "a same-name account with a different email must NEVER be matched: {html}",
+    );
+    // The only doc-mention in the document is the *folder link*; the person
+    // must not have become one.
+    assert_eq!(html.matches("doc-mention").count(), 1, "{html}");
+    assert!(html.contains("Family"), "the folder link is untouched: {html}");
+
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ImportStatus::Succeeded, "the import still succeeds");
+}
+
+/// **Security spine.** Resolving a mention is the first thing in the import
+/// worker that handles an email address. It may reach `UserRepo` and nothing
+/// else: not the stored document, not the report, not a thread's reason.
+///
+/// Run over both outcomes — matched and unmatched — because they take
+/// different code paths through the resolver, and the unmatched one is the
+/// one that writes a fallback string.
+#[tokio::test]
+async fn no_email_reaches_the_document_the_report_or_a_thread_reason() {
+    common::require_infra!();
+    for matched in [true, false] {
+        let server = quip_mention_server().await;
+        let app = common::TestApp::new_with_quip_base(server.uri()).await;
+        if matched {
+            app.create_user(QUIP_PERSON_EMAIL).await;
+        }
+        let import_id = seed_mention_import(&app, "owner1").await;
+
+        let ctx = worker_ctx_with_quip(&app, server.uri());
+        execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+        let doc_id = doc_id_for(&app, &import_id, "tm").await.expect("tm imported");
+
+        // 1. The document itself — both the rendered form and the raw CRDT
+        //    bytes, so an email hiding in an attribute is caught too.
+        let html = imported_html(&app, &doc_id).await;
+        assert!(!html.contains(QUIP_PERSON_EMAIL), "matched={matched}: {html}");
+        let snapshot = app.state.doc_repo.load_snapshot(&doc_id).await.unwrap().unwrap();
+        assert!(
+            !String::from_utf8_lossy(&snapshot).contains(QUIP_PERSON_EMAIL),
+            "matched={matched}: an email must not be stored in the snapshot",
+        );
+
+        // 2. The import report — counters and every note's detail.
+        if let Some(report) = app.state.import_repo.get_report(&import_id).await.unwrap() {
+            for note in &report.notes {
+                assert!(
+                    !note.detail.contains(QUIP_PERSON_EMAIL)
+                        && !note.kind.contains(QUIP_PERSON_EMAIL),
+                    "matched={matched}: an email reached a report note: {note:?}",
+                );
+            }
+        }
+
+        // 3. Every thread row's user-visible reason.
+        for thread in app.state.import_repo.list_threads(&import_id).await.unwrap() {
+            assert!(
+                !thread.reason.unwrap_or_default().contains(QUIP_PERSON_EMAIL),
+                "matched={matched}: an email reached a thread reason",
+            );
+        }
+    }
+}
+
+/// The rate-limit property: Quip allows 50 requests/minute per token, so the
+/// same person mentioned across many documents must cost **one** lookup for
+/// the whole import, not one per thread — and a batch of people must cost one
+/// request, not one each.
+#[tokio::test]
+async fn person_lookups_are_cached_across_threads_and_batched_within_one() {
+    common::require_infra!();
+    let server = MockServer::start().await;
+    // Three threads; the same two people mentioned in each.
+    let body = concat!(
+        r#"<p><control><a href="https://quip.com/PERSONA">Ann</a></control> and "#,
+        r#"<control><a href="https://quip.com/PERSONB">Bob</a></control></p>"#,
+    );
+    Mock::given(method("GET"))
+        .and(path("/1/folders/"))
+        .and(query_param("ids", "mroot"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "mroot": {
+                "folder": {"id": "mroot", "title": "Root"},
+                "children": [ {"thread_id": "x1"}, {"thread_id": "x2"}, {"thread_id": "x3"} ]
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/1/threads/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "x1": {"thread": {"id": "x1", "title": "A", "type": "document", "updated_usec": 1}},
+            "x2": {"thread": {"id": "x2", "title": "B", "type": "document", "updated_usec": 2}},
+            "x3": {"thread": {"id": "x3", "title": "C", "type": "document", "updated_usec": 3}}
+        })))
+        .mount(&server)
+        .await;
+    for t in ["x1", "x2", "x3"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/2/threads/{t}/html")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(body)))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/1/users/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "PERSONA": {"name": "Ann", "emails": ["ann.quip@example.com"]},
+            "PERSONB": {"name": "Bob", "emails": ["bob.quip@example.com"]}
+        })))
+        .mount(&server)
+        .await;
+
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_mention_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    // THE ASSERTION: six mentions over three documents, one Quip request.
+    assert_eq!(
+        hits(&server, "/1/users/").await,
+        1,
+        "two distinct people across three threads must cost exactly one batched lookup",
+    );
+}
+
+/// A Quip person lookup that fails outright must not cost the reader the
+/// document: the mentions degrade to names and the import completes.
+#[tokio::test]
+async fn a_failing_person_lookup_degrades_the_mention_without_failing_the_thread() {
+    common::require_infra!();
+    let server = quip_mention_server_with_users(ResponseTemplate::new(500)).await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    // The account DOES exist — the mention is unresolvable only because the
+    // Quip lookup failed, which is what makes this a degradation test rather
+    // than a no-match test.
+    app.create_user(QUIP_PERSON_EMAIL).await;
+    let import_id = seed_mention_import(&app, "owner1").await;
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let threads = app.state.import_repo.list_threads(&import_id).await.unwrap();
+    let tm = threads.iter().find(|t| t.quip_thread_id == "tm").unwrap();
+    assert_eq!(tm.state, ThreadState::ContentDone, "a lookup failure never fails the thread");
+    let html = imported_html(&app, &tm.ogre_doc_id.clone().unwrap()).await;
+    assert!(html.contains("@Joel"), "degraded to the name: {html}");
+    assert!(!html.contains("class=\"mention\""), "{html}");
 }
