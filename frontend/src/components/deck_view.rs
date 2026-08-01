@@ -27,9 +27,15 @@ use wasm_bindgen::JsCast;
 
 use crate::editor::model::{generate_block_id, Fragment, Node, NodeType};
 use crate::editor::state::EditorState;
-use crate::presentation::model::{deck_from_doc, deck_to_doc, Deck, DeckSlide};
+use crate::presentation::geometry::{self, Axis, Corner, DragKind, Guide};
+use crate::presentation::model::{deck_from_doc, deck_to_doc, Deck, DeckFrame, DeckSlide, FrameRole, Rect};
 use crate::presentation::presets::{instantiate, LayoutPreset, LAYOUT_PRESETS};
 use crate::presentation::themes::{theme_class, DECK_THEMES};
+
+/// Snap-attraction distance in normalized (0..1) slide fractions —
+/// how close a frame edge/center has to get to a guide line before
+/// `geometry::snap` pulls it the rest of the way.
+const SNAP_THRESHOLD: f64 = 0.01;
 
 const BLANK_LAYOUT_ID: &str = "blank";
 
@@ -134,6 +140,76 @@ fn find_slide_index(slides: &[DeckSlide], block_id: &str) -> Option<usize> {
     slides.iter().position(|s| s.block_id == block_id)
 }
 
+// ─── Frame mutations (Task 10) ─────────────────────────────────
+//
+// The frame analogue of the slide mutations above: pure functions
+// over `&mut DeckSlide`, kept out of the component closure so drag
+// commit / delete / duplicate / add are unit-testable without a
+// reactive runtime. Every one of them resolves its target frame by
+// `block_id` (never a captured index) for the same reason
+// `find_slide_index` does — see that function's doc comment.
+
+/// Geometry + seed content for the "Add text frame" toolbar button:
+/// `(0.3, 0.3, 0.4, 0.2)` with a single empty paragraph, per
+/// `design/presentations.md`.
+const TEXT_FRAME_RECT: (f64, f64, f64, f64) = (0.3, 0.3, 0.4, 0.2);
+
+/// Rect for a paste-created frame: the same size as
+/// `TEXT_FRAME_RECT`, but centered on the slide rather than placed at
+/// a fixed offset — the canvas keymap matrix specifies paste creates
+/// a new **centered** frame, distinct from the toolbar button's fixed
+/// placement.
+fn centered_text_frame_rect() -> Rect {
+    let (_, _, w, h) = TEXT_FRAME_RECT;
+    Rect::clamped(0.5 - w / 2.0, 0.5 - h / 2.0, w, h)
+}
+
+/// Resolve a frame's *current* index within `frames` by its
+/// `block_id` — the frame analogue of `find_slide_index`, and for the
+/// same reason: an index captured at gesture-start (pointerdown, or
+/// the moment a keymap action reads `selected_frame`) can go stale if
+/// a concurrent remote edit reorders or deletes a frame before the
+/// gesture commits.
+fn find_frame_index(frames: &[DeckFrame], block_id: &str) -> Option<usize> {
+    frames.iter().position(|f| f.block_id == block_id)
+}
+
+/// Insert a fresh frame into `slide`, placed above every existing
+/// frame (`z` = current max + 1, so a newly added frame never renders
+/// underneath earlier ones), and return its new `block_id`.
+fn add_frame(slide: &mut DeckSlide, rect: Rect, role: FrameRole, content: Fragment) -> String {
+    let z = slide.frames.iter().map(|f| f.z).max().map_or(0, |m| m + 1);
+    let block_id = generate_block_id();
+    slide.frames.push(DeckFrame { block_id: block_id.clone(), rect, z, role, content });
+    block_id
+}
+
+/// Remove the frame `block_id` from `slide`. A no-op if it's already
+/// gone (e.g. a concurrent remote delete raced this one, or a stale
+/// double-fire of a delete keymap action).
+fn delete_frame(slide: &mut DeckSlide, block_id: &str) {
+    if let Some(idx) = find_frame_index(&slide.frames, block_id) {
+        slide.frames.remove(idx);
+    }
+}
+
+/// Clone the frame `block_id` and insert the copy right after it,
+/// with a fresh `blockId` (same reasoning as `duplicate_slide` — a
+/// duplicate that kept the source id would collide with it in yrs's
+/// `find_match`) and nudged slightly so it's visibly distinct from
+/// its source instead of sitting exactly on top of it. Returns the
+/// duplicate's new `block_id`; `None` if `block_id` isn't found.
+fn duplicate_frame(slide: &mut DeckSlide, block_id: &str) -> Option<String> {
+    let idx = find_frame_index(&slide.frames, block_id)?;
+    let mut dup = slide.frames[idx].clone();
+    dup.block_id = generate_block_id();
+    dup.rect = geometry::nudge(dup.rect, 0.02, 0.02);
+    dup.z = slide.frames.iter().map(|f| f.z).max().map_or(0, |m| m + 1);
+    let new_id = dup.block_id.clone();
+    slide.frames.insert(idx + 1, dup);
+    Some(new_id)
+}
+
 // ─── Read-only frame content rendering ─────────────────────────
 //
 // Mirrors `diff_block_view.rs`'s block-type match: paragraphs as
@@ -199,7 +275,13 @@ fn render_frame_content(content: &Fragment) -> Vec<AnyView> {
 /// markup shrunk with `transform: scale()`, per
 /// `style/presentation.css`'s `.deck-slide-thumb__scaler` comment).
 fn render_deck_canvas(slide: &DeckSlide, theme: &str) -> AnyView {
-    let mut frames: Vec<_> = slide.frames.iter().collect();
+    // `role=notes` frames are never positioned on the canvas (design
+    // doc, "Canvas keymap matrix" section) — they render only in the
+    // collapsed notes drawer below the active canvas. This shared
+    // renderer backs both the slide-strip thumbnails and (indirectly,
+    // by the same filtering rule applied inline below) the active
+    // canvas, so a notes frame never leaks into a thumbnail either.
+    let mut frames: Vec<_> = slide.frames.iter().filter(|f| f.role == FrameRole::Content).collect();
     frames.sort_by_key(|f| f.z);
     let canvas_class = format!("deck-canvas {}", theme_class(theme));
     view! {
@@ -294,6 +376,38 @@ pub fn DeckView(
     // moment each move actually needs it (see that function's doc
     // comment).
     let (dragging_block_id, set_dragging_block_id) = signal::<Option<String>>(None);
+
+    // ─── Frame drag/resize state (Task 10) ─────────────────
+    //
+    // Mirrors the slide-strip drag hardening above: the gesture
+    // tracks the dragged frame's `block_id` and its rect *as it stood
+    // at pointerdown*, never a captured index and never an
+    // accumulated delta. `frame_drag` is the gesture descriptor;
+    // `drag_preview`/`drag_guides` are the transient, per-pointermove
+    // values the canvas renders from — the deck model itself is only
+    // written once, at pointerup (`persist()` is one yrs write per
+    // gesture, not per mousemove).
+    #[derive(Clone)]
+    struct FrameDrag {
+        block_id: String,
+        kind: DragKind,
+        start_client_x: f64,
+        start_client_y: f64,
+        start_rect: Rect,
+    }
+    let (frame_drag, set_frame_drag) = signal::<Option<FrameDrag>>(None);
+    let (drag_preview, set_drag_preview) = signal::<Option<Rect>>(None);
+    let (drag_guides, set_drag_guides) = signal::<Vec<Guide>>(Vec::new());
+    let canvas_ref = NodeRef::<leptos::html::Div>::new();
+    // Arrow-key nudges apply directly to `deck` on every keydown (for
+    // instant feedback — the deltas are tiny, no transient-signal
+    // indirection needed the way pixel-drag has), but `persist()` is
+    // coalesced to fire once on keyup rather than once per repeat
+    // event a held-down arrow key generates. This flag tracks whether
+    // any nudge happened since the last persist so an unrelated keyup
+    // (releasing Shift, or any other key) doesn't trigger a spurious
+    // write.
+    let (nudge_dirty, set_nudge_dirty) = signal(false);
 
     // ─── Persist helper ────────────────────────────────────
     //
@@ -391,6 +505,308 @@ pub fn DeckView(
         let val = event_target_value(&ev);
         deck.update(|d| d.theme = val);
         persist();
+    };
+
+    let add_text_frame = move |_: web_sys::MouseEvent| {
+        if readonly {
+            return;
+        }
+        let idx = active_slide.get_untracked();
+        let (x, y, w, h) = TEXT_FRAME_RECT;
+        let content = Fragment::from(vec![Node::element_with_content(NodeType::Paragraph, Fragment::empty())]);
+        let mut new_id: Option<String> = None;
+        deck.update(|d| {
+            if let Some(slide) = d.slides.get_mut(idx) {
+                new_id = Some(add_frame(slide, Rect::clamped(x, y, w, h), FrameRole::Content, content));
+            }
+        });
+        if let Some(id) = new_id {
+            set_selected_frame.set(Some(id));
+            persist();
+        }
+    };
+
+    // ─── Frame drag/resize (Task 10) ────────────────────────
+    //
+    // Shared by the frame body (`DragKind::Move`, on:pointerdown on
+    // `.deck-frame`) and each of the four corner handles
+    // (`DragKind::Resize(corner)`, on:pointerdown on
+    // `.deck-frame-handle`). Both call this with their own `kind`;
+    // `ev.stop_propagation()` on a handle's own pointerdown keeps a
+    // handle-press from *also* bubbling into the frame's own
+    // pointerdown and starting a second, conflicting Move gesture.
+    let start_frame_drag = move |block_id: String, kind: DragKind, ev: web_sys::PointerEvent| {
+        if readonly {
+            return;
+        }
+        ev.stop_propagation();
+        if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+            let _ = el.set_pointer_capture(ev.pointer_id());
+        }
+        let idx = active_slide.get_untracked();
+        let Some(start_rect) = deck.with_untracked(|d| {
+            d.slides
+                .get(idx)
+                .and_then(|s| s.frames.iter().find(|f| f.block_id == block_id))
+                .map(|f| f.rect)
+        }) else {
+            return;
+        };
+        set_selected_frame.set(Some(block_id.clone()));
+        set_drag_guides.set(Vec::new());
+        set_drag_preview.set(Some(start_rect));
+        set_frame_drag.set(Some(FrameDrag {
+            block_id,
+            kind,
+            start_client_x: ev.client_x() as f64,
+            start_client_y: ev.client_y() as f64,
+            start_rect,
+        }));
+    };
+
+    // Pixel deltas -> normalized (0..1) slide fractions by dividing
+    // through the canvas's own `getBoundingClientRect()` size, per
+    // the brief — never the viewport or a fixed constant, so this
+    // stays correct at any zoom/canvas width. Applies `apply_drag`
+    // then `snap` into the *transient* `drag_preview`/`drag_guides`
+    // signals on every move; the deck model is untouched until
+    // `commit_frame_drag` runs at pointerup.
+    let on_canvas_pointermove = move |ev: web_sys::PointerEvent| {
+        if readonly {
+            return;
+        }
+        let Some(state) = frame_drag.get_untracked() else { return };
+        let Some(canvas_el) = canvas_ref.get() else { return };
+        let bounds = canvas_el.get_bounding_client_rect();
+        let (w, h) = (bounds.width(), bounds.height());
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let dx = (ev.client_x() as f64 - state.start_client_x) / w;
+        let dy = (ev.client_y() as f64 - state.start_client_y) / h;
+        let dragged = geometry::apply_drag(state.start_rect, state.kind, dx, dy);
+        let idx = active_slide.get_untracked();
+        let others: Vec<Rect> = deck.with_untracked(|d| {
+            d.slides
+                .get(idx)
+                .map(|s| {
+                    s.frames
+                        .iter()
+                        .filter(|f| f.block_id != state.block_id && f.role == FrameRole::Content)
+                        .map(|f| f.rect)
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        let (snapped, guides) = geometry::snap(dragged, &others, SNAP_THRESHOLD);
+        set_drag_preview.set(Some(snapped));
+        set_drag_guides.set(guides);
+    };
+
+    // One yrs write per gesture: resolves the dragged frame fresh by
+    // `block_id` (never a captured index) so this still lands
+    // correctly even if a concurrent remote edit touched the slide's
+    // other frames mid-drag; if the dragged frame itself was deleted
+    // remotely mid-gesture, `find_frame_index` comes back empty and
+    // this is a no-op — no phantom persist of a frame that no longer
+    // exists.
+    let commit_frame_drag = move || {
+        let Some(state) = frame_drag.get_untracked() else { return };
+        set_frame_drag.set(None);
+        let final_rect = drag_preview.get_untracked();
+        set_drag_preview.set(None);
+        set_drag_guides.set(Vec::new());
+        let Some(final_rect) = final_rect else { return };
+        if final_rect == state.start_rect {
+            // A plain click (pointerdown immediately followed by
+            // pointerup, no intervening pointermove) already selected
+            // the frame at pointerdown — nothing actually moved, so
+            // skip the write rather than persisting a no-op rect
+            // change on every simple click-to-select.
+            return;
+        }
+        let idx = active_slide.get_untracked();
+        let mut applied = false;
+        deck.update(|d| {
+            if let Some(slide) = d.slides.get_mut(idx) {
+                if let Some(pos) = find_frame_index(&slide.frames, &state.block_id) {
+                    slide.frames[pos].rect = final_rect;
+                    applied = true;
+                }
+            }
+        });
+        if applied {
+            persist();
+        }
+    };
+
+    let on_canvas_pointerup = move |ev: web_sys::PointerEvent| {
+        if let Some(el) = ev.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+            let _ = el.release_pointer_capture(ev.pointer_id());
+        }
+        commit_frame_drag();
+    };
+
+    let on_canvas_pointercancel = move |ev: web_sys::PointerEvent| {
+        if let Some(el) = ev.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+            let _ = el.release_pointer_capture(ev.pointer_id());
+        }
+        // Cancel discards the gesture instead of committing it —
+        // mirrors the slide-strip's pointercancel handling above.
+        set_frame_drag.set(None);
+        set_drag_preview.set(None);
+        set_drag_guides.set(Vec::new());
+    };
+
+    // ─── Canvas keymap (Task 10) ─────────────────────────────
+    //
+    // Implements `design/presentations.md`'s "Canvas keymap matrix"
+    // for the "frame selected, not editing" column — real in-frame
+    // text editing (and its own key handling) lands in the
+    // frame-editing task; until then every frame renders read-only,
+    // so this handler never has an "editing" branch to dispatch to.
+    let on_canvas_keydown = move |ev: web_sys::KeyboardEvent| {
+        if readonly {
+            return;
+        }
+        let ctrl_or_meta = ev.ctrl_key() || ev.meta_key();
+        let key = ev.key();
+
+        // Cmd/Ctrl-D: prevent the browser's bookmark-this-page
+        // shortcut whenever the canvas has focus, whether or not a
+        // frame happens to be selected to actually duplicate.
+        if ctrl_or_meta && key.to_lowercase() == "d" {
+            ev.prevent_default();
+            let Some(block_id) = selected_frame.get_untracked() else { return };
+            let idx = active_slide.get_untracked();
+            let mut new_id: Option<String> = None;
+            deck.update(|d| {
+                if let Some(slide) = d.slides.get_mut(idx) {
+                    new_id = duplicate_frame(slide, &block_id);
+                }
+            });
+            if let Some(id) = new_id {
+                set_selected_frame.set(Some(id));
+                persist();
+            }
+            return;
+        }
+
+        match key.as_str() {
+            "Escape" => {
+                if selected_frame.get_untracked().is_some() {
+                    ev.prevent_default();
+                    set_selected_frame.set(None);
+                }
+            }
+            // Real edit mode lands in the frame-editing task; for now
+            // Enter on a selected frame is a no-op stub (the frame is
+            // already selected — nothing further happens yet).
+            "Enter" => {
+                if selected_frame.get_untracked().is_some() {
+                    ev.prevent_default();
+                }
+            }
+            "Delete" | "Backspace" => {
+                let Some(block_id) = selected_frame.get_untracked() else { return };
+                ev.prevent_default();
+                let idx = active_slide.get_untracked();
+                deck.update(|d| {
+                    if let Some(slide) = d.slides.get_mut(idx) {
+                        delete_frame(slide, &block_id);
+                    }
+                });
+                set_selected_frame.set(None);
+                persist();
+            }
+            "Tab" => {
+                ev.prevent_default();
+                let idx = active_slide.get_untracked();
+                let current = selected_frame.get_untracked();
+                // `role=notes` frames are never on the canvas (they
+                // render only in the notes drawer), so Tab must never
+                // land selection on one — only content frames enter
+                // the cycle.
+                let content_only: Vec<DeckFrame> = deck.with_untracked(|d| {
+                    d.slides
+                        .get(idx)
+                        .map(|s| s.frames.iter().filter(|f| f.role == FrameRole::Content).cloned().collect())
+                        .unwrap_or_default()
+                });
+                let next = if ev.shift_key() {
+                    geometry::previous_frame_id(&content_only, current.as_deref())
+                } else {
+                    geometry::next_frame_id(&content_only, current.as_deref())
+                };
+                set_selected_frame.set(next);
+            }
+            "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" => {
+                let Some(block_id) = selected_frame.get_untracked() else { return };
+                ev.prevent_default();
+                let step = if ev.shift_key() { 0.05 } else { 0.01 };
+                let (dx, dy) = match key.as_str() {
+                    "ArrowUp" => (0.0, -step),
+                    "ArrowDown" => (0.0, step),
+                    "ArrowLeft" => (-step, 0.0),
+                    _ => (step, 0.0),
+                };
+                let idx = active_slide.get_untracked();
+                deck.update(|d| {
+                    if let Some(slide) = d.slides.get_mut(idx) {
+                        if let Some(frame) = slide.frames.iter_mut().find(|f| f.block_id == block_id) {
+                            frame.rect = geometry::nudge(frame.rect, dx, dy);
+                        }
+                    }
+                });
+                set_nudge_dirty.set(true);
+            }
+            _ => {}
+        }
+    };
+
+    // Coalesces the nudge persist: a held-down arrow key fires many
+    // keydowns (each already applied to `deck` above for live visual
+    // feedback) but only one keyup, so this is where the single yrs
+    // write for the whole nudge streak happens.
+    let on_canvas_keyup = move |ev: web_sys::KeyboardEvent| {
+        if matches!(ev.key().as_str(), "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight")
+            && nudge_dirty.get_untracked()
+        {
+            set_nudge_dirty.set(false);
+            persist();
+        }
+    };
+
+    // Paste (native ClipboardEvent, same approach as
+    // `spreadsheet_view.rs`'s `on_paste`): always creates a new
+    // centered frame from the clipboard's plain text, regardless of
+    // whether a frame happens to be selected — per the keymap matrix,
+    // "with no frame selected, paste on the canvas also creates a new
+    // centered frame from the clipboard content."
+    let on_canvas_paste = move |ev: web_sys::Event| {
+        if readonly {
+            return;
+        }
+        let Ok(ce) = ev.dyn_into::<web_sys::ClipboardEvent>() else { return };
+        let Some(data) = ce.clipboard_data() else { return };
+        let text = data.get_data("text/plain").unwrap_or_default();
+        if text.trim().is_empty() {
+            return;
+        }
+        ce.prevent_default();
+        let idx = active_slide.get_untracked();
+        let content =
+            Fragment::from(vec![Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text(&text)]))]);
+        let mut new_id: Option<String> = None;
+        deck.update(|d| {
+            if let Some(slide) = d.slides.get_mut(idx) {
+                new_id = Some(add_frame(slide, centered_text_frame_rect(), FrameRole::Content, content));
+            }
+        });
+        if let Some(id) = new_id {
+            set_selected_frame.set(Some(id));
+            persist();
+        }
     };
 
     // ─── Render ─────────────────────────────────────────────
@@ -593,72 +1009,200 @@ pub fn DeckView(
             </div>
 
             <div class="deck-view__canvas-wrap">
-                {move || {
-                    let d = deck.get();
-                    let idx = active_slide.get().min(d.slides.len().saturating_sub(1));
-                    let Some(slide) = d.slides.get(idx).cloned() else {
-                        return view! { <div class="deck-canvas"></div> }.into_any();
-                    };
-                    let theme = d.theme.clone();
-                    let mut frames = slide.frames.to_vec();
-                    frames.sort_by_key(|f| f.z);
-                    let canvas_class = format!("deck-canvas {}", theme_class(&theme));
-                    view! {
-                        <div class=canvas_class>
-                            {frames
-                                .into_iter()
-                                .map(|frame| {
-                                    let block_id = frame.block_id.clone();
-                                    let block_id_click = block_id.clone();
-                                    let block_id_comment = block_id.clone();
-                                    let is_selected = move || {
-                                        selected_frame.get().as_deref() == Some(block_id.as_str())
-                                    };
-                                    let has_thread = {
-                                        let block_id = block_id_comment.clone();
-                                        move || frame_threads.get().iter().any(|t| t == &block_id)
-                                    };
-                                    let left = format!("{:.2}%", frame.rect.x * 100.0);
-                                    let top = format!("{:.2}%", frame.rect.y * 100.0);
-                                    let width = format!("{:.2}%", frame.rect.w * 100.0);
-                                    let height = format!("{:.2}%", frame.rect.h * 100.0);
-                                    view! {
-                                        <div
-                                            class="deck-frame"
-                                            class:deck-frame--selected=is_selected
-                                            style:left=left
-                                            style:top=top
-                                            style:width=width
-                                            style:height=height
-                                            on:click=move |_| {
-                                                if !readonly {
-                                                    set_selected_frame.set(Some(block_id_click.clone()));
+                <div class="deck-view__canvas-column">
+                    {move || {
+                        let d = deck.get();
+                        let idx = active_slide.get().min(d.slides.len().saturating_sub(1));
+                        let Some(slide) = d.slides.get(idx).cloned() else {
+                            return view! { <div class="deck-canvas"></div> }.into_any();
+                        };
+                        let theme = d.theme.clone();
+                        // `role=notes` frames never render on the canvas itself
+                        // (design doc, "Canvas keymap matrix") — they surface
+                        // only in the collapsed drawer below. Content frames
+                        // sort by `z` for paint order (later z on top).
+                        let mut frames: Vec<_> =
+                            slide.frames.iter().filter(|f| f.role == FrameRole::Content).cloned().collect();
+                        frames.sort_by_key(|f| f.z);
+                        let canvas_class = format!("deck-canvas {}", theme_class(&theme));
+                        // Transient drag state is read here (not just inside a
+                        // per-frame reactive prop) so the dragged frame's
+                        // geometry — and the snap guides overlay — update on
+                        // every pointermove, matching how a plain (non-drag)
+                        // geometry mutation already needs this closure to
+                        // re-run: `left`/`top`/`width`/`height` are computed
+                        // once per run, not as their own reactive closures.
+                        let dragging = frame_drag.get();
+                        let preview = drag_preview.get();
+                        let guides = drag_guides.get();
+                        view! {
+                            <div
+                                class=canvas_class
+                                tabindex="0"
+                                node_ref=canvas_ref
+                                on:keydown=on_canvas_keydown
+                                on:keyup=on_canvas_keyup
+                                on:paste=on_canvas_paste
+                                on:pointermove=on_canvas_pointermove
+                                on:pointerup=on_canvas_pointerup
+                                on:pointercancel=on_canvas_pointercancel
+                            >
+                                {frames
+                                    .into_iter()
+                                    .map(|frame| {
+                                        let block_id = frame.block_id.clone();
+                                        let block_id_pointerdown = block_id.clone();
+                                        let block_id_comment = block_id.clone();
+                                        let is_selected = {
+                                            let block_id = block_id.clone();
+                                            move || selected_frame.get().as_deref() == Some(block_id.as_str())
+                                        };
+                                        // A second, independently-reactive closure over the
+                                        // same block_id (not a plain bool computed once per
+                                        // outer rebuild): Escape / Tab-Shift-Tab / a plain
+                                        // click-to-select change `selected_frame` without
+                                        // touching `deck`/`frame_drag`/`drag_preview`, so the
+                                        // outer per-slide closure this frame is built inside
+                                        // won't itself re-run — the handles' visibility has to
+                                        // track selection via `<Show>`'s own reactivity instead.
+                                        let is_selected_for_handles = {
+                                            let block_id = block_id.clone();
+                                            move || selected_frame.get().as_deref() == Some(block_id.as_str())
+                                        };
+                                        let has_thread = {
+                                            let block_id = block_id_comment.clone();
+                                            move || frame_threads.get().iter().any(|t| t == &block_id)
+                                        };
+                                        let effective_rect = if dragging.as_ref().is_some_and(|s| s.block_id == block_id) {
+                                            preview.unwrap_or(frame.rect)
+                                        } else {
+                                            frame.rect
+                                        };
+                                        let left = format!("{:.2}%", effective_rect.x * 100.0);
+                                        let top = format!("{:.2}%", effective_rect.y * 100.0);
+                                        let width = format!("{:.2}%", effective_rect.w * 100.0);
+                                        let height = format!("{:.2}%", effective_rect.h * 100.0);
+                                        view! {
+                                            <div
+                                                class="deck-frame"
+                                                class:deck-frame--selected=is_selected
+                                                class:deck-frame--readonly=readonly
+                                                style:left=left
+                                                style:top=top
+                                                style:width=width
+                                                style:height=height
+                                                on:pointerdown=move |ev: web_sys::PointerEvent| {
+                                                    start_frame_drag(block_id_pointerdown.clone(), DragKind::Move, ev);
                                                 }
-                                            }
-                                        >
-                                            {render_frame_content(&frame.content)}
-                                            <button
-                                                class="deck-frame__comment-btn"
-                                                class:deck-frame__comment-btn--active=has_thread
-                                                title=crate::t!("deck-frame-comment")
-                                                aria-label=crate::t!("deck-frame-comment")
-                                                on:click=move |ev: web_sys::MouseEvent| {
-                                                    ev.stop_propagation();
-                                                    on_request_frame_comment.run(block_id_comment.clone());
-                                                }
-                                            >"\u{1F4AC}"</button>
-                                        </div>
-                                    }
-                                })
-                                .collect::<Vec<_>>()}
-                        </div>
-                    }
-                        .into_any()
-                }}
+                                            >
+                                                {render_frame_content(&frame.content)}
+                                                <button
+                                                    class="deck-frame__comment-btn"
+                                                    class:deck-frame__comment-btn--active=has_thread
+                                                    title=crate::t!("deck-frame-comment")
+                                                    aria-label=crate::t!("deck-frame-comment")
+                                                    on:pointerdown=|ev: web_sys::PointerEvent| ev.stop_propagation()
+                                                    on:click=move |ev: web_sys::MouseEvent| {
+                                                        ev.stop_propagation();
+                                                        on_request_frame_comment.run(block_id_comment.clone());
+                                                    }
+                                                >"\u{1F4AC}"</button>
+                                                <Show when=move || is_selected_for_handles() && !readonly>
+                                                    {
+                                                        let block_id = block_id.clone();
+                                                        [Corner::Nw, Corner::Ne, Corner::Sw, Corner::Se]
+                                                            .into_iter()
+                                                            .map(|corner| {
+                                                                let block_id = block_id.clone();
+                                                                let class = format!(
+                                                                    "deck-frame-handle deck-frame-handle--{}",
+                                                                    match corner {
+                                                                        Corner::Nw => "nw",
+                                                                        Corner::Ne => "ne",
+                                                                        Corner::Sw => "sw",
+                                                                        Corner::Se => "se",
+                                                                    }
+                                                                );
+                                                                view! {
+                                                                    <div
+                                                                        class=class
+                                                                        on:pointerdown=move |ev: web_sys::PointerEvent| {
+                                                                            start_frame_drag(
+                                                                                block_id.clone(),
+                                                                                DragKind::Resize(corner),
+                                                                                ev,
+                                                                            );
+                                                                        }
+                                                                    ></div>
+                                                                }
+                                                            })
+                                                            .collect::<Vec<_>>()
+                                                    }
+                                                </Show>
+                                            </div>
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()}
+                                {guides
+                                    .into_iter()
+                                    .map(|g| match g.axis {
+                                        Axis::X => {
+                                            let left = format!("{:.4}%", g.at * 100.0);
+                                            view! { <div class="deck-snap-guide deck-snap-guide--x" style:left=left></div> }
+                                                .into_any()
+                                        }
+                                        Axis::Y => {
+                                            let top = format!("{:.4}%", g.at * 100.0);
+                                            view! { <div class="deck-snap-guide deck-snap-guide--y" style:top=top></div> }
+                                                .into_any()
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()}
+                            </div>
+                        }
+                            .into_any()
+                    }}
+                    <Show when=move || {
+                        deck.with(|d| {
+                            let idx = active_slide.get().min(d.slides.len().saturating_sub(1));
+                            d.slides.get(idx).is_some_and(|s| s.frames.iter().any(|f| f.role == FrameRole::Notes))
+                        })
+                    }>
+                        <details class="deck-notes-drawer">
+                            <summary>{crate::t!("deck-notes-drawer-label")}</summary>
+                            <div class="deck-notes-drawer__body">
+                                {move || {
+                                    deck.with(|d| {
+                                        let idx = active_slide.get().min(d.slides.len().saturating_sub(1));
+                                        d.slides
+                                            .get(idx)
+                                            .map(|s| {
+                                                s.frames
+                                                    .iter()
+                                                    .filter(|f| f.role == FrameRole::Notes)
+                                                    .map(|f| {
+                                                        view! {
+                                                            <div class="deck-notes-drawer__frame">
+                                                                {render_frame_content(&f.content)}
+                                                            </div>
+                                                        }
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            })
+                                            .unwrap_or_default()
+                                    })
+                                }}
+                            </div>
+                        </details>
+                    </Show>
+                </div>
             </div>
 
             <div class="deck-view__pane">
                 <Show when=move || !readonly>
+                    <button class="deck-add-text-frame-btn" on:click=add_text_frame>
+                        {crate::t!("deck-add-text-frame")}
+                    </button>
                     <label class="deck-theme-picker">
                         {crate::t!("deck-theme-label")}
                         <select
@@ -848,5 +1392,85 @@ mod tests {
         let slide = bootstrap_blank_slide(true, false).expect("empty + editable bootstraps");
         assert_eq!(slide.layout, "blank");
         assert!(slide.frames.is_empty());
+    }
+
+    // ─── Frame mutations (Task 10) ─────────────────────────
+
+    #[test]
+    fn add_frame_places_above_existing_frames_and_returns_fresh_id() {
+        let mut slide = simple_slide(); // one frame, z = 0
+        let id = add_frame(&mut slide, Rect::clamped(0.3, 0.3, 0.4, 0.2), FrameRole::Content, Fragment::empty());
+        assert_eq!(slide.frames.len(), 2);
+        let added = slide.frames.iter().find(|f| f.block_id == id).expect("frame was inserted");
+        assert!(added.z > slide.frames[0].z, "new frame paints above the existing one");
+        assert_ne!(id, slide.frames[0].block_id);
+    }
+
+    #[test]
+    fn add_frame_on_empty_slide_starts_at_z_zero() {
+        let mut slide = named_slide("s");
+        let id = add_frame(&mut slide, Rect::clamped(0.0, 0.0, 0.5, 0.5), FrameRole::Notes, Fragment::empty());
+        let added = &slide.frames[0];
+        assert_eq!(added.block_id, id);
+        assert_eq!(added.z, 0);
+        assert_eq!(added.role, FrameRole::Notes);
+    }
+
+    #[test]
+    fn delete_frame_removes_matching_block_id() {
+        let mut slide = simple_slide();
+        let target = slide.frames[0].block_id.clone();
+        delete_frame(&mut slide, &target);
+        assert!(slide.frames.is_empty());
+    }
+
+    #[test]
+    fn delete_frame_missing_block_id_is_a_no_op() {
+        let mut slide = simple_slide();
+        let before = slide.frames.len();
+        delete_frame(&mut slide, "not-a-real-id");
+        assert_eq!(slide.frames.len(), before);
+    }
+
+    #[test]
+    fn duplicate_frame_gets_fresh_id_and_is_offset_from_source() {
+        // Needs headroom to nudge into (`simple_slide`'s frame is
+        // full-bleed 0,0,1,1 and would clamp right back to itself).
+        let mut slide = named_slide("s");
+        slide.frames.push(DeckFrame {
+            block_id: generate_block_id(),
+            rect: Rect::clamped(0.2, 0.2, 0.3, 0.3),
+            z: 0,
+            role: FrameRole::Content,
+            content: Fragment::empty(),
+        });
+        let source_id = slide.frames[0].block_id.clone();
+        let source_rect = slide.frames[0].rect;
+        let dup_id = duplicate_frame(&mut slide, &source_id).expect("source frame exists");
+        assert_eq!(slide.frames.len(), 2);
+        assert_ne!(dup_id, source_id, "duplicate never reuses the source blockId");
+        let dup = slide.frames.iter().find(|f| f.block_id == dup_id).unwrap();
+        assert_ne!(dup.rect, source_rect, "duplicate is nudged, not stacked exactly on the source");
+        assert!(dup.z > slide.frames.iter().find(|f| f.block_id == source_id).unwrap().z);
+    }
+
+    #[test]
+    fn duplicate_frame_missing_block_id_returns_none() {
+        let mut slide = simple_slide();
+        assert_eq!(duplicate_frame(&mut slide, "not-a-real-id"), None);
+        assert_eq!(slide.frames.len(), 1, "no-op leaves the slide untouched");
+    }
+
+    #[test]
+    fn centered_text_frame_rect_is_centered_on_the_slide() {
+        let r = centered_text_frame_rect();
+        assert!((r.x + r.w / 2.0 - 0.5).abs() < 1e-9);
+        assert!((r.y + r.h / 2.0 - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn find_frame_index_missing_block_id_is_none() {
+        let slide = simple_slide();
+        assert_eq!(find_frame_index(&slide.frames, "not-a-real-id"), None);
     }
 }

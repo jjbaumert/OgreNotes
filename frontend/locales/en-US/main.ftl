@@ -1189,3 +1189,11 @@ deck-duplicate-slide = Duplicate slide
 deck-delete-slide = Delete slide
 deck-theme-label = Theme
 deck-frame-comment = Comment on this frame
+
+# ─── Presentations P1 (canvas interactions, Task 10) ─────────────
+# Add-text-frame toolbar button and the collapsed speaker-notes
+# drawer below the canvas (role=notes frames never render on the
+# canvas itself).
+
+deck-add-text-frame = Add Text Frame
+deck-notes-drawer-label = Speaker notes
