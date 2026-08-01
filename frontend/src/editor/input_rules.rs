@@ -12,7 +12,12 @@ pub struct InputRule {
     /// Description for debugging.
     pub name: &'static str,
     /// The trigger pattern (matched against the text before the cursor + the just-typed char).
-    /// Returns Some((match_start_offset, match_len)) if the pattern matches.
+    /// Returns `Some((match_start_offset, match_len))` if the pattern matches.
+    ///
+    /// Both are **byte** offsets into the matched string — matchers are
+    /// written with `str::rfind` / `str::len`, which speak bytes.
+    /// [`check_input_rules`] converts them to model positions; matchers
+    /// must never do that arithmetic themselves (#152).
     pub matcher: Box<dyn Fn(&str) -> Option<(usize, usize)>>,
     /// The handler that produces a transaction.
     pub handler: Box<dyn Fn(&EditorState, usize, usize, &str) -> Option<Transaction>>,
@@ -39,16 +44,88 @@ pub fn check_input_rules(
         }
     }
     for rule in rules {
-        if let Some((match_offset, match_len)) = (rule.matcher)(text_before) {
-            let from = block_start + match_offset;
-            let to = block_start + match_offset + match_len;
-            let matched_text = &text_before[match_offset..match_offset + match_len];
-            if let Some(txn) = (rule.handler)(state, from, to, matched_text) {
-                return Some(txn);
-            }
+        let Some((match_offset, match_len)) = (rule.matcher)(text_before) else {
+            continue;
+        };
+        // Matchers speak bytes; the document model speaks positions.
+        // `get` (rather than indexing) also makes a matcher that returned
+        // a non-boundary offset decline instead of panicking.
+        let Some(matched_text) = text_before.get(match_offset..match_offset + match_len) else {
+            continue;
+        };
+        // A match spanning an inline atom has no plain-text equivalent —
+        // firing would replace a hard break or a mention with a literal
+        // placeholder character. Decline instead.
+        if matched_text.contains(INLINE_ATOM) {
+            continue;
+        }
+        // #152: `block_start + match_offset` added a *byte* offset to a
+        // model position. `text_before` carries exactly one char per
+        // model position (see `block_text`), so counting chars is the
+        // conversion — no per-rule arithmetic required.
+        let from = block_start + text_before[..match_offset].chars().count();
+        let to = from + matched_text.chars().count();
+        if let Some(txn) = (rule.handler)(state, from, to, matched_text) {
+            return Some(txn);
         }
     }
     None
+}
+
+/// Stand-in for an inline leaf node in the text input rules match against.
+///
+/// A rule match is turned into a model range by adding a char offset to
+/// the block's content start, which is only sound when one char of rule
+/// text equals one model position. [`Node::text_content`] breaks that in
+/// both directions: a `HardBreak` yields zero chars for its one position,
+/// a `Mention` yields its whole display string for its one position.
+/// Every inline leaf therefore contributes exactly one of these chars.
+///
+/// U+FFFC OBJECT REPLACEMENT CHARACTER is inert for every rule's pattern,
+/// and [`check_input_rules`] declines any match that spans one, so an
+/// atom can never be rewritten into literal text.
+///
+/// A *literal* U+FFFC in user-typed or pasted text is indistinguishable
+/// from an atom placeholder here, so a markdown rule spanning one is
+/// likewise declined and silently does not fire on that text. This is
+/// deliberate and fail-safe: the position arithmetic counts chars
+/// uniformly, so a literal U+FFFC is one char = one model position under
+/// either interpretation and can never mis-position an edit — the only
+/// consequence is the declined rule, never corruption. Do not "fix" the
+/// guard to special-case literal U+FFFC; distinguishing the two buys
+/// nothing and reintroduces the byte/position confusion this removed.
+const INLINE_ATOM: char = '\u{FFFC}';
+
+/// Render a textblock's content as the text input rules match against.
+///
+/// Invariant: `char_len(block_text(f)) == f.size()` for every fragment —
+/// char offsets into the result *are* model offsets into the block.
+fn block_text(content: &Fragment) -> String {
+    let mut out = String::new();
+    push_block_text(&content.children, &mut out);
+    out
+}
+
+fn push_block_text(nodes: &[Node], out: &mut String) {
+    for child in nodes {
+        match child {
+            Node::Text { text, .. } => out.push_str(text),
+            Node::Element {
+                node_type, content, ..
+            } => {
+                if node_type.is_leaf() {
+                    out.push(INLINE_ATOM);
+                } else {
+                    // Not schema-legal inside a textblock, but the size
+                    // invariant must hold regardless: open + content +
+                    // close, matching `Node::node_size`.
+                    out.push(INLINE_ATOM);
+                    push_block_text(&content.children, out);
+                    out.push(INLINE_ATOM);
+                }
+            }
+        }
+    }
 }
 
 /// Extract the text content before the cursor in the current block.
@@ -61,12 +138,14 @@ pub fn check_input_rules(
 /// only `doc.content.children`, so a cursor inside a nested textblock
 /// never matched and input rules silently never fired in lists or
 /// blockquotes (#1).
+///
+/// The text comes from [`block_text`], not `Node::text_content`: the
+/// cursor offset is a *model* offset, so truncating by chars is only
+/// exact when each model position contributes one char (#152).
 pub fn get_block_text_before(doc: &Node, cursor_pos: usize) -> Option<(String, usize)> {
     let block = find_block_at(doc, cursor_pos)?;
     let cursor_offset = cursor_pos.checked_sub(block.content_start)?;
-    let block_text =
-        Node::element_with_content(block.node_type, block.content).text_content();
-    let text_before: String = block_text.chars().take(cursor_offset).collect();
+    let text_before: String = block_text(&block.content).chars().take(cursor_offset).collect();
     Some((text_before, block.content_start))
 }
 
@@ -138,13 +217,13 @@ fn code_block_rule() -> InputRule {
     InputRule {
         name: "code_block",
         matcher: Box::new(|text| {
-            let tag = text.strip_prefix("```")?.strip_suffix(' ')?;
-            // ASCII-only tags: model positions are char-based but this
-            // API byte-slices the match, so decline anything multibyte
-            // rather than let the two diverge. Real fence infos are
-            // ASCII; `+ # . - _` cover c++, c#, objective-c, tf-vars…
-            // A backtick in the tag (e.g. "````rust ") also lands here
-            // and is rejected.
+            let tag = fence_tag(text)?;
+            // ASCII-only tags. Real fence infos are ASCII; `+ # . - _`
+            // cover c++, c#, objective-c, tf-vars… A backtick in the tag
+            // (e.g. "````rust ") also lands here and is rejected.
+            // Positions no longer depend on this — `check_input_rules`
+            // converts the byte length below to a model length (#152) —
+            // but the restriction is kept deliberately.
             if !tag
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "+#.-_".contains(c))
@@ -155,8 +234,7 @@ fn code_block_rule() -> InputRule {
         }),
         handler: Box::new(|state, from, to, matched| {
             let block_pos = from - 1;
-            // strip the leading ``` and the trailing space
-            let tag = &matched[3..matched.len() - 1];
+            let tag = fence_tag(matched)?;
             let mut attrs = HashMap::new();
             if !tag.is_empty() {
                 attrs.insert("language".to_string(), tag.to_string());
@@ -170,6 +248,13 @@ fn code_block_rule() -> InputRule {
             Some(txn)
         }),
     }
+}
+
+/// Split a fence trigger into its info tag: `"```rust "` → `Some("rust")`,
+/// `"``` "` → `Some("")`. Shared by the fence rule's matcher and handler
+/// so neither hand-slices byte ranges out of the match (#152).
+fn fence_tag(text: &str) -> Option<&str> {
+    text.strip_prefix("```")?.strip_suffix(' ')
 }
 
 fn blockquote_rule() -> InputRule {
@@ -346,6 +431,27 @@ fn wrap_block_after_delete(
 
 // ─── Inline Mark Rules ──────────────────────────────────────────
 
+/// The char immediately before byte offset `at`, if any.
+///
+/// The matchers locate their delimiters with `str::rfind`, which yields a
+/// byte offset; `s.as_bytes()[at - 1]` then inspects the *last byte* of
+/// the preceding char rather than the char itself (#152). The outcome
+/// happened to agree for the ASCII comparisons here — a UTF-8
+/// continuation byte is never an ASCII letter — but the shape invited
+/// exactly the confusion this file is being cleaned of.
+fn char_before(s: &str, at: usize) -> Option<char> {
+    s.get(..at)?.chars().next_back()
+}
+
+/// Whether `c` counts as a word char for CommonMark's intra-word
+/// underscore guard. Deliberately ASCII-only, preserving the behaviour of
+/// the byte comparison it replaces: `café_x_` still italicises, which
+/// CommonMark would not. That is a separate policy question from #152's
+/// offset arithmetic and is left alone here.
+fn is_word_char(c: Option<char>) -> bool {
+    c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn bold_rule() -> InputRule {
     InputRule {
         name: "bold",
@@ -363,14 +469,21 @@ fn bold_rule() -> InputRule {
             None
         }),
         handler: Box::new(|state, from, to, matched| {
-            // Extract the text between ** and **
-            if matched.len() < 5 {
-                return None;
-            }
-            let inner = &matched[2..matched.len() - 2];
+            // Extract the text between ** and ** by pattern, not by byte
+            // index — the delimiters are ASCII but the content is not (#152).
+            let inner = strip_delimiters(matched, "**")?;
             inline_mark_replace(state, from, to, inner, MarkType::Bold)
         }),
     }
+}
+
+/// Strip a matching pair of delimiters off an inline-mark match:
+/// `("**bold**", "**")` → `Some("bold")`. Returns `None` when the
+/// delimiters are absent or the content between them is empty, which is
+/// the guard the byte-length checks used to provide.
+fn strip_delimiters<'a>(matched: &'a str, delim: &str) -> Option<&'a str> {
+    let inner = matched.strip_prefix(delim)?.strip_suffix(delim)?;
+    (!inner.is_empty()).then_some(inner)
 }
 
 /// Shared handler for inline mark rules: replace matched text with marked text,
@@ -400,8 +513,7 @@ fn italic_rule() -> InputRule {
                 let inner = &text[..text.len() - 1];
                 // Find the opening * from the right, not part of a ** pair
                 if let Some(start) = inner.rfind('*') {
-                    let is_double =
-                        start > 0 && inner.as_bytes().get(start - 1) == Some(&b'*');
+                    let is_double = char_before(inner, start) == Some('*');
                     if !is_double && start + 1 < inner.len() {
                         return Some((start, text.len() - start));
                     }
@@ -410,8 +522,8 @@ fn italic_rule() -> InputRule {
             None
         }),
         handler: Box::new(|state, from, to, matched| {
-            if matched.len() < 3 { return None; }
-            inline_mark_replace(state, from, to, &matched[1..matched.len() - 1], MarkType::Italic)
+            let inner = strip_delimiters(matched, "*")?;
+            inline_mark_replace(state, from, to, inner, MarkType::Italic)
         }),
     }
 }
@@ -428,10 +540,7 @@ fn bold_underscore_rule() -> InputRule {
                     // Same intra-word guard as the italic underscore rule: the
                     // opening `__` must not follow a word char, so `snake__case__`
                     // isn't bolded mid-word.
-                    let preceded_by_word = start > 0 && {
-                        let b = inner.as_bytes()[start - 1];
-                        b.is_ascii_alphanumeric() || b == b'_'
-                    };
+                    let preceded_by_word = is_word_char(char_before(inner, start));
                     if !preceded_by_word && content_start < inner.len() {
                         return Some((start, text.len() - start));
                     }
@@ -440,8 +549,8 @@ fn bold_underscore_rule() -> InputRule {
             None
         }),
         handler: Box::new(|state, from, to, matched| {
-            if matched.len() < 5 { return None; }
-            inline_mark_replace(state, from, to, &matched[2..matched.len() - 2], MarkType::Bold)
+            let inner = strip_delimiters(matched, "__")?;
+            inline_mark_replace(state, from, to, inner, MarkType::Bold)
         }),
     }
 }
@@ -454,17 +563,13 @@ fn italic_underscore_rule() -> InputRule {
             if text.len() >= 3 && text.ends_with('_') && !text.ends_with("__") {
                 let inner = &text[..text.len() - 1];
                 if let Some(start) = inner.rfind('_') {
-                    let is_double =
-                        start > 0 && inner.as_bytes().get(start - 1) == Some(&b'_');
+                    let is_double = char_before(inner, start) == Some('_');
                     // CommonMark: `_` emphasis is not allowed intra-word, so the
                     // opening `_` must be at the block start or follow a non-word
                     // char. Without this, identifiers like `SUSTAINED_TYPE_` and
                     // `snake_case_` get mangled into italics mid-word (the bug the
                     // frontend-doctor sustained-type-reload scenario caught).
-                    let preceded_by_word = start > 0 && {
-                        let b = inner.as_bytes()[start - 1];
-                        b.is_ascii_alphanumeric() || b == b'_'
-                    };
+                    let preceded_by_word = is_word_char(char_before(inner, start));
                     if !is_double && !preceded_by_word && start + 1 < inner.len() {
                         return Some((start, text.len() - start));
                     }
@@ -473,8 +578,8 @@ fn italic_underscore_rule() -> InputRule {
             None
         }),
         handler: Box::new(|state, from, to, matched| {
-            if matched.len() < 3 { return None; }
-            inline_mark_replace(state, from, to, &matched[1..matched.len() - 1], MarkType::Italic)
+            let inner = strip_delimiters(matched, "_")?;
+            inline_mark_replace(state, from, to, inner, MarkType::Italic)
         }),
     }
 }
@@ -496,8 +601,8 @@ fn code_rule() -> InputRule {
             None
         }),
         handler: Box::new(|state, from, to, matched| {
-            if matched.len() < 3 { return None; }
-            inline_mark_replace(state, from, to, &matched[1..matched.len() - 1], MarkType::Code)
+            let inner = strip_delimiters(matched, "`")?;
+            inline_mark_replace(state, from, to, inner, MarkType::Code)
         }),
     }
 }
@@ -1346,6 +1451,322 @@ mod tests {
         let txn = check_input_rules(&rules, &state, "`code`", 1).unwrap();
         let new_state = state.apply(txn);
         assert_eq!(new_state.stored_marks, Some(vec![]));
+    }
+
+    // ── #152: byte offsets vs. model positions ──
+    //
+    // Rule matches are byte offsets into the block's text; the document
+    // model counts *positions* (one per char, one per inline leaf). The
+    // two only coincide for pure-ASCII, atom-free blocks. Every test
+    // below drives the same pipeline `view.rs` drives — build the text
+    // with `get_block_text_before`, then match — so the offset handoff
+    // is exercised, not bypassed.
+
+    fn hard_break() -> Node {
+        Node::element(NodeType::HardBreak)
+    }
+
+    fn mention(display: &str) -> Node {
+        let mut attrs = HashMap::new();
+        attrs.insert("display".to_string(), display.to_string());
+        attrs.insert("user_id".to_string(), "u1".to_string());
+        Node::Element {
+            node_type: NodeType::Mention,
+            attrs,
+            content: Fragment::empty(),
+            marks: vec![],
+        }
+    }
+
+    /// A doc holding one paragraph of `children`, cursor at its end.
+    fn state_with(children: Vec<Node>) -> EditorState {
+        let para = Node::element_with_content(NodeType::Paragraph, Fragment::from(children));
+        let content_size = para.content_size();
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![para]));
+        EditorState {
+            selection: Selection::cursor(1 + content_size),
+            ..EditorState::create_default(doc)
+        }
+    }
+
+    /// Run the rules exactly as `view.rs` does, deriving the rule text
+    /// and the block start from the document instead of hardcoding them.
+    fn fire_rules(state: &EditorState) -> Option<Transaction> {
+        let rules = default_input_rules();
+        let (text_before, block_start) =
+            get_block_text_before(&state.doc, state.selection.from())?;
+        check_input_rules(&rules, state, &text_before, block_start)
+    }
+
+    /// Concatenated text of every run in `para` carrying `mark_type`.
+    fn marked_text(para: &Node, mark_type: MarkType) -> String {
+        (0..para.child_count())
+            .filter_map(|i| {
+                let c = para.child(i).unwrap();
+                c.marks()
+                    .iter()
+                    .any(|m| m.mark_type == mark_type)
+                    .then(|| c.text_content())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bold_after_accented_char_keeps_the_accent() {
+        // #152 repro 1: typing `é**x**` produced `é*x`. `é` is two bytes,
+        // so the matcher's byte offset ran one position past the model
+        // position of the opening `**`.
+        let state = state_with(vec![Node::text("é**x**")]);
+        let txn = fire_rules(&state).expect("bold rule should fire after `é`");
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(para.text_content(), "éx");
+        assert_eq!(marked_text(para, MarkType::Bold), "x");
+        // Cursor sits after the bold `x`: 1 (para open) + 1 (é) + 1 (x).
+        assert_eq!(new_state.selection.from(), 3);
+    }
+
+    #[test]
+    fn bold_after_hard_break_keeps_the_break() {
+        // #152 repro 2: a hard break contributes 0 chars of text but 1
+        // model position, so the replacement window started one position
+        // early and swallowed the break.
+        let state = state_with(vec![hard_break(), Node::text("**x**")]);
+        let txn = fire_rules(&state).expect("bold rule should fire after a hard break");
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(
+            para.child(0).unwrap().node_type(),
+            Some(NodeType::HardBreak),
+            "the hard break must survive the input rule"
+        );
+        assert_eq!(para.text_content(), "x");
+        assert_eq!(marked_text(para, MarkType::Bold), "x");
+    }
+
+    #[test]
+    fn bold_after_cjk_text_keeps_the_text() {
+        // Three bytes per char: the offset drifts twice as fast as `é`.
+        let state = state_with(vec![Node::text("日本**x**")]);
+        let txn = fire_rules(&state).expect("bold rule should fire after CJK text");
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(para.text_content(), "日本x");
+        assert_eq!(marked_text(para, MarkType::Bold), "x");
+    }
+
+    #[test]
+    fn bold_after_emoji_keeps_the_emoji() {
+        // Four bytes, one char, one model position — and outside the BMP,
+        // so it is a surrogate pair on the DOM side.
+        let state = state_with(vec![Node::text("👍**x**")]);
+        let txn = fire_rules(&state).expect("bold rule should fire after an emoji");
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(para.text_content(), "👍x");
+        assert_eq!(marked_text(para, MarkType::Bold), "x");
+    }
+
+    #[test]
+    fn bold_wraps_multibyte_content() {
+        // The multibyte char is *inside* the match: the match length is a
+        // byte length, so the closing edge overshot the block.
+        let state = state_with(vec![Node::text("**é**")]);
+        let txn = fire_rules(&state).expect("bold rule should fire around `é`");
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(para.text_content(), "é");
+        assert_eq!(marked_text(para, MarkType::Bold), "é");
+    }
+
+    #[test]
+    fn bold_wraps_multi_codepoint_emoji() {
+        // `👍🏽` is emoji + skin-tone modifier: 8 bytes, 2 chars, 2 model
+        // positions. Byte length and model length disagree by six.
+        let state = state_with(vec![Node::text("**👍🏽**")]);
+        let txn = fire_rules(&state).expect("bold rule should fire around a modified emoji");
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(para.text_content(), "👍🏽");
+        assert_eq!(marked_text(para, MarkType::Bold), "👍🏽");
+    }
+
+    #[test]
+    fn italic_after_accented_char_keeps_the_accent() {
+        let state = state_with(vec![Node::text("é*x*")]);
+        let txn = fire_rules(&state).expect("italic rule should fire after `é`");
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(para.text_content(), "éx");
+        assert_eq!(marked_text(para, MarkType::Italic), "x");
+    }
+
+    #[test]
+    fn inline_code_after_accented_char_keeps_the_accent() {
+        let state = state_with(vec![Node::text("é`x`")]);
+        let txn = fire_rules(&state).expect("code rule should fire after `é`");
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(para.text_content(), "éx");
+        assert_eq!(marked_text(para, MarkType::Code), "x");
+    }
+
+    #[test]
+    fn italic_underscore_after_a_multibyte_word_keeps_the_word() {
+        // The underscore rules also inspect the char *before* the opening
+        // delimiter (CommonMark's intra-word guard). With `café ` ahead of
+        // it the byte offset of that delimiter runs one past its position.
+        let state = state_with(vec![Node::text("café _x_")]);
+        let txn = fire_rules(&state).expect("italic rule should fire after `café `");
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(para.text_content(), "café x");
+        assert_eq!(marked_text(para, MarkType::Italic), "x");
+    }
+
+    #[test]
+    fn bold_after_mention_atom_keeps_the_mention() {
+        // A Mention is one model position but contributes its whole
+        // display string to `text_content` — the mismatch runs the other
+        // way from a hard break's.
+        let state = state_with(vec![mention("@alice"), Node::text("**x**")]);
+        let txn = fire_rules(&state).expect("bold rule should fire after a mention");
+        let new_state = state.apply(txn);
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(
+            para.child(0).unwrap().node_type(),
+            Some(NodeType::Mention),
+            "the mention must survive the input rule"
+        );
+        assert_eq!(marked_text(para, MarkType::Bold), "x");
+    }
+
+    #[test]
+    fn inline_rule_declines_a_match_spanning_an_atom() {
+        // `*<br>*` has no plain-text inner content to re-mark; firing
+        // would replace the break with a literal character.
+        let state = state_with(vec![Node::text("*"), hard_break(), Node::text("*")]);
+        assert!(
+            fire_rules(&state).is_none(),
+            "an emphasis run spanning an inline atom must not fire"
+        );
+    }
+
+    #[test]
+    fn block_rule_does_not_fire_after_an_inline_atom() {
+        // `# ` is only a heading trigger at the *start* of the block. A
+        // preceding hard break contributes no text, so the trigger looked
+        // anchored and the conversion ate the break.
+        let state = state_with(vec![hard_break(), Node::text("# ")]);
+        assert!(
+            fire_rules(&state).is_none(),
+            "`# ` after a hard break is not at the block start"
+        );
+    }
+
+    #[test]
+    fn code_block_rule_does_not_fire_after_an_inline_atom() {
+        // Same shape as the heading case, on the fence rule.
+        let state = state_with(vec![hard_break(), Node::text("``` ")]);
+        assert!(
+            fire_rules(&state).is_none(),
+            "```` ``` ```` after a hard break is not at the block start"
+        );
+    }
+
+    #[test]
+    fn get_block_text_before_counts_an_inline_atom_as_one_char() {
+        // Doc > Paragraph(content@1) > [HardBreak@1, "ab"@2..4].
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![hard_break(), Node::text("ab")]),
+            )]),
+        );
+        assert_eq!(
+            get_block_text_before(&doc, 4),
+            Some(("\u{FFFC}ab".to_string(), 1)),
+            "a hard break occupies exactly one char of rule text"
+        );
+    }
+
+    #[test]
+    fn get_block_text_before_collapses_a_mention_to_one_char() {
+        // Doc > Paragraph(content@1) > [Mention@1, "ab"@2..4]. The
+        // mention's six-char display string is one model position.
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![mention("@alice"), Node::text("ab")]),
+            )]),
+        );
+        assert_eq!(
+            get_block_text_before(&doc, 4),
+            Some(("\u{FFFC}ab".to_string(), 1)),
+            "a mention occupies exactly one char of rule text"
+        );
+    }
+
+    #[test]
+    fn block_text_has_one_char_per_model_position() {
+        // The invariant the whole offset conversion rests on. Text runs
+        // contribute one char per char, every inline leaf contributes one
+        // char, and the non-leaf arm contributes its two boundary
+        // positions — matching `Node::node_size` in each case.
+        let fragment = Fragment::from(vec![
+            Node::text("é日👍👍🏽x"),
+            hard_break(),
+            mention("@alice"),
+            Node::text("tail"),
+            // Not schema-legal inside a textblock; pinned so the arm that
+            // handles it cannot silently break the invariant.
+            Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("nested"), hard_break()]),
+            ),
+        ]);
+        assert_eq!(
+            crate::editor::model::char_len(&block_text(&fragment)),
+            fragment.size(),
+            "block_text must emit exactly one char per model position"
+        );
+    }
+
+    #[test]
+    fn fence_tag_is_char_safe() {
+        // Latent path: the fence matcher rejects non-ASCII tags, so this
+        // input never reaches the rule today. Pinned directly because the
+        // handler used to reach in at byte offsets 3 and len-1.
+        assert_eq!(fence_tag("```pythön "), Some("pythön"));
+        assert_eq!(fence_tag("```日本語 "), Some("日本語"));
+        assert_eq!(fence_tag("``` "), Some(""));
+        assert_eq!(fence_tag("```rust"), None, "no trailing space");
+        assert_eq!(fence_tag("``rust "), None, "short fence");
+    }
+
+    #[test]
+    fn strip_delimiters_is_char_safe() {
+        assert_eq!(strip_delimiters("**é**", "**"), Some("é"));
+        assert_eq!(strip_delimiters("`日本`", "`"), Some("日本"));
+        assert_eq!(strip_delimiters("*👍🏽*", "*"), Some("👍🏽"));
+        assert_eq!(strip_delimiters("****", "**"), None, "empty content");
+        assert_eq!(strip_delimiters("``", "`"), None, "empty content");
+        assert_eq!(strip_delimiters("*x*", "**"), None, "wrong delimiter");
+    }
+
+    #[test]
+    fn a_match_offset_off_a_char_boundary_is_declined_not_panicked() {
+        // Byte 1 of "é" is a continuation byte. A matcher that returns it
+        // must make the rule decline, not slice through the char.
+        let rules = vec![InputRule {
+            name: "rogue",
+            matcher: Box::new(|text: &str| Some((1, text.len() - 1))),
+            handler: Box::new(|_, _, _, _| unreachable!("must not reach the handler")),
+        }];
+        let state = state_with(vec![Node::text("éx")]);
+        assert!(check_input_rules(&rules, &state, "éx", 1).is_none());
     }
 
     // ── check_input_rules: first match wins ──
