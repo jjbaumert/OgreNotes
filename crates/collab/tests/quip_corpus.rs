@@ -60,12 +60,16 @@
 //!
 //! # Some assertions below encode CURRENT, BUGGY behaviour
 //!
-//! Fixes for #187 (nesting), #188 (numbering) and #190 (section anchors) are
-//! queued. Until they land, this net asserts today's wrong values so that
-//! landing a fix makes the change **visible** rather than silent. Every such
-//! assertion carries a `// #NNN will …` comment naming the ticket that is
-//! expected to change it. Updating one of those numbers alongside its fix is
-//! correct; updating one without a corresponding fix is a regression.
+//! This net asserts today's wrong values so that landing a fix makes the
+//! change **visible** rather than silent. Every such assertion carries a
+//! `// #NNN will …` comment naming the ticket that is expected to change it.
+//! Updating one of those numbers alongside its fix is correct; updating one
+//! without a corresponding fix is a regression.
+//!
+//! #187 (nesting) and #188 (numbering) landed together in PR #200 and their
+//! assertions now record the fixed values, annotated `#NNN (PR #200)`. The
+//! #189 (trailing breaks) and #190 (section anchors) forecasts are still
+//! open and still assert the buggy behaviour.
 //!
 //! # Known coverage gaps in this fixture set
 //!
@@ -113,14 +117,16 @@ struct Census {
     list_items: usize,
     task_items: usize,
     /// Deepest list nesting reached anywhere in the output. Quip's own
-    /// nesting reaches 2–3; #187 is exactly the gap between the two.
+    /// nesting reaches 2–3, and since #187 (PR #200) so does the output;
+    /// this field used to measure exactly the gap between the two.
     max_list_depth: usize,
     /// Items in each top-level `ordered_list`, in document order.
     ordered_list_item_counts: Vec<usize>,
     /// Lengths of maximal runs of consecutive top-level `ordered_list`
     /// blocks. A `bullet_list` between two of them does **not** end a run:
-    /// that is Quip's sub-bullet section, and #188 is about merging the
-    /// numbered sections it separates.
+    /// that is Quip's sub-bullet section, and #188 (PR #200) merged the
+    /// numbered sections it separates. Post-fix every entry should be 1 —
+    /// a run longer than that is a numbered sequence that failed to merge.
     ordered_list_runs: Vec<usize>,
     hard_breaks: usize,
     /// `hard_break` elements that are the LAST child of their paragraph or
@@ -368,16 +374,19 @@ fn corpus_nested_lists_and_tables() {
     assert_eq!(c.headings.get("3"), Some(&1), "h3");
     assert_eq!(c.paragraphs, 47, "paragraph blocks (7 <p> + 38 <td> + 2 <li>)");
 
-    // One bullet section holding the `class='parent'` item and the item that
-    // lives in the sibling `<ul>` beneath it.
-    assert_eq!(c.bullet_lists, 1, "bullet_list blocks");
+    // One bullet section holding the `class='parent'` item, plus the nested
+    // list built from the sibling `<ul>` beneath it. #187 (PR #200) raised
+    // this from 1: the sibling `<ul>` is now a real nested `bullet_list`
+    // inside the preceding `<li>` rather than having its item hoisted into
+    // the outer list.
+    assert_eq!(c.bullet_lists, 2, "bullet_list blocks — outer plus the nested sibling <ul>");
     assert_eq!(c.ordered_lists, 0);
+    // Nesting moves an item, it never creates or destroys one.
     assert_eq!(c.list_items, 2, "list_item elements");
-    // #187 will raise both of these: the sibling `<ul>` becomes a nested list
-    // inside the preceding `<li>` instead of having its item hoisted, so
-    // depth goes 1 -> 2 and the list count goes 1 -> 2.
-    assert_eq!(c.max_list_depth, 1, "output list depth — the source nests 2 deep");
-    assert_eq!(c.lists(), 1, "total list blocks");
+    // #187 (PR #200) raised both of these from 1: the output now reproduces
+    // the two levels the source nests.
+    assert_eq!(c.max_list_depth, 2, "output list depth — matches the source's 2 levels");
+    assert_eq!(c.lists(), 2, "total list blocks");
 
     assert_eq!(c.tables, 2, "data-section-style='13' sections");
     assert_eq!(c.table_rows, 17, "table_row");
@@ -426,27 +435,49 @@ fn corpus_numbered_sequences_and_code_blocks() {
     assert_eq!(c.headings.get("3"), Some(&10), "h3");
     assert_eq!(c.paragraphs, 126, "paragraph blocks");
 
-    assert_eq!(c.bullet_lists, 22, "data-section-style='5' sections");
-    assert_eq!(c.ordered_lists, 12, "data-section-style='6' sections");
+    // #187 (PR #200) raised this from 22. The source nests a `<ul>` directly
+    // inside a `<ul>` in 20 places; in 8 of them the nested list follows an
+    // `<li class='parent'>` as a sibling, and each of those 8 used to have
+    // its items hoisted into the outer list instead of becoming a list of
+    // its own. 22 + 8 = 30.
+    assert_eq!(c.bullet_lists, 30, "data-section-style='5' sections plus 8 nested sibling <ul>");
+    // #188 (PR #200) lowered this from 12: the twelve single-step
+    // `data-section-style='6'` sections merge into the two numbered runs the
+    // reader actually sees.
+    assert_eq!(c.ordered_lists, 2, "merged numbered runs — the source has 12 sections");
+    // Neither nesting nor merging creates or destroys an item.
     assert_eq!(c.list_items, 119, "list_item elements");
-    // #187 will raise this to 2 — the source nests via a sibling `<ul>` in
-    // 20 places, and the owning `<li>` is marked `class='parent'` in 8.
-    assert_eq!(c.max_list_depth, 1, "output list depth — the source nests 2 deep");
+    // #187 (PR #200) raised this from 1. Three levels, not the two the
+    // ticket predicted: the source has `<div><ul><ul>…</ul></ul></div>`
+    // indent wrappers, and inside one of those a further sibling `<ul>`
+    // hangs off an `<li class='parent'>`.
+    assert_eq!(c.max_list_depth, 3, "output list depth — the source nests 3 deep");
 
-    // #188: every numbered step is its own single-item `ordered_list`, so the
-    // reader sees "1." twelve times instead of 1–7 and 1–5. The fix merges
-    // each run of consecutive numbered sections into one list, which will
-    // turn `[1; 12]` into roughly `[7, 2, 3]`-shaped item counts and empty
-    // out `ordered_list_runs` of length > 1.
+    // #188 (PR #200): each of the twelve numbered steps used to be its own
+    // single-item `ordered_list`, so the reader saw "1." twelve times
+    // instead of 1–7 and 1–5. `[1; 12]` is now `[7, 5]` — the same twelve
+    // steps, gathered into the two runs the author wrote. The split is 7/5
+    // and not 7/2/3 because Quip's continues-class spans the intervening
+    // `<pre>`: a code block between two numbered steps does not end the run
+    // (pinned directly by `a_code_block_between_two_numbered_items_does_
+    // not_end_the_run` in `import_quip.rs`).
     assert_eq!(
         c.ordered_list_item_counts,
-        vec![1; 12],
-        "items per ordered_list — every numbered step is its own list (#188)"
+        vec![7, 5],
+        "items per ordered_list — the twelve steps merged into two runs (#188)"
     );
+    // Each run is now a single `ordered_list` block, so no run is longer
+    // than one; #188 (PR #200) collapsed `[7, 2, 3]` to `[1, 1]`.
     assert_eq!(
         c.ordered_list_runs,
-        vec![7, 2, 3],
-        "runs of consecutive numbered sections — #188 will merge each into one list"
+        vec![1, 1],
+        "one ordered_list per numbered run — nothing left to merge"
+    );
+    // The merge redistributes items between lists; it must not lose one.
+    assert_eq!(
+        c.ordered_list_item_counts.iter().sum::<usize>(),
+        12,
+        "the source's twelve numbered steps all survive"
     );
 
     // #184 (fixed at 89050d8): a `<br>` inside `<pre>` became a newline.
@@ -660,8 +691,8 @@ fn captured_section_ids_all_occur_in_the_source() {
 /// Quip's nesting spelling is a `<ul>` that is a **sibling** of the `<li>`.
 /// The hand-authored fixtures use the standard `<ul>`-inside-`<li>` spelling,
 /// which does not occur once in 56 real documents. This pins the real shape
-/// so #187's fix has something to turn green — and so nobody "fixes" these
-/// fixtures into the shape the parser already handles.
+/// so #187's fix (PR #200) had something to turn green — and so nobody
+/// "fixes" these fixtures into the shape the parser already handled.
 #[test]
 fn the_corpus_nests_lists_as_a_sibling_ul_never_inside_the_li() {
     for thread_id in ["AeOAAAcV1hg", "CVLAAAgSl7Q"] {
