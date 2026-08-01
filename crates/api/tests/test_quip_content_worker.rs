@@ -122,6 +122,7 @@ async fn seed_scoping_import(app: &common::TestApp, owner: &str) -> String {
         phase: 0,
         quip_user_id: None,
         target_folder_id: Some("target-folder".to_string()),
+        import_folder_id: None,
         selected_roots: vec!["root".to_string()],
         created_at: now,
         updated_at: now,

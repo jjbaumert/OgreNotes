@@ -158,6 +158,7 @@ async fn seed_scoping_import(app: &common::TestApp, owner: &str, roots: &[&str])
         phase: 0,
         quip_user_id: None,
         target_folder_id: Some("target-folder".to_string()),
+        import_folder_id: None,
         selected_roots: roots.iter().map(|s| s.to_string()).collect(),
         created_at: now,
         updated_at: now,

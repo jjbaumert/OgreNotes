@@ -125,6 +125,7 @@ fn sample_record() -> ImportRecord {
         phase: 0,
         quip_user_id: Some("quip-user-1".to_string()),
         target_folder_id: Some("folder-1".to_string()),
+        import_folder_id: None,
         selected_roots: vec!["root-a".to_string(), "root-b".to_string()],
         created_at: now,
         updated_at: now,
@@ -743,6 +744,45 @@ async fn reserve_thread_doc_id_is_stable_across_retries() {
         ThreadState::Pending,
         "reserving an id must not advance the thread's progress state",
     );
+}
+
+/// #170 containment idempotency: the dedicated per-import folder id is recorded
+/// on `META` exactly once. The first `record_import_folder` wins and its
+/// candidate becomes the folder; a second call (a double-clicked start, a
+/// redelivered job) must NOT overwrite it — it must read the winner's id back.
+/// This is the single guarantee that a re-start cannot create a second folder.
+#[tokio::test]
+async fn record_import_folder_is_recorded_once_and_reused() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let mut record = sample_record();
+    // A brand-new import has no folder yet.
+    record.import_folder_id = None;
+    repo.create(&record).await.expect("create");
+
+    let first = repo
+        .record_import_folder(&record.import_id, "import-folder-A")
+        .await
+        .expect("first record");
+    assert_eq!(first, "import-folder-A", "an unrecorded import takes the candidate");
+
+    let second = repo
+        .record_import_folder(&record.import_id, "import-folder-B")
+        .await
+        .expect("second record");
+    assert_eq!(
+        second, "import-folder-A",
+        "a re-start must adopt the existing folder, never record a second",
+    );
+
+    // Durable on the row a re-start actually reads, and the effective target
+    // is left to `set_scope` — recording the folder must not touch it.
+    let fetched = repo
+        .get(&record.import_id)
+        .await
+        .expect("get")
+        .expect("record exists");
+    assert_eq!(fetched.import_folder_id.as_deref(), Some("import-folder-A"));
 }
 
 /// Regression: a runner that has been superseded must NOT clear the new

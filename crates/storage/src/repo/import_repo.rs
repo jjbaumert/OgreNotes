@@ -678,6 +678,61 @@ impl ImportRepo {
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
+    /// Record the dedicated per-import destination folder id on `META`, if one
+    /// is not already recorded, and return whichever id is now durably recorded.
+    ///
+    /// This is the idempotency point for the "one folder per import"
+    /// containment (issue #170). The write is conditional on
+    /// `attribute_not_exists(import_folder_id)`, so the FIRST `start` to reach
+    /// here wins and its `candidate` becomes the import's folder; every later
+    /// `start` — a double-click, or a job the queue redelivered — fails the
+    /// condition and reads the winner's id back instead of recording a second
+    /// folder. Mirrors [`reserve_thread_doc_id`](Self::reserve_thread_doc_id)'s
+    /// reserve-or-read-back shape.
+    ///
+    /// Returns `candidate` when THIS call won the reservation (the caller then
+    /// knows its freshly-created folder is the durable one), or the
+    /// pre-existing id when it lost (the caller's own candidate, if it created
+    /// one, is a harmless empty orphan and the winner's folder is used).
+    pub async fn record_import_folder(
+        &self,
+        import_id: &str,
+        candidate: &str,
+    ) -> Result<String, RepoError> {
+        let pk = format!("IMPORT#{import_id}");
+        let mut values = HashMap::new();
+        values.insert(":fid".to_string(), AttributeValue::S(candidate.to_string()));
+        values.insert(
+            ":updated_at".to_string(),
+            AttributeValue::N(ogrenotes_common::time::now_usec().to_string()),
+        );
+        let recorded = self
+            .db
+            .update_item_conditional(
+                &pk,
+                ImportRecord::sk(),
+                "SET import_folder_id = :fid, updated_at = :updated_at",
+                "attribute_not_exists(import_folder_id)",
+                values,
+                None,
+            )
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        if recorded {
+            return Ok(candidate.to_string());
+        }
+        // Lost the race (or this is a re-start): a folder is already recorded.
+        // Read the winner's id back so the caller files documents into the one
+        // durable import folder rather than its own.
+        let record = self
+            .get(import_id)
+            .await?
+            .ok_or_else(|| RepoError::MissingField(format!("import {import_id} META")))?;
+        record
+            .import_folder_id
+            .ok_or_else(|| RepoError::MissingField("import_folder_id".to_string()))
+    }
+
     /// Acquire the inventory lease. Succeeds if no claim exists or the
     /// existing claim's heartbeat is older than `stale_ms`. Uses a
     /// conditional update so two workers cannot both acquire.
@@ -825,6 +880,12 @@ fn import_to_item(record: &ImportRecord) -> HashMap<String, AttributeValue> {
             AttributeValue::S(target_folder_id.clone()),
         );
     }
+    if let Some(ref import_folder_id) = record.import_folder_id {
+        item.insert(
+            "import_folder_id".to_string(),
+            AttributeValue::S(import_folder_id.clone()),
+        );
+    }
     if !record.selected_roots.is_empty() {
         item.insert(
             "selected_roots".to_string(),
@@ -862,6 +923,12 @@ fn import_from_item(item: &HashMap<String, AttributeValue>) -> Result<ImportReco
         quip_user_id: item.get("quip_user_id").and_then(|v| v.as_s().ok()).cloned(),
         target_folder_id: item
             .get("target_folder_id")
+            .and_then(|v| v.as_s().ok())
+            .cloned(),
+        // Absent on imports written before the per-import folder existed →
+        // `None`, which the `start` handler reads as "not yet created".
+        import_folder_id: item
+            .get("import_folder_id")
             .and_then(|v| v.as_s().ok())
             .cloned(),
         selected_roots: item
@@ -1227,6 +1294,7 @@ mod tests {
             phase: 0,
             quip_user_id: Some("quip-u1".to_string()),
             target_folder_id: Some("f1".to_string()),
+            import_folder_id: Some("imp-folder-1".to_string()),
             selected_roots: vec!["root-a".to_string(), "root-b".to_string()],
             created_at: 100,
             updated_at: 200,
@@ -1245,15 +1313,18 @@ mod tests {
         let mut record = record_fixture();
         record.quip_user_id = None;
         record.target_folder_id = None;
+        record.import_folder_id = None;
         record.selected_roots = Vec::new();
         let item = import_to_item(&record);
         assert!(!item.contains_key("quip_user_id"));
         assert!(!item.contains_key("target_folder_id"));
+        assert!(!item.contains_key("import_folder_id"));
         assert!(!item.contains_key("selected_roots"));
 
         let back = import_from_item(&item).expect("from_item");
         assert_eq!(back.quip_user_id, None);
         assert_eq!(back.target_folder_id, None);
+        assert_eq!(back.import_folder_id, None);
         assert!(back.selected_roots.is_empty());
     }
 
