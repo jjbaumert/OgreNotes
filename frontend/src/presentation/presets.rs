@@ -11,23 +11,17 @@
 //! [`instantiate`] turns a preset into a fresh [`DeckSlide`]: every
 //! slide/frame gets a brand-new `blockId` via
 //! `crate::editor::model::generate_block_id`, and each frame's seed
-//! content is a single `Heading` or `Paragraph` node carrying the
-//! *resolved* i18n placeholder text.
+//! content is a single EMPTY `Heading` or `Paragraph` node.
 //!
-//! Baking a resolved string in at instantiate time (rather than
-//! storing the key as an attr for a renderer to resolve later)
-//! follows the precedent set by
-//! `frontend/src/editor/blocks/kanban.rs`'s `build_default_node`,
-//! which seeds its three default columns with literal English
-//! titles ("To Do", "In Progress", "Done") baked directly into the
-//! `KanbanColumn` node's `title` attr — never re-resolved at render
-//! time. `calendar.rs`'s `build_default_node` has no analogous
-//! placeholder-text case (Calendar seeds only machine attrs, no
-//! prose), so Kanban is the closer precedent for "insert-time
-//! content baking". The one difference here is the source of the
-//! literal text: Kanban hardcodes English, we resolve it through
-//! `crate::i18n::translate` so a non-English locale (once
-//! translated) seeds localized placeholder text instead.
+//! Placeholder text ("Click to add heading" / "Click to add text")
+//! is deliberately NOT baked into the document: an earlier version
+//! did (following `kanban.rs::build_default_node`'s literal-title
+//! precedent), which made entering a fresh frame mean *editing the
+//! placeholder prose* — the user had to delete it before typing.
+//! The hint is a render-time affordance instead: `DeckView`'s
+//! `render_frame_content` overlays a dimmed `deck-frame-placeholder`
+//! on visually-empty frames, resolved via `crate::i18n::translate`
+//! at render, so it also localizes without touching stored docs.
 
 use crate::editor::model::{generate_block_id, Fragment, Node, NodeType};
 use crate::presentation::model::{DeckFrame, DeckSlide, FrameRole, Rect};
@@ -41,8 +35,6 @@ pub struct PresetFrame {
     /// keeps this module from being a second source of truth for
     /// what "in range" means.
     pub rect: (f64, f64, f64, f64),
-    /// i18n key for this frame's seed placeholder text.
-    pub placeholder_key: &'static str,
     /// `true` -> seed a `Heading` (level 1); `false` -> seed a
     /// `Paragraph`.
     pub heading: bool,
@@ -58,19 +50,19 @@ pub struct LayoutPreset {
 }
 
 const TITLE_FRAMES: &[PresetFrame] = &[
-    PresetFrame { rect: (0.1, 0.35, 0.8, 0.2), placeholder_key: "deck-placeholder-title", heading: true },
-    PresetFrame { rect: (0.1, 0.58, 0.8, 0.1), placeholder_key: "deck-placeholder-subtitle", heading: false },
+    PresetFrame { rect: (0.1, 0.35, 0.8, 0.2), heading: true },
+    PresetFrame { rect: (0.1, 0.58, 0.8, 0.1), heading: false },
 ];
 
 const TITLE_CONTENT_FRAMES: &[PresetFrame] = &[
-    PresetFrame { rect: (0.06, 0.06, 0.88, 0.12), placeholder_key: "deck-placeholder-heading", heading: true },
-    PresetFrame { rect: (0.06, 0.22, 0.88, 0.7), placeholder_key: "deck-placeholder-body", heading: false },
+    PresetFrame { rect: (0.06, 0.06, 0.88, 0.12), heading: true },
+    PresetFrame { rect: (0.06, 0.22, 0.88, 0.7), heading: false },
 ];
 
 const TWO_COLUMN_FRAMES: &[PresetFrame] = &[
-    PresetFrame { rect: (0.06, 0.06, 0.88, 0.12), placeholder_key: "deck-placeholder-heading", heading: true },
-    PresetFrame { rect: (0.06, 0.22, 0.42, 0.7), placeholder_key: "deck-placeholder-column", heading: false },
-    PresetFrame { rect: (0.52, 0.22, 0.42, 0.7), placeholder_key: "deck-placeholder-column", heading: false },
+    PresetFrame { rect: (0.06, 0.06, 0.88, 0.12), heading: true },
+    PresetFrame { rect: (0.06, 0.22, 0.42, 0.7), heading: false },
+    PresetFrame { rect: (0.52, 0.22, 0.42, 0.7), heading: false },
 ];
 
 const BLANK_FRAMES: &[PresetFrame] = &[];
@@ -91,8 +83,8 @@ pub const LAYOUT_PRESETS: &[LayoutPreset] = &[
 /// Build a fresh [`DeckSlide`] from a preset: a new slide `blockId`,
 /// and one [`DeckFrame`] per `PresetFrame` with a new frame
 /// `blockId`, the preset's (clamped) rect, and seed content — a
-/// single `Heading` or `Paragraph` node wrapping the resolved i18n
-/// placeholder text.
+/// single empty `Heading` or `Paragraph` node (the placeholder hint
+/// is render-time, see the module docs).
 pub fn instantiate(preset: &LayoutPreset) -> DeckSlide {
     let frames = preset
         .frames
@@ -118,13 +110,18 @@ pub fn instantiate(preset: &LayoutPreset) -> DeckSlide {
 }
 
 fn seed_content(pf: &PresetFrame) -> Fragment {
-    let text = crate::i18n::translate(pf.placeholder_key, None);
+    // Seed an EMPTY node, not placeholder prose. The old behavior baked
+    // the resolved "Click to add heading" string in as real document
+    // text, so entering the frame meant *editing the placeholder* —
+    // users had to delete it before typing. The hint is now a
+    // render-time affordance: `DeckView` overlays a dimmed
+    // `deck-frame-placeholder` on visually-empty frames (keyed off the
+    // first child's node type) and the editor opens with a bare caret.
     // `NodeType::Heading`'s `default_attrs()` already seeds `level = "1"`
     // (see `NodeType::default_attrs` in `editor/model.rs`), so no extra
     // attr wiring is needed here.
     let node_type = if pf.heading { NodeType::Heading } else { NodeType::Paragraph };
-    let node = Node::element_with_content(node_type, Fragment::from(vec![Node::text(&text)]));
-    Fragment::from(vec![node])
+    Fragment::from(vec![Node::element(node_type)])
 }
 
 #[cfg(test)]
@@ -152,6 +149,54 @@ mod tests {
     /// share a blockId — every slide/frame identity is fresh so
     /// yrs's `find_match` never conflates two independently
     /// inserted slides.
+    /// Frames must seed EMPTY nodes — baked placeholder prose forced
+    /// users to delete "Click to add heading" before typing (the
+    /// launch-feedback bug this replaced).
+    #[test]
+    fn instantiate_seeds_empty_nodes_not_placeholder_prose() {
+        let preset = LAYOUT_PRESETS.iter().find(|p| p.id == "title-content").unwrap();
+        let s = instantiate(preset);
+        let heading = &s.frames[0].content.children[0];
+        assert_eq!(heading.node_type(), Some(NodeType::Heading));
+        let body = &s.frames[1].content.children[0];
+        assert_eq!(body.node_type(), Some(NodeType::Paragraph));
+        for f in &s.frames {
+            assert_eq!(f.content.children.len(), 1);
+            assert_eq!(
+                f.content.children[0].text_content(),
+                "",
+                "seed content must carry no text"
+            );
+        }
+    }
+
+    /// The empty seed nodes must survive the persist path: normalize +
+    /// ydoc round-trip must keep the empty Heading (else the frame's
+    /// heading-ness — and the render-time hint keyed off it — is lost
+    /// after reload).
+    #[test]
+    fn empty_seed_frames_survive_normalize_and_ydoc_roundtrip() {
+        use crate::editor::model::normalize_doc;
+        use crate::editor::yrs_bridge::{doc_to_ydoc_bytes, ydoc_bytes_to_doc};
+        use crate::presentation::model::{deck_from_doc, deck_to_doc, Deck, DEFAULT_THEME};
+
+        let preset = LAYOUT_PRESETS.iter().find(|p| p.id == "title-content").unwrap();
+        let deck = Deck {
+            theme: DEFAULT_THEME.to_string(),
+            slide_size: "16:9".to_string(),
+            slides: vec![instantiate(preset)],
+        };
+        let doc = normalize_doc(&deck_to_doc(&deck));
+        let back = ydoc_bytes_to_doc(&doc_to_ydoc_bytes(&doc)).unwrap();
+        let deck2 = deck_from_doc(&back);
+        assert_eq!(deck2.slides[0].frames.len(), 2, "both frames survive");
+        assert_eq!(
+            deck2.slides[0].frames[0].content.children[0].node_type(),
+            Some(NodeType::Heading),
+            "empty heading survives the round-trip"
+        );
+    }
+
     #[test]
     fn instantiate_generates_fresh_block_ids_each_call() {
         let preset = LAYOUT_PRESETS.iter().find(|p| p.id == "title-content").unwrap();
