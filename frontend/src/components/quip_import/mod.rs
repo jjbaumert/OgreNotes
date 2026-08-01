@@ -503,6 +503,15 @@ pub fn QuipImportWizard(
                                             }
                                         />
                                     </label>
+                                    <p class="quip-import-token-hint">
+                                        {crate::t!("quip-import-token-hint")}
+                                        " "
+                                        <a
+                                            href="https://quip.com/dev/token"
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                        >{crate::t!("quip-import-token-hint-link")}</a>
+                                    </p>
                                     {move || error.get().map(|e| view! {
                                         <div class="template-picker-error" role="alert">
                                             {crate::t!("quip-import-error", err = e)}
