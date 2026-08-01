@@ -84,6 +84,12 @@ fn validate_slide_attrs(
 
 // ── export helpers (called from export.rs match arms, Task 4) ──
 
+fn escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+}
+
 pub fn html_tag(node_type: NodeType) -> &'static str {
     match node_type {
         NodeType::Slide => "section",
@@ -100,7 +106,7 @@ pub fn html_attrs(node_type: NodeType, attrs: &HashMap<String, String>) -> Strin
     let mut out = String::new();
     for name in names {
         if let Some(v) = attrs.get(*name) {
-            out.push_str(&format!(" data-{}=\"{}\"", name, crate::export::html_escape(v)));
+            out.push_str(&format!(" data-{}=\"{}\"", name, escape_attr(v)));
         }
     }
     match node_type {
@@ -162,5 +168,17 @@ mod tests {
         let long = "x".repeat(300);
         assert!(PRESENTATION.validate_attrs(NodeType::Slide,
             &attrs(&[("background", &long)])).is_err()); // cap 200 chars
+    }
+
+    #[test]
+    fn html_attrs_escapes_quotes_to_prevent_injection() {
+        // Regression: quote characters in attribute values must be escaped
+        // to prevent breaking out of HTML attribute context. A payload like
+        // `x" onmouseover="alert(1)` must not render as a raw quote.
+        let a = attrs(&[("background", "x\" onmouseover=\"alert(1)")]);
+        let out = html_attrs(NodeType::Slide, &a);
+        // The output must contain the escaped quote, not the raw injection sequence.
+        assert!(out.contains("&quot;"), "quote must be escaped in HTML output, got: {out}");
+        assert!(!out.contains("\" onmouseover="), "raw injection sequence must not appear in output, got: {out}");
     }
 }
