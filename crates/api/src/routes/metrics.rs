@@ -77,12 +77,13 @@ struct RumVitals {
 
 /// Validate `page` against the bounded set. Anything outside the
 /// set rejects — keeps the CloudWatch `page` dimension cardinality
-/// at four.
+/// at five.
 fn validate_page(page: &str) -> Result<&'static str, ApiError> {
     match page {
         "home" => Ok("home"),
         "editor" => Ok("editor"),
         "spreadsheet" => Ok("spreadsheet"),
+        "presentation" => Ok("presentation"),
         "other" => Ok("other"),
         _ => Err(ApiError::BadRequest(format!("unknown page: {page}"))),
     }

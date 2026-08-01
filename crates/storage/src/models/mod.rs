@@ -47,6 +47,7 @@ pub enum DocType {
     Document,
     Spreadsheet,
     Chat,
+    Presentation,
 }
 
 impl DocType {
@@ -55,6 +56,7 @@ impl DocType {
             DocType::Document => "document",
             DocType::Spreadsheet => "spreadsheet",
             DocType::Chat => "chat",
+            DocType::Presentation => "presentation",
         }
     }
 }
@@ -244,6 +246,7 @@ mod tests {
         assert_eq!(DocType::Document.as_str(), token(&DocType::Document));
         assert_eq!(DocType::Spreadsheet.as_str(), token(&DocType::Spreadsheet));
         assert_eq!(DocType::Chat.as_str(), token(&DocType::Chat));
+        assert_eq!(DocType::Presentation.as_str(), token(&DocType::Presentation));
 
         assert_eq!(FolderType::System.as_str(), token(&FolderType::System));
         assert_eq!(FolderType::User.as_str(), token(&FolderType::User));
@@ -267,7 +270,12 @@ mod tests {
 
     #[test]
     fn lowercase_enums_round_trip() {
-        for v in [DocType::Document, DocType::Spreadsheet, DocType::Chat] {
+        for v in [
+            DocType::Document,
+            DocType::Spreadsheet,
+            DocType::Chat,
+            DocType::Presentation,
+        ] {
             let s = serde_json::to_string(&v).unwrap();
             assert_eq!(serde_json::from_str::<DocType>(&s).unwrap(), v);
         }
