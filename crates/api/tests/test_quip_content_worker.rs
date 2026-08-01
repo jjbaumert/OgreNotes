@@ -16,6 +16,7 @@
 
 mod common;
 
+use aws_sdk_dynamodb::types::AttributeValue;
 use ogrenotes_api::worker_mode::{
     build_folder_mapping, execute_start_quip_import, import_one_thread, WorkerCtx,
 };
@@ -540,5 +541,647 @@ async fn reserve_before_the_first_durable_write_survives_a_failed_attempt() {
     assert!(
         docs.iter().any(|d| d.doc_id == reserved && d.title == "Doc A"),
         "t1's document is the reserved one: {docs:?}",
+    );
+}
+
+// ─── Per-thread failure disposition (#141 / #142) ────────────────
+
+/// The queue's real budget for one `StartQuipImport` entry: the first
+/// attempt plus `worker_mode::MAX_RETRIES` (3) retries. A per-thread give-up
+/// that needed more runs than this would dead-letter the import instead of
+/// finishing it, which is #142 renamed rather than fixed — so every test that
+/// exercises the give-up path drives the job through *this* helper rather
+/// than calling the handler an unbounded number of times.
+const QUEUE_RUNS: usize = 4;
+
+/// Drive the import the way the queue does: run it until a run doesn't fail,
+/// giving up after `QUEUE_RUNS`. Returns how many runs it took.
+async fn run_like_the_queue(ctx: &WorkerCtx, import_id: &str, owner: &str) -> usize {
+    for run in 1..=QUEUE_RUNS {
+        if execute_start_quip_import(ctx, import_id, owner).await.is_ok() {
+            return run;
+        }
+    }
+    panic!("the import never completed inside the queue's {QUEUE_RUNS}-run budget: it would have dead-lettered");
+}
+
+/// [`quip_content_server`] with t1's HTML fetch overridden to `status`
+/// forever. Higher priority (lower number) than the 200 mounted underneath.
+async fn quip_server_with_thread_html_status(thread: &str, status: u16) -> MockServer {
+    let server = quip_content_server().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/2/threads/{thread}/html")))
+        .respond_with(ResponseTemplate::new(status))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn thread_row(app: &common::TestApp, import_id: &str, thread: &str) -> ThreadRow {
+    app.state
+        .import_repo
+        .list_threads(import_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.quip_thread_id == thread)
+        .unwrap_or_else(|| panic!("no THREAD# row for {thread}"))
+}
+
+/// Regression (#141): a 403 on ONE thread skips that thread and lets the rest
+/// of the import finish.
+///
+/// This is the bug's whole shape. A single access-restricted Quip document
+/// used to map to a run-terminal `TokenRejected`: the import halted and told
+/// the user their token had expired, when the token was fine. Reconnecting a
+/// fresh one didn't help — the re-run reached the same thread and halted
+/// again — so the import was permanently wedged behind a misleading
+/// diagnosis.
+#[tokio::test]
+async fn a_forbidden_thread_is_skipped_and_the_other_threads_still_import() {
+    common::require_infra!();
+    let server = quip_server_with_thread_html_status("t1", 403).await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    let runs = run_like_the_queue(&ctx, &import_id, "owner1").await;
+    assert_eq!(runs, 1, "a 403 is a decided outcome; it must not cost the job a retry");
+
+    // The inaccessible thread is skipped BY NAME, with a reason.
+    let t1 = thread_row(&app, &import_id, "t1").await;
+    assert_eq!(t1.state, ThreadState::Skipped, "a 403 thread is skipped, not fatal");
+    let reason = t1.reason.clone().unwrap_or_default();
+    assert!(reason.contains("403"), "the reason must say why: {reason:?}");
+
+    // ...and everything else really imported. This is the half that used to
+    // be missing entirely.
+    let t2 = thread_row(&app, &import_id, "t2").await;
+    assert_eq!(t2.state, ThreadState::ContentDone, "the other threads must still import");
+    let sheet_doc_id = t2.ogre_doc_id.clone().expect("t2 has a document");
+    let meta = app.state.doc_repo.get(&sheet_doc_id).await.unwrap().expect("t2's document exists");
+    assert_eq!(meta.title, "Sheet");
+
+    // The import is a SUCCESS with a report line, not a token failure.
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(
+        rec.status,
+        ImportStatus::Succeeded,
+        "one inaccessible document must not fail the import",
+    );
+    assert_ne!(
+        rec.status,
+        ImportStatus::TokenRejected,
+        "the credential was valid; claiming otherwise is the #141 misdiagnosis",
+    );
+    assert_eq!(rec.phase, 2, "the content pass must have run to completion");
+}
+
+/// Regression (#142): a thread that fails deterministically is given up on —
+/// marked `Failed` — and the pass completes for everyone else.
+///
+/// A Quip 5xx on one thread used to abort the whole content pass on every
+/// run, so the import produced "nothing after t0042" and eventually
+/// dead-lettered. The give-up has to land INSIDE the queue's retry budget:
+/// `run_like_the_queue` fails the test if it doesn't.
+#[tokio::test]
+async fn a_thread_that_always_fails_is_marked_failed_and_the_pass_completes() {
+    common::require_infra!();
+    let server = quip_server_with_thread_html_status("t1", 500).await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    let runs = run_like_the_queue(&ctx, &import_id, "owner1").await;
+    assert!(
+        runs <= QUEUE_RUNS,
+        "the give-up must happen before the job dead-letters (took {runs} runs)",
+    );
+
+    let t1 = thread_row(&app, &import_id, "t1").await;
+    assert_eq!(
+        t1.state,
+        ThreadState::Failed,
+        "a thread the pass tried and lost is Failed, not Skipped and not Pending",
+    );
+    assert_eq!(t1.attempts, 3, "the attempt counter is what decides the give-up");
+    let reason = t1.reason.clone().unwrap_or_default();
+    assert!(reason.contains("500"), "the reason names the failure: {reason:?}");
+    assert!(reason.contains("gave up"), "the reason says it gave up: {reason:?}");
+
+    // The other threads are unaffected — this is the whole point.
+    let t2 = thread_row(&app, &import_id, "t2").await;
+    assert_eq!(t2.state, ThreadState::ContentDone);
+    assert!(
+        app.state.doc_repo.get(&t2.ogre_doc_id.clone().unwrap()).await.unwrap().is_some(),
+        "the healthy thread's document must exist",
+    );
+
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.phase, 2, "the pass must reach the end of the manifest");
+    assert_eq!(
+        rec.status,
+        ImportStatus::Succeeded,
+        "one dead thread must not fail the import",
+    );
+}
+
+/// Regression: a 401 STILL halts the whole run. This is the risk #141's fix
+/// creates — loosening 403 must not loosen 401 with it.
+///
+/// A dead credential is genuinely run-terminal: every remaining thread would
+/// fail identically, so continuing would burn the retry budget hammering Quip
+/// with a revoked token and would mark every remaining thread `Failed` over a
+/// problem a reconnect fixes in one click.
+#[tokio::test]
+async fn a_401_on_a_thread_still_halts_the_whole_run() {
+    common::require_infra!();
+    let server = quip_server_with_thread_html_status("t1", 401).await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(
+        rec.status,
+        ImportStatus::TokenRejected,
+        "a 401 must still flip the import to TokenRejected so the UI prompts a reconnect",
+    );
+    assert_ne!(rec.phase, 2, "a halted run must not claim the content pass completed");
+
+    // The pass stopped AT t1 — it did not walk on marking threads Skipped or
+    // Failed, and it did not import anything past it.
+    let t1 = thread_row(&app, &import_id, "t1").await;
+    assert_eq!(t1.state, ThreadState::Pending, "a 401 thread stays Pending; it is not the thread's fault");
+    let t2 = thread_row(&app, &import_id, "t2").await;
+    assert_eq!(t2.state, ThreadState::Pending, "the run must stop, not continue to the next thread");
+    assert_eq!(
+        hits(&server, "/2/threads/t2/html").await,
+        0,
+        "no further Quip call may be made with a credential known to be dead",
+    );
+    let docs = app.state.doc_repo.query_docs_by_owner("owner1").await.unwrap();
+    assert!(docs.is_empty(), "a halted run creates no documents: {docs:?}");
+}
+
+/// The REPORT row is what turns "999 documents" into "999 documents and a
+/// report line": it must name the threads that were skipped and failed, with
+/// reasons, and carry the true totals in its counters.
+#[tokio::test]
+async fn the_report_names_the_skipped_and_failed_threads_with_reasons() {
+    common::require_infra!();
+    // t1 is inaccessible (403 → skip); t2 is broken (500 → fail after N).
+    //
+    // t2's error BODY is hostile on purpose: `QuipError::Api` carries the raw
+    // response verbatim, so anything that stringifies the error into a
+    // durable `reason` / `detail` — rather than going through
+    // `safe_quip_reason` — writes a credential and a user's address into
+    // DynamoDB and then into the frontend's report. This body is what makes
+    // the leak assertions at the bottom load-bearing rather than decorative.
+    let server = quip_server_with_thread_html_status("t1", 403).await;
+    Mock::given(method("GET"))
+        .and(path("/2/threads/t2/html"))
+        .respond_with(ResponseTemplate::new(500).set_body_string(
+            r#"{"error":"tok-SEEKRET rejected for ada@example.com"}"#,
+        ))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    run_like_the_queue(&ctx, &import_id, "owner1").await;
+
+    let report = app
+        .state
+        .import_repo
+        .get_report(&import_id)
+        .await
+        .expect("report read")
+        .expect("an import that lost threads must have a REPORT row");
+    assert_eq!(report.owner_id, "owner1");
+
+    assert_eq!(report.counters.get("threads_skipped_forbidden"), Some(&1));
+    assert_eq!(report.counters.get("threads_failed"), Some(&1));
+    assert_eq!(report.counters.get("threads_skipped_chat"), Some(&1), "tc is a chat");
+    assert_eq!(report.notes_dropped, 0, "nothing was over budget here: {report:?}");
+
+    let skipped = report
+        .notes
+        .iter()
+        .find(|n| n.quip_thread_id == "t1")
+        .expect("the skipped thread must be named: {report:?}");
+    assert_eq!(skipped.kind, "thread_skipped");
+    assert!(skipped.detail.contains("403"), "{skipped:?}");
+
+    let failed = report
+        .notes
+        .iter()
+        .find(|n| n.quip_thread_id == "t2")
+        .expect("the failed thread must be named");
+    assert_eq!(failed.kind, "thread_failed");
+    assert!(failed.detail.contains("500"), "{failed:?}");
+
+    // Chats are counted but deliberately NOT named — a chat-heavy import
+    // would otherwise spend the whole note budget on them and name none of
+    // the documents it actually lost.
+    assert!(
+        !report.notes.iter().any(|n| n.quip_thread_id == "tc"),
+        "chat skips are a counter, not a note: {report:?}",
+    );
+
+    // Nothing Quip echoed back into its error body reaches a durable,
+    // user-visible string — not the report's notes, and not the `THREAD#`
+    // row's `reason`, which the wizard renders.
+    let t2_reason = thread_row(&app, &import_id, "t2").await.reason.unwrap_or_default();
+    let durable_strings: Vec<String> = report
+        .notes
+        .iter()
+        .map(|n| n.detail.clone())
+        .chain(std::iter::once(t2_reason))
+        .collect();
+    for s in &durable_strings {
+        assert!(!s.contains("SEEKRET"), "a credential must never reach durable state: {s:?}");
+        assert!(!s.contains('@'), "no address may reach durable state: {s:?}");
+        assert!(
+            !s.contains("rejected for"),
+            "Quip's raw response body must not be stringified into durable state: {s:?}",
+        );
+    }
+}
+
+/// A report write that can never succeed must not affect the import.
+///
+/// The `REPORT` row is a plain read-modify-write over a decoded `ReportRow`,
+/// so a row whose `counters` map holds a non-numeric value fails
+/// `report_from_item` on *every* subsequent read — `bump_report_counter` and
+/// `append_report_note` are then permanently broken for that import. That is a
+/// real reachable state, not a mock: this test writes exactly such a row and
+/// then runs an ordinary, entirely healthy import over it. An import that died
+/// because it could not write a note about a dying import is the worst
+/// outcome available.
+#[tokio::test]
+async fn a_permanently_poisoned_report_row_does_not_affect_the_import() {
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    // Poison it: `counters.threads_imported` is a string where the decoder
+    // requires a number.
+    app.dynamo_client()
+        .put_item()
+        .table_name(&app.table_name)
+        .item("PK", AttributeValue::S(format!("IMPORT#{import_id}")))
+        .item("SK", AttributeValue::S("REPORT".to_string()))
+        .item("owner_id", AttributeValue::S("owner1".to_string()))
+        .item(
+            "counters",
+            AttributeValue::M(std::collections::HashMap::from([(
+                "threads_imported".to_string(),
+                AttributeValue::S("not-a-number".to_string()),
+            )])),
+        )
+        .send()
+        .await
+        .expect("seed a poisoned REPORT row");
+    assert!(
+        app.state.import_repo.get_report(&import_id).await.is_err(),
+        "precondition: every report read for this import now fails",
+    );
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1")
+        .await
+        .expect("a broken report must not fail the import");
+
+    // The import is completely unaffected: same outcome as the happy path.
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ImportStatus::Succeeded);
+    assert_eq!(rec.phase, 2);
+    let docs = app.state.doc_repo.query_docs_by_owner("owner1").await.unwrap();
+    assert_eq!(docs.len(), 2, "both documents imported: {docs:?}");
+    assert_eq!(thread_row(&app, &import_id, "t1").await.state, ThreadState::ContentDone);
+    assert_eq!(thread_row(&app, &import_id, "t2").await.state, ThreadState::ContentDone);
+
+    // And the row is still poisoned — the import never repaired or overwrote
+    // it, which is what makes this "permanently" broken rather than "broken
+    // once".
+    assert!(
+        app.state.import_repo.get_report(&import_id).await.is_err(),
+        "the poisoned row is still poisoned; the import simply never depended on it",
+    );
+}
+
+/// The arithmetic that makes #142's fix a fix rather than a rename: *several*
+/// deterministically-failing threads must all resolve inside the queue's
+/// retry budget, not just one.
+///
+/// This is what forces the pass to keep walking the manifest after an
+/// under-budget thread failure instead of returning `Err` on the spot. An
+/// abort-on-first-bad-thread pass advances exactly ONE thread's attempt
+/// counter per run, so two bad threads need `2 * MAX_THREAD_ATTEMPTS - 1` = 5
+/// runs — one more than the queue gives — and the import dead-letters with
+/// the second thread still `Pending`. Continuing charges an attempt to every
+/// bad thread in a single run, so any number of them resolve in
+/// `MAX_THREAD_ATTEMPTS` runs.
+#[tokio::test]
+async fn several_failing_threads_all_resolve_inside_the_queues_retry_budget() {
+    common::require_infra!();
+    let server = quip_server_with_thread_html_status("t1", 500).await;
+    Mock::given(method("GET"))
+        .and(path("/2/threads/t2/html"))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    // Fails the test — with the dead-letter spelled out — if the give-up
+    // needs more runs than the queue has.
+    let runs = run_like_the_queue(&ctx, &import_id, "owner1").await;
+    assert_eq!(
+        runs, 3,
+        "both threads must be charged an attempt PER RUN, so both give up on run \
+         MAX_THREAD_ATTEMPTS; taking longer means the pass is still aborting at the \
+         first bad thread",
+    );
+
+    for thread in ["t1", "t2"] {
+        let row = thread_row(&app, &import_id, thread).await;
+        assert_eq!(row.state, ThreadState::Failed, "{thread} must be given up on");
+        assert_eq!(row.attempts, 3, "{thread} must have been charged one attempt per run");
+    }
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ImportStatus::Succeeded);
+    assert_eq!(rec.phase, 2);
+}
+
+/// Mirror of `worker_mode::MAX_CONSECUTIVE_THREAD_FAILURES` (same convention
+/// as `CLAIM_STALE_MS` in the inventory suite — the const is private).
+const MAX_CONSECUTIVE_THREAD_FAILURES: usize = 5;
+
+/// Seed an extra `Pending` document thread straight onto the manifest.
+///
+/// `run_content_pass` walks `list_threads`, and `put_thread` is
+/// insert-if-absent with no delete anywhere in the repo, so a pre-seeded row
+/// survives the inventory re-walk at the top of every run. That is what makes
+/// a manifest larger than the wiremock fixture's folder tree possible without
+/// new plumbing.
+async fn seed_extra_thread(app: &common::TestApp, import_id: &str, quip_thread_id: &str) {
+    app.state
+        .import_repo
+        .put_thread(
+            import_id,
+            &ThreadRow {
+                quip_thread_id: quip_thread_id.to_string(),
+                owner_id: "owner1".to_string(),
+                title: quip_thread_id.to_string(),
+                thread_type: "document".to_string(),
+                updated_usec: 999,
+                member_folders: vec!["root".to_string()],
+                first_folder: "root".to_string(),
+                state: ThreadState::Pending,
+                ogre_doc_id: None,
+                reason: None,
+                attempts: 0,
+            },
+        )
+        .await
+        .expect("seed extra thread row");
+}
+
+/// The circuit breaker: back-to-back thread failures read as a broken *Quip*,
+/// not as broken threads, and stop the pass.
+///
+/// This is the guard that makes "keep walking after a thread failure" safe.
+/// Continuing is right when the bad threads are scattered (#142's shape), and
+/// catastrophic when *everything* is failing: without the breaker a Quip-wide
+/// 5xx outage would charge an attempt to every thread in the manifest, and
+/// three such runs would mark an entire import `Failed` thread by thread over
+/// an outage that resolved itself in an hour.
+///
+/// The load-bearing assertion is on the thread *past* the breaking point:
+/// `attempts == 0` and zero HTTP hits prove the walk actually STOPPED, rather
+/// than merely happening to end.
+#[tokio::test]
+async fn consecutive_thread_failures_stop_the_pass_instead_of_condemning_the_manifest() {
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    // t3..t8 have no `/2/threads/{id}/html` mock, so wiremock's default 404
+    // becomes `QuipError::Api { status: 404 }` -> `Transient`: six failing
+    // threads, one more than the breaker's threshold. Sorted order puts them
+    // after t1/t2 and before tc.
+    let failing: Vec<String> = (3..=8).map(|i| format!("t{i}")).collect();
+    assert_eq!(
+        failing.len(),
+        MAX_CONSECUTIVE_THREAD_FAILURES + 1,
+        "the fixture must hold exactly one thread PAST the breaking point",
+    );
+    for t in &failing {
+        seed_extra_thread(&app, &import_id, t).await;
+    }
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    let err = execute_start_quip_import(&ctx, &import_id, "owner1")
+        .await
+        .expect_err("tripping the breaker must fail the job so the queue retries with backoff");
+    assert!(err.contains("consecutive"), "the error must name the reason: {err:?}");
+
+    // The first MAX_CONSECUTIVE_THREAD_FAILURES failures were each charged an
+    // attempt, and then the pass stopped.
+    for t in &failing[..MAX_CONSECUTIVE_THREAD_FAILURES] {
+        let row = thread_row(&app, &import_id, t).await;
+        assert_eq!(row.attempts, 1, "{t} must have been charged exactly one attempt");
+        assert_eq!(row.state, ThreadState::Pending, "{t} is retryable, not given up on");
+    }
+
+    // THE ASSERTION: the thread past the breaking point was never touched.
+    // Without the breaker the pass would have walked it (and every thread
+    // after it) charging attempts the whole way.
+    let t8 = thread_row(&app, &import_id, "t8").await;
+    assert_eq!(t8.attempts, 0, "the pass must STOP, not run out of threads");
+    assert_eq!(t8.state, ThreadState::Pending);
+    assert_eq!(
+        hits(&server, "/2/threads/t8/html").await,
+        0,
+        "no Quip call may be spent past the breaking point",
+    );
+    // tc sorts after t8, so it is untouched too — a second, independent
+    // witness that the loop exited early rather than completing.
+    assert_eq!(
+        thread_row(&app, &import_id, "tc").await.state,
+        ThreadState::Pending,
+        "the chat thread sorts last and must not have been reached",
+    );
+
+    // Progress made before the breaker tripped is still durable.
+    for t in ["t1", "t2"] {
+        assert_eq!(
+            thread_row(&app, &import_id, t).await.state,
+            ThreadState::ContentDone,
+            "{t} imported before the failures started and must stay imported",
+        );
+    }
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_ne!(rec.phase, 2, "an aborted pass must not claim completion");
+    assert_ne!(
+        rec.status,
+        ImportStatus::Succeeded,
+        "an aborted pass must not claim success",
+    );
+}
+
+/// #142 residual: MORE than `MAX_CONSECUTIVE_THREAD_FAILURES` sort-adjacent
+/// deterministically-failing threads must NOT dead-letter the import.
+///
+/// The circuit breaker trips at 5 consecutive failures. The pre-fix breaker
+/// counted *every* failure, so with 6+ adjacent bad threads it re-tripped at
+/// the same offset on every run and returned `Err` before the walk ever
+/// reached the threads past the trip point — those never got a first attempt,
+/// never climbed to `Failed`, and the job dead-lettered with them still
+/// `Pending`. That is #142 in miniature (bounded to N > 5 rather than N > 1,
+/// but the same bug).
+///
+/// The fix counts only a thread's *first* failure toward the breaker, so a
+/// known-bad thread stops re-arming it and the walk advances past the cluster
+/// across runs. Seven adjacent failures (comfortably past the threshold of 5)
+/// must now all reach `Failed` and the import must complete.
+///
+/// Seven, not more, because sort order is lexicographic: t1, t2, t3 … t9 stay
+/// adjacent, but t10 would sort between t1 and t2. Seven is enough to prove
+/// the property (> 5); the resolvable bound is 2× the threshold, documented on
+/// `run_content_pass`.
+#[tokio::test]
+async fn more_than_five_adjacent_deterministic_failures_do_not_dead_letter() {
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    // t3..t9: seven adjacent threads with no `/2/threads/{id}/html` mock, so
+    // each 404s -> Api{404} -> Transient, deterministically, every run.
+    let failing: Vec<String> = (3..=9).map(|i| format!("t{i}")).collect();
+    assert!(
+        failing.len() > MAX_CONSECUTIVE_THREAD_FAILURES,
+        "the fixture must exceed the breaker threshold to exercise the residual",
+    );
+    for t in &failing {
+        seed_extra_thread(&app, &import_id, t).await;
+    }
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    // Panics (naming the dead-letter) if the import doesn't complete inside the
+    // queue's real 4-run budget — which is exactly what the pre-fix breaker
+    // did here.
+    let runs = run_like_the_queue(&ctx, &import_id, "owner1").await;
+    assert!(runs <= QUEUE_RUNS, "must complete within the job budget (took {runs} runs)");
+
+    // Every one of the seven is marked Failed — the pass reached and gave up
+    // on all of them, none left stranded Pending.
+    for t in &failing {
+        let row = thread_row(&app, &import_id, t).await;
+        assert_eq!(
+            row.state,
+            ThreadState::Failed,
+            "{t} must be given up on, not stranded Pending (the dead-letter symptom)",
+        );
+        assert_eq!(row.attempts, 3, "{t} must have exhausted its per-thread budget");
+    }
+
+    // The healthy threads still imported — the whole point of not
+    // dead-lettering.
+    for t in ["t1", "t2"] {
+        assert_eq!(thread_row(&app, &import_id, t).await.state, ThreadState::ContentDone);
+    }
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.phase, 2, "the pass must run to completion");
+    assert_eq!(
+        rec.status,
+        ImportStatus::Succeeded,
+        "a cluster of bad threads must not fail the whole import",
+    );
+}
+
+/// The property the first-attempt-only breaker had to NOT break: a *sustained*
+/// Quip outage — one spanning multiple runs, so the leading threads are
+/// already on attempt 2+ — must still trip the breaker every run and keep the
+/// walk bounded, rather than walking the whole manifest charging attempts.
+///
+/// This is the exact regression the reviewer flagged as the risk of counting
+/// only first failures: if attempt-2+ failures no longer arm the breaker, does
+/// run 2 of an outage still stop early? It does — because a tripping breaker
+/// never lets the walk get ahead of its leading edge, so on run 2 the deep
+/// threads are still on their *first* failure and re-arm it. The known-bad
+/// leading threads don't, but they aren't what an outage's blast radius is
+/// made of; the fresh leading edge is.
+///
+/// Twelve adjacent bad threads (u03..u14, zero-padded so they sort adjacently
+/// and after the fixture's t-threads). Run 1 trips after 5 fresh failures
+/// (u03..u07); run 2's leading five (u03..u07) are now attempt-2 and do NOT
+/// arm the breaker, yet run 2 still trips — on the next five fresh threads
+/// (u08..u12) — leaving u13/u14 untouched. That is containment surviving into
+/// a sustained outage.
+#[tokio::test]
+async fn a_sustained_outage_still_trips_the_breaker_on_the_second_run() {
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    let bad: Vec<String> = (3..=14).map(|i| format!("u{i:02}")).collect(); // u03..u14
+    for t in &bad {
+        seed_extra_thread(&app, &import_id, t).await;
+    }
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    // Run 1: trips on the first five fresh failures.
+    execute_start_quip_import(&ctx, &import_id, "owner1")
+        .await
+        .expect_err("run 1 must trip the breaker");
+    for t in &bad[..MAX_CONSECUTIVE_THREAD_FAILURES] {
+        assert_eq!(thread_row(&app, &import_id, t).await.attempts, 1, "{t} charged in run 1");
+    }
+    assert_eq!(
+        thread_row(&app, &import_id, "u08").await.attempts,
+        0,
+        "run 1 must have stopped before the sixth bad thread",
+    );
+
+    // Run 2: the leading five are now attempt-2 (known-bad, do NOT arm the
+    // breaker), yet the run must STILL trip — on the next five fresh threads.
+    execute_start_quip_import(&ctx, &import_id, "owner1")
+        .await
+        .expect_err("run 2 must still trip during a sustained outage, not walk the whole manifest");
+
+    // The already-charged leading threads advanced (attempt 2), proving they
+    // were re-walked but did not, by themselves, trip the breaker.
+    for t in &bad[..MAX_CONSECUTIVE_THREAD_FAILURES] {
+        assert_eq!(thread_row(&app, &import_id, t).await.attempts, 2, "{t} re-charged in run 2");
+    }
+    // The next five fresh threads got their first attempt and tripped it.
+    for t in &bad[MAX_CONSECUTIVE_THREAD_FAILURES..2 * MAX_CONSECUTIVE_THREAD_FAILURES] {
+        assert_eq!(thread_row(&app, &import_id, t).await.attempts, 1, "{t} first-charged in run 2");
+    }
+    // THE ASSERTION: the walk stayed bounded — the twelfth thread was never
+    // reached in either run, so run 2 did not walk the whole manifest.
+    assert_eq!(
+        thread_row(&app, &import_id, "u14").await.attempts,
+        0,
+        "a sustained outage must not walk the whole manifest — u14 must be untouched",
+    );
+    assert_eq!(
+        hits(&server, "/2/threads/u14/html").await,
+        0,
+        "no Quip call may be spent on threads past the breaking point",
     );
 }

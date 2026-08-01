@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use crate::dynamo::DynamoClient;
 use crate::models::import::{ImportRecord, ImportStatus};
 use crate::models::import_inventory::{
-    FolderRow, PendingLinkItem, SecMapRow, ThreadRow, ThreadState, UnresolvedRow,
-    UNRESOLVED_CHUNK_LINKS,
+    FolderRow, PendingLinkItem, ReportNote, ReportRow, SecMapRow, ThreadRow, ThreadState,
+    UnresolvedRow, UNRESOLVED_CHUNK_LINKS,
 };
 use crate::repo::{RepoError, get_n, get_n_u64, get_s};
 
@@ -339,24 +339,249 @@ impl ImportRepo {
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
-    /// Mark a thread `Skipped` (e.g. unsupported thread type). Plain
+    /// Mark a thread `Skipped` (e.g. unsupported thread type, or a 403
+    /// after Task 4 decides the thread is inaccessible) with a
+    /// human-readable `reason`. Plain `update_item`, same idempotency
+    /// rationale as `set_thread_content_done`.
+    pub async fn set_thread_skipped(
+        &self,
+        import_id: &str,
+        quip_thread_id: &str,
+        reason: &str,
+    ) -> Result<(), RepoError> {
+        self.set_thread_disposition(import_id, quip_thread_id, ThreadState::Skipped, reason)
+            .await
+    }
+
+    /// Mark a thread `Failed` (the content pass retried it and gave up)
+    /// with a human-readable `reason`. Same shape as `set_thread_skipped`
+    /// — the two states differ in *why* the pass stopped trying, not in
+    /// how the row is written.
+    pub async fn set_thread_failed(
+        &self,
+        import_id: &str,
+        quip_thread_id: &str,
+        reason: &str,
+    ) -> Result<(), RepoError> {
+        self.set_thread_disposition(import_id, quip_thread_id, ThreadState::Failed, reason)
+            .await
+    }
+
+    /// Shared body for `set_thread_skipped` / `set_thread_failed`: set
+    /// `state` and `reason` on an existing `THREAD#` row. Plain
     /// `update_item`, same idempotency rationale as
-    /// `set_thread_content_done`.
-    pub async fn set_thread_skipped(&self, import_id: &str, quip_thread_id: &str) -> Result<(), RepoError> {
+    /// `set_thread_content_done` — the row already exists from Phase 1's
+    /// inventory, and this is a forward-only checkpoint a re-run can
+    /// safely repeat.
+    async fn set_thread_disposition(
+        &self,
+        import_id: &str,
+        quip_thread_id: &str,
+        state: ThreadState,
+        reason: &str,
+    ) -> Result<(), RepoError> {
         let pk = format!("IMPORT#{import_id}");
         let mut values = HashMap::new();
         values.insert(
             ":state".to_string(),
-            AttributeValue::S(thread_state_to_str(ThreadState::Skipped).to_string()),
+            AttributeValue::S(thread_state_to_str(state).to_string()),
         );
+        values.insert(":reason".to_string(), AttributeValue::S(reason.to_string()));
         self.db
             .update_item(
                 &pk,
                 &format!("THREAD#{quip_thread_id}"),
-                "SET #state = :state",
+                "SET #state = :state, reason = :reason",
                 values,
                 Some(HashMap::from([("#state".to_string(), "state".to_string())])),
             )
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Atomically increment the per-thread attempt counter and return the
+    /// new count. Task 4 reads this to decide when a thread has failed
+    /// deterministically enough times (`N`) to be marked `Failed` and
+    /// skipped rather than retried forever.
+    ///
+    /// Uses a raw `ADD attempts :inc` (mirrors `ThreadRepo::add_reaction`'s
+    /// pattern for reaching through `DynamoClient::inner()`) rather than a
+    /// read-modify-write: `update_item`/`update_item_conditional` on
+    /// `DynamoClient` don't expose `ReturnValues`, so this goes straight to
+    /// the SDK builder with `ReturnValue::UpdatedNew` to read the
+    /// post-increment value back in the same round trip — atomic even
+    /// under concurrent callers, unlike a get-then-set.
+    pub async fn bump_thread_attempts(
+        &self,
+        import_id: &str,
+        quip_thread_id: &str,
+    ) -> Result<u32, RepoError> {
+        let pk = format!("IMPORT#{import_id}");
+        let sk = format!("THREAD#{quip_thread_id}");
+        let mut values = HashMap::new();
+        values.insert(":inc".to_string(), AttributeValue::N("1".to_string()));
+
+        let result = self
+            .db
+            .inner()
+            .update_item()
+            .table_name(self.db.table_name())
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S(sk))
+            .update_expression("ADD attempts :inc")
+            .set_expression_attribute_values(Some(values))
+            .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+            .send()
+            .await
+            .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+
+        result
+            .attributes
+            .as_ref()
+            .and_then(|a| a.get("attempts"))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u32>().ok())
+            .ok_or_else(|| RepoError::MissingField("attempts".to_string()))
+    }
+
+    /// Read this import's accumulating `REPORT` row.
+    ///
+    /// `Ok(None)` when the import has nothing to report yet — the row is
+    /// written lazily on the first counter or note, so its absence is the
+    /// normal state of a clean import, not an error.
+    ///
+    /// **Strongly consistent**, unlike every other read in this repo.
+    /// `DynamoClient::get_item` never sets `ConsistentRead`, and the
+    /// default eventually-consistent read can serve a replica that has not
+    /// yet seen the last write — which would make
+    /// [`mutate_report`](Self::mutate_report)'s read-modify-write lose
+    /// increments *with no concurrency at all*: two `bump_report_counter`
+    /// calls milliseconds apart from the same single runner are enough. So
+    /// this reaches through `DynamoClient::inner()` for a raw builder, the
+    /// same escape hatch [`bump_thread_attempts`](Self::bump_thread_attempts)
+    /// uses.
+    ///
+    /// The consistency is on *this* method rather than only on the RMW
+    /// path deliberately: a second, quietly eventually-consistent reader
+    /// would be a loaded gun for the next person to build a mutation on
+    /// top of. One read path, correct by construction. The cost is one
+    /// extra RCU per read of a single small item — read once per counter
+    /// bump or note and once per wizard poll, which is nothing against the
+    /// per-thread Quip API calls happening alongside it.
+    pub async fn get_report(&self, import_id: &str) -> Result<Option<ReportRow>, RepoError> {
+        let pk = format!("IMPORT#{import_id}");
+        let result = self
+            .db
+            .inner()
+            .get_item()
+            .table_name(self.db.table_name())
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S(ReportRow::sk().to_string()))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+        result.item.as_ref().map(report_from_item).transpose()
+    }
+
+    /// Add `by` to the named counter on the `REPORT` row, creating the row
+    /// (and the counter) if needed. Counters are the totals the report
+    /// quotes; unlike `notes` they are unbounded in value and bounded only
+    /// by the number of distinct keys the callers use, which is a small
+    /// compile-time set.
+    ///
+    /// **Callers must treat a failure here as advisory.** The report
+    /// describes an import; it must never be able to *stop* one. A
+    /// corrupt or unwritable report row that propagated into the content
+    /// pass's control flow would halt a migration over its own bookkeeping
+    /// — the failure mode this whole row exists to remove. Log and carry
+    /// on. (Same for [`append_report_note`](Self::append_report_note).)
+    pub async fn bump_report_counter(
+        &self,
+        import_id: &str,
+        owner_id: &str,
+        key: &str,
+        by: u64,
+    ) -> Result<(), RepoError> {
+        self.mutate_report(import_id, owner_id, |row| row.bump_counter(key, by))
+            .await
+    }
+
+    /// Append one named loss/fallback to the `REPORT` row, creating the row
+    /// if needed.
+    ///
+    /// Silently budgeted, per `kind`, at
+    /// [`REPORT_MAX_NOTES_PER_KIND`](crate::models::import_inventory::REPORT_MAX_NOTES_PER_KIND)
+    /// and globally at
+    /// [`REPORT_MAX_NOTES`](crate::models::import_inventory::REPORT_MAX_NOTES):
+    /// over budget the note is dropped and only `notes_dropped` advances,
+    /// so a pathological import (every thread inaccessible) can't grow this
+    /// item past DynamoDB's 400 KB cap and lose the whole report, and a
+    /// high-frequency kind can't spend the slots a rarer one needs.
+    /// Callers that need the true total must also
+    /// [`bump_report_counter`](Self::bump_report_counter) — the note list is
+    /// a sample, the counters are the tally. Failures here are advisory,
+    /// exactly as for `bump_report_counter`.
+    pub async fn append_report_note(
+        &self,
+        import_id: &str,
+        owner_id: &str,
+        note: ReportNote,
+    ) -> Result<(), RepoError> {
+        self.mutate_report(import_id, owner_id, |row| row.push_note(note))
+            .await
+    }
+
+    /// Shared read-modify-write body for the `REPORT` mutators.
+    ///
+    /// **This is a plain read-modify-write, and it is only safe because of
+    /// the `runner_claim` lease.** The content pass is single-writer per
+    /// import — `claim_runner`/`heartbeat_runner` admit one runner at a time
+    /// — so no second writer can interleave between the read and the write.
+    /// A future caller that writes the report from *outside* that lease
+    /// (an API handler, a second worker pass, a parallel per-thread task)
+    /// turns this into a lost-update bug: the loser's counters and notes
+    /// vanish silently. If that day comes, the fix is to make each mutation
+    /// atomic on the server — `ADD` for the counters (mirroring
+    /// [`bump_thread_attempts`](Self::bump_thread_attempts)) and a
+    /// `list_append` guarded by `size(notes) < :cap` for the notes — not to
+    /// add a lock here.
+    ///
+    /// Two caveats worth knowing even today. First, lease takeover after a
+    /// stale heartbeat can briefly overlap two runners (see
+    /// `clear_runner_claim`'s owner check — the superseded runner is still
+    /// executing and nothing revokes its ability to write; there is no
+    /// fencing token). What a lost update costs in that window is **not**
+    /// one line: this writes the whole item, so the loser's *entire*
+    /// mutation is dropped — every note **and every counter increment**
+    /// the other writer committed between our read and our put. The
+    /// counters are the worse half. They are what "…and 9 800 more" is
+    /// computed from, so a lost increment makes the report silently
+    /// **under-report** the losses — the exact failure this row exists to
+    /// prevent, arriving quietly and looking like good news. It is still
+    /// never document data: the report is derived from the `THREAD#` rows,
+    /// which are written by their own conditional/forward-only paths.
+    ///
+    /// Second, and for the same reason, a mutation must never be built
+    /// from a stale in-memory `ReportRow` — always go through these
+    /// methods, which re-read (consistently) first.
+    async fn mutate_report(
+        &self,
+        import_id: &str,
+        owner_id: &str,
+        mutate: impl FnOnce(&mut ReportRow),
+    ) -> Result<(), RepoError> {
+        let mut row = self
+            .get_report(import_id)
+            .await?
+            .unwrap_or_else(|| ReportRow::new(owner_id));
+        mutate(&mut row);
+
+        let mut item = report_to_item(&row);
+        item.insert("PK".to_string(), AttributeValue::S(format!("IMPORT#{import_id}")));
+        item.insert("SK".to_string(), AttributeValue::S(ReportRow::sk().to_string()));
+        self.db
+            .put_item(item)
             .await
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
@@ -688,6 +913,7 @@ fn thread_state_to_str(s: ThreadState) -> &'static str {
         ThreadState::ContentDone => "contentdone",
         ThreadState::CommentsDone => "commentsdone",
         ThreadState::Skipped => "skipped",
+        ThreadState::Failed => "failed",
     }
 }
 
@@ -734,6 +960,10 @@ fn thread_to_item(t: &ThreadRow) -> HashMap<String, AttributeValue> {
     if let Some(ref ogre_doc_id) = t.ogre_doc_id {
         item.insert("ogre_doc_id".to_string(), AttributeValue::S(ogre_doc_id.clone()));
     }
+    if let Some(ref reason) = t.reason {
+        item.insert("reason".to_string(), AttributeValue::S(reason.clone()));
+    }
+    item.insert("attempts".to_string(), AttributeValue::N(t.attempts.to_string()));
     item
 }
 
@@ -752,6 +982,15 @@ fn thread_from_item(item: &HashMap<String, AttributeValue>) -> Result<ThreadRow,
         first_folder: get_s(item, "first_folder")?,
         state: thread_state_from_item(item)?,
         ogre_doc_id: item.get("ogre_doc_id").and_then(|v| v.as_s().ok()).cloned(),
+        reason: item.get("reason").and_then(|v| v.as_s().ok()).cloned(),
+        // Rows written before `attempts` existed have no such attribute —
+        // decode as 0, the correct "never attempted under the new
+        // counter" value, rather than erroring on a mid-flight import.
+        attempts: item
+            .get("attempts")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(0),
     })
 }
 
@@ -881,9 +1120,104 @@ fn unresolved_from_item(item: &HashMap<String, AttributeValue>) -> Result<Unreso
     })
 }
 
+fn report_to_item(r: &ReportRow) -> HashMap<String, AttributeValue> {
+    let mut item = HashMap::new();
+    item.insert("owner_id".to_string(), AttributeValue::S(r.owner_id.clone()));
+    // Counters/notes are sparse-omitted when empty, same convention as
+    // `selected_roots` on `META` — an import with nothing to report writes
+    // the smallest possible row.
+    if !r.counters.is_empty() {
+        item.insert(
+            "counters".to_string(),
+            AttributeValue::M(
+                r.counters
+                    .iter()
+                    .map(|(k, v)| (k.clone(), AttributeValue::N(v.to_string())))
+                    .collect(),
+            ),
+        );
+    }
+    if !r.notes.is_empty() {
+        item.insert(
+            "notes".to_string(),
+            AttributeValue::L(
+                r.notes
+                    .iter()
+                    .map(|n| {
+                        AttributeValue::M(HashMap::from([
+                            (
+                                "quip_thread_id".to_string(),
+                                AttributeValue::S(n.quip_thread_id.clone()),
+                            ),
+                            ("kind".to_string(), AttributeValue::S(n.kind.clone())),
+                            ("detail".to_string(), AttributeValue::S(n.detail.clone())),
+                        ]))
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if r.notes_dropped > 0 {
+        item.insert(
+            "notes_dropped".to_string(),
+            AttributeValue::N(r.notes_dropped.to_string()),
+        );
+    }
+    item
+}
+
+fn report_from_item(item: &HashMap<String, AttributeValue>) -> Result<ReportRow, RepoError> {
+    let counters = item
+        .get("counters")
+        .and_then(|v| v.as_m().ok())
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    let n = v
+                        .as_n()
+                        .ok()
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .ok_or_else(|| RepoError::MissingField(format!("counters.{k}")))?;
+                    Ok((k.clone(), n))
+                })
+                .collect::<Result<_, RepoError>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let notes = item
+        .get("notes")
+        .and_then(|v| v.as_l().ok())
+        .map(|l| {
+            l.iter()
+                .filter_map(|av| av.as_m().ok())
+                .map(|m| {
+                    Ok(ReportNote {
+                        quip_thread_id: get_s(m, "quip_thread_id")?,
+                        kind: get_s(m, "kind")?,
+                        detail: get_s(m, "detail")?,
+                    })
+                })
+                .collect::<Result<Vec<_>, RepoError>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(ReportRow {
+        owner_id: get_s(item, "owner_id")?,
+        counters,
+        notes,
+        // Absent means nothing was ever dropped — the list is complete.
+        notes_dropped: item
+            .get("notes_dropped")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_smithy_runtime::client::http::test_util::StaticReplayClient;
 
     fn record_fixture() -> ImportRecord {
         ImportRecord {
@@ -992,10 +1326,97 @@ mod tests {
         let t = ThreadRow { quip_thread_id: "qt1".into(), owner_id: "u1".into(),
             title: "Doc".into(), thread_type: "document".into(), updated_usec: 42,
             member_folders: vec!["qf1".into(), "qf2".into()], first_folder: "qf1".into(),
-            state: ThreadState::Pending, ogre_doc_id: None };
+            state: ThreadState::Pending, ogre_doc_id: None, reason: None, attempts: 0 };
         let item = thread_to_item(&t);
         assert!(!item.contains_key("token") && !item.contains_key("secret"));
         assert_eq!(thread_from_item(&item).expect("from_item"), t);
+    }
+
+    fn thread_fixture(state: ThreadState, reason: Option<&str>, attempts: u32) -> ThreadRow {
+        ThreadRow {
+            quip_thread_id: "qt1".into(),
+            owner_id: "u1".into(),
+            title: "Doc".into(),
+            thread_type: "document".into(),
+            updated_usec: 42,
+            member_folders: vec!["qf1".into()],
+            first_folder: "qf1".into(),
+            state,
+            ogre_doc_id: None,
+            reason: reason.map(str::to_string),
+            attempts,
+        }
+    }
+
+    /// `Failed` and `Skipped` round-trip with and without a `reason`, and
+    /// carry no token/secret — same guard as the plain-`Pending` case
+    /// above, extended to the new variant and field (Task 2 of the
+    /// open-failures remediation plan).
+    #[test]
+    fn thread_row_failed_and_skipped_round_trip_with_and_without_reason() {
+        for state in [ThreadState::Failed, ThreadState::Skipped] {
+            for reason in [Some("403 forbidden"), None] {
+                let t = thread_fixture(state, reason, 2);
+                let item = thread_to_item(&t);
+                assert!(!item.contains_key("token") && !item.contains_key("secret"));
+                assert_eq!(
+                    item.contains_key("reason"),
+                    reason.is_some(),
+                    "reason must be sparse-omitted when None (state={state:?})"
+                );
+                assert_eq!(thread_from_item(&item).expect("from_item"), t, "state={state:?} reason={reason:?}");
+            }
+        }
+    }
+
+    /// `attempts` round-trips when present, and a row that never went
+    /// through the new write path (attribute absent entirely) decodes as
+    /// `0` rather than erroring — the load-bearing backward-compat case:
+    /// an import mid-flight across the deploy that adds this field.
+    #[test]
+    fn thread_row_attempts_present_and_backward_compat_absent() {
+        let t = thread_fixture(ThreadState::Pending, None, 5);
+        let item = thread_to_item(&t);
+        assert_eq!(item.get("attempts").and_then(|v| v.as_n().ok()), Some(&"5".to_string()));
+        assert_eq!(thread_from_item(&item).expect("from_item"), t);
+
+        // Simulate a pre-Task-2 row: no `attempts`, no `reason` attribute
+        // at all (not even sparse-omitted-and-present-as-null — genuinely
+        // absent, as a row written by the old `thread_to_item` would be).
+        let mut legacy_item = item.clone();
+        legacy_item.remove("attempts");
+        legacy_item.remove("reason");
+        let decoded = thread_from_item(&legacy_item).expect("from_item on legacy row");
+        assert_eq!(decoded.attempts, 0);
+        assert_eq!(decoded.reason, None);
+    }
+
+    /// Backward-compat decode of a hand-built item map that never had
+    /// `reason`/`attempts` at all (the exact shape of a `THREAD#` row
+    /// written before this change) — must decode cleanly, not error.
+    #[test]
+    fn thread_row_decodes_pre_task2_item_without_reason_or_attempts() {
+        let mut item = HashMap::new();
+        item.insert("quip_thread_id".to_string(), AttributeValue::S("qt1".into()));
+        item.insert("owner_id".to_string(), AttributeValue::S("u1".into()));
+        item.insert("title".to_string(), AttributeValue::S("Doc".into()));
+        item.insert("thread_type".to_string(), AttributeValue::S("document".into()));
+        item.insert("updated_usec".to_string(), AttributeValue::N("42".into()));
+        item.insert(
+            "member_folders".to_string(),
+            AttributeValue::L(vec![AttributeValue::S("qf1".into())]),
+        );
+        item.insert("first_folder".to_string(), AttributeValue::S("qf1".into()));
+        item.insert("state".to_string(), AttributeValue::S("contentdone".into()));
+        item.insert("ogre_doc_id".to_string(), AttributeValue::S("doc-1".into()));
+        // Deliberately no "reason", no "attempts" — this is what every
+        // THREAD# row written before Task 2 looks like.
+
+        let decoded = thread_from_item(&item).expect("must decode a pre-Task-2 row without error");
+        assert_eq!(decoded.state, ThreadState::ContentDone);
+        assert_eq!(decoded.ogre_doc_id.as_deref(), Some("doc-1"));
+        assert_eq!(decoded.reason, None);
+        assert_eq!(decoded.attempts, 0);
     }
 
     #[test]
@@ -1045,6 +1466,236 @@ mod tests {
         };
         let item = unresolved_to_item(&r);
         assert!(!item.contains_key("token") && !item.contains_key("secret"));
+    }
+
+    fn report_fixture() -> ReportRow {
+        let mut r = ReportRow::new("u1");
+        r.bump_counter("threads_imported", 7);
+        r.bump_counter("threads_skipped", 2);
+        r.push_note(ReportNote {
+            quip_thread_id: "qt1".into(),
+            kind: "skipped".into(),
+            detail: "403 forbidden".into(),
+        });
+        r.push_note(ReportNote {
+            quip_thread_id: "qt2".into(),
+            kind: "image_dropped".into(),
+            detail: "blob too large".into(),
+        });
+        r
+    }
+
+    #[test]
+    fn report_row_round_trips_and_has_no_token() {
+        let r = report_fixture();
+        let item = report_to_item(&r);
+        // Same guard as every other manifest row: no durable row in the
+        // import partition may carry the Quip credential.
+        assert!(!item.contains_key("token") && !item.contains_key("secret"));
+        assert_eq!(report_from_item(&item).expect("from_item"), r);
+    }
+
+    /// A report with nothing in it writes the smallest possible row (no
+    /// `counters`/`notes`/`notes_dropped` attributes) and reads back as an
+    /// empty report rather than erroring — the shape every import has
+    /// before its first loss.
+    #[test]
+    fn report_row_empty_is_sparse_and_decodes_clean() {
+        let r = ReportRow::new("u1");
+        let item = report_to_item(&r);
+        assert!(!item.contains_key("counters"));
+        assert!(!item.contains_key("notes"));
+        assert!(
+            !item.contains_key("notes_dropped"),
+            "an untruncated report must not claim a truncation"
+        );
+        let back = report_from_item(&item).expect("from_item");
+        assert_eq!(back, r);
+        assert!(back.counters.is_empty() && back.notes.is_empty());
+        assert_eq!(back.notes_dropped, 0);
+    }
+
+    /// The truncation marker must survive the wire, not just live in
+    /// memory: a reader that only ever sees the persisted row is the one
+    /// that has to say "and N more".
+    #[test]
+    fn report_row_truncation_marker_survives_the_item_round_trip() {
+        use crate::models::import_inventory::REPORT_MAX_NOTES_PER_KIND;
+
+        let mut r = ReportRow::new("u1");
+        for i in 0..REPORT_MAX_NOTES_PER_KIND + 3 {
+            r.push_note(ReportNote {
+                quip_thread_id: format!("qt{i}"),
+                kind: "failed".into(),
+                detail: "boom".into(),
+            });
+            r.bump_counter("threads_failed", 1);
+        }
+        let back = report_from_item(&report_to_item(&r)).expect("from_item");
+        assert_eq!(back.notes.len(), REPORT_MAX_NOTES_PER_KIND);
+        assert_eq!(back.notes_dropped, 3);
+        assert_eq!(
+            back.counters["threads_failed"],
+            (REPORT_MAX_NOTES_PER_KIND + 3) as u64
+        );
+    }
+
+    /// The per-kind budget has to survive the wire too: a reader that only
+    /// ever sees the persisted row must still find the rare kind's notes
+    /// among the noisy kind's.
+    #[test]
+    fn report_row_keeps_every_kind_across_the_item_round_trip() {
+        use crate::models::import_inventory::REPORT_MAX_NOTES_PER_KIND;
+
+        let mut r = ReportRow::new("u1");
+        for i in 0..REPORT_MAX_NOTES_PER_KIND * 4 {
+            r.push_note(ReportNote {
+                quip_thread_id: format!("qt{i}"),
+                kind: "image_dropped".into(),
+                detail: "blob 403".into(),
+            });
+        }
+        r.push_note(ReportNote {
+            quip_thread_id: "qt-late".into(),
+            kind: "skipped".into(),
+            detail: "403 forbidden".into(),
+        });
+
+        let back = report_from_item(&report_to_item(&r)).expect("from_item");
+        assert_eq!(
+            back.notes.iter().filter(|n| n.kind == "image_dropped").count(),
+            REPORT_MAX_NOTES_PER_KIND
+        );
+        assert_eq!(
+            back.notes.iter().filter(|n| n.kind == "skipped").count(),
+            1,
+            "the late, rare kind must still be on the persisted row"
+        );
+    }
+
+    /// A corrupt counter value must surface as a named `MissingField`
+    /// rather than silently decoding as zero — a report that under-counts
+    /// is worse than one that fails loudly.
+    #[test]
+    fn report_row_rejects_a_non_numeric_counter() {
+        let mut item = report_to_item(&report_fixture());
+        item.insert(
+            "counters".to_string(),
+            AttributeValue::M(HashMap::from([(
+                "threads_imported".to_string(),
+                AttributeValue::S("lots".to_string()),
+            )])),
+        );
+        match report_from_item(&item) {
+            Err(RepoError::MissingField(msg)) => {
+                assert!(msg.contains("threads_imported"), "must name the counter: {msg}")
+            }
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    /// A `DynamoClient` whose HTTP layer replays canned responses and
+    /// records the requests the SDK actually emitted. Lets a test assert on
+    /// request *shape* — the only way to pin `ConsistentRead`, since
+    /// DynamoDB Local serves every read from one store and so behaves
+    /// identically with and without it.
+    fn replaying_repo(responses: Vec<&str>) -> (ImportRepo, StaticReplayClient) {
+        use aws_smithy_runtime::client::http::test_util::ReplayEvent;
+        use aws_smithy_types::body::SdkBody;
+
+        let replay = StaticReplayClient::new(
+            responses
+                .into_iter()
+                .map(|body| {
+                    ReplayEvent::new(
+                        http::Request::builder()
+                            .uri("http://localhost/")
+                            .body(SdkBody::from("{}"))
+                            .unwrap(),
+                        http::Response::builder()
+                            .status(200)
+                            .body(SdkBody::from(body))
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+        );
+        let conf = aws_sdk_dynamodb::config::Builder::new()
+            .endpoint_url("http://localhost:9999")
+            .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+                "k", "s", None, None, "test",
+            ))
+            .http_client(replay.clone())
+            .behavior_version_latest()
+            .build();
+        let repo = ImportRepo::new(crate::dynamo::DynamoClient::new(
+            aws_sdk_dynamodb::Client::from_conf(conf),
+            "test-table".to_string(),
+        ));
+        (repo, replay)
+    }
+
+    /// The report's read-modify-write is only correct if its read is
+    /// **strongly consistent**. `DynamoClient::get_item` never sets
+    /// `ConsistentRead`, and under the default eventually-consistent read
+    /// two `bump_report_counter` calls milliseconds apart *from the same
+    /// single runner* can lose an increment: the second read may be served
+    /// by a replica that hasn't seen the first write. That is a lost update
+    /// with **no concurrency at all** — not the lease-overlap case — and a
+    /// lost counter increment makes the report silently under-report the
+    /// losses it exists to name.
+    ///
+    /// DynamoDB Local cannot express the difference (it serves every read
+    /// from one store), so the live integration tests pass either way. This
+    /// asserts the request the SDK actually puts on the wire instead.
+    #[tokio::test]
+    async fn the_report_read_modify_write_reads_consistently() {
+        let (repo, replay) = replaying_repo(vec![
+            // The existing row the RMW reads back...
+            r#"{"Item":{"owner_id":{"S":"u1"},"counters":{"M":{"threads_failed":{"N":"4"}}}}}"#,
+            // ...and the PutItem response.
+            "{}",
+        ]);
+
+        repo.bump_report_counter("imp1", "u1", "threads_failed", 1)
+            .await
+            .expect("bump_report_counter");
+
+        // Everything is read off the captured requests inline: they are
+        // smithy's own `Request` type, which this crate has no direct
+        // dependency on to name in a helper's signature.
+        let reqs: Vec<_> = replay.actual_requests().collect();
+        assert_eq!(reqs.len(), 2, "an RMW is exactly one read then one write");
+        let read_target = reqs[0].headers().get("x-amz-target").unwrap_or_default();
+        let read_body =
+            String::from_utf8(reqs[0].body().bytes().expect("in-memory body").to_vec())
+                .expect("utf-8 body");
+        let write_target = reqs[1].headers().get("x-amz-target").unwrap_or_default();
+        let write_body =
+            String::from_utf8(reqs[1].body().bytes().expect("in-memory body").to_vec())
+                .expect("utf-8 body");
+
+        assert!(
+            read_target.ends_with("GetItem"),
+            "first call must be the read: {read_target}"
+        );
+        assert!(
+            read_body.contains(r#""ConsistentRead":true"#),
+            "the RMW's read must be strongly consistent, else an increment can \
+             be lost with no concurrency at all: {read_body}",
+        );
+
+        // ...and the write really did merge what the read returned, rather
+        // than starting from an empty row.
+        assert!(
+            write_target.ends_with("PutItem"),
+            "second call must be the write: {write_target}"
+        );
+        assert!(
+            write_body.contains(r#""threads_failed":{"N":"5"}"#),
+            "the write must carry 4 + 1: {write_body}",
+        );
     }
 
     #[test]

@@ -990,10 +990,7 @@ impl Transaction {
     pub fn join_forward(self) -> Result<Self, StepError> {
         // #143: resolve a structural-seam caret to the end of the block
         // before it, so forward-delete there behaves exactly like
-        // forward-delete at that block's end. The `next` lookup below
-        // is deliberately left on `find_block_at` — it asks a different
-        // question ("which block starts here") and widening it is a
-        // separate change.
+        // forward-delete at that block's end.
         let (block, pos) = resolve_block_for_edit(&self.doc, self.selection.from())
             .ok_or_else(|| StepError("cursor not in a block".into()))?;
 
@@ -1004,9 +1001,21 @@ impl Transaction {
             return Err(StepError("cursor not at block end".into()));
         }
 
-        // Find the next sibling textblock by searching just after this block
+        // #145: the next textblock is found by *walking* the structure,
+        // not by probing `after_block + 1`. That `+1` assumed exactly one
+        // open token stood between this block's close and the next
+        // block's content — true for flat `Paragraph` → `Paragraph`
+        // siblings, false the moment a list is involved, where a
+        // `ListItem` open and a `Paragraph` open are both in the way. The
+        // probe then landed on a position no block claimed, `find_block_at`
+        // returned `None`, and forward-delete was inert at the end of
+        // every list item.
+        //
+        // The probe is *not* `resolve_block_for_edit(after_block + 1)`:
+        // that helper resolves **backwards**, so it would answer with the
+        // caret's own block and merge its content into itself.
         let after_block = block.offset + block.node_size;
-        let next = find_block_at(&self.doc, after_block + 1)
+        let next = next_textblock_after(&self.doc, after_block)
             .ok_or_else(|| StepError("no next textblock".into()))?;
 
         // Code blocks are sturdy: forward-delete never dissolves one
@@ -1017,10 +1026,19 @@ impl Transaction {
         // just steps the caret into the block.
         if next.node_type == NodeType::CodeBlock && block.node_type != NodeType::CodeBlock {
             if block.content.size() == 0 {
-                let mut txn =
-                    self.delete(block.offset, block.offset + block.node_size)?;
+                // #145: remove `block` together with any ancestor its
+                // removal would leave empty. Deleting only the paragraph
+                // node stranded a textblock-less `ListItem` behind —
+                // `find_block_at` can't reach one, so it rendered as a
+                // marker-only bullet that Backspace answered with "at
+                // block start with no action available". Same orphan
+                // class the cross-container branch below avoids; the
+                // guard has to share the cure.
+                let (shell_from, shell_to) =
+                    empty_shell_range(&self.doc, block.offset, block.offset + block.node_size);
+                let mut txn = self.delete(shell_from, shell_to)?;
                 txn.selection =
-                    Selection::cursor(next.content_start - block.node_size);
+                    Selection::cursor(next.content_start - (shell_to - shell_from));
                 return Ok(txn);
             }
             let mut txn = self;
@@ -1028,7 +1046,69 @@ impl Transaction {
             return Ok(txn);
         }
 
-        // Merge: replace both blocks with one block (current type) containing combined content
+        let cursor_pos = pos; // cursor stays where it was
+
+        if next.offset != after_block {
+            // #145: `next` lives in a different parent — the next list
+            // item, a sub-list under this bullet, the first item of a list
+            // that follows a paragraph. A single `replace` spanning both
+            // blocks would cut through the containers in between and leave
+            // their tokens unbalanced (`Fragment::cut` would hand back
+            // half-open `ListItem`s wrapped around the merged paragraph —
+            // the undeletable-orphan shape from the list-paste bug).
+            //
+            // Up to three aligned steps instead, applied back-to-front so
+            // no position needs remapping: drop `next`'s node (plus any
+            // ancestor that leaves empty), re-home whatever its list item
+            // was carrying, then splice its inline content onto the end of
+            // this block. Every position touched after the first is
+            // strictly below `shell_from`.
+            let next_end = next.offset + next.node_size;
+
+            // When `next` is the leading paragraph of a list item that
+            // carries more — a sub-list — that remainder has to move onto
+            // *this* block's item, exactly as `lift_from_list` does for
+            // Backspace. Left where it is, the item would keep only the
+            // sub-list, which `view.rs` renders as a marker-only bullet:
+            // an empty bullet the user never asked for. Restricted to
+            // list items on purpose; the trailing siblings of a
+            // `Blockquote` or of the doc itself belong where they are.
+            let carrier = find_item_at(&self.doc, next.content_start).filter(|item| {
+                matches!(item.node_type, NodeType::ListItem | NodeType::TaskItem)
+                    && item.offset + 1 == next.offset
+                    && item.content.children.len() > 1
+            });
+            let tail_content = carrier
+                .as_ref()
+                .map(|item| Fragment::from(item.content.children[1..].to_vec()));
+
+            let (shell_from, shell_to) = empty_shell_range(
+                &self.doc,
+                next.offset,
+                carrier
+                    .as_ref()
+                    .map_or(next_end, |item| item.offset + item.node_size - 1),
+            );
+
+            let txn = self.delete(shell_from, shell_to)?;
+            let txn = match tail_content {
+                Some(frag) => {
+                    txn.replace(after_block, after_block, Slice::new(frag, 0, 0))?
+                }
+                None => txn,
+            };
+            let mut txn = if next.content.size() > 0 {
+                let inline = Slice::new(next.content, 0, 0);
+                txn.replace(pos, pos, inline)?
+            } else {
+                txn
+            };
+            txn.selection = Selection::cursor(cursor_pos);
+            return Ok(txn);
+        }
+
+        // Flat siblings: replace both blocks with one block (current type)
+        // containing the combined content.
         let merged_content = block.content.append_fragment(next.content);
         let merged = Node::Element {
             node_type: block.node_type,
@@ -1036,7 +1116,6 @@ impl Transaction {
             content: merged_content,
             marks: vec![],
         };
-        let cursor_pos = pos; // cursor stays where it was
 
         let from = block.offset;
         let end = next.offset + next.node_size;
@@ -1082,22 +1161,33 @@ impl Transaction {
         let (block, pos) = resolve_block_for_edit(&self.doc, pos)
             .ok_or_else(|| StepError("cursor not in a block".into()))?;
 
-        let text: String = block.content.children.iter().map(|c| c.text_content()).collect();
+        // #146: walk the inline content, not its flattened text. `offset`
+        // is a *model* offset and counts inline atoms; `text_content()`
+        // drops them, so indexing the flattened text with `offset` used to
+        // run off the end and panic on any block ending in a `HardBreak`,
+        // `Mention` or `DocMention`.
+        let units = inline_units(&block.content);
         let offset = pos - block.content_start;
-        let chars: Vec<char> = text.chars().collect();
 
         if offset == 0 {
             // At start of block — try joining backward instead
             return self.join_backward();
         }
 
-        // Scan backward: skip whitespace, then skip word chars
-        let mut i = offset;
-        while i > 0 && chars[i - 1].is_whitespace() {
+        let mut i = offset.min(units.len());
+        if i > 0 && units[i - 1].is_none() {
+            // An inline atom: word deletion stops at it and removes just
+            // it, rather than swallowing the word on its far side.
             i -= 1;
-        }
-        while i > 0 && !chars[i - 1].is_whitespace() {
-            i -= 1;
+        } else {
+            // Scan backward: skip whitespace, then skip word chars. An
+            // atom is neither, so either loop halts on one.
+            while i > 0 && units[i - 1].is_some_and(char::is_whitespace) {
+                i -= 1;
+            }
+            while i > 0 && units[i - 1].is_some_and(|c| !c.is_whitespace()) {
+                i -= 1;
+            }
         }
 
         let delete_from = block.content_start + i;
@@ -1120,23 +1210,35 @@ impl Transaction {
         let (block, pos) = resolve_block_for_edit(&self.doc, pos)
             .ok_or_else(|| StepError("cursor not in a block".into()))?;
 
-        let text: String = block.content.children.iter().map(|c| c.text_content()).collect();
+        // #146: same model-offset-vs-character-offset mismatch as
+        // `delete_word_backward`. Here it never panicked — `offset >= len`
+        // bailed out early — but it made `len` too small, so a caret
+        // before a trailing atom looked like a caret at the block's end
+        // and Ctrl+Delete merged the next block in while leaving the atom
+        // stranded; and a scan that crossed an atom deleted the wrong
+        // range by exactly the number of atoms it crossed.
+        let units = inline_units(&block.content);
         let offset = pos - block.content_start;
-        let chars: Vec<char> = text.chars().collect();
-        let len = chars.len();
+        let len = units.len();
 
         if offset >= len {
             // At end of block — try joining forward instead
             return self.join_forward();
         }
 
-        // Scan forward: skip word chars, then skip whitespace
         let mut i = offset;
-        while i < len && !chars[i].is_whitespace() {
+        if units[i].is_none() {
+            // An inline atom: delete just it (mirror of the backward case).
             i += 1;
-        }
-        while i < len && chars[i].is_whitespace() {
-            i += 1;
+        } else {
+            // Scan forward: skip word chars, then skip whitespace. An atom
+            // is neither, so either loop halts on one.
+            while i < len && units[i].is_some_and(|c| !c.is_whitespace()) {
+                i += 1;
+            }
+            while i < len && units[i].is_some_and(char::is_whitespace) {
+                i += 1;
+            }
         }
 
         let delete_to = block.content_start + i;
@@ -1393,6 +1495,205 @@ fn last_textblock_in(node: &Node, offset: usize) -> Option<BlockInfo> {
         .find_map(|(o, c)| last_textblock_in(c, *o))
 }
 
+/// A textblock's inline content flattened to **one entry per model
+/// position**: `Some(ch)` for each character of a text node, `None` for
+/// each position an inline atom occupies (`HardBreak`, `Mention`,
+/// `DocMention`, inline images).
+///
+/// The point is the alignment. `Fragment::text_content()` concatenates
+/// only the text nodes, so a character index into it drifts from the
+/// model offset by one per atom to its left — index it with a model
+/// offset and you read the wrong character, or run off the end and panic
+/// (GitHub #146). Indices into this vector *are* model offsets relative
+/// to the block's `content_start`, and its length is exactly
+/// `content.size()`.
+fn inline_units(content: &Fragment) -> Vec<Option<char>> {
+    let mut units = Vec::with_capacity(content.size());
+    for child in &content.children {
+        match child {
+            Node::Text { text, .. } => units.extend(text.chars().map(Some)),
+            other => units.extend(std::iter::repeat_n(None, other.node_size())),
+        }
+    }
+    units
+}
+
+/// The textblock that forward-delete at `pos` should merge in, where
+/// `pos` is the position **just past** a block's close token.
+///
+/// This replaces `find_block_at(pos + 1)` (GitHub #145). That `+1`
+/// assumed exactly one open token stood between the two blocks — true
+/// for flat `Paragraph` → `Paragraph` siblings, false the moment a list
+/// is involved, where a `ListItem` open and a `Paragraph` open are both
+/// in the way, so the probe landed on a position no block claimed and
+/// forward-delete was inert at the end of every list item.
+///
+/// The walk closes and opens containers as needed but never steps
+/// *over* anything else, which is what keeps the old declines intact:
+///
+/// - a leaf sibling (`HorizontalRule`, `Image`, `Embed`, `Mermaid`)
+///   blocks it, so forward-delete cannot jump an atom and merge the
+///   paragraphs on either side — `view.rs` handles atoms with
+///   `atom_after_cursor_block` and needs this to keep declining;
+/// - so does **crossing an `isolating` boundary** in either direction:
+///   entering or leaving a `TableCell` / `TableHeader`, a `Kanban` or a
+///   `Calendar`. That is the schema's own property
+///   ([`schema::is_isolating`]), not a list of container types kept in
+///   parallel here — an allow-list drifts as node types are added, and
+///   it also mistakes "already inside a cell" for "about to enter one".
+///   Descending into a node that *strictly contains* the cursor crosses
+///   nothing, so a caret already inside a cell still reaches the next
+///   paragraph **of that cell**.
+pub(crate) fn next_textblock_after(doc: &Node, pos: usize) -> Option<BlockInfo> {
+    let Node::Element { content, .. } = doc else {
+        return None;
+    };
+    match next_textblock_in(&content.children, pos, 0) {
+        Probe::Found(block) => Some(block),
+        Probe::Exhausted | Probe::Blocked => None,
+    }
+}
+
+/// Outcome of one level of [`next_textblock_after`]'s walk. The
+/// distinction that matters is `Exhausted` vs `Blocked`: running off the
+/// end of a container means "keep looking past it", running into
+/// something unmergeable means "stop, forward-delete declines here".
+enum Probe {
+    Found(BlockInfo),
+    Exhausted,
+    Blocked,
+}
+
+fn next_textblock_in(children: &[Node], pos: usize, base: usize) -> Probe {
+    let mut cursor = pos;
+    let mut offset = base;
+    for child in children {
+        let child_offset = offset;
+        let child_size = child.node_size();
+        offset += child_size;
+
+        if child_offset + child_size <= cursor {
+            continue; // wholly before the cursor
+        }
+
+        if child_offset == cursor {
+            // Entering a sibling that starts here.
+            return textblock_head(child, child_offset);
+        }
+
+        // The cursor is strictly inside this child, so no boundary is
+        // crossed by looking there: either the answer is deeper down, or
+        // the cursor is sitting on this child's close token.
+        let Node::Element {
+            node_type, content, ..
+        } = child
+        else {
+            return Probe::Blocked;
+        };
+        if node_type.is_leaf() || node_type.is_textblock() {
+            return Probe::Blocked;
+        }
+        match next_textblock_in(&content.children, cursor, child_offset + 1) {
+            Probe::Found(block) => return Probe::Found(block),
+            Probe::Blocked => return Probe::Blocked,
+            // The cursor reached this container's content end. Leaving
+            // it *is* a crossing — refuse for an isolating node, so a
+            // caret at the end of a cell's last paragraph cannot reach
+            // into the next cell. Otherwise close it and carry on from
+            // just past its close token.
+            Probe::Exhausted => {
+                if super::schema::is_isolating(*node_type) {
+                    return Probe::Blocked;
+                }
+                cursor = child_offset + child_size;
+            }
+        }
+    }
+    Probe::Exhausted
+}
+
+/// The first textblock reachable by opening `node` at `offset` without
+/// stepping over anything.
+fn textblock_head(node: &Node, offset: usize) -> Probe {
+    let Node::Element {
+        node_type, content, ..
+    } = node
+    else {
+        return Probe::Blocked;
+    };
+    if node_type.is_leaf() || super::schema::is_isolating(*node_type) {
+        return Probe::Blocked;
+    }
+    if node_type.is_textblock() {
+        return match block_info_for(node, offset) {
+            Some(block) => Probe::Found(block),
+            None => Probe::Blocked,
+        };
+    }
+    // An empty container occupies the position but offers nothing to
+    // merge. Treat it as a blocker rather than stepping over it: the
+    // walk's whole contract is that it never skips a sibling.
+    match next_textblock_in(&content.children, offset + 1, offset + 1) {
+        Probe::Found(block) => Probe::Found(block),
+        Probe::Exhausted | Probe::Blocked => Probe::Blocked,
+    }
+}
+
+/// Widen `[from, to)` outward through every ancestor that removing it
+/// would leave with no content at all — the `ListItem` holding only that
+/// paragraph, the `BulletList` holding only that item, and so on.
+///
+/// Widening stops the moment an ancestor holds anything besides the
+/// range already covered, so nothing outside `[from, to)` is ever
+/// discarded: a `ListItem` that still carries a sub-list keeps both.
+///
+/// Callers pass a range that already aligns to node boundaries — a
+/// single node, or a run of siblings. Returns it unchanged when no
+/// ancestor qualifies.
+fn empty_shell_range(doc: &Node, from: usize, to: usize) -> (usize, usize) {
+    let Node::Element { content, .. } = doc else {
+        return (from, to);
+    };
+    empty_shell_range_in(&content.children, from, to, 0)
+}
+
+fn empty_shell_range_in(
+    children: &[Node],
+    from: usize,
+    to: usize,
+    base: usize,
+) -> (usize, usize) {
+    let mut offset = base;
+    for child in children {
+        let child_offset = offset;
+        let child_size = child.node_size();
+        offset += child_size;
+        // The child's content spans `content_span`; its open token sits
+        // at `child_offset` and its close token one before its end.
+        let content_span = (child_offset + 1, child_offset + child_size - 1);
+        if child_offset >= from || to > content_span.1 {
+            continue; // not the container holding the whole range
+        }
+        let Node::Element {
+            node_type, content, ..
+        } = child
+        else {
+            break;
+        };
+        if node_type.is_leaf() || node_type.is_textblock() {
+            break;
+        }
+        let inner = empty_shell_range_in(&content.children, from, to, content_span.0);
+        // Widen to this container only when the inner range already
+        // covers every last position of its content.
+        if inner == content_span {
+            return (child_offset, child_offset + child_size);
+        }
+        return inner;
+    }
+    (from, to)
+}
+
 /// Forwards half of [`resolve_block_for_edit`]: the first textblock in
 /// **document order** whose span has not already ended before `pos`.
 ///
@@ -1402,7 +1703,9 @@ fn last_textblock_in(node: &Node, offset: usize) -> Option<BlockInfo> {
 /// reachable from, because it is only consulted when *nothing* precedes
 /// `pos`: every candidate therefore lies at or after `pos`, and the
 /// first one found is the closest. Don't lean on it as a general
-/// "nearest textblock after a position" query.
+/// "nearest textblock after a position" query — it also happily steps
+/// over an atom or a table, which is why [`next_textblock_after`] is a
+/// separate walk rather than a call to this.
 fn first_textblock_at_or_after(
     children: &[Node],
     pos: usize,
@@ -2897,6 +3200,80 @@ mod tests {
         )
     }
 
+    /// `doc > bulletList > [ listItem > para("A"),
+    ///                       listItem > [ para("B"), bulletList >
+    ///                                    listItem > para("C") ] ]`
+    ///
+    /// The shape where forward- and backward-delete used to disagree:
+    /// the second item carries a sub-list that has to be re-homed.
+    fn item_with_sublist_doc() -> Node {
+        let item = |children: Vec<Node>| {
+            Node::element_with_content(NodeType::ListItem, Fragment::from(children))
+        };
+        let para = |text: &str| {
+            Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text(text)]),
+            )
+        };
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![
+                    item(vec![para("A")]),
+                    item(vec![
+                        para("B"),
+                        Node::element_with_content(
+                            NodeType::BulletList,
+                            Fragment::from(vec![item(vec![para("C")])]),
+                        ),
+                    ]),
+                ]),
+            )]),
+        )
+    }
+
+    /// `doc > paragraph("A"), blockquote > paragraph("B")`. Offsets:
+    /// para("A") 0..3 (content 1..2), blockquote 3..8, its paragraph
+    /// 4..7 (content 5..6).
+    fn para_then_blockquote_doc() -> Node {
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("A")]),
+                ),
+                Node::element_with_content(
+                    NodeType::Blockquote,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::Paragraph,
+                        Fragment::from(vec![Node::text("B")]),
+                    )]),
+                ),
+            ]),
+        )
+    }
+
+    /// `doc > table > tableRow > tableCell > blocks`. The cell's content
+    /// starts at position 3.
+    fn table_cell_doc(blocks: Vec<Node>) -> Node {
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Table,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::TableRow,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::TableCell,
+                        Fragment::from(blocks),
+                    )]),
+                )]),
+            )]),
+        )
+    }
+
     fn at_cursor(doc: Node, pos: usize) -> EditorState {
         let state = EditorState::create_default(doc);
         EditorState {
@@ -3226,6 +3603,225 @@ mod tests {
         assert_eq!(item.child(1).unwrap().text_content(), "Child");
     }
 
+    // ── #146: model offsets vs. character offsets ──
+
+    /// `doc > paragraph[ text("hello"), <atom> ]`. The paragraph's
+    /// content is 6 model positions wide but its `text_content()` is 5
+    /// characters, and the caret at the block's end sits at model
+    /// offset 6.
+    fn para_ending_in_atom(atom: NodeType) -> Node {
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![
+                    Node::text("hello"),
+                    Node::element(atom),
+                ]),
+            )]),
+        )
+    }
+
+    /// #146, the headline repro. `delete_word_backward` indexed
+    /// `text_content().chars()` — which drops inline atoms — with a
+    /// *model* offset, which counts them. With the caret at the end of a
+    /// paragraph that ends in a `HardBreak` (type, then Shift+Enter),
+    /// `offset` was 6 against a 5-element vector and `chars[i - 1]`
+    /// panicked with an out-of-bounds index.
+    ///
+    /// Walking the inline content instead makes the two offset spaces
+    /// agree, so the scan sees the atom for what it is and deletes just
+    /// it — word deletion stops at an atom rather than reaching through
+    /// it for the word beyond.
+    #[test]
+    fn delete_word_backward_over_a_trailing_inline_atom_deletes_the_atom() {
+        for atom in [NodeType::HardBreak, NodeType::Mention, NodeType::DocMention] {
+            let doc = para_ending_in_atom(atom);
+            let block = find_block_at(&doc, 7).expect("caret at the block's end");
+            let chars: usize = block
+                .content
+                .children
+                .iter()
+                .map(|c| c.text_content().chars().count())
+                .sum();
+            assert_eq!(
+                block.content.size() - chars,
+                1,
+                "precondition: {atom:?} occupies a model position but no character",
+            );
+
+            let state = at_cursor(doc, 7);
+            let txn = state
+                .transaction()
+                .delete_word_backward()
+                .expect("#146: must not panic");
+            let new_state = state.apply(txn);
+
+            assert_eq!(
+                shape(&new_state.doc),
+                "Doc[Paragraph[\"hello\"]]",
+                "{atom:?}: the atom goes, the word before it stays",
+            );
+            assert_eq!(new_state.selection.from(), 6);
+        }
+    }
+
+    /// The mirror on the forward side. This one never panicked —
+    /// `offset >= len` bailed out first — but the same undercounted
+    /// `len` made a caret *before* a trailing atom look like a caret at
+    /// the block's end, so Ctrl+Delete fell through to `join_forward`
+    /// and merged the next block in while the atom stayed put.
+    #[test]
+    fn delete_word_forward_before_a_trailing_inline_atom_deletes_the_atom() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![
+                        Node::text("hello"),
+                        Node::element(NodeType::HardBreak),
+                    ]),
+                ),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("next")]),
+                ),
+            ]),
+        );
+        // Model offset 5: after "hello", before the HardBreak.
+        let state = at_cursor(doc, 6);
+        let txn = state.transaction().delete_word_forward().unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(
+            shape(&new_state.doc),
+            "Doc[Paragraph[\"hello\"],Paragraph[\"next\"]]",
+            "the atom goes; the blocks do not merge",
+        );
+    }
+
+    /// `doc > paragraph[ text("hello "), HardBreak, text("world") ]`.
+    /// Content is 12 model positions wide; `text_content()` is 11
+    /// characters. Every character *after* the break sits one model
+    /// position further right than its index in the flattened text.
+    fn para_with_interior_atom() -> Node {
+        Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![
+                    Node::text("hello "),
+                    Node::element(NodeType::HardBreak),
+                    Node::text("world"),
+                ]),
+            )]),
+        )
+    }
+
+    /// A preservation pin, **not** a regression test: this passes before
+    /// the fix as well. Everything left of the atom has model offset ==
+    /// character offset, so the old code got this one right by accident,
+    /// and the new scan has to keep getting it right — it must halt on
+    /// the atom rather than consuming it.
+    #[test]
+    fn delete_word_forward_stops_at_an_inline_atom() {
+        let state = at_cursor(para_with_interior_atom(), 1);
+        let after = state
+            .clone()
+            .apply(state.transaction().delete_word_forward().unwrap());
+        assert_eq!(
+            shape(&after.doc),
+            "Doc[Paragraph[HardBreak,\"world\"]]",
+            "eats \"hello \" and stops at the break",
+        );
+    }
+
+    /// The genuine forward drift, which nothing covered before. With the
+    /// caret immediately *after* the break, the model offset is 7 but
+    /// "w" is at character index 6, so the old scan started one
+    /// character late: it skipped "orld", stopped at the text's end, and
+    /// deleted a range four positions wide starting at "w" — removing
+    /// "worl" and leaving a stray "d" behind. **Under**-deletion by one
+    /// character per atom to the caret's left, not over-deletion.
+    #[test]
+    fn delete_word_forward_after_an_inline_atom_deletes_the_whole_word() {
+        // content_start 1, break at model offset 6, so "w" is at 7.
+        let state = at_cursor(para_with_interior_atom(), 8);
+        let after = state
+            .clone()
+            .apply(state.transaction().delete_word_forward().unwrap());
+        assert_eq!(
+            shape(&after.doc),
+            "Doc[Paragraph[\"hello \",HardBreak]]",
+            "all of \"world\" goes — no stray trailing character",
+        );
+    }
+
+    /// The backward mirror across the same atom. This one panicked
+    /// before the fix (`offset` 12 against an 11-element vector), and
+    /// the scan must stop at the break rather than continuing into
+    /// "hello ".
+    #[test]
+    fn delete_word_backward_across_an_inline_atom_stops_at_the_atom() {
+        let state = at_cursor(para_with_interior_atom(), 13);
+        let after = state
+            .clone()
+            .apply(state.transaction().delete_word_backward().unwrap());
+        assert_eq!(
+            shape(&after.doc),
+            "Doc[Paragraph[\"hello \",HardBreak]]",
+        );
+    }
+
+    /// The panic was reachable from one caret position; nothing says it
+    /// was the only one. Sweep every position of a block stuffed with
+    /// atoms, in both directions, and require a result rather than a
+    /// crash.
+    #[test]
+    fn delete_word_never_panics_anywhere_in_a_block_full_of_atoms() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![
+                    Node::element(NodeType::Mention),
+                    Node::text("a b"),
+                    Node::element(NodeType::HardBreak),
+                    Node::element(NodeType::DocMention),
+                    Node::text(" c"),
+                    Node::element(NodeType::HardBreak),
+                ]),
+            )]),
+        );
+        for pos in 0..=doc.content_size() {
+            let state = at_cursor(doc.clone(), pos);
+            let _ = state.clone().transaction().delete_word_backward();
+            let _ = state.transaction().delete_word_forward();
+        }
+    }
+
+    /// `inline_units` is only useful if its indices *are* model offsets,
+    /// so pin the invariant its callers rely on.
+    #[test]
+    fn inline_units_has_one_entry_per_model_position() {
+        let content = Fragment::from(vec![
+            Node::text("héllo"),
+            Node::element(NodeType::HardBreak),
+            Node::element(NodeType::Mention),
+            Node::text("x"),
+        ]);
+        let units = inline_units(&content);
+        assert_eq!(units.len(), content.size());
+        assert_eq!(
+            units,
+            vec![
+                Some('h'), Some('é'), Some('l'), Some('l'), Some('o'),
+                None, None, Some('x'),
+            ],
+        );
+    }
+
     /// Backspace's character-delete fallback (`view.rs` runs
     /// `delete(pos - 1, pos)` after `join_backward` declines). At a raw
     /// seam that range straddles a close boundary and changes nothing —
@@ -3286,24 +3882,494 @@ mod tests {
         );
     }
 
-    /// The nested-list shape, where forward-delete is a no-op for a
-    /// *different* reason: `join_forward`'s next-block probe is
-    /// `find_block_at(block_end + 1)`, whose `+1` assumes a single open
-    /// token between the caret's block and the next textblock. With a
-    /// sub-list below, the next textblock is two opens away, so the
-    /// probe lands on another seam and the whole command declines —
-    /// at the ordinary in-block position 9 just as much as at the seam.
-    /// Filed separately (#145); pinned here so a future fix moves the
-    /// seam and the block end together.
+    /// The nested-list shape. This test used to pin that forward-delete
+    /// declined *equally* at the seam (10) and at the ordinary in-block
+    /// position 9 — #143 fixed the seam resolution but `join_forward`'s
+    /// next-block probe was still `find_block_at(block_end + 1)`, whose
+    /// `+1` assumes a single open token between the caret's block and
+    /// the next textblock. With a sub-list below, the next textblock is
+    /// two opens away, so the probe found nothing and the command
+    /// declined at both positions (#145).
+    ///
+    /// #145 is fixed, so the pin flips: both positions must now
+    /// *succeed*, and produce byte-identical results. The point of the
+    /// test is unchanged — seam resolution and block-end resolution move
+    /// together or not at all.
     #[test]
-    fn join_forward_declines_equally_at_seam_and_block_end_in_nested_list() {
+    fn join_forward_agrees_at_seam_and_block_end_in_nested_list() {
+        assert!(
+            find_block_at(&nested_list_doc(), 10).is_none(),
+            "precondition: 10 is a seam, 9 is an ordinary in-block position",
+        );
+
         let seam = at_cursor(nested_list_doc(), 10);
         let end = at_cursor(nested_list_doc(), 9);
-        assert!(end.transaction().join_forward().is_err(), "pre-existing #145");
+        let from_seam = seam
+            .clone()
+            .apply(seam.transaction().join_forward().expect("#145: seam"));
+        let from_end = end
+            .clone()
+            .apply(end.transaction().join_forward().expect("#145: block end"));
+
+        assert_eq!(shape(&from_seam.doc), shape(&from_end.doc));
+        assert_eq!(from_seam.selection.from(), from_end.selection.from());
+    }
+
+    /// #145, the headline repro: Delete at the end of a bullet that has
+    /// a sub-list under it pulls the sub-item's text up, and the sub-list
+    /// — now empty — goes with it. Nothing is left orphaned inside the
+    /// list.
+    #[test]
+    fn join_forward_at_end_of_bullet_merges_the_nested_sub_item() {
+        let state = at_cursor(nested_list_doc(), 9);
+        let txn = state.transaction().join_forward().unwrap();
+        let new_state = state.apply(txn);
+
         assert_eq!(
-            seam.transaction().join_forward().is_err(),
-            end.transaction().join_forward().is_err(),
+            shape(&new_state.doc),
+            "Doc[BulletList[ListItem[Paragraph[\"ParentChild\"]]]]",
         );
+        assert_eq!(new_state.selection.from(), 9, "caret does not move");
+        assert!(find_block_at(&new_state.doc, 9).is_some());
+    }
+
+    /// #145, the other half: Delete at the end of one bullet merges the
+    /// *following sibling* item in and removes the now-empty `ListItem`.
+    /// The `+1` probe missed this one too — a `ListItem` open plus a
+    /// `Paragraph` open are two tokens, not one.
+    #[test]
+    fn join_forward_at_end_of_list_item_merges_the_next_item() {
+        // "A" content 3..4, so 4 is an ordinary in-block position.
+        let state = at_cursor(sibling_items_doc(), 4);
+        assert!(find_block_at(&state.doc, 4).is_some(), "not a seam");
+
+        let txn = state.transaction().join_forward().unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(
+            shape(&new_state.doc),
+            "Doc[BulletList[ListItem[Paragraph[\"AB\"]]]]",
+            "one item, no empty ListItem left behind",
+        );
+        assert_eq!(new_state.selection.from(), 4);
+    }
+
+    /// When the merged-in item was carrying a sub-list, that sub-list
+    /// moves onto *this* item rather than being left behind in an item
+    /// with no textblock. `ListItem[BulletList[…]]` is schema-legal but
+    /// `view.rs` renders it as a **marker-only bullet** — a visible empty
+    /// bullet the user never asked for, and one `find_block_at` can't
+    /// reach. `lift_from_list` already re-homes the remainder this way
+    /// for Backspace; forward-delete has to agree, which
+    /// `join_forward_and_backward_agree_on_an_item_carrying_a_sublist`
+    /// pins directly.
+    #[test]
+    fn join_forward_into_an_item_with_a_sublist_rehomes_the_sublist() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("A")]),
+                        )]),
+                    ),
+                    Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![
+                            Node::element_with_content(
+                                NodeType::Paragraph,
+                                Fragment::from(vec![Node::text("B")]),
+                            ),
+                            Node::element_with_content(
+                                NodeType::BulletList,
+                                Fragment::from(vec![Node::element_with_content(
+                                    NodeType::ListItem,
+                                    Fragment::from(vec![
+                                        Node::element_with_content(
+                                            NodeType::Paragraph,
+                                            Fragment::from(vec![Node::text("C")]),
+                                        ),
+                                    ]),
+                                )]),
+                            ),
+                        ]),
+                    ),
+                ]),
+            )]),
+        );
+        let state = at_cursor(doc, 4);
+        let txn = state.transaction().join_forward().unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(
+            shape(&new_state.doc),
+            "Doc[BulletList[ListItem[Paragraph[\"AB\"],\
+             BulletList[ListItem[Paragraph[\"C\"]]]]]]",
+            "\"C\" survives, and rides along on the merged item",
+        );
+        assert!(
+            !shape(&new_state.doc).contains("ListItem[BulletList"),
+            "no textblock-less item left behind",
+        );
+    }
+
+    /// The asymmetry itself, pinned. Delete at the end of item A and
+    /// Backspace at the start of item B are the same edit from the two
+    /// sides, so they must produce the same document. `lift_from_list`
+    /// is what `view.rs` reaches for on the Backspace side once
+    /// `join_backward` declines.
+    #[test]
+    fn join_forward_and_backward_agree_on_an_item_carrying_a_sublist() {
+        let doc = item_with_sublist_doc();
+        // "A" content 3..4; "B" content 8..9.
+        let forward = at_cursor(doc.clone(), 4);
+        let backward = at_cursor(doc, 8);
+
+        let after_forward = forward
+            .clone()
+            .apply(forward.transaction().join_forward().unwrap());
+        assert!(
+            backward.transaction().join_backward().is_err(),
+            "view.rs falls through to lift_from_list here",
+        );
+        let after_backward = backward
+            .clone()
+            .apply(backward.transaction().lift_from_list().unwrap());
+
+        assert_eq!(shape(&after_forward.doc), shape(&after_backward.doc));
+    }
+
+    /// C1 regression guard. The caret is **already inside** a table
+    /// cell, so reaching the cell's next paragraph crosses no boundary
+    /// and must work exactly as it does anywhere else. An earlier
+    /// version of the walk gated on a container allow-list rather than
+    /// the schema's `isolating` flag and refused to descend into
+    /// `Table -> TableRow -> TableCell` at all, which made Delete inert
+    /// at the end of every line in a multi-paragraph cell — while
+    /// Backspace still merged.
+    #[test]
+    fn join_forward_merges_paragraphs_inside_one_table_cell() {
+        let doc = table_cell_doc(vec![
+            Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("a")]),
+            ),
+            Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("b")]),
+            ),
+        ]);
+        // Cell content starts at 3; para("a") 3..6 with content 4..5.
+        let state = at_cursor(doc, 5);
+        let txn = state.transaction().join_forward().unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(
+            shape(&new_state.doc),
+            "Doc[Table[TableRow[TableCell[Paragraph[\"ab\"]]]]]",
+        );
+        assert_eq!(new_state.selection.from(), 5);
+    }
+
+    /// The other side of the same rule: *leaving* a cell is a crossing,
+    /// so the last paragraph of a cell never reaches the next cell's
+    /// content. `TableCell` is `isolating` in the schema and that is the
+    /// only reason this declines — no table-specific branch here.
+    #[test]
+    fn join_forward_never_leaves_a_table_cell() {
+        let cell = |text: &str| {
+            Node::element_with_content(
+                NodeType::TableCell,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text(text)]),
+                )]),
+            )
+        };
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Table,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::TableRow,
+                    Fragment::from(vec![cell("a"), cell("b")]),
+                )]),
+            )]),
+        );
+        // First cell 2..7, its paragraph 3..6 with content 4..5.
+        let state = at_cursor(doc, 5);
+        assert!(state.transaction().join_forward().is_err());
+    }
+
+    /// C2 regression guard. The code-block guard removes the caret's
+    /// empty block; when that block was the only thing in a `ListItem`,
+    /// deleting the paragraph alone stranded `ListItem[]` — no
+    /// textblock inside, so `find_block_at` can't reach it, it renders
+    /// as a marker-only bullet, and Backspace from the code block
+    /// answers with "at block start with no action available". The
+    /// guard shares `empty_shell_range` with the main merge path now.
+    #[test]
+    fn join_forward_before_a_code_block_takes_the_empty_item_with_it() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::BulletList,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element(NodeType::Paragraph)]),
+                    )]),
+                ),
+                Node::element_with_content(
+                    NodeType::CodeBlock,
+                    Fragment::from(vec![Node::text("x")]),
+                ),
+            ]),
+        );
+        // Empty paragraph 2..4, its only content position is 3.
+        let state = at_cursor(doc, 3);
+        let txn = state.transaction().join_forward().unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(
+            shape(&new_state.doc),
+            "Doc[CodeBlock[\"x\"]]",
+            "the empty bullet goes with the paragraph",
+        );
+        assert!(
+            find_block_at(&new_state.doc, new_state.selection.from()).is_some(),
+            "caret lands in a reachable block",
+        );
+    }
+
+    // ── #145: blockquote crossing ──
+    //
+    // Crossing a `Blockquote` is the same two-open-token shape as
+    // crossing a `ListItem`, and `join_backward` *already* crossed one
+    // via its `block.offset - 2` fallback. So forward-delete gaining it
+    // removes an asymmetry rather than inventing a behaviour; these pin
+    // both halves of that claim.
+
+    /// Backspace's pre-existing behaviour, asserted so the symmetry
+    /// argument for the forward side rests on a test rather than on a
+    /// reading of the code: `join_backward` reaches out of the
+    /// blockquote via its `block.offset - 2` fallback and merges. This
+    /// predates #145 entirely.
+    ///
+    /// It also leaves an **empty `Blockquote`** behind, because its
+    /// cross-container branch deletes only the block's own node — the
+    /// same orphan class as the code-block guard, uncured on this path.
+    /// Pinned as-is rather than fixed: `join_backward` is out of scope
+    /// here (see `join_backward_still_declines_at_a_list_item_start`),
+    /// and the residue is reachable today without any of #145. Reported
+    /// separately; this assertion is what a future fix has to update.
+    #[test]
+    fn join_backward_already_crossed_a_blockquote_boundary() {
+        let doc = para_then_blockquote_doc();
+        // Blockquote's paragraph content starts at 5.
+        let state = at_cursor(doc, 5);
+        let merged = state
+            .clone()
+            .apply(state.transaction().join_backward().unwrap());
+        assert_eq!(
+            shape(&merged.doc),
+            "Doc[Paragraph[\"AB\"],Blockquote]",
+            "crosses the boundary, but strands an empty quote",
+        );
+    }
+
+    /// The forward half. Same crossing, and it takes the emptied
+    /// blockquote with it — `empty_shell_range` widens the removal
+    /// through any ancestor the merge leaves with nothing in it. So
+    /// forward-delete does not *gain* a boundary crossing that Backspace
+    /// lacked; it gains a cleaner one.
+    #[test]
+    fn join_forward_crosses_a_blockquote_boundary_and_removes_the_empty_quote() {
+        let doc = para_then_blockquote_doc();
+        // "A" content 1..2.
+        let state = at_cursor(doc, 2);
+        let merged = state
+            .clone()
+            .apply(state.transaction().join_forward().unwrap());
+
+        assert_eq!(shape(&merged.doc), "Doc[Paragraph[\"AB\"]]");
+        assert_eq!(merged.selection.from(), 2, "caret does not move");
+    }
+
+    /// A blockquote with more than one paragraph keeps the remainder
+    /// *in the quote* — the tail re-homing is deliberately restricted to
+    /// list items, because a blockquote's trailing paragraphs belong
+    /// where they are.
+    #[test]
+    fn join_forward_into_a_blockquote_leaves_its_other_paragraphs_alone() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("A")]),
+                ),
+                Node::element_with_content(
+                    NodeType::Blockquote,
+                    Fragment::from(vec![
+                        Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("B")]),
+                        ),
+                        Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("C")]),
+                        ),
+                    ]),
+                ),
+            ]),
+        );
+        let state = at_cursor(doc, 2);
+        let txn = state.transaction().join_forward().unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(
+            shape(&new_state.doc),
+            "Doc[Paragraph[\"AB\"],Blockquote[Paragraph[\"C\"]]]",
+        );
+    }
+
+    /// A paragraph directly above a list: the first bullet's text merges
+    /// up and the whole (now empty) list disappears. Two opens deep on
+    /// the way *in*, rather than out — same `+1` bug.
+    #[test]
+    fn join_forward_at_end_of_paragraph_before_a_list_merges_the_first_item() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("Hi")]),
+                ),
+                Node::element_with_content(
+                    NodeType::BulletList,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("Lo")]),
+                        )]),
+                    )]),
+                ),
+            ]),
+        );
+        let state = at_cursor(doc, 3);
+        let txn = state.transaction().join_forward().unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(shape(&new_state.doc), "Doc[Paragraph[\"HiLo\"]]");
+        assert_eq!(new_state.selection.from(), 3);
+    }
+
+    /// The mirror: the *last* bullet's end reaches a paragraph that
+    /// follows the list, closing two containers on the way out.
+    #[test]
+    fn join_forward_at_end_of_last_item_merges_the_paragraph_after_the_list() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::BulletList,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("A")]),
+                        )]),
+                    )]),
+                ),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("Z")]),
+                ),
+            ]),
+        );
+        let state = at_cursor(doc, 4);
+        let txn = state.transaction().join_forward().unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(
+            shape(&new_state.doc),
+            "Doc[BulletList[ListItem[Paragraph[\"AZ\"]]]]",
+        );
+    }
+
+    /// The walk closes and opens containers but never steps *over* a
+    /// sibling, so every position that declined before #145 for a reason
+    /// other than the `+1` still declines. An atom between two blocks is
+    /// `view.rs`'s `atom_after_cursor_block` case; table structure has
+    /// cell semantics, not merge semantics, and crossing a `TableCell`
+    /// boundary would tear a paragraph out of the row.
+    #[test]
+    fn join_forward_never_steps_over_an_atom_or_into_a_table() {
+        let with_after = |after: Node| {
+            Node::element_with_content(
+                NodeType::Doc,
+                Fragment::from(vec![
+                    Node::element_with_content(
+                        NodeType::Paragraph,
+                        Fragment::from(vec![Node::text("Hi")]),
+                    ),
+                    after,
+                ]),
+            )
+        };
+        let table = Node::element_with_content(
+            NodeType::Table,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::TableRow,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::TableCell,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::Paragraph,
+                        Fragment::from(vec![Node::text("cell")]),
+                    )]),
+                )]),
+            )]),
+        );
+        for blocker in [
+            Node::element(NodeType::HorizontalRule),
+            Node::element(NodeType::Embed),
+            Node::element(NodeType::Image),
+            Node::element(NodeType::Kanban),
+            table,
+        ] {
+            let doc = with_after(blocker);
+            assert!(
+                next_textblock_after(&doc, 4).is_none(),
+                "walk must stop at {:?}",
+                doc.child(1).unwrap().node_type(),
+            );
+            assert!(at_cursor(doc, 3).transaction().join_forward().is_err());
+        }
+    }
+
+    /// `join_backward` makes the mirror-image assumption — its previous
+    /// block is probed at `block.offset - 1` and then `- 2`, which is
+    /// the same "one or two tokens" guess — and so it still declines at
+    /// the start of a list item. That is **deliberate**: `view.rs` reads
+    /// the `Err` as its cue to run `lift_from_list`, which merges the
+    /// whole item (sub-lists included) instead of leaving an empty
+    /// `ListItem` behind. Widening `join_backward` without reordering
+    /// that fallback would silently take the worse path, so this pins
+    /// the decline until the two are moved together.
+    #[test]
+    fn join_backward_still_declines_at_a_list_item_start() {
+        // Start of the second item's paragraph — an ordinary in-block
+        // position, not a seam.
+        let doc = sibling_items_doc();
+        let block = find_block_at(&doc, 8).expect("in a block");
+        assert_eq!(block.content_start, 8, "precondition: at block start");
+        assert!(at_cursor(doc, 8).transaction().join_backward().is_err());
     }
 
     /// The one behavioural change this fix makes to `join_backward`,

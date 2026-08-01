@@ -110,7 +110,16 @@ if (!quipToken) {
       check("continue-advances-to-progress-step", progressOk);
       if (progressOk) {
         await page.screenshot({ path: `${OUT}/3-import-progress.png` });
-        const totalLine = page.locator("[data-quip-import-total]");
+        // Mid-flight lines carry `data-quip-import-total` (threads the
+        // inventory *discovered*); the report-bearing completion line
+        // carries `data-quip-import-imported` (threads actually imported)
+        // instead — deliberately a different anchor, because the two
+        // numbers differ whenever threads were skipped or failed. A fast
+        // import can reach completion before this wait starts, so accept
+        // either; "completion rendered" vs "still running" remains
+        // distinguishable via `data-quip-import-content-done`, present on
+        // every completion variant and no mid-flight one.
+        const totalLine = page.locator("[data-quip-import-total], [data-quip-import-imported]");
         const totalOk = await totalLine.first().waitFor({ timeout: 60000 }).then(() => true).catch(() => false);
         check("progress-view-shows-item-count", totalOk,
           totalOk ? (await totalLine.first().innerText()).slice(0, 80) : "");

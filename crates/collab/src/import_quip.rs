@@ -89,6 +89,14 @@ pub struct QuipDocument {
     pub images: Vec<QuipImageRef>,
     /// Intra-Quip links needing Phase-2b back-patch.
     pub pending_links: Vec<QuipPendingLink>,
+    /// How many subtrees were flattened for exceeding
+    /// [`MAX_NESTING_DEPTH`](crate::import_quip::MAX_NESTING_DEPTH).
+    ///
+    /// Non-zero means the document nested deeper than the walker will
+    /// descend: the text survived, the structure below that point did not.
+    /// A named loss, so the caller reports it the way it reports a dropped
+    /// image rather than letting it pass silently.
+    pub deep_nesting_truncated: usize,
 }
 
 /// An image the source referenced, keyed by the blockId of the
@@ -110,7 +118,8 @@ pub struct QuipPendingLink {
 /// Import a Quip HTML body into a fresh `Doc`, together with the
 /// side-tables the caller needs to finish the job.
 pub fn from_quip_html(html: &str) -> QuipDocument {
-    materialize(&parse_quip(html))
+    let (blocks, truncated) = parse_quip_counting_truncations(html);
+    QuipDocument { deep_nesting_truncated: truncated, ..materialize(&blocks) }
 }
 
 // ─── intermediate block model ────────────────────────────────────
@@ -317,9 +326,38 @@ fn sanitize(html: &str) -> String {
 
 // ─── stage 2+3: parse to the intermediate block model ────────────
 
+/// Deepest element nesting the walker is ever allowed to descend.
+///
+/// **This is a process-liveness bound, not a formatting preference.** The
+/// block walker (`walk_node` -> `walk_children` -> `walk_element`) recurses
+/// once per DOM level, and the HTML it consumes is authored entirely by a
+/// third party: Quip returns whatever `/2/threads/{id}/html` holds. Exhaust
+/// the thread stack and Rust **aborts the process** — stack overflow is not a
+/// panic, so no `catch_unwind` anywhere can contain it. On the shared import
+/// worker that kills every concurrent job, not just the offending import, and
+/// the re-run reaches the same document and dies again.
+///
+/// Measured abort threshold on a 2 MiB stack — what tokio worker threads and
+/// Rust test threads both get — is ~1 050 levels of nested
+/// `<div>`/`<span>`/`<blockquote>`. (`ammonia::clean` and html5ever survive
+/// 8 000+; the recursion that fails is ours.) 128 leaves roughly 8x headroom
+/// for a smaller stack or a deeper call path above the walker, and sits far
+/// above anything an authored document reaches: Quip's editor tops out around
+/// a dozen levels of nested list, and even paste-artifact wrapper
+/// accumulation runs to tens, not hundreds.
+pub const MAX_NESTING_DEPTH: usize = 128;
+
 /// Parse Quip HTML into the intermediate block model. Pure: no yrs
 /// transaction is live while the DOM is walked.
 pub(crate) fn parse_quip(html: &str) -> Vec<QuipBlock> {
+    parse_quip_counting_truncations(html).0
+}
+
+/// [`parse_quip`] plus the number of subtrees that were flattened for
+/// exceeding [`MAX_NESTING_DEPTH`]. Split out so `parse_quip` keeps the
+/// signature its unit tests use while [`from_quip_html`] can surface the loss
+/// on [`QuipDocument`] and the importer can report it.
+pub(crate) fn parse_quip_counting_truncations(html: &str) -> (Vec<QuipBlock>, usize) {
     use html5ever::tendril::TendrilSink;
     use markup5ever_rcdom::RcDom;
 
@@ -329,12 +367,87 @@ pub(crate) fn parse_quip(html: &str) -> Vec<QuipBlock> {
         .read_from(&mut safe.as_bytes())
         .expect("html5ever parse is infallible on bytes");
 
+    // Bound the tree BEFORE the recursive walk rather than threading a depth
+    // counter through all twelve `walk_children` call sites. The guarantee is
+    // then structural: whatever the walker receives is already shallower than
+    // MAX_NESTING_DEPTH, so every recursive pass over it — `walk_element`,
+    // `enforce_containment`, `materialize_block` — is bounded by the same
+    // constant for free, and no future recursive pass can forget to check.
+    let truncated = flatten_below_depth(&dom.document);
+
     let mut out = Vec::new();
     let mut pending = InlineBuf::default();
     walk_children(&dom.document, &mut out, &Marks::default(), &mut pending);
     pending.flush(&mut out, None);
 
-    enforce_containment(out, NodeType::Doc)
+    (enforce_containment(out, NodeType::Doc), truncated)
+}
+
+/// Replace every subtree rooted deeper than [`MAX_NESTING_DEPTH`] with a
+/// single text node holding that subtree's flattened text, returning how many
+/// subtrees were flattened.
+///
+/// **Fails soft: text survives, only the nesting is lost.** Dropping the
+/// subtree would silently delete the deepest content of a document, and
+/// returning an error would wedge the thread on every retry — the importer
+/// already treats "keep the content, record the loss" as the right answer for
+/// an unfetchable image, and over-deep nesting is the same shape of problem.
+///
+/// **Iterative, with an explicit stack, in both halves.** A recursive
+/// implementation of the guard against unbounded recursion would abort on
+/// exactly the input it exists to survive.
+fn flatten_below_depth(document: &markup5ever_rcdom::Handle) -> usize {
+    use markup5ever_rcdom::{Node, NodeData};
+
+    let mut truncated = 0usize;
+    // (node, depth) pairs still to inspect.
+    let mut stack: Vec<(markup5ever_rcdom::Handle, usize)> = vec![(document.clone(), 0)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth >= MAX_NESTING_DEPTH {
+            let children = std::mem::take(&mut *node.children.borrow_mut());
+            if children.is_empty() {
+                continue;
+            }
+            truncated += 1;
+            let text = collect_text(&children);
+            if !text.is_empty() {
+                let replacement = Node::new(NodeData::Text {
+                    contents: std::cell::RefCell::new(text.into()),
+                });
+                node.children.borrow_mut().push(replacement);
+            }
+            continue;
+        }
+        for child in node.children.borrow().iter() {
+            stack.push((child.clone(), depth + 1));
+        }
+    }
+    truncated
+}
+
+/// Concatenate every text node in `roots` and their descendants, separated by
+/// single spaces. Iterative for the same reason [`flatten_below_depth`] is.
+fn collect_text(roots: &[markup5ever_rcdom::Handle]) -> String {
+    use markup5ever_rcdom::NodeData;
+
+    let mut text = String::new();
+    let mut stack: Vec<markup5ever_rcdom::Handle> = roots.iter().rev().cloned().collect();
+    while let Some(node) = stack.pop() {
+        if let NodeData::Text { contents } = &node.data {
+            let borrowed = contents.borrow();
+            let chunk = borrowed.as_ref().trim();
+            if !chunk.is_empty() {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(chunk);
+            }
+        }
+        for child in node.children.borrow().iter().rev() {
+            stack.push(child.clone());
+        }
+    }
+    text
 }
 
 /// Inline text accumulated between block boundaries. Flushed as a
@@ -1358,6 +1471,9 @@ fn materialize(blocks: &[QuipBlock]) -> QuipDocument {
         sections: side.sections,
         images: side.images,
         pending_links: side.pending_links,
+        // Set by `from_quip_html`, which is the only caller that has the
+        // parse-time count; `materialize` alone cannot know.
+        deep_nesting_truncated: 0,
     }
 }
 
@@ -1461,6 +1577,87 @@ fn materialize_block(
 mod tests {
     use super::*;
     use yrs::ReadTxn;
+
+    // ─── the sanitizer allowlist (the actual XSS boundary) ───────
+    //
+    // These live HERE, next to `allowed_tags`/`allowed_attributes`, rather
+    // than in `tests/import_fuzz.rs`, for a reason worth stating: the fuzz
+    // suite can only observe the **materialized yrs document**, whose element
+    // names come from the closed `NodeType` enum. A doc-level assertion
+    // therefore cannot fail no matter what the allowlist admits — widen
+    // `allowed_tags()` with `iframe` and a doc-level "no iframe survived"
+    // property still passes, because materialization was never going to emit
+    // one. The boundary that actually decides what a `<script>` in a Quip
+    // document does is `sanitize()`, and the only place `sanitize()` is
+    // reachable is here.
+
+    /// Tags that must never be admitted: script execution, framing, and
+    /// external-resource loading.
+    const NEVER_ALLOWED_TAGS: &[&str] =
+        &["script", "iframe", "object", "embed", "style", "form", "link", "base", "meta"];
+
+    /// The allowlist sets themselves — the sharpest possible failure, naming
+    /// the exact entry someone added.
+    #[test]
+    fn the_allowlist_admits_no_script_framing_or_event_handler() {
+        let tags = allowed_tags();
+        for forbidden in NEVER_ALLOWED_TAGS {
+            assert!(
+                !tags.contains(forbidden),
+                "{forbidden:?} must never be an allowed tag — it is script/framing/resource-loading",
+            );
+        }
+        let attrs = allowed_attributes();
+        for attr in &attrs {
+            assert!(
+                !attr.to_ascii_lowercase().starts_with("on"),
+                "{attr:?} is an event-handler attribute and must not be allowlisted",
+            );
+            assert_ne!(attr.to_ascii_lowercase(), "style", "inline style is a payload vector");
+        }
+    }
+
+    /// The same guarantee behaviorally, through `sanitize` — which also
+    /// covers the parts the set assertions cannot see: the `data-` attribute
+    /// *prefix* allowance, and ammonia's own URL-scheme filtering.
+    #[test]
+    fn sanitize_strips_script_framing_and_event_handlers() {
+        for tag in NEVER_ALLOWED_TAGS {
+            let html = format!("<p>keep</p><{tag}>payload()</{tag}><p>keep2</p>");
+            let out = sanitize(&html).to_ascii_lowercase();
+            assert!(
+                !out.contains(&format!("<{tag}")),
+                "sanitize admitted <{tag}>: {out:?}",
+            );
+            assert!(out.contains("keep"), "sanitize must keep ordinary content: {out:?}");
+        }
+
+        // Event handlers, on both an allowed tag and an allowed-with-content
+        // one. `img` and `td` are in the Quip allowlist precisely because
+        // this importer needs them, which is what makes them the interesting
+        // carriers.
+        let out = sanitize(
+            "<img src=x onerror='steal()' alt=a>             <table><tr><td onclick='steal()'>c</td></tr></table>             <p onmouseover='steal()'>t</p>",
+        )
+        .to_ascii_lowercase();
+        for handler in ["onerror", "onclick", "onmouseover"] {
+            assert!(!out.contains(handler), "sanitize admitted {handler}: {out:?}");
+        }
+
+        // Script-bearing URL schemes on the tags that carry URLs.
+        let out = sanitize(
+            "<a href=\"javascript:steal()\">x</a><img src=\"javascript:steal()\">             <a href=\"data:text/html;base64,PHNjcmlwdD4=\">y</a>",
+        )
+        .to_ascii_lowercase();
+        assert!(!out.contains("javascript:"), "sanitize admitted a javascript: URL: {out:?}");
+        assert!(!out.contains("data:text/html"), "sanitize admitted a data: HTML URL: {out:?}");
+
+        // The `data-` prefix allowance must not become an `on*` allowance.
+        let out = sanitize("<p data-section-id=s1 onfocus='steal()'>t</p>").to_ascii_lowercase();
+        assert!(out.contains("data-section-id"), "data-* hints must survive: {out:?}");
+        assert!(!out.contains("onfocus"), "the data- prefix must not admit handlers: {out:?}");
+    }
+
     use yrs::types::GetString;
     use yrs::types::xml::XmlOut;
 

@@ -152,6 +152,13 @@ quip-import-token-expired = Your Quip session expired — please reconnect.
 quip-import-importing = Importing… { $done } of { $total }
 quip-import-content-done = Imported { $total } items
 quip-import-open-folder = Open folder
+quip-import-report-imported = Imported { $imported } documents
+quip-import-report-skipped = { $count } skipped — you don't have access in Quip
+quip-import-report-failed = { $count } couldn't be imported
+quip-import-report-and-more = …and { $count } more
+quip-import-report-chat = { $count } chat threads were not imported — chats aren't documents
+quip-import-report-note = { $id } — { $detail }
+quip-import-report-note-general = { $detail }
 
 # ─── Notification panel ─────────────────────────────────────────
 

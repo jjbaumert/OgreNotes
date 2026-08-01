@@ -1152,6 +1152,747 @@ async fn test_bulk_export_resolves_blob_ref_images_to_real_urls() {
     app.cleanup().await;
 }
 
+// ─── #140: images must survive a document copy ─────────────────
+
+/// Read back the single durable blob reference in a document's stored
+/// content, as `(blob_id, key)`. Panics if the doc doesn't hold exactly
+/// one — the copy tests below all stage exactly one image.
+async fn only_blob_ref(app: &common::TestApp, token: &str, doc_id: &str) -> (String, String) {
+    let (status, bytes) = app
+        .bytes_request(
+            Method::GET,
+            &format!("/api/v1/documents/{doc_id}/content"),
+            Some(token),
+            Vec::new(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 200, "content fetch for {doc_id}");
+    let doc = OgreDoc::from_state_bytes(&bytes).expect("stored content is a valid Y.Doc");
+    let mut refs = ogrenotes_collab::blob_ref::collect_blob_refs(doc.inner());
+    assert_eq!(refs.len(), 1, "expected exactly one blob reference in {doc_id}: {refs:?}");
+    refs.pop().unwrap()
+}
+
+/// Regression (#140): copying a document must re-home its image blobs
+/// under the **copy's** own `blobs/{doc_id}/` prefix.
+///
+/// Blob read authorization is keyed on the doc id embedded in the key
+/// (`request_download_url`'s `blobs/{id}/{blob_id}/` prefix test), so a
+/// copy that carried the source's keys forward had every image rejected
+/// at read time and rendered blank — acutely so for the templates
+/// gallery, which exists to be copied. This asserts all three links of
+/// that chain: the reference names the copy's prefix, the S3 object
+/// actually exists there, and the copy's own download endpoint (the
+/// guard that was failing) now hands back a presigned URL.
+#[tokio::test]
+async fn test_copy_document_rehomes_image_blobs_under_the_copy() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("copy-blob@test.com").await;
+    let src_id = app.create_doc(&token, "Source With Image", None).await;
+
+    let blob_id = "b-copy-1";
+    let src_key = format!("blobs/{src_id}/{blob_id}/photo.png");
+    app.s3_client()
+        .put_object()
+        .bucket(&app.bucket)
+        .key(&src_key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(
+            b"PNG-BYTES-FOR-COPY".to_vec(),
+        ))
+        .send()
+        .await
+        .expect("stage the source blob object");
+
+    let (doc, _src) = build_doc_with_blob_ref_image(&src_id, blob_id, "A copied photo");
+    let (status, _) = app
+        .bytes_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{src_id}/content"),
+            Some(&token),
+            doc.to_state_bytes(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let (status, body) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/documents/{src_id}/copy"),
+            Some(&token),
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, 201, "copy should succeed: {body}");
+    let new_id = body["id"].as_str().expect("copy returns an id").to_string();
+    assert_ne!(new_id, src_id);
+
+    // (1) The copy's reference names the copy's own prefix.
+    let (copied_blob_id, copied_key) = only_blob_ref(&app, &token, &new_id).await;
+    assert_eq!(copied_blob_id, blob_id, "blob id is carried over");
+    let expected_key = format!("blobs/{new_id}/{blob_id}/photo.png");
+    assert_eq!(
+        copied_key, expected_key,
+        "copied doc must reference its OWN blob prefix, not the source's",
+    );
+
+    // (2) The object really is there — a rewritten reference pointing at
+    //     a key that was never copied would still render blank.
+    let head = app
+        .s3_client()
+        .head_object()
+        .bucket(&app.bucket)
+        .key(&expected_key)
+        .send()
+        .await;
+    assert!(
+        head.is_ok(),
+        "S3 object missing at the copy's key {expected_key}: {:?}",
+        head.err(),
+    );
+
+    // (3) End to end: the guard that was rejecting the read now passes.
+    let (status, dl) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/documents/{new_id}/blobs/{blob_id}?key={expected_key}"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "download URL for the copy's blob: {dl}");
+    assert!(
+        dl["downloadUrl"].as_str().is_some_and(|u| u.contains(&expected_key)),
+        "expected a presigned URL over the copy's key: {dl}"
+    );
+
+    // The source is untouched — a copy must not move the original's bytes.
+    let (src_blob_id, src_ref_key) = only_blob_ref(&app, &token, &src_id).await;
+    assert_eq!((src_blob_id.as_str(), src_ref_key.as_str()), (blob_id, src_key.as_str()));
+
+    app.cleanup().await;
+}
+
+/// #140 partial-failure disposition: a blob that cannot be copied must
+/// not fail the document copy. The copied doc keeps the *source's*
+/// reference — status quo for that one image (it renders blank), and
+/// recoverable, since the source object is still where it always was.
+/// Dropping the image node instead would destroy the author's alt text
+/// and layout unrecoverably.
+///
+/// Staged by referencing a blob whose S3 object was never uploaded, so
+/// `CopyObject` fails with NoSuchKey.
+#[tokio::test]
+async fn test_copy_document_survives_an_uncopyable_blob() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("copy-blob-missing@test.com").await;
+    let src_id = app.create_doc(&token, "Source With Missing Blob", None).await;
+
+    // Note: no put_object — the key the reference names does not exist.
+    let blob_id = "b-copy-missing";
+    let src_key = format!("blobs/{src_id}/{blob_id}/photo.png");
+
+    let (doc, _src) = build_doc_with_blob_ref_image(&src_id, blob_id, "A missing photo");
+    let (status, _) = app
+        .bytes_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{src_id}/content"),
+            Some(&token),
+            doc.to_state_bytes(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let (status, body) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/documents/{src_id}/copy"),
+            Some(&token),
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, 201, "one uncopyable blob must not fail the copy: {body}");
+    let new_id = body["id"].as_str().unwrap().to_string();
+
+    // The image node survives with its alt text, still carrying the
+    // source reference (unrewritten) rather than a dangling new key.
+    let (kept_blob_id, kept_key) = only_blob_ref(&app, &token, &new_id).await;
+    assert_eq!(kept_blob_id, blob_id);
+    assert_eq!(
+        kept_key, src_key,
+        "an uncopyable blob keeps the source reference; the node is never dropped",
+    );
+
+    app.cleanup().await;
+}
+
+/// #140 authorization ordering: the S3 copies are a **write**, and must
+/// happen only after every authorization check has passed.
+///
+/// A caller with View on the source but no Edit on the requested
+/// destination folder ends in a 403. If the blob re-homing runs before
+/// `check_folder_access`, that caller can spend an unbounded amount of
+/// the owner's S3 storage — one full duplicate of every image in the
+/// source, per rejected attempt — into a prefix that no document will
+/// ever reference, and those objects are permanent. (`hard_delete` now
+/// sweeps `blobs/{doc_id}/` as well — #151 — but only for a doc id that
+/// became a real document; an id minted for a copy that then 403s never
+/// reaches a purge, so nothing would ever collect it.)
+///
+/// Asserts both halves: the 403, and that no object was created under
+/// the would-be new prefix. The second half is the one that matters —
+/// the 403 was never in doubt.
+#[tokio::test]
+async fn test_copy_document_does_not_copy_blobs_before_folder_authz() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let (_oid, owner_token) = app.create_user("copy-authz-owner@test.com").await;
+    let (viewer_id, viewer_token) = app.create_user("copy-authz-viewer@test.com").await;
+
+    let src_id = app.create_doc(&owner_token, "Shared Source", None).await;
+    let blob_id = "b-authz-1";
+    let src_key = format!("blobs/{src_id}/{blob_id}/photo.png");
+    app.s3_client()
+        .put_object()
+        .bucket(&app.bucket)
+        .key(&src_key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(
+            b"PNG-BYTES-AUTHZ".to_vec(),
+        ))
+        .send()
+        .await
+        .expect("stage the source blob object");
+
+    let (doc, _src) = build_doc_with_blob_ref_image(&src_id, blob_id, "An authz photo");
+    let (status, _) = app
+        .bytes_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{src_id}/content"),
+            Some(&owner_token),
+            doc.to_state_bytes(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    // Viewer gets View on the doc — enough to copy it — but nothing on
+    // the owner's private folder, which is where they aim the copy.
+    let (status, _) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/documents/{src_id}/members"),
+            Some(&owner_token),
+            Some(serde_json::json!({ "userId": viewer_id, "accessLevel": "VIEW" })),
+        )
+        .await;
+    assert!(
+        (200..300).contains(&status),
+        "granting the viewer View on the source failed: {status}"
+    );
+
+    let owner = app
+        .state
+        .user_repo
+        .get_by_id(&_oid)
+        .await
+        .unwrap()
+        .unwrap();
+    let forbidden_folder = owner.private_folder_id.clone();
+
+    // Snapshot the bucket's blob inventory before the rejected attempts.
+    let before = list_blob_keys(&app).await;
+
+    for _ in 0..3 {
+        let (status, body) = app
+            .json_request(
+                Method::POST,
+                &format!("/api/v1/documents/{src_id}/copy"),
+                Some(&viewer_token),
+                Some(serde_json::json!({ "folderId": forbidden_folder })),
+            )
+            .await;
+        assert!(
+            status == 403 || status == 404,
+            "copy into an unwritable folder must be rejected, got {status}: {body}"
+        );
+    }
+
+    let after = list_blob_keys(&app).await;
+    assert_eq!(
+        before, after,
+        "a rejected copy must not have written any blob object; new keys: {:?}",
+        after.difference(&before).collect::<Vec<_>>(),
+    );
+
+    app.cleanup().await;
+}
+
+/// Every key under `blobs/` currently in the test bucket.
+async fn list_blob_keys(app: &common::TestApp) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let mut continuation: Option<String> = None;
+    loop {
+        let mut builder = app
+            .s3_client()
+            .list_objects_v2()
+            .bucket(&app.bucket)
+            .prefix("blobs/");
+        if let Some(tok) = continuation.as_ref() {
+            builder = builder.continuation_token(tok);
+        }
+        let page = builder.send().await.expect("list blob objects");
+        for obj in page.contents.unwrap_or_default() {
+            if let Some(k) = obj.key {
+                out.insert(k);
+            }
+        }
+        if page.is_truncated.unwrap_or(false) {
+            continuation = page.next_continuation_token;
+            if continuation.is_none() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// #140 security property: a reference that already names a **third**
+/// document's prefix must be left alone by the copy — not rewritten, and
+/// above all not copied into the new document's prefix.
+///
+/// Copying it would take a reference the source document was never
+/// entitled to read (`request_download_url` rejects it on the
+/// `blobs/{doc_id}/{blob_id}/` prefix test) and launder it into one that
+/// passes the guard, under a document the caller owns. The export path
+/// has the equivalent test
+/// (`test_export_does_not_presign_blob_ref_for_a_foreign_document`);
+/// this is the copy path's, and it is what stops a later "why not just
+/// copy every ref" refactor from turning the fix into a laundering path.
+#[tokio::test]
+async fn test_copy_document_does_not_launder_a_foreign_blob_reference() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("copy-foreign-ref@test.com").await;
+    let src_id = app.create_doc(&token, "Source With Foreign Ref", None).await;
+
+    // A real object belonging to a third document the caller has no
+    // relationship with. Staged for real, so a laundering bug would
+    // actually succeed at copying it rather than failing on NoSuchKey —
+    // otherwise this test would pass for the wrong reason.
+    let victim_doc = "victim-doc-id";
+    let blob_id = "b-victim";
+    // NOTE: the filename must match what `build_doc_with_blob_ref_image`
+    // encodes into the reference (`photo.png`), or the staged object and
+    // the reference name different keys and the test proves nothing.
+    let victim_key = format!("blobs/{victim_doc}/{blob_id}/photo.png");
+    app.s3_client()
+        .put_object()
+        .bucket(&app.bucket)
+        .key(&victim_key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(
+            b"SECRET-PNG-BYTES".to_vec(),
+        ))
+        .send()
+        .await
+        .expect("stage the victim blob object");
+
+    let (doc, _src) = build_doc_with_blob_ref_image(victim_doc, blob_id, "A foreign photo");
+    let (status, _) = app
+        .bytes_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{src_id}/content"),
+            Some(&token),
+            doc.to_state_bytes(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let (status, body) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/documents/{src_id}/copy"),
+            Some(&token),
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, 201, "the copy itself still succeeds: {body}");
+    let new_id = body["id"].as_str().unwrap().to_string();
+
+    // The reference is untouched — still naming the victim's prefix, so
+    // it stays as unreadable in the copy as it was in the source.
+    let (kept_blob_id, kept_key) = only_blob_ref(&app, &token, &new_id).await;
+    assert_eq!(kept_blob_id, blob_id);
+    assert_eq!(
+        kept_key, victim_key,
+        "a foreign reference must be left exactly as-is, never re-pointed",
+    );
+
+    // And nothing was copied under the new document's prefix.
+    let leaked = format!("blobs/{new_id}/{blob_id}/photo.png");
+    let head = app
+        .s3_client()
+        .head_object()
+        .bucket(&app.bucket)
+        .key(&leaked)
+        .send()
+        .await;
+    assert!(
+        head.is_err(),
+        "foreign blob was laundered into the copy's own prefix at {leaked}",
+    );
+    let any_new = list_blob_keys(&app)
+        .await
+        .into_iter()
+        .filter(|k| k.starts_with(&format!("blobs/{new_id}/")))
+        .collect::<Vec<_>>();
+    assert!(
+        any_new.is_empty(),
+        "nothing at all should exist under the copy's prefix: {any_new:?}",
+    );
+
+    // The copy's download guard still rejects the foreign key, exactly
+    // as it did for the source — the copy gained no reach.
+    let (status, _) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/documents/{new_id}/blobs/{blob_id}?key={victim_key}"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 400, "the guard must still reject the foreign key");
+
+    app.cleanup().await;
+}
+
+// ─── #151: a purge must erase the document's images too ────────
+
+/// Put a real object at `key` in the test bucket.
+async fn stage_object(app: &common::TestApp, key: &str, body: &[u8]) {
+    app.s3_client()
+        .put_object()
+        .bucket(&app.bucket)
+        .key(key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(body.to_vec()))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("stage object at {key}: {e:?}"));
+}
+
+/// `HeadObject` reduced to a bool. A missing object is `false`; any other
+/// S3 error panics rather than being smuggled in as "gone" — a test that
+/// reads a transport failure as a successful erasure passes for the
+/// wrong reason.
+async fn object_present(app: &common::TestApp, key: &str) -> bool {
+    match app
+        .s3_client()
+        .head_object()
+        .bucket(&app.bucket)
+        .key(key)
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            let svc = e.into_service_error();
+            if svc.is_not_found() {
+                false
+            } else {
+                panic!("head_object({key}) failed for a reason other than 404: {svc:?}");
+            }
+        }
+    }
+}
+
+/// Every key currently under an arbitrary prefix in the test bucket.
+async fn keys_under(app: &common::TestApp, prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut continuation: Option<String> = None;
+    loop {
+        let mut builder = app
+            .s3_client()
+            .list_objects_v2()
+            .bucket(&app.bucket)
+            .prefix(prefix);
+        if let Some(tok) = continuation.as_ref() {
+            builder = builder.continuation_token(tok);
+        }
+        let page = builder.send().await.expect("list objects under prefix");
+        for obj in page.contents.unwrap_or_default() {
+            if let Some(k) = obj.key {
+                out.push(k);
+            }
+        }
+        if page.is_truncated.unwrap_or(false) {
+            continuation = page.next_continuation_token;
+            if continuation.is_none() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Trash a doc, then purge it through `DELETE /documents/:id/purge`.
+/// Purge refuses a doc that isn't already in the trash, so both steps
+/// are required to reach the destructive path.
+async fn trash_and_purge(app: &common::TestApp, token: &str, doc_id: &str) {
+    let (status, _) = app
+        .json_request(
+            Method::DELETE,
+            &format!("/api/v1/documents/{doc_id}"),
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204, "soft-delete of {doc_id}");
+    let (status, _) = app
+        .json_request(
+            Method::DELETE,
+            &format!("/api/v1/documents/{doc_id}/purge"),
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204, "purge of {doc_id}");
+}
+
+/// Regression (#151): purging a document must remove the images it
+/// holds, not just its `docs/{id}/` snapshots.
+///
+/// `hard_delete` swept `docs/{doc_id}/` alone, so every image ever
+/// uploaded to a document survived its purge indefinitely — while the
+/// caller got a 204 and a `DocDeleted { hard: true }` audit row said the
+/// erasure happened. A user or admin who deletes a document precisely to
+/// destroy its contents was told it worked. This is the right-to-erasure
+/// property, so it asserts the bytes are actually gone from the bucket,
+/// not merely that the reference stopped resolving.
+///
+/// The `docs/` probe is here so that a future change to the sweep can't
+/// quietly trade one prefix for the other.
+#[tokio::test]
+async fn test_purge_document_erases_its_image_blobs() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("purge-blob@test.com").await;
+    let doc_id = app.create_doc(&token, "Doc To Erase", None).await;
+
+    // A real image object, referenced by the document exactly the way an
+    // upload through `POST /documents/:id/blobs` would leave it.
+    let blob_id = "b-purge-1";
+    let blob_key = format!("blobs/{doc_id}/{blob_id}/photo.png");
+    stage_object(&app, &blob_key, b"PNG-BYTES-TO-ERASE").await;
+
+    let (doc, _src) = build_doc_with_blob_ref_image(&doc_id, blob_id, "A doomed photo");
+    let (status, _) = app
+        .bytes_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{doc_id}/content"),
+            Some(&token),
+            doc.to_state_bytes(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    // The pre-existing half of the sweep, so a regression that drops it
+    // in favour of the new half is caught here too.
+    let docs_probe = format!("docs/{doc_id}/snapshots/999999.bin");
+    stage_object(&app, &docs_probe, b"SNAPSHOT-BYTES").await;
+
+    assert!(
+        object_present(&app, &blob_key).await,
+        "precondition: the blob object must exist before the purge",
+    );
+
+    trash_and_purge(&app, &token, &doc_id).await;
+
+    assert!(
+        !object_present(&app, &blob_key).await,
+        "purge left the image behind at {blob_key} — the erasure was a false success",
+    );
+    let leftovers = keys_under(&app, &format!("blobs/{doc_id}/")).await;
+    assert!(
+        leftovers.is_empty(),
+        "nothing may survive under the purged document's blob prefix: {leftovers:?}",
+    );
+    assert!(
+        !object_present(&app, &docs_probe).await,
+        "the pre-existing docs/ sweep must still run: {docs_probe} survived",
+    );
+
+    app.cleanup().await;
+}
+
+/// The property that makes a whole-prefix delete safe (#151): purging
+/// document A touches only A's objects.
+///
+/// A prefix delete is only correct while a blob belongs to exactly one
+/// document — which is what #140's copy re-homing established. If a
+/// future refactor widens the swept prefix (drops the trailing slash,
+/// sweeps by owner, shares a prefix between documents), this is the test
+/// that notices before user data is gone. B's image is checked end to end
+/// through B's own download endpoint, not just by `HeadObject`, so a
+/// change that leaves the bytes but breaks the pairing also fails.
+#[tokio::test]
+async fn test_purging_one_document_leaves_another_documents_blobs_alone() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("purge-neighbour@test.com").await;
+    let doomed_id = app.create_doc(&token, "Doomed", None).await;
+    let survivor_id = app.create_doc(&token, "Survivor", None).await;
+
+    let blob_id = "b-neighbour";
+    let doomed_key = format!("blobs/{doomed_id}/{blob_id}/photo.png");
+    let survivor_key = format!("blobs/{survivor_id}/{blob_id}/photo.png");
+    stage_object(&app, &doomed_key, b"DOOMED-BYTES").await;
+    stage_object(&app, &survivor_key, b"SURVIVOR-BYTES").await;
+
+    // Boundary: a doc id that has the doomed id as a *string* prefix.
+    // Real ids are fixed-length nanoid so this can't arise naturally, but
+    // the trailing slash in `blobs/{id}/` is the only thing standing
+    // between a purge and every neighbouring prefix, and a trailing slash
+    // is exactly the kind of detail a refactor drops.
+    let lookalike_key = format!("blobs/{doomed_id}-lookalike/{blob_id}/photo.png");
+    stage_object(&app, &lookalike_key, b"LOOKALIKE-BYTES").await;
+
+    trash_and_purge(&app, &token, &doomed_id).await;
+
+    assert!(
+        !object_present(&app, &doomed_key).await,
+        "the purged document's own blob must be gone",
+    );
+    assert!(
+        object_present(&app, &survivor_key).await,
+        "purging {doomed_id} destroyed an unrelated document's image at {survivor_key}",
+    );
+    assert!(
+        object_present(&app, &lookalike_key).await,
+        "the sweep escaped its prefix and hit {lookalike_key}",
+    );
+
+    // End to end: the survivor can still read its image.
+    let (status, dl) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/documents/{survivor_id}/blobs/{blob_id}?key={survivor_key}"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "survivor's download URL: {dl}");
+
+    app.cleanup().await;
+}
+
+/// #151 failure semantics. `hard_delete` attempts *both* S3 sweeps
+/// unconditionally and reports the first error afterwards, rather than
+/// aborting the second when the first fails — a purge that gives up
+/// before touching `blobs/` never attempts the erasure the user actually
+/// asked for. Reporting the error is what keeps the audit trail honest:
+/// neither caller writes a "purged" row on an `Err`.
+///
+/// That disposition is only sound if a retry works, so this pins the
+/// retry. The half-completed state is staged directly (the `docs/` sweep
+/// having succeeded and the `blobs/` sweep not — S3 failures can't be
+/// injected through MinIO), then `hard_delete` is driven twice: the
+/// first call must finish the job, the second must still be `Ok` with
+/// nothing left to do.
+#[tokio::test]
+async fn test_hard_delete_is_retry_safe_after_a_half_completed_purge() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("purge-retry@test.com").await;
+    let doc_id = app.create_doc(&token, "Half-purged", None).await;
+
+    let blob_key = format!("blobs/{doc_id}/b-retry/photo.png");
+    let docs_probe = format!("docs/{doc_id}/snapshots/999999.bin");
+    stage_object(&app, &blob_key, b"RETRY-BYTES").await;
+    stage_object(&app, &docs_probe, b"RETRY-SNAPSHOT").await;
+
+    // Stage the "docs/ succeeded, blobs/ did not" half-state.
+    app.state
+        .doc_repo
+        .s3()
+        .delete_prefix(&format!("docs/{doc_id}/"))
+        .await
+        .expect("stage the already-completed half of the sweep");
+    assert!(!object_present(&app, &docs_probe).await);
+    assert!(object_present(&app, &blob_key).await);
+
+    // The retry must not be broken by the already-deleted half.
+    app.state
+        .doc_repo
+        .hard_delete(&doc_id)
+        .await
+        .expect("a retry over an already-swept docs/ prefix must succeed");
+    assert!(
+        !object_present(&app, &blob_key).await,
+        "the retry must finish the half that had not run",
+    );
+
+    // Fully idempotent: a third attempt (rows gone, both prefixes empty)
+    // is a no-op, not an error.
+    app.state
+        .doc_repo
+        .hard_delete(&doc_id)
+        .await
+        .expect("hard_delete over an already-purged document must be a no-op");
+
+    app.cleanup().await;
+}
+
+/// #151 destructive-path guard: `hard_delete` refuses a doc id that is
+/// empty or contains a `/`.
+///
+/// Every sweep in `hard_delete` is a *prefix* delete, so a degenerate id
+/// is the one input class whose blast radius could exceed the named
+/// document if the key layout is ever reshaped. Failing closed costs a
+/// purge; failing open costs somebody else's data. Real ids are nanoid
+/// over `[A-Za-z0-9_-]`, so nothing legitimate is rejected.
+#[tokio::test]
+async fn test_hard_delete_refuses_a_degenerate_doc_id() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("purge-guard@test.com").await;
+    let doc_id = app.create_doc(&token, "Bystander", None).await;
+
+    let blob_key = format!("blobs/{doc_id}/b-guard/photo.png");
+    stage_object(&app, &blob_key, b"BYSTANDER-BYTES").await;
+
+    let traversal = format!("../{doc_id}");
+    for bad in ["", "/", "a/b", "docs/", traversal.as_str()] {
+        let err = app
+            .state
+            .doc_repo
+            .hard_delete(bad)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("hard_delete({bad:?}) must be refused, not accepted"));
+        assert!(
+            matches!(err, ogrenotes_storage::repo::RepoError::InvalidArgument(_)),
+            "expected InvalidArgument for {bad:?}, got {err:?}",
+        );
+    }
+
+    assert!(
+        object_present(&app, &blob_key).await,
+        "a refused hard_delete must not have swept anything",
+    );
+
+    app.cleanup().await;
+}
+
 /// #59 T-6: a document's comment threads must appear in its exports.
 /// Import a doc, attach a document-level comment, then export as HTML and
 /// Markdown and assert the comment body + author + a "Comments" heading
