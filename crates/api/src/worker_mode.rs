@@ -1168,7 +1168,12 @@ const PANIC_REASON: &str = "this document could not be converted (the importer f
 ///
 /// Counters are uncapped in value and bounded only by the number of distinct
 /// keys, which is this compile-time set.
-mod report {
+/// `pub(crate)` so the read side — `routes::imports::get_status`, which
+/// projects this row into the wizard's completion state — names the same
+/// constants the writer does. A reader that re-typed the key strings would
+/// drift the first time one was renamed, and the drift would be silent: an
+/// unmatched key reads as a zero counter, i.e. "nothing was lost".
+pub(crate) mod report {
     /// One note kind per outcome. Cause goes in `ReportNote::detail`.
     pub const KIND_THREAD_SKIPPED: &str = "thread_skipped";
     pub const KIND_THREAD_FAILED: &str = "thread_failed";

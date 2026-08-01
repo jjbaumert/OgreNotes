@@ -23,10 +23,12 @@ use ogrenotes_common::time::now_usec;
 use ogrenotes_quip_import::{QuipError, QuipToken};
 use ogrenotes_storage::models::AccessLevel;
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
+use ogrenotes_storage::models::import_inventory::ReportRow;
 
 use crate::error::ApiError;
 use crate::middleware::auth::AuthUser;
 use crate::state::AppState;
+use crate::worker_mode::report;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -306,6 +308,18 @@ struct StatusResponse {
     status: String,
     phase: u8,
     progress: Progress,
+    /// The import's outcome report, or `null` while no `REPORT` row exists
+    /// yet (the worker creates it lazily on the first counted outcome).
+    ///
+    /// `null` is **not** the same as "an all-zero report", and the
+    /// distinction is load-bearing for the wizard: report writes are
+    /// deliberately advisory (see `worker_mode::record_report` — a report
+    /// must never be able to halt an import), so an import can succeed with
+    /// no row at all. A client that read a missing row as
+    /// `imported: 0` would announce "Imported 0 documents" after a clean
+    /// 47-document run. `null` means "no breakdown available"; the wizard
+    /// falls back to its pre-report wording there.
+    report: Option<ReportDto>,
 }
 
 #[derive(Debug, Serialize)]
@@ -316,9 +330,127 @@ struct Progress {
     stage: String,
 }
 
+/// The user-facing projection of `ReportRow`.
+///
+/// Deliberately **not** the raw `counters` map plus the raw `notes` list.
+/// The counter keys and note kinds are worker-internal names
+/// (`worker_mode::report`); re-typing them in the frontend would be a
+/// cross-target mirror with no test to hold it, and the failure mode of a
+/// drifted key is silent — an unmatched key reads as zero, i.e. "nothing
+/// was lost", which is exactly the bug this endpoint exists to fix. The
+/// projection happens once, here, next to the constants.
+///
+/// Skips and failures are separate fields, not one "problems" bucket,
+/// because they are different situations with different remedies: a skip
+/// is "Quip refused to hand this over" (the user may be able to get
+/// access); a failure is "we tried and lost" (the user cannot).
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReportDto {
+    /// Documents actually written into the destination folder.
+    imported: u64,
+    /// Documents Quip refused to serve (HTTP 403).
+    skipped: OutcomeDto,
+    /// Documents the content pass tried and gave up on.
+    failed: OutcomeDto,
+    /// Quip chat threads, which are counted but never named: chats are an
+    /// expected bulk category and are not documents, so they get their own
+    /// number rather than inflating `skipped` (see
+    /// `worker_mode`'s chat branch, which deliberately writes no note).
+    chat_threads_skipped: u64,
+    /// How many notes the `REPORT` row discarded, across **all** kinds —
+    /// including kinds this DTO does not project (dropped images, truncated
+    /// nesting). Reported for completeness; it is *not* the per-section
+    /// truncation signal, because it cannot say which section lost notes.
+    /// `OutcomeDto::total` is that signal — see its doc.
+    notes_dropped: u64,
+}
+
+/// One outcome class: the true total plus a bounded sample of named threads.
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutcomeDto {
+    /// **The true total, from the uncapped counter — never `notes.len()`.**
+    /// `notes` stops at the row's per-kind budget (25); this does not. A
+    /// reader renders "and `total - notes.len()` more" whenever the two
+    /// differ, which is the whole point: a list that silently stopped at 25
+    /// would recreate, in the UI, the very silence this feature removes.
+    total: u64,
+    /// Named examples, bounded by the storage row's per-kind note budget.
+    notes: Vec<NoteDto>,
+}
+
+/// One named thread within an [`OutcomeDto`].
+///
+/// `detail` is worker-authored and already sanitized (`safe_quip_reason` —
+/// no raw Quip response body, no URL). It is plain text: a client renders
+/// it as text, never as markup.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NoteDto {
+    /// Empty when the loss was not thread-scoped (the inventory's
+    /// forbidden-folder note uses an empty id — no single thread is to
+    /// blame). A client shows `detail` alone in that case.
+    quip_thread_id: String,
+    detail: String,
+}
+
+/// Project a stored `ReportRow` into the wire shape.
+///
+/// Two invariants worth naming:
+///
+/// 1. `total` is `max(counter, notes.len())`. The counter and the note kind
+///    are not in perfect one-to-one correspondence — the inventory's
+///    forbidden-*folder* note is filed under the `thread_skipped` kind but
+///    bumps its own counter — so a note could otherwise outnumber its
+///    counter and make `total - notes.len()` underflow into "the list is
+///    complete." `max` keeps the sentence honest in the direction that
+///    matters: never claim completeness we cannot back.
+/// 2. Counter keys and note kinds come from `worker_mode::report`, not from
+///    string literals typed here.
+fn project_report(row: ReportRow) -> ReportDto {
+    let counter = |key: &str| row.counters.get(key).copied().unwrap_or(0);
+    let notes_of = |kind: &str| -> Vec<NoteDto> {
+        row.notes
+            .iter()
+            .filter(|n| n.kind == kind)
+            .map(|n| NoteDto {
+                quip_thread_id: n.quip_thread_id.clone(),
+                detail: n.detail.clone(),
+            })
+            .collect()
+    };
+    let outcome = |counter_key: &str, kind: &str| {
+        let notes = notes_of(kind);
+        OutcomeDto {
+            total: counter(counter_key).max(notes.len() as u64),
+            notes,
+        }
+    };
+
+    ReportDto {
+        imported: counter(report::THREADS_IMPORTED),
+        skipped: outcome(report::THREADS_SKIPPED_FORBIDDEN, report::KIND_THREAD_SKIPPED),
+        failed: outcome(report::THREADS_FAILED, report::KIND_THREAD_FAILED),
+        chat_threads_skipped: counter(report::THREADS_SKIPPED_CHAT),
+        notes_dropped: row.notes_dropped,
+    }
+}
+
 /// `GET /api/v1/imports/quip/{id}` — owner-gated status + progress poll
 /// for the wizard. A different user (or a nonexistent id) gets 404, never
 /// 403 — same existence-hiding convention as `start`.
+///
+/// Also carries the import's outcome report (counters + the bounded note
+/// list) so the wizard's completion state can say what the run *lost*, not
+/// just what it finished. The report read is a single consistent `get_item`
+/// on one small row — `ImportRepo::get_report`'s own doc comment budgets
+/// for exactly this, one read per wizard poll.
+///
+/// The report never carries the Quip token: `ReportRow` has no token field,
+/// its `detail` strings are built by `worker_mode::safe_quip_reason` (which
+/// refuses Quip's raw response bodies), and
+/// `report_response_never_carries_a_token_field` pins the response shape.
 async fn get_status(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
@@ -338,6 +470,13 @@ async fn get_status(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
+    let report = state
+        .import_repo
+        .get_report(&import_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .map(project_report);
+
     let stage = match record.phase {
         0 => "scoping",
         1 => "inventory",
@@ -355,5 +494,6 @@ async fn get_status(
             total,
             stage: stage.to_string(),
         },
+        report,
     }))
 }
