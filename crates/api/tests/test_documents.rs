@@ -1338,8 +1338,10 @@ async fn test_copy_document_survives_an_uncopyable_blob() {
 /// `check_folder_access`, that caller can spend an unbounded amount of
 /// the owner's S3 storage — one full duplicate of every image in the
 /// source, per rejected attempt — into a prefix that no document will
-/// ever reference. Nothing garbage-collects `blobs/` (`hard_delete`
-/// sweeps `docs/{doc_id}/` only), so those objects are permanent.
+/// ever reference, and those objects are permanent. (`hard_delete` now
+/// sweeps `blobs/{doc_id}/` as well — #151 — but only for a doc id that
+/// became a real document; an id minted for a copy that then 403s never
+/// reaches a purge, so nothing would ever collect it.)
 ///
 /// Asserts both halves: the 403, and that no object was created under
 /// the would-be new prefix. The second half is the one that matters —
@@ -1566,6 +1568,327 @@ async fn test_copy_document_does_not_launder_a_foreign_blob_reference() {
         )
         .await;
     assert_eq!(status, 400, "the guard must still reject the foreign key");
+
+    app.cleanup().await;
+}
+
+// ─── #151: a purge must erase the document's images too ────────
+
+/// Put a real object at `key` in the test bucket.
+async fn stage_object(app: &common::TestApp, key: &str, body: &[u8]) {
+    app.s3_client()
+        .put_object()
+        .bucket(&app.bucket)
+        .key(key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(body.to_vec()))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("stage object at {key}: {e:?}"));
+}
+
+/// `HeadObject` reduced to a bool. A missing object is `false`; any other
+/// S3 error panics rather than being smuggled in as "gone" — a test that
+/// reads a transport failure as a successful erasure passes for the
+/// wrong reason.
+async fn object_present(app: &common::TestApp, key: &str) -> bool {
+    match app
+        .s3_client()
+        .head_object()
+        .bucket(&app.bucket)
+        .key(key)
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            let svc = e.into_service_error();
+            if svc.is_not_found() {
+                false
+            } else {
+                panic!("head_object({key}) failed for a reason other than 404: {svc:?}");
+            }
+        }
+    }
+}
+
+/// Every key currently under an arbitrary prefix in the test bucket.
+async fn keys_under(app: &common::TestApp, prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut continuation: Option<String> = None;
+    loop {
+        let mut builder = app
+            .s3_client()
+            .list_objects_v2()
+            .bucket(&app.bucket)
+            .prefix(prefix);
+        if let Some(tok) = continuation.as_ref() {
+            builder = builder.continuation_token(tok);
+        }
+        let page = builder.send().await.expect("list objects under prefix");
+        for obj in page.contents.unwrap_or_default() {
+            if let Some(k) = obj.key {
+                out.push(k);
+            }
+        }
+        if page.is_truncated.unwrap_or(false) {
+            continuation = page.next_continuation_token;
+            if continuation.is_none() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Trash a doc, then purge it through `DELETE /documents/:id/purge`.
+/// Purge refuses a doc that isn't already in the trash, so both steps
+/// are required to reach the destructive path.
+async fn trash_and_purge(app: &common::TestApp, token: &str, doc_id: &str) {
+    let (status, _) = app
+        .json_request(
+            Method::DELETE,
+            &format!("/api/v1/documents/{doc_id}"),
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204, "soft-delete of {doc_id}");
+    let (status, _) = app
+        .json_request(
+            Method::DELETE,
+            &format!("/api/v1/documents/{doc_id}/purge"),
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204, "purge of {doc_id}");
+}
+
+/// Regression (#151): purging a document must remove the images it
+/// holds, not just its `docs/{id}/` snapshots.
+///
+/// `hard_delete` swept `docs/{doc_id}/` alone, so every image ever
+/// uploaded to a document survived its purge indefinitely — while the
+/// caller got a 204 and a `DocDeleted { hard: true }` audit row said the
+/// erasure happened. A user or admin who deletes a document precisely to
+/// destroy its contents was told it worked. This is the right-to-erasure
+/// property, so it asserts the bytes are actually gone from the bucket,
+/// not merely that the reference stopped resolving.
+///
+/// The `docs/` probe is here so that a future change to the sweep can't
+/// quietly trade one prefix for the other.
+#[tokio::test]
+async fn test_purge_document_erases_its_image_blobs() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("purge-blob@test.com").await;
+    let doc_id = app.create_doc(&token, "Doc To Erase", None).await;
+
+    // A real image object, referenced by the document exactly the way an
+    // upload through `POST /documents/:id/blobs` would leave it.
+    let blob_id = "b-purge-1";
+    let blob_key = format!("blobs/{doc_id}/{blob_id}/photo.png");
+    stage_object(&app, &blob_key, b"PNG-BYTES-TO-ERASE").await;
+
+    let (doc, _src) = build_doc_with_blob_ref_image(&doc_id, blob_id, "A doomed photo");
+    let (status, _) = app
+        .bytes_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{doc_id}/content"),
+            Some(&token),
+            doc.to_state_bytes(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    // The pre-existing half of the sweep, so a regression that drops it
+    // in favour of the new half is caught here too.
+    let docs_probe = format!("docs/{doc_id}/snapshots/999999.bin");
+    stage_object(&app, &docs_probe, b"SNAPSHOT-BYTES").await;
+
+    assert!(
+        object_present(&app, &blob_key).await,
+        "precondition: the blob object must exist before the purge",
+    );
+
+    trash_and_purge(&app, &token, &doc_id).await;
+
+    assert!(
+        !object_present(&app, &blob_key).await,
+        "purge left the image behind at {blob_key} — the erasure was a false success",
+    );
+    let leftovers = keys_under(&app, &format!("blobs/{doc_id}/")).await;
+    assert!(
+        leftovers.is_empty(),
+        "nothing may survive under the purged document's blob prefix: {leftovers:?}",
+    );
+    assert!(
+        !object_present(&app, &docs_probe).await,
+        "the pre-existing docs/ sweep must still run: {docs_probe} survived",
+    );
+
+    app.cleanup().await;
+}
+
+/// The property that makes a whole-prefix delete safe (#151): purging
+/// document A touches only A's objects.
+///
+/// A prefix delete is only correct while a blob belongs to exactly one
+/// document — which is what #140's copy re-homing established. If a
+/// future refactor widens the swept prefix (drops the trailing slash,
+/// sweeps by owner, shares a prefix between documents), this is the test
+/// that notices before user data is gone. B's image is checked end to end
+/// through B's own download endpoint, not just by `HeadObject`, so a
+/// change that leaves the bytes but breaks the pairing also fails.
+#[tokio::test]
+async fn test_purging_one_document_leaves_another_documents_blobs_alone() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("purge-neighbour@test.com").await;
+    let doomed_id = app.create_doc(&token, "Doomed", None).await;
+    let survivor_id = app.create_doc(&token, "Survivor", None).await;
+
+    let blob_id = "b-neighbour";
+    let doomed_key = format!("blobs/{doomed_id}/{blob_id}/photo.png");
+    let survivor_key = format!("blobs/{survivor_id}/{blob_id}/photo.png");
+    stage_object(&app, &doomed_key, b"DOOMED-BYTES").await;
+    stage_object(&app, &survivor_key, b"SURVIVOR-BYTES").await;
+
+    // Boundary: a doc id that has the doomed id as a *string* prefix.
+    // Real ids are fixed-length nanoid so this can't arise naturally, but
+    // the trailing slash in `blobs/{id}/` is the only thing standing
+    // between a purge and every neighbouring prefix, and a trailing slash
+    // is exactly the kind of detail a refactor drops.
+    let lookalike_key = format!("blobs/{doomed_id}-lookalike/{blob_id}/photo.png");
+    stage_object(&app, &lookalike_key, b"LOOKALIKE-BYTES").await;
+
+    trash_and_purge(&app, &token, &doomed_id).await;
+
+    assert!(
+        !object_present(&app, &doomed_key).await,
+        "the purged document's own blob must be gone",
+    );
+    assert!(
+        object_present(&app, &survivor_key).await,
+        "purging {doomed_id} destroyed an unrelated document's image at {survivor_key}",
+    );
+    assert!(
+        object_present(&app, &lookalike_key).await,
+        "the sweep escaped its prefix and hit {lookalike_key}",
+    );
+
+    // End to end: the survivor can still read its image.
+    let (status, dl) = app
+        .json_request(
+            Method::GET,
+            &format!("/api/v1/documents/{survivor_id}/blobs/{blob_id}?key={survivor_key}"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "survivor's download URL: {dl}");
+
+    app.cleanup().await;
+}
+
+/// #151 failure semantics. `hard_delete` attempts *both* S3 sweeps
+/// unconditionally and reports the first error afterwards, rather than
+/// aborting the second when the first fails — a purge that gives up
+/// before touching `blobs/` never attempts the erasure the user actually
+/// asked for. Reporting the error is what keeps the audit trail honest:
+/// neither caller writes a "purged" row on an `Err`.
+///
+/// That disposition is only sound if a retry works, so this pins the
+/// retry. The half-completed state is staged directly (the `docs/` sweep
+/// having succeeded and the `blobs/` sweep not — S3 failures can't be
+/// injected through MinIO), then `hard_delete` is driven twice: the
+/// first call must finish the job, the second must still be `Ok` with
+/// nothing left to do.
+#[tokio::test]
+async fn test_hard_delete_is_retry_safe_after_a_half_completed_purge() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("purge-retry@test.com").await;
+    let doc_id = app.create_doc(&token, "Half-purged", None).await;
+
+    let blob_key = format!("blobs/{doc_id}/b-retry/photo.png");
+    let docs_probe = format!("docs/{doc_id}/snapshots/999999.bin");
+    stage_object(&app, &blob_key, b"RETRY-BYTES").await;
+    stage_object(&app, &docs_probe, b"RETRY-SNAPSHOT").await;
+
+    // Stage the "docs/ succeeded, blobs/ did not" half-state.
+    app.state
+        .doc_repo
+        .s3()
+        .delete_prefix(&format!("docs/{doc_id}/"))
+        .await
+        .expect("stage the already-completed half of the sweep");
+    assert!(!object_present(&app, &docs_probe).await);
+    assert!(object_present(&app, &blob_key).await);
+
+    // The retry must not be broken by the already-deleted half.
+    app.state
+        .doc_repo
+        .hard_delete(&doc_id)
+        .await
+        .expect("a retry over an already-swept docs/ prefix must succeed");
+    assert!(
+        !object_present(&app, &blob_key).await,
+        "the retry must finish the half that had not run",
+    );
+
+    // Fully idempotent: a third attempt (rows gone, both prefixes empty)
+    // is a no-op, not an error.
+    app.state
+        .doc_repo
+        .hard_delete(&doc_id)
+        .await
+        .expect("hard_delete over an already-purged document must be a no-op");
+
+    app.cleanup().await;
+}
+
+/// #151 destructive-path guard: `hard_delete` refuses a doc id that is
+/// empty or contains a `/`.
+///
+/// Every sweep in `hard_delete` is a *prefix* delete, so a degenerate id
+/// is the one input class whose blast radius could exceed the named
+/// document if the key layout is ever reshaped. Failing closed costs a
+/// purge; failing open costs somebody else's data. Real ids are nanoid
+/// over `[A-Za-z0-9_-]`, so nothing legitimate is rejected.
+#[tokio::test]
+async fn test_hard_delete_refuses_a_degenerate_doc_id() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("purge-guard@test.com").await;
+    let doc_id = app.create_doc(&token, "Bystander", None).await;
+
+    let blob_key = format!("blobs/{doc_id}/b-guard/photo.png");
+    stage_object(&app, &blob_key, b"BYSTANDER-BYTES").await;
+
+    let traversal = format!("../{doc_id}");
+    for bad in ["", "/", "a/b", "docs/", traversal.as_str()] {
+        let err = app
+            .state
+            .doc_repo
+            .hard_delete(bad)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("hard_delete({bad:?}) must be refused, not accepted"));
+        assert!(
+            matches!(err, ogrenotes_storage::repo::RepoError::InvalidArgument(_)),
+            "expected InvalidArgument for {bad:?}, got {err:?}",
+        );
+    }
+
+    assert!(
+        object_present(&app, &blob_key).await,
+        "a refused hard_delete must not have swept anything",
+    );
 
     app.cleanup().await;
 }

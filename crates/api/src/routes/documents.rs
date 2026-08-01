@@ -3906,7 +3906,10 @@ async fn copy_document(
     // earlier puts `CopyObject` calls in front of `check_folder_access`,
     // which lets a caller who will end up with a 403 duplicate every
     // source blob into a prefix no document will ever reference — and
-    // nothing garbage-collects `blobs/`, so those objects are permanent.
+    // those objects would be permanent. `hard_delete` now sweeps
+    // `blobs/{doc_id}/` too (#151), but that only ever runs for a doc id
+    // that became a real document; an id minted here and then abandoned
+    // by a 403 never reaches a purge, so nothing would ever collect it.
     // Keep the mint, the re-home, and `to_state_bytes` together and after
     // the last authorization check. #140.
     let new_doc_id = new_id();

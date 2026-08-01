@@ -729,12 +729,60 @@ impl DocRepo {
     }
 
     /// Hard delete a document and all associated DynamoDB rows (METADATA,
-    /// MEMBER#*, OPEN#*, UPDATE#*, REL#*, RREL#*), plus every S3 object under
-    /// `docs/<id>/`. Reverse-relationships on other docs must be cleaned up
-    /// separately by the caller (use `list_reverse_relationships` +
-    /// `delete_relationship`) so the forward side on the other doc is also
-    /// removed.
+    /// MEMBER#*, OPEN#*, UPDATE#*, REL#*, RREL#*), plus **both** of the S3
+    /// prefixes a document owns: `docs/<id>/` (snapshots and oversized
+    /// update payloads, `docs/<id>/updates/<clock>.bin`) and `blobs/<id>/`
+    /// (user-uploaded images). Import staging blobs live under
+    /// `imports/...`, are owned by a job rather than a document, and are
+    /// cleaned up by their own job lifecycle — this sweep does not touch
+    /// them. Reverse-
+    /// relationships on other docs must be cleaned up separately by the
+    /// caller (use `list_reverse_relationships` + `delete_relationship`) so
+    /// the forward side on the other doc is also removed.
+    ///
+    /// ## Why `blobs/<id>/` belongs here (#151)
+    ///
+    /// This is the only garbage collector a blob ever gets. Purging used to
+    /// sweep `docs/<id>/` alone, so every image a document ever held
+    /// outlived it in the bucket while the caller was told the purge
+    /// succeeded and an audit row recorded it — a right-to-erasure gap, not
+    /// a storage-cost one.
+    ///
+    /// A whole-prefix delete is correct only because a blob object belongs
+    /// to exactly one document: the key embeds the owning doc id, blob read
+    /// authorization is keyed on that same id, and `copy_document` re-homes
+    /// a copy's blobs under the copy's own prefix rather than aliasing the
+    /// source's (#140). Nothing else may ever be written under
+    /// `blobs/<id>/` on behalf of another document.
+    ///
+    /// ## Failure semantics
+    ///
+    /// Both sweeps are attempted unconditionally, and the first error is
+    /// returned afterwards. Aborting on the `docs/` failure would mean the
+    /// erasure payload the user actually cares about — their images — is
+    /// never even attempted; erasure is best-effort-maximal, then honest.
+    ///
+    /// Returning `Err` when either sweep fails is what keeps the audit
+    /// trail truthful: `purge_document` propagates it (no "purged" audit
+    /// row is written) and `trash_cleanup::sweep` counts it as an error and
+    /// skips the row. Both callers may retry, and a retry is safe: the DDB
+    /// query returns whatever rows remain and `delete_prefix` over an
+    /// already-empty prefix is a no-op, so the already-deleted half never
+    /// breaks the second attempt.
     pub async fn hard_delete(&self, doc_id: &str) -> Result<(), RepoError> {
+        // Destructive-path guard. Every sweep below is a *prefix* delete,
+        // so a degenerate id is the one input class that could widen the
+        // blast radius past this document if the key layout is ever
+        // reshaped. Ids are nanoid over `[A-Za-z0-9_-]` (see
+        // `ogrenotes_common::id::new_id`), so nothing legitimate is
+        // rejected here — and refusing to purge is the safe direction to
+        // fail in.
+        if doc_id.is_empty() || doc_id.contains('/') {
+            return Err(RepoError::InvalidArgument(format!(
+                "hard_delete refuses a doc_id that is empty or contains '/': {doc_id:?}"
+            )));
+        }
+
         let pk = format!("DOC#{doc_id}");
 
         // Enumerate every row under PK=DOC#<id>.
@@ -754,11 +802,12 @@ impl DocRepo {
             }
         }
 
-        // Then sweep S3.
-        self.s3
-            .delete_prefix(&format!("docs/{doc_id}/"))
-            .await
-            .map_err(|e| RepoError::S3(e.to_string()))?;
+        // Then sweep S3 — both prefixes, neither gated on the other.
+        let docs_swept = self.s3.delete_prefix(&format!("docs/{doc_id}/")).await;
+        let blobs_swept = self.s3.delete_prefix(&format!("blobs/{doc_id}/")).await;
+
+        docs_swept.map_err(|e| RepoError::S3(e.to_string()))?;
+        blobs_swept.map_err(|e| RepoError::S3(e.to_string()))?;
 
         Ok(())
     }
