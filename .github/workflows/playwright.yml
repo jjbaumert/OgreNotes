@@ -713,6 +713,21 @@ jobs:
             --base-url http://127.0.0.1:3000 \
             --out ../../artifacts/doctor/doc-mentions
 
+      # Presentations P1 (deck editor): create deck → canvas at real size
+      # (regression net for the 0×0 flex collapse) → add title-content
+      # slide → in-frame typing via the embedded editor → Escape →
+      # reload → text + thumb count persisted. First green run
+      # 2026-08-01 against a local stack (PR #186).
+      - name: Run deck-basics scenario
+        id: deck-basics
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario deck-basics \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/deck-basics
+
       # ─── Teardown / artifacts ─────────────────────────────────
       - name: Stop axum server
         if: always()
