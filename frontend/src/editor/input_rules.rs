@@ -84,6 +84,16 @@ pub fn check_input_rules(
 /// U+FFFC OBJECT REPLACEMENT CHARACTER is inert for every rule's pattern,
 /// and [`check_input_rules`] declines any match that spans one, so an
 /// atom can never be rewritten into literal text.
+///
+/// A *literal* U+FFFC in user-typed or pasted text is indistinguishable
+/// from an atom placeholder here, so a markdown rule spanning one is
+/// likewise declined and silently does not fire on that text. This is
+/// deliberate and fail-safe: the position arithmetic counts chars
+/// uniformly, so a literal U+FFFC is one char = one model position under
+/// either interpretation and can never mis-position an edit — the only
+/// consequence is the declined rule, never corruption. Do not "fix" the
+/// guard to special-case literal U+FFFC; distinguishing the two buys
+/// nothing and reintroduces the byte/position confusion this removed.
 const INLINE_ATOM: char = '\u{FFFC}';
 
 /// Render a textblock's content as the text input rules match against.
