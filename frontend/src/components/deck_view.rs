@@ -11,11 +11,13 @@
 //! that serializes the model back to a `Doc` and hands it to the
 //! host page via `on_state_change` (`spreadsheet_view.rs:1686`).
 //!
-//! Frame content renders read-only in this task: paragraphs,
-//! headings, and lists render as plain HTML (mirrors
-//! `diff_block_view.rs`'s block-type match); anything else renders a
-//! placeholder box labeled with its node type. Real in-canvas editing
-//! lands in Task 11.
+//! Frame content normally renders read-only: paragraphs, headings,
+//! and lists render as plain HTML (mirrors `diff_block_view.rs`'s
+//! block-type match); anything else renders a placeholder box
+//! labeled with its node type. The one frame named by `editing_frame`
+//! instead mounts a scoped `EditorComponent` over a synthetic Doc
+//! wrapping just that frame's content, for real in-place text editing
+//! (Task 11).
 //!
 //! Every deck mutation (add/duplicate/move/delete slide) is a free
 //! function taking `&mut Deck` — kept out of the component closure so
@@ -200,6 +202,33 @@ fn centered_text_frame_rect() -> Rect {
 /// gesture commits.
 fn find_frame_index(frames: &[DeckFrame], block_id: &str) -> Option<usize> {
     frames.iter().position(|f| f.block_id == block_id)
+}
+
+/// Re-apply a locally-nudged-but-not-yet-persisted frame's rect onto a
+/// freshly merged deck (resync-Effect Finding I1).
+///
+/// The old sequencing called `flush_nudge` *before* computing
+/// `merge_remote_deck`, which persisted the PRE-MERGE local snapshot.
+/// That was unsafe two ways: by send time `ws_client`'s
+/// `last_synced_doc` had already rebased past the incoming remote
+/// update, so the stale doc's sync could delete peer-added slides or
+/// revert peer edits wholesale; and it self-defeated the nudge itself,
+/// since the merge that followed adopted the remote rect for the very
+/// frame just nudged.
+///
+/// Calling this *after* `merge_remote_deck` instead means the deck
+/// that ends up persisted has every peer change AND the local nudge.
+/// Returns whether `frame_id` was found in `merged` (and thus the rect
+/// applied) — `false` when a concurrent remote delete raced the nudge,
+/// which is a legitimate no-op, not an error.
+fn carry_nudge(merged: &mut Deck, frame_id: &str, rect: Rect) -> bool {
+    for slide in merged.slides.iter_mut() {
+        if let Some(frame) = slide.frames.iter_mut().find(|f| f.block_id == frame_id) {
+            frame.rect = rect;
+            return true;
+        }
+    }
+    false
 }
 
 /// Task 11 review, Finding 2 — whether the frame named by `editing_id`
@@ -610,10 +639,28 @@ pub fn DeckView(
         // A genuine remote update is about to overwrite `deck` below.
         // If an arrow-nudge is mid-gesture (already mutated into
         // `deck` locally, not yet persisted — see `nudge_dirty`'s doc
-        // comment on `flush_nudge`), flush it *first* so it enters the
-        // CRDT merge instead of being silently discarded by the
-        // overwrite (Task 10 review, Finding 2).
-        flush_nudge();
+        // comment on `flush_nudge`), capture the nudged frame's *rect*
+        // now, before it's gone, so it can be carried onto the merged
+        // deck below (see `carry_nudge`'s doc comment for why calling
+        // `flush_nudge` here — persisting the pre-merge snapshot — was
+        // unsafe: it raced `ws_client`'s rebase and could delete
+        // peer-added slides / revert peer edits wholesale, and it
+        // self-defeated the nudge once the merge adopted the remote
+        // rect for the same frame).
+        let had_pending_nudge = nudge_dirty.get_untracked();
+        let pending_nudge = if had_pending_nudge {
+            selected_frame.get_untracked().and_then(|id| {
+                deck.with_untracked(|d| {
+                    d.slides
+                        .iter()
+                        .flat_map(|s| s.frames.iter())
+                        .find(|f| f.block_id == id)
+                        .map(|f| (id.clone(), f.rect))
+                })
+            })
+        } else {
+            None
+        };
 
         let mut remote_deck = deck_from_doc(&state.doc);
         let bootstrap = bootstrap_blank_slide(remote_deck.slides.is_empty(), readonly);
@@ -630,7 +677,7 @@ pub fn DeckView(
         // Effect must re-run when a new `editor_state` arrives, not
         // merely because `editing_frame` toggled.
         let editing = editing_frame.get_untracked();
-        let merged = deck.with_untracked(|local| merge_remote_deck(local, remote_deck, editing.as_deref()));
+        let mut merged = deck.with_untracked(|local| merge_remote_deck(local, remote_deck, editing.as_deref()));
         // If the frame being edited was deleted by this same remote
         // update (a concurrent peer's delete raced the open editor),
         // `merged` no longer has it — drop the dangling `editing_frame`
@@ -642,10 +689,49 @@ pub fn DeckView(
                 close_frame_editor();
             }
         }
+        // Carry the pending nudge onto the now-merged deck (Finding
+        // I1) — never onto the pre-merge local/remote decks
+        // individually. `carry_nudge` no-ops safely if a concurrent
+        // remote delete raced the nudge.
+        if let Some((id, rect)) = pending_nudge {
+            carry_nudge(&mut merged, &id, rect);
+        }
+        if had_pending_nudge {
+            set_nudge_dirty.set(false);
+        }
         deck.set(merged);
-        if should_persist {
+        if should_persist || had_pending_nudge {
             crate::a11y::defer(persist);
         }
+    });
+
+    // ─── Focus the embedded frame editor on mount (Task 11 review,
+    // Finding 2 / I2) ────────────────────────────────────────
+    //
+    // Mounting the scoped `EditorComponent` (in `frame_body`, below)
+    // does not by itself move DOM focus into its contenteditable —
+    // without this, focus stays on whatever last had it (typically
+    // the canvas div itself), so the very next keydown targets the
+    // canvas directly. That skips the `.deck-frame` div's own
+    // `on:keydown` listener entirely (it only intercepts events that
+    // bubble *through* the frame's DOM subtree) and lands on
+    // `on_canvas_keydown` instead, which would delete the frame on
+    // Backspace or eat every other keystroke with no visible effect.
+    // Deferred by a microtask (`a11y::defer`) so the `frame_body`
+    // branch has actually mounted `.editor-content` by the time this
+    // queries for it — same pattern as `spreadsheet_view.rs`'s
+    // cell-input-focus Effect and `ask_dialog.rs`'s input autofocus.
+    Effect::new(move |_| {
+        let Some(id) = editing_frame.get() else { return };
+        crate::a11y::defer(move || {
+            let Some(canvas) = canvas_ref.get_untracked() else { return };
+            let selector = format!("{} .editor-content", frame_selector(&id));
+            if let Ok(Some(el)) = canvas.query_selector(&selector) {
+                if let Ok(html_el) = el.dyn_into::<web_sys::HtmlElement>() {
+                    let _ = html_el.focus();
+                }
+            }
+        });
     });
 
     // Component teardown (navigating away, switching doc types, etc.)
@@ -936,12 +1022,21 @@ pub fn DeckView(
     // ─── Canvas keymap (Task 10) ─────────────────────────────
     //
     // Implements `design/presentations.md`'s "Canvas keymap matrix"
-    // for the "frame selected, not editing" column — real in-frame
-    // text editing (and its own key handling) lands in the
-    // frame-editing task; until then every frame renders read-only,
-    // so this handler never has an "editing" branch to dispatch to.
+    // for the "frame selected, not editing" column. The "editing"
+    // column's own key handling lives on the `.deck-frame` div's own
+    // `on:keydown` (below, "Hazard 1"), which stops propagation before
+    // an in-editor keystroke can reach this handler — this guard is
+    // defense in depth for the case that mechanism doesn't cover: a
+    // keydown whose *target* is the canvas itself (or anything else
+    // outside the editing frame's DOM subtree) never touches the frame
+    // div's listener at all, so it would otherwise still reach here.
+    // Escape is the one key the editing column needs, and it's handled
+    // entirely inside the frame's own listener — nothing here.
     let on_canvas_keydown = move |ev: web_sys::KeyboardEvent| {
         if readonly {
+            return;
+        }
+        if editing_frame.get_untracked().is_some() {
             return;
         }
         let ctrl_or_meta = ev.ctrl_key() || ev.meta_key();
@@ -1067,8 +1162,19 @@ pub fn DeckView(
     // whether a frame happens to be selected — per the keymap matrix,
     // "with no frame selected, paste on the canvas also creates a new
     // centered frame from the clipboard content."
+    //
+    // Defense in depth, same reasoning as `on_canvas_keydown` above:
+    // the `.deck-frame` div's own `on:paste` (Hazard 1) already stops
+    // propagation for a paste that bubbles up through the editing
+    // frame's DOM subtree, but a paste whose target is the canvas
+    // itself would skip that listener entirely and land here, spawning
+    // a spurious extra frame while the user is pasting into the open
+    // editor.
     let on_canvas_paste = move |ev: web_sys::Event| {
         if readonly {
+            return;
+        }
+        if editing_frame.get_untracked().is_some() {
             return;
         }
         let Ok(ce) = ev.dyn_into::<web_sys::ClipboardEvent>() else { return };
@@ -1153,7 +1259,19 @@ pub fn DeckView(
                     if let Some(el) = ev.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
                         let _ = el.release_pointer_capture(ev.pointer_id());
                     }
-                    set_dragging_block_id.set(None);
+                    // Minor M2: a cancel (e.g. the browser reclaiming
+                    // the gesture for a system action) still leaves
+                    // `deck`'s slide order live-reordered by every
+                    // `pointermove` this gesture already processed —
+                    // dropping the drag state here without persisting
+                    // (the old behavior) left the local order
+                    // permanently diverged from the persisted doc.
+                    // `pointerup`'s handling is the model: persist
+                    // whatever order the gesture landed on.
+                    if dragging_block_id.get_untracked().is_some() {
+                        set_dragging_block_id.set(None);
+                        persist();
+                    }
                 }
             >
                 <For
@@ -2002,6 +2120,52 @@ mod tests {
     fn find_frame_index_missing_block_id_is_none() {
         let slide = simple_slide();
         assert_eq!(find_frame_index(&slide.frames, "not-a-real-id"), None);
+    }
+
+    // ─── carry_nudge (resync-Effect Finding I1) ─────────────
+
+    #[test]
+    fn carry_nudge_applies_rect_when_frame_still_exists() {
+        let mut deck = fixture_deck_one_slide();
+        let frame_id = deck.slides[0].frames[0].block_id.clone();
+        let new_rect = Rect::clamped(0.4, 0.5, 0.2, 0.2);
+
+        let applied = carry_nudge(&mut deck, &frame_id, new_rect);
+
+        assert!(applied);
+        assert_eq!(deck.slides[0].frames[0].rect, new_rect);
+    }
+
+    #[test]
+    fn carry_nudge_returns_false_when_frame_no_longer_exists() {
+        // A concurrent remote delete raced the nudge — the frame named
+        // by the captured id is gone from the merged deck. This must
+        // be a safe no-op, not a panic or a silent frame re-creation.
+        let mut deck = fixture_deck_one_slide();
+        let untouched = deck.clone();
+        let new_rect = Rect::clamped(0.4, 0.5, 0.2, 0.2);
+
+        let applied = carry_nudge(&mut deck, "deleted-by-a-peer", new_rect);
+
+        assert!(!applied);
+        assert_eq!(deck, untouched);
+    }
+
+    #[test]
+    fn carry_nudge_only_touches_the_named_frame() {
+        // Two slides, each with one frame (`fixture_deck_two_slides`).
+        // Nudging the first slide's frame must leave the second
+        // slide's frame's rect untouched.
+        let mut deck = fixture_deck_two_slides();
+        let target_id = deck.slides[0].frames[0].block_id.clone();
+        let other_rect_before = deck.slides[1].frames[0].rect;
+        let new_rect = Rect::clamped(0.4, 0.5, 0.2, 0.2);
+
+        let applied = carry_nudge(&mut deck, &target_id, new_rect);
+
+        assert!(applied);
+        assert_eq!(deck.slides[0].frames[0].rect, new_rect);
+        assert_eq!(deck.slides[1].frames[0].rect, other_rect_before);
     }
 
     // ─── Frame-editor lifecycle (Task 11 review, Finding 2) ─
