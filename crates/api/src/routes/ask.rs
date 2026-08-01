@@ -84,9 +84,10 @@ enum SsePayload {
     Source {
         doc_id: String,
         title: String,
-        /// "document" / "spreadsheet" / "chat" — same wire shape
-        /// as DocType::as_str. Lets the frontend render a provider
-        /// icon next to each citation. M-6.2 piece C addition.
+        /// "document" / "spreadsheet" / "chat" / "presentation" —
+        /// same wire shape as DocType::as_str. Lets the frontend
+        /// render a provider icon next to each citation. M-6.2
+        /// piece C addition.
         doc_type: String,
     },
     /// Per-question token totals, summed across all Claude calls
@@ -522,7 +523,7 @@ fn build_tool_definitions(state: &AppState) -> Vec<Tool> {
                     "query": { "type": "string", "description": "Search query text" },
                     "doc_type": {
                         "type": "string",
-                        "enum": ["document", "spreadsheet", "chat"],
+                        "enum": ["document", "spreadsheet", "chat", "presentation"],
                         "description": "Filter by document type"
                     }
                 },
@@ -571,7 +572,7 @@ fn build_tool_definitions(state: &AppState) -> Vec<Tool> {
                 "properties": {
                     "doc_type": {
                         "type": "string",
-                        "enum": ["document", "spreadsheet", "chat"],
+                        "enum": ["document", "spreadsheet", "chat", "presentation"],
                         "description": "Filter by document type"
                     }
                 }
@@ -592,7 +593,7 @@ fn build_tool_definitions(state: &AppState) -> Vec<Tool> {
                     "query": { "type": "string", "description": "Natural language query" },
                     "doc_type": {
                         "type": "string",
-                        "enum": ["document", "spreadsheet", "chat"],
+                        "enum": ["document", "spreadsheet", "chat", "presentation"],
                         "description": "Filter by document type"
                     }
                 },

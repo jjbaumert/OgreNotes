@@ -359,6 +359,17 @@ pub fn Sidebar(
                     }
                 });
             }),
+            MenuEntry::action(crate::t!("deck-new"), move || {
+                close_drawer();
+                leptos::task::spawn_local(async move {
+                    match documents::create_presentation("Untitled Presentation", None).await {
+                        Ok(doc) => crate::commands::nav_bridge::go(&format!("/d/{}", doc.id)),
+                        Err(e) => web_sys::console::error_1(
+                            &format!("Failed to create presentation: {e}").into(),
+                        ),
+                    }
+                });
+            }),
         ];
         if on_templates.is_some() || on_quip_import.is_some() {
             items.push(MenuEntry::Separator);

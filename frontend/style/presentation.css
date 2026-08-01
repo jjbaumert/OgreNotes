@@ -1,0 +1,517 @@
+/* ─── Presentation / Slide-Deck View (Task 7) ─────────────────────
+ *
+ * Loaded on demand (copy-file, not always-bundled css — see the
+ * comment on spreadsheet.css's <link> in index.html) by the deck
+ * canvas editor landing in Task 9-12. This pass ships only the
+ * structural scaffolding + the six built-in theme palettes; the
+ * corner resize-handle elements and slide-strip drag interactions
+ * are wired up when the canvas component lands.
+ *
+ * `.deck-frame` geometry (left/top/width/height) is written as
+ * inline `style="left:…%; top:…%; …"` by the Rust canvas component
+ * from `DeckFrame.rect` (0..1 normalized, see
+ * `presentation::model::Rect`) — this file only supplies the
+ * `position: absolute` anchor and cosmetic rules, never the
+ * per-frame geometry itself.
+ */
+
+.deck-view {
+  display: grid;
+  grid-template-columns: 200px 1fr 280px;
+  grid-template-areas: "strip canvas pane";
+  height: 100%;
+  min-height: 0;
+  background: var(--color-bg);
+}
+
+.deck-view__strip {
+  grid-area: strip;
+  overflow-y: auto;
+  border-right: 1px solid var(--color-border);
+  background: var(--color-surface);
+  padding: var(--space-sm);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.deck-view__canvas-wrap {
+  grid-area: canvas;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  padding: var(--space-xl);
+}
+
+.deck-view__pane {
+  grid-area: pane;
+  overflow-y: auto;
+  border-left: 1px solid var(--color-border);
+  background: var(--color-surface);
+  padding: var(--space-md);
+}
+
+/* Canvas: fixed 16:9 aspect surface. `container-type: size` lets
+ * frame-internal typography (Task 9-12) scale with `cqw`/`cqh`
+ * units instead of the viewport, so a frame's heading reads the
+ * same relative size on the full-screen presenter view as it does
+ * shrunk into the editor canvas. */
+.deck-canvas {
+  position: relative;
+  width: 100%;
+  max-width: 960px;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: var(--radius-md);
+  box-shadow: 0 2px 16px rgba(0, 0, 0, 0.18);
+  container-type: size;
+  container-name: deck-canvas;
+  background: var(--deck-bg);
+  color: var(--deck-text-color);
+}
+
+/* The canvas is `tabindex="0"` so it can receive the keymap
+ * (Task 10: Escape/Delete/Tab/arrows/Cmd-D/paste) — give it a
+ * visible focus ring like any other keyboard-operable surface,
+ * rather than the browser's default (often invisible against
+ * `--deck-bg`, which is theme-controlled and frequently dark). */
+.deck-canvas:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+/* Column stack: the interactive canvas plus the collapsed notes
+ * drawer below it (Task 10) — `role=notes` frames never render on
+ * the canvas itself, only here. */
+.deck-view__canvas-column {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-sm);
+  width: 100%;
+}
+
+/* Snap guide line rendered while dragging/resizing a frame — a 1px
+ * line spanning the canvas at the alignment position `geometry::snap`
+ * reported. Positioned via inline `style:left`/`style:top` (percent
+ * of canvas, matching frame geometry) from the transient drag-guides
+ * signal; never persisted, purely visual drag feedback. */
+.deck-snap-guide {
+  position: absolute;
+  background: var(--deck-accent);
+  opacity: 0.8;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.deck-snap-guide--x {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+}
+
+.deck-snap-guide--y {
+  left: 0;
+  right: 0;
+  height: 1px;
+}
+
+/* Collapsed-by-default (native <details>) speaker-notes drawer.
+ * Rendered only when the active slide has at least one `role=notes`
+ * frame; those frames are read-only here in Task 10 the same way
+ * on-canvas frame content is (Task 11 lands real editing for both). */
+.deck-notes-drawer {
+  width: 100%;
+  max-width: 960px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+}
+
+.deck-notes-drawer summary {
+  padding: var(--space-sm);
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  font-size: 0.85em;
+}
+
+.deck-notes-drawer__body {
+  padding: 0 var(--space-sm) var(--space-sm);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.deck-notes-drawer__frame {
+  padding: var(--space-sm);
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.deck-add-text-frame-btn {
+  width: 100%;
+  padding: var(--space-sm);
+  margin-bottom: var(--space-sm);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text);
+  cursor: pointer;
+}
+
+.deck-add-text-frame-btn:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+/* Frame: positioned via inline style (left/top/width/height as
+ * percentages of the canvas, matching `DeckFrame.rect`). This rule
+ * only supplies the absolute-positioning anchor + content styling. */
+.deck-frame {
+  position: absolute;
+  box-sizing: border-box;
+  overflow: hidden;
+  padding: 2cqh 2cqw;
+  color: var(--deck-text-color);
+  cursor: move;
+  touch-action: none; /* pointer-drag (Task 10) owns the gesture, not scroll/zoom */
+}
+
+.deck-frame--readonly {
+  cursor: default;
+}
+
+/* Task 11 — while a frame's embedded editor is mounted, the frame's
+ * own `cursor: move` (a drag affordance) would sit visually on top of
+ * the contenteditable's caret, which is misleading: this frame no
+ * longer starts a drag on pointerdown (see `DeckView`'s per-frame
+ * pointerdown guard). Text cursor + normal touch scrolling instead. */
+.deck-frame--editing {
+  cursor: text;
+  touch-action: auto;
+}
+
+.deck-frame :is(h1, h2, h3, h4, h5, h6) {
+  color: var(--deck-heading-color);
+  margin: 0 0 0.3em 0;
+}
+
+.deck-frame p {
+  margin: 0 0 0.5em 0;
+}
+
+/* Selected-frame outline. Corner resize-handle elements are DOM
+ * children the canvas component renders (`.deck-frame-handle`,
+ * Task 9-12); this class only owns the outline treatment so it's
+ * visible even before handles exist. */
+.deck-frame--selected {
+  outline: 2px solid var(--deck-accent);
+  outline-offset: -2px;
+}
+
+.deck-frame-handle {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  background: var(--deck-accent);
+  border: 1px solid var(--color-surface);
+  border-radius: 2px;
+  touch-action: none; /* pointer-drag owns the gesture, not scroll/zoom */
+}
+
+.deck-frame-handle--nw {
+  top: -4px;
+  left: -4px;
+  cursor: nwse-resize;
+}
+
+.deck-frame-handle--ne {
+  top: -4px;
+  right: -4px;
+  cursor: nesw-resize;
+}
+
+.deck-frame-handle--sw {
+  bottom: -4px;
+  left: -4px;
+  cursor: nesw-resize;
+}
+
+.deck-frame-handle--se {
+  bottom: -4px;
+  right: -4px;
+  cursor: nwse-resize;
+}
+
+/* Slide-strip thumbnail. Renders a live miniature of the full
+ * canvas by scaling a fixed-size copy of the canvas subtree down
+ * with `transform: scale()` — cheaper than a second render path,
+ * and it stays byte-identical to the real canvas since it's the
+ * same DOM, just shrunk. `--deck-thumb-scale` is never actually set
+ * inline by the canvas component (Minor M3) -- the rule below's
+ * `0.2` fallback is what applies unconditionally today. A
+ * variable-width thumb strip would need to set the custom property
+ * per thumbnail (960px reference width / actual thumb width) for
+ * this to track it. */
+.deck-slide-thumb {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  width: 100%;
+  overflow: hidden;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  border: 2px solid transparent;
+  background: var(--deck-bg);
+}
+
+.deck-slide-thumb--active {
+  border-color: var(--color-primary);
+}
+
+.deck-slide-thumb__scaler {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 960px;
+  transform-origin: top left;
+  transform: scale(var(--deck-thumb-scale, 0.2));
+  pointer-events: none;
+}
+
+/* ─── Built-in themes ──────────────────────────────────────────
+ *
+ * Six named palettes (`presentation::themes::DECK_THEMES`), each a
+ * `.deck-theme-<id>` class defining the four `--deck-*` custom
+ * properties `.deck-canvas` / `.deck-frame` / `.deck-slide-thumb`
+ * consume. Unlike `tokens-light.css` / `tokens-dark.css` (which
+ * define the *app chrome's* palette), these are the deck's own
+ * self-contained visual identity — most default to a dark canvas
+ * background regardless of app theme, the way a slide deck's
+ * background is a deliberate design choice, not a UI surface. The
+ * `:root[data-theme="dark"]` overrides below exist so a theme still
+ * reads well sitting inside the app's dark-mode chrome (subtle
+ * palette shifts, not a repaint) — same override convention as
+ * `tokens-dark.css`. */
+
+.deck-theme-slate {
+  --deck-bg: #2a3440;
+  --deck-heading-color: #f5f7fa;
+  --deck-text-color: #c9d1d9;
+  --deck-accent: #5b9bd5;
+}
+:root[data-theme="dark"] .deck-theme-slate {
+  --deck-bg: #232b35;
+  --deck-heading-color: #f5f7fa;
+  --deck-text-color: #c2cad3;
+  --deck-accent: #6fa8dd;
+}
+
+.deck-theme-paper {
+  --deck-bg: #f5f0e8;
+  --deck-heading-color: #1a1a1a;
+  --deck-text-color: #3a3a3a;
+  --deck-accent: #2d5f2d;
+}
+:root[data-theme="dark"] .deck-theme-paper {
+  --deck-bg: #ede6d8;
+  --deck-heading-color: #1a1a1a;
+  --deck-text-color: #3a3a3a;
+  --deck-accent: #245024;
+}
+
+.deck-theme-midnight {
+  --deck-bg: #12121f;
+  --deck-heading-color: #ffffff;
+  --deck-text-color: #b8b8d0;
+  --deck-accent: #7c6ff0;
+}
+:root[data-theme="dark"] .deck-theme-midnight {
+  --deck-bg: #0d0d17;
+  --deck-heading-color: #ffffff;
+  --deck-text-color: #aeaecb;
+  --deck-accent: #9086f5;
+}
+
+.deck-theme-ember {
+  --deck-bg: #2b1810;
+  --deck-heading-color: #ffe8d6;
+  --deck-text-color: #e0c4a8;
+  --deck-accent: #e8743b;
+}
+:root[data-theme="dark"] .deck-theme-ember {
+  --deck-bg: #22120c;
+  --deck-heading-color: #ffe8d6;
+  --deck-text-color: #d8b99b;
+  --deck-accent: #ef8452;
+}
+
+.deck-theme-forest {
+  --deck-bg: #14231a;
+  --deck-heading-color: #e8f5e9;
+  --deck-text-color: #b8d4bc;
+  --deck-accent: #4a9960;
+}
+:root[data-theme="dark"] .deck-theme-forest {
+  --deck-bg: #0f1c14;
+  --deck-heading-color: #e8f5e9;
+  --deck-text-color: #aecab2;
+  --deck-accent: #5cab72;
+}
+
+.deck-theme-ocean {
+  --deck-bg: #0b2027;
+  --deck-heading-color: #e0f7fa;
+  --deck-text-color: #a8d8de;
+  --deck-accent: #1ab0c4;
+}
+:root[data-theme="dark"] .deck-theme-ocean {
+  --deck-bg: #081920;
+  --deck-heading-color: #e0f7fa;
+  --deck-text-color: #9dccd2;
+  --deck-accent: #2fc0d3;
+}
+
+/* ─── DeckView chrome (Task 9) ──────────────────────────────────
+ *
+ * Slide-strip mutation affordances, the read-only frame-content
+ * placeholder box, the frame comment button, and the theme picker.
+ * Frame geometry itself is still inline style from `DeckFrame.rect`
+ * (see the file-header comment); everything here is cosmetic. */
+
+.deck-slide-thumb__actions {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+
+.deck-slide-thumb:hover .deck-slide-thumb__actions {
+  opacity: 1;
+}
+
+.deck-slide-thumb__duplicate,
+.deck-slide-thumb__delete {
+  width: 20px;
+  height: 20px;
+  line-height: 1;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.deck-slide-thumb__delete:hover {
+  background: var(--color-error);
+}
+
+.deck-slide-thumb__duplicate:hover {
+  background: var(--color-primary);
+}
+
+.deck-view__add-slide {
+  position: relative;
+}
+
+.deck-add-slide-btn {
+  width: 100%;
+  padding: var(--space-sm);
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+
+.deck-add-slide-btn:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+.deck-preset-picker {
+  position: absolute;
+  z-index: 20;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  overflow: hidden;
+}
+
+.deck-preset-picker__item {
+  padding: var(--space-sm);
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  color: var(--color-text);
+}
+
+.deck-preset-picker__item:hover {
+  background: var(--color-bg-hover);
+}
+
+/* Read-only placeholder for a frame's block content that this task
+ * doesn't render faithfully (tables, code blocks, embeds, kanban,
+ * calendar, mermaid, …). Labeled with the block's `NodeType` debug
+ * name so it's obvious what real editing (Task 11) will replace it
+ * with, not just a blank box. */
+.deck-frame-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  border: 1px dashed var(--deck-accent);
+  border-radius: var(--radius-sm);
+  font-size: 0.85em;
+  opacity: 0.75;
+}
+
+.deck-frame__comment-btn {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 20px;
+  height: 20px;
+  line-height: 1;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.35);
+  color: #fff;
+  cursor: pointer;
+  font-size: 11px;
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+
+.deck-frame:hover .deck-frame__comment-btn,
+.deck-frame__comment-btn--active {
+  opacity: 1;
+}
+
+.deck-theme-picker {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs, 4px);
+  font-size: 0.85em;
+  color: var(--color-text-secondary);
+}
+
+.deck-theme-select {
+  padding: var(--space-sm);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+}

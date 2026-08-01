@@ -212,6 +212,7 @@ pub fn FileBrowser(
                                         let (icon, type_label) = match child_type.as_str() {
                                             "folder" => ("\u{1F4C1}", crate::t!("file-type-folder")),
                                             "spreadsheet" => ("\u{1F4CA}", crate::t!("file-type-spreadsheet")),
+                                            "presentation" => ("\u{1F4FD}", crate::t!("deck-doc-type-label")),
                                             "chat" => ("\u{1F4AC}", crate::t!("file-type-chat")),
                                             _ => ("\u{1F4C4}", crate::t!("file-type-document")),
                                         };

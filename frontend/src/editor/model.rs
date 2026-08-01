@@ -195,6 +195,17 @@ pub enum NodeType {
     /// the `source` attribute; rendered to SVG by `ogrenotes-mermaid`.
     /// Mirrors the same-named variant in `crates/collab/src/schema.rs`.
     Mermaid,
+    /// design/presentations.md — one slide in a presentation deck.
+    /// Container of `Frame` children. Attrs: `layout` (preset id),
+    /// `background` (optional theme-relative override). Mirrors the
+    /// same-named variant in `crates/collab/src/schema.rs`.
+    Slide,
+    /// design/presentations.md — a positioned frame on a slide.
+    /// Container of ordinary blocks. Attrs: `x`,`y`,`w`,`h`
+    /// (normalized 0..1), `z` (stacking), `role`
+    /// (`content` | `notes`). Mirrors the same-named variant in
+    /// `crates/collab/src/schema.rs`.
+    Frame,
 }
 
 impl NodeType {
@@ -272,7 +283,11 @@ impl NodeType {
             | NodeType::TableHeader
             | NodeType::Calendar
             | NodeType::Kanban
-            | NodeType::KanbanCard => true,
+            | NodeType::KanbanCard
+            // A frame is the slide-level analogue of a table cell —
+            // a positioned region a viewer can react to. The slide
+            // itself is a layout container, not a comment target.
+            | NodeType::Frame => true,
             NodeType::Doc
             | NodeType::BulletList
             | NodeType::OrderedList
@@ -286,7 +301,8 @@ impl NodeType {
             | NodeType::KanbanColumn
             | NodeType::Mention
             | NodeType::DocMention
-            | NodeType::Mermaid => false,
+            | NodeType::Mermaid
+            | NodeType::Slide => false,
         }
     }
 
@@ -335,7 +351,13 @@ impl NodeType {
             | NodeType::KanbanCard
             | NodeType::Mention
             | NodeType::DocMention
-            | NodeType::Mermaid => true,
+            | NodeType::Mermaid
+            // Both mandatory: without a stable blockId, the
+            // bridge's `find_match` can't align Slide/Frame across
+            // syncs and every edit degrades to a full subtree
+            // rewrite (see the pathology note above).
+            | NodeType::Slide
+            | NodeType::Frame => true,
         }
     }
 
@@ -1166,6 +1188,15 @@ fn normalize_node(node: &Node, parent_type: NodeType) -> Vec<Node> {
                     } else {
                         vec![node.copy_with_content(Fragment::from(children))]
                     }
+                }
+                // A `Slide` with no frames yet, or a `Frame` with no
+                // blocks yet, is a normal mid-authoring state (a
+                // freshly inserted slide, a frame the user hasn't
+                // populated) — never strip it. Unlike
+                // `is_spreadsheet_table`, no attr sniffing is needed:
+                // the node type alone is the signal.
+                NodeType::Slide | NodeType::Frame => {
+                    vec![node.copy_with_content(Fragment::from(children))]
                 }
                 // Everything else → just propagate normalized children
                 _ => vec![node.copy_with_content(Fragment::from(children))],

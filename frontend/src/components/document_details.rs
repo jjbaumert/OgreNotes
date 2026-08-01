@@ -59,12 +59,10 @@ pub fn DocumentDetailsDialog(
             .unwrap_or((0, 0))
     });
 
-    let type_label = move || {
-        if doc_type.get() == "spreadsheet" {
-            crate::t!("doc-type-spreadsheet")
-        } else {
-            crate::t!("doc-type-document")
-        }
+    let type_label = move || match doc_type.get().as_str() {
+        "spreadsheet" => crate::t!("doc-type-spreadsheet"),
+        "presentation" => crate::t!("deck-doc-type-label"),
+        _ => crate::t!("doc-type-document"),
     };
 
     view! {

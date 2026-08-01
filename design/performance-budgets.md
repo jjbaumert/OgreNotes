@@ -83,7 +83,7 @@ Measured by the M-P9 piece B CI job: `trunk build --release`,
 
 | Asset | Aspirational budget | Current baseline (2026-06-04) | CI gate threshold |
 |---|---|---|---|
-| `ogrenotes-frontend_bg.wasm` (gzipped) | **800 KB** | **~1.66 MB** (last measured main, 2026-07-10; was 2.07 MB on 2026-06-03, pre size-opt) | Fail PR if > **1.76 MiB** (1,850,000 B) |
+| `ogrenotes-frontend_bg.wasm` (gzipped) | **800 KB** | **~1.80 MB** (last measured PR #182, 2026-08-01; was ~1.66 MB on 2026-07-10) | Fail PR if > **~1.91 MiB** (2,005,000 B) |
 | `ogrenotes-frontend.js` glue (gzipped) | 100 KB | 12 KB | Tracked, no gate |
 | Total app shell (HTML + CSS + WASM + glue, gzipped) | 1 MB | ~1.20 MB | Tracked, no gate |
 
@@ -102,6 +102,18 @@ gate is what we have. Two independent disciplines come out of this:
   regex compiles, evaluate `wasm-snip` for unreachable panics,
   lazy-load the spreadsheet engine out of the document bundle)
   closes the gap between baseline and aspirational budget.
+
+> **2026-08-01 re-baseline (doc-noted bump).** The gate was raised
+> from ~1.76 MiB (1,850,000 B) to **~1.91 MiB (2,005,000 B)**. The
+> presentations P1 feature (PR #182 — deck editor: DeckView canvas,
+> geometry/snap engine, frame editing, themes/presets; 4,340 new
+> frontend lines, zero new dependencies) grew the gzipped bundle to
+> **1,891,640 B (~1.80 MiB)**. New ceiling is measured + ~6% headroom
+> per the original ratchet. Not an abandonment of the budget: the
+> optimization track (spreadsheet-split, and now a candidate
+> deck-split — the presentation module is similarly lazy-loadable)
+> still owes the recovery, and the gate steps back **down** as that
+> work lands.
 
 > **2026-06-03 re-baseline (doc-noted bump).** The gate was raised
 > from 2.0 MiB (2,097,152 B) to ~2.19 MiB (2,300,000 B). Over the ~2

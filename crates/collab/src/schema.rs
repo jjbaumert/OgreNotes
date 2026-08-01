@@ -83,6 +83,15 @@ pub enum NodeType {
     /// Mirrors the same-named variant in
     /// `frontend/src/editor/model.rs`.
     Mermaid,
+    /// design/presentations.md — one slide in a presentation deck.
+    /// Container of `Frame` children. Attrs: `layout` (preset id),
+    /// `background` (optional theme-relative override).
+    Slide,
+    /// design/presentations.md — a positioned frame on a slide.
+    /// Container of ordinary blocks. Attrs: `x`,`y`,`w`,`h`
+    /// (normalized 0..1), `z` (stacking), `role`
+    /// (`content` | `notes`).
+    Frame,
 }
 
 impl NodeType {
@@ -115,6 +124,8 @@ impl NodeType {
             NodeType::Mention => "mention",
             NodeType::DocMention => "doc_mention",
             NodeType::Mermaid => "mermaid",
+            NodeType::Slide => "slide",
+            NodeType::Frame => "frame",
         }
     }
 
@@ -147,6 +158,8 @@ impl NodeType {
             "mention" => Some(NodeType::Mention),
             "doc_mention" => Some(NodeType::DocMention),
             "mermaid" => Some(NodeType::Mermaid),
+            "slide" => Some(NodeType::Slide),
+            "frame" => Some(NodeType::Frame),
             _ => None,
         }
     }
@@ -177,6 +190,8 @@ impl NodeType {
                 | NodeType::KanbanColumn
                 | NodeType::KanbanCard
                 | NodeType::Mermaid
+                | NodeType::Slide
+                | NodeType::Frame
         )
     }
 
@@ -224,6 +239,7 @@ impl NodeType {
                 NodeType::Calendar,
                 NodeType::Kanban,
                 NodeType::Mermaid,
+                NodeType::Slide,
             ],
             NodeType::BulletList => &[NodeType::ListItem],
             NodeType::OrderedList => &[NodeType::ListItem],
@@ -269,6 +285,23 @@ impl NodeType {
             NodeType::Calendar => &[NodeType::CalendarEvent],
             NodeType::Kanban => &[NodeType::KanbanColumn],
             NodeType::KanbanColumn => &[NodeType::KanbanCard],
+            NodeType::Slide => &[NodeType::Frame],
+            NodeType::Frame => &[
+                NodeType::Paragraph,
+                NodeType::Heading,
+                NodeType::BulletList,
+                NodeType::OrderedList,
+                NodeType::TaskList,
+                NodeType::Blockquote,
+                NodeType::CodeBlock,
+                NodeType::HorizontalRule,
+                NodeType::Image,
+                NodeType::Table,
+                NodeType::Embed,
+                NodeType::Calendar,
+                NodeType::Kanban,
+                NodeType::Mermaid,
+            ],
             // Leaf/inline nodes and text containers have no element children
             NodeType::Paragraph
             | NodeType::Heading
@@ -377,6 +410,8 @@ mod tests {
             NodeType::Mention,
             NodeType::DocMention,
             NodeType::Mermaid,
+            NodeType::Slide,
+            NodeType::Frame,
         ];
 
         for nt in &types {
@@ -503,6 +538,8 @@ mod tests {
         NodeType::Mention,
         NodeType::DocMention,
         NodeType::Mermaid,
+        NodeType::Slide,
+        NodeType::Frame,
     ];
 
     /// The schema-validated mark types. Must match the marks registered in
@@ -536,7 +573,7 @@ mod tests {
         // If this fails, a node type was added to or removed from the collab
         // schema without updating the expected set. Update ALL_NODE_TYPES and
         // the corresponding frontend/src/editor/model.rs NodeType enum.
-        assert_eq!(ALL_NODE_TYPES.len(), 26, "expected 26 node types");
+        assert_eq!(ALL_NODE_TYPES.len(), 28, "expected 28 node types");
     }
 
     #[test]
@@ -599,6 +636,8 @@ mod tests {
             ("mention", NodeType::Mention),
             ("doc_mention", NodeType::DocMention),
             ("mermaid", NodeType::Mermaid),
+            ("slide", NodeType::Slide),
+            ("frame", NodeType::Frame),
         ];
         for (tag, nt) in expected {
             assert_eq!(nt.tag_name(), *tag, "tag mismatch for {nt:?}");
@@ -675,7 +714,7 @@ mod tests {
                 NodeType::OrderedList, NodeType::TaskList, NodeType::Blockquote,
                 NodeType::CodeBlock, NodeType::HorizontalRule, NodeType::Image,
                 NodeType::Table, NodeType::Embed, NodeType::Calendar,
-                NodeType::Kanban, NodeType::Mermaid,
+                NodeType::Kanban, NodeType::Mermaid, NodeType::Slide,
             ]
         );
         // List containers:
@@ -727,6 +766,28 @@ mod tests {
             &[NodeType::KanbanCard]
         );
         assert!(NodeType::KanbanCard.valid_children().is_empty());
+        // Presentation: slides contain frames; frames contain blocks.
+        assert_eq!(
+            NodeType::Slide.valid_children(),
+            &[NodeType::Frame]
+        );
+        let frame_children = &[
+            NodeType::Paragraph,
+            NodeType::Heading,
+            NodeType::BulletList,
+            NodeType::OrderedList,
+            NodeType::TaskList,
+            NodeType::Blockquote,
+            NodeType::CodeBlock,
+            NodeType::HorizontalRule,
+            NodeType::Image,
+            NodeType::Table,
+            NodeType::Embed,
+            NodeType::Calendar,
+            NodeType::Kanban,
+            NodeType::Mermaid,
+        ];
+        assert_eq!(NodeType::Frame.valid_children(), frame_children);
         // Text containers and leaves have no element children:
         assert!(NodeType::Paragraph.valid_children().is_empty());
         assert!(NodeType::Heading.valid_children().is_empty());

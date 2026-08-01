@@ -450,6 +450,28 @@ pub fn HomePage() -> impl IntoView {
         }
     };
 
+    let on_create_presentation = {
+        let navigate = navigate.clone();
+        move |_| {
+            let navigate = navigate.clone();
+            leptos::task::spawn_local(async move {
+                match documents::create_presentation("Untitled Presentation", None).await {
+                    Ok(doc) => {
+                        navigate(
+                            &format!("/d/{}/untitled-presentation", doc.id),
+                            Default::default(),
+                        );
+                    }
+                    Err(e) => {
+                        web_sys::console::error_1(
+                            &format!("Failed to create presentation: {e}").into(),
+                        );
+                    }
+                }
+            });
+        }
+    };
+
     let on_create_folder = {
         let refresh = refresh_folder.clone();
         move |_| {
@@ -777,6 +799,18 @@ pub fn HomePage() -> impl IntoView {
                         </button>
                         <button class="btn btn-primary" on:click=on_create_spreadsheet>
                             {crate::t!("home-new-spreadsheet")}
+                        </button>
+                        // Minor M6: was `{"+ "}{crate::t!("deck-new")}` — a
+                        // hardcoded "+ " concatenated onto the sidebar's
+                        // (unprefixed) "New Presentation" menu-entry string.
+                        // Every sibling new-* button here bakes its "+"
+                        // into its own dedicated `home-new-*` key instead,
+                        // so a translator can relocate/drop the prefix per
+                        // locale and RTL layout the same way they can for
+                        // document/spreadsheet/folder. This is visually
+                        // identical for en-US but structurally consistent.
+                        <button class="btn btn-primary" on:click=on_create_presentation>
+                            {crate::t!("home-new-presentation")}
                         </button>
                         <button class="btn btn-secondary" on:click=on_create_folder>
                             {crate::t!("home-new-folder")}

@@ -51,6 +51,11 @@
          always-loaded CSS, so document-only sessions don't fetch its
          ~35 KB. See components::spreadsheet_view::ensure_spreadsheet_css. -->
     <link data-trunk rel="copy-file" href="style/spreadsheet.css" />
+    <!-- Presentations P1 (Task 7): same on-demand-load rationale as
+         spreadsheet.css above — deck-only CSS, not fetched by
+         document-only sessions. Injected by the deck canvas view
+         (Task 9-12) the same way SpreadsheetView injects its CSS. -->
+    <link data-trunk rel="copy-file" href="style/presentation.css" />
     <link data-trunk rel="css" href="style/responsive.css" />
     <link data-trunk rel="css" href="style/fonts.css" />
     <!-- data-wasm-opt-params="--all-features" is REQUIRED for the

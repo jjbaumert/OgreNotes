@@ -87,7 +87,7 @@ env:
   # locales, ~55 KB gz) was declined to keep instant locale switching.
   # Gate stays at 1,850,000; future headroom is managed by this file's
   # rebaseline policy, not an optimization backlog.
-  WASM_GZ_LIMIT: "1850000"   # ~1.76 MiB
+  WASM_GZ_LIMIT: "2005000"   # ~1.91 MiB — 2026-08-01 doc-noted bump (presentations P1)
   # Soft regression budget — a no-op-change PR that adds > 5% to the
   # bundle (without crossing the hard limit) gets a warning so a
   # quiet drift can be caught before it eats the headroom.

@@ -401,6 +401,7 @@ document-restore-folder-title = Restore to folder
 home-new-document = + New Document
 home-new-from-template = + New from Template
 home-new-spreadsheet = + New Spreadsheet
+home-new-presentation = + New Presentation
 home-new-folder = + New Folder
 
 # ─── Folder management (#150) ───────────────────────────────────
@@ -1162,3 +1163,47 @@ doc-block-link-missing = The linked section no longer exists.
 # ─── Mentions spec §5 (Task 5) — per-viewer degradation overlay ──
 
 doc-mention-missing = Missing document
+
+# ─── Presentations P1 (deck foundation, Task 7) ──────────────────
+
+deck-layout-title-label = Title
+deck-layout-title-content-label = Title + Content
+deck-layout-two-column-label = Two Column
+deck-layout-blank-label = Blank
+deck-placeholder-title = Click to add title
+deck-placeholder-subtitle = Click to add subtitle
+deck-placeholder-heading = Click to add heading
+deck-placeholder-body = Click to add text
+deck-placeholder-column = Click to add text
+deck-theme-slate-label = Slate
+deck-theme-paper-label = Paper
+deck-theme-midnight-label = Midnight
+deck-theme-ember-label = Ember
+deck-theme-forest-label = Forest
+deck-theme-ocean-label = Ocean
+
+# ─── Presentations P1 (deck foundation, Task 8) ──────────────────
+# `deck-new` is the "New presentation" creation-menu/button label;
+# `deck-doc-type-label` is the display name for the presentation
+# doc type, reused everywhere a doc-type badge/label is rendered
+# (document details panel, file browser type column).
+
+deck-new = New Presentation
+deck-doc-type-label = Presentation
+
+# ─── Presentations P1 (deck foundation, Task 9) ──────────────────
+# DeckView: slide strip + canvas + theme picker chrome.
+
+deck-add-slide = Add Slide
+deck-duplicate-slide = Duplicate slide
+deck-delete-slide = Delete slide
+deck-theme-label = Theme
+deck-frame-comment = Comment on this frame
+
+# ─── Presentations P1 (canvas interactions, Task 10) ─────────────
+# Add-text-frame toolbar button and the collapsed speaker-notes
+# drawer below the canvas (role=notes frames never render on the
+# canvas itself).
+
+deck-add-text-frame = Add Text Frame
+deck-notes-drawer-label = Speaker notes

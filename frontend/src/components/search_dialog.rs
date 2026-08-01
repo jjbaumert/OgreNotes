@@ -46,9 +46,10 @@ fn sanitize_snippet(html: &str) -> String {
 
 fn doc_type_icon(doc_type: &str) -> &'static str {
     match doc_type {
-        "spreadsheet" => "\u{1F4CA}", // 📊
-        "chat" => "\u{1F4AC}",        // 💬
-        _ => "\u{1F4C4}",             // 📄
+        "spreadsheet" => "\u{1F4CA}",  // 📊
+        "presentation" => "\u{1F4FD}", // 📽️
+        "chat" => "\u{1F4AC}",         // 💬
+        _ => "\u{1F4C4}",              // 📄
     }
 }
 

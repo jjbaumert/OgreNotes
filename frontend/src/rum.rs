@@ -23,16 +23,47 @@
 //! plot the same session's vitals across the dashboard.
 //!
 //! Page classification: derived from the URL — `/` → home,
-//! `/d/...` → editor, everything else → other. Distinguishing
-//! editor vs spreadsheet from the URL alone is impossible; v2
-//! can grow an explicit `set_page_kind` API the spreadsheet page
-//! calls once it's mounted.
+//! `/d/...` → editor/spreadsheet/presentation, everything else →
+//! other. The URL alone can't distinguish which kind of document a
+//! `/d/...` path is (that's a doc-load response field, not a route
+//! segment), so `set_page_hint` (below) is the hook `DocumentPage`
+//! calls the moment `doc_type` resolves from the initial GET; until
+//! that fires (or if it never does, e.g. this session never opened a
+//! document) `/d/...` classifies as `"editor"`, the historical
+//! default.
+
+use std::cell::Cell;
 
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::api::client;
+
+thread_local! {
+    /// Page-kind hint set by `DocumentPage` once `doc_type` resolves
+    /// (Finding M1: `classify_page` used to map every `/d/...` path to
+    /// `"editor"` unconditionally, so deck sessions were miscounted as
+    /// editor sessions and the backend's `"presentation"` histogram
+    /// arm in `crates/api/src/routes/metrics.rs` was dead). `None`
+    /// until any document page has resolved its `doc_type` in this
+    /// session. Last-write-wins is correct for a single-page app with
+    /// one active document at a time.
+    static PAGE_HINT: Cell<Option<&'static str>> = const { Cell::new(None) };
+}
+
+/// Record which kind of document is open, for RUM page classification
+/// (Finding M1). Call once `doc_type` resolves — `DocumentPage` does
+/// this from its doc-load success handler, right where it also sets
+/// its own `doc_type` signal.
+pub fn set_page_hint(doc_type: &str) {
+    let hint = match doc_type {
+        "spreadsheet" => "spreadsheet",
+        "presentation" => "presentation",
+        _ => "editor",
+    };
+    PAGE_HINT.with(|h| h.set(Some(hint)));
+}
 
 /// Fraction of sessions to sample, in [0.0, 1.0]. Hardcoded for
 /// v1 — a runtime knob would mean either a server round-trip
@@ -151,9 +182,14 @@ fn snapshot_payload() -> RumPayload {
     RumPayload { page, vitals }
 }
 
-/// Map the current URL path to one of the four `page` dimensions
-/// the backend accepts. Anything ambiguous falls through to
-/// `"other"` — keeps the dimension cardinality bounded.
+/// Map the current URL path to one of the `page` dimensions the
+/// backend accepts (`crates/api/src/routes/metrics.rs::validate_page`:
+/// home / editor / spreadsheet / presentation / other). A `/d/...`
+/// path defers to `PAGE_HINT` (set by `DocumentPage` once `doc_type`
+/// resolves) to distinguish which kind of document is open; falls
+/// back to `"editor"` if the hint hasn't landed yet. Anything else
+/// ambiguous falls through to `"other"` — keeps the dimension
+/// cardinality bounded.
 fn classify_page() -> &'static str {
     let Some(window) = web_sys::window() else { return "other" };
     let Ok(path) = window.location().pathname() else {
@@ -162,7 +198,7 @@ fn classify_page() -> &'static str {
     if path == "/" || path.is_empty() {
         "home"
     } else if path.starts_with("/d/") {
-        "editor"
+        PAGE_HINT.with(|h| h.get()).unwrap_or("editor")
     } else {
         "other"
     }
@@ -226,4 +262,30 @@ fn navigation_timings(perf: &web_sys::Performance) -> Option<(f64, f64)> {
         .ok()
         .and_then(|v| v.as_f64())?;
     Some((dcl, load))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Finding M1 — `set_page_hint` must map every `doc_type` the
+    /// backend's document GET can return onto one of the three
+    /// `/d/...` dimensions `validate_page` accepts, defaulting
+    /// unrecognized/plain-document types to `"editor"` (the
+    /// historical, pre-hint behavior `classify_page` falls back to
+    /// before any hint has landed).
+    #[test]
+    fn set_page_hint_maps_known_doc_types() {
+        set_page_hint("presentation");
+        assert_eq!(PAGE_HINT.with(|h| h.get()), Some("presentation"));
+
+        set_page_hint("spreadsheet");
+        assert_eq!(PAGE_HINT.with(|h| h.get()), Some("spreadsheet"));
+
+        set_page_hint("document");
+        assert_eq!(PAGE_HINT.with(|h| h.get()), Some("editor"));
+
+        set_page_hint("something-unrecognized");
+        assert_eq!(PAGE_HINT.with(|h| h.get()), Some("editor"));
+    }
 }

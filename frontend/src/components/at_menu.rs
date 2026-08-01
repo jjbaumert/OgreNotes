@@ -783,6 +783,7 @@ async fn fetch_document_items(query: &str) -> Vec<AtMenuItem> {
             .map(|r| AtMenuItem {
                 icon: match r.doc_type.as_str() {
                     "spreadsheet" => "\u{1F4CA}".to_string(),
+                    "presentation" => "\u{1F4FD}".to_string(),
                     "chat" => "\u{1F4AC}".to_string(),
                     _ => "\u{1F4C4}".to_string(),
                 },

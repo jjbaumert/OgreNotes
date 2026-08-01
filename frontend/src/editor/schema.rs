@@ -289,6 +289,7 @@ pub fn default_schema() -> Schema {
                 NodeType::Calendar,
                 NodeType::Kanban,
                 NodeType::Mermaid,
+                NodeType::Slide,
             ],
             inline_content: false,
             block: false,
@@ -806,6 +807,63 @@ pub fn default_schema() -> Schema {
             defining: true,
             isolating: true,
             default_attrs: cell_attrs,
+            allowed_marks: Some(vec![]),
+        },
+    );
+
+    // design/presentations.md — Slide: container of Frame children.
+    // Isolating so a caret/join can't cross from one slide into the
+    // next (per commit `2180db3`, cross joins key on this flag) —
+    // mirrors Table/Kanban/Calendar's rationale, not schema-copied
+    // from any of them individually.
+    nodes.insert(
+        NodeType::Slide,
+        NodeSpec {
+            valid_children: vec![NodeType::Frame],
+            inline_content: false,
+            block: true,
+            leaf: false,
+            code: false,
+            atom: false,
+            defining: false,
+            isolating: true,
+            default_attrs: HashMap::new(),
+            allowed_marks: Some(vec![]),
+        },
+    );
+
+    // design/presentations.md — Frame: a positioned region on a
+    // Slide holding ordinary blocks. `valid_children` mirrors
+    // `crates/collab/src/schema.rs::NodeType::Frame::valid_children`
+    // exactly — the cross-schema duality test pins this list.
+    // Isolating for the same cross-frame-join reason as Slide.
+    nodes.insert(
+        NodeType::Frame,
+        NodeSpec {
+            valid_children: vec![
+                NodeType::Paragraph,
+                NodeType::Heading,
+                NodeType::BulletList,
+                NodeType::OrderedList,
+                NodeType::TaskList,
+                NodeType::Blockquote,
+                NodeType::CodeBlock,
+                NodeType::HorizontalRule,
+                NodeType::Image,
+                NodeType::Table,
+                NodeType::Embed,
+                NodeType::Calendar,
+                NodeType::Kanban,
+                NodeType::Mermaid,
+            ],
+            inline_content: false,
+            block: true,
+            leaf: false,
+            code: false,
+            atom: false,
+            defining: false,
+            isolating: true,
+            default_attrs: HashMap::new(),
             allowed_marks: Some(vec![]),
         },
     );

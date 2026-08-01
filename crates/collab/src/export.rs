@@ -160,6 +160,16 @@ impl Drop for DepthGuard {
     }
 }
 
+thread_local! {
+    /// Deck slide counter for the Markdown "## Slide N" headings.
+    /// `render_node_markdown` has no sibling-index parameter, so slide
+    /// numbering rides a thread-local incremented per `NodeType::Slide`
+    /// node visited. Every public export entry point resets this to 0
+    /// before traversing so a stale count from a prior export on the
+    /// same thread can never leak into the next one.
+    static SLIDE_NO: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn to_html(doc: &Doc) -> String {
     to_html_with_comments(doc, &[])
 }
@@ -169,6 +179,7 @@ pub fn to_html(doc: &Doc) -> String {
 /// omitted entirely when `comments` is empty, so existing output is
 /// unchanged.
 pub fn to_html_with_comments(doc: &Doc, comments: &[ExportComment]) -> String {
+    SLIDE_NO.with(|c| c.set(0));
     let txn = doc.transact();
     let mut html = String::new();
     if let Some(fragment) = txn.get_xml_fragment("content") {
@@ -186,6 +197,7 @@ pub fn to_markdown(doc: &Doc) -> String {
 /// Export a yrs document to Markdown with a trailing comments section
 /// (#59 T-6). Section omitted when `comments` is empty.
 pub fn to_markdown_with_comments(doc: &Doc, comments: &[ExportComment]) -> String {
+    SLIDE_NO.with(|c| c.set(0));
     let txn = doc.transact();
     let mut md = String::new();
     if let Some(fragment) = txn.get_xml_fragment("content") {
@@ -1009,11 +1021,22 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
 
             out.push_str(&format!("<{html_tag}{attrs}>"));
 
-            // Render children
-            let len = el.len(txn);
-            for i in 0..len {
-                if let Some(child) = el.get(txn, i) {
-                    render_node_html(txn, &child, out);
+            // Render children. A Slide's Frame children render in
+            // z-then-position order rather than tree order, so
+            // stacking/overlap in the degraded export matches what the
+            // live canvas draws regardless of insertion order.
+            if node_type == NodeType::Slide {
+                for i in slide_child_order(txn, el) {
+                    if let Some(child) = el.get(txn, i) {
+                        render_node_html(txn, &child, out);
+                    }
+                }
+            } else {
+                let len = el.len(txn);
+                for i in 0..len {
+                    if let Some(child) = el.get(txn, i) {
+                        render_node_html(txn, &child, out);
+                    }
                 }
             }
 
@@ -1237,6 +1260,19 @@ fn render_node_markdown<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String, de
                         out.push_str(&escape_md_link_text(&title));
                     }
                 }
+                NodeType::Slide => {
+                    let n = SLIDE_NO.with(|c| {
+                        c.set(c.get() + 1);
+                        c.get()
+                    });
+                    out.push_str(&format!("## Slide {n}\n\n"));
+                    for i in slide_child_order(txn, el) {
+                        if let Some(child) = el.get(txn, i) {
+                            render_node_markdown(txn, &child, out, depth);
+                        }
+                    }
+                    out.push('\n');
+                }
                 _ => {
                     render_children_markdown(txn, el, out, depth);
                 }
@@ -1365,7 +1401,40 @@ fn node_type_to_html_tag(nt: NodeType) -> &'static str {
         // special-case in `render_node_html`.
         NodeType::DocMention => "a",
         NodeType::Mermaid => "div",
+        NodeType::Slide | NodeType::Frame => crate::blocks::presentation::html_tag(nt),
     }
+}
+
+/// Indices of a Slide's element children sorted by (z, y, x); text
+/// children (invalid inside Slide) keep tree order at the end.
+/// Malformed numbers sort as 0.0 — export must never fail on bad attrs.
+fn slide_child_order<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef) -> Vec<u32> {
+    let mut keyed: Vec<(i64, f64, f64, u32)> = Vec::new();
+    for i in 0..el.len(txn) {
+        let (z, y, x) = match el.get(txn, i) {
+            Some(yrs::XmlOut::Element(child)) => {
+                let num = |k: &str| {
+                    child
+                        .get_attribute(txn, k)
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(0.0)
+                };
+                let z = child
+                    .get_attribute(txn, "z")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(0);
+                (z, num("y"), num("x"))
+            }
+            _ => (i64::MAX, 0.0, 0.0),
+        };
+        keyed.push((z, y, x, i));
+    }
+    keyed.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    keyed.into_iter().map(|(_, _, _, i)| i).collect()
 }
 
 /// Emit a highlighted code block. Returns false (emitting nothing)
@@ -1560,6 +1629,15 @@ fn render_html_attrs<T: ReadTxn>(
                 attrs.push_str(&format!(" href=\"{}\"", html_escape_attr(&url)));
             }
         }
+        NodeType::Slide | NodeType::Frame => {
+            let names: &[&str] = if node_type == NodeType::Slide {
+                crate::blocks::presentation::SLIDE_ATTR_NAMES
+            } else {
+                crate::blocks::presentation::FRAME_ATTR_NAMES
+            };
+            let collected = collect_named_attrs(txn, el, names);
+            attrs.push_str(&crate::blocks::presentation::html_attrs(node_type, &collected));
+        }
         _ => {}
     }
 
@@ -1580,7 +1658,7 @@ fn is_safe_url(url: &str) -> bool {
         || lower.starts_with("data:image/webp;")
 }
 
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -3143,5 +3221,94 @@ mod tests {
         assert!(!with.is_empty(), "pdf bytes produced");
         assert_eq!(&with[..5], b"%PDF-", "valid PDF header");
         assert_ne!(with, to_pdf(&doc), "comment lines must change the pdf");
+    }
+
+    // ── Presentation deck export (Task 4) ──────────────────────────
+
+    /// 2-slide deck. Slide 1 has two frames whose TREE order is the
+    /// opposite of their z order — the high-z frame is inserted first —
+    /// so a test asserting z-then-position ordering can't pass by
+    /// accident from tree order alone. Slide 1 also carries
+    /// `layout="blank"` for the exact `<section>` attr-string
+    /// assertion. Slide 2 is bare (numbering-only coverage).
+    fn fixture_deck() -> Doc {
+        doc_with(|txn, frag| {
+            let slide1 = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
+            slide1.insert_attribute(txn, "layout", "blank");
+
+            // Tree position 0, but z=1 — must render AFTER the z=0 frame.
+            let high = slide1.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+            high.insert_attribute(txn, "z", "1");
+            high.insert_attribute(txn, "y", "0.1");
+            let high_p = high.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &high_p, "high-z-text");
+
+            // Tree position 1, but z=0 — must render BEFORE the z=1 frame.
+            let low = slide1.insert(txn, 1, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+            low.insert_attribute(txn, "z", "0");
+            low.insert_attribute(txn, "y", "0.5");
+            let low_p = low.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &low_p, "low-z-text");
+
+            let slide2 = frag.insert(txn, 1, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
+            slide2.insert_attribute(txn, "layout", "blank");
+        })
+    }
+
+    /// One slide, one frame with an unparseable `x` attribute. Export
+    /// must degrade gracefully (malformed geometry sorts as 0.0), never
+    /// panic — the write-gate validator (`blocks::presentation`) is
+    /// what normally rejects this shape; export reads raw yrs attrs
+    /// directly and must be defensive independent of that gate.
+    fn fixture_deck_with_bad_geometry() -> Doc {
+        doc_with(|txn, frag| {
+            let slide = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
+            let frame = slide.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+            frame.insert_attribute(txn, "x", "garbage");
+            let p = frame.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &p, "bad-geometry-text");
+        })
+    }
+
+    #[test]
+    fn deck_html_export_slides_as_sections_frames_z_ordered() {
+        let doc = fixture_deck();
+        let html = to_html(&doc);
+        assert!(
+            html.contains(r#"<section data-layout="blank" class="deck-slide">"#),
+            "got: {html}"
+        );
+        // z=0 frame renders before z=1 frame despite tree order:
+        let low = html.find("low-z-text").unwrap();
+        let high = html.find("high-z-text").unwrap();
+        assert!(low < high, "got: {html}");
+    }
+
+    #[test]
+    fn deck_markdown_export_numbers_slides() {
+        let md = to_markdown(&fixture_deck());
+        assert!(md.contains("## Slide 1"), "got: {md}");
+        assert!(md.contains("## Slide 2"), "got: {md}");
+        let s1 = md.find("## Slide 1").unwrap();
+        let s2 = md.find("## Slide 2").unwrap();
+        assert!(s1 < s2, "got: {md}");
+    }
+
+    #[test]
+    fn deck_export_ignores_malformed_geometry() {
+        // Frame with x="garbage" must still render (sorted as 0.0), not panic.
+        let md = to_markdown(&fixture_deck_with_bad_geometry());
+        assert!(md.contains("bad-geometry-text"), "got: {md}");
+    }
+
+    #[test]
+    fn deck_slide_counter_resets_across_exports() {
+        // Regression guard for the thread-local SLIDE_NO counter: a
+        // second export on the same thread must start back at "Slide 1"
+        // rather than continuing from wherever a prior export left off.
+        let _ = to_markdown(&fixture_deck());
+        let md = to_markdown(&fixture_deck());
+        assert!(md.contains("## Slide 1"), "got: {md}");
+        assert!(!md.contains("## Slide 3"), "got: {md}");
     }
 }

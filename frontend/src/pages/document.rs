@@ -21,6 +21,7 @@ use crate::components::find_replace_bar::FindReplaceBar;
 use crate::components::folder_picker::FolderPickerDialog;
 use crate::components::selection_toolbar::{SelectionToolbar, SelectionCommand};
 use crate::components::cursor_overlay::CursorOverlay;
+use crate::components::deck_view::DeckView;
 use crate::components::document_details::DocumentDetailsDialog;
 use crate::components::editor_gutter::EditorGutterOverlay;
 use crate::components::history_viewer::HistoryViewer;
@@ -465,6 +466,14 @@ pub fn DocumentPage() -> impl IntoView {
     // cell, and opens its popup.
     let (focus_cell, set_focus_cell) =
         signal::<Option<crate::components::spreadsheet_view::CellFocus>>(None);
+    // Frame-anchored comment threads for DeckView (Task 12). Frames carry
+    // ordinary blockIds, so their threads are already `inline_threads` rows
+    // (the same fetch that populates `inline_threads`/`cell_threads` above)
+    // — no separate fetch. Populated by an Effect below, filtered down to
+    // block_ids that actually belong to a frame in the current deck via
+    // `deck_view::threads_for_slide`, so a coincidental block_id collision
+    // elsewhere in the doc can never light up a frame's comment badge.
+    let (frame_threads, set_frame_threads) = signal::<Vec<String>>(Vec::new());
     let (comment_count, set_comment_count) = signal(0usize);
     // Bumped each time a peer's REST write changes a comment thread on this
     // doc (see CollabClient::set_on_comment_event below). The thread-load
@@ -612,6 +621,11 @@ pub fn DocumentPage() -> impl IntoView {
                 Ok(doc) => {
                     set_title.set(doc.title);
                     set_folder_id.set(doc.folder_id);
+                    // Finding M1: tell the RUM sampler which kind of
+                    // document just resolved, so a `/d/...` beacon
+                    // classifies as editor/spreadsheet/presentation
+                    // instead of always "editor".
+                    crate::rum::set_page_hint(&doc.doc_type);
                     set_doc_type.set(doc.doc_type);
                     set_is_trashed.set(doc.is_deleted);
                     set_can_request_access.set(doc.can_request_access);
@@ -702,6 +716,42 @@ pub fn DocumentPage() -> impl IntoView {
             });
         });
     }
+
+    // Frame-anchored comment badges for DeckView (Task 12). Derived from
+    // `inline_threads` (no separate fetch — frames carry ordinary blockIds,
+    // so their threads are already inline rows) filtered down to block_ids
+    // that belong to a frame of *some* slide in the current deck, via
+    // `deck_view::threads_for_slide` looped over every slide. A separate
+    // Effect from the fetch above (which does network I/O and must not
+    // re-run on every `editor_state` change): this one is pure in-memory
+    // recomputation, so it can safely track `editor_state` too and stay
+    // live as slides/frames are added, removed, or duplicated.
+    Effect::new(move |_| {
+        let threads = inline_threads.get();
+        if doc_type.get() != "presentation" {
+            set_frame_threads.set(Vec::new());
+            return;
+        }
+        let Some(state) = editor_state.get() else {
+            set_frame_threads.set(Vec::new());
+            return;
+        };
+        let deck = crate::presentation::model::deck_from_doc(&state.doc);
+        let pairs: Vec<(String, String)> =
+            threads.iter().map(|t| (t.block_id.clone(), t.thread_id.clone())).collect();
+        let mut relevant_tids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for slide_idx in 0..deck.slides.len() {
+            relevant_tids.extend(crate::components::deck_view::threads_for_slide(
+                &deck, slide_idx, &pairs,
+            ));
+        }
+        let ids: Vec<String> = threads
+            .iter()
+            .filter(|t| relevant_tids.contains(&t.thread_id))
+            .map(|t| t.block_id.clone())
+            .collect();
+        set_frame_threads.set(ids);
+    });
 
     // Deep-link: open (and center) the comment named by `?comment=<tid>`
     // once the document's threads have loaded. A cell comment is handed to
@@ -1204,18 +1254,21 @@ pub fn DocumentPage() -> impl IntoView {
         ));
     });
 
-    // Forward remote updates to editor_state for spreadsheet mode.
-    // EditorComponent handles remote_state internally; SpreadsheetView reads editor_state,
-    // so we bridge the two signals here.
+    // Forward remote updates to editor_state for spreadsheet/presentation
+    // mode. EditorComponent handles remote_state internally; SpreadsheetView
+    // and DeckView both read editor_state, so we bridge the two signals here.
     let remote_flag_for_spreadsheet = std::rc::Rc::clone(&remote_update_flag);
     Effect::new(move |_| {
-        if doc_type.get() != "spreadsheet" { return; }
+        if !matches!(doc_type.get().as_str(), "spreadsheet" | "presentation") { return; }
         let Some(state) = remote_state.get() else { return; };
         // Don't let the post-handshake remote callback for a still-empty
         // server ydoc (decoded as a bare-Paragraph fallback) clobber the
         // locally-initialized table — see remote_doc_degrades_spreadsheet.
+        // Presentation docs have no analogous "degrades" risk (an empty
+        // deck bootstraps its own blank slide via DeckView's resync
+        // Effect), so this guard only fires for spreadsheet.
         let current = editor_state.get_untracked();
-        if remote_doc_degrades_spreadsheet(
+        if doc_type.get_untracked() == "spreadsheet" && remote_doc_degrades_spreadsheet(
             current.as_ref().map(|s| &s.doc),
             &state.doc,
         ) {
@@ -1225,14 +1278,14 @@ pub fn DocumentPage() -> impl IntoView {
         set_editor_state.set(Some(state));
     });
 
-    // Initialize the spreadsheet EditorState once content has loaded.
-    // Must run as an Effect, not inside the view closure: writing a signal
-    // during a reactive render stalls the closure before it returns the view,
-    // leaving the page on "Loading document..." forever.
+    // Initialize the spreadsheet/presentation EditorState once content has
+    // loaded. Must run as an Effect, not inside the view closure: writing a
+    // signal during a reactive render stalls the closure before it returns
+    // the view, leaving the page on "Loading document..." forever.
     let spreadsheet_initialized: std::rc::Rc<std::cell::RefCell<String>> =
         std::rc::Rc::new(std::cell::RefCell::new(String::new()));
     Effect::new(move |_| {
-        if !content_loaded.get() || doc_type.get() != "spreadsheet" {
+        if !content_loaded.get() || !matches!(doc_type.get().as_str(), "spreadsheet" | "presentation") {
             return;
         }
         let id = current_id.get_untracked();
@@ -1244,8 +1297,19 @@ pub fn DocumentPage() -> impl IntoView {
         }
         *spreadsheet_initialized.borrow_mut() = id;
 
+        // Presentations skip the has_table/create_default_spreadsheet_doc
+        // branch below entirely — DeckView's own doc→model resync Effect
+        // detects a slide-less doc and backfills + persists one blank
+        // slide, so this Effect only needs to hand it *some* decoded Doc
+        // (or the bare-paragraph empty_doc fallback) to read from.
+        let is_presentation = doc_type.get_untracked() == "presentation";
         let content = initial_content.get_untracked();
-        let doc = if let Some(ref bytes) = content {
+        let doc = if is_presentation {
+            content
+                .as_ref()
+                .and_then(|bytes| crate::editor::yrs_bridge::ydoc_bytes_to_doc(bytes).ok())
+                .unwrap_or_else(crate::editor::model::Node::empty_doc)
+        } else if let Some(ref bytes) = content {
             let decoded = crate::editor::yrs_bridge::ydoc_bytes_to_doc(bytes)
                 .unwrap_or_else(|_| crate::editor::model::Node::empty_doc());
             if has_table(&decoded) {
@@ -1587,9 +1651,12 @@ pub fn DocumentPage() -> impl IntoView {
         set_editor_state.set(Some(state.clone()));
 
         // For documents, derive the title from the first block's text content.
-        // Spreadsheets keep their explicit title (editable in the header).
+        // Spreadsheets and presentations keep their explicit title (editable
+        // in the header) — a presentation's first doc child is a Slide, not
+        // prose, so deriving a title from its text_content() would be
+        // meaningless even if the gate let it through.
         let Some(current_dt) = doc_type.try_get_untracked() else { return };
-        if current_dt != "spreadsheet" {
+        if !matches!(current_dt.as_str(), "spreadsheet" | "presentation") {
             let first_text = state.doc.child(0).map(|n| n.text_content()).unwrap_or_default();
             // Short-circuit if the first block's text hasn't changed.
             // This covers all selection-only dispatches and any edit
@@ -2115,6 +2182,53 @@ pub fn DocumentPage() -> impl IntoView {
         set_popup_thread_id.set(None);
     });
 
+    // Open the comment popup for a slide-deck frame (Task 12) — the
+    // frame-anchored analogue of `request_comment` above, minus the
+    // selection-offset logic (a frame has no text selection to anchor a
+    // range to; frame comments are always block-level). Never gated on
+    // `can_edit`/readonly — comment permission is independent of edit
+    // permission, same as every other comment entry point in this file.
+    // `DeckView`'s comment button fires this with just the frame's
+    // block_id, so this callback is what decides, by checking
+    // `inline_threads` (frames are ordinary blockIds — their threads are
+    // already inline rows there), whether to reopen an existing thread
+    // (mirrors `CommentHighlights`'s click-to-reopen) or start a new one
+    // (mirrors `AddCommentBubble`'s always-new block-level comment).
+    let request_frame_comment = Callback::new(move |bid: String| {
+        let existing = inline_threads
+            .get_untracked()
+            .iter()
+            .find(|t| t.block_id == bid)
+            .map(|t| t.thread_id.clone());
+
+        // Position from the frame's own DOM element — the same
+        // element_viewport_rect + place_left_margin pattern used for
+        // every other block-anchored popup open (AddCommentBubble,
+        // on_thread_click, the comment deep-link) — frames carry a
+        // stable `data-deck-frame-block-id` DOM hook for exactly this.
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            if let Ok(Some(el)) =
+                doc.query_selector(&crate::components::deck_view::frame_selector(&bid))
+            {
+                let rect = crate::components::dom_position::element_viewport_rect(&el);
+                let (pl, pt) = crate::components::dom_position::place_left_margin(&rect, 420.0, 12.0);
+                set_popup_left.set(pl);
+                set_popup_top.set(pt);
+            }
+        }
+
+        set_popup_block_id.set(Some(bid));
+        set_popup_anchor_start.set(None);
+        set_popup_anchor_end.set(None);
+        if let Some(tid) = existing {
+            set_popup_thread_id.set(Some(tid));
+            set_popup_is_new.set(false);
+        } else {
+            set_popup_is_new.set(true);
+            set_popup_thread_id.set(None);
+        }
+    });
+
     // Shared gutter-detection logic used by both mouse hover (desktop) and
     // touchstart (mobile). Returns true and shows the block menu when
     // (x, target) falls within the left gutter (<40px) of a block-level
@@ -2488,14 +2602,14 @@ pub fn DocumentPage() -> impl IntoView {
             DocAction::MoveToFolder => {
                 set_move_picker_visible.set(true);
             }
-            // #146: rename. A spreadsheet carries an explicit title, so we
-            // prompt and set it (the debounced title-save Effect persists it).
-            // A document's title IS its first line (derived in
+            // #146: rename. A spreadsheet or presentation carries an explicit
+            // title, so we prompt and set it (the debounced title-save Effect
+            // persists it). A document's title IS its first line (derived in
             // `on_state_change`), so a prompt-set would just be overwritten on
             // the next keystroke — instead we focus the editor and select that
             // first line for the user to retype.
             DocAction::RenameDocument => {
-                if doc_type.get_untracked() == "spreadsheet" {
+                if matches!(doc_type.get_untracked().as_str(), "spreadsheet" | "presentation") {
                     if let Some(window) = web_sys::window() {
                         let current = title.get_untracked();
                         if let Ok(Some(entered)) = window.prompt_with_message_and_default(
@@ -2812,7 +2926,7 @@ pub fn DocumentPage() -> impl IntoView {
                         on:click=move |_| set_mobile_sidebar_open.update(|v| *v = !*v)
                     >"\u{2630}"</button>
                     {move || {
-                        if doc_type.get() == "spreadsheet" {
+                        if matches!(doc_type.get().as_str(), "spreadsheet" | "presentation") {
                             view! {
                                 <input
                                     type="text"
@@ -3131,6 +3245,29 @@ pub fn DocumentPage() -> impl IntoView {
                 >
                 {move || {
                     if content_loaded.get() {
+                        if doc_type.get() == "presentation" {
+                            // EditorState is initialized by the Effect above (shared
+                            // with the spreadsheet init path); DeckView renders its
+                            // slide strip/canvas from editor_state and bootstraps a
+                            // blank first slide itself if the doc arrives empty.
+                            return view! {
+                                <DeckView
+                                    editor_state=editor_state
+                                    on_state_change=on_state_change.clone()
+                                    on_change=on_change_ss.clone()
+                                    doc_id=doc_id()
+                                    readonly=!can_edit.get()
+                                    on_request_frame_comment=request_frame_comment
+                                    frame_threads=frame_threads
+                                    // Task 11 review, Finding 3 — the same shared
+                                    // toolbar-command channel `<Toolbar>` (mounted
+                                    // unconditionally above, for every doc_type)
+                                    // and `SpreadsheetView` already use.
+                                    toolbar_command=toolbar_command
+                                    set_toolbar_command=set_toolbar_command
+                                />
+                            }.into_any();
+                        }
                         if doc_type.get() == "spreadsheet" {
                             // EditorState is initialized by the Effect above;
                             // SpreadsheetView renders its grid from editor_state.
@@ -3424,7 +3561,7 @@ pub fn DocumentPage() -> impl IntoView {
                 on_confirm=Callback::new(move |(new_name, folder): (String, String)| {
                     set_duplicate_dialog_visible.set(false);
                     let old_id = current_id.get_untracked();
-                    let is_spreadsheet = doc_type.get_untracked() == "spreadsheet";
+                    let source_doc_type = doc_type.get_untracked();
                     // Snapshot the *current in-memory* content. get_content(old_id)
                     // races the source's async WS persistence and could return
                     // content without the just-typed edits (duplicateCopiedContent
@@ -3433,10 +3570,14 @@ pub fn DocumentPage() -> impl IntoView {
                         .get_untracked()
                         .map(|s| crate::editor::yrs_bridge::doc_to_ydoc_bytes(&s.doc));
                     leptos::task::spawn_local(async move {
-                        let created = if is_spreadsheet {
-                            documents::create_spreadsheet(&new_name, Some(&folder)).await
-                        } else {
-                            documents::create_document(&new_name, Some(&folder)).await
+                        let created = match source_doc_type.as_str() {
+                            "spreadsheet" => {
+                                documents::create_spreadsheet(&new_name, Some(&folder)).await
+                            }
+                            "presentation" => {
+                                documents::create_presentation(&new_name, Some(&folder)).await
+                            }
+                            _ => documents::create_document(&new_name, Some(&folder)).await,
                         };
                         match created {
                             Ok(doc) => {
