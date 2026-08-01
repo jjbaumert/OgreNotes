@@ -176,6 +176,12 @@ pub fn QuipImportWizard(
     /// the header's close button).
     on_close: Callback<()>,
 ) -> impl IntoView {
+    // #174: the channel "Open folder" uses to land the user in the import's
+    // destination folder. Read here, at setup, because `use_context` must not
+    // run from a DOM callback. `None` only when the wizard is mounted outside
+    // the shell (no such mount today), which degrades to Home.
+    let shell = use_context::<crate::components::app_shell::ShellCtx>();
+
     let (token, set_token) = signal(String::new());
     let (connecting, set_connecting) = signal(false);
     let (error, set_error) = signal::<Option<String>>(None);
@@ -648,14 +654,19 @@ pub fn QuipImportWizard(
                                                     // Keyed off `phase`, not `status`: the
                                                     // terminal `"succeeded"` write lands just
                                                     // after the phase bump, so `status` may
-                                                    // still read `"running"`. The destination is
-                                                    // always the caller's Home folder (see the
-                                                    // module doc comment / `quip-import-target-
-                                                    // home` above) — Phase 1 deliberately skips
-                                                    // a destination picker, so "open folder"
-                                                    // always means Home.
+                                                    // still read `"running"`. "Open folder"
+                                                    // opens the folder the documents actually
+                                                    // landed in — since #172 that is a dedicated
+                                                    // `Quip Import — <date>` folder under the
+                                                    // caller's Home, which the status poll names
+                                                    // (#174). A poll that names no destination
+                                                    // (an older server, or an import that never
+                                                    // started) falls back to Home, which is where
+                                                    // this button always used to go.
                                                     Some(st) if st.phase >= 2 => {
                                                         let total = st.progress.total;
+                                                        let destination =
+                                                            open_folder_destination(&st);
                                                         // The report is what turns "Imported N
                                                         // items" (N = every thread *discovered*,
                                                         // skipped ones included) into an honest
@@ -686,8 +697,18 @@ pub fn QuipImportWizard(
                                                                 <button
                                                                     class="btn btn-primary"
                                                                     on:click=move |_| {
+                                                                        // Close first, and DEFERRED —
+                                                                        // a synchronous close-then-
+                                                                        // navigate is this codebase's
+                                                                        // modal-close panic ("closure
+                                                                        // invoked recursively or after
+                                                                        // being dropped"). Ordering
+                                                                        // preserved from before #174.
                                                                         a11y::defer_close(on_close);
-                                                                        crate::commands::nav_bridge::go("/");
+                                                                        open_import_folder(
+                                                                            shell,
+                                                                            destination.clone(),
+                                                                        );
                                                                     }
                                                                 >{crate::t!("quip-import-open-folder")}</button>
                                                             </div>
@@ -828,6 +849,50 @@ fn section_view(s: Section, kind: OutcomeKind) -> impl IntoView {
                 })}
             </ul>
         </details>
+    }
+}
+
+/// Which folder "Open folder" should open for this poll: the destination the
+/// server named, or `None` meaning "we were not told — use Home".
+///
+/// `None` is the honest answer in three cases and they all read the same to
+/// the user: a server older than #174 (the field decodes to `None`), an
+/// import that never started (no destination was ever chosen), and a server
+/// that sent an empty id. Guessing a folder id from anything else — the
+/// import id, the picked parent the wizard sent to `start` — would navigate
+/// somewhere wrong, which is worse than the Home fallback this button had
+/// before.
+fn open_folder_destination(status: &imports::StatusResponse) -> Option<String> {
+    status
+        .destination_folder_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// Take the user to `folder_id`, or to Home when there is none.
+///
+/// The folder view has no route of its own (folders are in-memory state on
+/// the home page), so this goes through the shell's `open_folder` /
+/// `pending_folder` channel: run the home page's registered opener when that
+/// page is the active outlet, else hand the id over and navigate to `/` so
+/// the mounting page opens it. Home — a plain navigate to `/` — is the
+/// fallback for every case where we have no folder to open, which is exactly
+/// what this button did before #174.
+fn open_import_folder(
+    shell: Option<crate::components::app_shell::ShellCtx>,
+    folder_id: Option<String>,
+) {
+    match (shell, folder_id) {
+        (Some(ctx), Some(folder_id)) => match ctx.open_folder.get_untracked() {
+            Some(open) => open.run(folder_id),
+            None => {
+                ctx.pending_folder.set(Some(folder_id));
+                crate::commands::nav_bridge::go("/");
+            }
+        },
+        _ => crate::commands::nav_bridge::go("/"),
     }
 }
 
@@ -980,6 +1045,69 @@ mod tests {
         assert_eq!(c.chat_skipped, 12);
         assert!(c.skipped.is_none(), "chats are not access-denied skips");
         assert!(!c.is_clean(), "12 unimported chat threads is worth saying");
+    }
+
+    // ─── #174: where "Open folder" goes ────────────────────────
+
+    /// A finished-import status as the server sends it. Built from wire JSON
+    /// rather than a struct literal on purpose: the field *name*, and the
+    /// behaviour when it is missing entirely, are the contract this button
+    /// rests on — a struct literal would test neither.
+    fn finished_status(destination: Option<serde_json::Value>) -> imports::StatusResponse {
+        let mut body = serde_json::json!({
+            "status": "succeeded",
+            "phase": 2,
+            "progress": { "done": 3, "total": 3, "stage": "content" },
+            "report": null,
+        });
+        if let Some(d) = destination {
+            body["destinationFolderId"] = d;
+        }
+        serde_json::from_value(body).expect("a status response must decode")
+    }
+
+    /// **The deliverable.** "Open folder" must open the folder the documents
+    /// landed in — since #172 a dedicated per-import folder — not Home, where
+    /// the user then has to hunt for it.
+    #[test]
+    fn open_folder_targets_the_folder_the_documents_landed_in() {
+        let status = finished_status(Some(serde_json::json!("folder-quip-import-1")));
+        assert_eq!(
+            open_folder_destination(&status).as_deref(),
+            Some("folder-quip-import-1"),
+        );
+    }
+
+    /// A server that predates #174 sends no such field at all. That must
+    /// decode — a hard error here would break the whole progress poll mid
+    /// rolling deploy — and read as "no destination", i.e. Home.
+    #[test]
+    fn a_status_from_a_server_without_the_field_decodes_and_means_home() {
+        let status = finished_status(None);
+        assert_eq!(status.phase, 2, "the rest of the poll must still decode");
+        assert_eq!(open_folder_destination(&status), None);
+    }
+
+    /// An import that was never started has an explicit `null` destination.
+    /// Same handling as a missing field: Home, never a guess.
+    #[test]
+    fn an_explicitly_null_destination_means_home() {
+        let status = finished_status(Some(serde_json::Value::Null));
+        assert_eq!(open_folder_destination(&status), None);
+    }
+
+    /// A blank id is not a folder. Navigating on one would produce a lookup
+    /// for the empty id — an error banner instead of a destination.
+    #[test]
+    fn a_blank_destination_is_not_a_folder() {
+        for blank in ["", "   "] {
+            let status = finished_status(Some(serde_json::json!(blank)));
+            assert_eq!(
+                open_folder_destination(&status),
+                None,
+                "a blank destination ({blank:?}) must fall back to Home",
+            );
+        }
     }
 
     /// Every string this component renders must exist in the catalog with

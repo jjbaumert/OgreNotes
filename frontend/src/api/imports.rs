@@ -79,6 +79,18 @@ pub struct StatusResponse {
     pub status: String,
     pub phase: u8,
     pub progress: Progress,
+    /// The folder this import's documents land in — where "Open folder"
+    /// takes the user (#174) — or `None` when the server named no
+    /// destination.
+    ///
+    /// `None` has two causes and one handling: an import that was never
+    /// started (no destination chosen), or a server older than #174 that
+    /// does not send the field at all. `#[serde(default)]` is what makes
+    /// the second case decode rather than error mid-rolling-deploy, and the
+    /// wizard falls back to Home either way — a missing destination must
+    /// never be guessed at.
+    #[serde(default)]
+    pub destination_folder_id: Option<String>,
     /// The run's outcome report, or `None` when the server has no `REPORT`
     /// row for this import.
     ///

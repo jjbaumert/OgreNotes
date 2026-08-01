@@ -68,6 +68,26 @@ pub struct ShellCtx {
     /// Home nav runs it when set — avoiding a route change on the page that
     /// owns the state — and otherwise client-side-navigates to `/`.
     pub home_reset: RwSignal<Option<Callback<()>>>,
+    /// #174: "show me this folder in the file browser", by folder id.
+    ///
+    /// The folder view has no route of its own — folders are in-memory state
+    /// on the home page (`on_navigate_folder` + the breadcrumb trail), so a
+    /// shell-owned surface (the Quip import wizard's "Open folder") cannot
+    /// reach one with a URL. Registered by the home page while it is the
+    /// active outlet, exactly like [`Self::home_reset`], and cleared on its
+    /// unmount; a caller that finds it `None` uses [`Self::pending_folder`]
+    /// instead.
+    pub open_folder: RwSignal<Option<Callback<String>>>,
+    /// #174: the folder id the home page should open on its NEXT mount,
+    /// consumed exactly once.
+    ///
+    /// The hand-off for the case [`Self::open_folder`] cannot cover: the home
+    /// page is not mounted (the wizard opens from any page, so "Open folder"
+    /// can fire from a document), or it is mounted under `/trash` and needs a
+    /// real route change first. The caller sets this and then navigates to
+    /// `/`; the mounting page takes the value and opens that folder instead
+    /// of Home.
+    pub pending_folder: RwSignal<Option<String>>,
 }
 
 impl ShellCtx {
@@ -88,6 +108,8 @@ impl ShellCtx {
             show_line_numbers: RwSignal::new(load_bool_pref(PREF_LINE_NUMBERS)),
             show_page_breaks: RwSignal::new(load_bool_pref(PREF_PAGE_BREAKS)),
             home_reset: RwSignal::new(None),
+            open_folder: RwSignal::new(None),
+            pending_folder: RwSignal::new(None),
         }
     }
 }
