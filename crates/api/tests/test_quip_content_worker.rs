@@ -1611,6 +1611,103 @@ async fn person_lookups_are_cached_across_threads_and_batched_within_one() {
     );
 }
 
+/// End-to-end: a `<control>`-wrapped chip Quip does not know as a person is
+/// a **document link**, and the pending-link row Phase 2b back-patches from
+/// is written for it.
+///
+/// This is the corpus's majority case. `<control>` wraps folder and thread
+/// chips as well as people — in the 56 staged documents there are four
+/// wrapped `quip.com` anchors, only one of which is a person, and **zero**
+/// bare ones. Classifying all of them as people would degrade the other
+/// three to plain `@Title` text and destroy their back-patch, which is the
+/// mirror of the bug this feature fixes. Quip's own "no such user" answer is
+/// what separates them, and it costs no extra request.
+///
+/// Both chips below are verbatim from `SSfAAALs7fy`, wrapper included.
+///
+/// Mutation check: map the no-profile case to `PersonFact::NoAccount` and
+/// this goes red — the doc-mention count drops to zero, no unresolved row is
+/// written, and the export reads `@Family`.
+#[tokio::test]
+async fn a_control_wrapped_non_person_stays_a_back_patchable_document_link() {
+    common::require_infra!();
+    const BODY: &str = concat!(
+        r#"<p id="sec-m">Assign tasks by mentioning someone: "#,
+        r#"<control data-remapped="true" id="SSfACAGTvYT">"#,
+        r#"<a href="https://quip.com/XYJAEA0Sgev">Joel</a></control>.</p>"#,
+        r#"<p>When you're done, check out your folder: "#,
+        r#"<control data-remapped="true" id="SSfACA1I4lV">"#,
+        r#"<a href="https://quip.com/JAdAOAxYGcQ">Family</a></control></p>"#,
+    );
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/1/folders/"))
+        .and(query_param("ids", "mroot"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "mroot": {
+                "folder": {"id": "mroot", "title": "Root"},
+                "children": [ {"thread_id": "tm"} ]
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/1/threads/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tm": {"thread": {"id": "tm", "title": "Mentions", "type": "document", "updated_usec": 9}}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2/threads/tm/html"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(BODY)))
+        .mount(&server)
+        .await;
+    // Quip answers for the person and says nothing about the folder id —
+    // exactly how the real API reports "that is not a user".
+    Mock::given(method("GET"))
+        .and(path("/1/users/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            QUIP_PERSON_ID: {"name": "Joel", "emails": [QUIP_PERSON_EMAIL]}
+        })))
+        .mount(&server)
+        .await;
+
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let (matched_user_id, _) = app.create_user(QUIP_PERSON_EMAIL).await;
+    let import_id = seed_mention_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let doc_id = doc_id_for(&app, &import_id, "tm").await.expect("tm imported");
+    let html = imported_html(&app, &doc_id).await;
+
+    // THE ASSERTION: the folder chip is a document link, not degraded text.
+    assert_eq!(html.matches("doc-mention").count(), 1, "the folder chip is a doc link: {html}");
+    assert!(html.contains("Family"), "{html}");
+    assert!(!html.contains("@Family"), "it must not degrade to plain text: {html}");
+
+    // And Phase 2b has something to back-patch.
+    let unresolved = app.state.import_repo.list_unresolved(&import_id).await.unwrap();
+    let links: Vec<String> = unresolved
+        .iter()
+        .flat_map(|u| u.links.iter().map(|l| l.target_quip_thread_id.clone()))
+        .collect();
+    assert_eq!(
+        links,
+        vec!["JAdAOAxYGcQ".to_string()],
+        "the wrapped folder link must be recorded for the back-patch",
+    );
+
+    // The real person in the same document is still a real mention — the two
+    // outcomes are distinct, on markup that is byte-identical in shape.
+    assert!(
+        html.contains(&format!("data-user-id=\"{matched_user_id}\"")),
+        "the person is still resolved: {html}",
+    );
+    assert!(!html.contains(QUIP_PERSON_ID), "no Quip person id survives: {html}");
+}
+
 /// A **transient** person-lookup failure must not be checkpointed.
 ///
 /// Step 10 marks a thread `ContentDone` unconditionally and a re-run skips a

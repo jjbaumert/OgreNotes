@@ -1377,9 +1377,9 @@ const USER_LOOKUP_BATCH: usize = 50;
 /// all that any caller can observe, is an OgreNotes user id.
 #[derive(Default)]
 pub struct PersonDirectory {
-    /// `Some(user_id)` = matched. `None` = looked up, decided, no match.
-    /// Absent = not yet known (or a lookup failed, so it stays retryable).
-    known: std::collections::HashMap<String, Option<String>>,
+    /// Decided answers only. Absent = not yet known, or a lookup failed and
+    /// so stays retryable.
+    known: std::collections::HashMap<String, PersonFact>,
     /// Set once `/1/users/` has answered with a **permanent** 4xx — a wrong
     /// endpoint shape, not an outage. Re-asking cannot change that answer, so
     /// the whole run stops asking: without this the doomed request is
@@ -1396,9 +1396,39 @@ pub struct PersonDirectory {
 /// silently (correct — no retry widens that), while a person we *failed* to
 /// decide must not be checkpointed, or the thread is permanently and
 /// invisibly degraded by a blip. See [`import_one_thread`] step 6b.
+/// One decided answer about a Quip person id.
+///
+/// The `NotAPerson` case exists because `<control>` is not exclusive to
+/// people: the staged corpus wraps folder and thread chips in it too (see
+/// `import_quip::walk_control`). Quip answering "no such user" for an id is
+/// the signal that separates them, and routing it to a `DocMention` is what
+/// keeps a wrapped document link back-patchable instead of degrading it to
+/// plain text — which would be a regression against the pre-feature
+/// behavior, where the wrapper was simply stripped.
+#[derive(Clone)]
+enum PersonFact {
+    /// Matched to this OgreNotes user.
+    User(String),
+    /// Quip returned a profile, so this is a person; no OgreNotes account
+    /// carries its address (or the profile exposed no address at all).
+    NoAccount,
+    /// Quip returned no profile for the id.
+    NotAPerson,
+}
+
+impl From<&PersonFact> for ogrenotes_collab::import_quip::PersonOutcome {
+    fn from(fact: &PersonFact) -> Self {
+        match fact {
+            PersonFact::User(id) => Self::User(id.clone()),
+            PersonFact::NoAccount => Self::NoAccount,
+            PersonFact::NotAPerson => Self::NotAPerson,
+        }
+    }
+}
+
 struct PersonResolution {
-    /// Quip person id → OgreNotes user id, for the matches only.
-    matched: std::collections::HashMap<String, String>,
+    /// Every id the caller asked about that reached a decision.
+    decided: std::collections::HashMap<String, ogrenotes_collab::import_quip::PersonOutcome>,
     /// How many of the requested ids reached no decision at all, because a
     /// lookup *failed*. A permanent endpoint 4xx is a decision (there is
     /// nothing left to learn), so it does not count here.
@@ -1452,8 +1482,13 @@ impl PersonDirectory {
             if self.endpoint_dead {
                 // Asked once this run, answered permanently. Degrade the rest
                 // for free rather than re-buying the same 4xx per thread.
+                //
+                // `NoAccount`, not `NotAPerson`: with the endpoint down we
+                // learned nothing about *which* of the two an id is, and
+                // plain `@Name` text is the answer that is never actively
+                // wrong. Calling a real colleague a missing document is.
                 for id in chunk {
-                    self.known.insert(id.clone(), None);
+                    self.known.insert(id.clone(), PersonFact::NoAccount);
                 }
                 continue;
             }
@@ -1465,7 +1500,7 @@ impl PersonDirectory {
                     // asking, and let every mention degrade to a name once.
                     self.endpoint_dead = true;
                     for id in chunk {
-                        self.known.insert(id.clone(), None);
+                        self.known.insert(id.clone(), PersonFact::NoAccount);
                     }
                     // Class only, never the error's own text — `QuipError`
                     // carries Quip's raw body and reqwest's URL.
@@ -1492,22 +1527,33 @@ impl PersonDirectory {
                 }
             };
             for id in chunk {
-                // Quip did not return this person (no such user, or the
-                // token cannot see them). No retry widens that, so decide it.
+                // Quip returned no profile for this id. It is not a person:
+                // `<control>` also wraps folder and thread chips, and this is
+                // the signal that tells them apart. No retry widens that, so
+                // decide it — and decide it as a *document*, which is what
+                // the walker would have produced without the wrapper.
                 let Some(profile) = profiles.get(id) else {
-                    self.known.insert(id.clone(), None);
+                    self.known.insert(id.clone(), PersonFact::NotAPerson);
                     continue;
                 };
+                // A profile came back, so this IS a person — just one we
+                // cannot address. Never `NotAPerson`: rendering a real
+                // colleague as a missing document is the bug this feature
+                // exists to fix.
+                //
                 // EXACT email only. Matching on display name is what the
                 // design's Phase-3 identity confirm gate exists to prevent:
                 // two people called "Joel" would silently swap mentions.
                 let Some(email) = profile.emails.iter().find(|e| !e.trim().is_empty()) else {
-                    self.known.insert(id.clone(), None);
+                    self.known.insert(id.clone(), PersonFact::NoAccount);
                     continue;
                 };
                 match ctx.user_repo.get_by_email(email).await {
                     Ok(found) => {
-                        self.known.insert(id.clone(), found.map(|u| u.user_id));
+                        self.known.insert(
+                            id.clone(),
+                            found.map_or(PersonFact::NoAccount, |u| PersonFact::User(u.user_id)),
+                        );
                     }
                     // Deliberately logged WITHOUT the error's text: the
                     // lookup key is an email address, and a DynamoDB error
@@ -1523,12 +1569,9 @@ impl PersonDirectory {
         }
 
         PersonResolution {
-            matched: wanted
+            decided: wanted
                 .iter()
-                .filter_map(|id| {
-                    let user_id = self.known.get(id)?.clone()?;
-                    Some((id.clone(), user_id))
-                })
+                .filter_map(|id| Some((id.clone(), self.known.get(id)?.into())))
                 .collect(),
             // Anything still absent from the cache reached no decision.
             undecided: wanted.iter().filter(|id| !self.known.contains_key(*id)).count(),
@@ -2038,7 +2081,7 @@ pub async fn import_one_thread(
         .map_err(|e| ThreadImportError::RunFailure(format!("stage html: {e}")))?;
 
     // 5. Walk it.
-    let quip_doc = ogrenotes_collab::import_quip::from_quip_html(&html);
+    let mut quip_doc = ogrenotes_collab::import_quip::from_quip_html(&html);
 
     // Nesting deeper than the walker will descend is a named loss, reported
     // like a dropped image rather than passed over in silence. The cap itself
@@ -2134,8 +2177,16 @@ pub async fn import_one_thread(
             );
             return Err(ThreadImportError::transient("person lookup failed"));
         }
-        let degraded =
-            ogrenotes_collab::import_quip::resolve_person_mentions(&quip_doc.doc, &outcome.matched);
+        let rewritten = ogrenotes_collab::import_quip::resolve_person_mentions(
+            &quip_doc.doc,
+            &outcome.decided,
+        );
+        // A chip Quip does not know as a person was a `<control>`-wrapped
+        // folder or thread link, and is now a `DocMention`. Its back-patch
+        // record has to join the walker's own before step 9 writes the row,
+        // or Phase 2b will never see it.
+        let doc_links = rewritten.doc_links.len();
+        quip_doc.pending_links.extend(rewritten.doc_links);
         // Counts only. A mention's *subject* — their name, and above all
         // the email the match was made on — is not something this worker
         // writes to a log or to any durable row.
@@ -2143,7 +2194,8 @@ pub async fn import_one_thread(
             import_id,
             thread = %thread.quip_thread_id,
             mentions = mention_count,
-            degraded,
+            degraded = rewritten.degraded,
+            doc_links,
             "quip content: person mentions resolved",
         );
     }
