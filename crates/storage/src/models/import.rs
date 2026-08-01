@@ -21,6 +21,27 @@ pub struct ImportRecord {
     pub quip_user_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_folder_id: Option<String>,
+    /// The dedicated OgreNotes folder created for THIS import on its first
+    /// `start`, as a child of the user-picked `target_folder_id` parent. All
+    /// imported documents land in it, so undoing a bad import is deleting one
+    /// folder rather than hand-picking documents out of Home (issue #170
+    /// containment; the folder picker + hierarchy mirroring stay out of scope).
+    ///
+    /// This field is the **idempotency key** for that folder's creation:
+    /// absent → no `start` has created a folder yet, so create one and record
+    /// it here; present → a prior `start` already created it, so reuse it and
+    /// never create a second. Sparse-omitted when absent, so an import written
+    /// before this field existed decodes to `None` (treated as "not yet
+    /// created") — the only imports that can be in that state are ones started
+    /// before this change deployed.
+    ///
+    /// Note: once set, `target_folder_id` is also updated to this same id (the
+    /// content pass reads its destination from `target_folder_id`), so the two
+    /// agree; `import_folder_id` exists as the explicit, unambiguous marker that
+    /// the folder was already created — `target_folder_id` alone cannot tell a
+    /// user-picked parent apart from an import folder we created under it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_folder_id: Option<String>,
     /// Root Quip folder/thread IDs the user scoped the import to. Stored
     /// sparsely (omitted when empty); legacy/pre-scoping rows decode to
     /// empty (import everything).
@@ -74,6 +95,7 @@ mod tests {
             phase: 0,
             quip_user_id: Some("quip-user-1".to_string()),
             target_folder_id: Some("folder-1".to_string()),
+            import_folder_id: Some("import-folder-1".to_string()),
             selected_roots: vec!["root-a".to_string(), "root-b".to_string()],
             created_at: now,
             updated_at: now,
@@ -130,6 +152,7 @@ mod tests {
             phase: _,
             quip_user_id: _,
             target_folder_id: _,
+            import_folder_id: _,
             selected_roots: _,
             created_at: _,
             updated_at: _,

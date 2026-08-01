@@ -45,6 +45,7 @@ async fn seed_scoping_import(app: &common::TestApp, owner: &str, roots: &[&str])
         phase: 0,
         quip_user_id: None,
         target_folder_id: None,
+        import_folder_id: None,
         selected_roots: roots.iter().map(|s| s.to_string()).collect(),
         created_at: now,
         updated_at: now,
@@ -85,7 +86,137 @@ async fn start_authorizes_target_folder_persists_scope_and_enqueues() {
         .unwrap()
         .expect("import record exists");
     assert_eq!(rec.selected_roots, vec!["root".to_string()]);
-    assert_eq!(rec.target_folder_id.as_deref(), Some(folder.as_str()));
+
+    // #170 containment: start now creates a dedicated per-import folder UNDER
+    // the picked target and records THAT as the effective destination, so
+    // imported documents land in one deletable folder instead of flat in the
+    // picked (Home) folder. `target_folder_id` is therefore the import folder,
+    // not the raw `folder` the wizard sent.
+    let import_folder = rec
+        .import_folder_id
+        .as_deref()
+        .expect("first start must create and record an import folder");
+    assert_ne!(
+        import_folder, folder,
+        "the import folder must be a NEW folder, not the picked parent",
+    );
+    assert_eq!(
+        rec.target_folder_id.as_deref(),
+        Some(import_folder),
+        "the effective destination on META must be the import folder",
+    );
+
+    // The import folder is a real, listable child of the picked parent, owned
+    // by the caller — so the user can see it in the sidebar and delete it to
+    // undo the whole import.
+    let child_folder = app
+        .state
+        .folder_repo
+        .get(import_folder)
+        .await
+        .unwrap()
+        .expect("the import folder exists as a Folder row");
+    assert_eq!(child_folder.parent_id.as_deref(), Some(folder.as_str()));
+    assert_eq!(child_folder.owner_id, user_id);
+    assert!(
+        child_folder.title.starts_with("Quip Import"),
+        "the folder name identifies the import: {}",
+        child_folder.title,
+    );
+    let parent_children = app
+        .state
+        .folder_repo
+        .list_children(&folder)
+        .await
+        .unwrap();
+    assert!(
+        parent_children.iter().any(|c| c.child_id == import_folder),
+        "the import folder must be linked as a child of the picked parent",
+    );
+    // The folder row must never carry the Quip token/secret — the security
+    // spine forbids it reaching any durable row or the folder name.
+    assert!(
+        !child_folder.title.to_lowercase().contains("token")
+            && !child_folder.title.to_lowercase().contains("secret"),
+        "the import folder name must not embed a credential: {}",
+        child_folder.title,
+    );
+
+    app.cleanup().await;
+}
+
+/// Idempotency guarantee (the crux of #170 containment): a re-start must NOT
+/// create a second import folder. The importer is deliberately re-startable
+/// (a crashed-and-reaped run replays), so clicking start twice — or the queue
+/// redelivering the job — must reuse the ONE folder recorded on the first
+/// start, never accumulate a fresh folder per attempt.
+#[tokio::test]
+async fn restart_reuses_the_same_import_folder() {
+    common::require_infra!();
+
+    let app = common::TestApp::new().await;
+    let (user_id, token) = app.create_user("owner1@test.com").await;
+    let folder = app.create_folder(&token, "Dest", None).await;
+    let import_id = seed_scoping_import(&app, &user_id, &[]).await;
+
+    let path = format!("/api/v1/imports/quip/{import_id}/start");
+    let body = serde_json::json!({
+        "selectedRootFolderIds": ["root"],
+        "targetFolderId": folder,
+    });
+
+    let (s1, b1) = app
+        .json_request(Method::POST, &path, Some(&token), Some(body.clone()))
+        .await;
+    assert_eq!(s1, 202, "first start failed: {b1}");
+    let after_first = app
+        .state
+        .import_repo
+        .get(&import_id)
+        .await
+        .unwrap()
+        .expect("record exists")
+        .import_folder_id
+        .expect("first start records an import folder");
+
+    let (s2, b2) = app
+        .json_request(Method::POST, &path, Some(&token), Some(body))
+        .await;
+    assert_eq!(s2, 202, "re-start failed: {b2}");
+    let after_second = app
+        .state
+        .import_repo
+        .get(&import_id)
+        .await
+        .unwrap()
+        .expect("record exists")
+        .import_folder_id
+        .expect("re-start keeps the import folder recorded");
+
+    assert_eq!(
+        after_first, after_second,
+        "a re-start must reuse the same import folder, not create a second",
+    );
+
+    // The picked parent started empty, so after two starts it must hold
+    // EXACTLY ONE child — the single import folder. Counting every child (not
+    // just the one whose id we already know) is what catches a broken guard
+    // that creates a second, differently-ided folder on the re-start.
+    let children = app
+        .state
+        .folder_repo
+        .list_children(&folder)
+        .await
+        .unwrap();
+    assert_eq!(
+        children.len(),
+        1,
+        "a re-start must not create a second folder under the target; children: {children:?}",
+    );
+    assert_eq!(
+        children[0].child_id, after_first,
+        "the one child must be the folder recorded on the first start",
+    );
 
     app.cleanup().await;
 }

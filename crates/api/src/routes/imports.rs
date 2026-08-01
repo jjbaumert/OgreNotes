@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 use ogrenotes_common::id::new_id;
 use ogrenotes_common::time::now_usec;
 use ogrenotes_quip_import::{QuipError, QuipToken};
-use ogrenotes_storage::models::AccessLevel;
+use ogrenotes_storage::models::folder::{Folder, FolderChild};
+use ogrenotes_storage::models::{AccessLevel, ChildType, FolderType};
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
 use ogrenotes_storage::models::import_inventory::ReportRow;
 
@@ -127,6 +128,7 @@ async fn connect(
         phase: 0,
         quip_user_id: Some(quip_user.id.clone()),
         target_folder_id: None,
+        import_folder_id: None,
         selected_roots: Vec::new(),
         created_at: now,
         updated_at: now,
@@ -264,7 +266,7 @@ async fn start(
     Path(import_id): Path<String>,
     Json(req): Json<StartRequest>,
 ) -> Result<(StatusCode, Json<StartResponse>), ApiError> {
-    state
+    let record = state
         .import_repo
         .get(&import_id)
         .await
@@ -272,12 +274,24 @@ async fn start(
         .filter(|r| r.owner_id == user_id)
         .ok_or_else(|| ApiError::NotFound("import not found".to_string()))?;
 
+    // Authorize the user-supplied parent. The check stays against
+    // `req.target_folder_id` — the folder the user proved Edit on — and we
+    // then create the dedicated import folder as a CHILD of it, which that
+    // Edit grant on the parent authorizes.
     super::folders::check_folder_access(&state, &req.target_folder_id, &user_id, AccessLevel::Edit)
         .await?;
 
+    // Land every imported document in ONE dedicated folder under the target,
+    // created on the first start and reused on every re-start (issue #170
+    // containment). This is the effective destination recorded on META; the
+    // content pass already reads its destination from `target_folder_id`, so
+    // recording the import folder there needs no change on the read side.
+    let effective_target =
+        ensure_import_folder(&state, &record, &import_id, &req.target_folder_id, &user_id).await?;
+
     state
         .import_repo
-        .set_scope(&import_id, &req.selected_root_folder_ids, &req.target_folder_id)
+        .set_scope(&import_id, &req.selected_root_folder_ids, &effective_target)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -300,6 +314,109 @@ async fn start(
             status: "running".to_string(),
         }),
     ))
+}
+
+/// Resolve the effective destination for an import: the dedicated per-import
+/// folder, creating it on the first `start` and reusing it forever after.
+///
+/// Interim containment for issue #170. Rather than dumping every imported
+/// document flat into the user's Home folder — where undoing a defective
+/// import means hand-deleting a large number of documents (issue #169) — we
+/// create ONE OgreNotes folder per import, under the access-checked `parent`
+/// the user picked, and file all imported documents into it. Deleting that one
+/// folder then undoes the import. The folder picker and Quip-hierarchy
+/// mirroring stay out of scope (still #170).
+///
+/// Idempotency is the crux: a double-clicked start, or a job the queue
+/// redelivered, must reuse the one folder, never create a second.
+/// [`ImportRecord::import_folder_id`] is the idempotency key —
+///
+/// - present → a prior start already created and recorded the folder; reuse it
+///   (this is also the re-start path the worker relies on being cheap).
+/// - absent → mint a fresh folder id, materialize the folder rows, then record
+///   the id on META **conditionally** via
+///   [`ImportRepo::record_import_folder`](ogrenotes_storage::repo::import_repo::ImportRepo::record_import_folder).
+///   The conditional write is what makes two genuinely-concurrent first-starts
+///   converge on one folder: the loser reads the winner's id back and leaves
+///   its own freshly-created folder as a harmless empty orphan — owned by the
+///   user and linked under the parent, so it is listable and deletable, never
+///   a wedge.
+///
+/// Ordering matters: the folder is materialized BEFORE its id is recorded, so a
+/// crash between the two can only ever leave an unreferenced folder, never a
+/// recorded id with no backing folder (which would file documents into a
+/// destination that does not exist).
+///
+/// Security spine: the folder name carries only a timestamp — never the Quip
+/// token or the user's email — and no token reaches any folder row.
+async fn ensure_import_folder(
+    state: &AppState,
+    record: &ImportRecord,
+    import_id: &str,
+    parent: &str,
+    user_id: &str,
+) -> Result<String, ApiError> {
+    // Fast path: a prior start already created and recorded the folder.
+    if let Some(existing) = record.import_folder_id.clone() {
+        return Ok(existing);
+    }
+
+    let now = now_usec();
+    let folder_id = new_id();
+
+    // Same create + parent + owner sequence as the canonical folder-create
+    // route (`routes::folders::create_folder`): link the folder under its
+    // parent first (so it is never orphaned), then create the metadata +
+    // owner MEMBER row (`FolderRepo::create` adds the owner as an OWN member).
+    state
+        .folder_repo
+        .add_child(&FolderChild {
+            folder_id: parent.to_string(),
+            child_id: folder_id.clone(),
+            child_type: ChildType::Folder,
+            added_at: now,
+        })
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let folder = Folder {
+        folder_id: folder_id.clone(),
+        title: import_folder_name(now),
+        color: 0,
+        parent_id: Some(parent.to_string()),
+        owner_id: user_id.to_string(),
+        folder_type: FolderType::User,
+        inherit_mode: ogrenotes_storage::models::InheritMode::default(),
+        created_at: now,
+        updated_at: now,
+    };
+    state
+        .folder_repo
+        .create(&folder)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Record the folder as the import's destination, conditionally: if a
+    // concurrent start beat us to it, adopt THAT folder (ours becomes the
+    // harmless orphan described above).
+    state
+        .import_repo
+        .record_import_folder(import_id, &folder_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// Display name of an import's dedicated folder, e.g.
+/// `Quip Import — 2026-07-31 14:05` (UTC, minute resolution).
+///
+/// Deliberately carries only the timestamp: the security spine forbids the
+/// Quip token or the user's email from reaching any durable row or name, and a
+/// name is a durable, user-visible string. `now_usec` is microseconds since the
+/// epoch; a malformed value degrades to the epoch rather than failing the start.
+fn import_folder_name(now_usec: i64) -> String {
+    let secs = now_usec / 1_000_000;
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap_or_default();
+    format!("Quip Import — {}", dt.format("%Y-%m-%d %H:%M"))
 }
 
 #[derive(Debug, Serialize)]
