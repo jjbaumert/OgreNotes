@@ -2675,6 +2675,12 @@ mod tests {
 
     #[test]
     fn nested_lists_stay_inside_their_item() {
+        // The *standard* HTML nesting shape, `<ul>` inside `<li>`. It
+        // pins a real property and stays — but note it has **zero**
+        // occurrences in the 56-document staged Quip corpus. Quip
+        // spells nesting the other way, as a sibling of the `<li>`;
+        // that shape is covered by
+        // `a_sibling_nested_list_lands_inside_the_item_that_owns_it`.
         let b = blocks("<ul><li>outer<ul><li>inner</li></ul></li></ul>");
         let QuipBlock::List { items, .. } = &b[0] else { panic!("expected list: {b:?}") };
         assert_eq!(items.len(), 1, "the inner list is not a sibling item: {items:?}");
@@ -2977,6 +2983,309 @@ mod tests {
             };
             assert_eq!(*inner_ordered, !outer_ordered, "{label} inner: {b:?}");
         }
+    }
+
+    // ─── #187: Quip's sibling-list nesting ───────────────────
+    //
+    // Verbatim from `AeOAAAcV1hg`. The nested `<ul>` is a **sibling**
+    // of the `<li>` that owns it, and that `<li>` carries
+    // `class='parent'`. This is Quip's only nesting spelling: it occurs
+    // 470 times across 25 of the 56 staged documents, while the
+    // standard `<ul>`-inside-`<li>` shape occurs zero times.
+    //
+    // The inner `<span>` holds a zero-width space (U+200B), which is
+    // what Quip emits for an empty list item — kept as-is rather than
+    // tidied away, since tidying fixtures is what hid this bug.
+    const REAL_NESTED_LIST_SECTION: &str = "<div data-section-style='5' class=\"\" style=\"\">\
+         <ul id='temp:C:AeO6b3a4714314f44579cbb3cf0c'>\
+         <li id='temp:C:AeObe85961cb2d4496ea374e229d' class='parent' style='' value='1'>\
+         <span id='temp:C:AeObe85961cb2d4496ea374e229d'>Queue</span>\
+         <br/></li>\
+         <ul><li id='temp:C:AeOff88d93bfbbd411981d8990df' class='' style=''>\
+         <span id='temp:C:AeOff88d93bfbbd411981d8990df'>\u{200b}</span>\
+         <br/></li></ul>\
+         </ul></div>";
+
+    #[test]
+    fn a_sibling_nested_list_lands_inside_the_item_that_owns_it() {
+        let b = blocks(REAL_NESTED_LIST_SECTION);
+        assert_eq!(b.len(), 1, "one list, not a list plus a hoisted one: {b:?}");
+        let QuipBlock::List { ordered, task, items } = &b[0] else {
+            panic!("expected a list, got {b:?}")
+        };
+        assert!(!*ordered && !*task, "a '5' section is plain bullets: {b:?}");
+        // Before the fix this was 2: `collect_items` hoisted the nested
+        // item up to sit beside `Queue` instead of under it.
+        assert_eq!(items.len(), 1, "the nested list is not a sibling item: {items:?}");
+
+        let QuipBlock::Para { spans, .. } = &items[0].blocks[0] else {
+            panic!("expected the item's own text first: {:?}", items[0].blocks)
+        };
+        assert_eq!(spans_text(spans), "Queue");
+
+        let QuipBlock::List { items: inner, .. } = &items[0].blocks[1] else {
+            panic!("expected the nested list inside the item: {:?}", items[0].blocks)
+        };
+        assert_eq!(inner.len(), 1, "{inner:?}");
+    }
+
+    #[test]
+    fn nesting_survives_to_the_materialized_document() {
+        // The parse-level shape is only half the claim — the nested list
+        // has to be a legal child of `list_item` and survive
+        // `enforce_containment` all the way into the yrs tree.
+        let doc = from_quip_html(REAL_NESTED_LIST_SECTION);
+        let txn = doc.doc.transact();
+        let root = txn.get_xml_fragment("content").expect("root fragment");
+        let xml = root.get_string(&txn);
+        // Two *opening* tags: the outer list and the one inside `Queue`.
+        // Counting `bullet_list` unqualified would match the closing tag
+        // too and pass on a flattened tree — the exact shape this guards.
+        assert_eq!(
+            xml.matches("<bullet_list").count(),
+            2,
+            "the nested list must still be nested in the materialized tree: {xml}"
+        );
+        let outer = xml.find("<bullet_list").expect("a bullet list");
+        let item = xml.find("<list_item").expect("a list item");
+        assert!(outer < item, "the nested list sits inside an item, not beside one: {xml}");
+        assert_eq!(doc.deep_nesting_truncated, 0, "real nesting must not trip the depth bound");
+    }
+
+    // ─── #188: numbered sequences split across sections ──────
+    //
+    // Verbatim from `CVLAAAgSl7Q` — the seven `data-section-style='6'`
+    // sections of its "API Endpoints" procedure, in document order.
+    // Only the first lacks `class="list-numbering-restart-at"`; that
+    // class is Quip's own marker for "this continues the list above",
+    // and it is what makes the run one list rather than seven.
+    //
+    // The interleaved `'5'` sub-content sections are omitted here so the
+    // fixture stays readable — `REAL_NUMBERED_RUN_WITH_SUBCONTENT`
+    // below is a contiguous, unedited slice that keeps them.
+    const REAL_NUMBERED_RUN: &str = "\
+        <div data-section-style='6' class=\"\" style=\"\">\
+        <ul id='temp:C:CVLe2c5aea1202145569d907b219'>\
+        <li id='temp:C:CVL10e4418acac74dceb9576b131' class='' style='' value='1'>\
+        <span id='temp:C:CVL10e4418acac74dceb9576b131'><b>Start Game (POST /games)</b></span>\
+        <br/></li></ul></div>\
+        <div data-section-style='6' class=\"list-numbering-restart-at\" style=\"--indent0: 2\">\
+        <ul id='temp:C:CVLcd86ff895ce94ad0b32c599ff'>\
+        <li id='temp:C:CVLbd9b01872b9e43dc8e479934c' class='' style='' value='1'>\
+        <span id='temp:C:CVLbd9b01872b9e43dc8e479934c'><b>Get Game Details (GET /games/{game_id})</b>\
+        </span><br/></li></ul></div>\
+        <div data-section-style='6' class=\"list-numbering-restart-at\" style=\"--indent0: 3\">\
+        <ul id='temp:C:CVLfef72b21e32c41a0b00d2f5a0'>\
+        <li id='temp:C:CVLed73a007acf941fdba391e23f' class='' style='' value='1'>\
+        <span id='temp:C:CVLed73a007acf941fdba391e23f'>\
+        <b>Submit Event (POST /games/{game_id}/events)</b></span><br/></li></ul></div>\
+        <div data-section-style='6' class=\"list-numbering-restart-at\" style=\"--indent0: 4\">\
+        <ul id='temp:C:CVL1c9aa8b08d0d47beb00a1964d'>\
+        <li id='temp:C:CVLe148365344114ec1a4374819d' class='' style='' value='1'>\
+        <span id='temp:C:CVLe148365344114ec1a4374819d'>\
+        <b>Get Event History (GET /games/{game_id}/events?start_index={optional})</b></span>\
+        <br/></li></ul></div>\
+        <div data-section-style='6' class=\"list-numbering-restart-at\" style=\"--indent0: 5\">\
+        <ul id='temp:C:CVL2191941b354b45268277ac976'>\
+        <li id='temp:C:CVL63c5d4f375134f4da09c65247' class='' style='' value='1'>\
+        <span id='temp:C:CVL63c5d4f375134f4da09c65247'>\
+        <b>Pause/Resume Game (PATCH /games/{game_id}/status)</b></span><br/></li></ul></div>\
+        <div data-section-style='6' class=\"list-numbering-restart-at\" style=\"--indent0: 6\">\
+        <ul id='temp:C:CVL3c5efdeac55e400796cb0c145'>\
+        <li id='temp:C:CVLb251cf6315f246aabf1645e99' class='' style='' value='1'>\
+        <span id='temp:C:CVLb251cf6315f246aabf1645e99'><b>End Game (POST /games/{game_id}/end)</b>\
+        </span><br/></li></ul></div>\
+        <div data-section-style='6' class=\"list-numbering-restart-at\" style=\"--indent0: 7\">\
+        <ul id='temp:C:CVL51895294c0584c31ba623f201'>\
+        <li id='temp:C:CVLf6b0a4e142ee4768877cb98c0' class='' style='' value='1'>\
+        <span id='temp:C:CVLf6b0a4e142ee4768877cb98c0'>\
+        <b>Send Chat Message (POST /games/{game_id}/chat)</b></span><br/></li></ul></div>";
+
+    /// A **contiguous, unedited** slice of `CVLAAAgSl7Q`: numbered items
+    /// 2 and 3 with the `'5'` section that sits between them. That
+    /// section is Quip's spelling for item 2's sub-content — note its
+    /// `<ul><ul>` indent wrapper, the signal that separates it from a
+    /// bullet list standing on its own.
+    const REAL_NUMBERED_RUN_WITH_SUBCONTENT: &str = "\
+        <div data-section-style='6' class=\"list-numbering-restart-at\" style=\"--indent0: 2\">\
+        <ul id='temp:C:CVLcd86ff895ce94ad0b32c599ff'>\
+        <li id='temp:C:CVLbd9b01872b9e43dc8e479934c' class='' style='' value='1'>\
+        <span id='temp:C:CVLbd9b01872b9e43dc8e479934c'><b>Get Game Details (GET /games/{game_id})</b>\
+        </span><br/></li></ul></div>\
+        <div data-section-style='5' class=\"\" style=\"\">\
+        <ul id='temp:C:CVL0248652808cc4b1fa0916d9df'><ul>\
+        <li id='temp:C:CVLd71640f09c004f7bba2c593a5' class='' style='' value='1'>\
+        <span id='temp:C:CVLd71640f09c004f7bba2c593a5'><b>Path Param</b>: game_id.</span>\
+        <br/></li>\
+        <li id='temp:C:CVL501af88b11394bb592d926964' class='' style=''>\
+        <span id='temp:C:CVL501af88b11394bb592d926964'><b>Logic</b>: Fetch from DynamoDB. \
+        Optionally reconstruct full state by reducing events (server-side for security).</span>\
+        <br/></li>\
+        <li id='temp:C:CVL24d7678bf8e6485c828cd6b3d' class='' style=''>\
+        <span id='temp:C:CVL24d7678bf8e6485c828cd6b3d'><b>Response</b>: 200 OK with Game JSON \
+        (events truncated if large; client requests full if needed).</span><br/></li>\
+        <li id='temp:C:CVLe0be914f68f245e3bfe5fbd22' class='' style=''>\
+        <span id='temp:C:CVLe0be914f68f245e3bfe5fbd22'><b>Error Handling</b>: 404 if not found, \
+        403 if not player.</span><br/></li>\
+        </ul></ul></div>\
+        <div data-section-style='6' class=\"list-numbering-restart-at\" style=\"--indent0: 3\">\
+        <ul id='temp:C:CVLfef72b21e32c41a0b00d2f5a0'>\
+        <li id='temp:C:CVLed73a007acf941fdba391e23f' class='' style='' value='1'>\
+        <span id='temp:C:CVLed73a007acf941fdba391e23f'>\
+        <b>Submit Event (POST /games/{game_id}/events)</b></span><br/></li></ul></div>";
+
+    /// The text of each item's leading paragraph.
+    fn item_texts(items: &[QuipItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|i| match &i.blocks[0] {
+                QuipBlock::Para { spans, .. } => spans_text(spans),
+                other => panic!("expected an item paragraph, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_split_numbered_sequence_becomes_one_list_of_seven() {
+        let b = blocks(REAL_NUMBERED_RUN);
+        // Before the fix: seven separate `ordered_list` blocks, each
+        // holding one item — so the reader saw "1." seven times.
+        assert_eq!(b.len(), 1, "the seven sections must merge into one list: {b:?}");
+        let QuipBlock::List { ordered, task, items } = &b[0] else {
+            panic!("expected a list, got {b:?}")
+        };
+        assert!(*ordered, "a '6' run is numbered: {b:?}");
+        assert!(!*task, "a numbered list is not a checklist: {b:?}");
+        assert_eq!(
+            item_texts(items),
+            vec![
+                "Start Game (POST /games)",
+                "Get Game Details (GET /games/{game_id})",
+                "Submit Event (POST /games/{game_id}/events)",
+                "Get Event History (GET /games/{game_id}/events?start_index={optional})",
+                "Pause/Resume Game (PATCH /games/{game_id}/status)",
+                "End Game (POST /games/{game_id}/end)",
+                "Send Chat Message (POST /games/{game_id}/chat)",
+            ],
+            "all seven steps, in source order, numbered 1-7 by position"
+        );
+    }
+
+    #[test]
+    fn an_interleaved_bullet_section_is_the_previous_items_sub_content() {
+        let b = blocks(REAL_NUMBERED_RUN_WITH_SUBCONTENT);
+        assert_eq!(b.len(), 1, "the '5' section must not terminate the run: {b:?}");
+        let QuipBlock::List { ordered, items, .. } = &b[0] else {
+            panic!("expected a list, got {b:?}")
+        };
+        assert!(*ordered, "{b:?}");
+        assert_eq!(
+            item_texts(items),
+            vec![
+                "Get Game Details (GET /games/{game_id})",
+                "Submit Event (POST /games/{game_id}/events)",
+            ],
+            "{b:?}"
+        );
+
+        // The sub-content hangs off item 1, and stays *bullets* — the
+        // moved section keeps its own `'5'` wrapper, so walking up for a
+        // section style must not reach the enclosing `'6'`.
+        assert_eq!(
+            items[0].blocks.len(),
+            2,
+            "item 1 keeps its text and gains the '5' section: {:?}",
+            items[0].blocks
+        );
+        let QuipBlock::List { ordered: sub_ordered, task: sub_task, items: sub } =
+            &items[0].blocks[1]
+        else {
+            panic!("expected the '5' section nested under item 1: {:?}", items[0].blocks)
+        };
+        assert!(!*sub_ordered, "sub-content of a numbered item is bullets: {sub:?}");
+        assert!(!*sub_task, "{sub:?}");
+        assert_eq!(sub.len(), 4, "{sub:?}");
+        assert!(item_texts(sub)[0].starts_with("Path Param"), "{sub:?}");
+        assert_eq!(items[1].blocks.len(), 1, "item 2 has no sub-content here: {:?}", items[1]);
+    }
+
+    #[test]
+    fn a_numbered_section_without_the_continues_class_starts_a_new_list() {
+        // Quip restarts numbering by *omitting* the class. Two runs must
+        // stay two lists, or `CVLAAAgSl7Q`'s 7-step procedure and its
+        // 5-component list would merge into one list of twelve.
+        let html = format!("{REAL_NUMBERED_RUN}{REAL_NUMBERED_RUN}");
+        let b = blocks(&html);
+        assert_eq!(b.len(), 2, "a run without the continues-class opens a new list: {b:?}");
+        for block in &b {
+            let QuipBlock::List { ordered, items, .. } = block else { panic!("{b:?}") };
+            assert!(*ordered);
+            assert_eq!(items.len(), 7, "{b:?}");
+        }
+    }
+
+    // ─── regressions: the shapes that already worked ─────────
+
+    #[test]
+    fn adjacent_bullet_sections_are_untouched_by_the_numbering_merge() {
+        // 565 bullet sections in the corpus; none may be merged, nested
+        // or absorbed. Two adjacent `'5'` sections stay two lists.
+        let html = format!("{REAL_BULLET_SECTION_5}{REAL_BULLET_SECTION_5}");
+        let b = blocks(&html);
+        assert_eq!(b.len(), 2, "bullet sections must not merge: {b:?}");
+        for block in &b {
+            let QuipBlock::List { ordered, task, items } = block else { panic!("{b:?}") };
+            assert!(!*ordered && !*task, "{b:?}");
+            assert_eq!(items.len(), 2, "{b:?}");
+            assert!(
+                items.iter().all(|i| i.blocks.len() == 1),
+                "a flat bullet list gains no nesting: {items:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_checklist_next_to_a_numbered_run_stays_a_checklist() {
+        // `'7'` is neither a continuation nor sub-content, so it ends the
+        // run and keeps its own kind.
+        let html = format!("{REAL_NUMBERED_RUN}{REAL_CHECKLIST_SECTION}");
+        let b = blocks(&html);
+        assert_eq!(b.len(), 2, "{b:?}");
+        let QuipBlock::List { ordered, task, items } = &b[1] else { panic!("{b:?}") };
+        assert!(*task, "the '7' section is still a checklist: {b:?}");
+        assert!(!*ordered, "{b:?}");
+        assert_eq!(items.len(), 2, "{b:?}");
+        assert!(items.iter().all(|i| i.checked == Some(false)), "{items:?}");
+    }
+
+    #[test]
+    fn an_explicit_ol_still_works_and_nests() {
+        // The `<ol>` tag never appears in the corpus (0 of 1096 list
+        // tags), but it is still honoured — and the sibling-nesting
+        // rewrite applies to it exactly as it does to `<ul>`.
+        let b = blocks("<ol><li>a</li><ol><li>b</li></ol></ol>");
+        assert_eq!(b.len(), 1, "{b:?}");
+        let QuipBlock::List { ordered, items, .. } = &b[0] else { panic!("{b:?}") };
+        assert!(*ordered, "{b:?}");
+        assert_eq!(items.len(), 1, "{b:?}");
+        let QuipBlock::List { ordered: inner_ordered, .. } = &items[0].blocks[1] else {
+            panic!("expected the nested ol inside the item: {:?}", items[0].blocks)
+        };
+        assert!(*inner_ordered, "{b:?}");
+    }
+
+    #[test]
+    fn an_indent_wrapper_with_no_bullet_above_it_keeps_its_items() {
+        // 52 of the 470 sibling-nested lists in the corpus have no `<li>`
+        // before them — Quip's bare `<ul><ul>` indent wrapper. There is
+        // nothing to nest into, so the items stay at this level rather
+        // than gaining an invented empty parent bullet.
+        let b = blocks(REAL_ORDERED_SECTION_6_INDENTED);
+        assert_eq!(b.len(), 1, "{b:?}");
+        let QuipBlock::List { ordered, items, .. } = &b[0] else { panic!("{b:?}") };
+        assert!(*ordered, "{b:?}");
+        assert_eq!(items.len(), 1, "the wrapper contributes no empty item: {items:?}");
+        assert!(matches!(items[0].blocks[0], QuipBlock::Para { .. }), "{items:?}");
     }
 
     #[test]
