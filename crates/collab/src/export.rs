@@ -1582,7 +1582,7 @@ fn is_safe_url(url: &str) -> bool {
         || lower.starts_with("data:image/webp;")
 }
 
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
