@@ -348,6 +348,20 @@ async fn reaper_loop(
     }
 }
 
+/// Best-effort human-readable text for a caught panic payload.
+///
+/// Only ever reaches a **log**, never a durable `reason` / `ReportNote`: a
+/// panic message is arbitrary runtime data — a slice of the document being
+/// parsed, at worst — and the durable strings are user-visible. See
+/// [`ThreadImportError::transient`] for how the per-thread path keeps it out.
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
 /// Execute one claimed job and finalize it: ack on success (then drop the
 /// staging blob), or retry / dead-letter on failure per [`MAX_RETRIES`].
 /// `pub` so integration tests can drive the real retry budget and the
@@ -368,11 +382,7 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
     {
         Ok(r) => r,
         Err(panic) => {
-            let msg = panic
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "non-string panic payload".to_string());
+            let msg = panic_message(&panic);
             tracing::error!(job_id, attempt, panic = %msg, "job execution panicked");
             Err(format!("job execution panicked: {msg}"))
         }
@@ -1139,6 +1149,11 @@ const MAX_THREAD_ATTEMPTS: u32 = 3;
 /// good threads sit between bad ones and reset the counter) untouched.
 const MAX_CONSECUTIVE_THREAD_FAILURES: usize = 5;
 
+/// Durable, user-visible reason for a thread whose import panicked. Authored
+/// here and `&'static` on purpose — the panic payload itself must never reach
+/// a `reason` or a `ReportNote`; see [`ThreadImportError::transient`].
+const PANIC_REASON: &str = "this document could not be converted (the importer failed on its content)";
+
 /// The complete set of `REPORT` row keys this worker writes.
 ///
 /// One module so the set is countable by reading one place.
@@ -1158,12 +1173,14 @@ mod report {
     pub const KIND_THREAD_SKIPPED: &str = "thread_skipped";
     pub const KIND_THREAD_FAILED: &str = "thread_failed";
     pub const KIND_IMAGE_DROPPED: &str = "image_dropped";
+    pub const KIND_CONTENT_TRUNCATED: &str = "content_truncated";
 
     pub const THREADS_IMPORTED: &str = "threads_imported";
     pub const THREADS_SKIPPED_CHAT: &str = "threads_skipped_chat";
     pub const THREADS_SKIPPED_FORBIDDEN: &str = "threads_skipped_forbidden";
     pub const THREADS_FAILED: &str = "threads_failed";
     pub const IMAGES_DROPPED: &str = "images_dropped";
+    pub const THREADS_TRUNCATED: &str = "threads_deep_nesting_truncated";
     pub const FOLDERS_FORBIDDEN: &str = "folders_forbidden";
 }
 
@@ -1264,6 +1281,24 @@ pub enum ThreadImportError {
     /// and deliberately **not** charged to the thread's attempt budget, which
     /// would otherwise let a storage blip condemn an innocent thread.
     RunFailure(String),
+}
+
+impl ThreadImportError {
+    /// Build a [`Self::Transient`] from something that is not a [`QuipError`].
+    ///
+    /// **Takes `&'static str`, not `String`, and that is the whole point.**
+    /// `Transient`'s payload is the one error string that reaches durable,
+    /// user-visible state (`THREAD#.reason`, `ReportNote::detail`), so the
+    /// leak guarantee has to be checkable rather than merely true today. It
+    /// is checkable because `Transient` has exactly two origins — this one
+    /// and `From<QuipError>`, which routes through [`safe_quip_reason`] — and
+    /// this one *cannot* carry runtime data at all: a `format!` result, a
+    /// response body, a URL, or a panic payload will not compile through a
+    /// `&'static str`. Anything that is not attributable to the thread should
+    /// be [`Self::RunFailure`], which never reaches durable state.
+    fn transient(reason: &'static str) -> Self {
+        Self::Transient(reason.to_string())
+    }
 }
 
 impl std::fmt::Display for ThreadImportError {
@@ -1430,7 +1465,42 @@ async fn run_content_pass(
     let mut consecutive_failures: usize = 0;
 
     for thread in &threads {
-        match import_one_thread(ctx, import_id, owner_id, client, token, thread, &folders).await {
+        // A panic in the per-thread work is contained HERE, not at
+        // `execute_and_finalize`. The document body is authored entirely by
+        // Quip and the walker that reads it (`from_quip_html`, plus the yrs
+        // `materialize` behind it) is the newest parser in the crate, so one
+        // malformed document must not be able to abort the pass and
+        // dead-letter the import — that is #142's shape arriving through a
+        // different door, and the only door `catch_unwind` at the job level
+        // cannot close.
+        //
+        // Mapping the panic to `Transient` rather than swallowing it keeps the
+        // bump-after-an-observed-failure invariant exactly as it was: a panic
+        // *is* an observed, thread-attributable failure, so it costs the
+        // thread one attempt and a genuinely poisonous document is marked
+        // `Failed` after [`MAX_THREAD_ATTEMPTS`] while the rest of the import
+        // completes. If instead the panic source is global (a yrs regression,
+        // say), every thread panics, and
+        // [`MAX_CONSECUTIVE_THREAD_FAILURES`] trips and retries the job
+        // rather than condemning the whole manifest — the two guards compose.
+        let outcome = std::panic::AssertUnwindSafe(import_one_thread(
+            ctx, import_id, owner_id, client, token, thread, &folders,
+        ))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|panic| {
+            // The payload goes to the log only. It is arbitrary runtime data
+            // — plausibly a slice of the document being parsed — and
+            // `ThreadImportError::transient` will not accept it.
+            tracing::error!(
+                import_id,
+                thread = %thread.quip_thread_id,
+                panic = %panic_message(&panic),
+                "quip content: thread import panicked; charged to the thread, not the import",
+            );
+            Err(ThreadImportError::transient(PANIC_REASON))
+        });
+        match outcome {
             Ok(()) => consecutive_failures = 0,
             Err(ThreadImportError::TokenRejected) => {
                 ctx.import_repo
@@ -1662,6 +1732,31 @@ pub async fn import_one_thread(
 
     // 5. Walk it.
     let quip_doc = ogrenotes_collab::import_quip::from_quip_html(&html);
+
+    // Nesting deeper than the walker will descend is a named loss, reported
+    // like a dropped image rather than passed over in silence. The cap itself
+    // is a process-liveness bound — see `import_quip::MAX_NESTING_DEPTH`; an
+    // uncapped walk on third-party HTML exhausts the stack, and stack
+    // exhaustion aborts the whole worker rather than unwinding.
+    if quip_doc.deep_nesting_truncated > 0 {
+        record_report(
+            ctx,
+            import_id,
+            owner_id,
+            report::THREADS_TRUNCATED,
+            Some(ReportNote {
+                quip_thread_id: thread.quip_thread_id.clone(),
+                kind: report::KIND_CONTENT_TRUNCATED.to_string(),
+                detail: format!(
+                    "nesting deeper than {} levels was flattened in {} place(s); \
+                     the text was kept, the structure below that point was not",
+                    ogrenotes_collab::import_quip::MAX_NESTING_DEPTH,
+                    quip_doc.deep_nesting_truncated,
+                ),
+            }),
+        )
+        .await;
+    }
 
     // 6. Settle this thread's document id BEFORE anything durable is written
     //    under it. It has to be known early anyway — every side-loaded blob

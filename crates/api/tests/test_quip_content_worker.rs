@@ -922,3 +922,121 @@ async fn several_failing_threads_all_resolve_inside_the_queues_retry_budget() {
     assert_eq!(rec.status, ImportStatus::Succeeded);
     assert_eq!(rec.phase, 2);
 }
+
+/// Mirror of `worker_mode::MAX_CONSECUTIVE_THREAD_FAILURES` (same convention
+/// as `CLAIM_STALE_MS` in the inventory suite — the const is private).
+const MAX_CONSECUTIVE_THREAD_FAILURES: usize = 5;
+
+/// Seed an extra `Pending` document thread straight onto the manifest.
+///
+/// `run_content_pass` walks `list_threads`, and `put_thread` is
+/// insert-if-absent with no delete anywhere in the repo, so a pre-seeded row
+/// survives the inventory re-walk at the top of every run. That is what makes
+/// a manifest larger than the wiremock fixture's folder tree possible without
+/// new plumbing.
+async fn seed_extra_thread(app: &common::TestApp, import_id: &str, quip_thread_id: &str) {
+    app.state
+        .import_repo
+        .put_thread(
+            import_id,
+            &ThreadRow {
+                quip_thread_id: quip_thread_id.to_string(),
+                owner_id: "owner1".to_string(),
+                title: quip_thread_id.to_string(),
+                thread_type: "document".to_string(),
+                updated_usec: 999,
+                member_folders: vec!["root".to_string()],
+                first_folder: "root".to_string(),
+                state: ThreadState::Pending,
+                ogre_doc_id: None,
+                reason: None,
+                attempts: 0,
+            },
+        )
+        .await
+        .expect("seed extra thread row");
+}
+
+/// The circuit breaker: back-to-back thread failures read as a broken *Quip*,
+/// not as broken threads, and stop the pass.
+///
+/// This is the guard that makes "keep walking after a thread failure" safe.
+/// Continuing is right when the bad threads are scattered (#142's shape), and
+/// catastrophic when *everything* is failing: without the breaker a Quip-wide
+/// 5xx outage would charge an attempt to every thread in the manifest, and
+/// three such runs would mark an entire import `Failed` thread by thread over
+/// an outage that resolved itself in an hour.
+///
+/// The load-bearing assertion is on the thread *past* the breaking point:
+/// `attempts == 0` and zero HTTP hits prove the walk actually STOPPED, rather
+/// than merely happening to end.
+#[tokio::test]
+async fn consecutive_thread_failures_stop_the_pass_instead_of_condemning_the_manifest() {
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    // t3..t8 have no `/2/threads/{id}/html` mock, so wiremock's default 404
+    // becomes `QuipError::Api { status: 404 }` -> `Transient`: six failing
+    // threads, one more than the breaker's threshold. Sorted order puts them
+    // after t1/t2 and before tc.
+    let failing: Vec<String> = (3..=8).map(|i| format!("t{i}")).collect();
+    assert_eq!(
+        failing.len(),
+        MAX_CONSECUTIVE_THREAD_FAILURES + 1,
+        "the fixture must hold exactly one thread PAST the breaking point",
+    );
+    for t in &failing {
+        seed_extra_thread(&app, &import_id, t).await;
+    }
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    let err = execute_start_quip_import(&ctx, &import_id, "owner1")
+        .await
+        .expect_err("tripping the breaker must fail the job so the queue retries with backoff");
+    assert!(err.contains("consecutive"), "the error must name the reason: {err:?}");
+
+    // The first MAX_CONSECUTIVE_THREAD_FAILURES failures were each charged an
+    // attempt, and then the pass stopped.
+    for t in &failing[..MAX_CONSECUTIVE_THREAD_FAILURES] {
+        let row = thread_row(&app, &import_id, t).await;
+        assert_eq!(row.attempts, 1, "{t} must have been charged exactly one attempt");
+        assert_eq!(row.state, ThreadState::Pending, "{t} is retryable, not given up on");
+    }
+
+    // THE ASSERTION: the thread past the breaking point was never touched.
+    // Without the breaker the pass would have walked it (and every thread
+    // after it) charging attempts the whole way.
+    let t8 = thread_row(&app, &import_id, "t8").await;
+    assert_eq!(t8.attempts, 0, "the pass must STOP, not run out of threads");
+    assert_eq!(t8.state, ThreadState::Pending);
+    assert_eq!(
+        hits(&server, "/2/threads/t8/html").await,
+        0,
+        "no Quip call may be spent past the breaking point",
+    );
+    // tc sorts after t8, so it is untouched too — a second, independent
+    // witness that the loop exited early rather than completing.
+    assert_eq!(
+        thread_row(&app, &import_id, "tc").await.state,
+        ThreadState::Pending,
+        "the chat thread sorts last and must not have been reached",
+    );
+
+    // Progress made before the breaker tripped is still durable.
+    for t in ["t1", "t2"] {
+        assert_eq!(
+            thread_row(&app, &import_id, t).await.state,
+            ThreadState::ContentDone,
+            "{t} imported before the failures started and must stay imported",
+        );
+    }
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_ne!(rec.phase, 2, "an aborted pass must not claim completion");
+    assert_ne!(
+        rec.status,
+        ImportStatus::Succeeded,
+        "an aborted pass must not claim success",
+    );
+}

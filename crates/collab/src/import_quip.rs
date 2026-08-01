@@ -89,6 +89,14 @@ pub struct QuipDocument {
     pub images: Vec<QuipImageRef>,
     /// Intra-Quip links needing Phase-2b back-patch.
     pub pending_links: Vec<QuipPendingLink>,
+    /// How many subtrees were flattened for exceeding
+    /// [`MAX_NESTING_DEPTH`](crate::import_quip::MAX_NESTING_DEPTH).
+    ///
+    /// Non-zero means the document nested deeper than the walker will
+    /// descend: the text survived, the structure below that point did not.
+    /// A named loss, so the caller reports it the way it reports a dropped
+    /// image rather than letting it pass silently.
+    pub deep_nesting_truncated: usize,
 }
 
 /// An image the source referenced, keyed by the blockId of the
@@ -110,7 +118,8 @@ pub struct QuipPendingLink {
 /// Import a Quip HTML body into a fresh `Doc`, together with the
 /// side-tables the caller needs to finish the job.
 pub fn from_quip_html(html: &str) -> QuipDocument {
-    materialize(&parse_quip(html))
+    let (blocks, truncated) = parse_quip_counting_truncations(html);
+    QuipDocument { deep_nesting_truncated: truncated, ..materialize(&blocks) }
 }
 
 // ─── intermediate block model ────────────────────────────────────
@@ -317,9 +326,38 @@ fn sanitize(html: &str) -> String {
 
 // ─── stage 2+3: parse to the intermediate block model ────────────
 
+/// Deepest element nesting the walker is ever allowed to descend.
+///
+/// **This is a process-liveness bound, not a formatting preference.** The
+/// block walker (`walk_node` -> `walk_children` -> `walk_element`) recurses
+/// once per DOM level, and the HTML it consumes is authored entirely by a
+/// third party: Quip returns whatever `/2/threads/{id}/html` holds. Exhaust
+/// the thread stack and Rust **aborts the process** — stack overflow is not a
+/// panic, so no `catch_unwind` anywhere can contain it. On the shared import
+/// worker that kills every concurrent job, not just the offending import, and
+/// the re-run reaches the same document and dies again.
+///
+/// Measured abort threshold on a 2 MiB stack — what tokio worker threads and
+/// Rust test threads both get — is ~1 050 levels of nested
+/// `<div>`/`<span>`/`<blockquote>`. (`ammonia::clean` and html5ever survive
+/// 8 000+; the recursion that fails is ours.) 128 leaves roughly 8x headroom
+/// for a smaller stack or a deeper call path above the walker, and sits far
+/// above anything an authored document reaches: Quip's editor tops out around
+/// a dozen levels of nested list, and even paste-artifact wrapper
+/// accumulation runs to tens, not hundreds.
+pub const MAX_NESTING_DEPTH: usize = 128;
+
 /// Parse Quip HTML into the intermediate block model. Pure: no yrs
 /// transaction is live while the DOM is walked.
 pub(crate) fn parse_quip(html: &str) -> Vec<QuipBlock> {
+    parse_quip_counting_truncations(html).0
+}
+
+/// [`parse_quip`] plus the number of subtrees that were flattened for
+/// exceeding [`MAX_NESTING_DEPTH`]. Split out so `parse_quip` keeps the
+/// signature its unit tests use while [`from_quip_html`] can surface the loss
+/// on [`QuipDocument`] and the importer can report it.
+pub(crate) fn parse_quip_counting_truncations(html: &str) -> (Vec<QuipBlock>, usize) {
     use html5ever::tendril::TendrilSink;
     use markup5ever_rcdom::RcDom;
 
@@ -329,12 +367,87 @@ pub(crate) fn parse_quip(html: &str) -> Vec<QuipBlock> {
         .read_from(&mut safe.as_bytes())
         .expect("html5ever parse is infallible on bytes");
 
+    // Bound the tree BEFORE the recursive walk rather than threading a depth
+    // counter through all twelve `walk_children` call sites. The guarantee is
+    // then structural: whatever the walker receives is already shallower than
+    // MAX_NESTING_DEPTH, so every recursive pass over it — `walk_element`,
+    // `enforce_containment`, `materialize_block` — is bounded by the same
+    // constant for free, and no future recursive pass can forget to check.
+    let truncated = flatten_below_depth(&dom.document);
+
     let mut out = Vec::new();
     let mut pending = InlineBuf::default();
     walk_children(&dom.document, &mut out, &Marks::default(), &mut pending);
     pending.flush(&mut out, None);
 
-    enforce_containment(out, NodeType::Doc)
+    (enforce_containment(out, NodeType::Doc), truncated)
+}
+
+/// Replace every subtree rooted deeper than [`MAX_NESTING_DEPTH`] with a
+/// single text node holding that subtree's flattened text, returning how many
+/// subtrees were flattened.
+///
+/// **Fails soft: text survives, only the nesting is lost.** Dropping the
+/// subtree would silently delete the deepest content of a document, and
+/// returning an error would wedge the thread on every retry — the importer
+/// already treats "keep the content, record the loss" as the right answer for
+/// an unfetchable image, and over-deep nesting is the same shape of problem.
+///
+/// **Iterative, with an explicit stack, in both halves.** A recursive
+/// implementation of the guard against unbounded recursion would abort on
+/// exactly the input it exists to survive.
+fn flatten_below_depth(document: &markup5ever_rcdom::Handle) -> usize {
+    use markup5ever_rcdom::{Node, NodeData};
+
+    let mut truncated = 0usize;
+    // (node, depth) pairs still to inspect.
+    let mut stack: Vec<(markup5ever_rcdom::Handle, usize)> = vec![(document.clone(), 0)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth >= MAX_NESTING_DEPTH {
+            let children = std::mem::take(&mut *node.children.borrow_mut());
+            if children.is_empty() {
+                continue;
+            }
+            truncated += 1;
+            let text = collect_text(&children);
+            if !text.is_empty() {
+                let replacement = Node::new(NodeData::Text {
+                    contents: std::cell::RefCell::new(text.into()),
+                });
+                node.children.borrow_mut().push(replacement);
+            }
+            continue;
+        }
+        for child in node.children.borrow().iter() {
+            stack.push((child.clone(), depth + 1));
+        }
+    }
+    truncated
+}
+
+/// Concatenate every text node in `roots` and their descendants, separated by
+/// single spaces. Iterative for the same reason [`flatten_below_depth`] is.
+fn collect_text(roots: &[markup5ever_rcdom::Handle]) -> String {
+    use markup5ever_rcdom::NodeData;
+
+    let mut text = String::new();
+    let mut stack: Vec<markup5ever_rcdom::Handle> = roots.iter().rev().cloned().collect();
+    while let Some(node) = stack.pop() {
+        if let NodeData::Text { contents } = &node.data {
+            let borrowed = contents.borrow();
+            let chunk = borrowed.as_ref().trim();
+            if !chunk.is_empty() {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(chunk);
+            }
+        }
+        for child in node.children.borrow().iter().rev() {
+            stack.push(child.clone());
+        }
+    }
+    text
 }
 
 /// Inline text accumulated between block boundaries. Flushed as a
@@ -1358,6 +1471,9 @@ fn materialize(blocks: &[QuipBlock]) -> QuipDocument {
         sections: side.sections,
         images: side.images,
         pending_links: side.pending_links,
+        // Set by `from_quip_html`, which is the only caller that has the
+        // parse-time count; `materialize` alone cannot know.
+        deep_nesting_truncated: 0,
     }
 }
 
