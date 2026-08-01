@@ -373,7 +373,36 @@ fn render_node_readonly(node: &Node) -> AnyView {
     }
 }
 
+/// True when a frame's content carries no visible text anywhere —
+/// i.e. only empty/whitespace text leaves under any nesting. Drives
+/// the render-time placeholder hint: presets seed EMPTY nodes (see
+/// `presets::seed_content`) so entering the frame gives a bare caret
+/// instead of forcing the user to delete baked-in placeholder prose.
+fn fragment_is_visually_empty(content: &Fragment) -> bool {
+    fn node_empty(node: &Node) -> bool {
+        match node {
+            Node::Text { text, .. } => text.trim().is_empty(),
+            Node::Element { content, .. } => content.children.iter().all(node_empty),
+        }
+    }
+    content.children.iter().all(node_empty)
+}
+
+/// i18n key for the empty-frame hint, keyed off the first child's
+/// node type so a heading frame invites a heading. Falls back to the
+/// body hint for anything else (including a fully empty fragment).
+fn placeholder_key_for(content: &Fragment) -> &'static str {
+    match content.children.first().and_then(|n| n.node_type()) {
+        Some(NodeType::Heading) => "deck-placeholder-heading",
+        _ => "deck-placeholder-body",
+    }
+}
+
 fn render_frame_content(content: &Fragment) -> Vec<AnyView> {
+    if fragment_is_visually_empty(content) {
+        let hint = crate::i18n::translate(placeholder_key_for(content), None);
+        return vec![view! { <div class="deck-frame-placeholder">{hint}</div> }.into_any()];
+    }
     content.children.iter().map(render_node_readonly).collect()
 }
 
@@ -1872,6 +1901,35 @@ mod tests {
     use super::*;
     use crate::editor::model::generate_block_id;
     use crate::presentation::model::{DeckFrame, FrameRole, Rect, DEFAULT_THEME};
+
+    #[test]
+    fn visually_empty_detects_whitespace_and_nesting() {
+        assert!(fragment_is_visually_empty(&Fragment::empty()));
+        assert!(fragment_is_visually_empty(&Fragment::from(vec![Node::element(
+            NodeType::Heading
+        )])));
+        assert!(fragment_is_visually_empty(&Fragment::from(vec![
+            Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("   ")]),
+            ),
+        ])));
+        assert!(!fragment_is_visually_empty(&Fragment::from(vec![
+            Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("real text")]),
+            ),
+        ])));
+    }
+
+    #[test]
+    fn placeholder_key_follows_first_node_type() {
+        let heading = Fragment::from(vec![Node::element(NodeType::Heading)]);
+        assert_eq!(placeholder_key_for(&heading), "deck-placeholder-heading");
+        let para = Fragment::from(vec![Node::element(NodeType::Paragraph)]);
+        assert_eq!(placeholder_key_for(&para), "deck-placeholder-body");
+        assert_eq!(placeholder_key_for(&Fragment::empty()), "deck-placeholder-body");
+    }
 
     fn simple_slide() -> DeckSlide {
         DeckSlide {
