@@ -1611,17 +1611,62 @@ async fn person_lookups_are_cached_across_threads_and_batched_within_one() {
     );
 }
 
-/// A Quip person lookup that fails outright must not cost the reader the
-/// document: the mentions degrade to names and the import completes.
+/// A **transient** person-lookup failure must not be checkpointed.
+///
+/// Step 10 marks a thread `ContentDone` unconditionally and a re-run skips a
+/// `ContentDone` thread with zero Quip calls, so checkpointing here would make
+/// a seconds-long Quip 5xx permanently degrade every mention it touched —
+/// issue #155's pattern, and worse than #155 because this path writes no
+/// report note, so the loss would be undiscoverable. The thread must instead
+/// stay `Pending` under its existing attempt budget.
+///
+/// The account DOES exist, which is what makes this a *failure* test rather
+/// than a no-match test: the only reason the mention is unresolvable is that
+/// Quip erred.
+///
+/// Mutation check: make `PersonDirectory::resolve` report `undecided: 0`
+/// unconditionally (or drop the `undecided > 0` bail in step 6b) and the
+/// thread checkpoints `ContentDone` with `@Joel` baked in — every assertion
+/// below goes red.
 #[tokio::test]
-async fn a_failing_person_lookup_degrades_the_mention_without_failing_the_thread() {
+async fn a_transient_person_lookup_failure_does_not_checkpoint_the_thread() {
     common::require_infra!();
     let server = quip_mention_server_with_users(ResponseTemplate::new(500)).await;
     let app = common::TestApp::new_with_quip_base(server.uri()).await;
-    // The account DOES exist — the mention is unresolvable only because the
-    // Quip lookup failed, which is what makes this a degradation test rather
-    // than a no-match test.
     app.create_user(QUIP_PERSON_EMAIL).await;
+    let import_id = seed_mention_import(&app, "owner1").await;
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    let outcome = execute_start_quip_import(&ctx, &import_id, "owner1").await;
+    assert!(outcome.is_err(), "the pass reports itself incomplete so the queue retries it");
+
+    let threads = app.state.import_repo.list_threads(&import_id).await.unwrap();
+    let tm = threads.iter().find(|t| t.quip_thread_id == "tm").unwrap();
+    assert_eq!(
+        tm.state,
+        ThreadState::Pending,
+        "a recoverable lookup failure must leave the thread retryable, not checkpointed",
+    );
+    assert_eq!(tm.attempts, 1, "charged to the thread's own attempt budget");
+    // The doc id is *reserved* before the first durable write, so it exists;
+    // what must not exist is a snapshot carrying the degraded placeholders.
+    let reserved = tm.ogre_doc_id.clone().expect("a doc id is reserved up front");
+    assert!(
+        app.state.doc_repo.load_snapshot(&reserved).await.unwrap().is_none(),
+        "no document may be persisted with mentions that a retry could still resolve",
+    );
+}
+
+/// A person Quip **decides** we cannot match still degrades permanently and
+/// silently — that is correct, and the retry above must not swallow it.
+///
+/// Quip answers 200 with a profile whose email belongs to nobody in
+/// OgreNotes: no retry could widen that, so the thread checkpoints.
+#[tokio::test]
+async fn a_decided_no_match_still_checkpoints_the_thread() {
+    common::require_infra!();
+    let server = quip_mention_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
     let import_id = seed_mention_import(&app, "owner1").await;
 
     let ctx = worker_ctx_with_quip(&app, server.uri());
@@ -1629,8 +1674,89 @@ async fn a_failing_person_lookup_degrades_the_mention_without_failing_the_thread
 
     let threads = app.state.import_repo.list_threads(&import_id).await.unwrap();
     let tm = threads.iter().find(|t| t.quip_thread_id == "tm").unwrap();
-    assert_eq!(tm.state, ThreadState::ContentDone, "a lookup failure never fails the thread");
+    assert_eq!(tm.state, ThreadState::ContentDone, "a decided no-match never fails the thread");
     let html = imported_html(&app, &tm.ogre_doc_id.clone().unwrap()).await;
     assert!(html.contains("@Joel"), "degraded to the name: {html}");
     assert!(!html.contains("class=\"mention\""), "{html}");
+}
+
+/// A **permanently** wrong `/1/users/` endpoint costs one request for the
+/// whole run, not one per mention-bearing thread.
+///
+/// The `?ids=` batch shape is an openly documented assumption (Quip's own
+/// reference client spells batch calls as form posts), so "the endpoint is
+/// simply wrong" is a live possibility — and re-asking once per thread would
+/// spend a 1 000-thread import's entire 50 req/min budget on a request that
+/// can never succeed. A 4xx is a *decision*: degrade every mention once and
+/// stop asking. The import still succeeds.
+///
+/// Mutation check: drop the `is_permanent_lookup_failure` arm and this test
+/// sees three `/1/users/` hits (one per thread) instead of one — and, because
+/// an uncached failure is undecided, all three threads stay `Pending` and the
+/// import never succeeds.
+#[tokio::test]
+async fn a_permanently_wrong_user_endpoint_is_asked_once_per_run_not_once_per_thread() {
+    common::require_infra!();
+    let server = MockServer::start().await;
+    let body = concat!(
+        r#"<p><control><a href="https://quip.com/PERSONA">Ann</a></control> and "#,
+        r#"<control><a href="https://quip.com/PERSONB">Bob</a></control></p>"#,
+    );
+    Mock::given(method("GET"))
+        .and(path("/1/folders/"))
+        .and(query_param("ids", "mroot"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "mroot": {
+                "folder": {"id": "mroot", "title": "Root"},
+                "children": [ {"thread_id": "x1"}, {"thread_id": "x2"}, {"thread_id": "x3"} ]
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/1/threads/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "x1": {"thread": {"id": "x1", "title": "A", "type": "document", "updated_usec": 1}},
+            "x2": {"thread": {"id": "x2", "title": "B", "type": "document", "updated_usec": 2}},
+            "x3": {"thread": {"id": "x3", "title": "C", "type": "document", "updated_usec": 3}}
+        })))
+        .mount(&server)
+        .await;
+    for t in ["x1", "x2", "x3"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/2/threads/{t}/html")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(body)))
+            .mount(&server)
+            .await;
+    }
+    // The endpoint shape is wrong. It will be wrong every time.
+    Mock::given(method("GET"))
+        .and(path("/1/users/"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_mention_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    // THE ASSERTION: one doomed request for the run, not one per thread.
+    assert_eq!(
+        hits(&server, "/1/users/").await,
+        1,
+        "a permanently-failing lookup endpoint must be asked exactly once per run",
+    );
+
+    // And the loss is bounded: every thread still imports, with names.
+    let threads = app.state.import_repo.list_threads(&import_id).await.unwrap();
+    assert_eq!(threads.len(), 3);
+    for t in &threads {
+        assert_eq!(t.state, ThreadState::ContentDone, "thread {} imported", t.quip_thread_id);
+        let html = imported_html(&app, &t.ogre_doc_id.clone().unwrap()).await;
+        assert!(html.contains("@Ann") && html.contains("@Bob"), "degraded to names: {html}");
+        assert!(!html.contains("class=\"mention\""), "{html}");
+    }
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ImportStatus::Succeeded, "the import still succeeds");
 }

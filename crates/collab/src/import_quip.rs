@@ -843,10 +843,34 @@ fn walk_anchor(
 ///    This becomes a `Mention` placeholder carrying the Quip person id and
 ///    the anchor's label. It is emphatically *not* [`walk_anchor`]'s
 ///    intra-Quip document link: a **bare** `<a href="https://quip.com/…">`
-///    in the same document is a folder/thread link and keeps its existing
-///    `DocMention` handling. The `<control>` wrapper is the only thing in
-///    the markup that tells the two apart, which is why it has to survive
-///    `allowed_tags`.
+///    is a folder/thread link and keeps its existing `DocMention` handling.
+///    The `<control>` wrapper has to survive `allowed_tags` for the two to
+///    be distinguishable at all.
+///
+///    **KNOWN OVER-BROAD, measured.** `<control>` is *not* exclusive to
+///    people. Across the 57-document staged corpus in
+///    `s3://…/imports/…/threads/` there are exactly four `<control>`-wrapped
+///    `quip.com` anchors, and only one is a person:
+///
+///    | href | label | actually |
+///    |---|---|---|
+///    | `quip.com/XYJAEA0Sgev` | `Joel` | a person |
+///    | `quip.com/JAdAOAxYGcQ` | `Family` | a **folder** |
+///    | `quip.com/nxkiAdYH4Nvj` | `SDM Opportunity - Alertus Technologies` | a **thread** |
+///    | `quip.com/81aBAkO87SsN#temp:C:KdF95ad…` | (section text) | a **thread section** |
+///
+///    The fragment-bearing row is handled: [`quip_person_id_from_url`]
+///    rejects it, so it stays a `DocMention`. The other two are **not**
+///    separable from a person in the markup — same tag, same
+///    `data-remapped="true"`, same attribute set, same URL shape — so a
+///    control-wrapped folder or thread chip currently becomes a person, fails
+///    to resolve, and degrades to plain `@Title` text, losing Phase 2b's
+///    back-patch. Narrowing further here would have to guess (id length is
+///    the only visible correlate, on a sample of four), so it is deliberately
+///    not attempted. The disambiguation this needs is *worker*-side: an id
+///    `/1/users/` returns no profile for is not a person, and the worker
+///    already computes exactly that distinction — see
+///    `worker_mode::PersonDirectory`.
 ///
 /// 2. **A client-rendered entity with no export content** — a Quip date, say:
 ///
@@ -1167,11 +1191,19 @@ fn quip_thread_from_url(href: &str) -> Option<QuipMention> {
 /// because Quip addresses a person and a thread identically; only the
 /// enclosing `<control>` says which one this is (see [`walk_control`]).
 /// Kept as its own helper rather than folded into `quip_thread_from_url` so
-/// no change here can alter how a bare document link is classified. A
-/// fragment is meaningless for a person and is ignored.
+/// no change here can alter how a bare document link is classified.
+///
+/// **A fragment disqualifies a person.** `#temp:C:…` is a *section* anchor,
+/// and sections belong to threads; a person has none. This is the one
+/// discriminator the staged corpus actually supplies (see [`walk_control`]),
+/// so a `<control>`-wrapped `quip.com/<ID>#<SECTION>` falls through to
+/// [`walk_anchor`] and keeps its back-patchable `DocMention`.
 fn quip_person_id_from_url(href: &str) -> Option<String> {
     let url = resolve_href(href)?;
     if !is_quip_host(url.host_str()?) {
+        return None;
+    }
+    if url.fragment().is_some_and(|f| !f.is_empty()) {
         return None;
     }
     url.path_segments()?.find(|s| !s.is_empty()).map(str::to_string)
@@ -1660,11 +1692,16 @@ fn insert_person_mention(
 ///   OgreNotes `user_id` and drops the pending attribute. Nothing about the
 ///   matching — no email, no Quip id — survives on the node; the OgreNotes
 ///   user id is the only identity a stored `Mention` carries.
-/// - **Unmatched**: the leaf is *replaced* by the plain text `@<display>`.
-///   Not left as an empty-`user_id` chip, which would render as a mention
-///   of nobody, and emphatically not as a `DocMention` — a person shown as
-///   a missing *document* is wrong however the lookup went. The reader
-///   still sees who was mentioned; only the link is missing.
+/// - **Unmatched**: the leaf is *replaced* by the plain text `@<display>`
+///   (or simply removed when there is no label to show). Not left as an
+///   empty-`user_id` chip, which would render as a mention of nobody, and
+///   emphatically not as a `DocMention` — a person shown as a missing
+///   *document* is wrong however the lookup went. The reader still sees who
+///   was mentioned; only the link is missing.
+///
+/// Each rewrite re-finds its node by `blockId` under the write transaction
+/// rather than by the index collected in phase one, because the degrade
+/// branch can change a parent's child count. See [`find_pending_mention`].
 ///
 /// Returns how many degraded, so the caller can log the loss.
 ///
@@ -1695,23 +1732,33 @@ pub fn resolve_person_mentions(doc: &Doc, resolved: &HashMap<String, String>) ->
     let mut degraded = 0usize;
     let mut txn = doc.transact_mut();
     for found in &pending {
+        // Re-find the node instead of trusting the index collected in phase
+        // one. The degrade branch below removes a child and only re-inserts
+        // when there is a label to show, so a *sibling* rewritten earlier in
+        // this loop can shift every later index in the same parent. Keying on
+        // the node's own `blockId` — minted by `insert_block`, unique, and
+        // already the handle the side table records — makes each rewrite
+        // independent of every other, in any order. It also confirms the
+        // target really is a still-pending `Mention` before writing a user id
+        // onto it, which an index alone cannot.
+        let Some((index, el)) = find_pending_mention(&txn, &found.parent, &found.block_id) else {
+            debug_assert!(false, "a collected pending mention vanished before it was decided");
+            continue;
+        };
         match resolved.get(&found.quip_user_id) {
             Some(user_id) => {
-                let Some(XmlOut::Element(el)) = found.parent.get(&txn, found.index) else {
-                    continue;
-                };
                 el.insert_attribute(&mut txn, "user_id", user_id.as_str());
                 el.remove_attribute(&mut txn, &PENDING_QUIP_USER_ATTR);
             }
             None => {
-                // Remove-one-then-insert-one leaves every later sibling at
-                // the same index, so the collected indices stay valid and
-                // no reverse-order walk is needed.
-                found.parent.remove_range(&mut txn, found.index, 1);
+                found.parent.remove_range(&mut txn, index, 1);
+                // An empty label (an avatar-only or deleted-user mention)
+                // leaves nothing to say, so the chip simply disappears
+                // rather than becoming a bare `@`.
                 if !found.display.is_empty() {
                     found.parent.insert(
                         &mut txn,
-                        found.index,
+                        index,
                         XmlTextPrelim::new(format!("@{}", found.display)),
                     );
                 }
@@ -1722,11 +1769,33 @@ pub fn resolve_person_mentions(doc: &Doc, resolved: &HashMap<String, String>) ->
     degraded
 }
 
-/// One unresolved `Mention` leaf plus the handle and index needed to
-/// rewrite it in place.
+/// The still-pending `Mention` child of `parent` carrying `block_id`, with
+/// its *current* index.
+///
+/// Matching on the pending attribute as well as the block id means a node
+/// this pass has already decided can never be picked up twice: a match drops
+/// the attribute and a degrade removes the node outright.
+fn find_pending_mention<T: ReadTxn>(
+    txn: &T,
+    parent: &XmlElementRef,
+    block_id: &str,
+) -> Option<(u32, XmlElementRef)> {
+    (0..parent.len(txn)).find_map(|i| {
+        let Some(XmlOut::Element(child)) = parent.get(txn, i) else {
+            return None;
+        };
+        let is_target = child.tag().as_ref() == NodeType::Mention.tag_name()
+            && child.get_attribute(txn, PENDING_QUIP_USER_ATTR).is_some()
+            && child.get_attribute(txn, "blockId").as_deref() == Some(block_id);
+        is_target.then_some((i, child))
+    })
+}
+
+/// One unresolved `Mention` leaf plus the handle and block id needed to
+/// re-find it and rewrite it in place.
 struct PendingPerson {
     parent: XmlElementRef,
-    index: u32,
+    block_id: String,
     quip_user_id: String,
     display: String,
 }
@@ -1744,7 +1813,7 @@ fn collect_person_mentions<T: ReadTxn>(
             if let Some(quip_user_id) = child.get_attribute(txn, PENDING_QUIP_USER_ATTR) {
                 out.push(PendingPerson {
                     parent: parent.clone(),
-                    index: i,
+                    block_id: child.get_attribute(txn, "blockId").unwrap_or_default(),
                     quip_user_id,
                     display: child.get_attribute(txn, "display").unwrap_or_default(),
                 });
@@ -2581,11 +2650,11 @@ mod tests {
 
     // ─── person mentions (`<control>`) ────────────────────────────
     //
-    // Every fixture below is markup **copied verbatim** from a real staged
-    // `/2` thread body, not a simplified invention: the whole class of bug
-    // here comes from the person shape and the document shape being
-    // indistinguishable once a wrapper is dropped, which a hand-written
-    // fixture is exactly the wrong tool for noticing.
+    // The fixtures below are markup from real staged `/2` thread bodies: the
+    // whole class of bug here comes from the person shape and the document
+    // shape being indistinguishable once a wrapper is dropped, which a
+    // hand-written fixture is exactly the wrong tool for noticing.
+    // `REAL_FOLDER_LINK` is the one derivation — see its own comment.
 
     /// A person mention. The `<control>` wrapper is the entire signal.
     const REAL_PERSON_MENTION: &str = concat!(
@@ -2594,12 +2663,29 @@ mod tests {
         r#"<a href="https://quip.com/XYJAEA0Sgev">Joel</a></control>."#,
     );
 
-    /// A folder link from the *same* document — a **bare** `<a>` at an
-    /// indistinguishable URL. This must keep the existing document-link
-    /// behavior, or the fix has simply moved the bug.
+    /// A folder link at an indistinguishable URL, **stripped of its wrapper**.
+    /// This must keep the existing document-link behavior, or the fix has
+    /// simply moved the bug.
+    ///
+    /// Provenance, corrected: the url and label are verbatim from the same
+    /// staged document as [`REAL_PERSON_MENTION`], but in the source this
+    /// folder link is *also* `<control>`-wrapped
+    /// (`<control data-remapped="true" id="SSfACA1I4lV">…`). The bare form
+    /// below is a derived fixture, not a transcription — see
+    /// [`super::walk_control`]'s KNOWN OVER-BROAD table for what the corpus
+    /// actually contains and why the person rule is not narrowed on it.
     const REAL_FOLDER_LINK: &str = concat!(
         "When you're done, check out your folder: ",
         r#"<a href="https://quip.com/JAdAOAxYGcQ">Family</a>"#,
+    );
+
+    /// A `<control>`-wrapped link to a *section of a thread*, verbatim from
+    /// the staged `KdFAAAxgYHm` body. The `#temp:C:…` fragment is what makes
+    /// it decidably a document rather than a person.
+    const REAL_CONTROL_SECTION_LINK: &str = concat!(
+        r#"<control data-remapped="true" id="temp:C:KdF6a74070b4ab84f488b2ddcf7d">"#,
+        r#"<a href="https://quip.com/81aBAkO87SsN#temp:C:KdF95ad5eac998f4086952fea453">"#,
+        r#"Quip is being retired.</a></control>"#,
     );
 
     /// A Quip date: client-rendered, so the export carries an empty control.
@@ -2772,6 +2858,89 @@ mod tests {
         );
         let html = crate::export::to_html(&out.doc);
         assert!(html.contains("@Joel") && html.contains("a ") && html.contains(" b"), "{html}");
+    }
+
+    /// An **empty-label** person mention (an avatar-only or deleted-user chip;
+    /// `trim_spans` deliberately retains a person span with no text) must not
+    /// disturb its siblings.
+    ///
+    /// This is the regression test for the index-shift corruption: the degrade
+    /// branch removes the node and, with no label to show, inserts nothing —
+    /// so an index-addressed rewrite loop leaves every later mention in the
+    /// same parent off by one.
+    ///
+    /// Mutation check: restore the index-based rewrite (`PendingPerson.index`
+    /// + `found.parent.get(&txn, found.index)`) and this test goes red on
+    /// every assertion below — the trailing `" C"` is deleted and replaced by
+    /// a duplicate `@Bob`, and a `<mention user_id="" pending_quip_user="…">`
+    /// survives into the document.
+    #[test]
+    fn an_empty_label_person_mention_does_not_shift_its_siblings() {
+        const BODY: &str = concat!(
+            r#"<p>A <control><a href="https://quip.com/EMPTYONE"></a></control>"#,
+            r#" B <control><a href="https://quip.com/SECOND">Bob</a></control> C</p>"#,
+        );
+
+        // Both unmatched.
+        let out = from_quip_html(BODY);
+        assert_eq!(out.person_mentions.len(), 2, "both chips are collected");
+        assert_eq!(out.person_mentions[0].label, "", "the empty label is retained");
+        assert_eq!(resolve_person_mentions(&out.doc, &HashMap::new()), 2, "both decided");
+        assert!(mention_leaves(&out.doc).is_empty(), "no empty-user_id chip may remain");
+        assert_valid_tree(&out.doc);
+
+        let html = crate::export::to_html(&out.doc);
+        assert!(html.contains("@Bob"), "the labelled chip degrades to its name: {html}");
+        assert_eq!(html.matches("@Bob").count(), 1, "and exactly once: {html}");
+        assert!(html.contains(" C"), "adjacent text must not be destroyed: {html}");
+        assert!(!html.contains("EMPTYONE") && !html.contains("SECOND"), "{html}");
+        assert!(
+            !String::from_utf8_lossy(&crate::snapshot::doc_to_bytes(&out.doc))
+                .contains(PENDING_QUIP_USER_ATTR),
+            "the intermediate node shape must not reach the snapshot",
+        );
+
+        // The later chip *matched*: it must get the real user id, not have it
+        // written onto whatever sat at a stale index.
+        let out = from_quip_html(BODY);
+        let resolved = HashMap::from([("SECOND".to_string(), "ogre-bob".to_string())]);
+        assert_eq!(resolve_person_mentions(&out.doc, &resolved), 1, "only the empty one degrades");
+        assert_eq!(
+            mention_leaves(&out.doc),
+            vec![("ogre-bob".to_string(), "Bob".to_string(), None)],
+            "the matched chip carries the OgreNotes id and no Quip id",
+        );
+        let html = crate::export::to_html(&out.doc);
+        assert!(html.contains(" C"), "adjacent text must not be destroyed: {html}");
+        assert!(!html.contains("SECOND"), "the Quip id must not survive: {html}");
+    }
+
+    /// A `<control>`-wrapped anchor carrying a **section fragment** is a
+    /// document link, not a person: sections belong to threads, and a person
+    /// has none. This is the one discriminator the staged corpus supplies.
+    ///
+    /// Mutation check: drop the fragment guard in `quip_person_id_from_url`
+    /// and this becomes a person mention — `person_mentions` gains an entry
+    /// and `pending_links` empties.
+    #[test]
+    fn a_control_wrapped_section_link_is_a_document_not_a_person() {
+        let out = from_quip_html(REAL_CONTROL_SECTION_LINK);
+
+        assert!(
+            out.person_mentions.is_empty(),
+            "a section anchor is a document link however it is wrapped: {:?}",
+            out.person_mentions.iter().map(|m| &m.quip_user_id).collect::<Vec<_>>(),
+        );
+        assert_eq!(out.pending_links.len(), 1, "the back-patchable link survives");
+        assert_eq!(out.pending_links[0].target_quip_thread_id, "81aBAkO87SsN");
+        assert_eq!(
+            out.pending_links[0].target_quip_section_id.as_deref(),
+            Some("temp:C:KdF95ad5eac998f4086952fea453"),
+        );
+        assert!(mention_leaves(&out.doc).is_empty(), "no person chip");
+
+        let html = crate::export::to_html(&out.doc);
+        assert!(html.contains("doc-mention"), "the DocMention placeholder survives: {html}");
     }
 
     /// A person mention inside a table cell / list item is reached too — the
