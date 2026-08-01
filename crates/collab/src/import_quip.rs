@@ -452,6 +452,13 @@ pub(crate) fn parse_quip_counting_truncations(html: &str) -> (Vec<QuipBlock>, us
         .read_from(&mut safe.as_bytes())
         .expect("html5ever parse is infallible on bytes");
 
+    // Rewrite Quip's two list-structure spellings into ordinary HTML first —
+    // nesting a list inside the item that owns it deepens the tree, so this
+    // has to happen on the *un*bounded tree for the bound below to still hold
+    // when the walker runs. `normalize_quip_lists` is itself iterative, so it
+    // survives the same pathological input `flatten_below_depth` exists for.
+    normalize_quip_lists(&dom.document);
+
     // Bound the tree BEFORE the recursive walk rather than threading a depth
     // counter through all twelve `walk_children` call sites. The guarantee is
     // then structural: whatever the walker receives is already shallower than
@@ -533,6 +540,295 @@ fn collect_text(roots: &[markup5ever_rcdom::Handle]) -> String {
         }
     }
     text
+}
+
+// ─── stage 2b: Quip list-structure normalization ─────────────────
+//
+// Quip spells list **structure** — nesting, and continuation of a
+// numbered sequence — in two shapes that are not the HTML those things
+// normally have. Both are rewritten here, on the sanitized DOM, into the
+// ordinary markup the walker already understands. Nothing downstream
+// (`walk_element`, `parse_list`, `enclosing_section_style`,
+// `enforce_containment`) changes, which is what keeps the corpus's 565
+// bullet lists, 46 tables and 1 checklist exactly as they were.
+
+/// Rewrite Quip's two list-structure spellings into ordinary HTML.
+///
+/// Runs before [`flatten_below_depth`] rather than after: nesting a list
+/// inside the item that owns it *deepens* the tree, and the walker's
+/// contract is that whatever reaches it is already shallower than
+/// [`MAX_NESTING_DEPTH`]. Doing the rewrite first and bounding after
+/// keeps that guarantee exact instead of approximately.
+///
+/// Iterative with an explicit stack, for the reason
+/// [`flatten_below_depth`] is: this runs on unbounded third-party markup,
+/// so it must not recurse. Both rewrites only ever move a node into one
+/// of its own siblings, so the moved node is still reached by the
+/// traversal that follows — no node is visited twice and none is missed.
+fn normalize_quip_lists(document: &markup5ever_rcdom::Handle) {
+    let mut stack = vec![document.clone()];
+    while let Some(node) = stack.pop() {
+        merge_numbered_sections(&node);
+        nest_sibling_lists(&node);
+        for child in node.children.borrow().iter() {
+            stack.push(child.clone());
+        }
+    }
+}
+
+/// **#187.** Move a list that is a *sibling* of the `<li>` it belongs to
+/// inside that `<li>`.
+///
+/// Quip has exactly one spelling for a nested list, and it is not the
+/// standard one:
+///
+/// ```html
+/// <ul><li class='parent'>Queue</li>
+///     <ul><li>nested</li></ul>          <!-- sibling of the <li> -->
+/// </ul>
+/// ```
+///
+/// **Measured across the 56-document staged corpus.** The sibling shape
+/// occurs **470 times in 25 documents**; the standard `<ul>`-inside-`<li>`
+/// shape occurs **zero** times. Of the 470, **418** are preceded by an
+/// `<li class='parent'>` and the remaining **52** have no preceding `<li>`
+/// at all. `class='parent'` is exact where it applies — all 418 `<li>`s
+/// carrying it are followed by a nested list, and no `<li>` *without* it
+/// is (0 counter-examples in either direction).
+///
+/// The rule below keys on **position** rather than on that class, because
+/// the two agree on all 418 sites and position also answers the other 52:
+/// those are `<ul><ul>…</ul></ul>` — an indent wrapper with no owning
+/// bullet, which has nothing to nest *into*. Leaving them alone preserves
+/// today's behaviour, where [`collect_items`] descends the wrapper and
+/// keeps its items at one level. Inventing an empty parent item for them
+/// would add 52 blank bullets to the corpus.
+fn nest_sibling_lists(list: &markup5ever_rcdom::Handle) {
+    if !matches!(tag_of(list).as_deref(), Some("ul" | "ol")) {
+        return;
+    }
+    let children = std::mem::take(&mut *list.children.borrow_mut());
+    let mut kept = Vec::new();
+    let mut owner: Option<markup5ever_rcdom::Handle> = None;
+    for child in children {
+        match tag_of(&child).as_deref() {
+            Some("li") => {
+                owner = Some(child.clone());
+                kept.push(child);
+            }
+            Some("ul" | "ol") => match &owner {
+                Some(item) => append_child(item, child),
+                // An indent wrapper with no bullet above it: nothing to
+                // nest into, so leave it where it is.
+                None => kept.push(child),
+            },
+            _ => kept.push(child),
+        }
+    }
+    *list.children.borrow_mut() = kept;
+}
+
+/// **#188.** Merge a run of sibling `data-section-style='6'` sections
+/// into a single ordered list, so a numbered sequence numbers 1..n
+/// instead of restarting at 1 on every item.
+///
+/// Quip emits each numbered item as its *own* section, and marks every
+/// section after the first with [`NUMBERING_CONTINUES_CLASS`]. Between
+/// two consecutive numbered items it puts that item's sub-content —
+/// an indented `'5'` section, and sometimes a `<pre>` code sample.
+///
+/// **Measured across the 56-document staged corpus.** 60 `'6'` sections
+/// produce 60 ordered lists today, 47 of them holding a single item;
+/// `CVLAAAgSl7Q`'s 7-step "API Endpoints" procedure renders "1." seven
+/// times. Applying the rule below yields **25** lists — 17 genuine
+/// singletons plus sequences of 3, 4, 4, 5, 5, 7, 7 and 8 — with all 60
+/// items preserved. The two 7s are `CVLAAAgSl7Q` and `NceAAAcEiOG`.
+///
+/// **What may interrupt a run, and what ends one.** In the whole corpus
+/// exactly two kinds of element ever sit between a `'6'` section and the
+/// next section continuing it: an indent-wrapped `'5'` section (36) and a
+/// `<pre>` (6). A heading, paragraph, table or anything else never does —
+/// wherever one of those appears, the next `'6'` section lacks the
+/// continues-class, i.e. **Quip itself has ended the sequence there**. So
+/// the run is ended by anything that is not a continuation or that item's
+/// own sub-content, and the continues-class alone decides which.
+///
+/// Absorbed content becomes the preceding item's sub-content, which
+/// `NodeType::ListItem::valid_children` permits for both kinds
+/// (`BulletList` and `CodeBlock`). The `'5'` section is moved **whole**,
+/// wrapper `<div>` included, so [`enclosing_section_style`] still resolves
+/// it to `'5'` and it stays a bullet list rather than inheriting the
+/// enclosing `'6'`.
+///
+/// Absorbing a `<pre>` is not gated on a continuation actually following:
+/// the corpus was checked both ways and the two rules agree on all six
+/// occurrences, and un-gated is the simpler invariant.
+fn merge_numbered_sections(container: &markup5ever_rcdom::Handle) {
+    let children = std::mem::take(&mut *container.children.borrow_mut());
+    let mut kept = Vec::new();
+    // The `<ul>` accumulating the open sequence's items, if one is open.
+    let mut open: Option<markup5ever_rcdom::Handle> = None;
+
+    for child in children {
+        let style = attr(&child, "data-section-style");
+        let style = style.as_deref().map(str::trim);
+        let absorbed = match (&open, style, tag_of(&child).as_deref()) {
+            // A continuation: its items join the open list and the now
+            // empty section disappears.
+            (Some(acc), Some(SECTION_STYLE_ORDERED), _)
+                if classes(&child).iter().any(|c| c == NUMBERING_CONTINUES_CLASS) =>
+            {
+                move_items_into(&child, acc);
+                !section_still_has_content(&child)
+            }
+            // A new sequence: this section's own list becomes the
+            // accumulator and the section stays where it is.
+            (_, Some(SECTION_STYLE_ORDERED), _) => {
+                open = items_list_of(&child);
+                false
+            }
+            // The preceding item's sub-content.
+            (Some(acc), Some(SECTION_STYLE_BULLET), _) if is_indent_wrapper(&child) => {
+                absorb_into_last_item(acc, &child)
+            }
+            (Some(acc), _, Some("pre")) => absorb_into_last_item(acc, &child),
+            // Anything else ends the sequence — but whitespace between
+            // two sections is layout, not an element, and must not.
+            _ => {
+                if !is_layout_whitespace(&child) {
+                    open = None;
+                }
+                false
+            }
+        };
+        if !absorbed {
+            kept.push(child);
+        }
+    }
+    *container.children.borrow_mut() = kept;
+}
+
+/// Append `section` to the last `<li>` of `acc`, reporting whether it
+/// moved. A list with no item yet has nowhere to put it.
+fn absorb_into_last_item(
+    acc: &markup5ever_rcdom::Handle,
+    section: &markup5ever_rcdom::Handle,
+) -> bool {
+    let Some(item) = last_item_of(acc) else { return false };
+    append_child(&item, section.clone());
+    true
+}
+
+/// Move every child of `section`'s item-bearing list onto the end of
+/// `acc`. Nested lists ride along as siblings and are nested into their
+/// own item by [`nest_sibling_lists`] when the traversal reaches `acc`.
+fn move_items_into(section: &markup5ever_rcdom::Handle, acc: &markup5ever_rcdom::Handle) {
+    let Some(list) = items_list_of(section) else { return };
+    for child in std::mem::take(&mut *list.children.borrow_mut()) {
+        append_child(acc, child);
+    }
+}
+
+/// The first list under `handle` that actually holds `<li>` children —
+/// which is the *inner* one when Quip has interposed an indent wrapper.
+fn items_list_of(handle: &markup5ever_rcdom::Handle) -> Option<markup5ever_rcdom::Handle> {
+    let mut stack = vec![handle.clone()];
+    while let Some(node) = stack.pop() {
+        if matches!(tag_of(&node).as_deref(), Some("ul" | "ol"))
+            && node.children.borrow().iter().any(|c| tag_of(c).as_deref() == Some("li"))
+        {
+            return Some(node);
+        }
+        for child in node.children.borrow().iter().rev() {
+            stack.push(child.clone());
+        }
+    }
+    None
+}
+
+/// The last `<li>` child of a list.
+fn last_item_of(list: &markup5ever_rcdom::Handle) -> Option<markup5ever_rcdom::Handle> {
+    list.children.borrow().iter().rev().find(|c| tag_of(c).as_deref() == Some("li")).cloned()
+}
+
+/// Whether a section's outermost list is Quip's bare indent wrapper —
+/// a `<ul>` holding no `<li>` of its own, only another list. That
+/// wrapper is exactly how Quip marks a `'5'` section as *indented under*
+/// the numbered item above it rather than a bullet list in its own right.
+fn is_indent_wrapper(section: &markup5ever_rcdom::Handle) -> bool {
+    let mut stack = vec![section.clone()];
+    while let Some(node) = stack.pop() {
+        if matches!(tag_of(&node).as_deref(), Some("ul" | "ol")) {
+            return !node.children.borrow().iter().any(|c| tag_of(c).as_deref() == Some("li"));
+        }
+        for child in node.children.borrow().iter().rev() {
+            stack.push(child.clone());
+        }
+    }
+    false
+}
+
+/// Whether a drained section still carries anything worth keeping. An
+/// emptied `<ul>` does not — `flatten_list` drops an item-less list —
+/// but a stray paragraph the section also held does, so the section is
+/// only discarded when nothing but empty list scaffolding remains.
+fn section_still_has_content(section: &markup5ever_rcdom::Handle) -> bool {
+    use markup5ever_rcdom::NodeData;
+    let mut stack = vec![section.clone()];
+    while let Some(node) = stack.pop() {
+        match &node.data {
+            NodeData::Text { contents } => {
+                if !contents.borrow().trim().is_empty() {
+                    return true;
+                }
+            }
+            NodeData::Element { .. } => {
+                let tag = tag_of(&node);
+                if !matches!(tag.as_deref(), Some("ul" | "ol" | "div")) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        for child in node.children.borrow().iter() {
+            stack.push(child.clone());
+        }
+    }
+    false
+}
+
+/// Whitespace between two block elements: layout, not content, and so
+/// not something that ends a numbered sequence.
+fn is_layout_whitespace(handle: &markup5ever_rcdom::Handle) -> bool {
+    use markup5ever_rcdom::NodeData;
+    match &handle.data {
+        NodeData::Text { contents } => contents.borrow().trim().is_empty(),
+        // Comments and doctypes are dropped by the walker outright.
+        NodeData::Element { .. } | NodeData::Document => false,
+        _ => true,
+    }
+}
+
+/// Re-parent `child` onto the end of `parent`'s children.
+///
+/// Setting the parent link is load-bearing, not bookkeeping:
+/// [`enclosing_section_style`] walks *up* from a list to find the
+/// `data-section-style` that decides whether it is bullets, numbers or
+/// checkboxes. A moved node with a stale parent would be read against
+/// the section it came from.
+fn append_child(parent: &markup5ever_rcdom::Handle, child: markup5ever_rcdom::Handle) {
+    child.parent.set(Some(std::rc::Rc::downgrade(parent)));
+    parent.children.borrow_mut().push(child);
+}
+
+/// The lowercased tag name of an element node, or `None` for anything
+/// that is not an element.
+fn tag_of(handle: &markup5ever_rcdom::Handle) -> Option<String> {
+    use markup5ever_rcdom::NodeData;
+    match &handle.data {
+        NodeData::Element { name, .. } => Some(name.local.as_ref().to_ascii_lowercase()),
+        _ => None,
+    }
 }
 
 /// Inline text accumulated between block boundaries. Flushed as a
@@ -1185,6 +1481,10 @@ fn find_checkbox(handle: &markup5ever_rcdom::Handle) -> Option<markup5ever_rcdom
 // element alone. Values absent from the table were not seen at all;
 // do not invent readings for them.
 
+/// Section style of a **bullet** list. Also the style Quip gives the
+/// *sub-content* of a numbered item — see [`merge_numbered_sections`].
+const SECTION_STYLE_BULLET: &str = "5";
+
 /// Section style of a **numbered** list. Its `<ul>` is indistinguishable
 /// from a bullet list's — see the table above.
 const SECTION_STYLE_ORDERED: &str = "6";
@@ -1192,6 +1492,24 @@ const SECTION_STYLE_ORDERED: &str = "6";
 /// Section style of a **checklist**. Its `<ul>` is indistinguishable
 /// from a bullet list's — see the table above.
 const SECTION_STYLE_CHECKLIST: &str = "7";
+
+/// Quip's own name for "this numbered section continues the previous
+/// one" — it appears on a [`SECTION_STYLE_ORDERED`] section together
+/// with `style="--indent0: N"`, where `N` is the number Quip renders.
+///
+/// **Measured, not guessed.** Across the 56-document staged corpus the
+/// class and `--indent0` co-occur exactly: 35 sections carry both, 25
+/// carry neither, and no section carries one without the other. In all
+/// 25 resulting sequences `N` equals the item's 1-based position, with
+/// zero mismatches — so the *class* is a sufficient signal and the
+/// number it restarts at is redundant. That is why nothing here reads
+/// `style`, which the sanitizer strips (`allowed_attributes`).
+///
+/// Despite the name, `--indent0` is **not** an indent level: every one
+/// of the 35 sections carrying it holds a flat, unnested list. List
+/// *nesting* is spelled the other way entirely — see
+/// [`nest_sibling_lists`].
+const NUMBERING_CONTINUES_CLASS: &str = "list-numbering-restart-at";
 
 /// Whether a list is a checklist independent of its items. `section` is
 /// the nearest enclosing `data-section-style`, already resolved by
