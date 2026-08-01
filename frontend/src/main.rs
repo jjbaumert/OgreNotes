@@ -17,6 +17,7 @@ pub use ogrenotes_frontend::i18n;
 pub use ogrenotes_frontend::t;
 pub mod observability;
 mod pages;
+mod presentation;
 mod rum;
 mod spreadsheet;
 mod editor_width;
