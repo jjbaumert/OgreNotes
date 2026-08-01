@@ -3224,6 +3224,131 @@ mod tests {
         }
     }
 
+    /// Verbatim `CVLAAAgSl7Q` again — its "Key Components" run, where a
+    /// `<pre>` code sample sits *between* two numbered items. Quip's
+    /// continues-class spans the code block (the next section is still
+    /// `--indent0: 3`), so the sample illustrates item 2 rather than
+    /// ending the sequence. The interleaved `'5'` section is omitted; the
+    /// three sections kept are unedited.
+    ///
+    /// A `<pre>` is one of exactly two things the corpus ever puts inside
+    /// a numbered run — the other being an indent-wrapped `'5'` section.
+    /// It occurs 6 times.
+    #[rustfmt::skip]
+    const REAL_NUMBERED_RUN_ACROSS_A_CODE_BLOCK: &str = concat!(
+        "<div data-section-style='6' class=\"list-numbering-restart-at\" style=\"--indent0: 2\">\
+         <ul id='temp:C:CVLbc2723c01b024e1894cbe3cd4'>\
+         <li id='temp:C:CVL4f59e56d490b4640a0d690d98' class='' style='' value='1'>\
+         <span id='temp:C:CVL4f59e56d490b4640a0d690d98'><b>GameDetail Component</b></span>\
+         <br/></li></ul></div>",
+        // One source line: a `<pre>`'s leading spaces are content, and a
+        // `\` continuation would eat them.
+        "<pre id='temp:C:CVL09a9aeedb1db4947b4fabcc84' class='prettyprint'>#[component]<br>pub fn GameDetail(game_id: String) -&gt; impl IntoView {<br>    let game = create_resource(move || game_id.clone(), |id| async { fetch_game(&amp;id).await });<br>    let state = create_memo(move || reduce_events(&amp;game.get().unwrap().events));<br>    view! {<br>        &lt;div&gt;<br>            &lt;GameBoard state=state /&gt;<br>        &lt;/div&gt;<br>    }<br>}</pre>",
+        "<div data-section-style='6' class=\"list-numbering-restart-at\" style=\"--indent0: 3\">\
+         <ul id='temp:C:CVL9824e70cfe1c4b0bbe6ed0e56'>\
+         <li id='temp:C:CVL7d39064289c345bf88c7b5bb5' class='' style='' value='1'>\
+         <span id='temp:C:CVL7d39064289c345bf88c7b5bb5'><b>GameBoard Component</b></span>\
+         <br/></li></ul></div>",
+    );
+
+    #[test]
+    fn a_code_block_between_two_numbered_items_does_not_end_the_run() {
+        let b = blocks(REAL_NUMBERED_RUN_ACROSS_A_CODE_BLOCK);
+        // Without the `<pre>` arm the code block closes the sequence and
+        // this is three blocks — list, code, list — and the corpus's
+        // 5-item "Key Components" run splits into 2 + 3.
+        assert_eq!(b.len(), 1, "a `<pre>` inside a numbered run is not a terminator: {b:?}");
+        let QuipBlock::List { ordered, items, .. } = &b[0] else {
+            panic!("expected one list, got {b:?}")
+        };
+        assert!(*ordered, "{b:?}");
+        assert_eq!(
+            item_texts(items),
+            vec!["GameDetail Component", "GameBoard Component"],
+            "the run continues across the code block: {b:?}"
+        );
+
+        // The sample becomes item 1's sub-content — legal, since
+        // `ListItem::valid_children` includes `CodeBlock`.
+        assert_eq!(
+            items[0].blocks.len(),
+            2,
+            "the code block hangs off the item it illustrates: {:?}",
+            items[0].blocks
+        );
+        let QuipBlock::Code { text, .. } = &items[0].blocks[1] else {
+            panic!("expected a code block inside item 1: {:?}", items[0].blocks)
+        };
+        assert!(text.contains("pub fn GameDetail"), "code text survives verbatim: {text:?}");
+        assert_eq!(items[1].blocks.len(), 1, "item 2 gains nothing: {:?}", items[1].blocks);
+    }
+
+    /// Verbatim, contiguous `AAMAAAUv1cp`: a numbered section followed
+    /// immediately by a **flat** `'5'` section — one whose `<ul>` has its
+    /// own `<li>` children rather than Quip's bare `<ul><ul>` indent
+    /// wrapper. Three such pairs exist in the corpus, against 44 where
+    /// the following `'5'` *is* wrapped.
+    ///
+    /// The wrapper is the whole discriminator: without it a `'5'` section
+    /// is a bullet list standing on its own, and swallowing it into the
+    /// numbered item above would be a content-structure regression.
+    const REAL_FLAT_BULLET_SECTION_AFTER_A_NUMBERED_ONE: &str =
+        "<div data-section-style='6' class=\"\" style=\"\">\
+         <ul id='temp:C:AAMba25b35f15e54908801e80b9f'><ul>\
+         <li id='temp:C:AAM7cc8c0e0f47640129a85c85ab' class='' style='' value='1'>\
+         <span id='temp:C:AAM7cc8c0e0f47640129a85c85ab'>Client connects with JWT in query \
+         param: ?token=ey...</span><br/></li>\
+         <li id='temp:C:AAM70224200fde24de09ab630db2' class='' style=''>\
+         <span id='temp:C:AAM70224200fde24de09ab630db2'>Server validates JWT → extracts \
+         userId</span><br/></li>\
+         <li id='temp:C:AAM5fed81e8312f455d99961c48a' class='' style=''>\
+         <span id='temp:C:AAM5fed81e8312f455d99961c48a'>Client sends JSON message: \
+         { \"type\": \"subscribe\", \"sessionId\": \"abc123\" }</span><br/></li>\
+         <li id='temp:C:AAM0e1c44390d4446b7870876176' class='' style=''>\
+         <span id='temp:C:AAM0e1c44390d4446b7870876176'>Server registers actor to session \
+         broadcast group</span><br/></li>\
+         </ul></ul></div>\
+         <div data-section-style='5' class=\"\" style=\"\">\
+         <ul id='temp:C:AAM3e8ed59e730b4d2aa6941b14d'>\
+         <li id='temp:C:AAMf5fa52d7d2c24fe5af779320f' class='parent' style='' value='1'>\
+         <span id='temp:C:AAMf5fa52d7d2c24fe5af779320f'>Message types (JSON):</span>\
+         <br/></li>\
+         <ul><li id='temp:C:AAM5ca9f0bc4485483980f6fc4f6' class='' style=''>\
+         <span id='temp:C:AAM5ca9f0bc4485483980f6fc4f6'>{ \"type\": \"chat\", \"content\": \
+         \"Hello!\" }</span><br/></li>\
+         <li id='temp:C:AAM5871d4747e6343f2a782ea077' class='' style=''>\
+         <span id='temp:C:AAM5871d4747e6343f2a782ea077'>{ \"type\": \"typing\", \"isTyping\": \
+         true } (optional)</span><br/></li>\
+         <li id='temp:C:AAMd60ebc26c0c6458c836963b9e' class='' style=''>\
+         <span id='temp:C:AAMd60ebc26c0c6458c836963b9e'>Server broadcasts to all in session + \
+         persists to DynamoDB</span><br/></li></ul>\
+         </ul></div>";
+
+    #[test]
+    fn a_flat_bullet_section_after_a_numbered_one_is_not_absorbed() {
+        let b = blocks(REAL_FLAT_BULLET_SECTION_AFTER_A_NUMBERED_ONE);
+        // Without the `is_indent_wrapper` gate this is one block: the
+        // bullet list is swallowed into the numbered list's last item.
+        assert_eq!(b.len(), 2, "an unwrapped '5' section stands on its own: {b:?}");
+
+        let QuipBlock::List { ordered, items, .. } = &b[0] else { panic!("{b:?}") };
+        assert!(*ordered, "{b:?}");
+        assert_eq!(items.len(), 4, "the numbered section keeps its four items: {items:?}");
+        assert!(
+            items.iter().all(|i| i.blocks.len() == 1),
+            "no numbered item gains the bullet section: {items:?}"
+        );
+
+        let QuipBlock::List { ordered: o, task, items: bullets } = &b[1] else { panic!("{b:?}") };
+        assert!(!*o && !*task, "a '5' section is bullets: {b:?}");
+        assert_eq!(item_texts(bullets), vec!["Message types (JSON):"], "{bullets:?}");
+        // Its own `class='parent'` nesting still applies inside it.
+        let QuipBlock::List { items: sub, .. } = &bullets[0].blocks[1] else {
+            panic!("expected the nested list inside it: {:?}", bullets[0].blocks)
+        };
+        assert_eq!(sub.len(), 3, "{sub:?}");
+    }
+
     // ─── regressions: the shapes that already worked ─────────
 
     #[test]
