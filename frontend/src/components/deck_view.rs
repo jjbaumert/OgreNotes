@@ -420,6 +420,38 @@ pub fn DeckView(
         on_change.run(());
     };
 
+    // Flushes a pending arrow-nudge (Task 10 review, Finding 2). Arrow
+    // nudges mutate `deck` directly on every keydown for instant
+    // feedback and only persist on the matching keyup — coalescing a
+    // held-key's repeat into one write — but a keyup can fail to land
+    // on this handler at all (focus loss, a slide switch mid-nudge,
+    // component teardown), which would leave `nudge_dirty` true with
+    // no write ever scheduled. Every place a nudge gesture can be
+    // interrupted before its own keyup calls this instead of
+    // duplicating the coalescing check inline.
+    //
+    // The doc is captured *synchronously* here (not by deferring the
+    // whole `persist()` call, which would re-read `deck` — and by
+    // then, when called from the resync Effect below, `deck` has
+    // already been overwritten with the remote update) — only the
+    // actual `on_state_change`/`on_change` send is deferred via
+    // `a11y::defer`, for the same synchronous-Effect-reentrancy reason
+    // the bootstrap-persist path defers below: `on_state_change` flows
+    // back into `editor_state`, which would otherwise re-enter the
+    // resync Effect while it's still on the stack.
+    let flush_nudge = move || {
+        if !nudge_dirty.get_untracked() {
+            return;
+        }
+        set_nudge_dirty.set(false);
+        let doc = deck.with_untracked(deck_to_doc);
+        crate::a11y::defer(move || {
+            set_persist_origin.set(true);
+            on_state_change.run(EditorState::create_default(doc));
+            on_change.run(());
+        });
+    };
+
     // ─── Doc → model sync ──────────────────────────────────
     //
     // Runs as an Effect, never inline in the render closure — see the
@@ -442,6 +474,14 @@ pub fn DeckView(
             return;
         }
 
+        // A genuine remote update is about to overwrite `deck` below.
+        // If an arrow-nudge is mid-gesture (already mutated into
+        // `deck` locally, not yet persisted — see `nudge_dirty`'s doc
+        // comment on `flush_nudge`), flush it *first* so it enters the
+        // CRDT merge instead of being silently discarded by the
+        // overwrite (Task 10 review, Finding 2).
+        flush_nudge();
+
         let mut new_deck = deck_from_doc(&state.doc);
         let bootstrap = bootstrap_blank_slide(new_deck.slides.is_empty(), readonly);
         let should_persist = bootstrap.is_some();
@@ -453,6 +493,13 @@ pub fn DeckView(
             crate::a11y::defer(persist);
         }
     });
+
+    // Component teardown (navigating away, switching doc types, etc.)
+    // is the fourth interruption point for a pending nudge (Task 10
+    // review, Finding 2) — without this, closing the tab/route on a
+    // frame mid-nudge would drop the last keydown's worth of movement
+    // silently, the same way a blur or slide-switch would.
+    on_cleanup(move || flush_nudge());
 
     // ─── Slide-strip mutation handlers ─────────────────────
 
@@ -496,6 +543,13 @@ pub fn DeckView(
     };
 
     let select_slide = move |block_id: &str| {
+        // A nudge in progress is scoped to the frame selected on the
+        // *current* active slide — flush it before switching slides
+        // out from under it (Task 10 review, Finding 2), or the
+        // keyup that would have persisted it never fires (it lands on
+        // the newly-active slide's canvas, which has nothing to do
+        // with the pending nudge).
+        flush_nudge();
         if let Some(idx) = deck.with_untracked(|d| find_slide_index(&d.slides, block_id)) {
             set_active_slide.set(idx);
         }
@@ -598,7 +652,15 @@ pub fn DeckView(
                 })
                 .unwrap_or_default()
         });
-        let (snapped, guides) = geometry::snap(dragged, &others, SNAP_THRESHOLD);
+        // `snap` (Move) and `snap_resize` (Resize) are deliberately
+        // different functions: `snap` may snap either edge or the
+        // center and translate the whole rect, which is only correct
+        // when size is fixed. A resize must never do that — see
+        // `snap_resize`'s doc comment (Task 10 review, Finding 1).
+        let (snapped, guides) = match state.kind {
+            DragKind::Move => geometry::snap(dragged, &others, SNAP_THRESHOLD),
+            DragKind::Resize(corner) => geometry::snap_resize(dragged, corner, &others, SNAP_THRESHOLD),
+        };
         set_drag_preview.set(Some(snapped));
         set_drag_guides.set(guides);
     };
@@ -720,7 +782,6 @@ pub fn DeckView(
                 persist();
             }
             "Tab" => {
-                ev.prevent_default();
                 let idx = active_slide.get_untracked();
                 let current = selected_frame.get_untracked();
                 // `role=notes` frames are never on the canvas (they
@@ -738,7 +799,15 @@ pub fn DeckView(
                 } else {
                     geometry::next_frame_id(&content_only, current.as_deref())
                 };
-                set_selected_frame.set(next);
+                // Only claim the keypress when there's actually
+                // something to cycle to — a slide with zero content
+                // frames (Task 10 review, Finding 3) must let Tab fall
+                // through to normal browser focus traversal instead of
+                // trapping keyboard users on the canvas.
+                if next.is_some() {
+                    ev.prevent_default();
+                    set_selected_frame.set(next);
+                }
             }
             "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" => {
                 let Some(block_id) = selected_frame.get_untracked() else { return };
@@ -767,13 +836,12 @@ pub fn DeckView(
     // Coalesces the nudge persist: a held-down arrow key fires many
     // keydowns (each already applied to `deck` above for live visual
     // feedback) but only one keyup, so this is where the single yrs
-    // write for the whole nudge streak happens.
+    // write for the whole nudge streak happens in the common case —
+    // `flush_nudge` also covers the cases where this keyup never
+    // fires (see its doc comment).
     let on_canvas_keyup = move |ev: web_sys::KeyboardEvent| {
-        if matches!(ev.key().as_str(), "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight")
-            && nudge_dirty.get_untracked()
-        {
-            set_nudge_dirty.set(false);
-            persist();
+        if matches!(ev.key().as_str(), "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight") {
+            flush_nudge();
         }
     };
 
@@ -1042,6 +1110,7 @@ pub fn DeckView(
                                 node_ref=canvas_ref
                                 on:keydown=on_canvas_keydown
                                 on:keyup=on_canvas_keyup
+                                on:blur=move |_| flush_nudge()
                                 on:paste=on_canvas_paste
                                 on:pointermove=on_canvas_pointermove
                                 on:pointerup=on_canvas_pointerup

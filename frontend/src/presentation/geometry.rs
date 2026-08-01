@@ -126,6 +126,21 @@ pub fn nudge(rect: Rect, dx: f64, dy: f64) -> Rect {
     apply_drag(rect, DragKind::Move, dx, dy)
 }
 
+/// Build one axis's snap target list: the slide's own edges (0.0/1.0)
+/// and center (0.5), plus every `others` rect's leading edge, trailing
+/// edge, and center on that axis. `pick` extracts `(min, size)` for
+/// the axis in question (`|r| (r.x, r.w)` or `|r| (r.y, r.h)`).
+fn axis_targets(others: &[Rect], pick: impl Fn(&Rect) -> (f64, f64)) -> Vec<f64> {
+    let mut targets = vec![0.0, 0.5, 1.0];
+    for o in others {
+        let (min, size) = pick(o);
+        targets.push(min);
+        targets.push(min + size);
+        targets.push(min + size / 2.0);
+    }
+    targets
+}
+
 /// Try to snap `rect` onto nearby alignment lines: the slide's own
 /// edges (0.0/1.0) and center (0.5) on each axis, plus every rect in
 /// `others`' edges and center. For each axis independently, the
@@ -135,17 +150,18 @@ pub fn nudge(rect: Rect, dx: f64, dy: f64) -> Rect {
 /// untouched. Returns the (possibly axis-wise adjusted) rect and the
 /// [`Guide`] line(s) it snapped to, if any — an empty `Vec` means no
 /// snap happened on either axis.
+///
+/// This is the `DragKind::Move` snap: size is always preserved, only
+/// position moves, and either edge *or* the center may snap — for a
+/// `Resize`, use [`snap_resize`] instead, which only lets the
+/// actively-dragged edge snap and always keeps the anchored (opposite)
+/// corner fixed. Applying this function's edge-or-center logic to a
+/// resize would let a trailing-edge candidate rewrite the leading
+/// edge (or vice versa) and translate the whole frame instead of
+/// resizing it — see `snap_resize`'s doc comment.
 pub fn snap(rect: Rect, others: &[Rect], threshold: f64) -> (Rect, Vec<Guide>) {
-    let mut targets_x = vec![0.0, 0.5, 1.0];
-    let mut targets_y = vec![0.0, 0.5, 1.0];
-    for o in others {
-        targets_x.push(o.x);
-        targets_x.push(o.x + o.w);
-        targets_x.push(o.x + o.w / 2.0);
-        targets_y.push(o.y);
-        targets_y.push(o.y + o.h);
-        targets_y.push(o.y + o.h / 2.0);
-    }
+    let targets_x = axis_targets(others, |r| (r.x, r.w));
+    let targets_y = axis_targets(others, |r| (r.y, r.h));
 
     let (new_x, guide_x) = snap_axis(rect.x, rect.w, &targets_x, threshold);
     let (new_y, guide_y) = snap_axis(rect.y, rect.h, &targets_y, threshold);
@@ -186,6 +202,72 @@ fn snap_axis(min: f64, size: f64, targets: &[f64], threshold: f64) -> (f64, Opti
     match best {
         Some((delta, new_min, guide_at)) if delta <= threshold => (new_min, Some(guide_at)),
         _ => (min, None),
+    }
+}
+
+/// The `DragKind::Resize(corner)` counterpart to [`snap`]. Corner-aware:
+/// only the edge the resize is actually dragging is a snap candidate on
+/// each axis (never the opposite, anchored edge, and never the rect's
+/// center — snapping either of those during a resize would translate
+/// the whole frame rather than resizing it, which was Finding 1 in the
+/// Task 10 review: an SE-drag's right edge landing near a guide moved
+/// the top-left anchor instead of growing `w`). Any adjustment is
+/// applied to the moving edge, feeding into `w`/`h` with the fixed
+/// (anchored) edge pinned exactly in place; the resulting size is
+/// still floored at [`MIN_FRAME_DIM`], the same invariant
+/// [`apply_drag`]'s `Resize` arm holds.
+pub fn snap_resize(rect: Rect, corner: Corner, others: &[Rect], threshold: f64) -> (Rect, Vec<Guide>) {
+    let targets_x = axis_targets(others, |r| (r.x, r.w));
+    let targets_y = axis_targets(others, |r| (r.y, r.h));
+
+    // Mirrors `apply_resize`'s corner -> moving-edge mapping exactly,
+    // so snap and drag agree on which edge is anchored.
+    let left_moves = matches!(corner, Corner::Nw | Corner::Sw);
+    let top_moves = matches!(corner, Corner::Nw | Corner::Ne);
+
+    let (x, w, guide_x) = snap_moving_edge(rect.x, rect.w, left_moves, &targets_x, threshold);
+    let (y, h, guide_y) = snap_moving_edge(rect.y, rect.h, top_moves, &targets_y, threshold);
+
+    let mut guides = Vec::new();
+    if let Some(at) = guide_x {
+        guides.push(Guide { axis: Axis::X, at });
+    }
+    if let Some(at) = guide_y {
+        guides.push(Guide { axis: Axis::Y, at });
+    }
+
+    (Rect { x, y, w, h }, guides)
+}
+
+/// Snap the single edge a resize is actively moving on one axis; the
+/// other edge (the anchor, `min` or `min + size` depending on
+/// `leading_moves`) never moves. `leading_moves = true` means the
+/// leading edge (`min`) is the one being dragged and `min + size` is
+/// the fixed anchor; `false` means the trailing edge (`min + size`) is
+/// dragged and `min` is the fixed anchor. Returns `(new_min, new_size,
+/// guide)` — `new_size` is floored at `MIN_FRAME_DIM`, recomputed from
+/// the (always-exact) anchor position so the anchor never drifts even
+/// in that clamped case.
+fn snap_moving_edge(min: f64, size: f64, leading_moves: bool, targets: &[f64], threshold: f64) -> (f64, f64, Option<f64>) {
+    let anchor = if leading_moves { min + size } else { min };
+    let moving = if leading_moves { min } else { min + size };
+
+    let mut best: Option<(f64, f64)> = None; // (abs_delta, target)
+    for &t in targets {
+        let delta = (moving - t).abs();
+        if best.is_none_or(|(best_delta, _)| delta < best_delta) {
+            best = Some((delta, t));
+        }
+    }
+
+    match best {
+        Some((delta, t)) if delta <= threshold => {
+            let raw_size = if leading_moves { anchor - t } else { t - anchor };
+            let new_size = raw_size.max(MIN_FRAME_DIM);
+            let new_min = if leading_moves { anchor - new_size } else { anchor };
+            (new_min, new_size, Some(t))
+        }
+        _ => (min, size, None),
     }
 }
 
@@ -307,6 +389,30 @@ mod tests {
     }
 
     #[test]
+    fn resize_ne_keeps_bottom_left_fixed() {
+        // corners: (0.2,0.2)..(0.5,0.5) — Ne drags the top-right corner,
+        // so the anchor is bottom-left (0.2, 0.5).
+        let r = Rect::clamped(0.2, 0.2, 0.3, 0.3);
+        let out = apply_drag(r, DragKind::Resize(Corner::Ne), 0.1, -0.05);
+        assert!((out.x - 0.2).abs() < 1e-9, "bottom-left x fixed");
+        assert!((out.y + out.h - 0.5).abs() < 1e-9, "bottom-left y (bottom edge) fixed");
+        assert!((out.x + out.w - 0.6).abs() < 1e-9, "right edge grew by dx");
+        assert!((out.y - 0.15).abs() < 1e-9, "top edge moved by dy");
+    }
+
+    #[test]
+    fn resize_sw_keeps_top_right_fixed() {
+        // corners: (0.2,0.2)..(0.5,0.5) — Sw drags the bottom-left
+        // corner, so the anchor is top-right (0.5, 0.2).
+        let r = Rect::clamped(0.2, 0.2, 0.3, 0.3);
+        let out = apply_drag(r, DragKind::Resize(Corner::Sw), -0.05, 0.1);
+        assert!((out.x + out.w - 0.5).abs() < 1e-9, "top-right x (right edge) fixed");
+        assert!((out.y - 0.2).abs() < 1e-9, "top-right y fixed");
+        assert!((out.x - 0.15).abs() < 1e-9, "left edge moved by dx");
+        assert!((out.y + out.h - 0.6).abs() < 1e-9, "bottom edge grew by dy");
+    }
+
+    #[test]
     fn resize_never_pushes_past_far_edge() {
         // Se-resize growing far beyond the slide clamps w/h so x+w and
         // y+h never exceed 1.0.
@@ -344,6 +450,91 @@ mod tests {
         assert!((out.x - 0.5).abs() < 1e-9);
         assert_eq!(guides[0].axis, Axis::X);
         assert!((guides[0].at - 0.5).abs() < 1e-9);
+    }
+
+    // ─── snap_resize (Task 10 review, Finding 1) ────────────
+    //
+    // Corner-aware resize snapping: reproduces the exact scenario from
+    // the review (SE-drag of a 0.3x0.3 frame at (0.2,0.2), right edge
+    // landing at 0.492, near the 0.5 center guide) and asserts the
+    // anchor corner never moves — only `w`/`h` change.
+
+    #[test]
+    fn snap_resize_se_grows_w_from_right_edge_x_unchanged() {
+        // Right edge at 0.2 + 0.292 = 0.492, within 0.01 of the 0.5
+        // guide. Bottom edge (0.2 + 0.35 = 0.55) is far from any guide
+        // so only the x-axis snaps.
+        let r = Rect::clamped(0.2, 0.2, 0.292, 0.35);
+        let (out, guides) = snap_resize(r, Corner::Se, &[], 0.01);
+        assert_eq!(out.x, 0.2, "SE-resize never moves the anchored (top-left) x");
+        assert_eq!(out.y, 0.2, "SE-resize never moves the anchored (top-left) y");
+        assert!((out.w - 0.3).abs() < 1e-9, "w grows to exactly land the right edge on the guide");
+        assert!((out.h - 0.35).abs() < 1e-9, "h untouched — not near any guide");
+        assert_eq!(guides.len(), 1);
+        assert_eq!(guides[0].axis, Axis::X);
+        assert!((guides[0].at - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn snap_resize_nw_moves_x_and_adjusts_w_right_edge_unchanged() {
+        // Anchor is the bottom-right corner (0.6, 0.6). Left edge at
+        // 0.492, within 0.01 of the 0.5 guide.
+        let r = Rect::clamped(0.492, 0.492, 0.108, 0.108);
+        let (out, guides) = snap_resize(r, Corner::Nw, &[], 0.01);
+        assert!((out.x - 0.5).abs() < 1e-9, "left edge snaps exactly to the guide");
+        assert!((out.y - 0.5).abs() < 1e-9);
+        assert!((out.x + out.w - 0.6).abs() < 1e-9, "NW-resize never moves the anchored (bottom-right) edge");
+        assert!((out.y + out.h - 0.6).abs() < 1e-9);
+        assert_eq!(guides.len(), 2, "both axes were within threshold here");
+    }
+
+    #[test]
+    fn snap_resize_never_snaps_the_anchored_edge_or_center() {
+        // The anchored (left) edge sits exactly on a guide (0.5) — but
+        // an SE-resize only ever considers the *moving* (right) edge
+        // (0.7, far from any guide), so this must not snap even
+        // though the old corner-unaware `snap_axis` would have jumped
+        // on the anchored-edge coincidence. `h` is chosen so the
+        // moving *bottom* edge (0.55) isn't coincidentally near a
+        // guide either, keeping this a clean "no snap on either axis"
+        // case.
+        let r = Rect::clamped(0.5, 0.3, 0.2, 0.25); // right edge = 0.7, bottom edge = 0.55
+        let (out, guides) = snap_resize(r, Corner::Se, &[], 0.01);
+        assert_eq!(out, r, "no snap candidate is close enough on either axis");
+        assert!(guides.is_empty());
+    }
+
+    #[test]
+    fn snap_resize_floors_at_min_frame_dim_anchor_still_fixed() {
+        // Anchor (x) fixed at 0.3, `w` already at `MIN_FRAME_DIM`
+        // (0.02) so the moving (right) edge sits at 0.32. `other`'s
+        // left edge at 0.315 is within threshold (delta 0.005) of
+        // that moving edge, but snapping onto it exactly would need
+        // `w = 0.015` — below `MIN_FRAME_DIM` — so the floor must
+        // engage instead, with the anchor still landing exactly on
+        // 0.3, not drifting to compensate. `h`/`other.y` are chosen
+        // so the y-axis doesn't also snap and complicate the case.
+        let other = Rect::clamped(0.315, 0.6, 0.02, 0.02);
+        let r = Rect::clamped(0.3, 0.3, MIN_FRAME_DIM, 0.15);
+        let (out, _guides) = snap_resize(r, Corner::Se, &[other], 0.01);
+        assert_eq!(out.x, 0.3, "anchor never moves even when the floor engages");
+        assert_eq!(out.w, MIN_FRAME_DIM, "size floors rather than following the raw (too-small) snap target");
+    }
+
+    #[test]
+    fn snap_resize_attracts_to_other_frame_edges() {
+        // `other`'s y is far from this rect's y-range so only the
+        // x-axis is exercised — keeps the guide assertion unambiguous.
+        let other = Rect::clamped(0.6, 0.9, 0.2, 0.05); // left edge = 0.6
+        // SW-resize: left edge is the moving one (right edge at 0.8 is
+        // the anchor). Left edge at 0.603 is within threshold of 0.6.
+        let r = Rect::clamped(0.603, 0.2, 0.197, 0.2);
+        let (out, guides) = snap_resize(r, Corner::Sw, &[other], 0.01);
+        assert!((out.x - 0.6).abs() < 1e-9);
+        assert!((out.x + out.w - 0.8).abs() < 1e-9, "anchor (right edge) unchanged");
+        assert_eq!(guides.len(), 1, "only the x-axis snapped");
+        assert_eq!(guides[0].axis, Axis::X);
+        assert!((guides[0].at - 0.6).abs() < 1e-9);
     }
 
     #[test]
