@@ -6632,8 +6632,16 @@ async function scenarioDeckBasics(ctx, collector) {
     // thumbnail's mini-canvas. Only the interactive canvas carries
     // `tabindex="0"` (deck_view.rs's `canvas_ref` div) — the
     // thumbnail canvases don't.
+    // Assert SIZE, not just presence: the P1 launch bug (`.deck-view`
+    // missing `flex: 1`) left the canvas mounted but 0×0 — a bare
+    // waitFor would have passed right through it.
     steps.canvasRendered = await page.locator('.deck-canvas[tabindex="0"]').first()
-      .waitFor({ timeout: 20000 }).then(() => true).catch(() => false);
+      .waitFor({ timeout: 20000 })
+      .then(async () => {
+        const box = await page.locator('.deck-canvas[tabindex="0"]').first().boundingBox();
+        return !!box && box.width > 300 && box.height > 150;
+      })
+      .catch(() => false);
     await waitFor(async () => (await page.locator(".deck-slide-thumb").count()) >= 1);
     steps.initialThumbCount = (await page.locator(".deck-slide-thumb").count()) === 1;
     await page.screenshot({ path: join(outDir, "1-deck-created.png") }).catch(() => {});
@@ -6659,8 +6667,16 @@ async function scenarioDeckBasics(ctx, collector) {
     const inlineEditor = page.locator(".deck-frame--editing .editor-content[data-editor-ready]");
     steps.inlineEditorMounted = await inlineEditor
       .waitFor({ timeout: 8000 }).then(() => true).catch(() => false);
-    await page.waitForTimeout(300); // let the embedded editor settle before typing
+    await page.waitForTimeout(1000); // settle after [data-editor-ready] (known first-keystroke gotcha)
+    // Ctrl+A → Delete → type, NOT type-over-selection: typing directly
+    // over a select-all relocates the first typed char to the end
+    // ("PROBE…" → "ROBE…P") — a pre-existing, deterministic editor bug
+    // reproduced in the plain document editor too (2026-08-01, tracked
+    // separately from presentations). Deleting first sidesteps it so
+    // this scenario measures deck persistence, not that bug.
     await page.keyboard.press("Control+a");
+    await page.keyboard.press("Delete");
+    await page.waitForTimeout(200);
     await page.keyboard.type(typedText);
     await page.waitForTimeout(500); // let on_state_change's persist() flush
     await page.keyboard.press("Escape");

@@ -1643,7 +1643,12 @@ pub fn DeckView(
                                         style:top=top
                                         style:width=width
                                         style:height=height
-                                        attr:data-deck-frame-block-id=block_id_data_attr
+                                        // NOTE: plain `data-x=` form, not `attr:data-x=` —
+                                        // the `attr:` prefix on a native element silently
+                                        // renders nothing in Leptos 0.7 (P1 launch bug:
+                                        // every frame lost this attribute, so editing
+                                        // closed instantly via the outside-click handler).
+                                        data-deck-frame-block-id=block_id_data_attr
                                         // Hazard 1 (keydown): while this frame is
                                         // being edited, a keydown that bubbles up
                                         // from the embedded editor's contenteditable
