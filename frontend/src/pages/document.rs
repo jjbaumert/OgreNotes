@@ -466,11 +466,14 @@ pub fn DocumentPage() -> impl IntoView {
     // cell, and opens its popup.
     let (focus_cell, set_focus_cell) =
         signal::<Option<crate::components::spreadsheet_view::CellFocus>>(None);
-    // Frame-anchored comment threads for DeckView (Task 9 skeleton — always
-    // empty; Task 12 wires this to the same list_threads fetch that
-    // populates `inline_threads`/`cell_threads`, keyed by frame block_id).
-    let (frame_threads_placeholder, _set_frame_threads_placeholder) =
-        signal::<Vec<String>>(Vec::new());
+    // Frame-anchored comment threads for DeckView (Task 12). Frames carry
+    // ordinary blockIds, so their threads are already `inline_threads` rows
+    // (the same fetch that populates `inline_threads`/`cell_threads` above)
+    // — no separate fetch. Populated by an Effect below, filtered down to
+    // block_ids that actually belong to a frame in the current deck via
+    // `deck_view::threads_for_slide`, so a coincidental block_id collision
+    // elsewhere in the doc can never light up a frame's comment badge.
+    let (frame_threads, set_frame_threads) = signal::<Vec<String>>(Vec::new());
     let (comment_count, set_comment_count) = signal(0usize);
     // Bumped each time a peer's REST write changes a comment thread on this
     // doc (see CollabClient::set_on_comment_event below). The thread-load
@@ -708,6 +711,42 @@ pub fn DocumentPage() -> impl IntoView {
             });
         });
     }
+
+    // Frame-anchored comment badges for DeckView (Task 12). Derived from
+    // `inline_threads` (no separate fetch — frames carry ordinary blockIds,
+    // so their threads are already inline rows) filtered down to block_ids
+    // that belong to a frame of *some* slide in the current deck, via
+    // `deck_view::threads_for_slide` looped over every slide. A separate
+    // Effect from the fetch above (which does network I/O and must not
+    // re-run on every `editor_state` change): this one is pure in-memory
+    // recomputation, so it can safely track `editor_state` too and stay
+    // live as slides/frames are added, removed, or duplicated.
+    Effect::new(move |_| {
+        let threads = inline_threads.get();
+        if doc_type.get() != "presentation" {
+            set_frame_threads.set(Vec::new());
+            return;
+        }
+        let Some(state) = editor_state.get() else {
+            set_frame_threads.set(Vec::new());
+            return;
+        };
+        let deck = crate::presentation::model::deck_from_doc(&state.doc);
+        let pairs: Vec<(String, String)> =
+            threads.iter().map(|t| (t.block_id.clone(), t.thread_id.clone())).collect();
+        let mut relevant_tids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for slide_idx in 0..deck.slides.len() {
+            relevant_tids.extend(crate::components::deck_view::threads_for_slide(
+                &deck, slide_idx, &pairs,
+            ));
+        }
+        let ids: Vec<String> = threads
+            .iter()
+            .filter(|t| relevant_tids.contains(&t.thread_id))
+            .map(|t| t.block_id.clone())
+            .collect();
+        set_frame_threads.set(ids);
+    });
 
     // Deep-link: open (and center) the comment named by `?comment=<tid>`
     // once the document's threads have loaded. A cell comment is handed to
@@ -2138,6 +2177,53 @@ pub fn DocumentPage() -> impl IntoView {
         set_popup_thread_id.set(None);
     });
 
+    // Open the comment popup for a slide-deck frame (Task 12) — the
+    // frame-anchored analogue of `request_comment` above, minus the
+    // selection-offset logic (a frame has no text selection to anchor a
+    // range to; frame comments are always block-level). Never gated on
+    // `can_edit`/readonly — comment permission is independent of edit
+    // permission, same as every other comment entry point in this file.
+    // `DeckView`'s comment button fires this with just the frame's
+    // block_id, so this callback is what decides, by checking
+    // `inline_threads` (frames are ordinary blockIds — their threads are
+    // already inline rows there), whether to reopen an existing thread
+    // (mirrors `CommentHighlights`'s click-to-reopen) or start a new one
+    // (mirrors `AddCommentBubble`'s always-new block-level comment).
+    let request_frame_comment = Callback::new(move |bid: String| {
+        let existing = inline_threads
+            .get_untracked()
+            .iter()
+            .find(|t| t.block_id == bid)
+            .map(|t| t.thread_id.clone());
+
+        // Position from the frame's own DOM element — the same
+        // element_viewport_rect + place_left_margin pattern used for
+        // every other block-anchored popup open (AddCommentBubble,
+        // on_thread_click, the comment deep-link) — frames carry a
+        // stable `data-deck-frame-block-id` DOM hook for exactly this.
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            if let Ok(Some(el)) =
+                doc.query_selector(&crate::components::deck_view::frame_selector(&bid))
+            {
+                let rect = crate::components::dom_position::element_viewport_rect(&el);
+                let (pl, pt) = crate::components::dom_position::place_left_margin(&rect, 420.0, 12.0);
+                set_popup_left.set(pl);
+                set_popup_top.set(pt);
+            }
+        }
+
+        set_popup_block_id.set(Some(bid));
+        set_popup_anchor_start.set(None);
+        set_popup_anchor_end.set(None);
+        if let Some(tid) = existing {
+            set_popup_thread_id.set(Some(tid));
+            set_popup_is_new.set(false);
+        } else {
+            set_popup_is_new.set(true);
+            set_popup_thread_id.set(None);
+        }
+    });
+
     // Shared gutter-detection logic used by both mouse hover (desktop) and
     // touchstart (mobile). Returns true and shows the block menu when
     // (x, target) falls within the left gutter (<40px) of a block-level
@@ -3166,11 +3252,8 @@ pub fn DocumentPage() -> impl IntoView {
                                     on_change=on_change_ss.clone()
                                     doc_id=doc_id()
                                     readonly=!can_edit.get()
-                                    // Task 12 wires the frame-comment popup; until
-                                    // then the page hands DeckView a no-op sink and
-                                    // an always-empty thread list.
-                                    on_request_frame_comment=Callback::new(|_: String| {})
-                                    frame_threads=frame_threads_placeholder
+                                    on_request_frame_comment=request_frame_comment
+                                    frame_threads=frame_threads
                                     // Task 11 review, Finding 3 — the same shared
                                     // toolbar-command channel `<Toolbar>` (mounted
                                     // unconditionally above, for every doc_type)

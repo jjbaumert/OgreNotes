@@ -47,6 +47,19 @@ use super::toolbar::ToolbarCommand;
 /// any future test/automation selector.
 const FRAME_BLOCK_ID_ATTR: &str = "data-deck-frame-block-id";
 
+/// Build a `[data-deck-frame-block-id="…"]` selector for locating a
+/// frame's DOM element from outside this component — the page-level
+/// comment-popup positioning path (`document.rs`'s
+/// `request_frame_comment`, Task 12) queries a frame's element the
+/// same way `document.rs`'s own `block_id_selector` queries an
+/// editor block's, and needs the same escaping for the same reason:
+/// a block id containing `"` or `\` must not be able to break out of
+/// the selector string and throw a `DOMException`.
+pub(crate) fn frame_selector(block_id: &str) -> String {
+    let escaped = block_id.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("[{FRAME_BLOCK_ID_ATTR}=\"{escaped}\"]")
+}
+
 /// Snap-attraction distance in normalized (0..1) slide fractions —
 /// how close a frame edge/center has to get to a guide line before
 /// `geometry::snap` pulls it the rest of the way.
@@ -250,6 +263,33 @@ fn duplicate_frame(slide: &mut DeckSlide, block_id: &str) -> Option<String> {
     Some(new_id)
 }
 
+// ─── Comment-thread filtering (Task 12) ────────────────────────
+//
+// Frames are `is_commentable() == true` with ordinary blockIds, so a
+// frame's comment threads are just rows in the same doc-wide
+// (block_id, thread_id) list the editor's inline-comment highlights
+// use — no separate storage or fetch. This is the pure filter behind
+// the per-frame comment badge: which of those threads actually
+// belong to a frame of the given slide (as opposed to some other
+// block elsewhere in the doc whose id happens to be in the list).
+// Kept out of the component closure, like the mutation functions
+// above, so it's unit-testable without a reactive runtime.
+
+/// (block_id, thread_id) pairs in, thread_ids whose block_id belongs
+/// to a frame of `slide` out. An out-of-range `slide` yields an empty
+/// result rather than panicking — callers pass a live slide index
+/// that can momentarily lag a concurrent slide deletion.
+pub fn threads_for_slide(deck: &Deck, slide: usize, threads: &[(String, String)]) -> Vec<String> {
+    let Some(slide) = deck.slides.get(slide) else {
+        return Vec::new();
+    };
+    threads
+        .iter()
+        .filter(|(block_id, _)| slide.frames.iter().any(|f| &f.block_id == block_id))
+        .map(|(_, thread_id)| thread_id.clone())
+        .collect()
+}
+
 // ─── Read-only frame content rendering ─────────────────────────
 //
 // Mirrors `diff_block_view.rs`'s block-type match: paragraphs as
@@ -385,12 +425,16 @@ pub fn DeckView(
     on_change: Callback<()>,
     doc_id: String,
     readonly: bool,
-    /// Frame block_id the user wants to comment on. Task 12 wires the
-    /// popup on the page side; for now the page passes a no-op.
+    /// Frame block_id the user wants to comment on — fired by the
+    /// per-frame comment button below, never gated on `readonly`
+    /// (comment permission is independent of edit permission, same
+    /// as the editor's and spreadsheet's own comment affordances).
+    /// The page owns deciding whether this reopens an existing
+    /// thread on `block_id` or starts a new one (Task 12).
     on_request_frame_comment: Callback<String>,
-    /// block_ids that currently have an open comment thread. Task 12
-    /// wires this from the page's `list_threads` fetch; for now the
-    /// page passes an empty signal.
+    /// block_ids that currently have an open comment thread, derived
+    /// by the page from its `list_threads` fetch (Task 12) — drives
+    /// the comment button's active/badge styling per frame below.
     frame_threads: ReadSignal<Vec<String>>,
     /// Shared page-level toolbar-command channel (Task 11 review,
     /// Finding 3) — the same `toolbar_command`/`set_toolbar_command`
@@ -1735,6 +1779,20 @@ mod tests {
             slide_size: "16:9".to_string(),
             slides: vec![simple_slide()],
         }
+    }
+
+    #[test]
+    fn threads_filter_to_slide_frames() {
+        let deck = fixture_deck_two_slides();
+        let slide0_ids: Vec<String> =
+            deck.slides[0].frames.iter().map(|f| f.block_id.clone()).collect();
+        let threads = vec![
+            (slide0_ids[0].clone(), "t1".to_string()),
+            (deck.slides[1].frames[0].block_id.clone(), "t2".to_string()),
+            ("orphan".to_string(), "t3".to_string()),
+        ];
+        let visible = threads_for_slide(&deck, 0, &threads);
+        assert_eq!(visible, vec!["t1".to_string()]);
     }
 
     #[test]
