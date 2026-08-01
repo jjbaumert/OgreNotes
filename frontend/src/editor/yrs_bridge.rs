@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use yrs::{
-    Any, Doc, Out, ReadTxn, Transact, WriteTxn,
+    Any, Doc, Map, Out, ReadTxn, Transact, WriteTxn,
     Update,
     updates::decoder::Decode,
     types::Attrs,
@@ -15,6 +15,86 @@ use yrs::{
 
 use super::model::{Fragment, Mark, MarkType, Node, NodeType};
 
+/// Root-level yrs Map name holding Doc-node attrs (theme, slideSize,
+/// and any future doc-level attr).
+///
+/// The persisted form's actual root is the `"content"` XmlFragment,
+/// which — unlike an `XmlElement` — cannot carry attributes. Every
+/// bridge path used to simply drop `Node::Element { attrs, .. }` on
+/// the `Doc` node: `doc_to_ydoc_bytes` wrote only `content`'s
+/// children, `read_doc_from_ydoc` rebuilt a `Doc` with no attrs, and
+/// `sync_model_to_ydoc_diffed` synced only the fragment's children.
+/// Symptom (deck theme/slideSize, #presentations): the theme picker
+/// worked locally but reverted on reload, and the first remote peer
+/// update reverted it mid-session too.
+///
+/// This is additive to the wire shape: an old snapshot simply has no
+/// `"docAttrs"` map, and readers default to no attrs, same as before
+/// this change. The backend's export/validate paths
+/// (`crates/collab/src/blocks/*`) walk only the `"content"` fragment
+/// and never touch root-level maps, so they're unaffected.
+const DOC_ATTRS_MAP: &str = "docAttrs";
+
+/// Write every Doc-node attr (except `blockId`, which is meaningless
+/// for the root) into the `docAttrs` map. Used on first write of a
+/// brand-new ydoc (`doc_to_ydoc_bytes`); unconditional inserts are
+/// fine here since the map starts empty.
+fn write_doc_attrs(txn: &mut yrs::TransactionMut<'_>, attrs: &HashMap<String, String>) {
+    if attrs.is_empty() {
+        return;
+    }
+    let map = txn.get_or_insert_map(DOC_ATTRS_MAP);
+    for (key, value) in attrs {
+        if key == "blockId" {
+            continue;
+        }
+        map.insert(txn, key.as_str(), value.as_str());
+    }
+}
+
+/// Reconcile the `docAttrs` map against `attrs`: add/update keys that
+/// differ, remove keys no longer present. Mirrors `sync_attrs`'s
+/// add/update/remove-stale shape for XmlElement attributes, just
+/// against a root Map instead.
+fn sync_doc_attrs(txn: &mut yrs::TransactionMut<'_>, attrs: &HashMap<String, String>) {
+    let map = txn.get_or_insert_map(DOC_ATTRS_MAP);
+    let mut existing: HashMap<String, String> = map
+        .iter(txn)
+        .filter_map(|(k, v)| match v {
+            Out::Any(Any::String(s)) => Some((k.to_string(), s.to_string())),
+            _ => None,
+        })
+        .collect();
+
+    for (key, value) in attrs {
+        if key == "blockId" {
+            continue;
+        }
+        if existing.get(key) != Some(value) {
+            map.insert(txn, key.as_str(), value.as_str());
+        }
+        existing.remove(key);
+    }
+    for key in existing.keys() {
+        map.remove(txn, key);
+    }
+}
+
+/// Read the `docAttrs` map back into a plain attr map. Missing map
+/// (old snapshot, or a doc that never had Doc-level attrs) reads back
+/// as empty, matching pre-docAttrs behavior.
+fn read_doc_attrs<T: ReadTxn>(txn: &T) -> HashMap<String, String> {
+    let mut attrs = HashMap::new();
+    if let Some(map) = txn.get_map(DOC_ATTRS_MAP) {
+        for (key, value) in map.iter(txn) {
+            if let Out::Any(Any::String(s)) = value {
+                attrs.insert(key.to_string(), s.to_string());
+            }
+        }
+    }
+    attrs
+}
+
 /// Convert an editor document model to yrs Y.Doc state bytes.
 /// Inline marks (bold, italic, link, etc.) are preserved as yrs formatting attributes.
 pub fn doc_to_ydoc_bytes(doc: &Node) -> Vec<u8> {
@@ -24,10 +104,11 @@ pub fn doc_to_ydoc_bytes(doc: &Node) -> Vec<u8> {
         let mut txn = ydoc.transact_mut();
         let fragment = txn.get_or_insert_xml_fragment("content");
 
-        if let Node::Element { content, .. } = doc {
+        if let Node::Element { content, attrs, .. } = doc {
             for (i, child) in content.children.iter().enumerate() {
                 write_node(&mut txn, &fragment, i as u32, child);
             }
+            write_doc_attrs(&mut txn, attrs);
         }
     }
 
@@ -72,7 +153,12 @@ pub fn read_doc_from_ydoc(ydoc: &Doc) -> Result<Node, BridgeError> {
         children.push(Node::element(NodeType::Paragraph));
     }
 
-    let doc = Node::element_with_content(NodeType::Doc, Fragment::from(children));
+    let doc_attrs = read_doc_attrs(&txn);
+    let doc = if doc_attrs.is_empty() {
+        Node::element_with_content(NodeType::Doc, Fragment::from(children))
+    } else {
+        Node::element_with_attrs(NodeType::Doc, doc_attrs, Fragment::from(children))
+    };
     Ok(super::model::normalize_doc(&doc))
 }
 
@@ -217,8 +303,8 @@ pub fn sync_model_to_ydoc_diffed(
         let mut txn = ydoc.transact_mut();
         let fragment = txn.get_or_insert_xml_fragment("content");
 
-        let new_children = match &normalized {
-            Node::Element { content, .. } => &content.children,
+        let (new_children, new_attrs) = match &normalized {
+            Node::Element { content, attrs, .. } => (&content.children, attrs),
             Node::Text { .. } => return normalized,
         };
         let old_children = match last_synced {
@@ -227,6 +313,7 @@ pub fn sync_model_to_ydoc_diffed(
         };
 
         sync_children(&mut txn, &fragment, new_children, old_children);
+        sync_doc_attrs(&mut txn, new_attrs);
     }
     normalized
 }
@@ -1405,14 +1492,62 @@ mod tests {
             [("layout", "blank")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             Fragment::from(vec![frame]),
         );
-        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![slide]));
+        // #C1 — a deck's theme/slideSize live on the Doc node itself
+        // (`presentation::model::deck_to_doc`). Give the fixture Doc
+        // real attrs so this test isn't vacuous: a fixture built via
+        // `element_with_content` has an empty attrs map, so
+        // `assert_eq!(back.attrs(), doc.attrs())` would pass by
+        // comparing empty==empty even while the bridge silently
+        // dropped every Doc attr (which it used to — the wire root is
+        // the "content" XmlFragment, which can't carry attributes;
+        // see `DOC_ATTRS_MAP`'s doc comment).
+        let doc_attrs: HashMap<String, String> = [("theme", "midnight"), ("slideSize", "16:9")]
+            .iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let doc = Node::element_with_attrs(NodeType::Doc, doc_attrs, Fragment::from(vec![slide]));
         let bytes = doc_to_ydoc_bytes(&doc);
         let back = ydoc_bytes_to_doc(&bytes).unwrap();
         // normalize strips nothing from a deck (empty-slide carve-out):
         assert_eq!(back.attrs(), doc.attrs());
+        assert_eq!(back.attrs().get("theme").map(String::as_str), Some("midnight"));
+        assert_eq!(back.attrs().get("slideSize").map(String::as_str), Some("16:9"));
         let slide_back = match &back { Node::Element { content, .. } => &content.children[0], _ => panic!() };
         assert_eq!(slide_back.node_type(), Some(NodeType::Slide));
         assert!(slide_back.block_id().is_some(), "slides must carry blockIds");
+    }
+
+    /// #C1 diffed-sync path: `sync_model_to_ydoc_diffed` (the path
+    /// `DeckView`'s `persist()` actually uses, not the one-shot
+    /// `doc_to_ydoc_bytes`) must also carry Doc-level attrs, and must
+    /// pick up a *change* to them on a second sync against a
+    /// previous-normalized baseline — not just an initial write.
+    #[test]
+    fn diffed_sync_carries_doc_attrs_across_a_theme_change() {
+        let doc_with_theme = |theme: &str| {
+            let attrs: HashMap<String, String> = [
+                ("theme".to_string(), theme.to_string()),
+                ("slideSize".to_string(), "16:9".to_string()),
+            ]
+            .into_iter()
+            .collect();
+            Node::element_with_attrs(
+                NodeType::Doc,
+                attrs,
+                Fragment::from(vec![Node::element(NodeType::Slide)]),
+            )
+        };
+
+        let ydoc = Doc::new();
+        let doc_a = doc_with_theme("midnight");
+        let norm_a = sync_model_to_ydoc_diffed(&ydoc, &doc_a, None);
+        let read_a = read_doc_from_ydoc(&ydoc).unwrap();
+        assert_eq!(read_a.attrs().get("theme").map(String::as_str), Some("midnight"));
+
+        let doc_b = doc_with_theme("slate");
+        let _ = sync_model_to_ydoc_diffed(&ydoc, &doc_b, Some(&norm_a));
+
+        let read_b = read_doc_from_ydoc(&ydoc).unwrap();
+        assert_eq!(read_b.attrs().get("theme").map(String::as_str), Some("slate"));
+        assert_eq!(read_b.attrs().get("slideSize").map(String::as_str), Some("16:9"));
     }
 
     /// design/presentations.md — `normalize_doc` must not strip an
