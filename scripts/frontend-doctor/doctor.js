@@ -6559,6 +6559,149 @@ async function scenarioDocMentions(ctx, collector) {
   await browser.close();
 }
 
+// ─── deck-basics scenario ────────────────────────────────────────
+//
+// Exercises the Task 1-12 presentation/slide-deck document type
+// end to end through the UI — unlike the other scenarios above, the
+// doc itself is created through the "+ New" sidebar menu (not the
+// `createDocViaApi` REST shortcut), since that creation path is
+// part of what's under test here:
+//   - sidebar "+ New" (`aria-label="Create new"`) → "New Presentation"
+//     menu entry creates a presentation doc and client-side-navigates
+//     to it (`nav_bridge::go`, no full reload).
+//   - DeckView's canvas (`.deck-canvas`) renders with the deck's
+//     self-bootstrapped first slide (one `.deck-slide-thumb`).
+//   - "Add Slide" → the `title-content` preset in the layout picker
+//     appends a second slide (`.deck-slide-thumb` count 2) and makes
+//     it active, so its frames render immediately.
+//   - Double-clicking the new slide's body frame (seeded with the
+//     "Click to add text" placeholder) mounts the embedded
+//     per-frame editor; Ctrl+A + typing + Escape replaces the
+//     placeholder and closes the editor.
+//   - A full reload resets `active_slide` to 0, but the slide count
+//     and the typed frame text both survive — DeckView reads them
+//     back from the persisted doc, not from in-memory state.
+async function scenarioDeckBasics(ctx, collector) {
+  const { baseUrlA, baseUrl, emailA, outDir } = ctx;
+  const target = baseUrlA || baseUrl;
+
+  const tokens = await devLogin(
+    target,
+    emailA || `doctor-deckbasics-${Date.now()}@ogrenotes.example.com`
+  );
+  logJson({ at: "dev-login", userId: tokens.userId });
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    ...DOCTOR_CONTEXT_DEFAULTS,
+    recordHar: { path: join(outDir, "tab-a.har"), mode: "full" },
+  });
+  await seedAuth(context, tokens);
+
+  const page = await context.newPage();
+  instrument(context, page, "tab-a", collector);
+
+  const waitFor = async (pred, ms = 8000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (await pred().catch(() => false)) return true;
+      await page.waitForTimeout(150);
+    }
+    return false;
+  };
+
+  const steps = {};
+  const typedText = "Deck basics probe text";
+  try {
+    // ── Create via the "+ New" sidebar menu (not the REST shortcut) ──
+    await page.goto(`${target}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
+    const newBtn = page.locator('button[aria-haspopup="menu"][aria-label="Create new"]');
+    steps.newButtonVisible = await newBtn.waitFor({ timeout: 15000 }).then(() => true).catch(() => false);
+    await newBtn.click();
+    const newPresentationItem = page.locator(".ui-menu-item", { hasText: "New Presentation" });
+    steps.newMenuItemVisible = await newPresentationItem
+      .waitFor({ timeout: 5000 }).then(() => true).catch(() => false);
+    await newPresentationItem.click();
+
+    steps.navigatedToDoc = await waitFor(() => Promise.resolve(/\/d\/[^/?#]+/.test(page.url())), 10000);
+
+    // ── DeckView canvas renders with the bootstrapped first slide ──
+    // `render_deck_canvas` (deck_view.rs) reuses the exact same
+    // `.deck-canvas`/`.deck-frame` markup for the slide-strip
+    // thumbnails, so a bare `.deck-canvas` would also match every
+    // thumbnail's mini-canvas. Only the interactive canvas carries
+    // `tabindex="0"` (deck_view.rs's `canvas_ref` div) — the
+    // thumbnail canvases don't.
+    steps.canvasRendered = await page.locator('.deck-canvas[tabindex="0"]').first()
+      .waitFor({ timeout: 20000 }).then(() => true).catch(() => false);
+    await waitFor(async () => (await page.locator(".deck-slide-thumb").count()) >= 1);
+    steps.initialThumbCount = (await page.locator(".deck-slide-thumb").count()) === 1;
+    await page.screenshot({ path: join(outDir, "1-deck-created.png") }).catch(() => {});
+
+    // ── Add a slide from the title-content preset ──
+    await page.locator(".deck-add-slide-btn").click();
+    const presetItem = page.locator(".deck-preset-picker__item", { hasText: "Title + Content" });
+    steps.presetPickerVisible = await presetItem.waitFor({ timeout: 5000 }).then(() => true).catch(() => false);
+    await presetItem.click();
+    steps.slideAdded = await waitFor(async () => (await page.locator(".deck-slide-thumb").count()) === 2);
+
+    // ── Double-click the new (now-active) slide's body frame, type,
+    // Escape ──
+    // `[data-deck-frame-block-id]` (only set on the interactive
+    // canvas's frames, deck_view.rs) disambiguates from the
+    // thumbnail's identically-classed `.deck-frame` preview divs.
+    const bodyFrame = page
+      .locator(".deck-frame[data-deck-frame-block-id]", { hasText: "Click to add text" })
+      .first();
+    steps.bodyFramePlaceholderVisible = await bodyFrame
+      .waitFor({ timeout: 8000 }).then(() => true).catch(() => false);
+    await bodyFrame.dblclick();
+    const inlineEditor = page.locator(".deck-frame--editing .editor-content[data-editor-ready]");
+    steps.inlineEditorMounted = await inlineEditor
+      .waitFor({ timeout: 8000 }).then(() => true).catch(() => false);
+    await page.waitForTimeout(300); // let the embedded editor settle before typing
+    await page.keyboard.press("Control+a");
+    await page.keyboard.type(typedText);
+    await page.waitForTimeout(500); // let on_state_change's persist() flush
+    await page.keyboard.press("Escape");
+    steps.editorClosedAfterEscape = await waitFor(
+      async () => (await page.locator(".deck-frame--editing").count()) === 0
+    );
+    await page.waitForTimeout(800); // WS persistence flush before reload
+    await page.screenshot({ path: join(outDir, "2-typed-text.png") }).catch(() => {});
+
+    // ── Reload: active_slide resets to 0, but slide count + typed
+    // frame text both survive because they live in the persisted doc ──
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+    steps.canvasRenderedAfterReload = await page.locator('.deck-canvas[tabindex="0"]').first()
+      .waitFor({ timeout: 20000 }).then(() => true).catch(() => false);
+    await waitFor(async () => (await page.locator(".deck-slide-thumb").count()) >= 1);
+    steps.thumbCountPersisted = (await page.locator(".deck-slide-thumb").count()) === 2;
+    await page.locator(".deck-slide-thumb").nth(1).click();
+    const persistedFrame = page.locator(".deck-frame[data-deck-frame-block-id]", { hasText: typedText });
+    steps.typedTextPersisted = await persistedFrame.first()
+      .waitFor({ timeout: 8000 }).then(() => true).catch(() => false);
+    await page.screenshot({ path: join(outDir, "3-after-reload.png") }).catch(() => {});
+  } catch (e) {
+    collector.stepError = `${e.message}`;
+  }
+
+  const tab = collector["tab-a"] || { errors: [], console: [] };
+  const realErrors = (tab.console || []).filter(
+    (m) => m.type === "error" && !/Failed to fetch|loading was aborted|compilation aborted/i.test(m.text || "")
+  );
+  steps.noConsoleErrors = realErrors.length === 0;
+
+  collector.scenario = {
+    name: collector.scenario?.name || "deck-basics",
+    steps,
+  };
+
+  await page.screenshot({ path: join(outDir, "tab-a.png"), fullPage: false }).catch(() => {});
+  await context.close();
+  await browser.close();
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   const scenario = args.scenario || "collab-sync";
@@ -6585,7 +6728,7 @@ async function main() {
         "semantic-search|import-job-round-trip|" +
         "menu-export-downloads|pre-sync-edit-preserved|" +
         "sustained-type-reload|history-pane|delete-document|" +
-        "share-dialog|comment-popup|block-links|doc-mentions] " +
+        "share-dialog|comment-popup|block-links|doc-mentions|deck-basics] " +
         "[--doc-id <docId>] [--email-a <addr>] [--email-b <addr>]"
     );
     process.exit(2);
@@ -6702,6 +6845,8 @@ async function main() {
       await scenarioBlockLinks(ctx, collector);
     } else if (scenario === "doc-mentions") {
       await scenarioDocMentions(ctx, collector);
+    } else if (scenario === "deck-basics") {
+      await scenarioDeckBasics(ctx, collector);
     } else {
       throw new Error(`unknown scenario: ${scenario}`);
     }
@@ -7175,6 +7320,13 @@ async function main() {
       "ctxCopyOriginalUrl", "ctxAbsentOnPlainText", "chipClickNavigates",
       "t2Trashed", "missingClassApplied", "missingLabel",
       "missingClickInert", "convertToPlainLink", "noConsoleErrors",
+    ],
+    "deck-basics": [
+      "newButtonVisible", "newMenuItemVisible", "navigatedToDoc",
+      "canvasRendered", "initialThumbCount", "presetPickerVisible",
+      "slideAdded", "bodyFramePlaceholderVisible", "inlineEditorMounted",
+      "editorClosedAfterEscape", "canvasRenderedAfterReload",
+      "thumbCountPersisted", "typedTextPersisted", "noConsoleErrors",
     ],
   };
   if (ok && Object.prototype.hasOwnProperty.call(requiredSteps, scenario)) {
