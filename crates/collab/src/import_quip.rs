@@ -5473,6 +5473,142 @@ mod tests {
         }
     }
 
+    // ─── comment anchors (#194 F-10) ─────────────────────────
+
+    /// Verbatim from the corpus fixture `ffbAAA8eMpE`: the annotated
+    /// `<span>` and the `<p class='line'>` that encloses it, truncated after
+    /// the highlight ends. Every tag, attribute, quote style and byte of the
+    /// markup is Quip's; only the prose was scrubbed length-for-length when
+    /// the fixture was staged, and ids were kept byte-exact.
+    ///
+    /// Note the highlight starts **mid-word** — `my` | `dipisc` — which is
+    /// what a comment anchor really looks like and why no block can be minted
+    /// for the range.
+    const REAL_COMMENT_ANNOTATION: &str =
+        "<p id='temp:C:ffb3d38c909e3d64493943c51b07' class='line'>Oeiusmodt rloremipsu \
+         eturadipis elitsedd head him mporloremipsu seddoei stare. Scingeli his \
+         <b>cingelit umdolorsitame</b> ectetura he my\
+         <span annotationid=\"temp:C:ffbc97475333a3d4bafaeed9f717\" class=\"c9 h2\" \
+         id=\"temp:C:ffbc97475333a3d4bafaeed9f717\">dipisc modtemp video — node Oeiusmodt \
+         moral <i>etconsec</i>. Album </span>ctetura come metcon a sectet ctetur stare.</p>";
+
+    /// Verbatim from the staged raw document `GDXAAAe8Rw0`, the only other of
+    /// the 56 that carries an annotation — and the one that carries **three**,
+    /// two of them inside a single paragraph, which the committed corpus
+    /// cannot show. Markup byte-exact, prose truncated after the second
+    /// highlight closes.
+    const REAL_TWO_ANNOTATIONS_ONE_PARAGRAPH: &str =
+        "<p id='temp:C:GDX14131f9a1b1f426f8eff01cc4' class='line'><b>Multi-Layer \
+         Strategic/Tactical System</b>\
+         <span annotationid=\"temp:C:GDX2c3e642d6fdc46d8922064007\" class=\"c9 h2\" \
+         id=\"temp:C:GDX2c3e642d6fdc46d8922064007\"><b>s</b> – The game operates on more \
+         than one scale</span>nstrai\
+         <span annotationid=\"temp:C:GDXec185fd3ce4643808781c75da\" class=\"c9 h2\" \
+         id=\"temp:C:GDXec185fd3ce4643808781c75da\">n outcome</span>s at another.</p>";
+
+    /// [`ANNOTATION_ATTR`] has to clear the sanitizer before anything can
+    /// read it — the same relationship `formula` has to its loss count, and
+    /// the reason both names are in `allowed_attributes`. Without this the
+    /// attribute is gone before the DOM exists and the anchor pass is
+    /// permanently, silently empty.
+    #[test]
+    fn the_sanitizer_admits_annotationid_so_the_anchor_can_be_captured() {
+        let out = sanitize(REAL_COMMENT_ANNOTATION);
+        assert!(out.contains("annotationid="), "sanitize must keep `annotationid`: {out:?}");
+        assert_eq!(
+            from_quip_html(REAL_COMMENT_ANNOTATION).sections.len(),
+            2,
+            "a stripped attribute would leave only the paragraph's own anchor",
+        );
+    }
+
+    /// The anchor resolves to the block the highlight lives **in**. There is
+    /// no block for the range itself and there never will be — it is inline,
+    /// and here it does not even start on a word boundary — so the paragraph
+    /// is the honest answer and the offsets are a stated loss, not a silent
+    /// one.
+    #[test]
+    fn a_comment_annotation_resolves_to_the_paragraph_that_contains_it() {
+        let out = from_quip_html(REAL_COMMENT_ANNOTATION);
+        let by_id: HashMap<&str, &str> =
+            out.sections.iter().map(|(s, b)| (s.as_str(), b.as_str())).collect();
+        let para = by_id["temp:C:ffb3d38c909e3d64493943c51b07"];
+        assert_eq!(
+            by_id.get("temp:C:ffbc97475333a3d4bafaeed9f717"),
+            Some(&para),
+            "the annotation must name the paragraph's block: {:?}",
+            out.sections
+        );
+        assert_eq!(para.len(), 10, "a real minted blockId");
+    }
+
+    /// Document order survives the splice: the anchor is inserted directly
+    /// after the entry it resolved through, not appended to the tail. The
+    /// chunker slices `sections` in order, so a tail append would scatter a
+    /// document's anchors across chunk boundaries in a way the source never
+    /// suggests.
+    #[test]
+    fn a_comment_anchor_is_spliced_in_document_order_not_appended() {
+        let html = format!("{REAL_COMMENT_ANNOTATION}<p id='temp:C:ffbfollowing'>after</p>");
+        let out = from_quip_html(&html);
+        let ids: Vec<&str> = out.sections.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "temp:C:ffb3d38c909e3d64493943c51b07",
+                "temp:C:ffbc97475333a3d4bafaeed9f717",
+                "temp:C:ffbfollowing",
+            ],
+        );
+    }
+
+    /// Two comments on one paragraph are two anchors on one block — the
+    /// relationship is many-to-one, and the map is keyed the way Phase 4 will
+    /// read it (annotation id in, block out), so both resolve without
+    /// colliding.
+    #[test]
+    fn two_annotations_in_one_paragraph_both_name_that_paragraphs_block() {
+        let out = from_quip_html(REAL_TWO_ANNOTATIONS_ONE_PARAGRAPH);
+        let by_id: HashMap<&str, &str> =
+            out.sections.iter().map(|(s, b)| (s.as_str(), b.as_str())).collect();
+        let para = by_id["temp:C:GDX14131f9a1b1f426f8eff01cc4"];
+        assert_eq!(by_id.get("temp:C:GDX2c3e642d6fdc46d8922064007"), Some(&para));
+        assert_eq!(by_id.get("temp:C:GDXec185fd3ce4643808781c75da"), Some(&para));
+        assert_eq!(out.sections.len(), 3, "one paragraph, two anchors: {:?}", out.sections);
+    }
+
+    /// The annotated `<span>` alone, with the enclosing `<p id='…'>` cut
+    /// away — the same real bytes, minus the ancestor. Nothing to resolve
+    /// through means nothing recorded: the pass never invents a key, and in
+    /// particular never falls back to the span's own id, which would map the
+    /// anchor to itself and answer nothing.
+    #[test]
+    fn an_annotation_with_no_anchored_ancestor_records_nothing() {
+        let orphan = REAL_COMMENT_ANNOTATION
+            .split_once("ectetura he my")
+            .expect("the fixture text before the highlight")
+            .1;
+        let out = from_quip_html(&format!("<p>{orphan}"));
+        assert!(
+            out.sections.is_empty(),
+            "no ancestor anchor, so no entry: {:?}",
+            out.sections
+        );
+        let xml = doc_xml(&out);
+        assert!(xml.contains("dipisc modtemp"), "the highlighted text still imports: {xml}");
+    }
+
+    /// The attribute is metadata for a side-table and must not leak into the
+    /// document, exactly as `formula` must not. It reaches `sections` and
+    /// stops there.
+    #[test]
+    fn an_annotation_id_reaches_the_section_map_and_no_yrs_node() {
+        let xml = doc_xml(&from_quip_html(REAL_COMMENT_ANNOTATION));
+        assert!(!xml.contains("annotationid"), "no `annotationid` attribute on a node: {xml}");
+        assert!(!xml.contains("ffbc9747"), "the anchor value is not content: {xml}");
+        assert!(xml.contains("dipisc modtemp"), "the highlighted text is: {xml}");
+    }
+
     #[test]
     fn images_are_collected_with_their_block_ids() {
         let out = from_quip_html("<p>x</p><img src=\"/blob/t1/b9\" alt=\"pic\">");
