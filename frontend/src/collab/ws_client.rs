@@ -894,7 +894,10 @@ impl CollabClient {
     }
 
     /// Connect to the WebSocket server.
-    /// `connected_flag` is set to true when synced, false on disconnect.
+    /// `connected_flag` is set to true when synced, and false again on
+    /// disconnect — by `onclose` for a socket the browser closed, or
+    /// directly by `disconnect()` for a deliberate one (which detaches
+    /// `onclose` before dropping the socket, so it can't fire).
     pub fn connect(&self, ws_url: &str, token: &str, connected_flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         *self.state.borrow_mut() = ConnectionState::Connecting;
         // Reconnect path: a stale interval from a prior session must not

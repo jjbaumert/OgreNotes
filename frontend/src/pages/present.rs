@@ -386,10 +386,10 @@ pub fn PresentPage() -> impl IntoView {
                 // document.rs's same-doc branch) — just disconnect the
                 // old WebSocket; the connect below opens a fresh one.
                 // `ws_synced_flag` is the same `Arc` every time, so the
-                // false it's set to on `onclose` and the true it gets
-                // back on the next SyncStep2 both land on the one signal
-                // the broadcast Effect's `just_resynced` edge-detector
-                // watches.
+                // false `disconnect()` stores into it and the true it
+                // gets back on the next SyncStep2 both land on the one
+                // signal the broadcast Effect's `just_resynced`
+                // edge-detector watches.
                 if let Some(ref client) = *collab_for_connect.borrow() {
                     client.disconnect();
                 }
