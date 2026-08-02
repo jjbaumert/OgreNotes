@@ -3431,8 +3431,8 @@ async fn a_quip_folder_holding_only_a_chat_is_still_mirrored_as_an_empty_folder(
 /// `root` offers it directly, and so do both of `root`'s sub-folders.
 ///
 ///   root -> [t1, f2, f3]
-///   f2   -> [t1, t2]
-///   f3   -> [t1]
+///   f2   -> [t1, t2, t3]
+///   f3   -> [t1, t3]
 ///
 /// Three, not two, because the interesting failures are plural: a bug that
 /// keeps only the primary and a bug that keeps only the *last* additional
@@ -3442,11 +3442,17 @@ async fn a_quip_folder_holding_only_a_chat_is_still_mirrored_as_an_empty_folder(
 /// batches a level; the fixture matches that ids string rather than inventing
 /// per-folder requests Quip would never receive.
 ///
-/// `first_folder` is unambiguous here — `root` is a selected root, met at
-/// depth 0, before anything at depth 1 can offer `t1`. That matters because
-/// `QuipClient::folders` yields `HashMap::into_values()`, so *within* a level
-/// (here `f2` vs `f3`) the order is nondeterministic. Nothing below asserts
-/// which of `f2`/`f3` came first.
+/// Two threads, deliberately, because `first_folder` is stable in one and a
+/// coin-flip in the other. `QuipClient::folders` yields
+/// `HashMap::into_values()`, so *within* a level the fetch order is
+/// nondeterministic:
+///
+/// - `t1` is offered by `root` at depth 0, before anything at depth 1 can
+///   claim it — its primary is always `root`'s mirror.
+/// - `t3` is offered only by `f2` and `f3`, **both at depth 1**, so which one
+///   becomes its `first_folder` is not stable across runs.
+///
+/// Nothing below asserts which of `f2`/`f3` won either race.
 async fn quip_server_with_a_thread_in_three_folders() -> MockServer {
     let server = MockServer::start().await;
 
@@ -3468,11 +3474,11 @@ async fn quip_server_with_a_thread_in_three_folders() -> MockServer {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "f2": {
                 "folder": {"id": "f2", "title": "Sub"},
-                "children": [ {"thread_id": "t1"}, {"thread_id": "t2"} ]
+                "children": [ {"thread_id": "t1"}, {"thread_id": "t2"}, {"thread_id": "t3"} ]
             },
             "f3": {
                 "folder": {"id": "f3", "title": "Other"},
-                "children": [ {"thread_id": "t1"} ]
+                "children": [ {"thread_id": "t1"}, {"thread_id": "t3"} ]
             }
         })))
         .mount(&server)
@@ -3482,7 +3488,8 @@ async fn quip_server_with_a_thread_in_three_folders() -> MockServer {
         .and(path("/1/threads/"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "t1": {"thread": {"id": "t1", "title": "Doc A", "type": "document", "updated_usec": 111}},
-            "t2": {"thread": {"id": "t2", "title": "Sheet", "type": "spreadsheet", "updated_usec": 222}}
+            "t2": {"thread": {"id": "t2", "title": "Sheet", "type": "spreadsheet", "updated_usec": 222}},
+            "t3": {"thread": {"id": "t3", "title": "Shared", "type": "document", "updated_usec": 333}}
         })))
         .mount(&server)
         .await;
@@ -3494,6 +3501,11 @@ async fn quip_server_with_a_thread_in_three_folders() -> MockServer {
         .await;
     Mock::given(method("GET"))
         .and(path("/2/threads/t2/html"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(T2_HTML)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2/threads/t3/html"))
         .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(T2_HTML)))
         .mount(&server)
         .await;
@@ -3635,6 +3647,50 @@ async fn a_thread_in_three_quip_folders_is_reachable_from_all_three_after_import
         t2_meta.additional_folder_ids.is_empty(),
         "a thread in one Quip folder must not acquire extra memberships",
     );
+}
+
+/// The same claim where **which folder is primary is a coin-flip**: `t3` is
+/// offered by `f2` and `f3`, both in the same BFS level, and
+/// `QuipClient::folders` hands that level back as `HashMap::into_values()`.
+///
+/// The point is that the user-visible claim does not depend on the race. Both
+/// folders list the document either way; only the `is_primary` flag on
+/// `GET /documents/:id/folders` differs, and nothing here asserts which id
+/// won. A test that pinned the winner would pass locally and flake in CI on a
+/// different hash seed — the failure mode this one is shaped to avoid.
+#[tokio::test]
+async fn a_thread_shared_by_two_folders_in_one_bfs_level_lands_in_both_either_way() {
+    common::require_infra!();
+    let server = quip_server_with_a_thread_in_three_folders().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    assert_eq!(
+        member_folders_of(&app, &import_id, "t3").await,
+        BTreeSet::from(["f2".to_string(), "f3".to_string()]),
+        "both same-level parents must be recorded, whichever was fetched first",
+    );
+
+    let ogre_f2 = mirrored_folder(&app, &import_id, "f2").await.expect("f2 mirrored");
+    let ogre_f3 = mirrored_folder(&app, &import_id, "f3").await.expect("f3 mirrored");
+    let both = BTreeSet::from([ogre_f2.clone(), ogre_f3]);
+
+    let doc_id = doc_id_for(&app, &import_id, "t3").await.expect("t3 imported");
+    assert_eq!(doc_folder_set(&app, &doc_id).await, both);
+    assert_eq!(
+        folders_listing_the_doc(&app, &both, &doc_id).await,
+        both,
+        "both folders list it regardless of which one won the primary slot",
+    );
+
+    // One of them is the primary and exactly one is additional — the two are
+    // chained by the routes, so neither an empty nor a doubled primary is ok.
+    let meta = app.state.doc_repo.get(&doc_id).await.unwrap().unwrap();
+    assert!(both.contains(meta.folder_id.as_deref().expect("filed somewhere")));
+    assert_eq!(meta.additional_folder_ids.len(), 1);
 }
 
 /// Re-run safety for the plural case: a thread in three folders is in exactly
