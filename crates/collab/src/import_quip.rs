@@ -5598,6 +5598,56 @@ mod tests {
         assert!(xml.contains("dipisc modtemp"), "the highlighted text still imports: {xml}");
     }
 
+    /// An annotation id that already keys the map is dropped, not appended.
+    ///
+    /// **Asserted on `resolve_comment_anchors` directly rather than through
+    /// markup, deliberately.** No document in the 56-thread staged corpus
+    /// spells a duplicate — all four `annotationid`s are distinct — and
+    /// inventing the Quip markup for one would only pin the invention. The
+    /// join is a pure function over `(id, id)` pairs, so the rule can be
+    /// stated on its real inputs without guessing at HTML that may not exist.
+    ///
+    /// The rule matters because `sections` is read as a lookup table: a
+    /// repeated key makes the answer depend on which entry the reader happens
+    /// to hit, and a Phase-4 comment resolving to a different block on
+    /// different runs is worse than one that does not resolve at all.
+    #[test]
+    fn a_duplicate_anchor_id_is_dropped_rather_than_making_the_map_ambiguous() {
+        let mut sections = vec![("sec-1".to_string(), "blockAAAAAA".to_string())];
+        let anchors = vec![
+            ("ann-1".to_string(), "sec-1".to_string()),
+            // The same annotation seen twice, and one colliding with a
+            // section id that is already a key.
+            ("ann-1".to_string(), "sec-1".to_string()),
+            ("sec-1".to_string(), "sec-1".to_string()),
+        ];
+        resolve_comment_anchors(&mut sections, &anchors);
+        assert_eq!(
+            sections,
+            vec![
+                ("sec-1".to_string(), "blockAAAAAA".to_string()),
+                ("ann-1".to_string(), "blockAAAAAA".to_string()),
+            ],
+        );
+    }
+
+    /// An anchor whose enclosing id never became a block is dropped, and
+    /// takes nothing with it — the pass must not shift or lose an ordinary
+    /// section entry while failing to place an anchor. Same rationale as
+    /// above for testing the join directly: the shape (an annotation inside
+    /// the `'6'` continuation `<ul>` that #188 merges away, say) does not
+    /// occur in the corpus.
+    #[test]
+    fn an_anchor_whose_enclosing_section_never_became_a_block_is_dropped() {
+        let mut sections = vec![
+            ("sec-1".to_string(), "blockAAAAAA".to_string()),
+            ("sec-2".to_string(), "blockBBBBBB".to_string()),
+        ];
+        let before = sections.clone();
+        resolve_comment_anchors(&mut sections, &[("ann-1".to_string(), "gone".to_string())]);
+        assert_eq!(sections, before, "an unplaceable anchor changes nothing");
+    }
+
     /// The attribute is metadata for a side-table and must not leak into the
     /// document, exactly as `formula` must not. It reaches `sections` and
     /// stops there.
