@@ -738,3 +738,75 @@ async fn get_status(
         report,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ogrenotes_storage::models::import_inventory::ReportNote;
+
+    fn row_with(counters: &[(&str, u64)], notes: Vec<ReportNote>) -> ReportRow {
+        ReportRow {
+            owner_id: "u1".to_string(),
+            counters: counters.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            notes,
+            notes_dropped: 0,
+        }
+    }
+
+    fn note(kind: &str, detail: &str) -> ReportNote {
+        ReportNote {
+            quip_thread_id: "qt1".to_string(),
+            kind: kind.to_string(),
+            detail: detail.to_string(),
+        }
+    }
+
+    /// **#208's whole invariant, checked over the roster rather than one
+    /// kind at a time.** Every `report::KIND_*` the worker can write must
+    /// come out of `project_report` somewhere a client can see it.
+    ///
+    /// The per-kind integration tests pin the seven kinds that exist today;
+    /// none of them fails when an *eighth* is added to `worker_mode::report`
+    /// and then projected nowhere — which is exactly the state #208 was
+    /// filed to end, and exactly the state a new `KIND_` reintroduces for
+    /// free. Driven off `ALL_KINDS`, which `report_keys!` derives from the
+    /// constants, so a kind cannot exist without being checked here.
+    ///
+    /// The assertion is on the serialized DTO rather than on named fields
+    /// because the question is "does this reach the wire at all", and a
+    /// field-by-field check would have to be extended by the same person
+    /// who forgot to project the kind.
+    #[test]
+    fn every_recorded_note_kind_reaches_the_wire() {
+        for kind in report::ALL_KINDS {
+            let detail = format!("sentinel detail for {kind}");
+            let json = serde_json::to_string(&project_report(row_with(
+                &[],
+                vec![note(kind, &detail)],
+            )))
+            .expect("ReportDto serializes");
+            assert!(
+                json.contains(&detail),
+                "note kind {kind:?} is recorded by the worker but projected nowhere on \
+                 the wire — a user sees it only as an increment to notesDropped: {json}",
+            );
+        }
+    }
+
+    /// A kind whose counter moved but which wrote **no note** must still
+    /// project. This is not a corner case: it is the ordinary shape of
+    /// `mentions_degraded`, which `worker_mode` bumps with `None` for every
+    /// document whose @mentions degraded without a systemic cause. A
+    /// projection that required a note to draw a section would silence the
+    /// most common within-document loss on the exact runs where nothing
+    /// else went wrong.
+    #[test]
+    fn a_counter_only_kind_still_projects_its_total() {
+        let dto = project_report(row_with(&[(report::THREADS_MENTIONS_DEGRADED, 5)], vec![]));
+        let mentions = dto
+            .mentions_degraded
+            .expect("a counter with no notes is still a loss the user must be told about");
+        assert_eq!(mentions.total, 5, "the total is the counter's, notes or not");
+        assert!(mentions.notes.is_empty(), "precondition: no notes were written");
+    }
+}

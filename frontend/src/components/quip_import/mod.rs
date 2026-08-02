@@ -1381,6 +1381,44 @@ mod tests {
         );
     }
 
+    /// A kind that reports a count and names **nothing** still draws.
+    ///
+    /// This is not a corner case — it is the ordinary shape of
+    /// `mentionsDegraded`. The server writes a note only for the systemic
+    /// cause (the lookup endpoint refusing the run); the far more common
+    /// per-document degradation bumps the counter alone. A `Section::new`
+    /// that treated an empty note list as "nothing happened" would silence
+    /// the most common within-document loss on exactly the runs where
+    /// nothing else went wrong, and every other test here supplies a note.
+    #[test]
+    fn a_counter_with_no_named_examples_still_draws_its_section() {
+        let c = Completion::from_report(&ImportReport {
+            imported: 47,
+            mentions_degraded: Some(outcome(5, vec![])),
+            ..ImportReport::default()
+        });
+
+        let s = c.mentions_degraded.clone().expect(
+            "a counted loss with no named example is still a loss the user must be told about",
+        );
+        assert_eq!(s.total, 5, "the heading count is the counter's");
+        assert!(s.named.is_empty(), "precondition: the server named nothing");
+        assert_eq!(
+            s.display_counts(),
+            (5, Some(5)),
+            "all five are unnamed, so all five are disclosed as the remainder",
+        );
+        assert_eq!(
+            c.sections(OutcomeTier::WithinDocuments)
+                .iter()
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>(),
+            vec![OutcomeKind::MentionsDegraded],
+            "the section must reach the screen, not just the struct",
+        );
+        assert!(!c.is_clean(), "a run that degraded 5 documents' mentions is not clean");
+    }
+
     /// A server that predates #208 sends no such fields at all. That must
     /// decode — a hard error here would break the whole progress poll mid
     /// rolling deploy, freezing the wizard on a live import — and must read
