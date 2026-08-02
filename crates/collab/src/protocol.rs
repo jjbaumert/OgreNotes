@@ -18,7 +18,22 @@ pub enum MessageType {
     SyncStep2 = 0x02,
     /// Incremental yrs update (binary).
     Update = 0x03,
-    /// Awareness update (JSON-encoded AwarenessState).
+    /// Awareness update (JSON-encoded AwarenessState). Fanned out both to
+    /// same-instance clients (local broadcast) and, since #212, to every
+    /// other API instance via Redis pub/sub — see
+    /// `RoomRegistry::apply_remote_update`'s `Awareness` arm, which caches
+    /// the remote payload under the sender's `session_id` (for
+    /// snapshot-on-join priming) before relaying it to this instance's
+    /// local clients. Presence and cursors previously never crossed
+    /// instances, so a presenter/viewer pair placed on different ECS
+    /// tasks would never see each other; this is what makes live-follow
+    /// work under >1 task.
+    ///
+    /// #211: the cache key is `AwarenessState::session_id`, not
+    /// `user_id` — a per-connection random id the frontend generates once
+    /// per page mount, so one user's two open windows (e.g. a projector
+    /// window and a separate `?presenter=1` control window) get
+    /// independent cursors instead of collapsing into one.
     Awareness = 0x04,
     /// Application-level keepalive. Payload is empty and ignored. The
     /// client sends these on a ~25s cadence while the user is active so the
@@ -49,11 +64,35 @@ pub enum MessageType {
     /// its per-foreign-doc yrs::Doc sidecar to refresh the
     /// REFERENCE* cache.
     ForeignDocUpdate = 0x09,
-    /// Awareness departure (server → client only). Payload is the leaving
-    /// user's id (UTF-8). Sent when a client disconnects and that user has
-    /// no other live connection in the room, so peers can drop the user's
-    /// cursor immediately instead of leaving it frozen until refresh (#9).
-    /// Like `Awareness`, this is local-broadcast only — never redis-fanned.
+    /// Awareness departure (server → client only). Sent when a connection
+    /// disconnects, so peers can drop that specific window's cursor
+    /// immediately instead of leaving it frozen until refresh (#9).
+    ///
+    /// Payload (#211/#212) is UTF-8 `"{session_id}\0{user_id}"` — the
+    /// departing *connection's* session id, not just the user id, so
+    /// closing one of a user's two open windows never forgets the
+    /// other's still-live cursor. `user_id` rides along for logging/
+    /// debug only; the server keys its cache removal on `session_id`
+    /// alone. Backward-tolerant during a rolling deploy: a frame with no
+    /// `\0` separator is the pre-#211/#212 bare-user_id shape, and is
+    /// handled by scanning the cache for every session belonging to that
+    /// user (`Room::forget_awareness_by_user`) rather than being dropped.
+    ///
+    /// Since #211/#212, there's no "does this user have another tab"
+    /// gate before emitting this frame — a session's departure never
+    /// affects any *other* session's cache entry, whether that other
+    /// session belongs to the same user or not, so the gate that used to
+    /// exist here (back when the cache was user_id-keyed) is gone.
+    ///
+    /// Since #212, this frame is also published to Redis — the instance
+    /// where a session's connection dropped tells every other instance to
+    /// forget that session's cached awareness and relay the leave to
+    /// their local clients too, otherwise the cursor/pill would linger
+    /// forever on any instance that never independently observes a leave
+    /// for that session. This publish happens even when the local room is
+    /// now empty (no local broadcast target) — skipping it in that case
+    /// was the original #212 bug: the very last local client leaving a
+    /// room never told other instances at all.
     AwarenessLeave = 0x0A,
     /// Error message (UTF-8 string). Server → client only.
     Error = 0xFF,

@@ -43,3 +43,4 @@ replacement.
 | `legacy-absolute.json` | Old-format payload with only absolute `cursor_pos` (no block fields). Exercises the backwards-compat path. |
 | `no-presence.json` | Connected user with no focus / no cursor at all. Baseline identity-only shape. |
 | `presenting.json` | A presenter broadcasting the slide they are on (live follow-the-presenter, P2). |
+| `session-id.json` | A presenter with a `session_id` populated (#211/#212) — one physical user with two windows (e.g. projector + `?presenter=1` control window) needs two independent, followable identities. |

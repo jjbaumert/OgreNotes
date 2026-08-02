@@ -19,23 +19,32 @@ use crate::presentation::model::{deck_from_doc, Deck, FrameRole, DEFAULT_THEME};
 use crate::presentation::nav::{index_of_slide, next_index, prev_index, slide_block_id};
 
 /// Who this viewer can follow: everyone else currently broadcasting a
-/// `presenting` slide. Self is excluded (you can't follow yourself),
-/// and cursors with no `presenting` value are ordinary editors.
-pub(crate) fn presenters<'a>(cursors: &'a [RemoteCursor], me: &str) -> Vec<&'a RemoteCursor> {
-    cursors.iter().filter(|c| c.presenting.is_some() && c.user_id != me).collect()
+/// `presenting` slide. "Self" here means this exact browser tab/window
+/// (session), not this user broadly (#211) — a presenter's OTHER
+/// window, e.g. a projector window and a separate `?presenter=1`
+/// control window, has a different `session_id` and so shows up here as
+/// followable. It's expected (and useful) for a presenter to see their
+/// own name listed when they have two present windows open.
+pub(crate) fn presenters<'a>(cursors: &'a [RemoteCursor], my_session_id: &str) -> Vec<&'a RemoteCursor> {
+    cursors.iter().filter(|c| c.presenting.is_some() && c.session_id != my_session_id).collect()
 }
 
 /// The slide index a follower should be on, given the presenter's
 /// broadcast id. `None` when not following, when the presenter is gone,
 /// or when the id names a slide this deck no longer has (a concurrent
 /// delete) — in every case the follower simply stays put.
+///
+/// `following` names a `session_id` (#211), not a `user_id` — so
+/// following a specific one of a presenter's two open windows keeps
+/// tracking *that* window even if their other window is also presenting
+/// a different slide.
 pub(crate) fn followed_index(
     deck: &Deck,
     cursors: &[RemoteCursor],
     following: Option<&str>,
 ) -> Option<usize> {
     let target = following?;
-    let cursor = cursors.iter().find(|c| c.user_id == target)?;
+    let cursor = cursors.iter().find(|c| c.session_id == target)?;
     let block_id = cursor.presenting.as_deref()?;
     index_of_slide(deck, block_id)
 }
@@ -49,6 +58,22 @@ pub(crate) fn followed_index(
 /// exercise — has a unit test.
 pub(crate) fn just_resynced(was_synced: bool, synced: bool) -> bool {
     synced && !was_synced
+}
+
+/// Clears an `Rc<Cell<bool>>` when dropped.
+///
+/// Used for the reconnect in-flight guard (#210): the guarded async
+/// block has several exits (token-fetch error, missing window/origin,
+/// success) and one that forgets to clear the flag would wedge present
+/// mode offline for the rest of the session — no further reconnect
+/// attempt would ever get past the guard. RAII makes that
+/// unforgettable.
+pub(crate) struct ClearOnDrop(pub(crate) std::rc::Rc<std::cell::Cell<bool>>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
 }
 
 /// Whether a DOM event's target is a native interactive control (button,
@@ -100,14 +125,23 @@ pub fn PresentPage() -> impl IntoView {
     let (loaded, set_loaded) = signal(false);
 
     // Live follow-the-presenter state (Task 8). `remote_cursors` mirrors
-    // document.rs's awareness callback; `following` names the user_id
-    // this viewer is tracking (`None` = not following anyone); `paused`
-    // is set the moment this viewer navigates manually while following,
-    // so their own click/keypress doesn't get immediately overwritten by
-    // the next presenter broadcast.
+    // document.rs's awareness callback — deliberately NOT deduped by
+    // user (unlike document.rs's copy, #211) so a presenter's two open
+    // windows both appear as independently followable; `following`
+    // names the session_id this viewer is tracking (`None` = not
+    // following anyone); `paused` is set the moment this viewer
+    // navigates manually while following, so their own click/keypress
+    // doesn't get immediately overwritten by the next presenter
+    // broadcast.
     let remote_cursors: RwSignal<Vec<RemoteCursor>> = RwSignal::new(Vec::new());
     let (following, set_following) = signal(None::<String>);
     let (paused, set_paused) = signal(false);
+    // #211: this window's own session_id, mirrored into a signal from
+    // `CollabClient::session_id()` the moment the client is constructed
+    // (see the connect Effect below). Empty string (never matches a
+    // real session_id) until then, which is fine — `presenters()` just
+    // excludes nothing extra in that brief window.
+    let (my_session_id, set_my_session_id) = signal(String::new());
     // `StoredValue` (Copy, unlike a plain `String`) because this id flows
     // through several nested `move` reactive closures below (the follow
     // affordance's two `<Show>`s, the presenter `<For>`, the per-button
@@ -310,42 +344,186 @@ pub fn PresentPage() -> impl IntoView {
     let ws_synced_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (ws_synced, set_ws_synced) = signal(false);
 
+    // #210: bumped by the liveness poll/listener below to re-run the
+    // connect Effect after an idle-disconnect or a network blip —
+    // mirrors document.rs:337's `reconnect_trigger`. Without this the
+    // one-shot `spawn_local` this block used to be could never run
+    // again, so a dropped socket stayed dropped for the rest of the
+    // session.
+    let (reconnect_trigger, set_reconnect_trigger) = signal(0u32);
+
+    // #210: guards the async gap between this Effect deciding to
+    // reconnect and `connect()` actually running (there's an `await` on
+    // `request_ws_token` in between, during which `is_connected()` still
+    // reads false). Without it, the 5s poll or a visibilitychange can
+    // bump the trigger again mid-flight and start a second token fetch,
+    // briefly putting two live sockets on one session_id — and the first
+    // of the two to close takes the survivor's server-side awareness
+    // entry with it.
+    let reconnect_in_flight = std::rc::Rc::new(std::cell::Cell::new(false));
+
     {
         let id = doc_id();
         let collab_for_connect = std::rc::Rc::clone(&collab_client);
         let synced_for_connect = std::sync::Arc::clone(&ws_synced_flag);
-        leptos::task::spawn_local(async move {
-            let client = CollabClient::new(id.clone(), None);
-            client.set_on_awareness_update(Box::new(move |cursors| {
-                remote_cursors.set(cursors);
-            }));
-            *collab_for_connect.borrow_mut() = Some(client);
+        let in_flight = std::rc::Rc::clone(&reconnect_in_flight);
+        Effect::new(move |_| {
+            // The only dependency: this Effect's job is purely "(re)connect
+            // now", it doesn't need to react to anything else on the page.
+            let _trigger = reconnect_trigger.get();
 
-            match crate::api::documents::request_ws_token(&id).await {
-                Ok(resp) => {
-                    let origin = web_sys::window()
-                        .and_then(|w| w.location().origin().ok())
-                        .unwrap_or_default();
-                    let ws_origin = if origin.starts_with("https") {
-                        origin.replacen("https", "wss", 1)
-                    } else {
-                        let api_origin = origin.replacen("http", "ws", 1);
-                        if api_origin.contains(":8080") {
-                            api_origin.replace(":8080", ":3000")
+            // Already reconnecting — drop this run. The poll fires again
+            // in LIVENESS_POLL_MS, so a genuinely-needed reconnect that
+            // races an in-flight one is retried, not lost.
+            if in_flight.get() {
+                return;
+            }
+            in_flight.set(true);
+
+            let has_client = collab_for_connect.borrow().is_some();
+            if has_client {
+                // Reconnect: reuse the existing CollabClient (mirrors
+                // document.rs's same-doc branch) — just disconnect the
+                // old WebSocket; the connect below opens a fresh one.
+                // `ws_synced_flag` is the same `Arc` every time, so the
+                // false `disconnect()` stores into it and the true it
+                // gets back on the next SyncStep2 both land on the one
+                // signal the broadcast Effect's `just_resynced`
+                // edge-detector watches.
+                if let Some(ref client) = *collab_for_connect.borrow() {
+                    client.disconnect();
+                }
+                // #210: force the false→true edge the broadcast Effect's
+                // `just_resynced` detector needs, instead of hoping the
+                // 300ms poll below samples the gap. `ws_synced` is only
+                // ever written by that poll, so on the fast path — the
+                // visibilitychange listener reconnects immediately, and
+                // token fetch + handshake + SyncStep2 all land between
+                // two ticks — the poll only ever observes `true`, no
+                // edge is detected, `last_sent_block_id` still matches
+                // the unchanged slide, and the reconnected presenter
+                // never re-announces. That's #210's exact symptom:
+                // invisible to every follower until they happen to
+                // change slides.
+                set_ws_synced.set(false);
+            } else {
+                let client = CollabClient::new(id.clone(), None);
+                // #211: capture this window's session_id once, at
+                // construction — a fresh `CollabClient` is only built on
+                // this (non-reconnect) branch, so this never re-fires on
+                // a reconnect and `my_session_id` stays stable for the
+                // component's lifetime, matching "once per CollabClient
+                // instance / page mount".
+                set_my_session_id.set(client.session_id().to_string());
+                client.set_on_awareness_update(Box::new(move |cursors| {
+                    remote_cursors.set(cursors);
+                }));
+                *collab_for_connect.borrow_mut() = Some(client);
+            }
+
+            let id = id.clone();
+            let collab_for_token = std::rc::Rc::clone(&collab_for_connect);
+            let synced_for_token = std::sync::Arc::clone(&synced_for_connect);
+            let in_flight_for_token = std::rc::Rc::clone(&in_flight);
+            leptos::task::spawn_local(async move {
+                // Cleared on *every* exit below (including the token
+                // error path) or the page could never reconnect again.
+                let _guard = ClearOnDrop(in_flight_for_token);
+                match crate::api::documents::request_ws_token(&id).await {
+                    Ok(resp) => {
+                        let origin = web_sys::window()
+                            .and_then(|w| w.location().origin().ok())
+                            .unwrap_or_default();
+                        let ws_origin = if origin.starts_with("https") {
+                            origin.replacen("https", "wss", 1)
                         } else {
-                            api_origin
+                            let api_origin = origin.replacen("http", "ws", 1);
+                            if api_origin.contains(":8080") {
+                                api_origin.replace(":8080", ":3000")
+                            } else {
+                                api_origin
+                            }
+                        };
+                        let ws_url = format!("{ws_origin}/api/v1/documents/{id}/ws");
+                        if let Some(ref client) = *collab_for_token.borrow() {
+                            client.connect(&ws_url, &resp.token, synced_for_token);
                         }
-                    };
-                    let ws_url = format!("{ws_origin}/api/v1/documents/{id}/ws");
-                    if let Some(ref client) = *collab_for_connect.borrow() {
-                        client.connect(&ws_url, &resp.token, synced_for_connect);
+                    }
+                    Err(e) => {
+                        crate::editor::debug::warn("collab", &format!("ws-token request failed: {e}"));
                     }
                 }
-                Err(e) => {
-                    crate::editor::debug::warn("collab", &format!("ws-token request failed: {e}"));
+            });
+        });
+    }
+
+    // #210 liveness: "visible tab = active" — while the present tab is
+    // visible, keep the connection warm unconditionally (a displayed
+    // slide IS the live session, whether or not anyone is pressing
+    // keys) and ask for a reconnect if the socket isn't up. Deliberately
+    // NOT the 300ms `ws_synced` poll above: that cadence exists to keep
+    // the *awareness broadcast* Effect's reactive dependency reasonably
+    // fresh, but `record_activity()` only matters on a 30-minute
+    // horizon (`IDLE_DISCONNECT_MS`), so ticking it that fast would just
+    // be needless wakeups for no behavioral gain — a slower, independent
+    // interval is enough. The `should_keep_warm`/`should_trigger_reconnect`
+    // predicates live in `presentation::liveness` so they're unit-tested
+    // without a DOM.
+    const LIVENESS_POLL_MS: u32 = 5_000;
+    {
+        let collab = std::rc::Rc::clone(&collab_client);
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let active_for_cleanup = active.clone();
+        on_cleanup(move || active_for_cleanup.store(false, std::sync::atomic::Ordering::Relaxed));
+        leptos::task::spawn_local(async move {
+            loop {
+                gloo_timers::future::TimeoutFuture::new(LIVENESS_POLL_MS).await;
+                if !active.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let visible = web_sys::window()
+                    .and_then(|w| w.document())
+                    .map(|d| !d.hidden())
+                    .unwrap_or(false);
+                let connected =
+                    collab.borrow().as_ref().map(|c| c.is_connected()).unwrap_or(false);
+                if crate::presentation::liveness::should_keep_warm(visible) {
+                    if let Some(ref client) = *collab.borrow() {
+                        client.record_activity();
+                    }
+                }
+                if crate::presentation::liveness::should_trigger_reconnect(visible, connected) {
+                    let _ = set_reconnect_trigger.try_update(|n| *n += 1);
                 }
             }
         });
+    }
+
+    // #210: a `visibilitychange` listener alongside the poll above gives
+    // an immediate reconnect the instant the tab comes back to the
+    // foreground, rather than waiting for the next `LIVENESS_POLL_MS`
+    // tick — the poll is the backstop that also catches a mid-session
+    // drop while the tab stays visible the whole time (a network blip),
+    // which a visibility listener alone would never observe. Same
+    // `window_event_listener_untyped` + `on_cleanup` pattern as the
+    // keydown handler above.
+    {
+        let collab_for_visibility = std::rc::Rc::clone(&collab_client);
+        let handle = window_event_listener_untyped("visibilitychange", move |_ev: web_sys::Event| {
+            let visible = web_sys::window()
+                .and_then(|w| w.document())
+                .map(|d| !d.hidden())
+                .unwrap_or(false);
+            let connected = collab_for_visibility
+                .borrow()
+                .as_ref()
+                .map(|c| c.is_connected())
+                .unwrap_or(false);
+            if crate::presentation::liveness::should_trigger_reconnect(visible, connected) {
+                let _ = set_reconnect_trigger.try_update(|n| *n += 1);
+            }
+        });
+        on_cleanup(move || handle.remove());
     }
 
     let color_idx = {
@@ -470,6 +648,30 @@ pub fn PresentPage() -> impl IntoView {
         }
     });
 
+    // #210: a real slide change — manual navigation or a follow-driven
+    // one, both of which land here through `set_idx` — is itself a
+    // liveness signal, so record it too. This is a dedicated Effect
+    // rather than folded into the awareness-broadcast Effect above on
+    // purpose: that Effect also re-runs on every 300ms `ws_synced` poll
+    // tick once synced (see its comment), so recording activity there
+    // would re-arm `record_activity()` every 300ms — exactly the "ping
+    // too fast" this liveness fix is meant to avoid. `prev_idx` gates on
+    // an actual change so mounting at idx 0 counts once, not on every
+    // poll-driven re-run of some other Effect.
+    {
+        let collab = std::rc::Rc::clone(&collab_client);
+        let prev_idx: StoredValue<Option<usize>> = StoredValue::new(None);
+        Effect::new(move |_| {
+            let i = idx.get();
+            if prev_idx.get_value() != Some(i) {
+                prev_idx.set_value(Some(i));
+                if let Some(ref client) = *collab.borrow() {
+                    client.record_activity();
+                }
+            }
+        });
+    }
+
     view! {
         <main
             id="main-content"
@@ -491,23 +693,24 @@ pub fn PresentPage() -> impl IntoView {
                 <div class="deck-present__counter">
                     {move || format!("{} / {}", idx.get() + 1, deck.with(|d| d.slides.len()))}
                 </div>
-                <Show when=move || my_user_id.with_value(|id| !presenters(&remote_cursors.get(), id).is_empty())>
+                <Show when=move || !presenters(&remote_cursors.get(), &my_session_id.get()).is_empty()>
                     <div class="deck-present__follow">
                         <Show
                             when=move || following.get().is_some() && paused.get()
                             fallback=move || view! {
-                                <For each=move || my_user_id.with_value(|id| {
-                                            presenters(&remote_cursors.get(), id)
-                                                .into_iter().map(|c| (c.user_id.clone(), c.name.clone())).collect::<Vec<_>>()
-                                        })
-                                         key=|(id, _)| id.clone()
-                                         children=move |(id, name)| {
-                                            let id2 = id.clone();
+                                <For each=move || {
+                                            let my_sid = my_session_id.get();
+                                            presenters(&remote_cursors.get(), &my_sid)
+                                                .into_iter().map(|c| (c.session_id.clone(), c.name.clone())).collect::<Vec<_>>()
+                                        }
+                                         key=|(session_id, _)| session_id.clone()
+                                         children=move |(session_id, name)| {
+                                            let target_session_id = session_id.clone();
                                             view! {
                                                 <button class="deck-present__follow-btn"
                                                     on:click=move |ev: web_sys::MouseEvent| {
                                                         ev.stop_propagation();
-                                                        set_following.set(Some(id2.clone()));
+                                                        set_following.set(Some(target_session_id.clone()));
                                                         set_paused.set(false);
                                                     }>
                                                     {crate::t!("deck-present-follow", name = name)}
@@ -575,7 +778,15 @@ mod follow_tests {
     use crate::collab::ws_client::RemoteCursor;
     use crate::presentation::model::{DeckSlide, DEFAULT_THEME};
 
+    /// `session` defaults to `"{user}-sess"` when a test doesn't care
+    /// about distinguishing sessions; tests exercising the #211
+    /// same-user-multiple-sessions behavior pass explicit session ids
+    /// via `cursor_with_session`.
     fn cursor(user: &str, presenting: Option<&str>) -> RemoteCursor {
+        cursor_with_session(user, &format!("{user}-sess"), presenting)
+    }
+
+    fn cursor_with_session(user: &str, session: &str, presenting: Option<&str>) -> RemoteCursor {
         RemoteCursor {
             user_id: user.to_string(),
             name: format!("{user}-name"),
@@ -585,6 +796,8 @@ mod follow_tests {
             selection_head_block: None,
             typing_thread_id: None,
             presenting: presenting.map(|s| s.to_string()),
+            session_id: session.to_string(),
+            seq: 0,
         }
     }
 
@@ -604,20 +817,53 @@ mod follow_tests {
     #[test]
     fn presenters_excludes_self_and_non_presenters() {
         let cs = vec![cursor("me", Some("s1")), cursor("them", Some("s2")), cursor("editor", None)];
-        let p = presenters(&cs, "me");
+        let p = presenters(&cs, "me-sess");
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].user_id, "them");
+    }
+
+    /// #211: the whole point of session-keyed `presenters()` — a
+    /// presenter's OTHER window (same user_id, different session_id)
+    /// must be followable, and only the caller's *own* session is
+    /// excluded.
+    #[test]
+    fn presenters_includes_same_user_different_session_excludes_only_own_session() {
+        let cs = vec![
+            cursor_with_session("me", "sess-projector", Some("s1")),
+            cursor_with_session("me", "sess-control", Some("s1")),
+            cursor("them", Some("s2")),
+        ];
+        // Viewing from the projector window: control window (same
+        // user, different session) and them are both followable.
+        let p = presenters(&cs, "sess-projector");
+        let sessions: std::collections::HashSet<_> = p.iter().map(|c| c.session_id.as_str()).collect();
+        assert_eq!(sessions, std::collections::HashSet::from(["sess-control", "them-sess"]));
+        assert!(!sessions.contains("sess-projector"), "own session must be excluded");
     }
 
     #[test]
     fn followed_index_resolves_the_presenters_slide() {
         let d = deck(&["s1", "s2", "s3"]);
         let cs = vec![cursor("them", Some("s3"))];
-        assert_eq!(followed_index(&d, &cs, Some("them")), Some(2));
+        assert_eq!(followed_index(&d, &cs, Some("them-sess")), Some(2));
         assert_eq!(followed_index(&d, &cs, None), None, "not following");
-        assert_eq!(followed_index(&d, &cs, Some("ghost")), None, "presenter left");
+        assert_eq!(followed_index(&d, &cs, Some("ghost-sess")), None, "presenter left");
         let cs_gone = vec![cursor("them", Some("deleted-slide"))];
-        assert_eq!(followed_index(&d, &cs_gone, Some("them")), None, "unknown slide id");
+        assert_eq!(followed_index(&d, &cs_gone, Some("them-sess")), None, "unknown slide id");
+    }
+
+    /// #211: following a SPECIFIC session keeps tracking that window
+    /// even when the same user's other window is presenting a
+    /// different slide — the two sessions must not be conflated.
+    #[test]
+    fn followed_index_distinguishes_sessions_of_the_same_user() {
+        let d = deck(&["s1", "s2", "s3"]);
+        let cs = vec![
+            cursor_with_session("presenter", "sess-projector", Some("s1")),
+            cursor_with_session("presenter", "sess-control", Some("s3")),
+        ];
+        assert_eq!(followed_index(&d, &cs, Some("sess-projector")), Some(0));
+        assert_eq!(followed_index(&d, &cs, Some("sess-control")), Some(2));
     }
 }
 
@@ -631,6 +877,84 @@ mod tests {
         assert!(!just_resynced(true, true), "staying synced is not a resync");
         assert!(!just_resynced(false, false), "staying unsynced is not a resync");
         assert!(!just_resynced(true, false), "dropping is not itself a resync");
+    }
+
+    /// Count the re-announce opportunities the broadcast Effect gets,
+    /// by folding a sequence of observed `ws_synced` values through the
+    /// same `just_resynced` edge detector the Effect uses. Each edge is
+    /// one `last_sent_block_id` clear, i.e. one chance to re-announce
+    /// the (unchanged) current slide to the room.
+    ///
+    /// This models the Effect's loop rather than running it — the Effect
+    /// itself needs a live reactive runtime and a `CollabClient` — but
+    /// the detector under test is the real one.
+    fn re_announce_opportunities(observed: &[bool]) -> usize {
+        let mut was = false;
+        let mut edges = 0;
+        for &synced in observed {
+            if just_resynced(was, synced) {
+                edges += 1;
+            }
+            was = synced;
+        }
+        edges
+    }
+
+    /// #210: a reconnect MUST force `ws_synced` false rather than
+    /// relying on the 300ms poll to sample the gap.
+    ///
+    /// Nothing writes that signal except the poll, and
+    /// `CollabClient::disconnect()` doesn't drive it either. On the
+    /// visibilitychange path the reconnect is immediate, so if the token
+    /// fetch + handshake + SyncStep2 all complete between two poll
+    /// ticks, every sample the Effect ever sees is `true` — no edge, the
+    /// dedup guard still matches the unchanged slide, and the
+    /// reconnected presenter never re-announces. They're then invisible
+    /// to every follower until they happen to change slides.
+    #[test]
+    fn a_reconnect_that_lands_between_poll_ticks_is_invisible_without_a_forced_false() {
+        // Initial handshake, then a reconnect fast enough that the poll
+        // only ever samples `true`.
+        assert_eq!(
+            re_announce_opportunities(&[false, true, true, true]),
+            1,
+            "poll sampling alone gives ONE edge — the initial handshake. \
+             The reconnect goes unnoticed; this is the #210 symptom.",
+        );
+
+        // Same reconnect, with the connect Effect setting the signal
+        // false as it tears the old socket down.
+        assert_eq!(
+            re_announce_opportunities(&[false, true, false, true]),
+            2,
+            "forcing the signal false makes the reconnect's edge observable, \
+             so the current slide is re-announced",
+        );
+    }
+
+    /// #210: the in-flight guard must clear on every exit of the
+    /// reconnect task — token-fetch failure included. A path that
+    /// leaves it set wedges present mode offline permanently, since no
+    /// later reconnect attempt could get past the guard.
+    #[test]
+    fn clear_on_drop_releases_the_reconnect_guard_on_every_exit() {
+        let flag = std::rc::Rc::new(std::cell::Cell::new(false));
+
+        flag.set(true);
+        {
+            let _guard = ClearOnDrop(std::rc::Rc::clone(&flag));
+            assert!(flag.get(), "guard held for the duration of the task");
+        }
+        assert!(!flag.get(), "released on the normal path");
+
+        // Early return out of the guarded scope (the token-error path).
+        flag.set(true);
+        (|| {
+            let _guard = ClearOnDrop(std::rc::Rc::clone(&flag));
+            #[allow(clippy::needless_return)]
+            return;
+        })();
+        assert!(!flag.get(), "released on an early return too");
     }
 
     #[test]

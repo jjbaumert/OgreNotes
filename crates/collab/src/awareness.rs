@@ -100,6 +100,31 @@ pub struct AwarenessState {
     /// presenting session (design/presentations.md, "Live follow").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presenting: Option<String>,
+
+    /// #211/#212: a random id generated client-side once per page mount
+    /// / `CollabClient` instance, distinct from `user_id`. Identifies
+    /// this *connection/window*, not this *person* — a user with a
+    /// projector window and a `?presenter=1` control window open at the
+    /// same time has one `user_id` but two `session_id`s.
+    ///
+    /// The server keys its awareness cache (`Room::store_awareness` /
+    /// `forget_awareness` / `awareness_snapshot`) by this field instead
+    /// of `user_id` so those two windows don't collapse into one cursor
+    /// server-side — the same reason the frontend now keys
+    /// `remote_cursors` by session_id (`ws_client.rs`) instead of
+    /// user_id. It also sidesteps the original #212 bug (the server's
+    /// per-room `client_id` counter isn't unique across API instances)
+    /// without needing any instance-id plumbing, since a randomly
+    /// generated session id is globally unique by construction.
+    ///
+    /// `None` only for a client that predates this field (mid-rollout).
+    /// The WS ingress handler (`routes::ws`) normalizes a missing value
+    /// to a per-connection random fallback before rebroadcasting, so by
+    /// the time a frame reaches `apply_remote_update` or a peer client
+    /// it should always be `Some`; `None` there is treated as "legacy,
+    /// synthesize a fallback" rather than dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Color palette for collaborator cursors (12 distinct colors).
@@ -207,6 +232,7 @@ fn state_has_oversize_field(s: &AwarenessState) -> bool {
         selection_head: _,
         typing_thread_id,
         presenting,
+        session_id,
     } = s;
     over(user_id)
         || over(name)
@@ -215,6 +241,95 @@ fn state_has_oversize_field(s: &AwarenessState) -> bool {
         || over_opt(sel_head_block_id)
         || over_opt(typing_thread_id)
         || over_opt(presenting)
+        || over_opt(session_id)
+}
+
+// ─── Disconnect-time leave decision (#212) ──────────────────────
+
+/// Build the `AwarenessLeave` payload for a departing session.
+///
+/// Wire shape (#211/#212) is UTF-8 `"{session_id}\0{user_id}"`. The
+/// `\0` separator is load-bearing: every consumer (`room.rs`'s
+/// `apply_remote_update`, the frontend's `handle_awareness_leave`)
+/// keys off `split_once('\0')`, and a payload without one is treated
+/// as the pre-#211/#212 bare-`user_id` legacy shape and routed to a
+/// scan-by-user fallback. `user_id` rides along purely for
+/// logging/debug — nothing parses it for correctness.
+pub fn leave_payload(session_id: &str, user_id: &str) -> String {
+    format!("{session_id}\0{user_id}")
+}
+
+/// Whether a disconnecting connection still owns the awareness cache
+/// entry under its session id.
+///
+/// An enum rather than a `bool` for two reasons: it makes
+/// `Room::forget_awareness_owned_by`'s return self-documenting (a bare
+/// `true` reads ambiguously as "removed" or "kept"), and it makes the
+/// two arguments of [`leave_actions`] different types, so they can't be
+/// silently transposed at the call site — a swap that no unit test of
+/// `leave_actions` itself could catch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOwnership {
+    /// The cached entry is still this connection's, so this connection
+    /// is the rightful source of a leave announcement for it.
+    StillOurs,
+    /// A newer connection re-stored under the same session id (a
+    /// reconnect reusing it), or a remote instance's fanout took the
+    /// entry over — or there was nothing cached at all. Either way
+    /// this connection must not announce a leave.
+    TakenOver,
+}
+
+/// What a disconnecting connection should do about its awareness entry.
+///
+/// This is the decision that used to live inline in
+/// `routes::ws.rs`'s cleanup block as an `if !is_empty { broadcast;
+/// publish }`, which *was* the #212 bug: the very last local client
+/// leaving a room never told other API instances the session was
+/// gone, so the cursor/"Follow …" pill lingered forever on every
+/// other instance. Pulled out here so the rule is pinned by unit
+/// tests rather than by reading the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AwarenessLeaveActions {
+    /// Send the leave to this instance's other clients in the room.
+    /// Pure optimization — `Room::broadcast` over an empty client map
+    /// is already a no-op, so this only avoids the allocation.
+    pub broadcast_locally: bool,
+    /// Publish the leave to Redis for the other API instances. This
+    /// must NOT be gated on the room being non-empty (#212).
+    pub publish_remotely: bool,
+}
+
+/// Decide what a disconnecting connection does about its awareness
+/// entry.
+///
+/// * `ownership` — whether the cache entry under this connection's
+///   `session_id` is still tagged as belonging to *this* connection.
+///   `TakenOver` means a newer connection re-stored under the same
+///   session id — the reconnect path deliberately reuses the session
+///   id, so a stale half-open socket being reaped by the load balancer
+///   60s later must not announce a leave for a presenter who is live
+///   again. Nothing would re-announce them (the client's send-dedup
+///   still matches the unchanged slide), so they'd stay invisible
+///   indefinitely.
+/// * `room_is_empty` — whether the room has any local clients left
+///   after this connection was removed.
+pub fn leave_actions(
+    ownership: SessionOwnership,
+    room_is_empty: bool,
+) -> AwarenessLeaveActions {
+    if ownership == SessionOwnership::TakenOver {
+        // Someone else owns this session id now. Emitting a leave —
+        // locally or over Redis — would wipe a live cursor.
+        return AwarenessLeaveActions {
+            broadcast_locally: false,
+            publish_remotely: false,
+        };
+    }
+    AwarenessLeaveActions {
+        broadcast_locally: !room_is_empty,
+        publish_remotely: true,
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────
@@ -242,6 +357,7 @@ mod tests {
             selection_head: None,
             typing_thread_id: None,
             presenting: None,
+            session_id: None,
         }
     }
 
@@ -350,6 +466,8 @@ mod tests {
         include_str!("../../../tests/fixtures/protocol/awareness/no-presence.json");
     const FIXTURE_PRESENTING: &str =
         include_str!("../../../tests/fixtures/protocol/awareness/presenting.json");
+    const FIXTURE_SESSION_ID: &str =
+        include_str!("../../../tests/fixtures/protocol/awareness/session-id.json");
 
     /// Asserts a fixture decodes, re-encodes, and decodes again without losing
     /// any populated field. Uses a `serde_json::Value` equality check on the
@@ -422,6 +540,11 @@ mod tests {
     }
 
     #[test]
+    fn fixture_session_id_preserved() {
+        assert_fixture_round_trips(FIXTURE_SESSION_ID, "session-id.json");
+    }
+
+    #[test]
     fn presenting_field_is_length_capped() {
         let long = "x".repeat(MAX_AWARENESS_FIELD_BYTES + 1);
         let raw = serde_json::json!({
@@ -431,6 +554,42 @@ mod tests {
         assert!(
             decode_awareness(raw.as_bytes()).is_none(),
             "an over-long presenting id must be rejected like every other string field"
+        );
+    }
+
+    /// #211/#212: session_id round-trips through decode → mutate →
+    /// encode just like every other field, and is subject to the same
+    /// per-field length cap as the rest of the string fields.
+    #[test]
+    fn session_id_round_trips() {
+        let state = AwarenessState {
+            session_id: Some("sess-abc123".to_string()),
+            ..empty_state("u1", "Alice", 2)
+        };
+        let bytes = encode_awareness(&state);
+        let decoded = decode_awareness(&bytes).unwrap();
+        assert_eq!(decoded.session_id.as_deref(), Some("sess-abc123"));
+    }
+
+    #[test]
+    fn session_id_absent_decodes_to_none() {
+        // A client that predates #211/#212 sends no session_id at all —
+        // must decode cleanly rather than being rejected.
+        let json = r#"{"user_id":"u1","name":"Bob","color":5}"#;
+        let state = decode_awareness(json.as_bytes()).unwrap();
+        assert!(state.session_id.is_none());
+    }
+
+    #[test]
+    fn session_id_field_is_length_capped() {
+        let long = "x".repeat(MAX_AWARENESS_FIELD_BYTES + 1);
+        let raw = serde_json::json!({
+            "user_id": "u", "name": "n", "color": 0, "session_id": long
+        })
+        .to_string();
+        assert!(
+            decode_awareness(raw.as_bytes()).is_none(),
+            "an over-long session_id must be rejected like every other string field"
         );
     }
 
@@ -576,5 +735,77 @@ mod tests {
         );
         decode_awareness(json.as_bytes())
             .expect("multibyte string exactly at byte cap must be accepted");
+    }
+}
+
+// ─── Leave-decision tests (#212, #210 interaction) ──────────────
+
+#[cfg(test)]
+mod leave_decision_tests {
+    use super::*;
+
+    /// The wire shape every consumer parses with `split_once('\0')`.
+    /// A payload that loses the separator silently degrades to the
+    /// legacy scan-by-user path on both the backend and the frontend.
+    #[test]
+    fn leave_payload_uses_the_nul_separated_session_user_shape() {
+        let p = leave_payload("sess-abc", "user-42");
+        assert_eq!(p, "sess-abc\0user-42");
+        assert_eq!(
+            p.split_once('\0'),
+            Some(("sess-abc", "user-42")),
+            "consumers key off split_once('\\0')",
+        );
+    }
+
+    #[test]
+    fn leave_payload_is_not_a_bare_user_id() {
+        // The legacy shape is a payload with no separator at all;
+        // a current-shape payload must never be mistaken for it.
+        assert!(leave_payload("s", "u").contains('\0'));
+    }
+
+    /// **This is the #212 regression guard.** The original bug was
+    /// `if !is_empty { broadcast; publish }` — the Redis publish
+    /// skipped exactly when the last local client left the room,
+    /// which is precisely when the other instances still hold the
+    /// stale cursor. Restoring that structure fails here.
+    #[test]
+    fn leave_is_published_remotely_even_when_the_room_went_empty() {
+        let actions = leave_actions(SessionOwnership::StillOurs, true);
+        assert!(
+            actions.publish_remotely,
+            "the last client leaving a room MUST still tell other instances (#212)",
+        );
+        assert!(
+            !actions.broadcast_locally,
+            "nobody local left to broadcast to",
+        );
+    }
+
+    #[test]
+    fn leave_is_broadcast_and_published_when_peers_remain() {
+        let actions = leave_actions(SessionOwnership::StillOurs, false);
+        assert!(actions.broadcast_locally);
+        assert!(actions.publish_remotely);
+    }
+
+    /// **This is the #210×#212 interaction guard.** A reconnect
+    /// reuses the session id, so a stale half-open connection reaped
+    /// later must stay silent — otherwise its leave wipes the live
+    /// reconnected presenter and nothing re-announces them.
+    #[test]
+    fn a_stale_connection_that_no_longer_owns_the_session_emits_nothing() {
+        for room_is_empty in [true, false] {
+            let actions = leave_actions(SessionOwnership::TakenOver, room_is_empty);
+            assert!(
+                !actions.publish_remotely,
+                "stale owner must not publish a leave (room_is_empty={room_is_empty})",
+            );
+            assert!(
+                !actions.broadcast_locally,
+                "stale owner must not broadcast a leave (room_is_empty={room_is_empty})",
+            );
+        }
     }
 }

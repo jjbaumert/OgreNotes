@@ -702,6 +702,34 @@ async fn handle_ws(
     let client_id = room.next_client_id();
     room.add_client(client_id, user_id.clone(), tx).await;
 
+    // #211/#212: this connection's awareness identity. Resolved to the
+    // real value the first time an Awareness frame carrying a
+    // `session_id` arrives (each `CollabClient`/page-mount generates one
+    // once and sends it on every frame — see `ws_client.rs`); until
+    // then, defaults to a per-connection random fallback so even a
+    // pre-rollout client (or a pure viewer that never sends an Awareness
+    // frame at all, e.g. a read-only session) gets a stable,
+    // globally-unique key for the server's awareness cache and any
+    // eventual `AwarenessLeave` — rather than colliding with another
+    // connection's fallback. `nanoid` gives the same collision-
+    // resistance the CSPRNG-backed `instance_id` in redis_pubsub.rs
+    // relies on for the same reason.
+    let session_id_cell: Arc<std::sync::Mutex<String>> =
+        Arc::new(std::sync::Mutex::new(format!("legacy-conn-{}", nanoid::nanoid!(16))));
+    let session_id_cell_for_recv = Arc::clone(&session_id_cell);
+
+    // #210 × #212: who owns the awareness cache entries this connection
+    // stores. `session_id` alone can't answer "is this entry still
+    // mine?" because the present-mode reconnect deliberately reuses it;
+    // `(instance_id, client_id)` identifies the *connection*. Cheap
+    // `Copy`, so the recv task and the cleanup block below can each
+    // hold one.
+    let awareness_owner = ogrenotes_collab::room::AwarenessOwner {
+        instance_id: state.redis_pubsub.instance_id(),
+        client_id,
+    };
+    let awareness_owner_for_recv = awareness_owner;
+
     let connected_at = std::time::Instant::now();
     let messages_in = Arc::new(AtomicU64::new(0));
     let messages_out = Arc::new(AtomicU64::new(0));
@@ -736,7 +764,14 @@ async fn handle_ws(
     // awareness (cursor + selection). Without this, a client that
     // idle-disconnected and reconnected wouldn't see existing cursors
     // until those users moved.
-    for payload in room.awareness_snapshot(client_id).await {
+    //
+    // Excludes by this connection's current session_id — at this point
+    // it's always still the freshly-minted fallback (nothing has been
+    // cached under it yet, since no Awareness frame has been received on
+    // this connection), so in practice this exclude is a no-op today,
+    // same as the pre-#211/#212 code's exclude-by-fresh-client_id was.
+    let initial_session_id = session_id_cell.lock().expect("session id mutex poisoned").clone();
+    for payload in room.awareness_snapshot(&initial_session_id).await {
         let msg = encode_message(MessageType::Awareness, &payload);
         room.send_to_client(client_id, msg).await;
     }
@@ -789,6 +824,12 @@ async fn handle_ws(
     // cleanup (line ~622: `state.room_registry.remove_if_empty`) can
     // still see `state` via its own disjoint capture.
     let state_for_recv = state.clone();
+    // #212: the recv task's `async move` block references `state.redis_pubsub`
+    // directly (Update + Awareness arms), so under RFC 2229 precise closure
+    // capture that field gets moved into the task. Grab a clone now so the
+    // post-disconnect cleanup below (which also needs to publish an
+    // AwarenessLeave to Redis) has its own handle.
+    let redis_pubsub_for_cleanup = state.redis_pubsub.clone();
     let user_id_for_recv = user_id.clone();
     let foreign_subs_for_recv = Arc::clone(&foreign_subs);
     let sync1_in_for_recv = Arc::clone(&sync1_in);
@@ -1049,13 +1090,79 @@ async fn handle_ws(
                                 // to prevent identity spoofing.
                                 if let Some(mut awareness) = ogrenotes_collab::awareness::decode_awareness(payload) {
                                     awareness.user_id = user_id.clone();
+
+                                    // #211/#212: resolve this connection's
+                                    // session_id — prefer what the client
+                                    // sent (a `CollabClient` generates one
+                                    // once per page mount and resends it on
+                                    // every frame); fall back to the
+                                    // per-connection random id minted at
+                                    // connect time for a client that
+                                    // predates this field, so its cache
+                                    // entry is at least stable-per-
+                                    // connection rather than colliding with
+                                    // another connection's fallback.
+                                    // Persist whichever we resolve back
+                                    // into both this connection's shared
+                                    // cell (so a later frame from the same
+                                    // connection — and the disconnect path
+                                    // below — agree on the same id) and the
+                                    // outgoing payload (so every downstream
+                                    // consumer, local peers and remote
+                                    // instances via Redis, sees an
+                                    // always-present, normalized
+                                    // session_id without needing their own
+                                    // fallback logic).
+                                    let resolved_session_id = match awareness.session_id.clone() {
+                                        Some(sid) if !sid.is_empty() => {
+                                            *session_id_cell_for_recv.lock().expect("session id mutex poisoned") = sid.clone();
+                                            sid
+                                        }
+                                        _ => session_id_cell_for_recv.lock().expect("session id mutex poisoned").clone(),
+                                    };
+                                    awareness.session_id = Some(resolved_session_id.clone());
+
                                     let validated = ogrenotes_collab::awareness::encode_awareness(&awareness);
                                     let broadcast_msg = encode_message(MessageType::Awareness, &validated);
-                                    room_for_recv.broadcast(client_id, broadcast_msg).await;
+                                    room_for_recv.broadcast(client_id, broadcast_msg.clone()).await;
                                     // Cache for snapshot-on-join so a future
                                     // reconnecting client sees this cursor
                                     // without having to wait for a move.
-                                    room_for_recv.store_awareness(client_id, validated).await;
+                                    // Keyed by session_id (#211/#212), not
+                                    // client_id and not user_id, so it
+                                    // stays meaningful once fanned out
+                                    // across instances below AND doesn't
+                                    // collapse one user's two open windows
+                                    // into one cursor.
+                                    // Tagged with *this* connection's
+                                    // identity (#210 × #212): the
+                                    // present-mode reconnect path reuses
+                                    // the same session_id, so the entry
+                                    // has to record which connection
+                                    // stored it or a stale half-open
+                                    // socket reaped a minute later would
+                                    // forget a live presenter's cursor.
+                                    // Newest writer wins.
+                                    room_for_recv
+                                        .store_awareness_owned(
+                                            &resolved_session_id,
+                                            validated,
+                                            awareness_owner_for_recv,
+                                        )
+                                        .await;
+
+                                    // #212: mirror the Update path
+                                    // (~line 936) — fan the frame out over
+                                    // Redis so a presenter/viewer pair
+                                    // placed on different ECS tasks still
+                                    // see each other's cursor. Failures are
+                                    // logged + counted, never fatal — the
+                                    // local broadcast above already
+                                    // delivered to same-instance peers.
+                                    if let Err(e) = state.redis_pubsub.publish_update(&doc_id, &broadcast_msg).await {
+                                        counter::inc(MetricKey::new("redis.publish_failures_total", &[]));
+                                        tracing::warn!(error = %e, "redis publish failed (awareness)");
+                                    }
                                 }
                             }
                             MessageType::SubscribeForeignDoc => {
@@ -1188,15 +1295,54 @@ async fn handle_ws(
 
     // Cleanup
     let is_empty = room.remove_client(client_id).await;
-    room.forget_awareness(client_id).await;
-    // #9: tell the remaining peers to drop this user's cursor, otherwise
-    // it lingers frozen at its last position until they refresh. Skip if
-    // the room is now empty (no one to notify) or if this user still has
-    // another tab/connection here (multi-tab — their cursor is still
-    // live). Awareness is local-broadcast only, so this matches its scope.
-    if !is_empty && room.client_count_for_user(&user_id_for_log).await == 0 {
-        let leave = encode_message(MessageType::AwarenessLeave, user_id_for_log.as_bytes());
-        room.broadcast(client_id, leave).await;
+    // #211/#212: the awareness cache is keyed by this connection's
+    // session_id, which is independent of any *other* session the same
+    // user might have open (another tab, another window, another
+    // instance) — so unlike the old user_id-keyed cache, there's no
+    // "does this user have another live connection" gate needed here.
+    // Forgetting this session's entry can never touch a different
+    // session's entry.
+    //
+    // #210 × #212: session ids ARE reused across a reconnect, though, so
+    // the forget is conditional on this connection still owning the
+    // entry. The failing case is a half-open socket: the browser sees
+    // `onclose` and reconnects (same session id, new connection, and it
+    // re-announces), while the server only notices the original socket
+    // is dead when the load balancer reaps it ~60s later. An
+    // unconditional forget + leave at that point wipes a presenter who
+    // is live, and nothing re-announces them — the client's send-dedup
+    // still matches the unchanged slide — so they stay invisible to
+    // every follower for the rest of the session.
+    let session_id_for_log = session_id_cell.lock().expect("session id mutex poisoned").clone();
+    let ownership = room
+        .forget_awareness_owned_by(&session_id_for_log, awareness_owner)
+        .await;
+    // #9: tell the remaining peers to drop this cursor, otherwise it
+    // lingers frozen at its last position until they refresh.
+    //
+    // The broadcast/publish rule itself lives in
+    // `awareness::leave_actions` so it's pinned by unit tests rather
+    // than by reading this call site: publish is unconditional (the
+    // original #212 bug was gating it on `!is_empty`, which skipped it
+    // in exactly the case where other instances still hold the stale
+    // cursor), the local broadcast is skipped when the room is empty
+    // (pure allocation-saving — `broadcast` over an empty client map is
+    // already a no-op), and a connection that no longer owns the entry
+    // stays silent entirely.
+    let actions = ogrenotes_collab::awareness::leave_actions(ownership, is_empty);
+    if actions.broadcast_locally || actions.publish_remotely {
+        let payload =
+            ogrenotes_collab::awareness::leave_payload(&session_id_for_log, &user_id_for_log);
+        let leave = encode_message(MessageType::AwarenessLeave, payload.as_bytes());
+        if actions.broadcast_locally {
+            room.broadcast(client_id, leave.clone()).await;
+        }
+        if actions.publish_remotely {
+            if let Err(e) = redis_pubsub_for_cleanup.publish_update(room.doc_id(), &leave).await {
+                counter::inc(MetricKey::new("redis.publish_failures_total", &[]));
+                tracing::warn!(error = %e, "redis publish failed (awareness-leave)");
+            }
+        }
     }
     // Drain any active foreign-doc subscriptions: abort the forward
     // tasks and remove this connection's client handle from each

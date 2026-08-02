@@ -654,6 +654,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cross_instance_awareness_fanout_reaches_peer_and_skips_self() {
+        // #212: awareness never used to cross instances — this is the
+        // fix's core cross-instance test, mirroring
+        // `cross_instance_fanout_reaches_peer_and_skips_self` above but
+        // for an `Awareness` frame instead of `Update`. A presenter on
+        // instance A publishes their cursor; a viewer on instance B
+        // (different RoomRegistry, different RedisPubSub) must receive
+        // it via the Redis fanout, and instance A must not see its own
+        // frame loop back.
+        use super::super::awareness::{encode_awareness, AwarenessState};
+
+        let pub_a = make_connected_pubsub().await;
+        let pub_b = make_connected_pubsub().await;
+        assert_ne!(pub_a.instance_id(), pub_b.instance_id());
+
+        let registry_a = Arc::new(RoomRegistry::new());
+        let registry_b = Arc::new(RoomRegistry::new());
+
+        let doc_id = format!("awareness-fanout-doc-{}", nanoid::nanoid!(8));
+        let room_a = registry_a.get_or_insert(&doc_id, OgreDoc::new());
+        let room_b = registry_b.get_or_insert(&doc_id, OgreDoc::new());
+
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        room_a.add_client(1, "alice".to_string(), tx_a).await;
+        room_b.add_client(1, "bob".to_string(), tx_b).await;
+
+        let sub_a_handle = pub_a
+            .spawn_subscriber(make_subscriber_client().await, registry_a.clone())
+            .await
+            .expect("spawn A subscriber");
+        let sub_b_handle = pub_b
+            .spawn_subscriber(make_subscriber_client().await, registry_b.clone())
+            .await
+            .expect("spawn B subscriber");
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // ── alice (on A) moves her cursor ──────────────────────────
+        let alice_state = AwarenessState {
+            user_id: "alice".to_string(),
+            name: "Alice".to_string(),
+            color: 0,
+            cursor_block_id: Some("block-1".to_string()),
+            cursor_offset: Some(3),
+            sel_anchor_block_id: None,
+            sel_anchor_offset: None,
+            sel_head_block_id: None,
+            sel_head_offset: None,
+            cursor_pos: None,
+            selection_anchor: None,
+            selection_head: None,
+            typing_thread_id: None,
+            presenting: Some("slide-block-1".to_string()),
+            session_id: Some("sess-alice-1".to_string()),
+        };
+        let payload = encode_awareness(&alice_state);
+        let wire = encode_message(MessageType::Awareness, &payload);
+
+        // WS handler sequence for the Awareness arm: local broadcast
+        // (skip sender), store locally, then publish to Redis.
+        room_a.broadcast(1, wire.clone()).await;
+        room_a.store_awareness("sess-alice-1", payload.clone()).await;
+        pub_a.publish_update(&doc_id, &wire).await.expect("publish");
+
+        // ── bob (on B) must see alice's cursor via Redis fanout ────
+        let bob_got = tokio::time::timeout(std::time::Duration::from_secs(2), rx_b.recv())
+            .await
+            .expect("timed out waiting for peer awareness on instance B")
+            .expect("B's broadcast channel closed unexpectedly");
+        assert_eq!(bob_got, wire, "B should receive the exact wire frame A published");
+
+        // And B's own room cache is primed — a joiner on instance B
+        // right now would already see alice's cursor without waiting
+        // for another move. This is the whole point of #212: it makes
+        // presentations' live-follow work across instances.
+        let snap_b = room_b.awareness_snapshot("nobody").await;
+        assert_eq!(snap_b, vec![payload], "instance B's room must cache alice's awareness for snapshot-on-join");
+
+        // ── alice (on A) must not see her own awareness echoed back ─
+        assert!(!sub_a_handle.is_finished(), "A's subscriber task must still be running");
+        assert!(!sub_b_handle.is_finished(), "B's subscriber task must still be running");
+        let alice_echo = tokio::time::timeout(std::time::Duration::from_millis(200), rx_a.recv()).await;
+        assert!(
+            alice_echo.is_err(),
+            "self-published awareness must not loop back to the sender's own room (got {alice_echo:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_instance_awareness_leave_fanout_forgets_peer() {
+        // #212: the LAST local client leaving instance A must still tell
+        // instance B to drop the cursor — this is the specific "ghost
+        // cursor" bug the fix targets (the old `!is_empty && ...` guard
+        // meant a solo-viewer room's leave was never even attempted).
+        use super::super::awareness::{encode_awareness, AwarenessState};
+
+        let pub_a = make_connected_pubsub().await;
+        let pub_b = make_connected_pubsub().await;
+
+        let registry_a = Arc::new(RoomRegistry::new());
+        let registry_b = Arc::new(RoomRegistry::new());
+
+        let doc_id = format!("awareness-leave-fanout-doc-{}", nanoid::nanoid!(8));
+        let room_a = registry_a.get_or_insert(&doc_id, OgreDoc::new());
+        let room_b = registry_b.get_or_insert(&doc_id, OgreDoc::new());
+
+        // B already has alice's cursor cached (as if an earlier
+        // Awareness frame had fanned out) and a local client to notify.
+        let alice_state = AwarenessState {
+            user_id: "alice".to_string(),
+            name: "Alice".to_string(),
+            color: 0,
+            cursor_block_id: None,
+            cursor_offset: None,
+            sel_anchor_block_id: None,
+            sel_anchor_offset: None,
+            sel_head_block_id: None,
+            sel_head_offset: None,
+            cursor_pos: None,
+            selection_anchor: None,
+            selection_head: None,
+            typing_thread_id: None,
+            presenting: None,
+            session_id: Some("sess-alice-1".to_string()),
+        };
+        room_b.store_awareness("sess-alice-1", encode_awareness(&alice_state)).await;
+
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        room_b.add_client(1, "bob".to_string(), tx_b).await;
+
+        // A has no local clients left at all (alice was the sole/last
+        // connection and already disconnected) — this is the
+        // last-client-leaves case.
+        let _room_a_ref = &room_a;
+
+        let _sub_a_handle = pub_a
+            .spawn_subscriber(make_subscriber_client().await, registry_a.clone())
+            .await
+            .expect("spawn A subscriber");
+        let _sub_b_handle = pub_b
+            .spawn_subscriber(make_subscriber_client().await, registry_b.clone())
+            .await
+            .expect("spawn B subscriber");
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Simulate the disconnect-path publish that fires even when
+        // `is_empty` is true on instance A (room_a has zero clients).
+        // Current wire shape: "session_id\0user_id".
+        let leave = encode_message(MessageType::AwarenessLeave, b"sess-alice-1\0alice");
+        pub_a.publish_update(&doc_id, &leave).await.expect("publish leave");
+
+        let bob_got = tokio::time::timeout(std::time::Duration::from_secs(2), rx_b.recv())
+            .await
+            .expect("timed out waiting for AwarenessLeave on instance B")
+            .expect("B's broadcast channel closed unexpectedly");
+        assert_eq!(bob_got, leave);
+
+        // B's cache must have forgotten alice.
+        let snap_b = room_b.awareness_snapshot("nobody").await;
+        assert!(snap_b.is_empty(), "instance B must forget alice's cursor on remote AwarenessLeave");
+    }
+
+    #[tokio::test]
     async fn subscriber_stays_alive_after_spawn_returns() {
         // Regression guard for the original 86c5c89 defect: the subscriber
         // client was passed by Arc and dropped at the end of the spawn_*
