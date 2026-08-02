@@ -1,14 +1,41 @@
 # Quip import — folder structure (#170) and adjacent work
 
-**Status:** plan, not started. Written 2026-08-01, after the second real-account
-demo-gate run.
+**Status:** plan, not started. Written 2026-08-01 after the second real-account
+demo-gate run; **re-verified against `main` @ `24db1a3` on 2026-08-02** — every
+claim below still holds, with the exact gap now pinned to a single line.
 
 Today every imported document lands **flat** in a single per-import folder
 (`Quip Import — <date>`, added in #172 as interim containment). The Quip folder
 tree is discarded, and the wizard never asks where the import should go.
 
+Note #170 was **closed** when #172 shipped the per-import folder, which was
+accepted as interim containment ("I am ok deploying to a temporary folder for the
+time being"). This plan is the real hierarchy work; it needs a fresh issue.
+
 This plan covers #170 and the work genuinely coupled to it. It is deliberately
 **not** "everything left in the importer" — see *Excluded* at the end.
+
+---
+
+## The gap, precisely (re-verified 2026-08-02)
+
+**One line.** `crates/api/src/worker_mode.rs:1149` writes `ogre_folder_id: None`
+when Phase 1's BFS creates each `FOLDER#` row. Nothing else in the codebase ever
+writes that field.
+
+Everything on both sides of it is already built:
+
+- `crates/storage/src/repo/import_repo.rs:958` **persists** `ogre_folder_id`
+  whenever it is `Some`.
+- `crates/api/src/worker_mode.rs:1920` **consumes** it to build the mapping.
+
+So the shape of Unit 1 is: create the folders, and change that `None`.
+
+A test at `worker_mode.rs:3103` already documents the current state — *"Phase 1
+writes no `ogre_folder_id`, so every Quip folder resolves to the fallback… once
+something populates `ogre_folder_id`, the change is visible here."* Expect that
+test to need updating; per repo rules that is a **behaviour change to argue**, not
+a mechanical edit. It was written in anticipation of exactly this work.
 
 ---
 
@@ -73,6 +100,46 @@ Quip folder under the import's destination, and record `ogre_folder_id` on the r
 new; an unselected parent is handled per the documented rule; a cycle terminates.
 Mutation-check the idempotency guard — that is the one that turns one bad run into
 a mess of duplicate trees.
+
+### New constraint (2026-08-02): the report budget has ONE slot left
+
+Unit 1 will want to report folders it could not create — a forbidden folder, a
+name collision, a parent that vanished. That means a new **note kind**, and the
+`REPORT` row's budget is **25 notes/kind, 8 distinct kinds, 200 total**. #208
+confirmed **7 of 8 kinds are now used**:
+
+`thread_skipped`, `thread_failed`, `image_dropped`, `content_truncated`,
+`mentions_degraded`, `live_app_dropped`, `formulas_dropped`
+
+**A 9th kind's notes are discarded outright** — not truncated, dropped. A
+roster-driven test (`the_worker_stays_within_the_report_rows_note_kind_budget`)
+enforces the ceiling, so this cannot regress silently, but it *will* fail the
+build if Unit 1 adds a kind carelessly.
+
+Two ways through, decide deliberately:
+1. **Spend the last slot** on `folder_failed`. Defensible — folders become
+   user-visible structure in this unit, so a lost one is worth naming.
+2. **Piggyback on an existing kind**, as `FOLDERS_FORBIDDEN` already does: it is a
+   *counter* whose notes file under `KIND_THREAD_SKIPPED`. That keeps the slot but
+   accepts the same defect described below.
+
+**Related known gap, worth fixing inside this unit rather than after:**
+`FOLDERS_FORBIDDEN` is the **only unprojected counter** — its notes surface in the
+skipped list but its count reaches nothing. Consequence, measured during #208's
+review: a run with >25 forbidden folders and no forbidden *threads* reports 25
+rather than the true number. That is tolerable today because folders are invisible;
+once Unit 1 makes the folder tree the point of the feature, an under-reported
+folder failure becomes a real hole. Fold it in.
+
+### Precedent to follow (2026-08-02): `QuipThreadKind`
+
+#230 needed to tell the walker something the HTML could not express, and did it by
+plumbing Quip's thread type in as a typed parameter from a **single call site**
+(`worker_mode.rs:2362`). If Unit 1 needs comparable context, follow that shape —
+and note its documented weakness: one call site with an unchanged convenience
+signature means a future caller silently gets the old behaviour. If Unit 1 adds a
+similar seam, cover it with a worker-level end-to-end test the way #233 Gap 2 did,
+not just a unit test.
 
 ---
 
@@ -158,6 +225,34 @@ ambiguity, resolved worker-side by asking Quip what the id is).
 Demo gate for 1–3: import a Quip account with a nested folder structure and a
 document filed in two folders. The tree appears, the document appears in both
 folders, and re-running the import changes nothing.
+
+**Add to the demo gate (2026-08-02):** re-run the import a *second* time after
+manually moving one imported document to a different folder. The moved document
+must stay where the user put it. This is the mutable-location constraint below,
+and it is the property most likely to be broken by a well-meaning "repair the
+tree" implementation.
+
+---
+
+## Testing discipline this importer has earned
+
+Ten fidelity bugs in this importer shared one root cause: **every fixture encoded
+an HTML shape Quip never emits**, so tests passed against imaginary markup while
+real documents broke. Folder work is less HTML-bound than content work, but two
+rules still apply:
+
+- **Never hand-author Quip markup or a Quip folder-graph shape.** If a test needs
+  a folder tree, derive its shape from what the inventory walk actually records
+  for a real account, not from what a clean tree ought to look like. The malformed
+  graph in hazard 3 is not hypothetical — assume it until measured.
+- **Add a negative control that passes before *and* after.** For Unit 1 the
+  obvious one is: a document the user has already moved does not get moved back.
+  The #153 and #233 work both showed that the test which only goes green after the
+  fix misses the over-reach failure entirely.
+
+Both the corpus net (`crates/collab/tests/quip_corpus.rs`) and the worker
+end-to-end suite (`crates/api/tests/test_quip_content_worker.rs`, extended by #233
+Gap 2) are live and should be extended rather than bypassed.
 
 ---
 
