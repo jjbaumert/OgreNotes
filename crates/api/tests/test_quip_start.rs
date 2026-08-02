@@ -29,8 +29,22 @@ const THREADS_IMPORTED: &str = "threads_imported";
 const THREADS_SKIPPED_FORBIDDEN: &str = "threads_skipped_forbidden";
 const THREADS_SKIPPED_CHAT: &str = "threads_skipped_chat";
 const THREADS_FAILED: &str = "threads_failed";
+const IMAGES_DROPPED: &str = "images_dropped";
+const THREADS_TRUNCATED: &str = "threads_deep_nesting_truncated";
+const THREADS_MENTIONS_DEGRADED: &str = "threads_mentions_degraded";
+const LIVE_APPS_DROPPED: &str = "live_apps_dropped";
+/// The counter's key is *not* its note kind's name: the kind is
+/// `formulas_dropped`, the counter is `spreadsheet_formulas_dropped`
+/// (`worker_mode::report`). Re-typing both here is what keeps a projection
+/// that mixed them up from reading as a silent zero.
+const FORMULAS_DROPPED: &str = "spreadsheet_formulas_dropped";
 const KIND_THREAD_SKIPPED: &str = "thread_skipped";
 const KIND_THREAD_FAILED: &str = "thread_failed";
+const KIND_IMAGE_DROPPED: &str = "image_dropped";
+const KIND_CONTENT_TRUNCATED: &str = "content_truncated";
+const KIND_MENTIONS_DEGRADED: &str = "mentions_degraded";
+const KIND_LIVE_APP_DROPPED: &str = "live_app_dropped";
+const KIND_FORMULAS_DROPPED: &str = "formulas_dropped";
 
 /// Seed a `Scoping` import record with the given owner + selected roots,
 /// returning its id. Mirrors the helper in
@@ -597,6 +611,199 @@ async fn get_status_surfaces_true_counter_totals_alongside_the_bounded_notes() {
     app.cleanup().await;
 }
 
+/// #208 — **the deliverable.** Every kind the worker records reaches the
+/// wire with its own counter and its own notes.
+///
+/// Before this, `image_dropped` / `content_truncated` / `mentions_degraded`
+/// — and, from #214, `live_app_dropped` / `formulas_dropped` — were written
+/// durably and correctly and then projected nowhere: a user saw them only as
+/// an increment to `notesDropped`, a bare number with no explanation
+/// attached. Writing the note is the cheap floor; this is the half that lets
+/// someone stand on it.
+///
+/// Each kind gets a *distinct* counter value and a distinct note so a
+/// projection that crossed two kinds' wires — the likeliest way to get this
+/// wrong — fails rather than passing on symmetry.
+#[tokio::test]
+async fn get_status_surfaces_every_recorded_loss_kind() {
+    common::require_infra!();
+
+    let app = common::TestApp::new().await;
+    let (owner_id, owner_token) = app.create_user("owner1@test.com").await;
+    let import_id = seed_scoping_import(&app, &owner_id, &[]).await;
+
+    let repo = &app.state.import_repo;
+    repo.bump_report_counter(&import_id, &owner_id, IMAGES_DROPPED, 8)
+        .await
+        .expect("images counter");
+    repo.bump_report_counter(&import_id, &owner_id, THREADS_TRUNCATED, 3)
+        .await
+        .expect("truncation counter");
+    repo.bump_report_counter(&import_id, &owner_id, THREADS_MENTIONS_DEGRADED, 5)
+        .await
+        .expect("mentions counter");
+    repo.bump_report_counter(&import_id, &owner_id, LIVE_APPS_DROPPED, 2)
+        .await
+        .expect("live apps counter");
+    repo.bump_report_counter(&import_id, &owner_id, FORMULAS_DROPPED, 300)
+        .await
+        .expect("formulas counter");
+
+    for (kind, id, detail) in [
+        (KIND_IMAGE_DROPPED, "qi1", "image blob-9: it could not be stored"),
+        (KIND_CONTENT_TRUNCATED, "qc1", "nesting deeper than 32 levels was flattened"),
+        (KIND_MENTIONS_DEGRADED, "qm1", "the Quip person-lookup endpoint rejected this import"),
+        (KIND_LIVE_APP_DROPPED, "ql1", "2 embedded Quip live app(s) could not be converted"),
+        (KIND_FORMULAS_DROPPED, "qs1", "300 spreadsheet formula(s) were not imported"),
+    ] {
+        repo.append_report_note(
+            &import_id,
+            &owner_id,
+            ReportNote {
+                quip_thread_id: id.to_string(),
+                kind: kind.to_string(),
+                detail: detail.to_string(),
+            },
+        )
+        .await
+        .expect("note");
+    }
+
+    let body = get_report_status(&app, &import_id, &owner_token).await;
+    let report = &body["report"];
+
+    for (field, total, id, detail_fragment) in [
+        ("imagesDropped", 8, "qi1", "could not be stored"),
+        ("contentTruncated", 3, "qc1", "flattened"),
+        ("mentionsDegraded", 5, "qm1", "person-lookup endpoint"),
+        ("liveAppsDropped", 2, "ql1", "live app(s)"),
+        // 300 formulas, one note: the counter counts formulas, the note
+        // counts documents. A projection that read the total off the note
+        // list would report 1.
+        ("spreadsheetFormulasDropped", 300, "qs1", "formula(s)"),
+    ] {
+        let section = &report[field];
+        assert!(!section.is_null(), "{field} must be projected: {body}");
+        assert_eq!(
+            section["total"], total,
+            "{field}.total must come from its own uncapped counter: {report}",
+        );
+        let notes = section["notes"].as_array().expect("notes array");
+        assert_eq!(notes.len(), 1, "{field} must carry exactly its own notes");
+        assert_eq!(notes[0]["quipThreadId"], id, "{field} projected another kind's note");
+        assert!(
+            notes[0]["detail"].as_str().unwrap().contains(detail_fragment),
+            "{field} detail must be the one the worker authored: {section}",
+        );
+    }
+
+    app.cleanup().await;
+}
+
+/// A kind that never occurred is `null`, not a zero row.
+///
+/// "Zero images were dropped" is not news, and a section drawn for it pushes
+/// the sections that *are* news off the screen. `null` is also what lets the
+/// client draw nothing without re-deriving emptiness from two fields.
+#[tokio::test]
+async fn a_loss_kind_that_never_occurred_is_null_not_a_zero_row() {
+    common::require_infra!();
+
+    let app = common::TestApp::new().await;
+    let (owner_id, owner_token) = app.create_user("owner1@test.com").await;
+    let import_id = seed_scoping_import(&app, &owner_id, &[]).await;
+
+    // A clean 47-document run: a REPORT row exists, and nothing was lost.
+    app.state
+        .import_repo
+        .bump_report_counter(&import_id, &owner_id, THREADS_IMPORTED, 47)
+        .await
+        .expect("imported counter");
+
+    let body = get_report_status(&app, &import_id, &owner_token).await;
+    let report = &body["report"];
+    assert_eq!(report["imported"], 47, "precondition: the row exists: {body}");
+    for field in [
+        "imagesDropped",
+        "contentTruncated",
+        "mentionsDegraded",
+        "liveAppsDropped",
+        "spreadsheetFormulasDropped",
+    ] {
+        assert!(
+            report[field].is_null(),
+            "{field} must be null on a run that never hit it, not a zero section: {report}",
+        );
+    }
+
+    app.cleanup().await;
+}
+
+/// #208's truncation case, on a within-document kind: the counter is the
+/// total, the note list is a sample, and the response must let the reader
+/// see the difference.
+///
+/// This is the same property `get_status_surfaces_true_counter_totals_...`
+/// pins for skips, re-pinned here because the new sections are a *new* place
+/// to get it wrong — a projection that reported `total = notes.len()` would
+/// tell a user who lost 4 000 images that 25 images were lost, which is the
+/// original silence with a smaller number on it.
+///
+/// `images_dropped` counts images rather than documents, so its counter runs
+/// past the 25-note budget far sooner than the thread-scoped kinds do; this
+/// is the kind most likely to be truncated in a real run.
+#[tokio::test]
+async fn a_truncated_within_document_kind_still_reports_its_true_total() {
+    common::require_infra!();
+
+    let app = common::TestApp::new().await;
+    let (owner_id, owner_token) = app.create_user("owner1@test.com").await;
+    let import_id = seed_scoping_import(&app, &owner_id, &[]).await;
+
+    let repo = &app.state.import_repo;
+    const TRUE_TOTAL: u64 = 4_000;
+    repo.bump_report_counter(&import_id, &owner_id, IMAGES_DROPPED, TRUE_TOTAL)
+        .await
+        .expect("images counter");
+    const OVERFLOW: usize = 7;
+    for i in 0..REPORT_MAX_NOTES_PER_KIND + OVERFLOW {
+        repo.append_report_note(
+            &import_id,
+            &owner_id,
+            ReportNote {
+                quip_thread_id: format!("qi{i:04}"),
+                kind: KIND_IMAGE_DROPPED.to_string(),
+                detail: "image blob-9: Quip denied access (HTTP 403)".to_string(),
+            },
+        )
+        .await
+        .expect("image note");
+    }
+
+    let body = get_report_status(&app, &import_id, &owner_token).await;
+    let images = &body["report"]["imagesDropped"];
+    assert_eq!(
+        images["total"], TRUE_TOTAL,
+        "the total must be the uncapped counter, not the note list's length: {images}",
+    );
+    let notes = images["notes"].as_array().expect("imagesDropped.notes");
+    assert_eq!(
+        notes.len(),
+        REPORT_MAX_NOTES_PER_KIND,
+        "the note list stops at the storage row's per-kind budget",
+    );
+    // The remainder the client renders as "…and N more". Derived here the
+    // same way the client derives it, so a response that made the subtraction
+    // read as zero — i.e. "the list is complete" — fails here first.
+    assert_eq!(
+        images["total"].as_u64().unwrap() - notes.len() as u64,
+        TRUE_TOTAL - REPORT_MAX_NOTES_PER_KIND as u64,
+        "the unnamed remainder must be recoverable from the response: {images}",
+    );
+
+    app.cleanup().await;
+}
+
 /// The no-token guard for the *response* shape, mirroring
 /// `import_record_never_carries_a_token_field` (which guards the durable
 /// row) in `crates/storage/tests/test_import_repo.rs`.
@@ -610,6 +817,13 @@ async fn get_status_surfaces_true_counter_totals_alongside_the_bounded_notes() {
 ///
 /// Field *names* rather than the whole body, because `status` legitimately
 /// serializes as `"tokenrejected"`.
+///
+/// **Every projected kind is populated here (#208), not just the two the
+/// guard was written for.** The recursive key walk only inspects what the
+/// response actually contains, so a response whose new sections were all
+/// `null` would walk past the very fields the new code added — the guard
+/// would stay green while covering nothing. Each kind gets a counter and a
+/// note so every section is materialized before the walk runs.
 #[tokio::test]
 async fn report_response_never_carries_a_token_field() {
     common::require_infra!();
@@ -627,26 +841,50 @@ async fn report_response_never_carries_a_token_field() {
         .await
         .expect("stash token");
 
-    app.state
-        .import_repo
-        .bump_report_counter(&import_id, &owner_id, THREADS_SKIPPED_FORBIDDEN, 1)
-        .await
-        .expect("counter");
-    app.state
-        .import_repo
-        .append_report_note(
+    let repo = &app.state.import_repo;
+    for (counter, kind) in [
+        (THREADS_SKIPPED_FORBIDDEN, KIND_THREAD_SKIPPED),
+        (THREADS_FAILED, KIND_THREAD_FAILED),
+        (IMAGES_DROPPED, KIND_IMAGE_DROPPED),
+        (THREADS_TRUNCATED, KIND_CONTENT_TRUNCATED),
+        (THREADS_MENTIONS_DEGRADED, KIND_MENTIONS_DEGRADED),
+        (LIVE_APPS_DROPPED, KIND_LIVE_APP_DROPPED),
+        (FORMULAS_DROPPED, KIND_FORMULAS_DROPPED),
+    ] {
+        repo.bump_report_counter(&import_id, &owner_id, counter, 1)
+            .await
+            .expect("counter");
+        repo.append_report_note(
             &import_id,
             &owner_id,
             ReportNote {
                 quip_thread_id: "qt1".to_string(),
-                kind: KIND_THREAD_SKIPPED.to_string(),
+                kind: kind.to_string(),
                 detail: "Quip denied access to this content (HTTP 403)".to_string(),
             },
         )
         .await
         .expect("note");
+    }
 
     let body = get_report_status(&app, &import_id, &owner_token).await;
+    let report = &body["report"];
+    // Precondition for the walk below: every section the guard is meant to
+    // cover is actually present in the body being walked.
+    for section in [
+        "skipped",
+        "failed",
+        "imagesDropped",
+        "contentTruncated",
+        "mentionsDegraded",
+        "liveAppsDropped",
+        "spreadsheetFormulasDropped",
+    ] {
+        assert!(
+            report[section]["notes"].as_array().is_some_and(|n| !n.is_empty()),
+            "the guard must walk a populated {section}: {body}",
+        );
+    }
     let serialized = body.to_string();
 
     assert!(
