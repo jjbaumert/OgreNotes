@@ -526,13 +526,78 @@ async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<JobDisposition, Strin
 async fn cleanup_staging_blob(ctx: &WorkerCtx, payload: &Job) {
     let s3_key = match payload {
         Job::ImportDocx { s3_key, .. } | Job::ImportPdf { s3_key, .. } => s3_key.as_str(),
-        // The Quip inventory trigger stages nothing in S3; its durable
-        // state is the DynamoDB manifest, cleaned up on the import's own
-        // lifecycle, not here.
+        // A Quip import DOES stage in S3 — one raw-HTML object per thread
+        // under [`quip_staging_prefix`], written by `import_one_thread`
+        // since Phase 2a. It is deliberately not swept from here, because
+        // this hook is *job*-terminal and the delete has to be
+        // *import*-terminal: an acked `StartQuipImport` is not necessarily a
+        // finished import (a `TokenRejected` run acks too, and that import
+        // resumes the moment the user reconnects), and a dead-lettered one
+        // is finalized by [`mark_import_dead_lettered`]. The sweep therefore
+        // hangs off the terminal-status writes themselves — see
+        // [`cleanup_quip_staging`] for the full list of hooks.
         Job::StartQuipImport { .. } | Job::Noop { .. } => return,
     };
     if let Err(e) = ctx.s3.delete_object(s3_key).await {
         tracing::warn!(s3_key, error = %e, "failed to delete import staging blob");
+    }
+}
+
+/// The S3 prefix a Quip import stages its per-thread raw HTML under.
+///
+/// One object per thread lives directly beneath it
+/// (`imports/{import_id}/threads/{quip_thread_id}.html`), written by
+/// [`import_one_thread`] and swept by [`cleanup_quip_staging`]. Both spell it
+/// through this function so the writer and the deleter cannot drift apart —
+/// a deleter aimed at a prefix the writer no longer uses is a silent leak of
+/// the user's full document text, which is what issue #196 was.
+///
+/// **The trailing `/` is load-bearing.** It is what confines a delete to one
+/// import: without it, `imports/abc` would also match `imports/abcdef/...`,
+/// i.e. a *different* import's staged documents. It also excludes the DOCX /
+/// PDF staging that shares the `imports/` root but has a different shape
+/// (`imports/{user_id}/{id}.{ext}` — those are single objects owned by their
+/// own job, cleaned by [`cleanup_staging_blob`]).
+fn quip_staging_prefix(import_id: &str) -> String {
+    format!("imports/{import_id}/threads/")
+}
+
+/// Drop an import's staged raw Quip HTML. **Call only once the import itself
+/// is terminal** — `Succeeded`, or `Failed` (including the dead-letter).
+///
+/// The staged objects are the user's full document text (issue #196: a real
+/// import staged brokerage statements and named correspondence), so retaining
+/// them past the run that needed them is a data-retention defect on its own —
+/// deleting the imported OgreNotes documents does not reach these, because
+/// they are keyed by import id rather than doc id.
+///
+/// **Import-terminal, not job-terminal.** A job retry, a
+/// [`JobDisposition::HeldByLiveRunner`] redelivery, a mid-pass transient
+/// failure and a `TokenRejected` import all leave the import re-runnable, and
+/// none of them may reach this function: while an import can still run again,
+/// its staging is still the in-flight run's diagnostic material.
+///
+/// **Advisory by construction: this returns nothing, so it cannot enter the
+/// import's control flow** — the same discipline [`record_report`] follows. An
+/// import that succeeded must never be reported as failed because its cleanup
+/// could not reach S3; the failure is logged, and the `imports/` lifecycle
+/// rule (see `infra/lib/data.ts`) is the backstop that catches what a lost
+/// delete leaves behind.
+async fn cleanup_quip_staging(ctx: &WorkerCtx, import_id: &str) {
+    let prefix = quip_staging_prefix(import_id);
+    match ctx.s3.delete_prefix(&prefix).await {
+        Ok(()) => tracing::info!(
+            import_id,
+            prefix = %prefix,
+            "quip import: staged thread HTML deleted (import is terminal)",
+        ),
+        Err(e) => tracing::warn!(
+            import_id,
+            prefix = %prefix,
+            error = %e,
+            "quip import: deleting the staged thread HTML failed; the import's outcome is \
+             unchanged and the bucket lifecycle rule remains the backstop",
+        ),
     }
 }
 
@@ -552,6 +617,12 @@ async fn mark_import_dead_lettered(ctx: &WorkerCtx, payload: &Job) {
             if let Err(e) = ctx.import_repo.set_status(import_id, ImportStatus::Failed).await {
                 tracing::warn!(import_id, error = %e, "failed to mark dead-lettered import Failed");
             }
+            // Import-terminal: the queue has exhausted the retry budget, so no
+            // future run will read this import's staging. Unconditional on the
+            // status write above — a dead-lettered job is terminal whether or
+            // not DynamoDB accepted the record of it, and the staged content
+            // must not outlive the run either way.
+            cleanup_quip_staging(ctx, import_id).await;
         }
         Job::ImportDocx { .. } | Job::ImportPdf { .. } | Job::Noop { .. } => {}
     }
@@ -2116,6 +2187,13 @@ async fn run_content_pass(
         .set_status(import_id, ImportStatus::Succeeded)
         .await
         .map_err(|e| format!("set succeeded: {e}"))?;
+    // Import-terminal, and only here: every earlier exit from this pass leaves
+    // the import re-runnable (a returned `Err` is retried by the queue, a
+    // `TokenRejected` resumes after a reconnect), and the staged HTML is the
+    // in-flight run's diagnostic material until the run is over. Deliberately
+    // AFTER the `Succeeded` write, and only if that write landed: a status
+    // this pass could not record is a pass the queue will retry.
+    cleanup_quip_staging(ctx, import_id).await;
     tracing::info!(import_id, threads = threads.len(), "quip content: phase 2 complete");
     Ok(())
 }
@@ -2197,9 +2275,16 @@ pub async fn import_one_thread(
     // 3. Fetch the section-id-bearing `/2` HTML.
     let html = client.thread_html(token, &thread.quip_thread_id).await?;
 
-    // 4. Stage the raw HTML. Kept after the import so a conversion bug can be
-    //    diagnosed — and re-run — without going back to Quip.
-    let staged_key = format!("imports/{import_id}/threads/{}.html", thread.quip_thread_id);
+    // 4. Stage the raw HTML, so a conversion bug hit part-way through a long
+    //    import can be diagnosed — and re-run — without going back to Quip and
+    //    its per-minute rate budget. Kept for the life of the *import*, not
+    //    forever: this is the user's full document text, so the prefix is
+    //    swept the moment the import is terminal (see
+    //    [`cleanup_quip_staging`]; issue #196). Nothing reads it back — a
+    //    resumed pass skips on the `THREAD#` row's `ContentDone` checkpoint
+    //    and re-fetches anything still `Pending` — so its lifetime is purely
+    //    a retention decision.
+    let staged_key = format!("{}{}.html", quip_staging_prefix(import_id), thread.quip_thread_id);
     ctx.s3
         .put_object(&staged_key, html.clone().into_bytes())
         .await
@@ -2658,6 +2743,13 @@ async fn mark_quip_failure(
             )
             .await;
             ctx.import_repo.set_status(import_id, ImportStatus::Failed).await.ok();
+            // Import-terminal (`Failed`, and this run returns `Ok` so the queue
+            // acks rather than retries): nothing will re-run this import, so
+            // its staged thread HTML — which an earlier run of the same import
+            // may well have written before a selected root became unreadable —
+            // has no reader left. The sibling `Unauthorized` arm above
+            // deliberately does NOT sweep: `TokenRejected` is resumable.
+            cleanup_quip_staging(ctx, import_id).await;
             tracing::warn!(
                 import_id,
                 "quip inventory: a selected root is not readable (403); Failed (not TokenRejected \
