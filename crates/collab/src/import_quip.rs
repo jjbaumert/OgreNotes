@@ -2300,12 +2300,13 @@ fn flatten_table(section_id: Option<String>, rows: Vec<QuipRow>) -> Vec<QuipBloc
 ///   shape alone would delete real content, so it takes
 ///   [`QuipThreadKind::Spreadsheet`] — a signal that is not in the HTML at
 ///   all (#230).
-/// * The **gutter column** has no such twin. Across the same corpus all 131
-///   row-number cells are a bare `<td>` with no `id`, no `<span>` and no
-///   terminating `<br/>`, whereas every one of the 2 343 authored cells —
-///   including the 8 whose text is digits only — carries an `id`. Nothing an
-///   author can type produces the gutter's shape, so it needs no thread type
-///   and goes on both paths (#232).
+/// * The **gutter column** has no such twin. Of the corpus's 2 492 table
+///   cells exactly 151 have no `id`: the 131 row-number cells, the 17 empty
+///   2em corners, and 3 `<th>`. Every one of the 131 is a bare `<td>` with no
+///   `<span>` and no terminating `<br/>`, and every one of the 2 341 anchored
+///   cells — including the 8 whose text is digits only — carries all three.
+///   Nothing an author can type produces the gutter's shape, so it needs no
+///   thread type and goes on both paths (#232).
 ///
 /// One pass, one predicate, both paths: [`has_grid_chrome`] decides whether
 /// this table is ruled at all, and `kind` decides only whether the header row
