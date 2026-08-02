@@ -405,10 +405,10 @@ fn find_table<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> Option<XmlElementRef> 
         return Some(el.clone());
     }
     for i in 0..el.len(txn) {
-        if let Some(XmlOut::Element(child)) = el.get(txn, i) {
-            if let Some(found) = find_table(txn, &child) {
-                return Some(found);
-            }
+        if let Some(XmlOut::Element(child)) = el.get(txn, i)
+            && let Some(found) = find_table(txn, &child)
+        {
+            return Some(found);
         }
     }
     None
