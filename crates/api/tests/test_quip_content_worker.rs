@@ -1282,6 +1282,201 @@ async fn the_report_names_the_skipped_and_failed_threads_with_reasons() {
     }
 }
 
+// ─── #155: a recoverable blob failure must not checkpoint the thread ─
+//
+// Step 10 marks a thread `ContentDone` unconditionally, and a `ContentDone`
+// thread is skipped on every later run with zero Quip calls — the content
+// pass's whole resumability guarantee. So dropping an image `src` and then
+// checkpointing makes the loss **permanent**: re-running the import cannot
+// recover it. The thread must instead stay retryable whenever a later attempt
+// could still fetch the blob, and checkpoint only when it genuinely could not.
+
+/// [`quip_content_server`] with t1's blob fetch overridden to `status`
+/// forever. Higher priority (lower number) than the 200 mounted underneath.
+async fn quip_server_with_blob_status(status: u16) -> MockServer {
+    let server = quip_content_server().await;
+    Mock::given(method("GET"))
+        .and(path("/1/blob/t1/b9"))
+        .respond_with(ResponseTemplate::new(status))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Regression (#155): a **rate-limited** blob leaves the thread retryable.
+///
+/// This is the bug's headline shape. A 503 is Quip saying "not now", not "not
+/// ever"; the pre-fix code dropped the `src`, kept the alt text and marked the
+/// thread `ContentDone`, so the very next run skipped it and the document was
+/// image-less forever. During a rate-limit storm that silently persists a whole
+/// migration's worth of pictureless documents while reporting success.
+///
+/// Throttling is never one thread's fault, so it is a `RunFailure`: the pass
+/// aborts, the queue's backoff does the waiting, and the thread is charged
+/// **no** attempt — the same disposition a rate-limited `/2/threads/{id}/html`
+/// already had.
+///
+/// Mutation check: restore the blanket `Err(e) => { drop the src; continue }`
+/// arm in `sideload_images` and every assertion below goes red — the run
+/// succeeds and t1 is `ContentDone` with no image.
+#[tokio::test]
+async fn a_rate_limited_blob_leaves_the_thread_retryable() {
+    common::require_infra!();
+    let server = quip_server_with_blob_status(503).await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    let outcome = execute_start_quip_import(&ctx, &import_id, "owner1").await;
+    assert!(
+        outcome.is_err(),
+        "the pass must report itself incomplete so the queue retries it",
+    );
+
+    let t1 = thread_row(&app, &import_id, "t1").await;
+    assert_eq!(
+        t1.state,
+        ThreadState::Pending,
+        "a rate-limited image must leave the thread retryable, never ContentDone",
+    );
+    assert_eq!(
+        t1.attempts, 0,
+        "throttling is not the thread's fault, so it costs the thread no attempt",
+    );
+    // The doc id is reserved before the first durable write, so it exists —
+    // what must not exist is a snapshot checkpointed without the image.
+    let reserved = t1.ogre_doc_id.clone().expect("a doc id is reserved up front");
+    assert!(
+        app.state.doc_repo.load_snapshot(&reserved).await.unwrap().is_none(),
+        "no document may be persisted without an image a retry could still fetch",
+    );
+
+    // ...and the recovery really works: serve the blob and re-run.
+    server.reset().await;
+    let healthy = quip_content_server().await;
+    let ctx = worker_ctx_with_quip(&app, healthy.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let t1 = thread_row(&app, &import_id, "t1").await;
+    assert_eq!(t1.state, ThreadState::ContentDone, "the retry finishes the thread");
+    let snapshot = app.state.doc_repo.load_snapshot(&reserved).await.unwrap().expect("snapshot");
+    let doc = ogrenotes_collab::snapshot::deserialize(&snapshot).expect("decode snapshot");
+    assert_eq!(
+        ogrenotes_collab::blob_ref::collect_blob_refs(doc.inner()).len(),
+        1,
+        "the image the first run could not fetch is present after the retry",
+    );
+}
+
+/// The #142 attempt bound really does apply to the new blob path.
+///
+/// A Quip 5xx on a blob is recoverable, so it propagates — but propagating
+/// without a bound would be an unbounded retry, which is the failure #142
+/// exists to prevent. It routes through `ThreadImportError::Transient`, so the
+/// per-thread counter charges it, the thread is `Failed` after
+/// `MAX_THREAD_ATTEMPTS`, and the import still *completes* inside the queue's
+/// budget with the healthy threads imported.
+///
+/// This is also the negative control for "a thread with no images is
+/// unaffected": t2 has no image and imports normally throughout.
+#[tokio::test]
+async fn a_blob_that_always_5xxs_is_bounded_by_the_threads_attempt_budget() {
+    common::require_infra!();
+    let server = quip_server_with_blob_status(500).await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    let runs = run_like_the_queue(&ctx, &import_id, "owner1").await;
+    assert!(
+        runs <= QUEUE_RUNS,
+        "the give-up must happen before the job dead-letters (took {runs} runs)",
+    );
+
+    let t1 = thread_row(&app, &import_id, "t1").await;
+    assert_eq!(t1.attempts, 3, "the existing per-thread counter bounds the new path");
+    assert_eq!(t1.state, ThreadState::Failed, "and the give-up is reached, not an endless retry");
+    let reason = t1.reason.clone().unwrap_or_default();
+    assert!(reason.contains("gave up"), "the reason says it gave up: {reason:?}");
+
+    // A thread with no images is untouched by any of this.
+    let t2 = thread_row(&app, &import_id, "t2").await;
+    assert_eq!(t2.state, ThreadState::ContentDone, "an image-free thread imports normally");
+    assert!(
+        app.state.doc_repo.get(&t2.ogre_doc_id.clone().unwrap()).await.unwrap().is_some(),
+        "the healthy thread's document must exist",
+    );
+
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ImportStatus::Succeeded, "one dead thread must not fail the import");
+    let report = app.state.import_repo.get_report(&import_id).await.unwrap().expect("report");
+    let failed = report
+        .notes
+        .iter()
+        .find(|n| n.quip_thread_id == "t1")
+        .expect("the failed thread must be named in the report");
+    assert_eq!(failed.kind, "thread_failed", "no new note kind: the #142 kind already says it");
+}
+
+/// A **permanent** blob failure still drops the image and still checkpoints —
+/// and must, because the alternative is strictly worse for the user.
+///
+/// A 404 blob is gone. Retrying it three times and then marking the thread
+/// `Failed` would turn a document that imported fine-but-imageless into a
+/// document that did not import at all. So the pre-#155 policy is exactly right
+/// for this class and is deliberately kept: drop the `src`, keep the alt text,
+/// name the loss on the report, and finish the thread. One run, no retries.
+///
+/// This is the negative control against the fix over-reaching: an unconditional
+/// propagate would loop this thread to `Failed` and lose the document.
+#[tokio::test]
+async fn a_permanently_missing_blob_still_checkpoints_the_thread_in_one_run() {
+    common::require_infra!();
+    let server = quip_server_with_blob_status(404).await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    execute_start_quip_import(&ctx, &import_id, "owner1")
+        .await
+        .expect("a blob that will never exist must not fail the run");
+
+    let t1 = thread_row(&app, &import_id, "t1").await;
+    assert_eq!(
+        t1.state,
+        ThreadState::ContentDone,
+        "the document is worth more than the picture it lost",
+    );
+    assert_eq!(t1.attempts, 0, "a decided loss costs no attempt: there is nothing to retry");
+    assert_eq!(
+        hits(&server, "/1/blob/t1/b9").await,
+        1,
+        "asked once and decided; a permanent failure must not be re-bought",
+    );
+
+    // The document exists, keeps its text, and has no dangling blob reference.
+    let doc_id = t1.ogre_doc_id.clone().expect("t1 imported");
+    let snapshot = app.state.doc_repo.load_snapshot(&doc_id).await.unwrap().expect("snapshot");
+    let doc = ogrenotes_collab::snapshot::deserialize(&snapshot).expect("decode snapshot");
+    assert!(
+        ogrenotes_collab::blob_ref::collect_blob_refs(doc.inner()).is_empty(),
+        "the src is dropped rather than left pointing at nothing",
+    );
+
+    // ...and the loss is named on the report under the kind that already
+    // exists for it. No new note kind is spent on #155.
+    let report = app.state.import_repo.get_report(&import_id).await.unwrap().expect("report");
+    assert_eq!(report.counters.get("images_dropped"), Some(&1));
+    let note = report
+        .notes
+        .iter()
+        .find(|n| n.kind == "image_dropped")
+        .expect("the dropped image must be named");
+    assert_eq!(note.quip_thread_id, "t1");
+    assert!(note.detail.contains("b9"), "the note names the blob: {note:?}");
+}
+
 // ─── silent content loss: live apps (#191) and formulas (#192) ───────
 //
 // These two are unlike every other loss this suite covers. A dropped image
