@@ -809,12 +809,18 @@ fn corpus_spreadsheet_section_id_density() {
     let (html, quip, c) = import("QGYAAAjicgG");
 
     assert_eq!(c.headings.get("1"), Some(&1), "h1");
-    assert_eq!(c.paragraphs, 527, "one per cell, plus the spacer paragraphs");
+    // #232 took 31 of these with the gutter column — the 30 row-number `<td>`
+    // and the corner `<th>`, one paragraph each — from 527. This is the
+    // *document* path over a spreadsheet's markup, which is not how the
+    // worker imports this thread; see the two tests below for both real paths.
+    assert_eq!(c.paragraphs, 496, "one per cell, plus the spacer paragraphs");
 
     assert_eq!(c.tables, 1, "one data-section-style='13' section");
-    assert_eq!(c.table_rows, 31, "table_row");
-    assert_eq!(c.table_cells, 510, "table_cell");
-    assert_eq!(c.table_headers, 17, "<th> column headers — <thead> is transparent");
+    assert_eq!(c.table_rows, 31, "table_row — the header row is content on this path");
+    // #232: 510 source `<td>` less the 30 `#f0f0f0` row-number cells.
+    assert_eq!(c.table_cells, 480, "table_cell");
+    // #232: 17 source `<th>` less the empty 2em corner.
+    assert_eq!(c.table_headers, 16, "<th> column headers — <thead> is transparent");
 
     assert_eq!(c.lists(), 0);
     assert_eq!(c.code_blocks, 0);
@@ -964,8 +970,7 @@ fn corpus_spreadsheet_grid_chrome_is_not_imported_as_data() {
 }
 
 /// **#230, the negative control.** Byte-for-byte the same markup, imported as
-/// an ordinary document: the header row and the leading column survive as
-/// content.
+/// an ordinary document: the header row survives as content.
 ///
 /// This is the discriminator under test, isolated — same input, one bit
 /// different, opposite outcome. It matters because Quip wraps *prose* tables
@@ -973,8 +978,17 @@ fn corpus_spreadsheet_grid_chrome_is_not_imported_as_data() {
 /// 56-document corpus carry a `<thead>` whose first cell is the empty 2em
 /// corner and a `#f0f0f0` numeric gutter on every body row, and 16 of those
 /// 17 are ordinary document tables whose `<th>` cells hold real headings.
-/// Any fix keyed on that markup instead of on the thread type would delete
-/// those headings. This test fails the moment such a fix is attempted.
+/// Any fix that deleted the *header row* on that markup instead of on the
+/// thread type would delete those headings. This test fails the moment such a
+/// fix is attempted.
+///
+/// **#232 narrowed what the thread bit controls, and only that.** The leading
+/// column used to be asserted here as surviving content: it no longer does,
+/// on either path, because no author can produce an id-less cell and so the
+/// gutter needs no thread type to be recognised. What the bit still decides
+/// — the 31st row, all 17 of its `<th>` — is unchanged and is what remains
+/// asserted. `table_cells` 510 → 480 and `table_headers` 17 → 16 are the
+/// 30 gutter cells and the one corner.
 #[test]
 fn the_same_grid_markup_imported_as_a_document_keeps_its_header_row() {
     let html = fixture("QGYAAAjicgG");
@@ -982,21 +996,27 @@ fn the_same_grid_markup_imported_as_a_document_keeps_its_header_row() {
     let grid = first_table_grid(&quip.doc);
 
     assert_eq!(grid.len(), 31, "the header row is content here");
-    assert_eq!(grid.iter().map(Vec::len).collect::<Vec<_>>(), vec![17; 31], "17 cells per row");
+    assert_eq!(grid.iter().map(Vec::len).collect::<Vec<_>>(), vec![16; 31], "16 cells per row");
     assert_eq!(
         grid[0].iter().filter(|(header, _)| *header).count(),
-        17,
+        16,
         "the whole first row is <th>",
     );
     assert!(
-        column(&grid, 0)[1..].iter().all(|t| t.bytes().all(|b| b.is_ascii_digit())),
-        "the leading column survives as content",
+        grid[0].iter().all(|(_, t)| !t.trim().is_empty()),
+        "every column letter survives, and the empty corner went with the gutter: {:?}",
+        grid[0],
+    );
+    assert!(
+        !column(&grid, 0)[1..].iter().all(|t| t.bytes().all(|b| b.is_ascii_digit())),
+        "the row-number ruler is gone from column A on this path too (#232): {:?}",
+        column(&grid, 0),
     );
 
     // `QuipThreadKind::Document` is what plain `from_quip_html` means, so the
     // counts the rest of this file pins are the counts asserted here.
-    assert_eq!(census(&quip.doc).table_cells, 510);
-    assert_eq!(census(&quip.doc).table_headers, 17);
+    assert_eq!(census(&quip.doc).table_cells, 480);
+    assert_eq!(census(&quip.doc).table_headers, 16);
     assert_eq!(quip.sections.len(), 528, "no anchor is lost on the document path");
 }
 
@@ -1019,16 +1039,19 @@ fn corpus_prose_tables_with_header_rows() {
     assert_eq!(c.headings.get("1"), Some(&1), "h1");
     assert_eq!(c.headings.get("2"), Some(&6), "h2");
     assert_eq!(c.headings.get("3"), Some(&13), "h3");
-    // 41 `<p>` + 73 `<li>` + 88 `<td>` + 20 `<th>`.
-    assert_eq!(c.paragraphs, 222, "paragraph blocks");
+    // 41 `<p>` + 73 `<li>` + 66 `<td>` + 15 `<th>`. #232 took 27 of these
+    // with the gutter column — one paragraph per chrome cell — from 222.
+    assert_eq!(c.paragraphs, 195, "paragraph blocks");
 
     assert_eq!(c.tables, 5, "data-section-style='13' sections");
     assert_eq!(c.table_rows, 27, "5 header rows + 22 body rows");
-    assert_eq!(c.table_cells, 88, "table_cell");
+    // #232: 88 source `<td>` less the 22 `#f0f0f0` row-number cells.
+    assert_eq!(c.table_cells, 66, "table_cell");
     // The number this fixture was added for. `AeOAAAcV1hg` has tables but
     // spells its header row with `<td class='bold'>`; this is the corpus's
-    // only real `<th>` heading outside the spreadsheet.
-    assert_eq!(c.table_headers, 20, "<th> — 5 empty corners + 15 real headings");
+    // only real `<th>` heading outside the spreadsheet. #232 took the five
+    // empty 2em corners with the gutter column, from 20.
+    assert_eq!(c.table_headers, 15, "<th> — the real headings, corners stripped");
 
     assert_eq!(c.bullet_lists, 21, "data-section-style='5' sections");
     assert_eq!(c.list_items, 73, "list_item elements");
@@ -1082,24 +1105,91 @@ fn corpus_prose_tables_with_header_rows() {
 
 /// **#233.** The property #230 promised not to break, on the real markup that
 /// made it a promise: five prose tables whose `<thead>` rows hold genuine
-/// headings, imported the way production imports them.
+/// headings, imported the way production imports them. Every heading keeps
+/// its text and its `<th>`. If the *header-row* strip ever fires on a
+/// `document` thread, this is red.
 ///
-/// Twenty `<th>` across five tables. Every one keeps its text, and the
-/// `#f0f0f0` gutter that #230's fix strips from a sheet stays here as
-/// content. If the strip ever fires on a `document` thread, this is red.
+/// **#232 changed what this test says about the gutter, and only that.** The
+/// `#f0f0f0` row-number column used to be asserted here as surviving content,
+/// because it did: the fix was gated on the thread type as a whole. #232
+/// separated the two halves of the chrome — the header row still needs the
+/// thread type, the gutter never did — so the gutter statement moved to
+/// `corpus_prose_table_gutter_is_not_imported_as_data` and inverted. The
+/// numbers that moved with it are `table_headers` 20 → 15 (the five empty 2em
+/// corners are the header row's share of the gutter column) and `table_cells`
+/// 88 → 66 (the 22 gutter cells). Fifteen headings, 27 rows and 5 tables are
+/// unchanged, and those are what this test is for.
 #[test]
-fn corpus_prose_table_headers_and_gutters_survive_the_document_path() {
+fn corpus_prose_table_headings_survive_the_document_path() {
     let (_html, quip, c) = import("ffbAAA8eMpE");
     let grids = all_table_grids(&quip.doc);
     assert_eq!(grids.len(), 5, "five data-section-style='13' sections");
 
-    // Shape, table by table: header row plus body rows, uniform width.
+    // Every cell of every first row is a `table_header` and every one carries
+    // text. This is the assertion the whole fixture exists for: `<th>`
+    // headings are content, not chrome.
+    let mut headings: Vec<&str> = Vec::new();
+    for (t, grid) in grids.iter().enumerate() {
+        assert!(
+            grid[0].iter().all(|(header, _)| *header),
+            "table {t}: the whole first row must still be <th>: {:?}",
+            grid[0],
+        );
+        for (_, text) in &grid[0] {
+            assert!(!text.trim().is_empty(), "table {t}: an empty heading — the strip fired");
+            headings.push(text);
+        }
+    }
+    assert_eq!(headings.len(), 15, "headings — the five 2em corners went with the gutter");
+    assert_eq!(c.table_headers, 15, "<th> elements");
+    assert_eq!(c.table_rows, 27, "5 header rows + 22 body rows — no row is ever removed here");
+
+    // The permissions table, spelled out. Scrubbed, so the words are filler
+    // of the source's lengths — `Access Level` / `Can Read Comments` /
+    // `Can Comment` / `Can Edit Document`, 12/17/11/17 characters. Their
+    // *presence and position* is the assertion; a header-row strip takes the
+    // whole row, and a strip one column too wide takes `Access Level`.
+    assert_eq!(
+        grids[3][0].iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+        vec!["Oremip Treat", "Any Work Scingeli", "Any Ctetura", "Any Hear Mporlore"],
+        "the permissions table's header row, in order",
+    );
+    // Its body is the corpus's only U+2713/U+2717 content, and each tick sits
+    // under the heading that names it — so a strip off by one column shows up
+    // as ticks under `Access Level`.
+    assert_eq!(grids[3][1][1].1, "\u{2713}", "the check marks survive scrubbing and import");
+    assert_eq!(grids[3][4][2].1, "\u{2717}", "and so does the cross");
+}
+
+/// **#232.** The row-number gutter is chrome in a `document` thread too, and
+/// the fix that removes it must remove *only* it.
+///
+/// #230 read the gutter off a spreadsheet; the same ruler runs down 16 real
+/// prose tables, five of them here. It is not ambiguous the way the `<th>`
+/// header row is: across the 56-document staged corpus every one of the 131
+/// gutter cells is a bare `<td>` with no `id`, no `<span>` and no terminating
+/// `<br/>`, while all 8 authored digit-only leading cells carry all three. So
+/// the gutter goes on both thread paths and the headings stay on this one —
+/// which is the pair of statements below.
+///
+/// Scrubbing rewrites the digits, so "is a digit, in column A" is the most
+/// the fixture can say about what was removed; the *positional* assertions
+/// (the header row's texts, column A's new contents) are what pin that the
+/// right column went.
+#[test]
+fn corpus_prose_table_gutter_is_not_imported_as_data() {
+    let (_html, quip, c) = import("ffbAAA8eMpE");
+    let grids = all_table_grids(&quip.doc);
+    assert_eq!(grids.len(), 5, "five data-section-style='13' sections");
+
+    // One column narrower than the source, and the same number of rows: the
+    // header row is content here, unlike on the spreadsheet path.
     let shape: Vec<(usize, usize)> =
         grids.iter().map(|g| (g.len(), g.first().map_or(0, Vec::len))).collect();
     assert_eq!(
         shape,
-        vec![(5, 3), (6, 3), (5, 4), (5, 5), (6, 5)],
-        "rows × columns per table — the header row and the gutter are both present",
+        vec![(5, 2), (6, 2), (5, 3), (5, 4), (6, 4)],
+        "rows × columns per table — every row lost its leading chrome cell",
     );
     for (t, grid) in grids.iter().enumerate() {
         let widths: Vec<usize> = grid.iter().map(Vec::len).collect();
@@ -1109,9 +1199,21 @@ fn corpus_prose_table_headers_and_gutters_survive_the_document_path() {
         );
     }
 
-    // Every cell of every first row is a `table_header`, and every one after
-    // the empty 2em corner carries text. This is the assertion the whole
-    // fixture exists for: `<th>` headings are content, not chrome.
+    // Nothing that is left is the ruler: no body row leads with a digit-only
+    // non-header cell any more.
+    for (t, grid) in grids.iter().enumerate() {
+        for (r, row) in grid.iter().enumerate().skip(1) {
+            let (header, text) = &row[0];
+            assert!(
+                *header || text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()),
+                "table {t} row {r}: {text:?} still leads the row — the gutter survived",
+            );
+        }
+    }
+
+    // The other half, and the one #233 exists to protect: every `<th>` is
+    // still a `<th>`, and the empty 2em corner — the header row's share of
+    // the gutter column — is the only one that went.
     let mut headings: Vec<&str> = Vec::new();
     for (t, grid) in grids.iter().enumerate() {
         assert!(
@@ -1119,62 +1221,43 @@ fn corpus_prose_table_headers_and_gutters_survive_the_document_path() {
             "table {t}: the whole first row must still be <th>: {:?}",
             grid[0],
         );
-        assert_eq!(grid[0][0].1, "", "table {t}: the corner <th> is the empty 2em one");
-        for (_, text) in &grid[0][1..] {
-            assert!(!text.trim().is_empty(), "table {t}: an empty heading — the strip fired");
+        for (_, text) in &grid[0] {
+            assert!(!text.trim().is_empty(), "table {t}: an empty heading survived the strip");
             headings.push(text);
         }
     }
-    assert_eq!(headings.len(), 15, "headings, corners excluded");
-    assert_eq!(c.table_headers, 20, "<th> elements, the five corners included");
+    assert_eq!(headings.len(), 15, "all fifteen real headings, no corners");
+    assert_eq!(c.table_headers, 15, "20 <th> - 5 corners");
+    assert_eq!(c.table_cells, 66, "88 <td> - 22 gutter cells");
+    assert_eq!(c.table_rows, 27, "5 header rows + 22 body rows — no row is removed");
+    assert_eq!(c.tables, 5, "no table is emptied out of existence");
 
-    // The permissions table, spelled out. Scrubbed, so the words are filler
-    // of the source's lengths — `Access Level` / `Can Read Comments` /
-    // `Can Comment` / `Can Edit Document`, 12/17/11/17 characters. Their
-    // *presence and position* is the assertion; a strip takes the whole row.
+    // Positional, and the assertion that says the *right* column went: the
+    // permissions table's column A is now the access-level labels that used
+    // to sit one place right of the ruler. A strip of any other column, or
+    // of a whole row, lands somewhere else here. What is still *in* those
+    // cells is `corpus_prose_table_headings_survive_the_document_path`.
     assert_eq!(
-        grids[3][0].iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
-        vec!["", "Oremip Treat", "Any Work Scingeli", "Any Ctetura", "Any Hear Mporlore"],
-        "the permissions table's header row, in order",
-    );
-    // Its body is the corpus's only U+2713/U+2717 content, and it sits one
-    // column right of the gutter — so a gutter strip would take the labels
-    // and leave the ticks.
-    assert_eq!(
-        column(&grids[3], 1)[1..],
+        column(&grids[3], 0)[1..],
         ["Wire Oremip", "Hear", "Ctetura", "Pool long"],
-        "column B is the access-level labels, not the ticks",
+        "column A is the access-level labels the ruler used to displace",
     );
-    assert_eq!(grids[3][1][2].1, "\u{2713}", "the check marks survive scrubbing and import");
-    assert_eq!(grids[3][4][3].1, "\u{2717}", "and so does the cross");
 
-    // The gutter, on every body row of every table: a non-header cell of
-    // digits in column A. Scrubbing rewrites the digits, so `1..N` is not
-    // recoverable here — that they are digits, in column A, and still cells
-    // at all, is what survives and what is being pinned.
-    for (t, grid) in grids.iter().enumerate() {
-        for (r, row) in grid.iter().enumerate().skip(1) {
-            let (header, text) = &row[0];
-            assert!(!header, "table {t} row {r}: the gutter cell must be a <td>");
-            assert!(
-                !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()),
-                "table {t} row {r}: gutter cell {text:?} is not the row-number ruler",
-            );
-        }
-    }
-    assert_eq!(c.table_cells, 88, "22 gutter cells + 66 data cells");
-    assert_eq!(c.table_rows, 27, "5 header rows + 22 body rows");
+    // Anchors are untouched: the gutter `<td>` and the corner `<th>` are the
+    // only cells in the document with no `id`, so removing them costs nothing
+    // the Phase-2b back-patch could have resolved.
+    assert_eq!(quip.sections.len(), 263, "no anchor is lost with the chrome");
 }
 
-/// **#233, the sharp end.** These five prose tables satisfy #230's *shape*
-/// gate. The thread type is the only thing standing between their twenty
-/// headings and deletion.
+/// **#233, the sharp end.** These five prose tables satisfy the *shape* gate.
+/// The thread type is the only thing standing between their fifteen headings
+/// and deletion.
 ///
 /// The chrome here is the same bytes as the spreadsheet's — the assertions
 /// below check that against `QGYAAAjicgG` directly rather than asserting it
-/// in prose. So `is_spreadsheet_grid` says yes to all five, and pushing this
+/// in prose. So `has_grid_chrome` says yes to all five, and pushing this
 /// document down the *spreadsheet* path really does delete every heading:
-/// 20 `<th>` → 0, 88 cells → 66, 27 rows → 22.
+/// 15 `<th>` → 0, 27 rows → 22.
 ///
 /// That is not a bug — no `document` thread ever takes that path — it is the
 /// measurement that says how much the thread-type discriminator is carrying.
@@ -1182,6 +1265,13 @@ fn corpus_prose_table_headers_and_gutters_survive_the_document_path() {
 /// the same discriminator from the other side, on the sheet's markup; this
 /// states it on a real prose table, which is the case #230's safety argument
 /// was actually about.
+///
+/// **#232 halved what that discriminator carries, and the numbers here say by
+/// how much.** The 66 data cells are now the same on both paths — the gutter
+/// goes either way — so the whole of the difference between the two censuses
+/// below is the header row: 15 headings and 5 rows. Before #232 the
+/// difference was 20 headings, 22 cells and 5 rows, and the extra 22 was the
+/// bug.
 #[test]
 fn the_prose_tables_shape_matches_the_sheets_and_only_the_thread_type_spares_them() {
     let prose = fixture_body("ffbAAA8eMpE");
@@ -1215,11 +1305,17 @@ fn the_prose_tables_shape_matches_the_sheets_and_only_the_thread_type_spares_the
     assert_eq!(sc.tables, 5, "all five tables are read as grids");
 
     // And the document path — the one production uses for this thread —
-    // leaves all of it alone.
+    // keeps the header row. Same cell count as the sheet path: since #232
+    // the gutter is not what the thread type is deciding.
     let kept = census(&from_quip_html(&prose).doc);
-    assert_eq!(kept.table_headers, 20);
-    assert_eq!(kept.table_cells, 88);
+    assert_eq!(kept.table_headers, 15);
+    assert_eq!(kept.table_cells, 66);
     assert_eq!(kept.table_rows, 27);
+    assert_eq!(
+        (kept.table_headers - sc.table_headers, kept.table_cells - sc.table_cells),
+        (15, 0),
+        "the thread type decides the header row and nothing else",
+    );
 }
 
 // ─── cross-fixture invariants ────────────────────────────────────
