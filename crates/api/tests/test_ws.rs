@@ -1031,13 +1031,14 @@ async fn spawn_peer_instance(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     room.add_client(1, "peer-viewer".to_string(), tx).await;
 
+    // The subscriber task owns a clone of the registry, which keeps the
+    // room (and its client handle) alive for as long as the task runs —
+    // so the local `registry`/`room` can go out of scope here.
     let handle = pubsub
-        .spawn_subscriber(subscriber, registry.clone())
+        .spawn_subscriber(subscriber, registry)
         .await
         .expect("peer subscriber");
-    // Keep the registry (and therefore the room + its client handle)
-    // alive for the subscriber task's lifetime.
-    std::mem::forget(registry);
+    drop(room);
     (rx, handle)
 }
 
