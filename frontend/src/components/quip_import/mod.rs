@@ -1896,6 +1896,151 @@ mod tests {
         }
     }
 
+    // ─── #236 Unit 3: where the import lands ───────────────────
+    //
+    // What these can and cannot reach: `start_target_folder_id` is the sole
+    // expression that produces `start`'s `target_folder_id` argument, so its
+    // behaviour is the destination feature. The *click* that populates its
+    // `chosen` argument is not covered — this crate has no DOM harness, and
+    // no amount of native testing changes that. Nor is the one-line wiring in
+    // `do_start` that hands this function's result to `imports::start`: a
+    // mutation that ignored the picked folder there would survive every test
+    // in this module. A `frontend-doctor` scenario driving the step is the
+    // honest coverage for both, and is the outstanding gap on #174.
+
+    /// **The deliverable.** A folder the user picked is what `start`
+    /// receives. The server authorizes exactly this id
+    /// (`check_folder_access(..., Edit)` in `routes/imports.rs`, pinned by
+    /// `start_rejects_unauthorized_target_folder`), so sending the choice is
+    /// simultaneously the feature and the thing the access check runs
+    /// against — a wizard that quietly kept sending Home would pass an access
+    /// check on a folder the user never chose.
+    #[test]
+    fn the_picked_folder_is_what_start_receives() {
+        assert_eq!(
+            start_target_folder_id(Some("folder-projects"), Some("folder-home")).as_deref(),
+            Some("folder-projects"),
+        );
+    }
+
+    /// **Negative control.** A user who never opens the destination step must
+    /// be indistinguishable from every user before this step existed: the
+    /// import goes to Home. This asserts the pre-change constant behaviour
+    /// and would hold verbatim against the wizard that had no picker at all.
+    #[test]
+    fn an_untouched_destination_still_imports_to_home() {
+        assert_eq!(
+            start_target_folder_id(None, Some("folder-home")).as_deref(),
+            Some("folder-home"),
+        );
+    }
+
+    /// Home is a row in the tree like any other, and the destination step
+    /// opens highlighted on it. Confirming that highlight must land in the
+    /// same place as never opening the step — otherwise "Change → Use this
+    /// folder" on the default would silently mean something else.
+    #[test]
+    fn choosing_home_explicitly_matches_the_untouched_default() {
+        assert_eq!(
+            start_target_folder_id(Some("folder-home"), Some("folder-home")),
+            start_target_folder_id(None, Some("folder-home")),
+        );
+    }
+
+    /// A blank id is not a folder — the same rule
+    /// [`open_folder_destination`] applies on the way back. Sending one would
+    /// fail the server's access check on an empty id and surface as an error
+    /// banner over a wizard the user filled in correctly.
+    #[test]
+    fn a_blank_choice_falls_back_to_home_rather_than_being_sent() {
+        for blank in ["", "   "] {
+            assert_eq!(
+                start_target_folder_id(Some(blank), Some("folder-home")).as_deref(),
+                Some("folder-home"),
+                "a blank choice ({blank:?}) must fall back to Home",
+            );
+        }
+    }
+
+    /// Before `/users/me` lands there is no Home and nothing to send. The
+    /// Continue button is disabled in exactly this state; this is `do_start`'s
+    /// half of the same guard, because a start with no parent is a 400.
+    #[test]
+    fn without_a_home_folder_and_without_a_choice_there_is_nothing_to_start() {
+        assert_eq!(start_target_folder_id(None, None), None);
+        assert_eq!(start_target_folder_id(Some("  "), None), None);
+    }
+
+    /// A choice still works if the Home lookup failed — the tree cannot be
+    /// opened in that state today, but the rule is "the choice wins", not
+    /// "the choice wins when Home is also known".
+    #[test]
+    fn a_choice_does_not_depend_on_home_being_known() {
+        assert_eq!(
+            start_target_folder_id(Some("folder-projects"), None).as_deref(),
+            Some("folder-projects"),
+        );
+    }
+
+    /// The default destination line must keep promising Home. Paired with
+    /// `an_untouched_destination_still_imports_to_home`: one pins where an
+    /// untouched wizard sends the import, this pins what it tells the user it
+    /// will do. Both held before this unit and must still hold after.
+    #[test]
+    fn the_untouched_destination_line_still_promises_home() {
+        let line = EN_US
+            .lines()
+            .find(|l| l.starts_with("quip-import-target-home ="))
+            .expect("en-US catalog is missing quip-import-target-home");
+        assert!(
+            line.contains("Home"),
+            "the default line must still name Home; got {line:?}",
+        );
+        assert!(
+            !line.contains('{'),
+            "the default line takes no arguments; got {line:?}",
+        );
+    }
+
+    /// The chosen-folder line interpolates the folder's name. A mismatched
+    /// placeable here renders the raw key over the one line that tells the
+    /// user their import is no longer going to Home.
+    #[test]
+    fn the_chosen_destination_line_names_the_folder() {
+        let line = EN_US
+            .lines()
+            .find(|l| l.starts_with("quip-import-target-folder ="))
+            .expect("en-US catalog is missing quip-import-target-folder");
+        assert!(
+            line.contains("$folder"),
+            "quip-import-target-folder must interpolate $folder; got {line:?}",
+        );
+    }
+
+    /// Every string the destination step renders must exist. Unlike the
+    /// report strings these are all argument-free, so existence is the whole
+    /// contract — but a missing one renders its raw key as a heading or a
+    /// button label.
+    #[test]
+    fn every_destination_string_exists() {
+        for key in [
+            "quip-import-destination-change",
+            "quip-import-destination-heading",
+            "quip-import-destination-hint",
+            "quip-import-destination-select",
+            // Borrowed from the shared catalog rather than duplicated.
+            "common-cancel",
+            "common-loading",
+        ] {
+            assert!(
+                EN_US
+                    .lines()
+                    .any(|l| l.starts_with(&format!("{key} ="))),
+                "en-US catalog is missing {key}",
+            );
+        }
+    }
+
     /// Every string this component renders must exist in the catalog with
     /// the argument name the component actually passes — a mismatched
     /// placeable renders as the raw key or drops the number.
@@ -1982,6 +2127,109 @@ mod tests {
                 expected,
                 "{name} does not carry the same quip-import-report-* keys as en-US",
             );
+        }
+    }
+
+    /// The same guarantee, widened to the whole wizard (#236 Unit 3): the
+    /// destination step's strings are not `quip-import-report-*`, so the test
+    /// above would not have noticed a locale that was missing them, and a
+    /// German user would have met a raw key where the button that changes
+    /// their import's destination should be.
+    ///
+    /// Widened rather than duplicated for the new prefix, because the next
+    /// wizard string will not be a `destination-` one either. All six
+    /// catalogs already agreed on the pre-existing keys, so this asserts a
+    /// property that was true before it was written.
+    #[test]
+    fn every_locale_carries_every_wizard_string() {
+        const CATALOGS: [(&str, &str); 6] = [
+            ("en-US", EN_US),
+            ("de", include_str!("../../../locales/de/main.ftl")),
+            ("es", include_str!("../../../locales/es/main.ftl")),
+            ("fr", include_str!("../../../locales/fr/main.ftl")),
+            ("it", include_str!("../../../locales/it/main.ftl")),
+            ("ar", include_str!("../../../locales/ar/main.ftl")),
+        ];
+
+        fn wizard_keys(catalog: &str) -> Vec<String> {
+            let mut keys: Vec<String> = catalog
+                .lines()
+                .filter_map(|l| l.split_once(" ="))
+                .map(|(k, _)| k.to_string())
+                .filter(|k| k.starts_with("quip-import-"))
+                .collect();
+            keys.sort();
+            keys
+        }
+
+        let expected = wizard_keys(EN_US);
+        for key in [
+            "quip-import-target-folder",
+            "quip-import-destination-change",
+            "quip-import-destination-heading",
+            "quip-import-destination-hint",
+            "quip-import-destination-select",
+        ] {
+            assert!(
+                expected.iter().any(|k| k == key),
+                "precondition: en-US should hold {key}",
+            );
+        }
+        for (name, catalog) in CATALOGS {
+            assert_eq!(
+                wizard_keys(catalog),
+                expected,
+                "{name} does not carry the same quip-import-* keys as en-US",
+            );
+        }
+    }
+
+    /// A translated string is a translation, not English in a foreign file.
+    /// The check that survives having no translator on the team: the
+    /// destination step's wording must differ from en-US in every locale that
+    /// is not en-US. It cannot judge quality — it does catch the failure mode
+    /// this task is most likely to produce, which is pasting English into
+    /// `de` and `ar` to make the parity test above go green.
+    ///
+    /// `quip-import-destination-change` is exempt: "Change" is genuinely
+    /// "Cambia" in it and "Cambiar" in es, but a one-word button label is
+    /// exactly where a real translation can coincide with English, so a
+    /// future locale that legitimately matches would fail this for no reason.
+    #[test]
+    fn the_destination_step_is_translated_not_copied() {
+        const TRANSLATED: [(&str, &str); 5] = [
+            ("de", include_str!("../../../locales/de/main.ftl")),
+            ("es", include_str!("../../../locales/es/main.ftl")),
+            ("fr", include_str!("../../../locales/fr/main.ftl")),
+            ("it", include_str!("../../../locales/it/main.ftl")),
+            ("ar", include_str!("../../../locales/ar/main.ftl")),
+        ];
+
+        fn value_of(catalog: &str, key: &str) -> String {
+            catalog
+                .lines()
+                .find(|l| l.starts_with(&format!("{key} =")))
+                .unwrap_or_else(|| panic!("catalog is missing {key}"))
+                .split_once(" = ")
+                .expect("a catalog line has a value")
+                .1
+                .to_string()
+        }
+
+        for key in [
+            "quip-import-target-folder",
+            "quip-import-destination-heading",
+            "quip-import-destination-hint",
+            "quip-import-destination-select",
+        ] {
+            let english = value_of(EN_US, key);
+            for (name, catalog) in TRANSLATED {
+                assert_ne!(
+                    value_of(catalog, key),
+                    english,
+                    "{name}'s {key} is the en-US string verbatim",
+                );
+            }
         }
     }
 }
