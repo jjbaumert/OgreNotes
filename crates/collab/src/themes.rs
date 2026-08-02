@@ -107,7 +107,7 @@ mod tests {
                 ("--deck-accent", t.accent),
             ] {
                 assert!(
-                    block.contains(&format!("{var}: {want}")),
+                    block.contains(&format!("{var}: {want};")),
                     "theme {} : CSS {var} does not match the backend table value {want}",
                     t.id
                 );
