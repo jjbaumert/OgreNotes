@@ -743,6 +743,19 @@ jobs:
             --base-url http://127.0.0.1:3000 \
             --out ../../artifacts/doctor/deck-blocks
 
+      # Present mode (P2): full-screen stage at real size, keyboard
+      # navigation, Escape back to the editor, presenter view panels +
+      # timer, and PDF slide export over the API.
+      - name: Run deck-present scenario
+        id: deck-present
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario deck-present \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/deck-present
+
       # ─── Teardown / artifacts ─────────────────────────────────
       - name: Stop axum server
         if: always()

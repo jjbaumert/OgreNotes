@@ -604,6 +604,13 @@ pub fn to_pdf_with_comments(doc: &Doc, comments: &[ExportComment]) -> Vec<u8> {
         Point, Pt, TextItem,
     };
 
+    if is_deck(doc) {
+        // Decks render as slides (landscape, one page each); comments
+        // are omitted — a slide deck's PDF is the deck, and the flow
+        // path's trailing comment section has no place on a slide.
+        return to_pdf_slides(doc);
+    }
+
     // A4 portrait, 20mm margins, 11pt text on 14pt leading. WRAP_CHARS
     // is a width estimate for 11pt Helvetica across the ~170mm text
     // column — proportional fonts make exact wrapping impossible without
@@ -756,6 +763,182 @@ fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// True when this document is a slide deck: its top-level children are
+/// `Slide` elements. Decks are self-describing, so the exporter needs
+/// no `doc_type` plumbing from the API layer.
+#[cfg(feature = "pdf")]
+fn is_deck(doc: &Doc) -> bool {
+    let txn = doc.transact();
+    let Some(fragment) = txn.get_xml_fragment("content") else { return false };
+    (0..fragment.len(&txn)).any(|i| {
+        matches!(fragment.get(&txn, i), Some(XmlOut::Element(el))
+            if NodeType::from_tag(el.tag().as_ref()) == Some(NodeType::Slide))
+    })
+}
+
+/// One frame flattened for PDF: geometry already clamped, text already
+/// extracted. `is_heading` drives font size and color choice. `h` is
+/// carried for interface parity with the frame's persisted geometry
+/// (a future pass may clip/wrap text to frame height); the renderer
+/// doesn't consume it yet, hence the `allow`.
+#[cfg(feature = "pdf")]
+struct PdfFrame {
+    x: f64,
+    y: f64,
+    w: f64,
+    #[allow(dead_code)]
+    h: f64,
+    text: String,
+    is_heading: bool,
+}
+
+/// Deck-level `Doc` attribute (`theme`, `slideSize`). These live in the
+/// root-level `docAttrs` yrs Map the frontend bridge writes
+/// (`frontend/src/editor/yrs_bridge.rs`); mirrors its read side.
+#[cfg(feature = "pdf")]
+fn doc_attr(doc: &Doc, name: &str) -> Option<String> {
+    use yrs::Map;
+    let txn = doc.transact();
+    let map = txn.get_map("docAttrs")?;
+    match map.get(&txn, name) {
+        Some(Out::Any(Any::String(s))) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+/// Content frames of every slide, in document order, each already
+/// filtered (`role != "notes"`) and sorted by paint order (z, then y,
+/// then x — same key `slide_child_order` uses for the HTML/Markdown
+/// deck path) so later frames paint on top.
+#[cfg(feature = "pdf")]
+fn collect_slides(doc: &Doc) -> Vec<Vec<PdfFrame>> {
+    let txn = doc.transact();
+    let Some(fragment) = txn.get_xml_fragment("content") else { return Vec::new() };
+    let mut slides = Vec::new();
+    for i in 0..fragment.len(&txn) {
+        let Some(XmlOut::Element(slide_el)) = fragment.get(&txn, i) else { continue };
+        if NodeType::from_tag(slide_el.tag().as_ref()) != Some(NodeType::Slide) {
+            continue;
+        }
+        let mut frames = Vec::new();
+        for idx in slide_child_order(&txn, &slide_el) {
+            let Some(XmlOut::Element(frame_el)) = slide_el.get(&txn, idx) else { continue };
+            if NodeType::from_tag(frame_el.tag().as_ref()) != Some(NodeType::Frame) {
+                continue;
+            }
+            let role = frame_el.get_attribute(&txn, "role").unwrap_or_default();
+            if role == "notes" {
+                continue;
+            }
+            let geom = |key: &str, default: f64| {
+                frame_el
+                    .get_attribute(&txn, key)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|f| f.is_finite())
+                    .unwrap_or(default)
+                    .clamp(0.0, 1.0)
+            };
+            let is_heading = matches!(
+                frame_el.get(&txn, 0),
+                Some(XmlOut::Element(child))
+                    if NodeType::from_tag(child.tag().as_ref()) == Some(NodeType::Heading)
+            );
+            frames.push(PdfFrame {
+                x: geom("x", 0.0),
+                y: geom("y", 0.0),
+                w: geom("w", 1.0),
+                h: geom("h", 1.0),
+                text: extract_text(&txn, &frame_el),
+                is_heading,
+            });
+        }
+        slides.push(frames);
+    }
+    slides
+}
+
+/// Render a slide deck to PDF: one landscape page per slide, frames
+/// positioned by their normalized `x`/`y`/`w`/`h` geometry and painted
+/// in z order. Comments are not rendered (see the call site).
+#[cfg(feature = "pdf")]
+fn to_pdf_slides(doc: &Doc) -> Vec<u8> {
+    use printpdf::{
+        BuiltinFont, Color, Mm, Op, PdfDocument, PdfFontHandle, PdfPage, PdfSaveOptions,
+        PdfWarnMsg, Point, Pt, Rect, Rgb, TextItem,
+    };
+    const PAGE_W_MM: f32 = 297.0;
+    const PAGE_H_MM: f32 = 167.0; // 16:9 at A4-landscape width
+    const HEADING_PT: f32 = 28.0;
+    const BODY_PT: f32 = 14.0;
+    const LINE_RATIO: f32 = 1.25; // leading as a multiple of font size
+    // Chars-per-line estimate for Helvetica at BODY_PT across a full
+    // page width; scaled per frame by its fractional width. Same
+    // proportional-font caveat as the flow path's WRAP_CHARS.
+    const FULL_WIDTH_CHARS: f32 = 95.0;
+
+    let theme_id = doc_attr(doc, "theme").unwrap_or_default();
+    let theme = crate::themes::theme_by_id(&theme_id);
+    let (bg_r, bg_g, bg_b) = crate::themes::hex_to_rgb(theme.bg).unwrap_or((1.0, 1.0, 1.0));
+    let (h_r, h_g, h_b) = crate::themes::hex_to_rgb(theme.heading).unwrap_or((0.0, 0.0, 0.0));
+    let (t_r, t_g, t_b) = crate::themes::hex_to_rgb(theme.text).unwrap_or((0.0, 0.0, 0.0));
+
+    let font = PdfFontHandle::Builtin(BuiltinFont::Helvetica);
+    let page_w_pt = Pt::from(Mm(PAGE_W_MM)).0;
+    let page_h_pt = Pt::from(Mm(PAGE_H_MM)).0;
+    let mut pages: Vec<PdfPage> = Vec::new();
+
+    for frames in collect_slides(doc) {
+        let mut ops: Vec<Op> = Vec::new();
+        // Full-page background fill. printpdf 0.9's `DrawRectangle` op
+        // only strokes the path outline into the content stream and
+        // never emits a fill operator (see `rectangle_to_stream_ops`
+        // in printpdf's serialize.rs — it always closes with `n`, "end
+        // path without painting"); `Rect::to_polygon()` defaults to
+        // `PaintMode::Fill`, and `DrawPolygon` honors that mode, so a
+        // filled rect must go through `DrawPolygon`.
+        let bg_rect = Rect::from_xywh(Pt(0.0), Pt(0.0), Pt(page_w_pt), Pt(page_h_pt));
+        ops.push(Op::SetFillColor { col: Color::Rgb(Rgb::new(bg_r, bg_g, bg_b, None)) });
+        ops.push(Op::DrawPolygon { polygon: bg_rect.to_polygon() });
+
+        for frame in &frames {
+            let size = if frame.is_heading { HEADING_PT } else { BODY_PT };
+            let (fr, fg, fb) = if frame.is_heading { (h_r, h_g, h_b) } else { (t_r, t_g, t_b) };
+            let max_chars = ((FULL_WIDTH_CHARS * frame.w as f32) as usize).max(8);
+            let lines = wrap_text(&frame.text, max_chars);
+
+            let x_pt = Pt::from(Mm(PAGE_W_MM * frame.x as f32)).0;
+            // Model y is top-down; PDF y is bottom-up.
+            let top_pt = Pt::from(Mm(PAGE_H_MM * (1.0 - frame.y as f32))).0;
+
+            ops.push(Op::SetFillColor { col: Color::Rgb(Rgb::new(fr, fg, fb, None)) });
+            ops.push(Op::StartTextSection);
+            ops.push(Op::SetFont { font: font.clone(), size: Pt(size) });
+            ops.push(Op::SetLineHeight { lh: Pt(size * LINE_RATIO) });
+            ops.push(Op::SetTextCursor { pos: Point { x: Pt(x_pt), y: Pt(top_pt - size) } });
+            for line in lines {
+                if !line.is_empty() {
+                    ops.push(Op::ShowText { items: vec![TextItem::Text(line)] });
+                }
+                ops.push(Op::AddLineBreak);
+            }
+            ops.push(Op::EndTextSection);
+        }
+        pages.push(PdfPage::new(Mm(PAGE_W_MM), Mm(PAGE_H_MM), ops));
+    }
+
+    if pages.is_empty() {
+        pages.push(PdfPage::new(Mm(PAGE_W_MM), Mm(PAGE_H_MM), Vec::new()));
+    }
+    let mut pdf = PdfDocument::new("OgreNotes deck export");
+    pdf.with_pages(pages);
+    let mut warnings: Vec<PdfWarnMsg> = Vec::new();
+    let bytes = pdf.save(&PdfSaveOptions::default(), &mut warnings);
+    for w in &warnings {
+        tracing::warn!(warning = ?w, "to_pdf_slides: printpdf serialization warning");
+    }
+    bytes
 }
 
 pub(crate) const ATTR_SHEET_NAME: &str = "sheetName";
@@ -3221,6 +3404,214 @@ mod tests {
         assert!(!with.is_empty(), "pdf bytes produced");
         assert_eq!(&with[..5], b"%PDF-", "valid PDF header");
         assert_ne!(with, to_pdf(&doc), "comment lines must change the pdf");
+    }
+
+    // ── Presentation deck PDF export (Task 3) ──────────────────────
+
+    /// 3 slides, each with a heading frame and a body frame.
+    #[cfg(feature = "pdf")]
+    fn fixture_deck_three_slides() -> Doc {
+        doc_with(|txn, frag| {
+            for i in 0..3 {
+                let slide = frag.insert(txn, i, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
+                let heading = slide.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+                heading.insert_attribute(txn, "y", "0.0");
+                heading.insert_attribute(txn, "h", "0.2");
+                let h_el = heading.insert(txn, 0, XmlElementPrelim::empty(NodeType::Heading.tag_name()));
+                insert_text(txn, &h_el, &format!("Slide {i} heading"));
+
+                let body = slide.insert(txn, 1, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+                body.insert_attribute(txn, "y", "0.3");
+                body.insert_attribute(txn, "h", "0.6");
+                let b_el = body.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+                insert_text(txn, &b_el, &format!("Slide {i} body"));
+            }
+        })
+    }
+
+    /// Two slides, slide1 "ALPHA", slide2 "BETA" — used to assert
+    /// document order is preserved in the rendered PDF byte stream.
+    #[cfg(feature = "pdf")]
+    fn fixture_deck_ordered_text() -> Doc {
+        doc_with(|txn, frag| {
+            let slide1 = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
+            let p1 = slide1.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+            let t1 = p1.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &t1, "ALPHA");
+
+            let slide2 = frag.insert(txn, 1, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
+            let p2 = slide2.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+            let t2 = p2.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &t2, "BETA");
+        })
+    }
+
+    /// One slide, one frame with malformed geometry: `x="garbage"`
+    /// (unparseable), `w="99"` (finite but out of 0..1, must clamp),
+    /// `h=""` (empty, unparseable). Export must degrade gracefully,
+    /// never panic.
+    #[cfg(feature = "pdf")]
+    fn fixture_deck_bad_geometry() -> Doc {
+        doc_with(|txn, frag| {
+            let slide = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
+            let frame = slide.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+            frame.insert_attribute(txn, "x", "garbage");
+            frame.insert_attribute(txn, "w", "99");
+            frame.insert_attribute(txn, "h", "");
+            let p = frame.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &p, "bad-geometry-text");
+        })
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn deck_pdf_has_one_landscape_page_per_slide() {
+        // The brief's suggested `/Type /Page\n` substring match proved
+        // brittle: printpdf 0.9 emits dict entries back-to-back with no
+        // separator (`/Type/Page/MediaBox[...]`, no space, no
+        // newline). Parse the PDF object graph with `lopdf` instead
+        // (already a collab dev-dependency, used to build `from_pdf`
+        // test fixtures) for a real behavioral page count + MediaBox
+        // check.
+        let doc = fixture_deck_three_slides();
+        let bytes = to_pdf(&doc);
+        assert!(bytes.starts_with(b"%PDF-"));
+        let parsed = lopdf::Document::load_mem(&bytes).expect("printpdf output must be a valid PDF");
+        let pages = parsed.get_pages();
+        assert_eq!(pages.len(), 3, "one page per slide");
+        // Landscape 16:9 — MediaBox width must exceed height on every page.
+        for (_, id) in pages {
+            let page_dict = parsed.get_dictionary(id).expect("page dict");
+            let media_box = page_dict
+                .get(b"MediaBox")
+                .and_then(|o| o.as_array())
+                .expect("page must carry a MediaBox");
+            let w = media_box[2].as_float().unwrap_or_else(|_| media_box[2].as_i64().unwrap() as f32);
+            let h = media_box[3].as_float().unwrap_or_else(|_| media_box[3].as_i64().unwrap() as f32);
+            assert!(w > h, "slide page must be landscape, got {w}x{h}");
+        }
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn deck_pdf_contains_frame_text_in_slide_order() {
+        let doc = fixture_deck_ordered_text();
+        let bytes = to_pdf(&doc);
+        let text = String::from_utf8_lossy(&bytes);
+        let a = text.find("ALPHA").expect("slide 1 text present");
+        let b = text.find("BETA").expect("slide 2 text present");
+        assert!(a < b, "slides must render in document order");
+    }
+
+    /// One slide: a `role="content"` frame with "VISIBLE-CONTENT" and a
+    /// `role="notes"` frame with "SECRET-NOTES". Speaker notes must
+    /// never reach the PDF.
+    #[cfg(feature = "pdf")]
+    fn fixture_deck_with_notes() -> Doc {
+        doc_with(|txn, frag| {
+            let slide = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
+
+            let content = slide.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+            content.insert_attribute(txn, "role", "content");
+            let c_p = content.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &c_p, "VISIBLE-CONTENT");
+
+            let notes = slide.insert(txn, 1, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+            notes.insert_attribute(txn, "role", "notes");
+            let n_p = notes.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &n_p, "SECRET-NOTES");
+        })
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn deck_pdf_excludes_notes_frames() {
+        let doc = fixture_deck_with_notes();
+        let bytes = to_pdf(&doc);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("VISIBLE-CONTENT"), "content frame text must render");
+        assert!(!text.contains("SECRET-NOTES"), "notes frame text must never reach the PDF");
+    }
+
+    /// One slide, two content frames whose TREE order is the opposite
+    /// of their z order (mirrors `fixture_deck`'s HTML/Markdown
+    /// counterpart, but with distinctive text for a PDF byte-order
+    /// assertion): the z=1 frame is inserted first in the tree, the
+    /// z=0 frame second.
+    #[cfg(feature = "pdf")]
+    fn fixture_deck_z_inverted() -> Doc {
+        doc_with(|txn, frag| {
+            let slide = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
+
+            // Tree position 0, but z=1 — must PAINT (render) after the
+            // z=0 frame, i.e. its text appears LATER in the content stream.
+            let high = slide.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+            high.insert_attribute(txn, "z", "1");
+            let high_p = high.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &high_p, "Z-HIGH-TEXT");
+
+            // Tree position 1, but z=0 — must paint BEFORE the z=1 frame.
+            let low = slide.insert(txn, 1, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+            low.insert_attribute(txn, "z", "0");
+            let low_p = low.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &low_p, "Z-LOW-TEXT");
+        })
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn deck_pdf_paints_frames_in_z_order() {
+        let doc = fixture_deck_z_inverted();
+        let bytes = to_pdf(&doc);
+        let text = String::from_utf8_lossy(&bytes);
+        let low = text.find("Z-LOW-TEXT").expect("z=0 frame text present");
+        let high = text.find("Z-HIGH-TEXT").expect("z=1 frame text present");
+        assert!(
+            low < high,
+            "z=0 frame must paint (appear in the content stream) before the z=1 frame despite tree order"
+        );
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn non_deck_pdf_is_unchanged_by_the_slide_path() {
+        // A plain document must still take the A4 flow-text (portrait)
+        // path — see the lopdf note on the deck page-count test above.
+        let doc = one_para_doc();
+        let bytes = to_pdf(&doc);
+        assert!(bytes.starts_with(b"%PDF-"));
+        let parsed = lopdf::Document::load_mem(&bytes).expect("printpdf output must be a valid PDF");
+        let pages = parsed.get_pages();
+        assert_eq!(pages.len(), 1, "short plain doc stays a single A4 page");
+        let (_, id) = pages.into_iter().next().unwrap();
+        let page_dict = parsed.get_dictionary(id).expect("page dict");
+        let media_box = page_dict
+            .get(b"MediaBox")
+            .and_then(|o| o.as_array())
+            .expect("page must carry a MediaBox");
+        let w = media_box[2].as_float().unwrap_or_else(|_| media_box[2].as_i64().unwrap() as f32);
+        let h = media_box[3].as_float().unwrap_or_else(|_| media_box[3].as_i64().unwrap() as f32);
+        assert!(h > w, "non-deck page must stay A4 portrait, got {w}x{h}");
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn deck_pdf_tolerates_malformed_geometry() {
+        let doc = fixture_deck_bad_geometry();
+        let bytes = to_pdf(&doc); // must not panic
+        assert!(bytes.starts_with(b"%PDF-"));
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn deck_pdf_with_zero_slides_is_still_a_valid_pdf() {
+        // `to_pdf_with_comments` only reaches `to_pdf_slides` once
+        // `is_deck` finds at least one Slide, so exercise the
+        // zero-slide fallback (`pages.is_empty()`) directly against
+        // the renderer, same module so private items are reachable.
+        let doc = doc_with(|_txn, _frag| {});
+        let bytes = to_pdf_slides(&doc);
+        assert!(bytes.starts_with(b"%PDF-"), "empty deck must still be a valid single-page PDF");
     }
 
     // ── Presentation deck export (Task 4) ──────────────────────────

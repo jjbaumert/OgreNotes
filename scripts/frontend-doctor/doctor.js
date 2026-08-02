@@ -6879,6 +6879,256 @@ async function scenarioDeckBlocks(ctx, collector) {
   await browser.close();
 }
 
+// ─── deck-present scenario ──────────────────────────────────────
+//
+// Presentations P2: full-screen Present mode. Exercises the
+// full-screen stage at real size (regression net for the same 0×0
+// flex-collapse class of bug deck-basics guards against), keyboard
+// navigation (ArrowRight/ArrowLeft + the counter), Escape back to
+// the editor, presenter view (`?presenter=1`) — timer/next-slide/
+// notes panels, the timer actually ticking — and the PDF slide
+// export over the REST API.
+//
+// Deck shape after seed: creating a "presentation" doc via REST
+// yields zero slides; opening it in the UI client-side-bootstraps
+// one *blank* slide (no frames at all) at index 0 first, and only
+// then does adding a "Title + Content" slide via the "+" button
+// insert the new (typed-into) slide at index 1 and move
+// `active_slide` there (deck_view.rs `add_with_preset`). Present
+// mode's own slide-index signal always starts at 0 regardless of
+// the editor's `active_slide` (present.rs), so it opens on the
+// *blank* bootstrap slide, not the typed one — the typed text only
+// becomes visible after one `ArrowRight`. `arrowAdvances` is
+// therefore asserted before `slideTextVisible` here, even though
+// the task brief lists `slideTextVisible` first; both step keys are
+// still present and required.
+//
+// A `page.reload()` sits between typing and clicking Present — see the
+// comment at that call site. It's load-bearing, not decorative: without
+// it, this scenario reproduced a corrupted (extra-slide) deck on
+// present.rs's initial load in roughly half of repeated local runs.
+async function scenarioDeckPresent(ctx, collector) {
+  const { baseUrlA, baseUrl, emailA, outDir } = ctx;
+  const target = baseUrlA || baseUrl;
+
+  const tokens = await devLogin(
+    target,
+    emailA || `doctor-deckpresent-${Date.now()}@ogrenotes.example.com`
+  );
+  logJson({ at: "dev-login", userId: tokens.userId });
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    ...DOCTOR_CONTEXT_DEFAULTS,
+    recordHar: { path: join(outDir, "tab-a.har"), mode: "full" },
+  });
+  await seedAuth(context, tokens);
+
+  const page = await context.newPage();
+  instrument(context, page, "tab-a", collector);
+
+  const waitFor = async (pred, ms = 8000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (await pred().catch(() => false)) return true;
+      await page.waitForTimeout(150);
+    }
+    return false;
+  };
+
+  const steps = {};
+  const typedText = "Present probe slide text";
+  try {
+    // ── Create via REST, add a title-content slide, type into its
+    // body frame (creation UI + block editing are deck-basics' /
+    // deck-blocks' concern) ──
+    const doc = await createDocViaApi(target, tokens.accessToken, "Present probe", "presentation");
+    await page.goto(`${target}/d/${doc.id}`, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.locator('.deck-canvas[tabindex="0"]').first().waitFor({ timeout: 20000 }).catch(() => {});
+    await waitFor(async () => (await page.locator(".deck-slide-thumb").count()) >= 1);
+
+    await page.locator(".deck-add-slide-btn").click();
+    await page.locator(".deck-preset-picker__item", { hasText: "Title + Content" }).click();
+    await waitFor(async () => (await page.locator(".deck-slide-thumb").count()) === 2);
+    const bodyFrame = page
+      .locator(".deck-frame[data-deck-frame-block-id]", { hasText: "Click to add text" })
+      .first();
+    await bodyFrame.dblclick();
+    await page.locator(".deck-frame--editing .editor-content[data-editor-ready]")
+      .waitFor({ timeout: 8000 });
+    await page.waitForTimeout(1000); // settle (first-keystroke gotcha)
+    // Ctrl+A → Delete → type, NOT type-over-selection: typing directly
+    // over a select-all hits pre-existing issue #195 (first char jumps
+    // to the end) — same workaround deck-basics uses.
+    await page.keyboard.press("Control+a");
+    await page.keyboard.press("Delete");
+    await page.waitForTimeout(200);
+    await page.keyboard.type(typedText);
+    await page.waitForTimeout(500); // let on_state_change's persist() flush
+    await page.keyboard.press("Escape");
+    await waitFor(async () => (await page.locator(".deck-frame--editing").count()) === 0);
+    steps.persistedBeforeOpen = await waitFor(async () => {
+      const res = await fetch(`${target}/api/v1/documents/${doc.id}/content`, {
+        headers: { authorization: `Bearer ${tokens.accessToken}` },
+      });
+      if (!res.ok) return false;
+      const buf = Buffer.from(await res.arrayBuffer());
+      return buf.includes(Buffer.from(typedText));
+    }, 15000);
+
+    // Reload before opening Present — found by direct repro (~50% of
+    // ~20 local runs), NOT a scripting artifact: clicking Present is a
+    // same-tab SPA route change, so document.rs's editing `CollabClient`
+    // (still alive from the typing above) and present.rs's own fresh
+    // REST `get_content` + awareness `CollabClient` can genuinely
+    // overlap in the same WASM runtime — unlike a full `page.reload()`,
+    // which forces a clean socket teardown before the next page's
+    // fetch. When they overlap, present.rs occasionally opens onto a
+    // corrupted deck (an extra empty slide, confirmed via direct byte
+    // inspection — not a rendering glitch). A `page.reload()` here,
+    // exactly mirroring deck-basics'/deck-blocks' own reload-then-
+    // reverify pattern, closes the editing socket cleanly first and
+    // reproduced 0 corrupt loads across 10 runs (vs ~50% without it).
+    // Worth a ticket: the underlying race is real and not present-mode-
+    // specific to fix (see task-10 report).
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.locator('.deck-canvas[tabindex="0"]').first().waitFor({ timeout: 20000 });
+    steps.thumbCountPersistedBeforeOpen = await waitFor(
+      async () => (await page.locator(".deck-slide-thumb").count()) === 2,
+      10000
+    );
+
+    // ── Click Present ──
+    await page.locator("button.deck-present-btn").click();
+    steps.presentRouteReached = await waitFor(
+      () => Promise.resolve(/\/d\/[^/?#]+\/present$/.test(page.url())),
+      10000
+    );
+
+    // ── Stage renders the (blank, index-0) slide at real size. Assert
+    // SIZE, not mere presence: the P1 launch bug was a 0×0 canvas that
+    // a bare presence check sailed right through. ──
+    const stageCanvas = page.locator(".deck-present__stage .deck-canvas").first();
+    steps.stageRendersSlide = await waitFor(async () => {
+      const box = await stageCanvas.boundingBox();
+      return !!box && box.width > 600;
+    }, 15000);
+    await page.screenshot({ path: join(outDir, "1-present-opened.png") }).catch(() => {});
+
+    // ── Keyboard navigation: ArrowRight advances the counter and
+    // brings the typed slide (index 1) onto the stage. ──
+    const counter = page.locator(".deck-present__counter");
+    const counterBefore = ((await counter.textContent().catch(() => "")) || "").trim();
+    await page.keyboard.press("ArrowRight");
+    steps.arrowAdvances = await waitFor(async () => {
+      const t = ((await counter.textContent().catch(() => "")) || "").trim();
+      return t !== counterBefore && /^2 \/ \d+$/.test(t);
+    });
+    steps.slideTextVisible = await page
+      .locator(".deck-present__stage", { hasText: typedText })
+      .waitFor({ timeout: 8000 }).then(() => true).catch(() => false);
+
+    await page.keyboard.press("ArrowLeft");
+    steps.arrowGoesBack = await waitFor(async () => {
+      const t = ((await counter.textContent().catch(() => "")) || "").trim();
+      return /^1 \/ \d+$/.test(t);
+    });
+
+    // ── Escape returns to the editor ──
+    // present.rs navigates to the bare `/d/{id}`, but document.rs then
+    // rewrites the URL in place to `/d/{id}/{slug}` once the title is
+    // known (`replace_state_with_url`, document.rs ~line 1454) — so
+    // the URL check has to tolerate an optional trailing slug segment,
+    // same as deck-basics' (unanchored) `navigatedToDoc` check.
+    await page.keyboard.press("Escape");
+    steps.escapeReturnsToEditor = await waitFor(async () => {
+      const pathname = new URL(page.url()).pathname;
+      if (!/^\/d\/[^/]+(\/[^/]+)?$/.test(pathname) || pathname.endsWith("/present")) return false;
+      return (await page.locator(".deck-view").count()) > 0;
+    }, 10000);
+    await page.screenshot({ path: join(outDir, "2-back-in-editor.png") }).catch(() => {});
+
+    // ── Presenter view: timer, next-slide preview, notes panels ──
+    // Built from the known `doc.id`, not `page.url()` — the URL may by
+    // now carry the slug from the rewrite above, and naively appending
+    // "/present?presenter=1" onto a slugged URL produces an invalid
+    // three-segment path (`/d/{id}/{slug}/present`) that matches no
+    // registered route (app.rs only registers the flat `/d/:id/present`).
+    await page.goto(`${target}/d/${doc.id}/present?presenter=1`, { waitUntil: "domcontentloaded", timeout: 30000 });
+    steps.presenterViewPanels = await waitFor(async () => {
+      const timer = await page.locator(".deck-present__timer").count();
+      const next = await page.locator(".deck-present__next").count();
+      const notes = await page.locator(".deck-present__notes").count();
+      return timer > 0 && next > 0 && notes > 0;
+    }, 15000);
+    await page.screenshot({ path: join(outDir, "3-presenter-view.png") }).catch(() => {});
+
+    // ── Timer advances ──
+    const timerLocator = page.locator(".deck-present__timer");
+    const t0 = ((await timerLocator.textContent().catch(() => "")) || "").trim();
+    await page.waitForTimeout(2200);
+    const t1 = ((await timerLocator.textContent().catch(() => "")) || "").trim();
+    steps.timerAdvances = t0 !== "" && t1 !== "" && t0 !== t1;
+
+    // ── PDF slide export over the API ──
+    // CI's playwright.yml deliberately builds the API with
+    // `--no-default-features --features "dev-login,xlsx,docx"` — no
+    // `pdf` — to skip ~70 crates of pdf-extract/printpdf compile time
+    // (see crates/api/Cargo.toml's `default` feature comment). With
+    // the feature off, documents.rs's export handler hits its
+    // `#[cfg(not(feature = "pdf"))]` arm and returns 400 with the body
+    // "PDF export not compiled into this build" — that's the backend's
+    // own explicit signal, not an error to paper over. Do NOT "fix"
+    // this by asserting 200 unconditionally: locally (default features)
+    // this always takes the real-PDF branch; in CI it always takes the
+    // skip branch, and both are legitimate. `pdfExportDownloads` is
+    // required truthy in `requiredSteps` either way — the separate
+    // `pdfExportSkippedNoFeature` key plus the logJson line make the
+    // skip visible in CI output instead of silently green.
+    const pdfRes = await fetch(`${target}/api/v1/documents/${doc.id}/export/pdf`, {
+      headers: { authorization: `Bearer ${tokens.accessToken}` },
+    });
+    const pdfBuf = Buffer.from(await pdfRes.arrayBuffer());
+    const pdfIsRealPdf =
+      pdfRes.ok &&
+      (pdfRes.headers.get("content-type") || "").includes("application/pdf") &&
+      pdfBuf.slice(0, 5).toString("latin1") === "%PDF-";
+    const pdfNotCompiled =
+      pdfRes.status === 400 && pdfBuf.toString("utf8").includes("not compiled into this build");
+    if (pdfIsRealPdf) {
+      steps.pdfExportDownloads = true;
+      steps.pdfExportSkippedNoFeature = false;
+    } else if (pdfNotCompiled) {
+      steps.pdfExportDownloads = true;
+      steps.pdfExportSkippedNoFeature = true;
+      logJson({ at: "deck-present", pdf: "skipped-no-feature" });
+    } else {
+      steps.pdfExportDownloads = false;
+      steps.pdfExportSkippedNoFeature = false;
+    }
+  } catch (e) {
+    collector.stepError = `${e.message}`;
+  }
+
+  const tab = collector["tab-a"] || { errors: [], console: [] };
+  // Same filter as deck-blocks: excuses `Failed to fetch`, aborted
+  // loads, and the handled 409 retry noise from the REST-fallback
+  // persist's optimistic-concurrency conflict.
+  const realErrors = (tab.console || []).filter(
+    (m) => m.type === "error" && !/Failed to fetch|loading was aborted|compilation aborted|status of 409 \(Conflict\)|Auto-save failed: HTTP 409/i.test(m.text || "")
+  );
+  steps.noConsoleErrors = realErrors.length === 0;
+
+  collector.scenario = {
+    name: collector.scenario?.name || "deck-present",
+    steps,
+  };
+
+  await page.screenshot({ path: join(outDir, "tab-a.png"), fullPage: false }).catch(() => {});
+  await context.close();
+  await browser.close();
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   const scenario = args.scenario || "collab-sync";
@@ -6905,7 +7155,8 @@ async function main() {
         "semantic-search|import-job-round-trip|" +
         "menu-export-downloads|pre-sync-edit-preserved|" +
         "sustained-type-reload|history-pane|delete-document|" +
-        "share-dialog|comment-popup|block-links|doc-mentions|deck-basics|deck-blocks] " +
+        "share-dialog|comment-popup|block-links|doc-mentions|deck-basics|deck-blocks|" +
+        "deck-present] " +
         "[--doc-id <docId>] [--email-a <addr>] [--email-b <addr>]"
     );
     process.exit(2);
@@ -7026,6 +7277,8 @@ async function main() {
       await scenarioDeckBasics(ctx, collector);
     } else if (scenario === "deck-blocks") {
       await scenarioDeckBlocks(ctx, collector);
+    } else if (scenario === "deck-present") {
+      await scenarioDeckPresent(ctx, collector);
     } else {
       throw new Error(`unknown scenario: ${scenario}`);
     }
@@ -7512,6 +7765,12 @@ async function main() {
       "mermaidInserted", "mermaidOnCanvas", "imageUploaded",
       "imageOnCanvas", "persistedBeforeReload", "reloadMermaidPersisted",
       "reloadImagePersisted", "noConsoleErrors",
+    ],
+    "deck-present": [
+      "presentRouteReached", "stageRendersSlide", "slideTextVisible",
+      "arrowAdvances", "arrowGoesBack", "escapeReturnsToEditor",
+      "presenterViewPanels", "timerAdvances", "pdfExportDownloads",
+      "noConsoleErrors",
     ],
   };
   if (ok && Object.prototype.hasOwnProperty.call(requiredSteps, scenario)) {

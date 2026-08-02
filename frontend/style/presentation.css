@@ -609,3 +609,183 @@
   background: var(--color-surface);
   color: var(--color-text);
 }
+
+/* ─── Present mode (P2) ─────────────────────────────────────── */
+
+/* Chrome-free stage. Fixed rather than 100vh so mobile browser URL
+ * bars can't shrink the slide mid-presentation. */
+.deck-present {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+  cursor: pointer;
+}
+
+.deck-present__stage {
+  width: min(100vw, calc(100vh * 16 / 9));
+  max-width: 100vw;
+}
+
+/* The editor caps the canvas at 960px; presenting must fill the
+ * stage instead. */
+.deck-present__stage .deck-canvas {
+  max-width: none;
+  width: 100%;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.deck-present__counter {
+  position: fixed;
+  right: var(--space-md);
+  bottom: var(--space-sm);
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 0.85rem;
+  pointer-events: none;
+}
+
+.deck-present__empty {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+/* Presenter view: stage left, panel right. Plain flex row — the stage
+ * keeps its own aspect box, so the panel just takes the remainder. */
+.deck-present--presenter {
+  flex-direction: row;
+  align-items: stretch;
+  justify-content: flex-start;
+  cursor: default;
+}
+
+.deck-present--presenter .deck-present__stage {
+  flex: 1 1 auto;
+  align-self: center;
+  width: auto;
+  max-width: 65vw;
+}
+
+.deck-present__panel {
+  flex: 0 0 30vw;
+  min-width: 260px;
+  overflow-y: auto;
+  padding: var(--space-md);
+  background: var(--color-surface);
+  color: var(--color-text);
+  cursor: default;
+}
+
+.deck-present__timer {
+  font-size: 2rem;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: var(--space-md);
+}
+
+.deck-present__next .deck-canvas {
+  max-width: 100%;
+  box-shadow: none;
+}
+
+.deck-present__note {
+  border-inline-start: 3px solid var(--color-border);
+  padding-inline-start: var(--space-sm);
+  margin-block: var(--space-sm);
+}
+
+/* ─── Live follow-the-presenter (Task 8) ───────────────────────── */
+
+.deck-present__follow {
+  position: fixed;
+  left: var(--space-md);
+  bottom: var(--space-md);
+  display: flex;
+  gap: var(--space-sm);
+  z-index: 2;
+}
+
+.deck-present__follow-btn,
+.deck-present__rejoin {
+  padding: 0.4em 0.9em;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  cursor: pointer;
+}
+
+/* ─── Mobile (P2: view + present only; editing stays desktop) ── */
+@media (max-width: 640px) {
+  /* Presenter view can't afford a side panel on a phone: stack it
+   * under the stage and let the page scroll. */
+  .deck-present--presenter {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .deck-present--presenter .deck-present__stage {
+    max-width: 100vw;
+    width: 100%;
+  }
+
+  .deck-present__panel {
+    flex: 1 1 auto;
+    width: 100%;
+    min-width: 0;
+  }
+
+  /* The editor's three-column grid collapses to the canvas alone — the
+   * strip (slide list) is pure editing chrome. The pane also hosts
+   * `.deck-present-btn` though, which is the *only* in-app entry point to
+   * `/d/:id/present` (it deliberately sits outside deck_view.rs's
+   * `Show when=!readonly` gate because presenting is a read operation,
+   * not an edit) — hiding the whole pane would strand the one
+   * mobile-reachable way to present. Only the pane's genuinely
+   * editing-only children (add-text-frame, theme picker) are hidden. */
+  .deck-view {
+    grid-template-columns: 1fr;
+    grid-template-areas: "canvas";
+  }
+
+  .deck-view__strip {
+    display: none;
+  }
+
+  /* Fixed, not grid-flowed: `document.rs` mounts the shared doc `Toolbar`
+   * above `DeckView` unconditionally for every doc_type, and on mobile
+   * `responsive.css` pins THAT toolbar to the true viewport bottom
+   * (`position: fixed; z-index: 80`, `--mobile-toolbar-height: 44px`) —
+   * a rule aimed at ordinary document editing, but it still applies
+   * here since deck editing being out of scope doesn't stop the shared
+   * chrome from rendering. A grid-flowed pane would get squeezed under
+   * that (and under the also-unresponsive menu bar above it) to
+   * near-zero height, making Present unreachable again just less
+   * obviously than `display: none`. Pinning the pane above the mobile
+   * toolbar instead — same `--mobile-toolbar-height` offset
+   * `.spreadsheet-wrapper` already uses to clear it — decouples Present's
+   * reachability from that chrome entirely. */
+  .deck-view__pane {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: calc(var(--mobile-toolbar-height) + env(safe-area-inset-bottom));
+    z-index: 21;
+    display: flex;
+    justify-content: center;
+    padding: var(--space-sm);
+    border-top: 1px solid var(--color-border);
+    background: var(--color-surface);
+  }
+
+  .deck-view__pane > :not(.deck-present-btn) {
+    display: none;
+  }
+
+  .deck-present-btn {
+    width: 100%;
+    max-width: 320px;
+    min-height: var(--touch-target-min);
+  }
+}

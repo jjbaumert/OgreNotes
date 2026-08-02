@@ -19,4 +19,10 @@ pub mod i18n;
 pub mod menu_nav;
 pub mod nav_bridge;
 pub mod observability;
+// Deck model, layout presets, themes, and canvas geometry for
+// presentations (components/deck_view.rs in the binary consumes
+// them). Lib-visible so `cargo test --lib` — the CI tier-1 command —
+// runs their unit tests; before this they compiled only into the
+// binary target and never gated CI.
+pub mod presentation;
 pub mod touch;

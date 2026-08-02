@@ -581,7 +581,7 @@ fn placeholder_key_for(content: &Fragment) -> &'static str {
     }
 }
 
-fn render_frame_content(content: &Fragment) -> AnyView {
+pub(crate) fn render_frame_content(content: &Fragment) -> AnyView {
     if fragment_is_visually_empty(content) {
         let hint = crate::i18n::translate(placeholder_key_for(content), None);
         return view! { <div class="deck-frame-placeholder">{hint}</div> }.into_any();
@@ -602,7 +602,7 @@ fn render_frame_content(content: &Fragment) -> AnyView {
 /// so both stay pixel-identical (the thumbnail is just the same
 /// markup shrunk with `transform: scale()`, per
 /// `style/presentation.css`'s `.deck-slide-thumb__scaler` comment).
-fn render_deck_canvas(slide: &DeckSlide, theme: &str) -> AnyView {
+pub(crate) fn render_deck_canvas(slide: &DeckSlide, theme: &str) -> AnyView {
     // `role=notes` frames are never positioned on the canvas (design
     // doc, "Canvas keymap matrix" section) — they render only in the
     // collapsed notes drawer below the active canvas. This shared
@@ -644,7 +644,7 @@ fn render_deck_canvas(slide: &DeckSlide, theme: &str) -> AnyView {
 /// is a Trunk `copy-file` (see `index.html`), not a bundled `rel="css"`, so a
 /// pure-document or pure-spreadsheet session never fetches it. Idempotent via
 /// a stable element id.
-fn ensure_presentation_css() {
+pub(crate) fn ensure_presentation_css() {
     let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
         return;
     };
@@ -1486,6 +1486,8 @@ pub fn DeckView(
 
     // ─── Render ─────────────────────────────────────────────
 
+    let doc_id_for_present = doc_id.clone();
+
     view! {
         <div class="deck-view">
             <div
@@ -2129,6 +2131,12 @@ pub fn DeckView(
             </div>
 
             <div class="deck-view__pane">
+                <button
+                    class="deck-present-btn"
+                    on:click=move |_| crate::nav_bridge::go(&format!("/d/{}/present", doc_id_for_present))
+                >
+                    {crate::t!("deck-present")}
+                </button>
                 <Show when=move || !readonly>
                     <button class="deck-add-text-frame-btn" on:click=add_text_frame>
                         {crate::t!("deck-add-text-frame")}

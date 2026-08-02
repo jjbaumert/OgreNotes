@@ -32,6 +32,10 @@ pub fn App() -> impl IntoView {
                 <Route path=path!("/auth/mfa-challenge") view=pages::mfa_challenge::MfaChallengePage />
                 <Route path=path!("/workspaces/:id/saml") view=pages::workspace_saml::WorkspaceSamlPage />
                 <Route path=path!("/workspaces/:id/scim") view=pages::workspace_scim::WorkspaceScimPage />
+                // Present mode is chrome-free: flat route, no AppShell.
+                // Must precede the `d/:id/:slug` child route below or
+                // "present" is swallowed as a slug.
+                <Route path=path!("/d/:id/present") view=pages::present::PresentPage />
 
                 // #152: the sidebar pages render inside a persistent
                 // `AppShell` (sidebar + `.app-layout` wrapper + `<Outlet/>`).

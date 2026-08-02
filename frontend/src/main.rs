@@ -6,7 +6,7 @@ mod app;
 mod collab;
 mod commands;
 mod components;
-pub mod editor;
+pub use ogrenotes_frontend::editor;
 mod inserts;
 mod nav_bridge;
 // `i18n` now lives in `lib.rs` so editor/*.rs and other lib
@@ -17,7 +17,7 @@ pub use ogrenotes_frontend::i18n;
 pub use ogrenotes_frontend::t;
 pub mod observability;
 mod pages;
-mod presentation;
+pub use ogrenotes_frontend::presentation;
 mod rum;
 mod spreadsheet;
 mod editor_width;

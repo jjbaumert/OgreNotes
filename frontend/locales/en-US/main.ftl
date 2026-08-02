@@ -1132,6 +1132,7 @@ menubar-doc-export-html = HTML
 menubar-doc-export-markdown = Markdown (copy)
 menubar-doc-export-csv = CSV
 menubar-doc-export-excel = Excel (.xlsx)
+menubar-doc-export-pdf = PDF
 menubar-doc-print = Print…
 menubar-doc-history = Document History…
 menubar-doc-details = Document Details…
@@ -1208,3 +1209,18 @@ deck-frame-comment = Comment on this frame
 
 deck-add-text-frame = Add Text Frame
 deck-notes-drawer-label = Speaker notes
+
+# ─── Presentations P2 (present mode, Task 6) ─────────────────────
+
+deck-present = Present
+deck-present-empty = This deck has no slides yet.
+
+# ─── Presentations P2 (presenter view, Task 7) ───────────────────
+
+deck-present-next = Next
+deck-present-notes = Speaker notes
+
+# ─── Presentations P2 (live follow-the-presenter, Task 8) ────────
+
+deck-present-follow = Follow { $name }
+deck-present-rejoin = Rejoin presenter
