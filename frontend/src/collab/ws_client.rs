@@ -145,6 +145,11 @@ struct AwarenessPayload {
     // JSON unchanged — see `tests/fixtures/protocol/awareness/`.
     #[serde(skip_serializing_if = "Option::is_none")]
     typing_thread_id: Option<String>,
+    /// P2 live follow-the-presenter: the slide `block_id` this user is
+    /// currently presenting, when they are in present mode. Absent for
+    /// every ordinary editing session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presenting: Option<String>,
 }
 
 /// State of the WebSocket connection.
@@ -181,6 +186,8 @@ pub struct RemoteCursor {
     /// Comment thread the user is currently typing into, if any.
     /// Drives the "X is typing…" indicator in the conversation pane.
     pub typing_thread_id: Option<String>,
+    /// Slide `block_id` this user is currently presenting, if in present mode.
+    pub presenting: Option<String>,
 }
 
 /// Callback for when remote cursors change.
@@ -475,6 +482,7 @@ fn handle_awareness(
         selection_anchor_block: block_pos(&state.sel_anchor_block_id, &state.sel_anchor_offset),
         selection_head_block: block_pos(&state.sel_head_block_id, &state.sel_head_offset),
         typing_thread_id: state.typing_thread_id.clone(),
+        presenting: state.presenting.clone(),
     };
     remote_cursors.borrow_mut().insert(state.user_id, cursor);
 
@@ -1048,6 +1056,7 @@ impl CollabClient {
     /// `cursor`: (block_id, char_offset) for cursor position
     /// `sel_anchor`/`sel_head`: (block_id, char_offset) for selection endpoints
     /// `typing_thread_id`: comment thread the user is currently typing into
+    /// `presenting`: slide `block_id` this user is presenting, if in present mode
     pub fn send_awareness(
         &self,
         user_id: &str,
@@ -1057,6 +1066,7 @@ impl CollabClient {
         sel_anchor: Option<(&str, u32)>,
         sel_head: Option<(&str, u32)>,
         typing_thread_id: Option<&str>,
+        presenting: Option<&str>,
     ) {
         if *self.state.borrow() != ConnectionState::Synced {
             return;
@@ -1076,6 +1086,7 @@ impl CollabClient {
             selection_anchor: None,
             selection_head: None,
             typing_thread_id: typing_thread_id.map(|s| s.to_string()),
+            presenting: presenting.map(|s| s.to_string()),
         };
         if let Ok(json) = serde_json::to_vec(&payload) {
             if let Some(ws) = self.ws.borrow().as_ref() {
@@ -1523,6 +1534,7 @@ mod tests {
             selection_anchor: None,
             selection_head: None,
             typing_thread_id: None,
+            presenting: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("\"user_id\":\"user1\""));
@@ -1550,10 +1562,12 @@ mod tests {
             selection_anchor: None,
             selection_head: None,
             typing_thread_id: None,
+            presenting: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         assert!(!json.contains("cursor_block_id"), "None fields should be omitted: {json}");
         assert!(!json.contains("sel_anchor"), "None fields should be omitted: {json}");
+        assert!(!json.contains("presenting"), "None fields should be omitted: {json}");
     }
 
     // ── Awareness departure (#9) ──
@@ -1567,6 +1581,7 @@ mod tests {
             selection_anchor_block: None,
             selection_head_block: None,
             typing_thread_id: None,
+            presenting: None,
         }
     }
 
@@ -1625,6 +1640,8 @@ mod tests {
         include_str!("../../../tests/fixtures/protocol/awareness/legacy-absolute.json");
     const FIXTURE_NO_PRESENCE: &str =
         include_str!("../../../tests/fixtures/protocol/awareness/no-presence.json");
+    const FIXTURE_PRESENTING: &str =
+        include_str!("../../../tests/fixtures/protocol/awareness/presenting.json");
 
     fn assert_awareness_fixture_round_trips(raw: &str, name: &str) {
         use serde_json::Value;
@@ -1682,6 +1699,11 @@ mod tests {
     #[test]
     fn fixture_no_presence_preserved() {
         assert_awareness_fixture_round_trips(FIXTURE_NO_PRESENCE, "no-presence");
+    }
+
+    #[test]
+    fn fixture_presenting_round_trips() {
+        assert_awareness_fixture_round_trips(FIXTURE_PRESENTING, "presenting.json");
     }
 
     // ── Heartbeat gate predicate ──

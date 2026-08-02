@@ -28,6 +28,7 @@ pub const MAX_AWARENESS_PAYLOAD_BYTES: usize = 4 * 1024;
 ///     `sel_head_block_id` — DOM block ids; the editor's id
 ///     generator (nanoid, 16 char base62) fits well within this.
 ///   - `typing_thread_id` — comment thread id; same generator.
+///   - `presenting` — slide `block_id` being presented; same generator.
 ///
 /// Reject the whole payload if any field exceeds — a partial
 /// rebroadcast would leak that a field was trimmed.
@@ -91,6 +92,14 @@ pub struct AwarenessState {
     /// Thread ID where the user is currently typing (for typing indicators).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub typing_thread_id: Option<String>,
+
+    /// P2 live follow-the-presenter: the slide `block_id` this user is
+    /// currently presenting, when they are in present mode. Absent for
+    /// every ordinary editing session. Ephemeral by construction — the
+    /// state vanishes with the connection, which is what ends a
+    /// presenting session (design/presentations.md, "Live follow").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presenting: Option<String>,
 }
 
 /// Color palette for collaborator cursors (12 distinct colors).
@@ -197,6 +206,7 @@ fn state_has_oversize_field(s: &AwarenessState) -> bool {
         selection_anchor: _,
         selection_head: _,
         typing_thread_id,
+        presenting,
     } = s;
     over(user_id)
         || over(name)
@@ -204,6 +214,7 @@ fn state_has_oversize_field(s: &AwarenessState) -> bool {
         || over_opt(sel_anchor_block_id)
         || over_opt(sel_head_block_id)
         || over_opt(typing_thread_id)
+        || over_opt(presenting)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────
@@ -230,6 +241,7 @@ mod tests {
             selection_anchor: None,
             selection_head: None,
             typing_thread_id: None,
+            presenting: None,
         }
     }
 
@@ -336,6 +348,8 @@ mod tests {
         include_str!("../../../tests/fixtures/protocol/awareness/legacy-absolute.json");
     const FIXTURE_NO_PRESENCE: &str =
         include_str!("../../../tests/fixtures/protocol/awareness/no-presence.json");
+    const FIXTURE_PRESENTING: &str =
+        include_str!("../../../tests/fixtures/protocol/awareness/presenting.json");
 
     /// Asserts a fixture decodes, re-encodes, and decodes again without losing
     /// any populated field. Uses a `serde_json::Value` equality check on the
@@ -400,6 +414,24 @@ mod tests {
     #[test]
     fn fixture_no_presence_preserved() {
         assert_fixture_round_trips(FIXTURE_NO_PRESENCE, "no-presence");
+    }
+
+    #[test]
+    fn fixture_presenting_preserved() {
+        assert_fixture_round_trips(FIXTURE_PRESENTING, "presenting.json");
+    }
+
+    #[test]
+    fn presenting_field_is_length_capped() {
+        let long = "x".repeat(MAX_AWARENESS_FIELD_BYTES + 1);
+        let raw = serde_json::json!({
+            "user_id": "u", "name": "n", "color": 0, "presenting": long
+        })
+        .to_string();
+        assert!(
+            decode_awareness(raw.as_bytes()).is_none(),
+            "an over-long presenting id must be rejected like every other string field"
+        );
     }
 
     #[test]

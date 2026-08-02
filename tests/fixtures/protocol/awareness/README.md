@@ -42,3 +42,4 @@ replacement.
 | `typing-indicator.json` | User is typing in a comment thread; no editor cursor. |
 | `legacy-absolute.json` | Old-format payload with only absolute `cursor_pos` (no block fields). Exercises the backwards-compat path. |
 | `no-presence.json` | Connected user with no focus / no cursor at all. Baseline identity-only shape. |
+| `presenting.json` | A presenter broadcasting the slide they are on (live follow-the-presenter, P2). |

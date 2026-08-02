@@ -1402,6 +1402,7 @@ pub fn DocumentPage() -> impl IntoView {
                         cursor_block.as_ref().map(|(b, o)| (b.as_str(), *o)),
                         None, None,
                         typing_ref,
+                        None,
                     );
                 } else {
                     let anchor_block = pos_to_block(from);
@@ -1412,6 +1413,7 @@ pub fn DocumentPage() -> impl IntoView {
                         anchor_block.as_ref().map(|(b, o)| (b.as_str(), *o)),
                         head_block.as_ref().map(|(b, o)| (b.as_str(), *o)),
                         typing_ref,
+                        None,
                     );
                 }
             }
@@ -1524,6 +1526,7 @@ pub fn DocumentPage() -> impl IntoView {
             user_id, name, color_idx,
             Some((block_id.as_str(), 0)),
             None, None,
+            None,
             None,
         );
     });
