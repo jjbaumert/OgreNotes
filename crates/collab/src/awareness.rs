@@ -100,6 +100,31 @@ pub struct AwarenessState {
     /// presenting session (design/presentations.md, "Live follow").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presenting: Option<String>,
+
+    /// #211/#212: a random id generated client-side once per page mount
+    /// / `CollabClient` instance, distinct from `user_id`. Identifies
+    /// this *connection/window*, not this *person* — a user with a
+    /// projector window and a `?presenter=1` control window open at the
+    /// same time has one `user_id` but two `session_id`s.
+    ///
+    /// The server keys its awareness cache (`Room::store_awareness` /
+    /// `forget_awareness` / `awareness_snapshot`) by this field instead
+    /// of `user_id` so those two windows don't collapse into one cursor
+    /// server-side — the same reason the frontend now keys
+    /// `remote_cursors` by session_id (`ws_client.rs`) instead of
+    /// user_id. It also sidesteps the original #212 bug (the server's
+    /// per-room `client_id` counter isn't unique across API instances)
+    /// without needing any instance-id plumbing, since a randomly
+    /// generated session id is globally unique by construction.
+    ///
+    /// `None` only for a client that predates this field (mid-rollout).
+    /// The WS ingress handler (`routes::ws`) normalizes a missing value
+    /// to a per-connection random fallback before rebroadcasting, so by
+    /// the time a frame reaches `apply_remote_update` or a peer client
+    /// it should always be `Some`; `None` there is treated as "legacy,
+    /// synthesize a fallback" rather than dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Color palette for collaborator cursors (12 distinct colors).
@@ -207,6 +232,7 @@ fn state_has_oversize_field(s: &AwarenessState) -> bool {
         selection_head: _,
         typing_thread_id,
         presenting,
+        session_id,
     } = s;
     over(user_id)
         || over(name)
@@ -215,6 +241,7 @@ fn state_has_oversize_field(s: &AwarenessState) -> bool {
         || over_opt(sel_head_block_id)
         || over_opt(typing_thread_id)
         || over_opt(presenting)
+        || over_opt(session_id)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────
@@ -242,6 +269,7 @@ mod tests {
             selection_head: None,
             typing_thread_id: None,
             presenting: None,
+            session_id: None,
         }
     }
 
@@ -350,6 +378,8 @@ mod tests {
         include_str!("../../../tests/fixtures/protocol/awareness/no-presence.json");
     const FIXTURE_PRESENTING: &str =
         include_str!("../../../tests/fixtures/protocol/awareness/presenting.json");
+    const FIXTURE_SESSION_ID: &str =
+        include_str!("../../../tests/fixtures/protocol/awareness/session-id.json");
 
     /// Asserts a fixture decodes, re-encodes, and decodes again without losing
     /// any populated field. Uses a `serde_json::Value` equality check on the
@@ -422,6 +452,11 @@ mod tests {
     }
 
     #[test]
+    fn fixture_session_id_preserved() {
+        assert_fixture_round_trips(FIXTURE_SESSION_ID, "session-id.json");
+    }
+
+    #[test]
     fn presenting_field_is_length_capped() {
         let long = "x".repeat(MAX_AWARENESS_FIELD_BYTES + 1);
         let raw = serde_json::json!({
@@ -431,6 +466,42 @@ mod tests {
         assert!(
             decode_awareness(raw.as_bytes()).is_none(),
             "an over-long presenting id must be rejected like every other string field"
+        );
+    }
+
+    /// #211/#212: session_id round-trips through decode → mutate →
+    /// encode just like every other field, and is subject to the same
+    /// per-field length cap as the rest of the string fields.
+    #[test]
+    fn session_id_round_trips() {
+        let state = AwarenessState {
+            session_id: Some("sess-abc123".to_string()),
+            ..empty_state("u1", "Alice", 2)
+        };
+        let bytes = encode_awareness(&state);
+        let decoded = decode_awareness(&bytes).unwrap();
+        assert_eq!(decoded.session_id.as_deref(), Some("sess-abc123"));
+    }
+
+    #[test]
+    fn session_id_absent_decodes_to_none() {
+        // A client that predates #211/#212 sends no session_id at all —
+        // must decode cleanly rather than being rejected.
+        let json = r#"{"user_id":"u1","name":"Bob","color":5}"#;
+        let state = decode_awareness(json.as_bytes()).unwrap();
+        assert!(state.session_id.is_none());
+    }
+
+    #[test]
+    fn session_id_field_is_length_capped() {
+        let long = "x".repeat(MAX_AWARENESS_FIELD_BYTES + 1);
+        let raw = serde_json::json!({
+            "user_id": "u", "name": "n", "color": 0, "session_id": long
+        })
+        .to_string();
+        assert!(
+            decode_awareness(raw.as_bytes()).is_none(),
+            "an over-long session_id must be rejected like every other string field"
         );
     }
 

@@ -49,14 +49,36 @@ pub struct Room {
     doc: RwLock<OgreDoc>,
     /// Connected clients, keyed by client_id.
     clients: RwLock<HashMap<u64, ClientHandle>>,
-    /// Most recent awareness JSON payload per client.
+    /// Most recent awareness JSON payload per *session* (not per
+    /// client_id, and not per user).
     ///
     /// Without this, a client that idle-disconnects and reconnects 30 min
     /// later never sees other collaborators' cursors until *they* move,
     /// because the server previously only forwarded live awareness frames
     /// and had no memory of the last broadcast. Snapshot-on-join primes the
     /// rejoining client with everyone's current cursor state.
-    awareness: RwLock<HashMap<u64, Vec<u8>>>,
+    ///
+    /// Keyed by `AwarenessState::session_id` (#211/#212) rather than the
+    /// per-room monotonic `client_id` counter or `user_id`:
+    /// - `client_id` is only unique *within* one Room on one API
+    ///   instance, so with >1 ECS task instance A's client 1 and
+    ///   instance B's client 1 would collide once awareness started
+    ///   fanning out over Redis.
+    /// - `user_id` collapses a single user's multiple open windows
+    ///   (e.g. a presenter's projector window and their separate
+    ///   `?presenter=1` control window, #211) into one cursor, which
+    ///   breaks live-follow between those two windows.
+    ///
+    /// A `session_id` is generated client-side once per page mount /
+    /// `CollabClient` instance and is globally unique by construction
+    /// (no instance-id plumbing needed to avoid cross-instance
+    /// collision, unlike `client_id`). The frontend mirrors this by
+    /// keying `remote_cursors` by session_id too (`ws_client.rs`),
+    /// de-duplicating back down to one-cursor-per-user only at render
+    /// time in the consumers that want that (cursor overlay, spreadsheet
+    /// view) — present mode's follow feature deliberately keeps the
+    /// full per-session list.
+    awareness: RwLock<HashMap<String, Vec<u8>>>,
     /// Document ID.
     doc_id: String,
     /// Timestamp of the last edit (milliseconds since epoch).
@@ -361,28 +383,57 @@ impl Room {
         clients.len()
     }
 
-    /// Remember a client's latest awareness JSON payload. Called after each
-    /// awareness frame is broadcast so future joiners can be primed with the
-    /// current cursor state.
-    pub async fn store_awareness(&self, client_id: u64, payload: Vec<u8>) {
-        self.awareness.write().await.insert(client_id, payload);
+    /// Remember a session's latest awareness JSON payload. Called after
+    /// each awareness frame is broadcast so future joiners can be primed
+    /// with the current cursor state. Keyed by `session_id` (#211/#212)
+    /// — see the field doc on `awareness` for why.
+    pub async fn store_awareness(&self, session_id: &str, payload: Vec<u8>) {
+        self.awareness.write().await.insert(session_id.to_string(), payload);
     }
 
-    /// Forget a client's awareness when they disconnect.
-    pub async fn forget_awareness(&self, client_id: u64) {
-        self.awareness.write().await.remove(&client_id);
+    /// Forget a session's awareness when it disconnects (or on a remote
+    /// `AwarenessLeave`). Two sessions of the same user are independent —
+    /// forgetting one never touches the other's entry.
+    pub async fn forget_awareness(&self, session_id: &str) {
+        self.awareness.write().await.remove(session_id);
     }
 
-    /// Snapshot the awareness payloads of every *other* client in the room.
-    /// Used after a new client joins: the server replays each entry to them
-    /// so their cursor overlay renders existing collaborators immediately
-    /// instead of waiting for movement.
-    pub async fn awareness_snapshot(&self, exclude_client: u64) -> Vec<Vec<u8>> {
+    /// Legacy fallback for an `AwarenessLeave` frame that carries only a
+    /// bare `user_id` (no `\0`-separated session_id — a pre-#211/#212
+    /// peer instance mid-rollout, see `apply_remote_update`'s
+    /// `AwarenessLeave` arm). Without a session id to key on directly,
+    /// this decodes every cached entry and removes the ones whose
+    /// `AwarenessState::user_id` matches — correct but O(n) in the
+    /// room's cache size, which is bounded by connected-client count so
+    /// this is cheap in practice. Should only ever fire transiently
+    /// during a rolling deploy.
+    pub async fn forget_awareness_by_user(&self, user_id: &str) {
+        let mut awareness = self.awareness.write().await;
+        awareness.retain(|_session_id, payload| {
+            match super::awareness::decode_awareness(payload) {
+                Some(state) => state.user_id != user_id,
+                // Undecodable cached payload — shouldn't happen (we only
+                // ever cache what we successfully decoded), but keep it
+                // rather than guessing.
+                None => true,
+            }
+        });
+    }
+
+    /// Snapshot the awareness payloads of every *other* session in the
+    /// room. Used after a new client joins: the server replays each
+    /// entry to them so their cursor overlay renders existing
+    /// collaborators immediately instead of waiting for movement.
+    ///
+    /// `exclude_session` is the joining client's own session_id, so a
+    /// joiner doesn't get echoed their own (possibly stale, from a
+    /// same-session reconnect) cursor state.
+    pub async fn awareness_snapshot(&self, exclude_session: &str) -> Vec<Vec<u8>> {
         self.awareness
             .read()
             .await
             .iter()
-            .filter_map(|(id, v)| (*id != exclude_client).then(|| v.clone()))
+            .filter_map(|(sid, v)| (sid != exclude_session).then(|| v.clone()))
             .collect()
     }
 
@@ -519,8 +570,12 @@ impl RoomRegistry {
     /// Expects `wire_bytes` to be a protocol-framed message (1-byte type +
     /// payload). `Update` frames are applied to the local CRDT before
     /// being relayed; `CommentEvent` frames carry no CRDT state so they're
-    /// just relayed to every connected client. Other types (SyncStep1/2,
-    /// awareness, etc.) are ignored.
+    /// just relayed to every connected client. `Awareness` frames (#211/
+    /// #212) are cached under the sender's session_id (so a later local
+    /// joiner is primed via `awareness_snapshot`) and then relayed;
+    /// `AwarenessLeave` frames forget that session's cached entry and are
+    /// relayed so local clients drop the stale cursor. Other types
+    /// (SyncStep1/2, Ping, etc.) are ignored.
     pub async fn apply_remote_update(&self, doc_id: &str, wire_bytes: &[u8]) {
         use super::protocol::{decode_message, MessageType};
         let Some(room) = self.get(doc_id) else { return };
@@ -538,6 +593,59 @@ impl RoomRegistry {
             MessageType::CommentEvent => {
                 // No CRDT state to update — comments live in the thread DB.
                 // Just relay so clients on this instance refresh.
+            }
+            MessageType::Awareness => {
+                // Decode to pull out the session_id so we can cache the
+                // payload for snapshot-on-join priming. The originating
+                // instance's WS ingress handler always normalizes
+                // `session_id` to `Some(..)` before broadcasting/
+                // publishing (minting a per-connection fallback for a
+                // client that predates #211/#212), so `None` here should
+                // be unreachable in practice; treat it as "legacy,
+                // synthesize a fallback from user_id" defense-in-depth
+                // rather than dropping the frame outright — losing a
+                // remote peer's cursor entirely is worse than caching it
+                // under an imprecise key.
+                let Some(state) = super::awareness::decode_awareness(payload) else {
+                    tracing::warn!(doc_id, "remote awareness: undecodable payload");
+                    return;
+                };
+                let session_id = match &state.session_id {
+                    Some(sid) if !sid.is_empty() => sid.clone(),
+                    _ => {
+                        tracing::warn!(
+                            doc_id,
+                            user_id = %state.user_id,
+                            "remote awareness: missing session_id, falling back to per-user key"
+                        );
+                        format!("legacy-session-{}", state.user_id)
+                    }
+                };
+                room.store_awareness(&session_id, payload.to_vec()).await;
+            }
+            MessageType::AwarenessLeave => {
+                let Ok(text) = std::str::from_utf8(payload) else {
+                    tracing::warn!(doc_id, "remote awareness-leave: non-utf8 payload");
+                    return;
+                };
+                // Current wire shape (#211/#212): "session_id\0user_id".
+                // Legacy shape (pre-#211/#212 peer instance mid-rollout):
+                // a bare user_id with no separator — fall back to the
+                // O(cache-size) scan-by-user rather than dropping the
+                // leave entirely.
+                match text.split_once('\0') {
+                    Some((session_id, _user_id)) => {
+                        room.forget_awareness(session_id).await;
+                    }
+                    None => {
+                        tracing::warn!(
+                            doc_id,
+                            "remote awareness-leave: legacy user_id-only payload, \
+                             falling back to forget-by-user"
+                        );
+                        room.forget_awareness_by_user(text).await;
+                    }
+                }
             }
             _ => return,
         }
@@ -933,20 +1041,23 @@ mod tests {
 
     #[tokio::test]
     async fn awareness_store_and_snapshot() {
+        // #211/#212: keyed by session_id (not client_id, not user_id) so
+        // the cache stays meaningful across API instances AND across a
+        // single user's multiple open windows.
         let room = Room::new_empty("doc-1".to_string());
-        room.store_awareness(1, b"alice-state".to_vec()).await;
-        room.store_awareness(2, b"bob-state".to_vec()).await;
+        room.store_awareness("sess-alice-1", b"alice-state".to_vec()).await;
+        room.store_awareness("sess-bob-1", b"bob-state".to_vec()).await;
 
-        // Snapshot excluding client 1 returns bob only.
-        let snap = room.awareness_snapshot(1).await;
+        // Snapshot excluding alice's session returns bob only.
+        let snap = room.awareness_snapshot("sess-alice-1").await;
         assert_eq!(snap, vec![b"bob-state".to_vec()]);
 
-        // Snapshot excluding client 2 returns alice only.
-        let snap = room.awareness_snapshot(2).await;
+        // Snapshot excluding bob's session returns alice only.
+        let snap = room.awareness_snapshot("sess-bob-1").await;
         assert_eq!(snap, vec![b"alice-state".to_vec()]);
 
         // Snapshot excluding a third party returns both (order-independent).
-        let mut snap = room.awareness_snapshot(99).await;
+        let mut snap = room.awareness_snapshot("sess-carol-1").await;
         snap.sort();
         let mut expected: Vec<Vec<u8>> = vec![b"alice-state".to_vec(), b"bob-state".to_vec()];
         expected.sort();
@@ -955,28 +1066,97 @@ mod tests {
 
     #[tokio::test]
     async fn awareness_store_overwrites() {
-        // Each client has at most one cached awareness payload — the latest.
+        // Each session has at most one cached awareness payload — the
+        // latest. Re-sending from the *same* session (e.g. cursor moved
+        // again) overwrites rather than adding a second entry.
         let room = Room::new_empty("doc-1".to_string());
-        room.store_awareness(1, b"v1".to_vec()).await;
-        room.store_awareness(1, b"v2".to_vec()).await;
-        let snap = room.awareness_snapshot(999).await;
+        room.store_awareness("sess-alice-1", b"v1".to_vec()).await;
+        room.store_awareness("sess-alice-1", b"v2".to_vec()).await;
+        let snap = room.awareness_snapshot("nobody").await;
         assert_eq!(snap, vec![b"v2".to_vec()]);
     }
 
     #[tokio::test]
     async fn awareness_forget_removes() {
         let room = Room::new_empty("doc-1".to_string());
-        room.store_awareness(1, b"alice".to_vec()).await;
-        room.store_awareness(2, b"bob".to_vec()).await;
-        room.forget_awareness(1).await;
-        let snap = room.awareness_snapshot(999).await;
+        room.store_awareness("sess-alice-1", b"alice".to_vec()).await;
+        room.store_awareness("sess-bob-1", b"bob".to_vec()).await;
+        room.forget_awareness("sess-alice-1").await;
+        let snap = room.awareness_snapshot("nobody").await;
         assert_eq!(snap, vec![b"bob".to_vec()]);
     }
 
     #[tokio::test]
     async fn awareness_snapshot_empty_when_nobody_has_stored() {
         let room = Room::new_empty("doc-1".to_string());
-        assert!(room.awareness_snapshot(42).await.is_empty());
+        assert!(room.awareness_snapshot("nobody").await.is_empty());
+    }
+
+    /// #211: the whole point of session-keying. A presenter with a
+    /// projector window AND a `?presenter=1` control window has one
+    /// user_id but two independent sessions — both must show up in the
+    /// snapshot, and closing one must never touch the other's entry.
+    #[tokio::test]
+    async fn awareness_two_sessions_same_user_are_independent() {
+        let room = Room::new_empty("doc-1".to_string());
+        room.store_awareness("sess-projector", b"projector-state".to_vec()).await;
+        room.store_awareness("sess-control", b"control-state".to_vec()).await;
+
+        // Both of this user's sessions appear to a third party.
+        let mut snap = room.awareness_snapshot("nobody").await;
+        snap.sort();
+        let mut expected = vec![b"projector-state".to_vec(), b"control-state".to_vec()];
+        expected.sort();
+        assert_eq!(snap, expected);
+
+        // Forgetting the control window's session leaves the projector's
+        // entry untouched.
+        room.forget_awareness("sess-control").await;
+        let snap = room.awareness_snapshot("nobody").await;
+        assert_eq!(snap, vec![b"projector-state".to_vec()]);
+
+        // And the projector session is independently forgettable too.
+        room.forget_awareness("sess-projector").await;
+        assert!(room.awareness_snapshot("nobody").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn awareness_forget_by_user_removes_all_that_users_sessions() {
+        // Legacy fallback path (`AwarenessLeave` payload with no
+        // session_id, see `apply_remote_update`): a single user_id must
+        // remove every session belonging to that user, leaving others
+        // untouched.
+        use super::super::awareness::{encode_awareness, AwarenessState};
+
+        let room = Room::new_empty("doc-1".to_string());
+        let mk = |user_id: &str, session_id: &str| {
+            encode_awareness(&AwarenessState {
+                user_id: user_id.to_string(),
+                name: "n".to_string(),
+                color: 0,
+                cursor_block_id: None,
+                cursor_offset: None,
+                sel_anchor_block_id: None,
+                sel_anchor_offset: None,
+                sel_head_block_id: None,
+                sel_head_offset: None,
+                cursor_pos: None,
+                selection_anchor: None,
+                selection_head: None,
+                typing_thread_id: None,
+                presenting: None,
+                session_id: Some(session_id.to_string()),
+            })
+        };
+        room.store_awareness("sess-alice-1", mk("alice", "sess-alice-1")).await;
+        room.store_awareness("sess-alice-2", mk("alice", "sess-alice-2")).await;
+        room.store_awareness("sess-bob-1", mk("bob", "sess-bob-1")).await;
+
+        room.forget_awareness_by_user("alice").await;
+
+        let snap = room.awareness_snapshot("nobody").await;
+        assert_eq!(snap.len(), 1, "only bob's entry should remain");
+        assert_eq!(snap[0], mk("bob", "sess-bob-1"));
     }
 
     // ── apply_remote_update CommentEvent relay ─────────────────────
@@ -1009,9 +1189,14 @@ mod tests {
 
     #[tokio::test]
     async fn apply_remote_update_ignores_unknown_message_types() {
-        // SyncStep1/2, Awareness, Ping, Auth, Error: not relayed via the
-        // pub/sub fanout. Only Update and CommentEvent should reach
-        // connected clients.
+        // #212: Awareness and AwarenessLeave used to be in this "never
+        // relayed" bucket, but they're now deliberately fanned out (see
+        // the tests below) so cursors cross API instances. SyncStep1/2,
+        // Ping, Auth, Error remain genuinely unhandled — a remote peer
+        // publishing one of these (which shouldn't happen in practice,
+        // since only Update/CommentEvent/Awareness/AwarenessLeave are
+        // ever passed to `publish_update`) must still be a no-op rather
+        // than reaching connected clients.
         use super::super::protocol::encode_message;
 
         let registry = RoomRegistry::new();
@@ -1019,9 +1204,174 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         room.add_client(1, "alice".into(), tx).await;
 
-        let frame = encode_message(MessageType::Awareness, b"junk");
+        let frame = encode_message(MessageType::Ping, b"junk");
         registry.apply_remote_update("doc-1", &frame).await;
-        assert!(rx.try_recv().is_err(), "Awareness frames must not be relayed");
+        assert!(rx.try_recv().is_err(), "Ping frames must not be relayed");
+    }
+
+    // ── apply_remote_update Awareness / AwarenessLeave relay (#211/#212) ─
+
+    #[tokio::test]
+    async fn apply_remote_update_relays_awareness_and_stores_by_session_id() {
+        // A peer instance published an Awareness frame for a doc that has
+        // active subscribers on this instance. apply_remote_update must
+        // both (a) forward the wire-framed message to each connected
+        // local client, and (b) cache the payload under the sender's
+        // session_id so a *future* local joiner is primed via
+        // `awareness_snapshot` without waiting for the remote user to
+        // move again.
+        use super::super::awareness::{encode_awareness, AwarenessState};
+        use super::super::protocol::encode_message;
+
+        let registry = RoomRegistry::new();
+        let room = registry.get_or_insert("doc-1", OgreDoc::new());
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        room.add_client(1, "alice".into(), tx1).await;
+
+        let remote_state = AwarenessState {
+            user_id: "remote-bob".to_string(),
+            name: "Bob".to_string(),
+            color: 1,
+            cursor_block_id: None,
+            cursor_offset: None,
+            sel_anchor_block_id: None,
+            sel_anchor_offset: None,
+            sel_head_block_id: None,
+            sel_head_offset: None,
+            cursor_pos: None,
+            selection_anchor: None,
+            selection_head: None,
+            typing_thread_id: None,
+            presenting: None,
+            session_id: Some("sess-remote-bob-1".to_string()),
+        };
+        let payload = encode_awareness(&remote_state);
+        let frame = encode_message(MessageType::Awareness, &payload);
+
+        registry.apply_remote_update("doc-1", &frame).await;
+
+        // Local broadcast reached alice.
+        let recv1 = rx1.try_recv().expect("alice should get the remote Awareness frame");
+        assert_eq!(recv1, frame);
+
+        // And the snapshot cache is primed under "sess-remote-bob-1" — a
+        // joiner arriving *after* this remote frame still sees bob's
+        // cursor.
+        let snap = room.awareness_snapshot("someone-elses-session").await;
+        assert_eq!(snap, vec![payload]);
+    }
+
+    /// #212 fallback: a remote Awareness frame that arrives with no
+    /// session_id at all (a peer instance mid-rollout, or in principle a
+    /// malformed frame that slipped past ingress normalization) must
+    /// still be cached and relayed rather than dropped — see the
+    /// `apply_remote_update` doc on the `Awareness` arm.
+    #[tokio::test]
+    async fn apply_remote_update_awareness_missing_session_id_falls_back() {
+        use super::super::awareness::{encode_awareness, AwarenessState};
+        use super::super::protocol::encode_message;
+
+        let registry = RoomRegistry::new();
+        let room = registry.get_or_insert("doc-1", OgreDoc::new());
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        room.add_client(1, "alice".into(), tx1).await;
+
+        let remote_state = AwarenessState {
+            user_id: "remote-bob".to_string(),
+            name: "Bob".to_string(),
+            color: 1,
+            cursor_block_id: None,
+            cursor_offset: None,
+            sel_anchor_block_id: None,
+            sel_anchor_offset: None,
+            sel_head_block_id: None,
+            sel_head_offset: None,
+            cursor_pos: None,
+            selection_anchor: None,
+            selection_head: None,
+            typing_thread_id: None,
+            presenting: None,
+            session_id: None,
+        };
+        let payload = encode_awareness(&remote_state);
+        let frame = encode_message(MessageType::Awareness, &payload);
+
+        registry.apply_remote_update("doc-1", &frame).await;
+
+        rx1.try_recv().expect("alice should still get the frame despite the missing session_id");
+        let snap = room.awareness_snapshot("someone-elses-session").await;
+        assert_eq!(snap, vec![payload], "frame must be cached under the synthesized fallback key");
+    }
+
+    #[tokio::test]
+    async fn apply_remote_update_awareness_leave_forgets_and_relays() {
+        // A peer instance's client disconnected and published an
+        // AwarenessLeave — current wire shape is "session_id\0user_id".
+        // apply_remote_update must forget that session's cached
+        // awareness entry AND relay the leave frame to local clients so
+        // their cursor overlay drops the stale pill immediately.
+        use super::super::protocol::encode_message;
+
+        let registry = RoomRegistry::new();
+        let room = registry.get_or_insert("doc-1", OgreDoc::new());
+        room.store_awareness("sess-remote-bob-1", b"stale-cursor-state".to_vec()).await;
+
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        room.add_client(1, "alice".into(), tx1).await;
+
+        let frame = encode_message(MessageType::AwarenessLeave, b"sess-remote-bob-1\0remote-bob");
+        registry.apply_remote_update("doc-1", &frame).await;
+
+        let recv1 = rx1.try_recv().expect("alice should get the remote AwarenessLeave frame");
+        assert_eq!(recv1, frame);
+
+        // The stale entry is gone — a joiner arriving now gets no
+        // snapshot entry for that session.
+        let snap = room.awareness_snapshot("someone-elses-session").await;
+        assert!(snap.is_empty(), "forgotten session must not appear in the snapshot");
+    }
+
+    /// #212 legacy fallback: an `AwarenessLeave` frame with the OLD
+    /// (pre-#211/#212) bare-user_id wire shape — no `\0` separator —
+    /// must still forget that user's cached session(s) rather than
+    /// being silently ignored. Exercises the `forget_awareness_by_user`
+    /// scan path via the wire-level entry point.
+    #[tokio::test]
+    async fn apply_remote_update_awareness_leave_legacy_format_falls_back_to_forget_by_user() {
+        use super::super::awareness::{encode_awareness, AwarenessState};
+        use super::super::protocol::encode_message;
+
+        let registry = RoomRegistry::new();
+        let room = registry.get_or_insert("doc-1", OgreDoc::new());
+        let bob_state = encode_awareness(&AwarenessState {
+            user_id: "remote-bob".to_string(),
+            name: "Bob".to_string(),
+            color: 1,
+            cursor_block_id: None,
+            cursor_offset: None,
+            sel_anchor_block_id: None,
+            sel_anchor_offset: None,
+            sel_head_block_id: None,
+            sel_head_offset: None,
+            cursor_pos: None,
+            selection_anchor: None,
+            selection_head: None,
+            typing_thread_id: None,
+            presenting: None,
+            session_id: Some("sess-remote-bob-1".to_string()),
+        });
+        room.store_awareness("sess-remote-bob-1", bob_state).await;
+
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        room.add_client(1, "alice".into(), tx1).await;
+
+        // Legacy shape: bare user_id, no `\0`.
+        let frame = encode_message(MessageType::AwarenessLeave, b"remote-bob");
+        registry.apply_remote_update("doc-1", &frame).await;
+
+        rx1.try_recv().expect("alice should still get the legacy-format leave frame");
+        let snap = room.awareness_snapshot("someone-elses-session").await;
+        assert!(snap.is_empty(), "legacy user_id-only leave must forget the user's cached session");
     }
 
     // ── Phase 2a — LiveApp pre-apply gate ────────────────────────

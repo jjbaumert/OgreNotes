@@ -982,8 +982,19 @@ pub fn DocumentPage() -> impl IntoView {
             }));
 
             // Set up awareness callback for remote cursor presence.
+            //
+            // #211/#212: `cursors` is keyed per-session now (one entry
+            // per open window, not per user), so a user with two tabs
+            // open would otherwise render two cursors in the editor
+            // where there used to be one. `remote_cursors` here feeds
+            // the editor's CursorOverlay, EditorGutterOverlay, and
+            // SpreadsheetView — all of which want the pre-#211
+            // one-cursor-per-person display — so dedup at this single
+            // point rather than in each of those three consumers.
+            // ConversationPane's typing indicator already dedupes by
+            // display name downstream and doesn't need this.
             client.set_on_awareness_update(Box::new(move |cursors| {
-                set_remote_cursors.set(cursors);
+                set_remote_cursors.set(crate::collab::ws_client::dedup_cursors_by_user(&cursors));
             }));
 
             // Comments live in the thread DB rather than the CRDT, so the

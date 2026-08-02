@@ -150,6 +150,54 @@ struct AwarenessPayload {
     /// every ordinary editing session.
     #[serde(skip_serializing_if = "Option::is_none")]
     presenting: Option<String>,
+    /// #211/#212: a random id generated once per `CollabClient` instance
+    /// (i.e. once per page mount), distinct from `user_id`. Identifies
+    /// this connection/window, not this person — see
+    /// `CollabClient::session_id` and the matching field doc on the
+    /// backend's `AwarenessState`. Lets the server (and this frontend's
+    /// own `remote_cursors` map) keep a user's two open windows — e.g. a
+    /// presenter's projector window and their separate `?presenter=1`
+    /// control window — as two independent, followable cursors instead
+    /// of collapsing them into one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+}
+
+/// Generate a random session id (#211/#212): one per `CollabClient`
+/// instance / page mount, sent on every awareness frame so the server
+/// (and this frontend's own `remote_cursors` map) can distinguish two
+/// windows belonging to the same user. Mirrors
+/// `editor::model::generate_block_id`'s wasm/native split — `Math.random`
+/// in the browser, a hasher-seeded counter for native unit tests, since
+/// this module's tests run natively (not under wasm-pack).
+fn generate_session_id() -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut id = String::with_capacity(16);
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        for _ in 0..16 {
+            let idx = (js_sys::Math::random() * CHARS.len() as f64) as usize;
+            id.push(CHARS[idx % CHARS.len()] as char);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seed = RandomState::new().build_hasher().finish()
+            .wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed));
+        let mut state = seed;
+        for _ in 0..16 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            id.push(CHARS[(state >> 33) as usize % CHARS.len()] as char);
+        }
+    }
+
+    format!("sess-{id}")
 }
 
 /// State of the WebSocket connection.
@@ -188,6 +236,36 @@ pub struct RemoteCursor {
     pub typing_thread_id: Option<String>,
     /// Slide `block_id` this user is currently presenting, if in present mode.
     pub presenting: Option<String>,
+    /// #211/#212: the connection/window this cursor came from, distinct
+    /// from `user_id`. `remote_cursors` is keyed by this field, not
+    /// `user_id`, so a user's two open windows show as two independent
+    /// entries. Falls back to `"legacy-user-{user_id}"` when the peer's
+    /// frame carried no session_id (pre-rollout client), so a mixed
+    /// fleet still gets a stable (if imprecise) key instead of panicking
+    /// or being dropped.
+    pub session_id: String,
+}
+
+/// Collapse a list of `RemoteCursor`s down to one entry per `user_id`,
+/// for consumers that want the pre-#211 "one cursor per person" display
+/// (the editor's `CursorOverlay`, `SpreadsheetView`'s per-cell badges).
+/// `remote_cursors` itself stays keyed by session_id — full per-window
+/// granularity is still available to callers that want it (present
+/// mode's follow feature, `presenters()`), this is purely a render-time
+/// view.
+///
+/// Which of a user's sessions "wins" when they have more than one open
+/// is arbitrary (whichever the input order happens to put first) — the
+/// pre-#211 behavior was equally arbitrary (whichever tab's frame
+/// happened to arrive last), so this isn't a regression, just a
+/// different arbitrary choice.
+pub fn dedup_cursors_by_user(cursors: &[RemoteCursor]) -> Vec<RemoteCursor> {
+    let mut seen = std::collections::HashSet::new();
+    cursors
+        .iter()
+        .filter(|c| seen.insert(c.user_id.clone()))
+        .cloned()
+        .collect()
 }
 
 /// Callback for when remote cursors change.
@@ -474,6 +552,15 @@ fn handle_awareness(
     };
 
     let color_idx = (state.color as usize) % CURSOR_COLORS.len();
+    // #211/#212: key by session_id, not user_id, so a user's two open
+    // windows (e.g. projector + `?presenter=1` control window) render as
+    // two independent cursors. The backend normalizes session_id to
+    // always-present before broadcasting, so the fallback below should
+    // only ever trigger for a frame from a pre-rollout peer — keep it
+    // stable-per-user rather than dropping the frame.
+    let session_id = state.session_id.clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("legacy-user-{}", state.user_id));
     let cursor = RemoteCursor {
         user_id: state.user_id.clone(),
         name: state.name.clone(),
@@ -483,8 +570,9 @@ fn handle_awareness(
         selection_head_block: block_pos(&state.sel_head_block_id, &state.sel_head_offset),
         typing_thread_id: state.typing_thread_id.clone(),
         presenting: state.presenting.clone(),
+        session_id: session_id.clone(),
     };
-    remote_cursors.borrow_mut().insert(state.user_id, cursor);
+    remote_cursors.borrow_mut().insert(session_id, cursor);
 
     if let Some(callback) = on_awareness.borrow().as_ref() {
         let cursors: Vec<RemoteCursor> = remote_cursors.borrow().values().cloned().collect();
@@ -493,17 +581,33 @@ fn handle_awareness(
 }
 
 /// Handle MSG_AWARENESS_LEAVE: a peer disconnected, so drop their cursor.
-/// Payload is the departing user's id (UTF-8). Without this the cursor
-/// would stay frozen at its last position until the local user refreshes
-/// (#9). No-op if we weren't tracking that user; only fires the callback
+///
+/// Payload (#211/#212) is UTF-8 `"{session_id}\0{user_id}"` — removes by
+/// session_id, so closing one of a user's two open windows never drops
+/// the other's still-live cursor. Backward-tolerant: a payload with no
+/// `\0` separator is the pre-#211/#212 bare-user_id shape (a peer
+/// instance mid-rollout); falls back to removing every entry whose
+/// `user_id` matches. No-op if nothing matched; only fires the callback
 /// when something was actually removed.
 fn handle_awareness_leave(
     payload: &[u8],
     remote_cursors: &Rc<RefCell<std::collections::HashMap<String, RemoteCursor>>>,
     on_awareness: &Rc<RefCell<Option<OnAwarenessUpdate>>>,
 ) {
-    let Ok(user_id) = std::str::from_utf8(payload) else { return };
-    let removed = remote_cursors.borrow_mut().remove(user_id).is_some();
+    let Ok(text) = std::str::from_utf8(payload) else { return };
+    let removed = match text.split_once('\0') {
+        Some((session_id, _user_id)) => {
+            remote_cursors.borrow_mut().remove(session_id).is_some()
+        }
+        None => {
+            // Legacy shape: bare user_id. Drop every session belonging
+            // to that user (there's normally at most one, pre-rollout).
+            let mut cursors = remote_cursors.borrow_mut();
+            let before = cursors.len();
+            cursors.retain(|_session_id, cursor| cursor.user_id != text);
+            cursors.len() != before
+        }
+    };
     if !removed {
         return;
     }
@@ -568,6 +672,11 @@ pub struct CollabClient {
     /// Heartbeat interval — Some while the WebSocket is open. Cleared on
     /// `onclose` and `disconnect()` so the timer can't outlive the WS.
     heartbeat_handle: Rc<RefCell<Option<gloo_timers::callback::Interval>>>,
+    /// #211/#212: this connection/window's identity, generated once per
+    /// `CollabClient` instance (i.e. once per page mount) and sent on
+    /// every awareness frame. Distinct from `user_id` — see the field
+    /// doc on `RemoteCursor::session_id` and `AwarenessPayload::session_id`.
+    session_id: String,
 }
 
 impl CollabClient {
@@ -630,7 +739,17 @@ impl CollabClient {
             _update_sub: update_sub,
             last_activity_at: Rc::new(Cell::new(0.0)),
             heartbeat_handle: Rc::new(RefCell::new(None)),
+            session_id: generate_session_id(),
         }
+    }
+
+    /// This connection/window's session id (#211/#212) — stable for the
+    /// lifetime of this `CollabClient` instance, including across
+    /// reconnects. Used by page-level code that needs to distinguish
+    /// "my other window" from "someone else" (present mode's
+    /// `presenters()` follow filter).
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Record that the user is "present" right now — keystroke, mouse
@@ -1087,6 +1206,7 @@ impl CollabClient {
             selection_head: None,
             typing_thread_id: typing_thread_id.map(|s| s.to_string()),
             presenting: presenting.map(|s| s.to_string()),
+            session_id: Some(self.session_id.clone()),
         };
         if let Ok(json) = serde_json::to_vec(&payload) {
             if let Some(ws) = self.ws.borrow().as_ref() {
@@ -1535,15 +1655,18 @@ mod tests {
             selection_head: None,
             typing_thread_id: None,
             presenting: None,
+            session_id: Some("sess-1".into()),
         };
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("\"user_id\":\"user1\""));
         assert!(json.contains("\"cursor_block_id\":\"block1\""));
         assert!(json.contains("\"cursor_offset\":5"));
+        assert!(json.contains("\"session_id\":\"sess-1\""));
         let back: AwarenessPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back.user_id, "user1");
         assert_eq!(back.cursor_block_id.as_deref(), Some("block1"));
         assert_eq!(back.cursor_offset, Some(5));
+        assert_eq!(back.session_id.as_deref(), Some("sess-1"));
     }
 
     #[test]
@@ -1563,16 +1686,44 @@ mod tests {
             selection_head: None,
             typing_thread_id: None,
             presenting: None,
+            session_id: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         assert!(!json.contains("cursor_block_id"), "None fields should be omitted: {json}");
         assert!(!json.contains("sel_anchor"), "None fields should be omitted: {json}");
         assert!(!json.contains("presenting"), "None fields should be omitted: {json}");
+        assert!(!json.contains("session_id"), "None fields should be omitted: {json}");
     }
 
-    // ── Awareness departure (#9) ──
+    // ── session_id generation (#211/#212) ──
 
-    fn test_cursor(user_id: &str) -> RemoteCursor {
+    #[test]
+    fn generated_session_ids_are_distinct_and_prefixed() {
+        let a = generate_session_id();
+        let b = generate_session_id();
+        assert_ne!(a, b, "two generated session ids must not collide");
+        assert!(a.starts_with("sess-"));
+        assert!(b.starts_with("sess-"));
+    }
+
+    #[test]
+    fn collab_client_session_id_is_stable_across_calls() {
+        let client = CollabClient::new("doc1".into(), None);
+        let id1 = client.session_id().to_string();
+        let id2 = client.session_id().to_string();
+        assert_eq!(id1, id2, "session_id must not change within one CollabClient instance");
+    }
+
+    #[test]
+    fn two_collab_clients_get_distinct_session_ids() {
+        let a = CollabClient::new("doc1".into(), None);
+        let b = CollabClient::new("doc1".into(), None);
+        assert_ne!(a.session_id(), b.session_id());
+    }
+
+    // ── Awareness departure (#9, reworked for session_id by #211/#212) ──
+
+    fn test_cursor(user_id: &str, session_id: &str) -> RemoteCursor {
         RemoteCursor {
             user_id: user_id.into(),
             name: user_id.into(),
@@ -1582,14 +1733,15 @@ mod tests {
             selection_head_block: None,
             typing_thread_id: None,
             presenting: None,
+            session_id: session_id.into(),
         }
     }
 
     #[test]
     fn awareness_leave_removes_cursor_and_notifies() {
         let cursors = Rc::new(RefCell::new(std::collections::HashMap::new()));
-        cursors.borrow_mut().insert("alice".to_string(), test_cursor("alice"));
-        cursors.borrow_mut().insert("bob".to_string(), test_cursor("bob"));
+        cursors.borrow_mut().insert("sess-alice".to_string(), test_cursor("alice", "sess-alice"));
+        cursors.borrow_mut().insert("sess-bob".to_string(), test_cursor("bob", "sess-bob"));
 
         let last_seen: Rc<RefCell<Option<Vec<RemoteCursor>>>> = Rc::new(RefCell::new(None));
         let sink = Rc::clone(&last_seen);
@@ -1597,19 +1749,19 @@ mod tests {
             Box::new(move |c: Vec<RemoteCursor>| *sink.borrow_mut() = Some(c)),
         )));
 
-        handle_awareness_leave(b"bob", &cursors, &on_awareness);
+        handle_awareness_leave(b"sess-bob\0bob", &cursors, &on_awareness);
 
-        assert!(!cursors.borrow().contains_key("bob"), "departed user dropped");
-        assert!(cursors.borrow().contains_key("alice"), "other user retained");
+        assert!(!cursors.borrow().contains_key("sess-bob"), "departed session dropped");
+        assert!(cursors.borrow().contains_key("sess-alice"), "other session retained");
         let notified = last_seen.borrow().clone().expect("callback fired");
         assert_eq!(notified.len(), 1);
         assert_eq!(notified[0].user_id, "alice");
     }
 
     #[test]
-    fn awareness_leave_unknown_user_is_noop() {
+    fn awareness_leave_unknown_session_is_noop() {
         let cursors = Rc::new(RefCell::new(std::collections::HashMap::new()));
-        cursors.borrow_mut().insert("alice".to_string(), test_cursor("alice"));
+        cursors.borrow_mut().insert("sess-alice".to_string(), test_cursor("alice", "sess-alice"));
 
         let fired = Rc::new(RefCell::new(false));
         let sink = Rc::clone(&fired);
@@ -1617,10 +1769,86 @@ mod tests {
             Box::new(move |_: Vec<RemoteCursor>| *sink.borrow_mut() = true),
         )));
 
-        handle_awareness_leave(b"nobody", &cursors, &on_awareness);
+        handle_awareness_leave(b"sess-nobody\0nobody", &cursors, &on_awareness);
 
         assert_eq!(cursors.borrow().len(), 1, "no cursor removed");
         assert!(!*fired.borrow(), "callback not fired when nothing changed");
+    }
+
+    /// #211: closing one of a user's two open windows must not clear the
+    /// other window's still-live cursor — this is the whole point of
+    /// keying `remote_cursors` by session_id instead of user_id.
+    #[test]
+    fn awareness_leave_one_session_preserves_users_other_session() {
+        let cursors = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        cursors.borrow_mut().insert(
+            "sess-projector".to_string(),
+            test_cursor("presenter", "sess-projector"),
+        );
+        cursors.borrow_mut().insert(
+            "sess-control".to_string(),
+            test_cursor("presenter", "sess-control"),
+        );
+
+        let on_awareness: Rc<RefCell<Option<OnAwarenessUpdate>>> = Rc::new(RefCell::new(None));
+        handle_awareness_leave(b"sess-control\0presenter", &cursors, &on_awareness);
+
+        assert!(
+            cursors.borrow().contains_key("sess-projector"),
+            "the SAME user's other session must survive a leave for a different session",
+        );
+        assert!(!cursors.borrow().contains_key("sess-control"));
+    }
+
+    /// #212 backward tolerance: an `AwarenessLeave` frame in the legacy
+    /// (pre-#211/#212) bare-user_id shape — no `\0` separator — must
+    /// still drop that user's cursor(s) rather than being silently
+    /// ignored, mirroring the backend's `forget_awareness_by_user`
+    /// fallback.
+    #[test]
+    fn awareness_leave_legacy_format_falls_back_to_user_match() {
+        let cursors = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        cursors.borrow_mut().insert("sess-bob".to_string(), test_cursor("bob", "sess-bob"));
+        cursors.borrow_mut().insert("sess-alice".to_string(), test_cursor("alice", "sess-alice"));
+
+        let fired = Rc::new(RefCell::new(false));
+        let sink = Rc::clone(&fired);
+        let on_awareness: Rc<RefCell<Option<OnAwarenessUpdate>>> = Rc::new(RefCell::new(Some(
+            Box::new(move |_: Vec<RemoteCursor>| *sink.borrow_mut() = true),
+        )));
+
+        // Legacy shape: bare user_id, no `\0`.
+        handle_awareness_leave(b"bob", &cursors, &on_awareness);
+
+        assert!(!cursors.borrow().contains_key("sess-bob"), "legacy leave must still drop bob's cursor");
+        assert!(cursors.borrow().contains_key("sess-alice"), "alice untouched");
+        assert!(*fired.borrow(), "callback must fire when something was removed");
+    }
+
+    // ── dedup_cursors_by_user (#211: render-time one-cursor-per-user) ──
+
+    #[test]
+    fn dedup_cursors_by_user_collapses_multiple_sessions() {
+        let cursors = vec![
+            test_cursor("presenter", "sess-projector"),
+            test_cursor("presenter", "sess-control"),
+            test_cursor("viewer", "sess-viewer-1"),
+        ];
+        let deduped = dedup_cursors_by_user(&cursors);
+        assert_eq!(deduped.len(), 2, "one entry per user_id");
+        let user_ids: std::collections::HashSet<_> =
+            deduped.iter().map(|c| c.user_id.as_str()).collect();
+        assert_eq!(user_ids, std::collections::HashSet::from(["presenter", "viewer"]));
+    }
+
+    #[test]
+    fn dedup_cursors_by_user_is_noop_when_all_distinct() {
+        let cursors = vec![
+            test_cursor("alice", "sess-a"),
+            test_cursor("bob", "sess-b"),
+        ];
+        let deduped = dedup_cursors_by_user(&cursors);
+        assert_eq!(deduped.len(), 2);
     }
 
     // ── Golden wire-format fixtures (mirrors backend) ──
@@ -1642,6 +1870,8 @@ mod tests {
         include_str!("../../../tests/fixtures/protocol/awareness/no-presence.json");
     const FIXTURE_PRESENTING: &str =
         include_str!("../../../tests/fixtures/protocol/awareness/presenting.json");
+    const FIXTURE_SESSION_ID: &str =
+        include_str!("../../../tests/fixtures/protocol/awareness/session-id.json");
 
     fn assert_awareness_fixture_round_trips(raw: &str, name: &str) {
         use serde_json::Value;
@@ -1704,6 +1934,11 @@ mod tests {
     #[test]
     fn fixture_presenting_round_trips() {
         assert_awareness_fixture_round_trips(FIXTURE_PRESENTING, "presenting.json");
+    }
+
+    #[test]
+    fn fixture_session_id_round_trips() {
+        assert_awareness_fixture_round_trips(FIXTURE_SESSION_ID, "session-id.json");
     }
 
     // ── Heartbeat gate predicate ──

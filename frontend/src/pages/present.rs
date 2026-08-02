@@ -19,23 +19,32 @@ use crate::presentation::model::{deck_from_doc, Deck, FrameRole, DEFAULT_THEME};
 use crate::presentation::nav::{index_of_slide, next_index, prev_index, slide_block_id};
 
 /// Who this viewer can follow: everyone else currently broadcasting a
-/// `presenting` slide. Self is excluded (you can't follow yourself),
-/// and cursors with no `presenting` value are ordinary editors.
-pub(crate) fn presenters<'a>(cursors: &'a [RemoteCursor], me: &str) -> Vec<&'a RemoteCursor> {
-    cursors.iter().filter(|c| c.presenting.is_some() && c.user_id != me).collect()
+/// `presenting` slide. "Self" here means this exact browser tab/window
+/// (session), not this user broadly (#211) — a presenter's OTHER
+/// window, e.g. a projector window and a separate `?presenter=1`
+/// control window, has a different `session_id` and so shows up here as
+/// followable. It's expected (and useful) for a presenter to see their
+/// own name listed when they have two present windows open.
+pub(crate) fn presenters<'a>(cursors: &'a [RemoteCursor], my_session_id: &str) -> Vec<&'a RemoteCursor> {
+    cursors.iter().filter(|c| c.presenting.is_some() && c.session_id != my_session_id).collect()
 }
 
 /// The slide index a follower should be on, given the presenter's
 /// broadcast id. `None` when not following, when the presenter is gone,
 /// or when the id names a slide this deck no longer has (a concurrent
 /// delete) — in every case the follower simply stays put.
+///
+/// `following` names a `session_id` (#211), not a `user_id` — so
+/// following a specific one of a presenter's two open windows keeps
+/// tracking *that* window even if their other window is also presenting
+/// a different slide.
 pub(crate) fn followed_index(
     deck: &Deck,
     cursors: &[RemoteCursor],
     following: Option<&str>,
 ) -> Option<usize> {
     let target = following?;
-    let cursor = cursors.iter().find(|c| c.user_id == target)?;
+    let cursor = cursors.iter().find(|c| c.session_id == target)?;
     let block_id = cursor.presenting.as_deref()?;
     index_of_slide(deck, block_id)
 }
@@ -100,14 +109,23 @@ pub fn PresentPage() -> impl IntoView {
     let (loaded, set_loaded) = signal(false);
 
     // Live follow-the-presenter state (Task 8). `remote_cursors` mirrors
-    // document.rs's awareness callback; `following` names the user_id
-    // this viewer is tracking (`None` = not following anyone); `paused`
-    // is set the moment this viewer navigates manually while following,
-    // so their own click/keypress doesn't get immediately overwritten by
-    // the next presenter broadcast.
+    // document.rs's awareness callback — deliberately NOT deduped by
+    // user (unlike document.rs's copy, #211) so a presenter's two open
+    // windows both appear as independently followable; `following`
+    // names the session_id this viewer is tracking (`None` = not
+    // following anyone); `paused` is set the moment this viewer
+    // navigates manually while following, so their own click/keypress
+    // doesn't get immediately overwritten by the next presenter
+    // broadcast.
     let remote_cursors: RwSignal<Vec<RemoteCursor>> = RwSignal::new(Vec::new());
     let (following, set_following) = signal(None::<String>);
     let (paused, set_paused) = signal(false);
+    // #211: this window's own session_id, mirrored into a signal from
+    // `CollabClient::session_id()` the moment the client is constructed
+    // (see the connect Effect below). Empty string (never matches a
+    // real session_id) until then, which is fine — `presenters()` just
+    // excludes nothing extra in that brief window.
+    let (my_session_id, set_my_session_id) = signal(String::new());
     // `StoredValue` (Copy, unlike a plain `String`) because this id flows
     // through several nested `move` reactive closures below (the follow
     // affordance's two `<Show>`s, the presenter `<For>`, the per-button
@@ -342,6 +360,13 @@ pub fn PresentPage() -> impl IntoView {
                 }
             } else {
                 let client = CollabClient::new(id.clone(), None);
+                // #211: capture this window's session_id once, at
+                // construction — a fresh `CollabClient` is only built on
+                // this (non-reconnect) branch, so this never re-fires on
+                // a reconnect and `my_session_id` stays stable for the
+                // component's lifetime, matching "once per CollabClient
+                // instance / page mount".
+                set_my_session_id.set(client.session_id().to_string());
                 client.set_on_awareness_update(Box::new(move |cursors| {
                     remote_cursors.set(cursors);
                 }));
@@ -616,23 +641,24 @@ pub fn PresentPage() -> impl IntoView {
                 <div class="deck-present__counter">
                     {move || format!("{} / {}", idx.get() + 1, deck.with(|d| d.slides.len()))}
                 </div>
-                <Show when=move || my_user_id.with_value(|id| !presenters(&remote_cursors.get(), id).is_empty())>
+                <Show when=move || !presenters(&remote_cursors.get(), &my_session_id.get()).is_empty()>
                     <div class="deck-present__follow">
                         <Show
                             when=move || following.get().is_some() && paused.get()
                             fallback=move || view! {
-                                <For each=move || my_user_id.with_value(|id| {
-                                            presenters(&remote_cursors.get(), id)
-                                                .into_iter().map(|c| (c.user_id.clone(), c.name.clone())).collect::<Vec<_>>()
-                                        })
-                                         key=|(id, _)| id.clone()
-                                         children=move |(id, name)| {
-                                            let id2 = id.clone();
+                                <For each=move || {
+                                            let my_sid = my_session_id.get();
+                                            presenters(&remote_cursors.get(), &my_sid)
+                                                .into_iter().map(|c| (c.session_id.clone(), c.name.clone())).collect::<Vec<_>>()
+                                        }
+                                         key=|(session_id, _)| session_id.clone()
+                                         children=move |(session_id, name)| {
+                                            let target_session_id = session_id.clone();
                                             view! {
                                                 <button class="deck-present__follow-btn"
                                                     on:click=move |ev: web_sys::MouseEvent| {
                                                         ev.stop_propagation();
-                                                        set_following.set(Some(id2.clone()));
+                                                        set_following.set(Some(target_session_id.clone()));
                                                         set_paused.set(false);
                                                     }>
                                                     {crate::t!("deck-present-follow", name = name)}
@@ -700,7 +726,15 @@ mod follow_tests {
     use crate::collab::ws_client::RemoteCursor;
     use crate::presentation::model::{DeckSlide, DEFAULT_THEME};
 
+    /// `session` defaults to `"{user}-sess"` when a test doesn't care
+    /// about distinguishing sessions; tests exercising the #211
+    /// same-user-multiple-sessions behavior pass explicit session ids
+    /// via `cursor_with_session`.
     fn cursor(user: &str, presenting: Option<&str>) -> RemoteCursor {
+        cursor_with_session(user, &format!("{user}-sess"), presenting)
+    }
+
+    fn cursor_with_session(user: &str, session: &str, presenting: Option<&str>) -> RemoteCursor {
         RemoteCursor {
             user_id: user.to_string(),
             name: format!("{user}-name"),
@@ -710,6 +744,7 @@ mod follow_tests {
             selection_head_block: None,
             typing_thread_id: None,
             presenting: presenting.map(|s| s.to_string()),
+            session_id: session.to_string(),
         }
     }
 
@@ -729,20 +764,53 @@ mod follow_tests {
     #[test]
     fn presenters_excludes_self_and_non_presenters() {
         let cs = vec![cursor("me", Some("s1")), cursor("them", Some("s2")), cursor("editor", None)];
-        let p = presenters(&cs, "me");
+        let p = presenters(&cs, "me-sess");
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].user_id, "them");
+    }
+
+    /// #211: the whole point of session-keyed `presenters()` — a
+    /// presenter's OTHER window (same user_id, different session_id)
+    /// must be followable, and only the caller's *own* session is
+    /// excluded.
+    #[test]
+    fn presenters_includes_same_user_different_session_excludes_only_own_session() {
+        let cs = vec![
+            cursor_with_session("me", "sess-projector", Some("s1")),
+            cursor_with_session("me", "sess-control", Some("s1")),
+            cursor("them", Some("s2")),
+        ];
+        // Viewing from the projector window: control window (same
+        // user, different session) and them are both followable.
+        let p = presenters(&cs, "sess-projector");
+        let sessions: std::collections::HashSet<_> = p.iter().map(|c| c.session_id.as_str()).collect();
+        assert_eq!(sessions, std::collections::HashSet::from(["sess-control", "them-sess"]));
+        assert!(!sessions.contains("sess-projector"), "own session must be excluded");
     }
 
     #[test]
     fn followed_index_resolves_the_presenters_slide() {
         let d = deck(&["s1", "s2", "s3"]);
         let cs = vec![cursor("them", Some("s3"))];
-        assert_eq!(followed_index(&d, &cs, Some("them")), Some(2));
+        assert_eq!(followed_index(&d, &cs, Some("them-sess")), Some(2));
         assert_eq!(followed_index(&d, &cs, None), None, "not following");
-        assert_eq!(followed_index(&d, &cs, Some("ghost")), None, "presenter left");
+        assert_eq!(followed_index(&d, &cs, Some("ghost-sess")), None, "presenter left");
         let cs_gone = vec![cursor("them", Some("deleted-slide"))];
-        assert_eq!(followed_index(&d, &cs_gone, Some("them")), None, "unknown slide id");
+        assert_eq!(followed_index(&d, &cs_gone, Some("them-sess")), None, "unknown slide id");
+    }
+
+    /// #211: following a SPECIFIC session keeps tracking that window
+    /// even when the same user's other window is presenting a
+    /// different slide — the two sessions must not be conflated.
+    #[test]
+    fn followed_index_distinguishes_sessions_of_the_same_user() {
+        let d = deck(&["s1", "s2", "s3"]);
+        let cs = vec![
+            cursor_with_session("presenter", "sess-projector", Some("s1")),
+            cursor_with_session("presenter", "sess-control", Some("s3")),
+        ];
+        assert_eq!(followed_index(&d, &cs, Some("sess-projector")), Some(0));
+        assert_eq!(followed_index(&d, &cs, Some("sess-control")), Some(2));
     }
 }
 
