@@ -3192,16 +3192,54 @@ async fn the_quip_folder_tree_is_mirrored_under_the_import_destination() {
     );
 }
 
-/// **Negative control — passes before and after.** A re-run must create
-/// nothing new.
+/// **Negative control — passes before and after.** A second run of the same
+/// import must leave the folder tree exactly as it found it.
 ///
-/// This is the guard whose failure spawns a duplicate tree on every retry,
-/// and the reaper re-runs crashed jobs, so "every retry" is not hypothetical.
-/// It asserts the *folder set under the destination is unchanged*, not merely
-/// that a mapping still exists — a second tree would leave the mapping
-/// pointing at the first tree while the duplicates piled up beside it.
+/// Deliberately phrased as *set equality over what is actually under the
+/// destination*, with no `expect` on the mapping: that is what lets it run
+/// unchanged against the pre-#236 worker (which mirrored nothing, so both
+/// sets are empty) as well as after. A test that first demanded a mapping
+/// could only ever go green after the fix, and the failure this one guards —
+/// a duplicate tree on every retry, with the mapping still pointing happily
+/// at the *first* tree while copies pile up beside it — is exactly the kind
+/// a fix-only test walks straight past.
+///
+/// The reaper re-runs crashed jobs, so "every retry" is not hypothetical.
 #[tokio::test]
-async fn re_running_an_import_creates_no_second_folder_tree() {
+async fn re_running_an_import_adds_no_folder_under_the_destination() {
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+    let under_target = child_folder_ids(&app, "target-folder").await;
+    let mut nested: Vec<(String, BTreeSet<String>)> = Vec::new();
+    for folder in &under_target {
+        nested.push((folder.clone(), child_folder_ids(&app, folder).await));
+    }
+
+    // The queue redelivering the job, or the user pressing start again.
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    assert_eq!(
+        child_folder_ids(&app, "target-folder").await,
+        under_target,
+        "a re-run must add no folder under the destination",
+    );
+    for (parent, children) in nested {
+        assert_eq!(child_folder_ids(&app, &parent).await, children, "nor under {parent}");
+    }
+}
+
+/// The other half of the idempotency claim: a re-run does not merely avoid
+/// *adding* folders, it **adopts the ones already recorded**. Without this a
+/// run could build a second tree and re-point the manifest at it, leaving the
+/// first tree orphaned — a state the set-equality control above would catch
+/// only by the count, and only under the destination.
+#[tokio::test]
+async fn re_running_an_import_reuses_the_folders_it_already_mirrored() {
     common::require_infra!();
     let server = quip_content_server().await;
     let app = common::TestApp::new_with_quip_base(server.uri()).await;
@@ -3211,10 +3249,7 @@ async fn re_running_an_import_creates_no_second_folder_tree() {
     execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
     let first_root = mirrored_folder(&app, &import_id, "root").await.expect("mirrored");
     let first_sub = mirrored_folder(&app, &import_id, "f2").await.expect("mirrored");
-    let under_target = child_folder_ids(&app, "target-folder").await;
-    let under_root = child_folder_ids(&app, &first_root).await;
 
-    // The queue redelivering the job, or the user pressing start again.
     execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
 
     assert_eq!(
@@ -3225,16 +3260,6 @@ async fn re_running_an_import_creates_no_second_folder_tree() {
     assert_eq!(
         mirrored_folder(&app, &import_id, "f2").await.as_deref(),
         Some(first_sub.as_str()),
-    );
-    assert_eq!(
-        child_folder_ids(&app, "target-folder").await,
-        under_target,
-        "a re-run must add no folder under the destination",
-    );
-    assert_eq!(
-        child_folder_ids(&app, &first_root).await,
-        under_root,
-        "nor under any mirrored folder",
     );
 }
 
