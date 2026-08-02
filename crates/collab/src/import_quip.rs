@@ -4641,14 +4641,96 @@ mod tests {
         assert!(rows[0].cells[0].header);
     }
 
-    // ─── #230: the grid-chrome detector declines ─────────────
+    // ─── #230 / #232: the grid-chrome detector declines ──────
     //
-    // The positive case — a whole real sheet losing its chrome — is pinned
-    // against the committed fixture in `tests/quip_corpus.rs`. What belongs
-    // here is the other half: the tables the detector must NOT touch even
-    // when the thread *is* a spreadsheet. Every input below is markup that
-    // already appears verbatim in this file, so each is a shape Quip is
-    // known to emit rather than one invented to make a branch fire.
+    // The positive case — a whole real sheet losing its chrome, and five real
+    // prose tables losing their gutter — is pinned against the committed
+    // fixtures in `tests/quip_corpus.rs`. What belongs here is the other
+    // half: the tables the detector must NOT touch, on either thread path.
+    // Every input below is markup that already appears verbatim in this file
+    // or in a committed fixture, so each is a shape Quip is known to emit
+    // rather than one invented to make a branch fire.
+
+    /// `QGYAAAjicgG`'s two-cell `<thead>`, verbatim — the same slice
+    /// [`a_header_row_with_no_body_row_is_not_a_grid`] uses.
+    const REAL_HEAD: &str = "<table id='temp:C:QGYcfc9c8f7c7714f4a9955e1b7f'><thead><tr><th class='empty' style='width: 2em'/><th id='temp:C:QGY04be7f796bf1483e87f847ed3' class='empty' style='width: 6em'>A<br/></th></tr></thead><tbody>";
+
+    /// A body row of `QGYAAAjicgG` led by its `#f0f0f0` row-number cell,
+    /// verbatim — the same slice
+    /// [`a_numeric_leading_column_with_no_header_row_is_not_a_grid`] uses.
+    const REAL_RULED_ROW: &str = "<tr id='temp:C:QGYe66f22cd7b834833a7ee9dc58'><td style='background-color:#f0f0f0'>1</td><td id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d' style=''><span id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d'>as</span>\n\n<br/></td></tr>";
+
+    /// The same row with its leading cell replaced by an **authored** cell
+    /// whose text is digits only — `<td id='…'><span id='…'>1</span><br/>`,
+    /// lifted verbatim from `QGYAAAjicgG`'s D-column numeric run.
+    ///
+    /// This is the case the whole #232 discriminator turns on, and the corpus
+    /// says it is real: `DbFAAApjMFp` and `fbTAAAkPTCa` between them hold 8
+    /// leading cells of this exact shape, carrying `3 4 5 6 8 9 10` and a
+    /// year. All 8 have an `id`; none of the 131 gutter cells does.
+    const REAL_AUTHORED_NUMERIC_ROW: &str = "<tr id='temp:C:QGYe66f22cd7b834833a7ee9dc58'><td id='temp:s:temp:C:QGYc5941d52725344448a2cfd883_temp:C:QGY2d8b7a16c9bb42f5bf0bc2efd' style=''><span id='temp:s:temp:C:QGYc5941d52725344448a2cfd883_temp:C:QGY2d8b7a16c9bb42f5bf0bc2efd'>1</span>\n\n<br/></td><td id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d' style=''><span id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d'>as</span>\n\n<br/></td></tr>";
+
+    /// **#232, the whole of it in one comparison.** The same ruled table down
+    /// both paths: the gutter column goes either way, and the header row goes
+    /// only for a spreadsheet.
+    ///
+    /// The corpus states this on five real prose tables; this states it on
+    /// the smallest table that can carry the chrome, which is where an
+    /// off-by-one in the strip is easiest to read.
+    #[test]
+    fn the_gutter_goes_on_both_paths_and_the_header_row_only_on_the_sheets() {
+        let html = format!("{REAL_HEAD}{REAL_RULED_ROW}</tbody></table>");
+
+        // Document: header row kept, one column narrower. The corner `<th>`
+        // is the header row's share of the gutter column, so `A` — a real
+        // heading's position in a prose table — is what is left.
+        assert_eq!(
+            table_grid(&doc_blocks(&html)[0]),
+            vec![vec![(true, "A".to_string())], vec![(false, "as".to_string())]],
+            "the ruler goes, the heading stays",
+        );
+
+        // Spreadsheet: the header row goes too, leaving only the data cell.
+        assert_eq!(
+            table_grid(&sheet_blocks(&html)[0]),
+            vec![vec![(false, "as".to_string())]],
+            "#230's outcome, unchanged",
+        );
+
+        // The unstripped walk, for contrast — this is what both used to be.
+        assert_eq!(
+            table_grid(&blocks(&html)[0]),
+            vec![
+                vec![(true, String::new()), (true, "A".to_string())],
+                vec![(false, "1".to_string()), (false, "as".to_string())],
+            ],
+            "the source shape",
+        );
+    }
+
+    /// **#232's negative control, and the sharpest one.** Byte-identical
+    /// chrome above it, a leading column that is digits only — and it stays,
+    /// on both paths, because the cell is *anchored*.
+    ///
+    /// This is what makes the discriminator "the cell shape" and not "the
+    /// first column is numeric". A prose table whose author typed `1`, `2`,
+    /// `3` down column A produces exactly this markup, and 8 such cells exist
+    /// in the staged corpus.
+    #[test]
+    fn an_authored_numeric_leading_column_under_the_same_head_is_not_the_gutter() {
+        let html = format!("{REAL_HEAD}{REAL_AUTHORED_NUMERIC_ROW}</tbody></table>");
+        let source = table_grid(&blocks(&html)[0]);
+        assert_eq!(
+            source,
+            vec![
+                vec![(true, String::new()), (true, "A".to_string())],
+                vec![(false, "1".to_string()), (false, "as".to_string())],
+            ],
+            "the shape under test — a numeric leading column beneath a real <thead>",
+        );
+        assert_eq!(table_grid(&doc_blocks(&html)[0]), source, "the document path takes nothing");
+        assert_eq!(table_grid(&sheet_blocks(&html)[0]), source, "nor does the spreadsheet path");
+    }
 
     /// `AeOAAAcV1hg`'s table, verbatim — a prose table, no `<thead>`, no
     /// gutter — pushed through the **spreadsheet** path.
