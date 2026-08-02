@@ -3,31 +3,42 @@
 // Quip import wizard. Step 1: paste a Quip personal access token,
 // POST it to `/imports/quip/connect`, and on success show the
 // connected profile + a checklist of the caller's root Quip folders
-// (Phase 0). Step 2 (this task): "Continue" persists the checked
-// scope + the user's Home folder as the destination *parent* via
-// `POST /imports/quip/{id}/start`, then Step 3 polls
-// `GET /imports/quip/{id}` on an interval and shows live inventory
-// progress until the walk completes (`phase >= 1`) or the run hits a
-// terminal failure status.
+// (Phase 0). Step 2: "Continue" persists the checked scope + the
+// chosen destination *parent* via `POST /imports/quip/{id}/start`,
+// then Step 3 polls `GET /imports/quip/{id}` on an interval and shows
+// live inventory progress until the walk completes (`phase >= 1`) or
+// the run hits a terminal failure status.
 //
-// DESTINATION: Home is the *parent* this wizard sends, not where the
+// DESTINATION: the parent this wizard sends is not where the
 // documents end up. The server creates one dedicated
 // `Quip Import — <date>` folder under it per import and lands every
 // document in that folder (#172), so undoing a bad import is deleting
-// one folder rather than hand-picking documents out of Home. That
-// subfolder is what the status poll names (`destinationFolderId`) and
-// what the completion step's "Open folder" button opens (#174), and
-// it is what `quip-import-target-home` promises the user — Home alone
-// would be a false promise.
+// one folder rather than hand-picking documents out of the parent.
+// That subfolder is what the status poll names
+// (`destinationFolderId`) and what the completion step's "Open
+// folder" button opens (#174), and it is what
+// `quip-import-target-home` / `quip-import-target-folder` promise the
+// user — naming the parent alone would be a false promise.
+//
+// The parent defaults to the caller's Home and stays Home for a user
+// who never opens the destination step (#236 Unit 3). Choosing one is
+// a *step of this wizard*, not a nested dialog: `FolderPickerDialog`
+// is itself a modal with its own focus trap, and mounting it inside
+// this modal's trap is the documented reason Phase 1 shipped without a
+// picker at all. Step 2 swaps its own body for a folder tree built
+// from `components::folder_tree` — the picker's data, none of its
+// shell — so there is only ever one trap, one `role="dialog"`, and one
+// Escape handler on screen. Every transition into and out of that
+// step goes through `a11y::defer`, because flipping the signal that
+// owns the subtree from inside its own `on:click` is this codebase's
+// modal-close panic ("closure invoked recursively or after being
+// dropped").
 //
 // Mirrors `template_picker_modal.rs` for the modal skeleton (backdrop
 // + `<Show when=visible>` + per-open reset) and `share_dialog.rs` for
 // the focus trap + checkbox-row list pattern. The Home-folder lookup
 // mirrors the `UserMeResponse` local-struct pattern in
-// `folder_picker.rs` / `duplicate_dialog.rs` — Phase 1 deliberately
-// skips a destination picker (nesting `FolderPickerDialog` inside
-// this modal risks focus-trap conflicts), so the parent is always
-// Home.
+// `folder_picker.rs` / `duplicate_dialog.rs`.
 //
 // SECURITY: the token field is `type="password"` and its value is
 // never passed to `console.*`/`web_sys::console::*` — only
@@ -39,7 +50,7 @@
 // token field — see crates/storage). No token handling happens past
 // `connect` — `start`/`get_status` never see or send one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use leptos::prelude::*;
 
@@ -47,7 +58,9 @@ use wasm_bindgen::JsCast;
 
 use crate::a11y;
 use crate::api::client;
+use crate::api::folders::{self, FolderResponse};
 use crate::api::imports::{self, ConnectResponse};
+use crate::components::folder_tree::{self, FolderTreeRow};
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -353,6 +366,23 @@ pub fn QuipImportWizard(
     // we've moved into the progress step, the latest poll result, and
     // a terminal outcome if the run failed / the token was rejected.
     let (home_folder_id, set_home_folder_id) = signal::<Option<String>>(None);
+    // #236 Unit 3: the destination parent the user picked, as
+    // `(folder id, folder title)`. `None` — the value a wizard that is
+    // opened and driven straight through never leaves — means Home, exactly
+    // as before this step existed.
+    let destination: RwSignal<Option<(String, String)>> = RwSignal::new(None);
+    // Whether step 2 is currently showing the folder tree instead of the
+    // scope checklist. A sub-step of this modal, never a modal of its own.
+    let (picking_destination, set_picking_destination) = signal(false);
+    // The destination step's slice of the picker's data layer: every folder
+    // visited so far, which of them are expanded, and the row the user has
+    // highlighted but not yet confirmed. `dest_selected` is deliberately
+    // separate from `destination` — highlighting a row must not change where
+    // the import goes until "Use this folder" is pressed, so Cancel is a real
+    // cancel.
+    let dest_folders: RwSignal<HashMap<String, FolderResponse>> = RwSignal::new(HashMap::new());
+    let dest_expanded: RwSignal<HashSet<String>> = RwSignal::new(HashSet::new());
+    let dest_selected: RwSignal<Option<String>> = RwSignal::new(None);
     let (starting, set_starting) = signal(false);
     let (started, set_started) = signal(false);
     // Gate for the poll loop below: flipped false to stop it early
@@ -404,6 +434,16 @@ pub fn QuipImportWizard(
         set_error.set(None);
         set_response.set(None);
         selected.set(HashMap::new());
+        // A fresh open starts on Home again, and re-fetches the tree rather
+        // than showing a cache that predates any folder the user has created
+        // since. Resetting `picking_destination` matters most: a wizard
+        // reopened onto a half-finished destination step would show a tree
+        // with no scope behind it.
+        destination.set(None);
+        set_picking_destination.set(false);
+        dest_folders.set(HashMap::new());
+        dest_expanded.set(HashSet::new());
+        dest_selected.set(None);
         set_starting.set(false);
         set_started.set(false);
         set_progress.set(None);
@@ -473,9 +513,86 @@ pub fn QuipImportWizard(
         });
     };
 
-    // Kick off the actual import: persist the checked scope + Home as
-    // the destination parent, then switch into the progress step and start
-    // polling. `start`'s failure path reuses the same `error` signal
+    // ─── Destination step (#236 Unit 3) ──────────────────────────
+    //
+    // Lazy per-folder loading, same as `FolderPickerDialog`: a folder's
+    // children are fetched the first time it is expanded rather than walking
+    // the whole tree up front. A failed fetch goes to the wizard's existing
+    // error banner (`ApiClientError`'s `Display` is opaque — see
+    // `do_connect`), never to a silent empty branch.
+    let load_dest_folder = move |id: String| {
+        if dest_folders.with_untracked(|m| m.contains_key(&id)) {
+            return;
+        }
+        leptos::task::spawn_local(async move {
+            match folders::get_folder(&id).await {
+                Ok(f) => dest_folders.update(|m| {
+                    m.insert(id.clone(), f);
+                }),
+                Err(e) => set_error.set(Some(e.to_string())),
+            }
+        });
+    };
+
+    let toggle_dest_expand = move |id: String| {
+        if dest_expanded.with_untracked(|s| s.contains(&id)) {
+            dest_expanded.update(|s| {
+                s.remove(&id);
+            });
+            return;
+        }
+        dest_expanded.update(|s| {
+            s.insert(id.clone());
+        });
+        load_dest_folder(id);
+    };
+
+    // Enter the destination step. The tree is rooted at Home — the same root
+    // `FolderPickerDialog` uses — so the step cannot be entered before the
+    // `/users/me` lookup lands; the "Change" button is disabled until then,
+    // and this guard is the second half of that.
+    //
+    // Opens highlighted on the destination currently in effect, so the
+    // primary button is live immediately and pressing it is a no-op rather
+    // than a trap the user has to work out.
+    let open_destination_step = move || {
+        let Some(home) = home_folder_id.get_untracked() else {
+            return;
+        };
+        dest_expanded.update(|s| {
+            s.insert(home.clone());
+        });
+        load_dest_folder(home.clone());
+        dest_selected.set(Some(
+            destination
+                .get_untracked()
+                .map(|(id, _)| id)
+                .unwrap_or(home),
+        ));
+        set_picking_destination.set(true);
+    };
+
+    // Leave the step, keeping whatever destination was already in effect.
+    let cancel_destination_step = move || set_picking_destination.set(false);
+
+    // Leave the step, adopting the highlighted row. The title comes from the
+    // fetched folder rather than the row that was clicked so the label the
+    // user then reads is the server's name for the folder, not a stale one.
+    let confirm_destination_step = move || {
+        let Some(id) = dest_selected.get_untracked() else {
+            return;
+        };
+        let Some(title) = dest_folders.with_untracked(|m| m.get(&id).map(|f| f.title.clone()))
+        else {
+            return;
+        };
+        destination.set(Some((id, title)));
+        set_picking_destination.set(false);
+    };
+
+    // Kick off the actual import: persist the checked scope + the chosen
+    // parent (Home when the user never chose one), then switch into the
+    // progress step and start polling. `start`'s failure path reuses the same `error` signal
     // + `quip-import-error` banner the connect step already uses —
     // `ApiClientError::Display` is opaque by construction (see
     // `do_connect` above), so it's safe to surface directly here too.
@@ -486,7 +603,17 @@ pub fn QuipImportWizard(
         let Some(resp) = response.get_untracked() else {
             return;
         };
-        let Some(home) = home_folder_id.get_untracked() else {
+        // The one place the destination becomes a wire value. Home when the
+        // user never opened the destination step; `None` only when the
+        // `/users/me` lookup has not landed, which also keeps Continue
+        // disabled — starting an import with no parent at all would 400.
+        let Some(target) = start_target_folder_id(
+            destination
+                .get_untracked()
+                .as_ref()
+                .map(|(id, _)| id.as_str()),
+            home_folder_id.get_untracked().as_deref(),
+        ) else {
             return;
         };
         let roots: Vec<String> = selected
@@ -501,7 +628,7 @@ pub fn QuipImportWizard(
         set_error.set(None);
         let import_id = resp.import_id.clone();
         leptos::task::spawn_local(async move {
-            match imports::start(&import_id, &roots, &home).await {
+            match imports::start(&import_id, &roots, &target).await {
                 Ok(_) => {
                     set_starting.set(false);
                     set_started.set(true);
@@ -695,7 +822,146 @@ pub fn QuipImportWizard(
                             }.into_any(),
                             Some(resp) if !started.get() => {
                                 let profile_name = resp.quip_profile.name.clone();
-                                let folders = resp.root_folders;
+                                let root_folders = resp.root_folders;
+                                let import_id_attr = resp.import_id;
+                                let quip_user_attr = resp.quip_profile.id;
+                                // Step 2 has two faces and exactly one is
+                                // mounted at a time: the scope checklist, or
+                                // the destination tree. Swapping them inside
+                                // the wizard's own body — rather than mounting
+                                // `FolderPickerDialog` over it — is what keeps
+                                // this to one focus trap, one `role="dialog"`,
+                                // and one Escape handler (#236 Unit 3).
+                                view! {
+                                {move || {
+                                if picking_destination.get() {
+                                return view! {
+                                    // ─── Step 2b: destination tree ────────
+                                    <div
+                                        class="quip-import-step-destination"
+                                        data-quip-import-step="destination"
+                                    >
+                                        <h4 class="template-picker-section-title">
+                                            {crate::t!("quip-import-destination-heading")}
+                                        </h4>
+                                        <p class="quip-import-destination-hint">
+                                            {crate::t!("quip-import-destination-hint")}
+                                        </p>
+                                        <div class="folder-picker-body">
+                                            {move || {
+                                                let mut rows: Vec<FolderTreeRow> = Vec::new();
+                                                if let Some(root) = home_folder_id.get() {
+                                                    dest_folders.with(|map| {
+                                                        dest_expanded.with(|set| {
+                                                            folder_tree::flatten_tree(
+                                                                &root, map, set, &mut rows, 0,
+                                                            );
+                                                        });
+                                                    });
+                                                }
+                                                // A single not-yet-loaded root is
+                                                // "still fetching", not a tree.
+                                                if rows.first().map(|r| !r.is_loaded).unwrap_or(true) {
+                                                    return view! {
+                                                        <p class="folder-picker-empty">
+                                                            {crate::t!("common-loading")}
+                                                        </p>
+                                                    }.into_any();
+                                                }
+                                                view! {
+                                                    <ul class="folder-picker-tree">
+                                                        {rows.into_iter().map(|row| {
+                                                            let row_id = row.id.clone();
+                                                            let row_id_for_toggle = row_id.clone();
+                                                            let is_selected =
+                                                                dest_selected.get() == Some(row_id.clone());
+                                                            let indent = format!(
+                                                                "padding-inline-start: {}px",
+                                                                (row.depth as u16) * 16 + 8,
+                                                            );
+                                                            let disabled = !row.is_selectable();
+                                                            let has_children = row.has_children;
+                                                            let chevron = if !has_children {
+                                                                ""
+                                                            } else if row.is_expanded {
+                                                                "\u{25BE}"
+                                                            } else {
+                                                                "\u{25B8}"
+                                                            };
+                                                            let row_title = if row.is_loaded {
+                                                                row.title.clone()
+                                                            } else {
+                                                                crate::t!("common-loading")
+                                                            };
+                                                            view! {
+                                                                <li
+                                                                    class="folder-picker-row"
+                                                                    class:selected=is_selected
+                                                                    class:disabled=disabled
+                                                                    style=indent
+                                                                    on:click=move |_| {
+                                                                        if disabled { return; }
+                                                                        dest_selected
+                                                                            .set(Some(row_id.clone()));
+                                                                    }
+                                                                >
+                                                                    <span
+                                                                        class="folder-picker-chevron"
+                                                                        // Deferred: expanding
+                                                                        // re-renders this whole
+                                                                        // list, dropping the very
+                                                                        // closure that is running.
+                                                                        on:click=move |e: web_sys::MouseEvent| {
+                                                                            e.stop_propagation();
+                                                                            if !has_children { return; }
+                                                                            let id = row_id_for_toggle.clone();
+                                                                            a11y::defer(move || toggle_dest_expand(id));
+                                                                        }
+                                                                    >
+                                                                        {chevron}
+                                                                    </span>
+                                                                    <span class="folder-picker-icon">
+                                                                        "\u{1F4C1}"
+                                                                    </span>
+                                                                    <span class="folder-picker-title">
+                                                                        {row_title}
+                                                                    </span>
+                                                                </li>
+                                                            }
+                                                        }).collect::<Vec<_>>()}
+                                                    </ul>
+                                                }.into_any()
+                                            }}
+                                        </div>
+                                        {move || error.get().map(|e| view! {
+                                            <div class="template-picker-error" role="alert">
+                                                {crate::t!("quip-import-error", err = e)}
+                                            </div>
+                                        })}
+                                        <div class="confirm-actions">
+                                            <button
+                                                class="btn btn-secondary"
+                                                // Both actions unmount this step
+                                                // from inside their own handler —
+                                                // the same reason every close path
+                                                // in this modal defers.
+                                                on:click=move |_| a11y::defer(cancel_destination_step)
+                                            >
+                                                {crate::t!("common-cancel")}
+                                            </button>
+                                            <button
+                                                class="btn btn-primary"
+                                                disabled=move || dest_selected.get().is_none()
+                                                on:click=move |_| a11y::defer(confirm_destination_step)
+                                            >
+                                                {crate::t!("quip-import-destination-select")}
+                                            </button>
+                                        </div>
+                                    </div>
+                                }.into_any();
+                                }
+                                let profile_name = profile_name.clone();
+                                let folders = root_folders.clone();
                                 view! {
                                     // ─── Step 2: profile + folder scope ───
                                     // `data-import-id` / `data-quip-user-id`
@@ -706,8 +972,8 @@ pub fn QuipImportWizard(
                                     // anchor for the Task 9 demo.
                                     <div
                                         class="quip-import-step-scope"
-                                        data-import-id=resp.import_id
-                                        data-quip-user-id=resp.quip_profile.id
+                                        data-import-id=import_id_attr.clone()
+                                        data-quip-user-id=quip_user_attr.clone()
                                     >
                                         <p class="quip-import-profile">
                                             {crate::t!("quip-import-profile", name = profile_name)}
@@ -744,9 +1010,58 @@ pub fn QuipImportWizard(
                                                 }
                                             }).collect::<Vec<_>>().into_any()
                                         }}
-                                        <p class="quip-import-target-home">
-                                            {crate::t!("quip-import-target-home")}
-                                        </p>
+                                        // Where the import will land, and the
+                                        // way into changing it. The default —
+                                        // the wording a user who never presses
+                                        // "Change" sees — is the Home promise
+                                        // this line has always made.
+                                        //
+                                        // `data-quip-import-target` carries the
+                                        // id that `do_start` will actually send,
+                                        // derived from the same
+                                        // `start_target_folder_id` call, so an
+                                        // automation anchor and the wire value
+                                        // cannot drift apart.
+                                        <div class="quip-import-destination-row">
+                                            <p
+                                                class="quip-import-target-home"
+                                                data-quip-import-target=move || {
+                                                    start_target_folder_id(
+                                                        destination
+                                                            .get()
+                                                            .as_ref()
+                                                            .map(|(id, _)| id.as_str()),
+                                                        home_folder_id.get().as_deref(),
+                                                    )
+                                                        .unwrap_or_default()
+                                                }
+                                            >
+                                                {move || match destination.get() {
+                                                    None => crate::t!("quip-import-target-home"),
+                                                    Some((_, title)) => crate::t!(
+                                                        "quip-import-target-folder",
+                                                        folder = title,
+                                                    ),
+                                                }}
+                                            </p>
+                                            <button
+                                                class="btn btn-secondary quip-import-destination-change"
+                                                // The tree is rooted at Home, so
+                                                // there is nothing to show until
+                                                // `/users/me` lands.
+                                                disabled=move || home_folder_id.get().is_none()
+                                                // Deferred: this flips the signal
+                                                // that owns the subtree the button
+                                                // itself lives in. Tearing that
+                                                // down inside its own `on:click`
+                                                // is the "closure invoked
+                                                // recursively or after being
+                                                // dropped" panic.
+                                                on:click=move |_| a11y::defer(open_destination_step)
+                                            >
+                                                {crate::t!("quip-import-destination-change")}
+                                            </button>
+                                        </div>
                                         {move || error.get().map(|e| view! {
                                             <div class="template-picker-error" role="alert">
                                                 {crate::t!("quip-import-error", err = e)}
@@ -768,6 +1083,8 @@ pub fn QuipImportWizard(
                                             }}</button>
                                         </div>
                                     </div>
+                                }.into_any()
+                                }}
                                 }.into_any()
                             }
                             Some(resp) => {
@@ -1044,6 +1361,35 @@ fn section_view(s: Section, kind: OutcomeKind) -> impl IntoView {
 /// import id, the picked parent the wizard sent to `start` — would navigate
 /// somewhere wrong, which is worse than the Home fallback this button had
 /// before.
+/// The `target_folder_id` a `POST /imports/quip/{id}/start` must carry: the
+/// **parent** the import's `Quip Import — <date>` folder is created beneath
+/// (#172), not where documents land.
+///
+/// `chosen` is the folder the user picked in the destination step, `home` the
+/// caller's Home folder from `/users/me`. The rules, in the order they matter:
+///
+/// - A picked folder wins. This is the whole of #236 Unit 3 — the server
+///   already authorizes whatever id arrives here (`check_folder_access(...,
+///   Edit)` in `routes/imports.rs`), so sending the user's choice is both the
+///   feature and the thing the access check is run against.
+/// - Otherwise Home, which is what this wizard sent unconditionally before the
+///   destination step existed. A user who never opens that step must be
+///   indistinguishable from that user.
+/// - Blank is not an id. An empty or whitespace-only choice falls through to
+///   Home rather than being sent, for the same reason
+///   [`open_folder_destination`] refuses to navigate on one.
+/// - `None` — no choice and no Home — means there is nothing to send. The
+///   caller must not start: an import with no parent is a 400, and the
+///   Continue button is disabled in exactly this state.
+fn start_target_folder_id(chosen: Option<&str>, home: Option<&str>) -> Option<String> {
+    fn usable(id: Option<&str>) -> Option<String> {
+        id.map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    }
+    usable(chosen).or_else(|| usable(home))
+}
+
 fn open_folder_destination(status: &imports::StatusResponse) -> Option<String> {
     status
         .destination_folder_id
