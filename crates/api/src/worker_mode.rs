@@ -1272,6 +1272,17 @@ pub(crate) mod report {
     /// One outcome: mentions in this import lost their link. `detail` names
     /// the cause, per the "kind names an outcome, never a cause" rule above.
     pub const KIND_MENTIONS_DEGRADED: &str = "mentions_degraded";
+    /// One outcome: an embedded Quip live app's contents did not come over
+    /// (#191). Deliberately **not** split by app kind — `live_app_kanban` /
+    /// `live_app_poll` / `live_app_calendar` is exactly the cause-splitting
+    /// the paragraph above forbids, and three of them would take the last
+    /// free slot and two we do not have. Which app it was goes in `detail`.
+    pub const KIND_LIVE_APP_DROPPED: &str = "live_app_dropped";
+    /// One outcome: this document's spreadsheet formulas did not come over
+    /// (#192). One note per *document*, with the count in `detail` — a sheet
+    /// with 300 formulas must not spend 300 of the 25 notes this kind gets,
+    /// and the true total is on the counter, which is uncapped.
+    pub const KIND_FORMULAS_DROPPED: &str = "formulas_dropped";
 
     pub const THREADS_IMPORTED: &str = "threads_imported";
     pub const THREADS_SKIPPED_CHAT: &str = "threads_skipped_chat";
@@ -1284,7 +1295,30 @@ pub(crate) mod report {
     /// plain text. Counts *documents*, like the other `THREADS_*` keys, so a
     /// chatty document cannot dominate the number.
     pub const THREADS_MENTIONS_DEGRADED: &str = "threads_mentions_degraded";
+    /// Embedded live-app blocks whose contents were not converted (#191).
+    /// Counts **blocks**, not documents, like `IMAGES_DROPPED` — "3 boards
+    /// lost" is the sentence a user can act on; "2 documents had a board" is
+    /// not.
+    pub const LIVE_APPS_DROPPED: &str = "live_apps_dropped";
+    /// Spreadsheet formulas that were not imported (#192). Counts
+    /// **formulas**, for the same reason, and is the number that stays true
+    /// after the notes hit their 25-per-kind budget.
+    pub const FORMULAS_DROPPED: &str = "spreadsheet_formulas_dropped";
 }
+
+/// The kinds this worker can write, for the budget assertion in `tests`.
+/// Listing them once here is what makes "are we still under
+/// `REPORT_MAX_NOTE_KINDS`?" a question with an answer.
+#[cfg(test)]
+const ALL_NOTE_KINDS: &[&str] = &[
+    report::KIND_THREAD_SKIPPED,
+    report::KIND_THREAD_FAILED,
+    report::KIND_IMAGE_DROPPED,
+    report::KIND_CONTENT_TRUNCATED,
+    report::KIND_MENTIONS_DEGRADED,
+    report::KIND_LIVE_APP_DROPPED,
+    report::KIND_FORMULAS_DROPPED,
+];
 
 /// Write one outcome to the import's `REPORT` row.
 ///
@@ -1305,7 +1339,24 @@ async fn record_report(
     counter: &str,
     note: Option<ReportNote>,
 ) {
-    if let Err(e) = ctx.import_repo.bump_report_counter(import_id, owner_id, counter, 1).await {
+    record_report_by(ctx, import_id, owner_id, counter, 1, note).await
+}
+
+/// [`record_report`] for an outcome whose counter counts *things*, not
+/// occasions: one note saying "30 formulas were dropped" has to leave the
+/// counter at 30, not 1.
+///
+/// Advisory identically — it returns `()`, and the two writes are attempted
+/// independently, for the reasons on `record_report`.
+async fn record_report_by(
+    ctx: &WorkerCtx,
+    import_id: &str,
+    owner_id: &str,
+    counter: &str,
+    by: u64,
+    note: Option<ReportNote>,
+) {
+    if let Err(e) = ctx.import_repo.bump_report_counter(import_id, owner_id, counter, by).await {
         tracing::warn!(
             import_id,
             counter,
@@ -2318,6 +2369,56 @@ pub async fn import_one_thread(
         .await;
     }
 
+    // Two losses the walker knows it took, and that a reader of the imported
+    // document cannot possibly infer (#191, #192). Both differ from every
+    // other loss reported here in one way that matters: the data *is* in the
+    // export. A dropped image is a fetch that failed; these are content this
+    // importer chose not to carry, and until it does, the only honest thing
+    // is to say so.
+    //
+    // `detail` names what was lost and where, never what it contained — a
+    // board's card titles and a formula's text are document content, and
+    // this string is durable and user-visible (`safe_quip_reason`'s rule).
+    if quip_doc.live_apps_dropped > 0 {
+        record_report_by(
+            ctx,
+            import_id,
+            owner_id,
+            report::LIVE_APPS_DROPPED,
+            quip_doc.live_apps_dropped as u64,
+            Some(ReportNote {
+                quip_thread_id: thread.quip_thread_id.clone(),
+                kind: report::KIND_LIVE_APP_DROPPED.to_string(),
+                detail: format!(
+                    "{} embedded Quip live app(s) — a Kanban board or similar — could not be \
+                     converted; whatever the block displayed in Quip is not in the imported \
+                     document",
+                    quip_doc.live_apps_dropped,
+                ),
+            }),
+        )
+        .await;
+    }
+    if quip_doc.formulas_dropped > 0 {
+        record_report_by(
+            ctx,
+            import_id,
+            owner_id,
+            report::FORMULAS_DROPPED,
+            quip_doc.formulas_dropped as u64,
+            Some(ReportNote {
+                quip_thread_id: thread.quip_thread_id.clone(),
+                kind: report::KIND_FORMULAS_DROPPED.to_string(),
+                detail: format!(
+                    "{} spreadsheet formula(s) were not imported; the cells keep the values \
+                     Quip had last calculated and will not recalculate",
+                    quip_doc.formulas_dropped,
+                ),
+            }),
+        )
+        .await;
+    }
+
     // 6. Settle this thread's document id BEFORE anything durable is written
     //    under it. It has to be known early anyway — every side-loaded blob
     //    key embeds it and those keys go into the snapshot — but it is also
@@ -2861,6 +2962,59 @@ mod tests {
                 .map(|(q, o)| (q.to_string(), o.to_string()))
                 .collect(),
             fallback: fallback.to_string(),
+        }
+    }
+
+    /// The 8-kind budget is enforced at *runtime*, in `ReportRow::push_note`,
+    /// and its penalty is the harshest in the report machinery: the 9th
+    /// distinct kind to appear in an import has its notes **discarded
+    /// outright**, not truncated, for the life of that import. Which kind
+    /// loses depends on the order documents happen to fail in, so the bug
+    /// would be silent, intermittent, and unattributable.
+    ///
+    /// Nothing else fails when a sixth, ninth or twentieth `KIND_*` is added
+    /// to `report` — not the compiler, not CI. This is that check. #191 and
+    /// #192 took the set from five to seven; a slot remains, and it is one
+    /// slot, not a habit.
+    #[test]
+    fn the_worker_stays_within_the_report_rows_note_kind_budget() {
+        use ogrenotes_storage::models::import_inventory::REPORT_MAX_NOTE_KINDS;
+        let mut sorted = ALL_NOTE_KINDS.to_vec();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "two note kinds share a string: {sorted:?}");
+        assert!(
+            ALL_NOTE_KINDS.len() <= REPORT_MAX_NOTE_KINDS,
+            "{} note kinds against a budget of {REPORT_MAX_NOTE_KINDS}; past it, whichever \
+             kind appears 9th in a given import loses every note it writes: {ALL_NOTE_KINDS:?}",
+            ALL_NOTE_KINDS.len(),
+        );
+    }
+
+    /// A kind names an outcome; a counter counts things. They live in
+    /// different maps on the `REPORT` row, so an identical string is legal —
+    /// and would still be a trap for anyone reading a stored row, where the
+    /// two are told apart only by which map they came out of.
+    #[test]
+    fn no_note_kind_collides_with_a_counter_key() {
+        const COUNTERS: &[&str] = &[
+            report::THREADS_IMPORTED,
+            report::THREADS_SKIPPED_CHAT,
+            report::THREADS_SKIPPED_FORBIDDEN,
+            report::THREADS_FAILED,
+            report::IMAGES_DROPPED,
+            report::THREADS_TRUNCATED,
+            report::FOLDERS_FORBIDDEN,
+            report::THREADS_MENTIONS_DEGRADED,
+            report::LIVE_APPS_DROPPED,
+            report::FORMULAS_DROPPED,
+        ];
+        for kind in ALL_NOTE_KINDS {
+            assert!(
+                !COUNTERS.contains(kind),
+                "{kind:?} is both a note kind and a counter key",
+            );
         }
     }
 

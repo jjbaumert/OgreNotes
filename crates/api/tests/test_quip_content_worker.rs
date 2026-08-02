@@ -962,6 +962,218 @@ async fn the_report_names_the_skipped_and_failed_threads_with_reasons() {
     }
 }
 
+// ─── silent content loss: live apps (#191) and formulas (#192) ───────
+//
+// These two are unlike every other loss this suite covers. A dropped image
+// is a fetch that failed; a truncated nesting is a bound we chose. These are
+// content that IS in the export, that the importer does not carry, and that
+// the imported document gives the reader no way to notice: a Kanban board
+// arrives as its column headings with no cards, a live spreadsheet as a grid
+// of frozen numbers. The report note is the entire signal.
+
+/// t2's body, carrying both losses at once.
+///
+/// The two `<td>` cells are **verbatim** from
+/// `crates/collab/tests/fixtures/quip/corpus/QGYAAAjicgG.html` — the real
+/// `<span formula=…>`-inside-`<td>` spelling, its text being the value Quip
+/// last computed, and Quip's `<br/>` cell terminator.
+///
+/// The live-app block is **synthetic** and says so: no corpus fixture carries
+/// one (`quip_corpus.rs` records that as a known coverage gap) and the
+/// audit's Kanban thread was never checked in. Its *payload*, however, is
+/// deliberately hostile — a card title spelling both a credential and an
+/// address — because that payload is document content and the assertions
+/// below are what stop it reaching a durable, user-visible note. A `detail`
+/// that quoted what was lost would leak exactly the thing the loss is about.
+const T2_LOSSY_HTML: &str = concat!(
+    "<div data-live-app-id='kanban' data-live-app-payload='",
+    r#"{"cards":[{"title":"tok-SEEKRET rejected for ada@example.com"}]}"#,
+    "'><table><tr><th>To do</th><th>Done</th></tr></table></div>",
+    "<table><tr>",
+    "<td id='temp:s:temp:C:QGY02ded512fb3c4b019236db16b_temp:C:QGY2d8b7a16c9bb42f5bf0bc2efd' style=''>",
+    "<span id='temp:s:temp:C:QGY02ded512fb3c4b019236db16b_temp:C:QGY2d8b7a16c9bb42f5bf0bc2efd' formula='=D8*D9'>3</span>\n\n<br/></td>",
+    "<td id='temp:s:temp:C:QGY332cf016b08748b09637afc75_temp:C:QGY2d8b7a16c9bb42f5bf0bc2efd' style=''>",
+    "<span id='temp:s:temp:C:QGY332cf016b08748b09637afc75_temp:C:QGY2d8b7a16c9bb42f5bf0bc2efd' formula='=SUM(D8:D10)'>4</span>\n\n<br/></td>",
+    "</tr></table>",
+);
+
+/// [`quip_content_server`] with t2 serving [`T2_LOSSY_HTML`].
+async fn quip_server_with_a_lossy_spreadsheet() -> MockServer {
+    let server = quip_content_server().await;
+    Mock::given(method("GET"))
+        .and(path("/2/threads/t2/html"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(T2_LOSSY_HTML)))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// #191 + #192: a document whose live app and formulas were dropped still
+/// imports, and the report says what it lost.
+///
+/// The import succeeding is half the contract and the easier half to get
+/// wrong in the other direction — a loss that failed the thread would be a
+/// far worse bug than the silence it replaced.
+#[tokio::test]
+async fn a_dropped_live_app_and_dropped_formulas_are_named_in_the_report() {
+    common::require_infra!();
+    let server = quip_server_with_a_lossy_spreadsheet().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    run_like_the_queue(&ctx, &import_id, "owner1").await;
+
+    // The import is otherwise completely ordinary.
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ImportStatus::Succeeded, "a named loss is not a failure");
+    assert_eq!(thread_row(&app, &import_id, "t2").await.state, ThreadState::ContentDone);
+    assert!(doc_id_for(&app, &import_id, "t2").await.is_some(), "the document still exists");
+
+    let report = app
+        .state
+        .import_repo
+        .get_report(&import_id)
+        .await
+        .expect("report read")
+        .expect("an import that lost content must have a REPORT row");
+
+    // Counters count *things*, not occasions — one note, two formulas.
+    assert_eq!(
+        report.counters.get("spreadsheet_formulas_dropped"),
+        Some(&2),
+        "both formulas counted: {report:?}",
+    );
+    assert_eq!(
+        report.counters.get("live_apps_dropped"),
+        Some(&1),
+        "one live-app block: {report:?}",
+    );
+    assert_eq!(report.notes_dropped, 0, "nothing was over budget here: {report:?}");
+
+    let formulas = report
+        .notes
+        .iter()
+        .find(|n| n.kind == "formulas_dropped")
+        .unwrap_or_else(|| panic!("the dropped formulas must be named: {report:?}"));
+    assert_eq!(formulas.quip_thread_id, "t2", "the note names the document that lost them");
+    assert!(formulas.detail.contains('2'), "the count is in the detail: {formulas:?}");
+
+    let live_app = report
+        .notes
+        .iter()
+        .find(|n| n.kind == "live_app_dropped")
+        .unwrap_or_else(|| panic!("the dropped live app must be named: {report:?}"));
+    assert_eq!(live_app.quip_thread_id, "t2");
+
+    // One note per document per kind — a sheet with 300 formulas must spend
+    // one of this kind's 25 notes, not 300.
+    assert_eq!(
+        report.notes.iter().filter(|n| n.kind == "formulas_dropped").count(),
+        1,
+        "one note per document, with the count in the detail: {report:?}",
+    );
+}
+
+/// A note's `detail` is durable and user-visible. It may name **what** was
+/// lost and **where**; it may never carry what the lost thing contained.
+///
+/// Asserted over both the rendered note and the raw DynamoDB item, because
+/// the two are different surfaces and only one of them is what a future
+/// export, support dump, or backup actually reads.
+#[tokio::test]
+async fn no_lost_content_reaches_a_report_note_or_the_raw_report_row() {
+    common::require_infra!();
+    let server = quip_server_with_a_lossy_spreadsheet().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    run_like_the_queue(&ctx, &import_id, "owner1").await;
+
+    let report = app.state.import_repo.get_report(&import_id).await.unwrap().unwrap();
+    let mut durable: Vec<String> = report.notes.iter().map(|n| n.detail.clone()).collect();
+    assert!(!durable.is_empty(), "precondition: notes were written at all: {report:?}");
+
+    // The raw item, exactly as it sits in DynamoDB — a `detail` that leaked
+    // through some path the decoded view smooths over would still be here.
+    let raw = app
+        .dynamo_client()
+        .get_item()
+        .table_name(&app.table_name)
+        .key("PK", AttributeValue::S(format!("IMPORT#{import_id}")))
+        .key("SK", AttributeValue::S("REPORT".to_string()))
+        .send()
+        .await
+        .expect("read the raw REPORT item")
+        .item
+        .expect("the REPORT row exists");
+    durable.push(format!("{raw:?}"));
+
+    for s in &durable {
+        assert!(!s.contains("SEEKRET"), "a credential must never reach durable state: {s:?}");
+        assert!(!s.contains('@'), "no address may reach durable state: {s:?}");
+        assert!(
+            !s.contains("cards"),
+            "the live-app payload must not be quoted into the report: {s:?}",
+        );
+        assert!(
+            !s.contains("D8") && !s.contains("SUM("),
+            "a formula is document content and must not be quoted into the report: {s:?}",
+        );
+    }
+}
+
+/// The advisory rule, exercised on the new path specifically: a report row
+/// that can never be written must not change what the import does with a
+/// document that lost content.
+///
+/// `a_permanently_poisoned_report_row_does_not_affect_the_import` covers the
+/// healthy document. This covers the one that has something to report — the
+/// case where a caller who treated `record_report`'s outcome as meaningful
+/// would fail a thread over its own bookkeeping.
+#[tokio::test]
+async fn a_broken_report_row_does_not_change_the_outcome_of_a_lossy_import() {
+    common::require_infra!();
+    let server = quip_server_with_a_lossy_spreadsheet().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    app.dynamo_client()
+        .put_item()
+        .table_name(&app.table_name)
+        .item("PK", AttributeValue::S(format!("IMPORT#{import_id}")))
+        .item("SK", AttributeValue::S("REPORT".to_string()))
+        .item("owner_id", AttributeValue::S("owner1".to_string()))
+        .item(
+            "counters",
+            AttributeValue::M(std::collections::HashMap::from([(
+                "spreadsheet_formulas_dropped".to_string(),
+                AttributeValue::S("not-a-number".to_string()),
+            )])),
+        )
+        .send()
+        .await
+        .expect("seed a poisoned REPORT row");
+    assert!(
+        app.state.import_repo.get_report(&import_id).await.is_err(),
+        "precondition: every report read for this import now fails",
+    );
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1")
+        .await
+        .expect("an unwritable report must not fail the import");
+
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ImportStatus::Succeeded);
+    assert_eq!(rec.phase, 2);
+    let docs = app.state.doc_repo.query_docs_by_owner("owner1").await.unwrap();
+    assert_eq!(docs.len(), 2, "both documents imported: {docs:?}");
+    assert_eq!(thread_row(&app, &import_id, "t2").await.state, ThreadState::ContentDone);
+}
+
 /// A report write that can never succeed must not affect the import.
 ///
 /// The `REPORT` row is a plain read-modify-write over a decoded `ReportRow`,
