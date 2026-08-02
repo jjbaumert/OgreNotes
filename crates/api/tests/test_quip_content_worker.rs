@@ -1477,6 +1477,114 @@ async fn a_permanently_missing_blob_still_checkpoints_the_thread_in_one_run() {
     assert!(note.detail.contains("b9"), "the note names the blob: {note:?}");
 }
 
+/// A sustained rate-limit **storm** must abort cheaply and stay recoverable —
+/// it must not dead-letter the manifest, and it must not condemn a thread.
+///
+/// This is the risk #155's fix creates, and the one it had to not create.
+/// Losing images is bad; failing the whole import is worse. So the storm's
+/// disposition is `RunFailure`, which returns immediately: it does **not** arm
+/// the consecutive-failure breaker (nothing to arm — the pass is already
+/// leaving), does not touch a single attempt counter, and above all does not
+/// walk the manifest spending Quip calls it does not have. One blob call per
+/// run, then out; the queue's backoff does the waiting.
+///
+/// Note the pre-fix behavior under a real storm was never "the import completes
+/// with images lost" — a rate-limited `/2/threads/{id}/html` has always mapped
+/// to `RunFailure`, and the HTML fetch precedes every blob fetch. The blob case
+/// is the narrow one where the HTML got through and the blob tipped the budget
+/// over; this test pins that it now behaves like its own HTML fetch does.
+#[tokio::test]
+async fn a_rate_limit_storm_aborts_cheaply_and_stays_fully_recoverable() {
+    common::require_infra!();
+    // Every blob in the account is 503ing, not just t1's.
+    let server = quip_content_server().await;
+    Mock::given(method("GET"))
+        .and(path("/1/blob/t1/b9"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    // Threads sorting after t1, so reaching them at all would prove the pass
+    // kept walking through the storm.
+    for t in ["t3", "t4", "t5", "t6", "t7", "t8"] {
+        seed_extra_thread(&app, &import_id, t).await;
+    }
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    for run in 1..=QUEUE_RUNS {
+        assert!(
+            execute_start_quip_import(&ctx, &import_id, "owner1").await.is_err(),
+            "run {run} must fail so the queue retries with backoff",
+        );
+    }
+
+    // Nothing was condemned and nothing was checkpointed with a hole in it.
+    let threads = app.state.import_repo.list_threads(&import_id).await.unwrap();
+    for t in &threads {
+        assert_ne!(
+            t.state,
+            ThreadState::Failed,
+            "a throttled import must never mark a thread Failed: {t:?}",
+        );
+        assert_ne!(
+            t.state,
+            ThreadState::ContentDone,
+            "and must never checkpoint one image-less: {t:?}",
+        );
+        assert_eq!(t.attempts, 0, "throttling costs no thread an attempt: {t:?}");
+    }
+    let docs = app.state.doc_repo.query_docs_by_owner("owner1").await.unwrap();
+    assert!(docs.is_empty(), "a storm persists no half-imported document: {docs:?}");
+
+    // ...and the abort was CHEAP: the pass stops at the first throttled blob
+    // rather than walking the manifest spending a budget Quip just said it has
+    // none of. One blob call per run, and nothing past t1 was ever fetched.
+    assert_eq!(
+        hits(&server, "/1/blob/t1/b9").await,
+        QUEUE_RUNS,
+        "exactly one blob call per run — a storm must not be re-bought per image",
+    );
+    for t in ["t2", "t8"] {
+        assert_eq!(
+            hits(&server, &format!("/2/threads/{t}/html")).await,
+            0,
+            "no Quip call may be spent past the point the storm stopped the pass",
+        );
+    }
+
+    // The storm's cost is a retriable dead-letter, not lost data: when Quip
+    // recovers, one run finishes the whole import.
+    server.reset().await;
+    let healthy = quip_content_server().await;
+    let ctx = worker_ctx_with_quip(&app, healthy.uri());
+    for t in ["t3", "t4", "t5", "t6", "t7", "t8"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/2/threads/{t}/html")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(T2_HTML)))
+            .mount(&healthy)
+            .await;
+    }
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let t1 = thread_row(&app, &import_id, "t1").await;
+    assert_eq!(t1.state, ThreadState::ContentDone, "the storm cost the import nothing durable");
+    let snapshot = app
+        .state
+        .doc_repo
+        .load_snapshot(&t1.ogre_doc_id.clone().unwrap())
+        .await
+        .unwrap()
+        .expect("snapshot");
+    let doc = ogrenotes_collab::snapshot::deserialize(&snapshot).expect("decode snapshot");
+    assert_eq!(
+        ogrenotes_collab::blob_ref::collect_blob_refs(doc.inner()).len(),
+        1,
+        "including the image the storm could not fetch",
+    );
+}
+
 // ─── silent content loss: live apps (#191) and formulas (#192) ───────
 //
 // These two are unlike every other loss this suite covers. A dropped image
