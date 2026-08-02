@@ -581,11 +581,17 @@ pub(crate) fn parse_quip_counting_losses(html: &str) -> (Vec<QuipBlock>, ParseLo
 /// and a silent one. Nothing about a count can fail, so this returns no
 /// error and the caller has no branch to get wrong.
 ///
-/// One live app is one *element*, however many `data-live-app-*` attributes
-/// it carries; one formula is one *cell*. Counted on the sanitized DOM,
-/// which is the only DOM there is — `formula` survives `sanitize` by being
-/// in `allowed_attributes`, and `data-live-app-*` by the `data-` prefix
-/// allowance.
+/// Both counts are per **element**: one element carrying any number of
+/// `data-live-app-*` attributes is one live app, and one element carrying
+/// `formula` is one formula. In Quip's markup the second of those is a cell
+/// — the attribute rides on the `<span>` inside a `<td>`, one per cell — but
+/// that is a fact about the input, not a rule this function enforces, and
+/// the corpus net states it as such by asserting `formulas_dropped` equals
+/// the source's `formula='` count.
+///
+/// Counted on the sanitized DOM, which is the only DOM there is — `formula`
+/// survives `sanitize` by being in `allowed_attributes`, and
+/// `data-live-app-*` by the `data-` prefix allowance.
 ///
 /// **Iterative**, like `flatten_below_depth` and for the same reason: this
 /// runs *before* the depth bound is imposed, so it sees third-party HTML of
@@ -602,9 +608,19 @@ fn count_unconverted_content(document: &markup5ever_rcdom::Handle) -> ParseLosse
             if names.clone().any(|n| n.eq_ignore_ascii_case(FORMULA_ATTR)) {
                 losses.formulas_dropped += 1;
             }
+            // `get`, never `n[..len]`. An attribute name is arbitrary
+            // third-party text: non-ASCII names are legal HTML, html5ever
+            // keeps them, and the whole `data-` namespace reaches here. A
+            // byte slice panics on any name whose 13th byte lands inside a
+            // multi-byte character — `data-emoji-🙂` is enough — and the
+            // worker's `catch_unwind` would turn that into a thread that
+            // burns its attempts and lands `Failed`. `get` returns `None`
+            // both out of bounds and off a char boundary, and `None` is the
+            // right answer either way: a name whose 13th byte is mid-character
+            // cannot start with an ASCII prefix.
             if names.any(|n| {
-                n.len() >= LIVE_APP_ATTR_PREFIX.len()
-                    && n[..LIVE_APP_ATTR_PREFIX.len()].eq_ignore_ascii_case(LIVE_APP_ATTR_PREFIX)
+                n.get(..LIVE_APP_ATTR_PREFIX.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(LIVE_APP_ATTR_PREFIX))
             }) {
                 losses.live_apps_dropped += 1;
             }
@@ -979,7 +995,7 @@ fn append_child(parent: &markup5ever_rcdom::Handle, child: markup5ever_rcdom::Ha
 ///
 /// Runs as a DOM pre-pass rather than inside the walker so the question
 /// is answered against the markup Quip actually wrote; see the ordering
-/// comment in [`parse_quip_counting_truncations`]. Iterative for the same
+/// comment in [`parse_quip_counting_losses`]. Iterative for the same
 /// reason [`flatten_below_depth`] is: it runs on the un-bounded tree.
 ///
 /// # This is the exact opposite of #184 — deliberately, do not unify
@@ -3013,6 +3029,56 @@ mod tests {
             "<div data-live-app-payload='a'>x</div><div data-live-app-payload='b'>y</div>",
         );
         assert_eq!(quip.live_apps_dropped, 2);
+    }
+
+    /// An attribute name that is not ASCII must not take the importer down.
+    ///
+    /// `LIVE_APP_ATTR_PREFIX` is 13 bytes, and the prefix test used to be a
+    /// **byte** slice — `n[..13]` — which panics on any name whose 13th byte
+    /// falls inside a multi-byte character. `data-emoji-🙂` is exactly that:
+    /// `data-emoji-` is 11 bytes and the emoji occupies 11..15, so 13 splits
+    /// it. Nothing about the name is live-app-ish; it only has to be the
+    /// wrong length in the wrong place.
+    ///
+    /// This is reachable input, not a curiosity. Non-ASCII attribute names
+    /// are legal HTML, html5ever preserves them, and the whole `data-`
+    /// namespace is admitted by `generic_attribute_prefixes`, so the
+    /// sanitizer hands them straight to the census. The per-thread
+    /// `catch_unwind` in the worker would contain the panic, which is
+    /// precisely what makes it nasty: the import does not crash, the thread
+    /// just burns its attempts and lands `Failed`. A document that imports
+    /// today would stop importing — in the change whose entire purpose is to
+    /// stop losing content.
+    ///
+    /// `from_quip_html_never_panics` does not cover this: proptest is not
+    /// going to invent a 13-byte-prefixed attribute name.
+    #[test]
+    fn a_non_ascii_attribute_name_is_not_a_live_app_and_does_not_panic() {
+        // Names that must NOT match. The first two straddle byte 13 exactly
+        // — `data-emoji-` is 11 bytes and `data-live-ap` is 12, so the emoji
+        // spans it either way — and the rest are shorter than the prefix or
+        // diverge before it. Every one of these panicked before the fix.
+        for name in ["data-emoji-🙂", "data-live-ap🙂", "data-liv🙂-app-payload", "🙂", "data-🙂"] {
+            let html = format!("<div {name}='x'>hi</div>");
+            let quip = from_quip_html(&html);
+            assert_eq!(
+                quip.live_apps_dropped, 0,
+                "{name:?} is not a live app; it is only an awkward length",
+            );
+            assert_eq!(quip.formulas_dropped, 0, "{name:?}");
+        }
+
+        // Names that must still match — the fix must not turn the detector
+        // off. `data-live-app🙂` is one of these, not a near-miss: it really
+        // does begin with the 13 ASCII bytes of the prefix, and a prefix
+        // match is what this detector promises. What it is followed by,
+        // multi-byte or not, is the same "sibling spelling" case as
+        // `data-live-app-id`.
+        for name in ["data-live-app🙂", "data-live-app-payload", "DATA-LIVE-APP-PAYLOAD"] {
+            let html = format!("<div {name}='🙂'>hi</div>");
+            let quip = from_quip_html(&html);
+            assert_eq!(quip.live_apps_dropped, 1, "{name:?} carries the prefix");
+        }
     }
 
     /// The count has to be a *loss* signal, not a noise generator: an

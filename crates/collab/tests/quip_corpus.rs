@@ -701,9 +701,27 @@ fn corpus_spreadsheet_section_id_density() {
     // difference between a lossy import and a silent one. It still does not
     // carry it: the cells hold the values Quip last computed, nothing
     // recalculates, and the number below is what the worker turns into the
-    // user's report note. A fix that actually lands the formulas — which
-    // means importing a Quip sheet as a `DocType::Spreadsheet`, since a
-    // native sheet's formula *is* its cell text — drives this to 0.
+    // user's report note.
+    //
+    // Landing the formulas looks closer than it may read. A native sheet has
+    // no `formula` attribute — the formula **is** the cell's text, re-parsed
+    // on load (`spreadsheet_view/persistence.rs` hydrates each cell with
+    // `engine.set_cell(addr, &cell_node.text_content())`), and both formulas
+    // here are inside the native grammar (`*`, `SUM`, A1 ranges). Quip
+    // reports this thread's type as `spreadsheet` and `worker_mode` already
+    // maps that to `DocType::Spreadsheet`, so writing the formula as the
+    // cell's text — rather than the cached value — is the shape of the fix,
+    // and it drives this assertion to 0.
+    //
+    // What still has to be settled first, and why this is a separate unit:
+    // the sheet attrs (`sheetName`, the grid bounds) are not emitted by this
+    // walker, Quip's cell geometry has to be mapped onto `(col, row)` past
+    // the row-number `<td>` and corner `<th>`, and a formula *outside* the
+    // native grammar needs the literal-text-plus-note fallback rather than a
+    // silently different answer. Note also that the same attribute can ride
+    // in a table embedded in an ordinary `document` thread, where there is no
+    // sheet to be live in and the cached value is the better import — so the
+    // fix is conditioned on the thread's type, not on the attribute alone.
     assert_eq!(quip.formulas_dropped, 2, "both source formulas are reported as lost");
     assert_eq!(quip.live_apps_dropped, 0, "a spreadsheet is not a live app");
 
