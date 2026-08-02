@@ -1209,3 +1209,8 @@ deck-frame-comment = Comment on this frame
 
 deck-add-text-frame = Add Text Frame
 deck-notes-drawer-label = Speaker notes
+
+# ─── Presentations P2 (present mode, Task 6) ─────────────────────
+
+deck-present = Present
+deck-present-empty = This deck has no slides yet.

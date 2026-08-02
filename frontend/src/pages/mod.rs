@@ -7,6 +7,7 @@ pub mod home;
 pub mod login;
 pub mod mfa_challenge;
 pub mod mfa_enroll;
+pub mod present;
 pub mod settings;
 pub mod workspace_saml;
 pub mod workspace_scim;
