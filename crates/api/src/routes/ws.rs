@@ -1314,7 +1314,7 @@ async fn handle_ws(
     // still matches the unchanged slide — so they stay invisible to
     // every follower for the rest of the session.
     let session_id_for_log = session_id_cell.lock().expect("session id mutex poisoned").clone();
-    let still_ours = room
+    let ownership = room
         .forget_awareness_owned_by(&session_id_for_log, awareness_owner)
         .await;
     // #9: tell the remaining peers to drop this cursor, otherwise it
@@ -1329,7 +1329,7 @@ async fn handle_ws(
     // (pure allocation-saving — `broadcast` over an empty client map is
     // already a no-op), and a connection that no longer owns the entry
     // stays silent entirely.
-    let actions = ogrenotes_collab::awareness::leave_actions(still_ours, is_empty);
+    let actions = ogrenotes_collab::awareness::leave_actions(ownership, is_empty);
     if actions.broadcast_locally || actions.publish_remotely {
         let payload =
             ogrenotes_collab::awareness::leave_payload(&session_id_for_log, &user_id_for_log);

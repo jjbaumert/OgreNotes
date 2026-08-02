@@ -259,6 +259,27 @@ pub fn leave_payload(session_id: &str, user_id: &str) -> String {
     format!("{session_id}\0{user_id}")
 }
 
+/// Whether a disconnecting connection still owns the awareness cache
+/// entry under its session id.
+///
+/// An enum rather than a `bool` for two reasons: it makes
+/// `Room::forget_awareness_owned_by`'s return self-documenting (a bare
+/// `true` reads ambiguously as "removed" or "kept"), and it makes the
+/// two arguments of [`leave_actions`] different types, so they can't be
+/// silently transposed at the call site — a swap that no unit test of
+/// `leave_actions` itself could catch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOwnership {
+    /// The cached entry is still this connection's, so this connection
+    /// is the rightful source of a leave announcement for it.
+    StillOurs,
+    /// A newer connection re-stored under the same session id (a
+    /// reconnect reusing it), or a remote instance's fanout took the
+    /// entry over — or there was nothing cached at all. Either way
+    /// this connection must not announce a leave.
+    TakenOver,
+}
+
 /// What a disconnecting connection should do about its awareness entry.
 ///
 /// This is the decision that used to live inline in
@@ -282,19 +303,22 @@ pub struct AwarenessLeaveActions {
 /// Decide what a disconnecting connection does about its awareness
 /// entry.
 ///
-/// * `owns_cached_entry` — whether the cache entry under this
-///   connection's `session_id` is still tagged as belonging to *this*
-///   connection. False means a newer connection re-stored under the
-///   same session id — the reconnect path deliberately reuses the
-///   session id, so a stale half-open socket being reaped by the load
-///   balancer 60s later must not announce a leave for a presenter who
-///   is live again. Nothing would re-announce them (the client's
-///   send-dedup still matches the unchanged slide), so they'd stay
-///   invisible indefinitely.
+/// * `ownership` — whether the cache entry under this connection's
+///   `session_id` is still tagged as belonging to *this* connection.
+///   `TakenOver` means a newer connection re-stored under the same
+///   session id — the reconnect path deliberately reuses the session
+///   id, so a stale half-open socket being reaped by the load balancer
+///   60s later must not announce a leave for a presenter who is live
+///   again. Nothing would re-announce them (the client's send-dedup
+///   still matches the unchanged slide), so they'd stay invisible
+///   indefinitely.
 /// * `room_is_empty` — whether the room has any local clients left
 ///   after this connection was removed.
-pub fn leave_actions(owns_cached_entry: bool, room_is_empty: bool) -> AwarenessLeaveActions {
-    if !owns_cached_entry {
+pub fn leave_actions(
+    ownership: SessionOwnership,
+    room_is_empty: bool,
+) -> AwarenessLeaveActions {
+    if ownership == SessionOwnership::TakenOver {
         // Someone else owns this session id now. Emitting a leave —
         // locally or over Redis — would wipe a live cursor.
         return AwarenessLeaveActions {
@@ -748,7 +772,7 @@ mod leave_decision_tests {
     /// stale cursor. Restoring that structure fails here.
     #[test]
     fn leave_is_published_remotely_even_when_the_room_went_empty() {
-        let actions = leave_actions(true, true);
+        let actions = leave_actions(SessionOwnership::StillOurs, true);
         assert!(
             actions.publish_remotely,
             "the last client leaving a room MUST still tell other instances (#212)",
@@ -761,7 +785,7 @@ mod leave_decision_tests {
 
     #[test]
     fn leave_is_broadcast_and_published_when_peers_remain() {
-        let actions = leave_actions(true, false);
+        let actions = leave_actions(SessionOwnership::StillOurs, false);
         assert!(actions.broadcast_locally);
         assert!(actions.publish_remotely);
     }
@@ -773,7 +797,7 @@ mod leave_decision_tests {
     #[test]
     fn a_stale_connection_that_no_longer_owns_the_session_emits_nothing() {
         for room_is_empty in [true, false] {
-            let actions = leave_actions(false, room_is_empty);
+            let actions = leave_actions(SessionOwnership::TakenOver, room_is_empty);
             assert!(
                 !actions.publish_remotely,
                 "stale owner must not publish a leave (room_is_empty={room_is_empty})",

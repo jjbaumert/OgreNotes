@@ -464,30 +464,30 @@ impl Room {
     }
 
     /// Forget a session's awareness **only if** `owner` still owns the
-    /// cached entry. Returns whether the entry was removed — i.e.
-    /// whether this connection is still the rightful source of a leave
-    /// announcement for `session_id`.
+    /// cached entry. The return says whether this connection is still
+    /// the rightful source of a leave announcement for `session_id`;
+    /// feed it straight to `awareness::leave_actions`.
     ///
-    /// `false` means a newer connection re-stored under the same
-    /// session id (a reconnect, which reuses the id by design) or a
-    /// remote instance's fanout took over the entry. The caller must
-    /// then suppress its leave entirely — see
-    /// `awareness::leave_actions`.
+    /// `TakenOver` means a newer connection re-stored under the same
+    /// session id (a reconnect, which reuses the id by design), or a
+    /// remote instance's fanout took over the entry, or nothing was
+    /// cached at all. The caller must then suppress its leave entirely.
     pub async fn forget_awareness_owned_by(
         &self,
         session_id: &str,
         owner: AwarenessOwner,
-    ) -> bool {
+    ) -> super::awareness::SessionOwnership {
+        use super::awareness::SessionOwnership;
         let mut awareness = self.awareness.write().await;
         match awareness.get(session_id) {
             Some(entry) if entry.owner == Some(owner) => {
                 awareness.remove(session_id);
-                true
+                SessionOwnership::StillOurs
             }
             // Either nothing cached (nothing to announce a leave for)
             // or someone else owns it now (announcing would wipe a live
             // cursor).
-            _ => false,
+            _ => SessionOwnership::TakenOver,
         }
     }
 
@@ -1254,6 +1254,8 @@ mod tests {
 
     // ── awareness entry ownership (#210 × #212 interaction) ────────
 
+    use super::super::awareness::SessionOwnership;
+
     /// The reconnect path (#210) deliberately reuses the session id, so
     /// after a half-open socket is replaced the *stale* connection must
     /// not be able to forget the live one's entry. Newest writer wins.
@@ -1271,8 +1273,12 @@ mod tests {
         // The ALB reaps A's half-open socket ~60s later. Its cleanup
         // must be a no-op — and must report that it owns nothing, so the
         // caller suppresses the leave announcement entirely.
-        let removed = room.forget_awareness_owned_by("sess-S", conn_a).await;
-        assert!(!removed, "a stale connection must not own the re-stored entry");
+        let ownership = room.forget_awareness_owned_by("sess-S", conn_a).await;
+        assert_eq!(
+            ownership,
+            SessionOwnership::TakenOver,
+            "a stale connection must not own the re-stored entry",
+        );
         assert_eq!(
             room.awareness_snapshot("nobody").await,
             vec![b"b-state".to_vec()],
@@ -1280,8 +1286,12 @@ mod tests {
         );
 
         // B, the real owner, can still clean itself up normally.
-        let removed = room.forget_awareness_owned_by("sess-S", conn_b).await;
-        assert!(removed, "the current owner forgets its own entry");
+        let ownership = room.forget_awareness_owned_by("sess-S", conn_b).await;
+        assert_eq!(
+            ownership,
+            SessionOwnership::StillOurs,
+            "the current owner forgets its own entry",
+        );
         assert!(room.awareness_snapshot("nobody").await.is_empty());
     }
 
@@ -1299,8 +1309,12 @@ mod tests {
         // out to us and overwrote the entry.
         room.store_awareness("sess-S", b"remote-state".to_vec()).await;
 
-        let removed = room.forget_awareness_owned_by("sess-S", conn_a).await;
-        assert!(!removed, "an entry owned elsewhere is not ours to forget");
+        let ownership = room.forget_awareness_owned_by("sess-S", conn_a).await;
+        assert_eq!(
+            ownership,
+            SessionOwnership::TakenOver,
+            "an entry owned elsewhere is not ours to forget",
+        );
         assert_eq!(
             room.awareness_snapshot("nobody").await,
             vec![b"remote-state".to_vec()],
@@ -1313,7 +1327,10 @@ mod tests {
         // announce a leave for.
         let room = Room::new_empty("doc-1".to_string());
         let owner = AwarenessOwner { instance_id: 7, client_id: 1 };
-        assert!(!room.forget_awareness_owned_by("sess-never-announced", owner).await);
+        assert_eq!(
+            room.forget_awareness_owned_by("sess-never-announced", owner).await,
+            SessionOwnership::TakenOver,
+        );
     }
 
     #[tokio::test]
@@ -1326,8 +1343,14 @@ mod tests {
         let on_instance_8 = AwarenessOwner { instance_id: 8, client_id: 1 };
 
         room.store_awareness_owned("sess-S", b"state".to_vec(), on_instance_7).await;
-        assert!(!room.forget_awareness_owned_by("sess-S", on_instance_8).await);
-        assert!(room.forget_awareness_owned_by("sess-S", on_instance_7).await);
+        assert_eq!(
+            room.forget_awareness_owned_by("sess-S", on_instance_8).await,
+            SessionOwnership::TakenOver,
+        );
+        assert_eq!(
+            room.forget_awareness_owned_by("sess-S", on_instance_7).await,
+            SessionOwnership::StillOurs,
+        );
     }
 
     // ── apply_remote_update CommentEvent relay ─────────────────────
