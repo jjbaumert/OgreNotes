@@ -706,6 +706,74 @@ fn the_grid_fixture_really_carries_the_chrome_being_stripped() {
     );
 }
 
+/// [`quip_content_server`] with the *document* thread's HTML overridden to the
+/// same grid fixture. t1 is typed `"document"` by the mock `/1/threads/`
+/// response, so this is byte-identical markup down the other branch.
+async fn quip_server_with_grid_t1_envelope() -> MockServer {
+    let server = quip_content_server().await;
+    Mock::given(method("GET"))
+        .and(path("/2/threads/t1/html"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(T2_GRID_HTML)))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// **The worker-level negative control.** The same bytes down a `document`
+/// thread keep their header row and leading column.
+///
+/// Without this, `content_pass_imports_a_spreadsheet_grid_unshifted` passes
+/// just as happily against a worker that hardcodes
+/// `QuipThreadKind::Spreadsheet` and never reads `thread_type` at all — the
+/// two tests together say the worker *discriminates*, not merely that it
+/// strips. It is also the worker-side statement of why #230 could not use a
+/// structural discriminator: 16 real prose tables in `document` threads carry
+/// chrome byte-identical to this, and their `<th>` headings must survive.
+///
+/// The collab crate pins the same pair on the walker
+/// (`the_same_grid_markup_imported_as_a_document_keeps_its_header_row`);
+/// this pins that the worker hands it the right side of that pair.
+#[tokio::test]
+async fn the_same_grid_markup_in_a_document_thread_keeps_its_header_row() {
+    common::require_infra!();
+    let server = quip_server_with_grid_t1_envelope().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let doc_id = doc_id_for(&app, &import_id, "t1").await.expect("t1 imported");
+    let meta = app.state.doc_repo.get(&doc_id).await.unwrap().expect("t1 document");
+    assert_eq!(
+        meta.doc_type,
+        DocType::Document,
+        "precondition: t1 is a document thread, whatever its body contains",
+    );
+
+    let snapshot = app.state.doc_repo.load_snapshot(&doc_id).await.unwrap().expect("snapshot");
+    let doc = ogrenotes_collab::snapshot::deserialize(&snapshot).expect("decode snapshot");
+    let grid = first_table_grid(doc.inner());
+
+    assert_eq!(grid.len(), 31, "the header row is content in a document thread");
+    assert_eq!(
+        grid.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![17; 31],
+        "17 cells per row — nothing is stripped off a document thread",
+    );
+    assert_eq!(
+        grid[0].iter().filter(|(header, _)| *header).count(),
+        17,
+        "the whole first row survives as header cells",
+    );
+    assert!(
+        column(&grid, 0)[1..].iter().all(|t| t.bytes().all(|b| b.is_ascii_digit())),
+        "the leading column survives as content: {:?}",
+        column(&grid, 0),
+    );
+}
+
 #[tokio::test]
 async fn intra_quip_links_are_recorded_unresolved_for_phase_2b() {
     common::require_infra!();
