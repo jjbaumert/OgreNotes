@@ -109,8 +109,8 @@ export class DataConstruct extends Construct {
     });
 
     // ── S3 bucket (one bucket; backups land under backups/<date>/) ──
-    // Lifecycle rule mirrors the tracked infra/s3/bucket-policy.json: only
-    // tmp/ objects expire (snapshots + blobs are untouched).
+    // Only staging prefixes expire — snapshots (docs/) and attachments
+    // (blobs/) are the durable product and are untouched.
     this.bucket = new s3.Bucket(this, 'Bucket', {
       bucketName: `${prefix}ogrenote`,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -121,6 +121,24 @@ export class DataConstruct extends Construct {
           enabled: true,
           prefix: 'tmp/',
           expiration: Duration.days(7),
+        },
+        // Import staging is upload/transit material, never the product:
+        // `imports/{user_id}/{id}.{ext}` for DOCX/PDF uploads, and
+        // `imports/{import_id}/threads/{thread_id}.html` — the raw Quip
+        // body, i.e. the user's FULL DOCUMENT TEXT — for Quip imports. The
+        // worker deletes both when the job/import goes terminal (issue
+        // #196); this rule is the backstop for what it can't reach: an
+        // import abandoned or wedged mid-run never reaches a terminal
+        // status, so nothing sweeps it and it would be retained forever.
+        // 30 days is far longer than any run (a large Quip import is hours,
+        // bounded by a per-minute API rate budget), so it can never expire
+        // objects a live run still wants, while capping retention of the
+        // most sensitive transient data in the bucket.
+        {
+          id: 'expire-import-staging-30-days',
+          enabled: true,
+          prefix: 'imports/',
+          expiration: Duration.days(30),
         },
       ],
       removalPolicy: dataRemovalPolicy,

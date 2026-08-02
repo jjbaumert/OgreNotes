@@ -159,6 +159,50 @@ async fn hits(server: &MockServer, suffix: &str) -> usize {
         .count()
 }
 
+/// Every S3 key currently under `prefix`, read straight from the bucket.
+///
+/// Deliberately a real `list_objects_v2` rather than a spy on the delete call:
+/// "a delete was issued" is exactly the assertion that passes against code
+/// that deletes the wrong prefix, and #196 is a data-*retention* bug, so the
+/// only assertion that means anything is what the bucket still holds.
+async fn keys_under(app: &common::TestApp, prefix: &str) -> Vec<String> {
+    app.s3_client()
+        .list_objects_v2()
+        .bucket(&app.bucket)
+        .prefix(prefix)
+        .send()
+        .await
+        .expect("list objects")
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_string))
+        .collect()
+}
+
+/// The keys staged under one import's thread-staging prefix.
+async fn staged_keys(app: &common::TestApp, import_id: &str) -> Vec<String> {
+    keys_under(app, &format!("imports/{import_id}/threads/")).await
+}
+
+/// `true` when S3 answers `HEAD` with a 404 for `key` — the object is really
+/// gone, not merely absent from a cached listing.
+async fn head_is_404(app: &common::TestApp, key: &str) -> bool {
+    match app.s3_client().head_object().bucket(&app.bucket).key(key).send().await {
+        Ok(_) => false,
+        Err(e) => e.into_service_error().is_not_found(),
+    }
+}
+
+/// Put one object into the test bucket under an arbitrary key.
+async fn seed_object(app: &common::TestApp, key: &str, body: &[u8]) {
+    app.state
+        .doc_repo
+        .s3()
+        .put_object(key, body.to_vec())
+        .await
+        .unwrap_or_else(|e| panic!("seed {key}: {e}"));
+}
+
 /// The `ogre_doc_id` recorded on a thread's manifest row.
 async fn doc_id_for(app: &common::TestApp, import_id: &str, thread: &str) -> Option<String> {
     let threads = app.state.import_repo.list_threads(import_id).await.unwrap();
@@ -209,15 +253,16 @@ async fn content_pass_creates_documents_with_quip_timestamps_and_folders() {
         children.iter().map(|c| c.child_id.clone()).collect();
     assert!(child_ids.contains(&t1_doc_id), "t1's doc is linked into the target folder");
 
-    // The raw HTML was staged to S3 under the import's prefix.
-    let staged = app
-        .state
-        .doc_repo
-        .s3()
-        .get_object(&format!("imports/{import_id}/threads/t1.html"))
-        .await
-        .expect("staged html exists");
-    assert_eq!(String::from_utf8(staged).unwrap(), T1_HTML);
+    // The raw HTML was staged to S3 under the import's prefix *during* the
+    // run, and swept when the import went terminal (#196 — the staged object
+    // is the user's full document text, so it must not outlive the import).
+    // This assertion used to read "staged html exists"; the mid-run staging it
+    // covered now lives in `a_retryable_run_keeps_its_staging_for_the_retry`,
+    // and the sweep itself in `a_succeeded_import_deletes_its_staged_html`.
+    assert!(
+        staged_keys(&app, &import_id).await.is_empty(),
+        "a succeeded import must leave no staged thread HTML behind",
+    );
 
     // Section map recorded for the two anchored blocks, in document order.
     let sections = app.state.import_repo.get_secmap(&import_id, "t1").await.unwrap();
@@ -1947,4 +1992,250 @@ async fn a_permanently_wrong_user_endpoint_is_asked_once_per_run_not_once_per_th
 
     let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
     assert_eq!(rec.status, ImportStatus::Succeeded, "the import still succeeds");
+}
+
+// ─── #196: staged thread HTML must not outlive the import ─────────
+
+/// The staged objects under `imports/{import_id}/threads/` are the user's
+/// **full document text** — on the test stack that demonstrably included
+/// brokerage holdings with account numbers and correspondence naming a real
+/// individual. Nothing deleted them, and deleting the imported OgreNotes
+/// documents does not reach them (they are keyed by *import* id, not doc id),
+/// so every import retained a second copy of everything, forever, even when it
+/// succeeded.
+///
+/// The sweep hangs off the import's **terminal status**, never off the job's
+/// finalization: see `a_retryable_run_keeps_its_staging_for_the_retry` for the
+/// negative that protects the in-flight run.
+#[tokio::test]
+async fn a_succeeded_import_deletes_its_staged_html() {
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ImportStatus::Succeeded, "precondition: the import is terminal");
+
+    // The objects are GONE, asserted against the bucket itself — both by
+    // listing the prefix and by asking S3 for each key by name.
+    let left = staged_keys(&app, &import_id).await;
+    assert!(left.is_empty(), "the staging prefix must be empty after a succeeded import: {left:?}");
+    for thread in ["t1", "t2"] {
+        let key = format!("imports/{import_id}/threads/{thread}.html");
+        assert!(head_is_404(&app, &key).await, "{key} must be a 404, not merely unlisted");
+    }
+
+    // What the user actually asked for survives: the documents and the images
+    // side-loaded out of Quip into the document's own blob prefix. A sweep
+    // that took those with it would be a far worse bug than the one it fixes.
+    let t1_doc_id = doc_id_for(&app, &import_id, "t1").await.expect("t1 imported");
+    assert!(app.state.doc_repo.get(&t1_doc_id).await.unwrap().is_some(), "the document survives");
+    assert!(
+        !keys_under(&app, &format!("blobs/{t1_doc_id}/")).await.is_empty(),
+        "the side-loaded image must survive the staging sweep",
+    );
+}
+
+/// **The load-bearing negative.** A run that ends retryable must leave every
+/// staged object in place.
+///
+/// A mid-run sweep would delete the in-flight run's diagnostic material — the
+/// one copy of the raw HTML that does not cost a round trip against Quip's
+/// rate budget to obtain — and it would do so at exactly the moment something
+/// has gone wrong and that material is worth most. The queue is still going to
+/// re-run this import: it is not terminal, and only terminal imports may be
+/// swept.
+#[tokio::test]
+async fn a_retryable_run_keeps_its_staging_for_the_retry() {
+    common::require_infra!();
+    // t1 imports and stages; t2 500s, which is transient and under its attempt
+    // budget, so the pass walks the whole manifest and then returns Err for the
+    // queue to retry.
+    let server = quip_server_with_thread_html_status("t2", 500).await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    let outcome = execute_start_quip_import(&ctx, &import_id, "owner1").await;
+    assert!(outcome.is_err(), "precondition: this run is retryable, not terminal: {outcome:?}");
+
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(
+        rec.status,
+        ImportStatus::Running,
+        "precondition: a retryable run leaves the import non-terminal",
+    );
+
+    // THE ASSERTION: the staged HTML is still there, byte-for-byte.
+    let staged = app
+        .state
+        .doc_repo
+        .s3()
+        .get_object(&format!("imports/{import_id}/threads/t1.html"))
+        .await
+        .expect("a retryable run must not delete its staged thread HTML");
+    assert_eq!(
+        String::from_utf8(staged).unwrap(),
+        T1_HTML,
+        "the staged HTML must survive intact, not be replaced or truncated",
+    );
+}
+
+/// The other terminal state. An import that ends `Failed` retains exactly as
+/// much of the user's document text as one that ends `Succeeded`, so it is
+/// swept on the same terms.
+///
+/// Driven through the real sequence that produces it: a first run stages t1 and
+/// ends retryable, then a selected root becomes unreadable (403), which is
+/// terminal-as-`Failed` (the credential is valid, so a reconnect would not
+/// help) rather than terminal-as-`TokenRejected`.
+#[tokio::test]
+async fn a_failed_import_deletes_its_staged_html() {
+    common::require_infra!();
+    let server = quip_server_with_thread_html_status("t2", 500).await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    // Run 1: t1 is imported and staged; the run ends retryable.
+    assert!(execute_start_quip_import(&ctx, &import_id, "owner1").await.is_err());
+    assert_eq!(
+        staged_keys(&app, &import_id).await.len(),
+        1,
+        "precondition: run 1 staged t1's HTML and kept it",
+    );
+
+    // Run 2: the selected root is no longer readable.
+    Mock::given(method("GET"))
+        .and(path("/1/folders/"))
+        .respond_with(ResponseTemplate::new(403))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    execute_start_quip_import(&ctx, &import_id, "owner1")
+        .await
+        .expect("a 403 on a selected root is terminal for the import, not an error to retry");
+
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ImportStatus::Failed, "precondition: the import is terminally Failed");
+
+    let left = staged_keys(&app, &import_id).await;
+    assert!(left.is_empty(), "a failed import must not retain the text it staged: {left:?}");
+    let key = format!("imports/{import_id}/threads/t1.html");
+    assert!(head_is_404(&app, &key).await, "{key} must be a 404");
+}
+
+/// Blast-radius fence. The sweep is scoped to
+/// `imports/{import_id}/threads/` — the narrowest prefix that covers the
+/// staging and nothing else — and this pins each way a wider prefix could
+/// reach past it:
+///
+/// * `imports/` alone would take every other import and every DOCX/PDF upload
+///   (`imports/{user_id}/{id}.{ext}` — a different shape under the same root);
+/// * `imports/{import_id}` **without the trailing slash** would also match a
+///   different import whose id merely starts with this one's;
+/// * `imports/{import_id}/` would take anything else this import ever keys
+///   under its own id.
+#[tokio::test]
+async fn the_staging_sweep_reaches_no_other_import_or_user() {
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    // Four decoys, each one prefix-adjacent to the sweep in a different way.
+    let other_import = "imports/imp-someone-else/threads/t1.html".to_string();
+    let id_prefix_twin = format!("imports/{import_id}-twin/threads/t1.html");
+    let docx_staging = "imports/owner2/some-upload.docx".to_string();
+    let same_import_other_shape = format!("imports/{import_id}/manifest.json");
+    let decoys = [&other_import, &id_prefix_twin, &docx_staging, &same_import_other_shape];
+    for key in decoys {
+        seed_object(&app, key, b"do not touch").await;
+    }
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+    assert!(
+        staged_keys(&app, &import_id).await.is_empty(),
+        "precondition: this import's own staging was swept",
+    );
+
+    for key in decoys {
+        let body = app
+            .state
+            .doc_repo
+            .s3()
+            .get_object(key)
+            .await
+            .unwrap_or_else(|e| panic!("{key} must survive the sweep, but: {e}"));
+        assert_eq!(body, b"do not touch", "{key} must survive byte-for-byte");
+    }
+}
+
+/// [`quip_content_server`] with every thread typed `chat`, so the pass reaches
+/// the end of the manifest — and its terminal `Succeeded` — without ever
+/// touching S3 itself. That isolation is what lets the next test point the
+/// worker's S3 client at a bucket that does not exist and be sure the *only*
+/// operation that fails is the staging sweep.
+async fn quip_server_with_only_chat_threads() -> MockServer {
+    let server = quip_content_server().await;
+    Mock::given(method("GET"))
+        .and(path("/1/threads/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "t1": {"thread": {"id": "t1", "title": "Chat A", "type": "chat", "updated_usec": 111}},
+            "t2": {"thread": {"id": "t2", "title": "Chat B", "type": "chat", "updated_usec": 222}},
+            "tc": {"thread": {"id": "tc", "title": "Chat C", "type": "chat", "updated_usec": 333}}
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// The sweep is **advisory**: it must never fail, retry, or alter an import.
+///
+/// The same discipline `record_report` follows — an import that could not
+/// write a note about itself must not die of it, and an import that succeeded
+/// must not be reported as failed because a cleanup could not reach S3. If the
+/// sweep's error propagated, this run would return `Err`, the queue would
+/// retry a *finished* import, and after four such runs it would dead-letter and
+/// overwrite the user's `Succeeded` with `Failed`.
+#[tokio::test]
+async fn a_staging_sweep_failure_does_not_change_the_imports_outcome() {
+    common::require_infra!();
+    let server = quip_server_with_only_chat_threads().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    // The worker's own S3 client points at a bucket that does not exist, so
+    // the sweep's `list_objects_v2` fails outright. `doc_repo` keeps the real
+    // bucket; nothing else in a chat-only pass uses `ctx.s3`.
+    let ctx = WorkerCtx::new(
+        app.state.doc_repo.clone(),
+        app.state.folder_repo.clone(),
+        ogrenotes_storage::s3::S3Client::new(
+            app.s3_client().clone(),
+            format!("no-such-bucket-{}", nanoid::nanoid!(8).to_lowercase()),
+        ),
+        app.state.import_repo.clone(),
+        app.state.user_repo.clone(),
+        app.state.quip_token_store.clone(),
+        Some(server.uri()),
+    );
+
+    execute_start_quip_import(&ctx, &import_id, "owner1")
+        .await
+        .expect("a sweep that cannot reach S3 must not fail the import");
+
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(
+        rec.status,
+        ImportStatus::Succeeded,
+        "the import's outcome must be decided by the import, not by its cleanup",
+    );
+    assert_eq!(rec.phase, 2, "the pass still completed");
 }

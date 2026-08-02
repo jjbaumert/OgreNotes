@@ -491,6 +491,144 @@ async fn dead_lettered_quip_import_ends_failed() {
     );
 }
 
+/// #196's disposition boundary, and the reason the sweep does **not** live in
+/// `cleanup_staging_blob` next to the DOCX/PDF one.
+///
+/// A `TokenRejected` run returns `Ok` on purpose — hammering Quip with a dead
+/// credential must not burn the retry budget — so the queue **acks** it, and
+/// the job is as finished as a successful one. The *import* is not: the user
+/// reconnects and it resumes. So the whole job-terminal path (ack included)
+/// must leave the staging alone, and the only thing that may sweep it is a
+/// terminal import status.
+#[tokio::test]
+async fn an_acked_token_rejected_job_keeps_the_imports_staging() {
+    common::require_infra!();
+    let server = quip_unauthorized_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1", &["root"]).await;
+    app.state
+        .quip_token_store
+        .put(&import_id, &QuipToken::new("revoked".into()))
+        .await
+        .unwrap();
+
+    // What an earlier run of this import staged before the token was revoked.
+    let staged_key = format!("imports/{import_id}/threads/t1.html");
+    app.state
+        .doc_repo
+        .s3()
+        .put_object(&staged_key, b"<p>the user's document text</p>".to_vec())
+        .await
+        .expect("seed staged html");
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    let queue = fresh_queue("tokenrejected-staging").await;
+    queue
+        .enqueue(Job::StartQuipImport {
+            import_id: import_id.clone(),
+            owner_id: "owner1".to_string(),
+        })
+        .await
+        .expect("enqueue");
+    let claimed = queue.consume_next("c1", 1_000).await.expect("consume").expect("an entry");
+    execute_and_finalize(&queue, claimed, &ctx).await;
+
+    // Precondition: the job really was acked (nothing left to redeliver) and
+    // the import really is in the resumable TokenRejected state.
+    assert!(
+        queue.consume_next("c1", 500).await.expect("consume").is_none(),
+        "precondition: a TokenRejected run is acked, not retried",
+    );
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ImportStatus::TokenRejected, "precondition: resumable, not terminal");
+
+    // THE ASSERTION: an acked job is not a finished import.
+    assert!(
+        app.state.doc_repo.s3().get_object(&staged_key).await.is_ok(),
+        "an import that resumes on reconnect must keep its staged HTML",
+    );
+}
+
+/// #196, the dead-letter half. A dead-lettered import is terminal — the queue
+/// has spent the retry budget and no run will ever read this import's staged
+/// thread HTML again — so the staged copy of the user's document text must go
+/// with it.
+///
+/// The retries on the way there are the second half of the test, and the more
+/// important one: each of attempts 0..2 re-enqueues the job, and a sweep on any
+/// of them would delete the staging out from under the very run that is about
+/// to resume. So the staged object is asserted **present after the first
+/// retry** and **gone only after the dead-letter**.
+///
+/// The staged object is seeded directly rather than produced by a content pass:
+/// this file's fixture server serves the inventory endpoints only, and the key
+/// shape (`imports/{import_id}/threads/{thread}.html`) is exactly what
+/// `import_one_thread` writes.
+#[tokio::test]
+async fn dead_lettered_quip_import_drops_its_staged_thread_html() {
+    common::require_infra!();
+    let server = quip_transient_error_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1", &["root"]).await;
+    app.state
+        .quip_token_store
+        .put(&import_id, &QuipToken::new("tok".into()))
+        .await
+        .unwrap();
+
+    // What an earlier, partly-successful content pass would have left behind.
+    let staged_key = format!("imports/{import_id}/threads/t1.html");
+    let other_import_key = "imports/imp-someone-else/threads/t1.html".to_string();
+    for key in [&staged_key, &other_import_key] {
+        app.state
+            .doc_repo
+            .s3()
+            .put_object(key, b"<p>the user's document text</p>".to_vec())
+            .await
+            .expect("seed staged html");
+    }
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    let queue = fresh_queue("deadletter-staging").await;
+    queue
+        .enqueue(Job::StartQuipImport {
+            import_id: import_id.clone(),
+            owner_id: "owner1".to_string(),
+        })
+        .await
+        .expect("enqueue");
+
+    // MAX_RETRIES = 3: attempts 0,1,2 retry; attempt 3 dead-letters.
+    for expected_attempt in 0..=3u32 {
+        let claimed = loop {
+            if let Some(c) = queue.consume_next("c1", 1_000).await.expect("consume") {
+                break c;
+            }
+        };
+        assert_eq!(claimed.envelope.attempt, expected_attempt);
+        execute_and_finalize(&queue, claimed, &ctx).await;
+
+        if expected_attempt == 0 {
+            // THE NEGATIVE: a retried job is not a terminal import.
+            assert!(
+                app.state.doc_repo.s3().get_object(&staged_key).await.is_ok(),
+                "a retried job must leave the staged HTML for the run that resumes",
+            );
+        }
+    }
+
+    let rec = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ImportStatus::Failed, "precondition: the import is terminal");
+    assert!(
+        app.state.doc_repo.s3().get_object(&staged_key).await.is_err(),
+        "a dead-lettered import must not retain the document text it staged",
+    );
+    assert!(
+        app.state.doc_repo.s3().get_object(&other_import_key).await.is_ok(),
+        "the sweep must not reach another import's staging",
+    );
+}
+
 /// Regression (C1/C2, the critical one): the reaper must NOT ack a job whose
 /// work is still in flight on another worker.
 ///
