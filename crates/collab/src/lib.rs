@@ -19,3 +19,4 @@ pub mod redis_pubsub;
 pub mod room;
 pub mod schema;
 pub mod snapshot;
+pub mod themes;
