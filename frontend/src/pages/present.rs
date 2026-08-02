@@ -51,8 +51,40 @@ pub(crate) fn just_resynced(was_synced: bool, synced: bool) -> bool {
     synced && !was_synced
 }
 
+/// Whether a DOM event's target is a native interactive control (button,
+/// link, form field). Mirrors the tag-name checks other global keydown
+/// handlers use to yield to focused controls — e.g.
+/// `spreadsheet_view.rs`'s Ctrl+A handler checking `INPUT`/`TEXTAREA` on
+/// the active element. Present mode's Follow/Rejoin `<button>`s are the
+/// only focusable controls on this page, but the check is written against
+/// the general set of interactive tags rather than just `BUTTON` so it
+/// keeps working if more controls are added later.
+fn is_interactive_target(ev: &web_sys::Event) -> bool {
+    ev.target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        .map(|el| {
+            matches!(
+                el.tag_name().to_uppercase().as_str(),
+                "BUTTON" | "INPUT" | "TEXTAREA" | "SELECT" | "A"
+            )
+        })
+        .unwrap_or(false)
+}
+
 #[component]
 pub fn PresentPage() -> impl IntoView {
+    // Mirrors document.rs:258-263's route guard: an expired/absent
+    // session would otherwise fall through to the empty-deck fallback
+    // below ("This deck has no slides yet"), which reads as data loss
+    // rather than as an auth problem. Server-side gating already denies
+    // the content fetch either way — this is purely about giving the
+    // same route-guard UX as every other authenticated page.
+    if !crate::api::client::is_authenticated() {
+        let navigate = use_navigate();
+        navigate("/login", Default::default());
+        return view! { <div>{crate::t!("common-redirecting-login")}</div> }.into_any();
+    }
+
     ensure_presentation_css();
     let params = use_params_map();
     let doc_id = move || params.read().get("id").unwrap_or_default();
@@ -120,8 +152,12 @@ pub fn PresentPage() -> impl IntoView {
         set_idx.set(prev_index(idx.get_untracked()));
     };
 
-    // Swipe: left → next, right → previous. 48px threshold, and the
-    // gesture must be predominantly horizontal so a vertical scroll in
+    // Swipe: left → next, right → previous. Uses the shared
+    // `crate::touch::SWIPE_THRESHOLD_PX` (this is the frontend's only
+    // swipe consumer, so there's no other call site to stay consistent
+    // with, but a page-local magic number would just be a second
+    // threshold to keep in sync by hand). The gesture must also be
+    // predominantly horizontal so a vertical scroll in
     // the presenter panel doesn't change slides. `touches()` is empty by
     // the time `touchend` fires (the lifted finger is no longer "on" the
     // surface), so both endpoints are read via `changed_touches()`
@@ -152,7 +188,8 @@ pub fn PresentPage() -> impl IntoView {
         set_touch_start.set(None);
         let Some(t) = ev.changed_touches().get(0) else { return };
         let dir = crate::touch::swipe_direction(
-            start_x, start_y, t.client_x() as f64, t.client_y() as f64, 48.0,
+            start_x, start_y, t.client_x() as f64, t.client_y() as f64,
+            crate::touch::SWIPE_THRESHOLD_PX,
         );
         // Only a horizontal swipe navigates; a vertical one (dy-dominant,
         // e.g. scrolling the presenter panel) is left alone entirely — no
@@ -189,7 +226,21 @@ pub fn PresentPage() -> impl IntoView {
         let handle = window_event_listener_untyped("keydown", move |ev: web_sys::Event| {
             let Ok(ke) = ev.clone().dyn_into::<web_sys::KeyboardEvent>() else { return };
             match ke.key().as_str() {
-                "ArrowRight" | "ArrowDown" | " " | "PageDown" => { ev.prevent_default(); go_next(); }
+                "ArrowRight" | "ArrowDown" | "PageDown" => { ev.prevent_default(); go_next(); }
+                " " => {
+                    // The Follow/Rejoin buttons live inside this same
+                    // full-page keydown scope (there's no container-scoped
+                    // handler to yield to, see the comment above), so an
+                    // unconditional prevent_default() here would suppress
+                    // native Space-activation whenever one of them has
+                    // focus. Only treat Space as "advance the deck" when
+                    // the event didn't originate on an interactive element.
+                    if is_interactive_target(&ev) {
+                        return;
+                    }
+                    ev.prevent_default();
+                    go_next();
+                }
                 "ArrowLeft" | "ArrowUp" | "PageUp" => { ev.prevent_default(); go_prev(); }
                 "Home" => { ev.prevent_default(); mark_manual_nav(); set_idx.set(0); }
                 "End" => {
@@ -420,7 +471,9 @@ pub fn PresentPage() -> impl IntoView {
     });
 
     view! {
-        <div
+        <main
+            id="main-content"
+            tabindex="-1"
             class="deck-present"
             class:deck-present--presenter=is_presenter_view
             on:click=on_stage_click
@@ -502,8 +555,9 @@ pub fn PresentPage() -> impl IntoView {
                     </aside>
                 </Show>
             </Show>
-        </div>
+        </main>
     }
+    .into_any()
 }
 
 /// Elapsed wall-clock as `M:SS` (or `H:MM:SS` past an hour) for the
