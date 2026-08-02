@@ -1629,6 +1629,17 @@ pub fn DeckView(
                                             class="deck-slide-thumb__duplicate"
                                             title=crate::t!("deck-duplicate-slide")
                                             aria-label=crate::t!("deck-duplicate-slide")
+                                            // Stop the press BEFORE it reaches the thumb's
+                                            // drag handler. Without this the thumb's
+                                            // `on:pointerdown` runs and calls
+                                            // `set_pointer_capture` on itself, which
+                                            // retargets the follow-up `click` to the thumb
+                                            // — so this button's `on:click` never fires and
+                                            // the button looks dead. `stop_propagation` on
+                                            // `click` alone is too late: pointerdown has
+                                            // already captured. Same pairing the frame
+                                            // comment button uses below.
+                                            on:pointerdown=|ev: web_sys::PointerEvent| ev.stop_propagation()
                                             on:click={
                                                 // `<Show>`'s children closure can be
                                                 // re-invoked every time `when` toggles
@@ -1651,6 +1662,10 @@ pub fn DeckView(
                                             class="deck-slide-thumb__delete"
                                             title=crate::t!("deck-delete-slide")
                                             aria-label=crate::t!("deck-delete-slide")
+                                            // See the duplicate button above: pointerdown
+                                            // must be stopped or the thumb captures the
+                                            // pointer and swallows this button's click.
+                                            on:pointerdown=|ev: web_sys::PointerEvent| ev.stop_propagation()
                                             on:click={
                                                 let block_id_delete = block_id_delete.clone();
                                                 move |ev: web_sys::MouseEvent| {
