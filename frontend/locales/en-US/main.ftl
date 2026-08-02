@@ -1219,3 +1219,8 @@ deck-present-empty = This deck has no slides yet.
 
 deck-present-next = Next
 deck-present-notes = Speaker notes
+
+# ─── Presentations P2 (live follow-the-presenter, Task 8) ────────
+
+deck-present-follow = Follow { $name }
+deck-present-rejoin = Rejoin presenter

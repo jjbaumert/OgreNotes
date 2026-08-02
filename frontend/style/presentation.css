@@ -694,3 +694,24 @@
   padding-inline-start: var(--space-sm);
   margin-block: var(--space-sm);
 }
+
+/* ─── Live follow-the-presenter (Task 8) ───────────────────────── */
+
+.deck-present__follow {
+  position: fixed;
+  left: var(--space-md);
+  bottom: var(--space-md);
+  display: flex;
+  gap: var(--space-sm);
+  z-index: 2;
+}
+
+.deck-present__follow-btn,
+.deck-present__rejoin {
+  padding: 0.4em 0.9em;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  cursor: pointer;
+}
