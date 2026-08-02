@@ -1222,7 +1222,6 @@ fn the_prose_tables_shape_matches_the_sheets_and_only_the_thread_type_spares_the
     assert_eq!(kept.table_rows, 27);
 }
 
-
 // ─── cross-fixture invariants ────────────────────────────────────
 
 /// Whatever else changes, the corpus must keep parsing, must not truncate,
