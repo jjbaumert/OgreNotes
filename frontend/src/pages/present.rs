@@ -258,22 +258,26 @@ pub fn PresentPage() -> impl IntoView {
         });
     }
 
-    // Broadcasts this viewer's current slide as awareness whenever it
-    // changes AND whenever the deck finishes loading AND whenever the
-    // socket reaches `Synced` — three independent async pieces (REST
-    // deck fetch, WS handshake, user navigation) that can each finish
-    // last. `send_awareness` itself no-ops unless `Synced`
-    // (ws_client.rs), so depending on all three (rather than just `idx`,
-    // as a single-shot "on mount" broadcast would) guarantees whichever
-    // piece finishes last is the one that actually gets a frame out —
-    // otherwise a presenter who opens present mode and doesn't navigate
-    // again (a single-slide deck, or one who hasn't advanced yet) could
-    // broadcast into a pre-sync or pre-deck-load window and never be
-    // seen by anyone who joins after.
+    // Broadcasts this viewer's current slide as awareness. The Effect
+    // depends on `idx`, the deck-loaded/non-empty state, and the polled
+    // `ws_synced` signal — three independent async pieces (REST deck
+    // fetch, WS handshake, user navigation) that can each finish last —
+    // so it necessarily *re-runs* on every one of those changes,
+    // including every 300ms `ws_synced` poll tick once synced (the poll
+    // writes unconditionally; `reactive_graph`'s `Set::set` has no
+    // equality gate, so it notifies every tick regardless of whether the
+    // value actually changed). Left alone that would resend an identical
+    // frame to the room roughly every 300ms forever. `last_sent_block_id`
+    // is the guard: only an Effect run that would send a *different*
+    // block_id than last time actually calls `send_awareness` (mirrors
+    // `document.rs:1341-1364`'s `prev_sel_hash` change-detection for its
+    // own awareness Effect), so in steady state — synced, loaded, no
+    // navigation — this sends nothing at all after the first frame.
     {
         let collab = std::rc::Rc::clone(&collab_client);
         let user_id = my_user_id.get_value();
         let name = my_name.clone();
+        let last_sent_block_id: StoredValue<Option<String>> = StoredValue::new(None);
         Effect::new(move |_| {
             let i = idx.get();
             let synced = ws_synced.get();
@@ -282,12 +286,16 @@ pub fn PresentPage() -> impl IntoView {
                 return;
             }
             let Some(block_id) = deck.with_untracked(|d| slide_block_id(d, i)) else { return };
+            if last_sent_block_id.get_value().as_deref() == Some(block_id.as_str()) {
+                return;
+            }
             if let Some(ref client) = *collab.borrow() {
                 client.send_awareness(
                     &user_id, &name, color_idx,
                     None, None, None, None,
                     Some(block_id.as_str()),
                 );
+                last_sent_block_id.set_value(Some(block_id));
             }
         });
     }
