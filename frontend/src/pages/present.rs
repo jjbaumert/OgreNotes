@@ -40,6 +40,17 @@ pub(crate) fn followed_index(
     index_of_slide(deck, block_id)
 }
 
+/// True exactly on a false→true transition of the polled `ws_synced`
+/// flag — the moment a resync (initial handshake, or a reconnect after a
+/// mid-session drop) completes. Pulled out of the awareness-broadcast
+/// Effect below as a standalone pure function purely so this one piece of
+/// its logic — as opposed to the `Effect`/`StoredValue`/`CollabClient`
+/// plumbing around it, which needs a live DOM/WASM environment to
+/// exercise — has a unit test.
+pub(crate) fn just_resynced(was_synced: bool, synced: bool) -> bool {
+    synced && !was_synced
+}
+
 #[component]
 pub fn PresentPage() -> impl IntoView {
     ensure_presentation_css();
@@ -337,9 +348,21 @@ pub fn PresentPage() -> impl IntoView {
         let user_id = my_user_id.get_value();
         let name = my_name.clone();
         let last_sent_block_id: StoredValue<Option<String>> = StoredValue::new(None);
+        // Tracks the previous `ws_synced` poll value so a false→true
+        // transition (initial handshake completing, or a reconnect after
+        // a mid-session drop) clears the dedup guard below. Without this,
+        // a resync would never re-announce the current slide: the block
+        // id hasn't changed, so `last_sent_block_id` would still match it
+        // and the Effect would treat it as "already sent" even though the
+        // reconnect means the room never actually received it.
+        let was_synced: StoredValue<bool> = StoredValue::new(false);
         Effect::new(move |_| {
             let i = idx.get();
             let synced = ws_synced.get();
+            if just_resynced(was_synced.get_value(), synced) {
+                last_sent_block_id.set_value(None);
+            }
+            was_synced.set_value(synced);
             let ready = loaded.get() && deck.with(|d| !d.slides.is_empty());
             if !synced || !ready {
                 return;
@@ -348,13 +371,30 @@ pub fn PresentPage() -> impl IntoView {
             if last_sent_block_id.get_value().as_deref() == Some(block_id.as_str()) {
                 return;
             }
+            // `ws_synced` is a 300ms poll of the raw connection flag
+            // (see the comment above where it's populated) and can be up
+            // to 300ms stale, so a run that reaches this point can still
+            // race a disconnect that happened in that window —
+            // `send_awareness` re-checks the live state internally and
+            // silently no-ops if it's not actually synced. Recording
+            // `last_sent_block_id` unconditionally after calling it would
+            // poison the dedup guard on exactly that race: the block id
+            // would look "sent" forever even though the frame was
+            // dropped, and nothing else re-triggers the same id to retry
+            // it. `client.is_synced()` reads that same live state
+            // synchronously right here (no await between the check and
+            // the call, single-threaded WASM), so gating the dedup write
+            // on it — rather than on the polled `synced` local — records
+            // only when the frame is actually known to have been queued.
             if let Some(ref client) = *collab.borrow() {
-                client.send_awareness(
-                    &user_id, &name, color_idx,
-                    None, None, None, None,
-                    Some(block_id.as_str()),
-                );
-                last_sent_block_id.set_value(Some(block_id));
+                if client.is_synced() {
+                    client.send_awareness(
+                        &user_id, &name, color_idx,
+                        None, None, None, None,
+                        Some(block_id.as_str()),
+                    );
+                    last_sent_block_id.set_value(Some(block_id));
+                }
             }
         });
     }
@@ -530,6 +570,14 @@ mod follow_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn just_resynced_fires_only_on_the_false_to_true_edge() {
+        assert!(just_resynced(false, true), "false->true is a resync");
+        assert!(!just_resynced(true, true), "staying synced is not a resync");
+        assert!(!just_resynced(false, false), "staying unsynced is not a resync");
+        assert!(!just_resynced(true, false), "dropping is not itself a resync");
+    }
 
     #[test]
     fn elapsed_formats_as_a_clock() {
