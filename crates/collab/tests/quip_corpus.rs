@@ -87,7 +87,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use ogrenotes_collab::import_quip::{from_quip_html, QuipDocument};
+use ogrenotes_collab::import_quip::{
+    from_quip_html, from_quip_html_as, QuipDocument, QuipThreadKind,
+};
 use yrs::types::xml::{XmlFragment, XmlOut};
 use yrs::{Any, Doc, Out, ReadTxn, Text, Transact, Xml, XmlElementRef};
 
@@ -371,6 +373,76 @@ fn import(thread_id: &str) -> (String, QuipDocument, Census) {
     let quip = from_quip_html(&html);
     let c = census(&quip.doc);
     (html, quip, c)
+}
+
+// ─── grid readout (#230) ─────────────────────────────────────────
+//
+// The census counts cells; it cannot say *where* a value landed, which is
+// the whole of #230. These read the first table back as a grid so a test
+// can assert a position.
+
+/// All text under `el`, descendants included, in document order.
+fn element_text<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> String {
+    let mut body = String::new();
+    for i in 0..el.len(txn) {
+        match el.get(txn, i) {
+            Some(XmlOut::Text(text)) => {
+                for delta in text.diff(txn, yrs::types::text::YChange::identity) {
+                    if let Out::Any(Any::String(s)) = &delta.insert {
+                        body.push_str(s.as_ref());
+                    }
+                }
+            }
+            Some(XmlOut::Element(child)) => body.push_str(&element_text(txn, &child)),
+            _ => {}
+        }
+    }
+    body
+}
+
+fn find_table<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> Option<XmlElementRef> {
+    if el.tag().as_ref() == "table" {
+        return Some(el.clone());
+    }
+    for i in 0..el.len(txn) {
+        if let Some(XmlOut::Element(child)) = el.get(txn, i) {
+            if let Some(found) = find_table(txn, &child) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// The document's first `table`, row-major, as `(is_header_cell, text)`.
+fn first_table_grid(doc: &Doc) -> Vec<Vec<(bool, String)>> {
+    let txn = doc.transact();
+    let Some(frag) = txn.get_xml_fragment("content") else { return Vec::new() };
+    let mut found = None;
+    for i in 0..frag.len(&txn) {
+        let Some(XmlOut::Element(el)) = frag.get(&txn, i) else { continue };
+        if let Some(t) = find_table(&txn, &el) {
+            found = Some(t);
+            break;
+        }
+    }
+    let Some(table) = found else { return Vec::new() };
+    let mut grid = Vec::new();
+    for r in 0..table.len(&txn) {
+        let Some(XmlOut::Element(row)) = table.get(&txn, r) else { continue };
+        let mut cells = Vec::new();
+        for c in 0..row.len(&txn) {
+            let Some(XmlOut::Element(cell)) = row.get(&txn, c) else { continue };
+            cells.push((cell.tag().as_ref() == "table_header", element_text(&txn, &cell)));
+        }
+        grid.push(cells);
+    }
+    grid
+}
+
+/// Column `index` of a grid, top to bottom.
+fn column(grid: &[Vec<(bool, String)>], index: usize) -> Vec<&str> {
+    grid.iter().filter_map(|r| r.get(index)).map(|(_, t)| t.as_str()).collect()
 }
 
 // ─── per-fixture assertions ──────────────────────────────────────
@@ -740,6 +812,123 @@ fn corpus_spreadsheet_section_id_density() {
     assert_eq!(quip.sections.len(), 528, "section ids captured — every distinct id (#190)");
 
     assert_eq!(quip.deep_nesting_truncated, 0);
+}
+
+/// **#230.** The same fixture, imported as the *spreadsheet* Quip says it is.
+///
+/// Quip renders a sheet as an HTML table that includes its own rulers: a
+/// `<thead>` row of column letters, and a leading `<td>` per body row holding
+/// the row number. Importing those as cells shifts every value down one row
+/// and right one column — `a1` lands at B2, and column A fills with 1…30.
+///
+/// This is the positional statement the census cannot make: `table_cells`
+/// counts the same 510 cells whether or not they are in the right places.
+#[test]
+fn corpus_spreadsheet_grid_chrome_is_not_imported_as_data() {
+    let html = fixture("QGYAAAjicgG");
+    let quip = from_quip_html_as(&html, QuipThreadKind::Spreadsheet);
+    let grid = first_table_grid(&quip.doc);
+
+    // 30 rows × 16 columns of data. The source table is 31 × 17; the extra
+    // row is the column-letter `<thead>` and the extra column is the gutter.
+    assert_eq!(grid.len(), 30, "body rows only — the column-letter row is chrome");
+    let widths: Vec<usize> = grid.iter().map(Vec::len).collect();
+    assert_eq!(widths, vec![16; 30], "data columns only — the row-number gutter is chrome");
+
+    // Every `<th>` in this document was a column letter, so once the header
+    // row is gone there is no header cell left.
+    assert!(
+        grid.iter().flatten().all(|(header, _)| !header),
+        "a stripped sheet keeps no header cell",
+    );
+
+    // The top-left data cell. The fixture is content-scrubbed — every word
+    // run became filler of the identical length — so `a1 b1 c1 d1` reads as
+    // four 2-character strings. Their *values* are meaningless; that they are
+    // the first four cells of the first row, rather than cells 2-5 of row 2,
+    // is the entire assertion.
+    assert_eq!(
+        grid[0][..4].iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+        vec!["as", "as", "no", "it"],
+        "row 1, columns A-D — Quip's a1..d1, unshifted",
+    );
+
+    // The shift was diagonal, so pin both axes. Column A must be the sheet's
+    // own first column, not the gutter: under the bug every one of its 30
+    // cells was a row number.
+    let col_a = column(&grid, 0);
+    assert!(
+        !col_a.iter().all(|t| t.bytes().all(|b| b.is_ascii_digit())),
+        "column A is data, not the row-number ruler: {col_a:?}",
+    );
+
+    // The other axis, pinned along the whole of column D — the one column of
+    // this sheet with content spread down it. Quip has a value at D1 and D6
+    // and a run of four numbers at D8-D11 (the last two computed by the
+    // formulas of #192); every other cell of the column is one of the 469
+    // U+200B-only spacers. Under the bug all of it read one row lower, in
+    // column E. `occupied` is the shape, not the values: the fixture's digits
+    // are scrubbed, so `1, 2, 2, 5` is not recoverable — where they sit is.
+    let col_d = column(&grid, 3);
+    let occupied: Vec<usize> = col_d
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !t.trim_matches('\u{200b}').is_empty())
+        .map(|(i, _)| i + 1)
+        .collect();
+    assert_eq!(occupied, vec![1, 6, 8, 9, 10, 11], "column D's filled rows, 1-based: {col_d:?}");
+    assert!(
+        col_d[7..11].iter().all(|t| t.bytes().all(|b| b.is_ascii_digit())),
+        "D8-D11 are the numeric run: {:?}",
+        &col_d[7..11],
+    );
+
+    // The cost of the strip, stated rather than left silent: the 16
+    // column-letter `<th>` elements each carried an `id`, and dropping the
+    // cells drops those anchors. 528 - 16 = 512. A Phase-2b link pointing at
+    // a column letter no longer resolves; a link pointing at any of the 480
+    // data cells still does, and those are all 480 of them.
+    assert_eq!(quip.sections.len(), 512, "every anchor except the 16 column letters");
+
+    assert_eq!(quip.formulas_dropped, 2, "the strip does not disturb the #192 count");
+    assert_eq!(quip.deep_nesting_truncated, 0);
+}
+
+/// **#230, the negative control.** Byte-for-byte the same markup, imported as
+/// an ordinary document: the header row and the leading column survive as
+/// content.
+///
+/// This is the discriminator under test, isolated — same input, one bit
+/// different, opposite outcome. It matters because Quip wraps *prose* tables
+/// in exactly this chrome too: 17 of the 47 tables across the staged
+/// 56-document corpus carry a `<thead>` whose first cell is the empty 2em
+/// corner and a `#f0f0f0` numeric gutter on every body row, and 16 of those
+/// 17 are ordinary document tables whose `<th>` cells hold real headings.
+/// Any fix keyed on that markup instead of on the thread type would delete
+/// those headings. This test fails the moment such a fix is attempted.
+#[test]
+fn the_same_grid_markup_imported_as_a_document_keeps_its_header_row() {
+    let html = fixture("QGYAAAjicgG");
+    let quip = from_quip_html_as(&html, QuipThreadKind::Document);
+    let grid = first_table_grid(&quip.doc);
+
+    assert_eq!(grid.len(), 31, "the header row is content here");
+    assert_eq!(grid.iter().map(Vec::len).collect::<Vec<_>>(), vec![17; 31], "17 cells per row");
+    assert_eq!(
+        grid[0].iter().filter(|(header, _)| *header).count(),
+        17,
+        "the whole first row is <th>",
+    );
+    assert!(
+        column(&grid, 0)[1..].iter().all(|t| t.bytes().all(|b| b.is_ascii_digit())),
+        "the leading column survives as content",
+    );
+
+    // `QuipThreadKind::Document` is what plain `from_quip_html` means, so the
+    // counts the rest of this file pins are the counts asserted here.
+    assert_eq!(census(&quip.doc).table_cells, 510);
+    assert_eq!(census(&quip.doc).table_headers, 17);
+    assert_eq!(quip.sections.len(), 528, "no anchor is lost on the document path");
 }
 
 // ─── cross-fixture invariants ────────────────────────────────────

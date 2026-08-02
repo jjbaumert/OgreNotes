@@ -179,13 +179,55 @@ pub const PENDING_QUIP_USER_ATTR: &str = "pending_quip_user";
 /// it, and the other two replace the node outright.
 pub const PENDING_QUIP_URL_ATTR: &str = "pending_quip_url";
 
+/// Which kind of Quip thread this HTML came from.
+///
+/// Quip spells an ordinary document table and a whole spreadsheet with the
+/// same `<table>` element, and — this is the part that forces the caller to
+/// answer — with the same *grid chrome* around it. Across the 56-document
+/// staged corpus, 17 of the 47 tables carry the column-header `<thead>` and
+/// the row-number gutter column described on
+/// [`strip_spreadsheet_grid_chrome`]; **16 of those 17 are prose tables**
+/// whose `<th>` cells hold real headings ("Access Level", "What it means").
+/// Only the one spreadsheet's `<th>` cells hold `A B C D …`.
+///
+/// So no structural marker separates the two — not `class='empty'`, not the
+/// 2em corner cell, not the `#f0f0f0` numeric gutter, all of which appear on
+/// prose tables that must keep their headers. The thread's own type is the
+/// only signal that does, and it lives in Quip's thread metadata rather than
+/// in the HTML body, so it has to be carried in from the caller (#230).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuipThreadKind {
+    /// Anything Quip does not call a spreadsheet. Tables are imported
+    /// exactly as the markup spells them.
+    #[default]
+    Document,
+    /// Quip `thread_type == "spreadsheet"`. The grid chrome is stripped.
+    Spreadsheet,
+}
+
 /// Import a Quip HTML body into a fresh `Doc`, together with the
 /// side-tables the caller needs to finish the job.
 ///
 /// The returned document's person mentions are **unfinished** — see
 /// [`QuipDocument::person_mentions`] and [`resolve_person_mentions`].
+///
+/// Treats the body as an ordinary document; a caller that knows Quip called
+/// this thread a spreadsheet must say so via [`from_quip_html_as`], because
+/// nothing in the markup reveals it.
 pub fn from_quip_html(html: &str) -> QuipDocument {
-    let (blocks, losses) = parse_quip_counting_losses(html);
+    from_quip_html_as(html, QuipThreadKind::Document)
+}
+
+/// [`from_quip_html`], told what kind of thread the body came from.
+///
+/// The only thing `kind` changes is whether a table's grid chrome is treated
+/// as presentation — see [`QuipThreadKind`] and
+/// [`strip_spreadsheet_grid_chrome`].
+pub fn from_quip_html_as(html: &str, kind: QuipThreadKind) -> QuipDocument {
+    let (mut blocks, losses) = parse_quip_counting_losses(html);
+    if kind == QuipThreadKind::Spreadsheet {
+        strip_spreadsheet_grid_chrome(&mut blocks);
+    }
     QuipDocument {
         deep_nesting_truncated: losses.deep_nesting_truncated,
         formulas_dropped: losses.formulas_dropped,
@@ -2234,6 +2276,109 @@ fn flatten_table(section_id: Option<String>, rows: Vec<QuipRow>) -> Vec<QuipBloc
     let mut out = vec![QuipBlock::Table { section_id, rows: clean_rows }];
     out.extend(after);
     out
+}
+
+// ─── #230: a spreadsheet's grid chrome ───────────────────────────
+
+/// Drop the grid chrome from every table in a **spreadsheet** thread: the
+/// column-letter header row, and the row-number cell that leads each body
+/// row. Both are Quip's rendering of the grid's rulers, not the user's data,
+/// and importing them shifts every value down one row and right one column
+/// (#230).
+///
+/// Runs only for [`QuipThreadKind::Spreadsheet`]. That is not a convenience —
+/// it is the whole discriminator, and [`QuipThreadKind`] records the corpus
+/// measurement that forced it: the same chrome markup wraps 16 real *prose*
+/// tables whose header cells are genuine content, so keying on the markup
+/// would delete real headings from real documents.
+///
+/// Within a spreadsheet thread the shape is still checked before anything is
+/// removed ([`is_spreadsheet_grid`]), so a table that does not look like a
+/// grid is left exactly as it was. The two conditions do different jobs: the
+/// thread type says *this document may contain a grid*, the shape says
+/// *this table is one*.
+fn strip_spreadsheet_grid_chrome(blocks: &mut [QuipBlock]) {
+    for block in blocks.iter_mut() {
+        match block {
+            QuipBlock::Table { rows, .. } => {
+                if is_spreadsheet_grid(rows) {
+                    rows.remove(0);
+                    for row in rows.iter_mut() {
+                        row.cells.remove(0);
+                    }
+                }
+            }
+            // A sheet's table is a top-level block in every real sample, but
+            // the walker can nest a table inside either block container, and
+            // a pass that silently skipped those would be chrome-stripping
+            // that depends on where the table happens to sit.
+            QuipBlock::Quote { blocks, .. } => strip_spreadsheet_grid_chrome(blocks),
+            QuipBlock::List { items, .. } => {
+                for item in items.iter_mut() {
+                    strip_spreadsheet_grid_chrome(&mut item.blocks);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Does this table carry Quip's spreadsheet grid chrome?
+///
+/// The shape, verbatim from `QGYAAAjicgG` and identical in all 17 chrome
+/// -bearing tables of the staged corpus:
+///
+/// ```text
+/// <thead><tr>
+///   <th class='empty' style='width: 2em'/>                    ← corner
+///   <th id='…' class='empty' style='width: 6em'>A<br/></th>   ← column letter
+///   …
+/// </tr></thead>
+/// <tbody><tr id='…'>
+///   <td style='background-color:#f0f0f0'>1</td>               ← row number
+///   <td id='…' style=''><span id='…'>value</span><br/></td>
+///   …
+/// ```
+///
+/// Checked, in order: a leading all-`<th>` row of at least two cells whose
+/// first cell is empty and anchorless (the corner); at least one body row;
+/// and every body row exactly as wide as the header row and led by an
+/// anchorless `<td>` whose only content is digits.
+///
+/// Deliberately **not** checked: that the row numbers read `1, 2, 3 … N`,
+/// which they do in all 17 real tables. The committed corpus fixtures are
+/// content-scrubbed, and the scrubber rewrites every digit run to different
+/// digits of the same length — so a sequence check would be untestable
+/// against the only real markup this repository holds. Width and
+/// anchorlessness survive scrubbing; the digits' values do not.
+fn is_spreadsheet_grid(rows: &[QuipRow]) -> bool {
+    let [header, body @ ..] = rows else { return false };
+    if body.is_empty() || header.cells.len() < 2 || !header.cells.iter().all(|c| c.header) {
+        return false;
+    }
+    let corner = &header.cells[0];
+    if corner.section_id.is_some() || single_para_text(corner).is_none_or(|t| !t.is_empty()) {
+        return false;
+    }
+    body.iter().all(|row| {
+        row.cells.len() == header.cells.len()
+            && row.cells.first().is_some_and(|c| {
+                !c.header
+                    && c.section_id.is_none()
+                    && single_para_text(c)
+                        .is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+            })
+    })
+}
+
+/// The text of a cell that holds exactly one paragraph — the only shape a
+/// chrome cell ever has. `None` for a cell holding anything else, which is
+/// itself reason enough to decline to read the table as a grid.
+fn single_para_text(cell: &QuipCell) -> Option<String> {
+    match cell.blocks.as_slice() {
+        [QuipBlock::Para { spans, .. }] => Some(spans.iter().map(|s| s.text.as_str()).collect()),
+        _ => None,
+    }
 }
 
 // ─── materialize into yrs ────────────────────────────────────────
