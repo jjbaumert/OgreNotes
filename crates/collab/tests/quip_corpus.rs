@@ -1391,6 +1391,88 @@ fn captured_section_ids_all_occur_in_the_source() {
     }
 }
 
+/// **#194 F-10 — the comment anchor.** Quip marks a commented range with
+/// `<span annotationid="…">`; the id is what Quip's comment API hands back
+/// when Phase 4 asks for a thread's comments, and until this landed the
+/// walker discarded it. A document imported without it can never be given
+/// its comments back short of re-importing the whole account, which is the
+/// asymmetry that pulled this out of #194 ahead of the rest.
+///
+/// What the anchor resolves to is the **block that contains the highlight**,
+/// not the highlight itself: the range is inline — mid-word, in this
+/// document's case, splitting `my`/`dipisc` — and there is no block to mint
+/// for it. So the entry recorded is the one that can be honestly stated,
+/// `annotation id → the block the commented text lives in`. Phase 4 gets the
+/// paragraph; it does not get the character offsets, and nothing here
+/// pretends otherwise.
+///
+/// It goes into `sections` rather than a table of its own because it *is* a
+/// Quip anchor id — Quip spells it in the span's `id` as well as its
+/// `annotationid`, so a `#temp:C:ffbc9747…` deep link and a Phase-4 comment
+/// lookup are asking the same question and want the same answer. Reusing
+/// `SECMAP#` means Phase 4 needs no new row kind, no new repo method and no
+/// migration: `ImportRepo::get_secmap` already returns it.
+#[test]
+fn the_comment_annotation_anchor_resolves_to_the_block_that_contains_it() {
+    // Verbatim from `ffbAAA8eMpE`: the annotated `<span>` and the
+    // `<p class='line'>` that encloses it. Ids are kept byte-exact by the
+    // scrubbing rule, so these are the real handles.
+    const ANNOTATION: &str = "temp:C:ffbc97475333a3d4bafaeed9f717";
+    const ENCLOSING_PARA: &str = "temp:C:ffb3d38c909e3d64493943c51b07";
+
+    let (html, quip, _c) = import("ffbAAA8eMpE");
+    assert_eq!(
+        html.matches("annotationid=").count(),
+        1,
+        "the fixture must still carry the annotation this test is about"
+    );
+
+    let by_id: BTreeMap<&str, &str> =
+        quip.sections.iter().map(|(s, b)| (s.as_str(), b.as_str())).collect();
+    let para_block = by_id
+        .get(ENCLOSING_PARA)
+        .unwrap_or_else(|| panic!("the enclosing paragraph's own anchor is captured (#190)"));
+    assert_eq!(
+        by_id.get(ANNOTATION),
+        Some(para_block),
+        "the annotation id must resolve to the same block as the paragraph that holds it"
+    );
+}
+
+/// The negative control, and the half the test above cannot state: the anchor
+/// pass adds **nothing** to a document that carries no annotation. Five of
+/// the six fixtures have none, and for those every key in the section map is
+/// still an ordinary single-quoted source `id`.
+///
+/// Passes both before and after #194 F-10 by construction — which is the
+/// point. A pass that started minting keys of its own, or that mistook some
+/// other attribute for an annotation, turns this red on documents that have
+/// nothing to do with comments.
+#[test]
+fn a_document_with_no_comment_annotation_records_no_extra_anchor() {
+    for thread_id in CORPUS {
+        if *thread_id == "ffbAAA8eMpE" {
+            continue;
+        }
+        let (html, quip, _c) = import(thread_id);
+        assert_eq!(
+            html.matches("annotationid").count(),
+            0,
+            "{thread_id}: expected an annotation-free fixture"
+        );
+        let invented: Vec<&str> = quip
+            .sections
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .filter(|s| !html.contains(&format!("id='{s}'")))
+            .collect();
+        assert!(
+            invented.is_empty(),
+            "{thread_id}: section-map keys with no `id='…'` in the source: {invented:?}"
+        );
+    }
+}
+
 /// #190 stated as an exhaustive fact rather than six totals: after the fix,
 /// **every id a Quip anchor could name is a key in the section map**, bar
 /// fourteen in the whole corpus, all three groups named and understood.
