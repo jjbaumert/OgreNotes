@@ -1740,7 +1740,7 @@ pub(crate) fn build_image_element(
     Some(el)
 }
 
-pub(crate) fn is_safe_url(url: &str) -> bool {
+pub fn is_safe_url(url: &str) -> bool {
     let lower = url.trim().to_lowercase();
     lower.starts_with("https://")
         || lower.starts_with("http://")
@@ -1752,7 +1752,7 @@ pub(crate) fn is_safe_url(url: &str) -> bool {
 }
 
 /// Check that a color value is safe (hex color or named color, no script injection).
-pub(crate) fn is_safe_color(color: &str) -> bool {
+pub fn is_safe_color(color: &str) -> bool {
     let c = color.trim();
     // Allow hex colors: #RGB, #RRGGBB, #RRGGBBAA
     if c.starts_with('#') && c.len() <= 9 && c[1..].chars().all(|ch| ch.is_ascii_hexdigit()) {
@@ -1857,7 +1857,7 @@ fn caret_on_block_edge_line(caret_pos: usize, block_edge: usize) -> bool {
 // ─── DOM Position Mapping ───────────────────────────────────────
 
 /// Find the DOM node and offset for a model position.
-pub(crate) fn find_dom_position(container: &HtmlElement, target_pos: usize) -> Option<(DomNode, usize)> {
+pub fn find_dom_position(container: &HtmlElement, target_pos: usize) -> Option<(DomNode, usize)> {
     let mut pos = 0;
     find_in_element(container.as_ref(), &mut pos, target_pos)
 }
