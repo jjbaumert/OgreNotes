@@ -6698,6 +6698,68 @@ async function scenarioDeckBasics(ctx, collector) {
     steps.typedTextPersisted = await persistedFrame.first()
       .waitFor({ timeout: 8000 }).then(() => true).catch(() => false);
     await page.screenshot({ path: join(outDir, "3-after-reload.png") }).catch(() => {});
+
+    // ── Add a third slide (title-content preset again) — two added
+    // slides plus the bootstrapped first one gives duplicate/delete
+    // below distinct, identifiable targets without touching the slide
+    // the reload assertions above already checked ──
+    await page.locator(".deck-add-slide-btn").click();
+    const presetItem2 = page.locator(".deck-preset-picker__item", { hasText: "Title + Content" });
+    await presetItem2.waitFor({ timeout: 5000 }).catch(() => {});
+    await presetItem2.click();
+    steps.thirdSlideAdded = await waitFor(async () => (await page.locator(".deck-slide-thumb").count()) === 3);
+
+    // ── Regression guard (fix 715d0c9): .deck-slide-thumb__duplicate
+    // and .deck-slide-thumb__delete only stopped propagation on
+    // `click`, but the parent .deck-slide-thumb's own `on:pointerdown`
+    // calls `set_pointer_capture()` on itself for drag-reorder — once
+    // captured, the browser retargets the follow-up `click` to the
+    // thumb, so the buttons' `on:click` never fired and they looked
+    // dead. Deliberately use Playwright's normal actionability
+    // (`.click()`, which hovers the thumb to reveal the
+    // hover-only `.deck-slide-thumb__actions` before clicking) rather
+    // than `{ force: true }` — forcing would click through the same
+    // hover-reveal + pointer-capture machinery the bug lived in and
+    // defeat the point of the guard.
+    const blockIdsBeforeDuplicate = await page.locator(".deck-slide-thumb").evaluateAll(
+      (els) => els.map((el) => el.getAttribute("data-slide-block-id"))
+    );
+    const duplicateTargetThumb = page.locator(".deck-slide-thumb").nth(1);
+    await duplicateTargetThumb.locator(".deck-slide-thumb__duplicate").click();
+    steps.duplicateIncreasedCount = await waitFor(
+      async () => (await page.locator(".deck-slide-thumb").count()) === blockIdsBeforeDuplicate.length + 1
+    );
+    const blockIdsAfterDuplicate = await page.locator(".deck-slide-thumb").evaluateAll(
+      (els) => els.map((el) => el.getAttribute("data-slide-block-id"))
+    );
+    // `duplicate_slide` (deck_view.rs) inserts the copy right after
+    // its source with a freshly generated `block_id` — assert a new
+    // id actually showed up, not just that the count moved (a dead
+    // button plus an unrelated re-render could coincidentally satisfy
+    // a count-only check).
+    const newBlockIds = blockIdsAfterDuplicate.filter((id) => !blockIdsBeforeDuplicate.includes(id));
+    steps.duplicateAddedNewBlockId = newBlockIds.length === 1;
+
+    // Delete the slide duplicated above (index 2, right after its
+    // source at index 1).
+    const deleteTargetIndex = 2;
+    const deleteTargetBlockId = blockIdsAfterDuplicate[deleteTargetIndex];
+    const expectedRemainingBlockIds = blockIdsAfterDuplicate.filter((_, i) => i !== deleteTargetIndex);
+    const deleteTargetThumb = page.locator(".deck-slide-thumb").nth(deleteTargetIndex);
+    await deleteTargetThumb.locator(".deck-slide-thumb__delete").click();
+    steps.deleteDecreasedCount = await waitFor(
+      async () => (await page.locator(".deck-slide-thumb").count()) === blockIdsAfterDuplicate.length - 1
+    );
+    const blockIdsAfterDelete = await page.locator(".deck-slide-thumb").evaluateAll(
+      (els) => els.map((el) => el.getAttribute("data-slide-block-id"))
+    );
+    // Assert the SPECIFIC targeted slide disappeared and every other
+    // slide survived in place — a count-only check would also pass if
+    // the wrong slide were removed.
+    steps.deleteRemovedTargetBlockId =
+      !blockIdsAfterDelete.includes(deleteTargetBlockId) &&
+      JSON.stringify(blockIdsAfterDelete) === JSON.stringify(expectedRemainingBlockIds);
+    await page.screenshot({ path: join(outDir, "4-duplicate-delete.png") }).catch(() => {});
   } catch (e) {
     collector.stepError = `${e.message}`;
   }
@@ -7758,7 +7820,10 @@ async function main() {
       "canvasRendered", "initialThumbCount", "presetPickerVisible",
       "slideAdded", "bodyFramePlaceholderVisible", "inlineEditorMounted",
       "editorClosedAfterEscape", "canvasRenderedAfterReload",
-      "thumbCountPersisted", "typedTextPersisted", "noConsoleErrors",
+      "thumbCountPersisted", "typedTextPersisted", "thirdSlideAdded",
+      "duplicateIncreasedCount", "duplicateAddedNewBlockId",
+      "deleteDecreasedCount", "deleteRemovedTargetBlockId",
+      "noConsoleErrors",
     ],
     "deck-blocks": [
       "canvasRendered", "slideAdded", "editorMounted", "slashMenuOpen",
