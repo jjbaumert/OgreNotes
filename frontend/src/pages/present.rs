@@ -310,42 +310,143 @@ pub fn PresentPage() -> impl IntoView {
     let ws_synced_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (ws_synced, set_ws_synced) = signal(false);
 
+    // #210: bumped by the liveness poll/listener below to re-run the
+    // connect Effect after an idle-disconnect or a network blip —
+    // mirrors document.rs:337's `reconnect_trigger`. Without this the
+    // one-shot `spawn_local` this block used to be could never run
+    // again, so a dropped socket stayed dropped for the rest of the
+    // session.
+    let (reconnect_trigger, set_reconnect_trigger) = signal(0u32);
+
     {
         let id = doc_id();
         let collab_for_connect = std::rc::Rc::clone(&collab_client);
         let synced_for_connect = std::sync::Arc::clone(&ws_synced_flag);
-        leptos::task::spawn_local(async move {
-            let client = CollabClient::new(id.clone(), None);
-            client.set_on_awareness_update(Box::new(move |cursors| {
-                remote_cursors.set(cursors);
-            }));
-            *collab_for_connect.borrow_mut() = Some(client);
+        Effect::new(move |_| {
+            // The only dependency: this Effect's job is purely "(re)connect
+            // now", it doesn't need to react to anything else on the page.
+            let _trigger = reconnect_trigger.get();
 
-            match crate::api::documents::request_ws_token(&id).await {
-                Ok(resp) => {
-                    let origin = web_sys::window()
-                        .and_then(|w| w.location().origin().ok())
-                        .unwrap_or_default();
-                    let ws_origin = if origin.starts_with("https") {
-                        origin.replacen("https", "wss", 1)
-                    } else {
-                        let api_origin = origin.replacen("http", "ws", 1);
-                        if api_origin.contains(":8080") {
-                            api_origin.replace(":8080", ":3000")
+            let has_client = collab_for_connect.borrow().is_some();
+            if has_client {
+                // Reconnect: reuse the existing CollabClient (mirrors
+                // document.rs's same-doc branch) — just disconnect the
+                // old WebSocket; the connect below opens a fresh one.
+                // `ws_synced_flag` is the same `Arc` every time, so the
+                // false it's set to on `onclose` and the true it gets
+                // back on the next SyncStep2 both land on the one signal
+                // the broadcast Effect's `just_resynced` edge-detector
+                // watches.
+                if let Some(ref client) = *collab_for_connect.borrow() {
+                    client.disconnect();
+                }
+            } else {
+                let client = CollabClient::new(id.clone(), None);
+                client.set_on_awareness_update(Box::new(move |cursors| {
+                    remote_cursors.set(cursors);
+                }));
+                *collab_for_connect.borrow_mut() = Some(client);
+            }
+
+            let id = id.clone();
+            let collab_for_token = std::rc::Rc::clone(&collab_for_connect);
+            let synced_for_token = std::sync::Arc::clone(&synced_for_connect);
+            leptos::task::spawn_local(async move {
+                match crate::api::documents::request_ws_token(&id).await {
+                    Ok(resp) => {
+                        let origin = web_sys::window()
+                            .and_then(|w| w.location().origin().ok())
+                            .unwrap_or_default();
+                        let ws_origin = if origin.starts_with("https") {
+                            origin.replacen("https", "wss", 1)
                         } else {
-                            api_origin
+                            let api_origin = origin.replacen("http", "ws", 1);
+                            if api_origin.contains(":8080") {
+                                api_origin.replace(":8080", ":3000")
+                            } else {
+                                api_origin
+                            }
+                        };
+                        let ws_url = format!("{ws_origin}/api/v1/documents/{id}/ws");
+                        if let Some(ref client) = *collab_for_token.borrow() {
+                            client.connect(&ws_url, &resp.token, synced_for_token);
                         }
-                    };
-                    let ws_url = format!("{ws_origin}/api/v1/documents/{id}/ws");
-                    if let Some(ref client) = *collab_for_connect.borrow() {
-                        client.connect(&ws_url, &resp.token, synced_for_connect);
+                    }
+                    Err(e) => {
+                        crate::editor::debug::warn("collab", &format!("ws-token request failed: {e}"));
                     }
                 }
-                Err(e) => {
-                    crate::editor::debug::warn("collab", &format!("ws-token request failed: {e}"));
+            });
+        });
+    }
+
+    // #210 liveness: "visible tab = active" — while the present tab is
+    // visible, keep the connection warm unconditionally (a displayed
+    // slide IS the live session, whether or not anyone is pressing
+    // keys) and ask for a reconnect if the socket isn't up. Deliberately
+    // NOT the 300ms `ws_synced` poll above: that cadence exists to keep
+    // the *awareness broadcast* Effect's reactive dependency reasonably
+    // fresh, but `record_activity()` only matters on a 30-minute
+    // horizon (`IDLE_DISCONNECT_MS`), so ticking it that fast would just
+    // be needless wakeups for no behavioral gain — a slower, independent
+    // interval is enough. The `should_keep_warm`/`should_trigger_reconnect`
+    // predicates live in `presentation::liveness` so they're unit-tested
+    // without a DOM.
+    const LIVENESS_POLL_MS: u32 = 5_000;
+    {
+        let collab = std::rc::Rc::clone(&collab_client);
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let active_for_cleanup = active.clone();
+        on_cleanup(move || active_for_cleanup.store(false, std::sync::atomic::Ordering::Relaxed));
+        leptos::task::spawn_local(async move {
+            loop {
+                gloo_timers::future::TimeoutFuture::new(LIVENESS_POLL_MS).await;
+                if !active.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let visible = web_sys::window()
+                    .and_then(|w| w.document())
+                    .map(|d| !d.hidden())
+                    .unwrap_or(false);
+                let connected =
+                    collab.borrow().as_ref().map(|c| c.is_connected()).unwrap_or(false);
+                if crate::presentation::liveness::should_keep_warm(visible) {
+                    if let Some(ref client) = *collab.borrow() {
+                        client.record_activity();
+                    }
+                }
+                if crate::presentation::liveness::should_trigger_reconnect(visible, connected) {
+                    let _ = set_reconnect_trigger.try_update(|n| *n += 1);
                 }
             }
         });
+    }
+
+    // #210: a `visibilitychange` listener alongside the poll above gives
+    // an immediate reconnect the instant the tab comes back to the
+    // foreground, rather than waiting for the next `LIVENESS_POLL_MS`
+    // tick — the poll is the backstop that also catches a mid-session
+    // drop while the tab stays visible the whole time (a network blip),
+    // which a visibility listener alone would never observe. Same
+    // `window_event_listener_untyped` + `on_cleanup` pattern as the
+    // keydown handler above.
+    {
+        let collab_for_visibility = std::rc::Rc::clone(&collab_client);
+        let handle = window_event_listener_untyped("visibilitychange", move |_ev: web_sys::Event| {
+            let visible = web_sys::window()
+                .and_then(|w| w.document())
+                .map(|d| !d.hidden())
+                .unwrap_or(false);
+            let connected = collab_for_visibility
+                .borrow()
+                .as_ref()
+                .map(|c| c.is_connected())
+                .unwrap_or(false);
+            if crate::presentation::liveness::should_trigger_reconnect(visible, connected) {
+                let _ = set_reconnect_trigger.try_update(|n| *n += 1);
+            }
+        });
+        on_cleanup(move || handle.remove());
     }
 
     let color_idx = {
@@ -469,6 +570,30 @@ pub fn PresentPage() -> impl IntoView {
             }
         }
     });
+
+    // #210: a real slide change — manual navigation or a follow-driven
+    // one, both of which land here through `set_idx` — is itself a
+    // liveness signal, so record it too. This is a dedicated Effect
+    // rather than folded into the awareness-broadcast Effect above on
+    // purpose: that Effect also re-runs on every 300ms `ws_synced` poll
+    // tick once synced (see its comment), so recording activity there
+    // would re-arm `record_activity()` every 300ms — exactly the "ping
+    // too fast" this liveness fix is meant to avoid. `prev_idx` gates on
+    // an actual change so mounting at idx 0 counts once, not on every
+    // poll-driven re-run of some other Effect.
+    {
+        let collab = std::rc::Rc::clone(&collab_client);
+        let prev_idx: StoredValue<Option<usize>> = StoredValue::new(None);
+        Effect::new(move |_| {
+            let i = idx.get();
+            if prev_idx.get_value() != Some(i) {
+                prev_idx.set_value(Some(i));
+                if let Some(ref client) = *collab.borrow() {
+                    client.record_activity();
+                }
+            }
+        });
+    }
 
     view! {
         <main
