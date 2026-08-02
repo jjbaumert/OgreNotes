@@ -452,6 +452,14 @@ pub(crate) fn parse_quip_counting_truncations(html: &str) -> (Vec<QuipBlock>, us
         .read_from(&mut safe.as_bytes())
         .expect("html5ever parse is infallible on bytes");
 
+    // Drop Quip's per-cell line terminators BEFORE anything reshapes the
+    // tree. Order is load-bearing: `normalize_quip_lists` re-parents a
+    // sibling `<ul>` onto the end of the `<li>` that owns it, which lands
+    // *after* the terminator and would stop it being the item's last child.
+    // Deciding the question on the markup as Quip wrote it keeps the rule
+    // independent of every later rewrite.
+    strip_cell_terminators(&dom.document);
+
     // Rewrite Quip's two list-structure spellings into ordinary HTML first —
     // nesting a list inside the item that owns it deepens the tree, so this
     // has to happen on the *un*bounded tree for the bound below to still hold
@@ -819,6 +827,90 @@ fn is_layout_whitespace(handle: &markup5ever_rcdom::Handle) -> bool {
 fn append_child(parent: &markup5ever_rcdom::Handle, child: markup5ever_rcdom::Handle) {
     child.parent.set(Some(std::rc::Rc::downgrade(parent)));
     parent.children.borrow_mut().push(child);
+}
+
+/// Remove the trailing `<br>` Quip emits as a **line terminator** at the
+/// end of every `<li>`, `<td>` and `<th>` (#189).
+///
+/// Quip's editor closes the content of every list item and every table
+/// cell with a `<br/>` immediately before the closing tag. It is a
+/// serializer artifact, not something the author typed: kept, it renders
+/// as a blank line under every bullet and inside every cell. The Phase-2a
+/// fidelity audit (F-3) counted 5483 of them across 47 of the 56 staged
+/// documents — very nearly every document that has a list or a table; 659
+/// of those are in the five threads checked in under `tests/fixtures/`.
+///
+/// **Discriminate by position, never by presence.** A `<br>` anywhere
+/// else inside the same element *is* authored content: `a<br/>b` in a
+/// cell is two lines the author wrote and stays two lines. Only the break
+/// that is the last meaningful child is a terminator, and exactly one is
+/// removed per cell — `a<br/><br/>` keeps the first.
+///
+/// Runs as a DOM pre-pass rather than inside the walker so the question
+/// is answered against the markup Quip actually wrote; see the ordering
+/// comment in [`parse_quip_counting_truncations`]. Iterative for the same
+/// reason [`flatten_below_depth`] is: it runs on the un-bounded tree.
+///
+/// # This is the exact opposite of #184 — deliberately, do not unify
+///
+/// #184 fixed the inverse defect: a `<br>` inside `<pre>` contributed
+/// **nothing** and had to *become* a newline, which is why [`raw_text`]
+/// now emits `\n` for it. Same element, opposite treatment, because the
+/// container differs. Inside `<pre>` every `<br>` is a real line
+/// separator, the last one included; inside `<li>`/`<td>`/`<th>` the last
+/// one is Quip's terminator and every other one is authored. A single
+/// shared "how should the importer treat `<br>`?" rule cannot satisfy
+/// both — it would either resurrect the blank lines this pass removes or
+/// swallow a line of code. `<pre>` is untouched here precisely because
+/// this pass only ever looks at the direct children of a cell, and a
+/// `<pre>` child ends the scan like any other element.
+fn strip_cell_terminators(root: &markup5ever_rcdom::Handle) {
+    let mut stack = vec![root.clone()];
+    while let Some(node) = stack.pop() {
+        if matches!(tag_of(&node).as_deref(), Some("li" | "td" | "th"))
+            && let Some(i) = terminal_break_index(&node)
+        {
+            node.children.borrow_mut().remove(i);
+        }
+        for child in node.children.borrow().iter() {
+            stack.push(child.clone());
+        }
+    }
+}
+
+/// Index, among `handle`'s direct children, of the `<br>` that terminates
+/// it — or `None` when it does not end in one.
+///
+/// "Last meaningful child" means last once the whitespace-only text nodes
+/// and comments Quip's serializer leaves behind are ignored. The shape in
+/// the corpus is `<span>…</span>\n\n<br/></li>`: the `\n\n` sits *before*
+/// the break, so the break is genuinely the final node — but the scan
+/// tolerates whitespace on either side rather than betting on that.
+///
+/// Anything else — a text node with real content, any other element —
+/// ends the scan immediately, because then the `<br>` was not the last
+/// thing in the cell and is authored content. Only *direct* children are
+/// considered: no document in the corpus spells the terminator as
+/// `<span>…<br/></span></li>`, and reaching into the final inline wrapper
+/// would be guessing at markup nobody has seen.
+fn terminal_break_index(handle: &markup5ever_rcdom::Handle) -> Option<usize> {
+    use markup5ever_rcdom::NodeData;
+    let children = handle.children.borrow();
+    for (i, child) in children.iter().enumerate().rev() {
+        match &child.data {
+            NodeData::Text { contents } => {
+                if !contents.borrow().as_ref().trim().is_empty() {
+                    return None;
+                }
+            }
+            NodeData::Comment { .. } => {}
+            NodeData::Element { name, .. } if name.local.as_ref().eq_ignore_ascii_case("br") => {
+                return Some(i);
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// The lowercased tag name of an element node, or `None` for anything
@@ -3689,6 +3781,285 @@ mod tests {
             }
         }
         assert_eq!(seen, vec!["text:a", "hard_break", "text:b"], "{seen:?}");
+    }
+
+    // ─── #189: Quip's per-cell line terminator ───────────────
+    //
+    // Every string below starts as markup copied byte-for-byte out of
+    // `tests/fixtures/quip/corpus/` — the same real thread bodies the
+    // regression net loads.
+    //
+    // Four of them then edit that markup, because the shape being tested
+    // does not occur in the corpus at all: every `<br>` outside a `<pre>`
+    // in all five fixtures is a terminator, so a mid-content break, a
+    // doubled break, a break-only item and a whitespace-after-the-break
+    // item all have to be constructed. Each edit is a single insertion or
+    // deletion, called out in that test's own doc comment. Everything
+    // around it — the `id`s, the quote style, the `\n\n` before the
+    // break — is untouched, because those are exactly the details
+    // hand-authored fixtures got wrong in this feature seven times
+    // running.
+
+    /// Rendered shape of a span run: text, with `⏎` marking a span that
+    /// carries `hard_break_before`. Assert-on-this rather than on a count,
+    /// so a test says *where* a break is, not merely how many there are.
+    fn spans_shape(spans: &[Span]) -> String {
+        spans
+            .iter()
+            .map(|s| if s.hard_break_before { format!("⏎{}", s.text) } else { s.text.clone() })
+            .collect()
+    }
+
+    fn only_item_shape(html: &str) -> String {
+        match blocks(html).as_slice() {
+            [QuipBlock::List { items, .. }] => match items.as_slice() {
+                [QuipItem { blocks, .. }] => match blocks.as_slice() {
+                    [QuipBlock::Para { spans, .. }] => spans_shape(spans),
+                    other => panic!("expected one paragraph, got {other:?}"),
+                },
+                other => panic!("expected one item, got {other:?}"),
+            },
+            other => panic!("expected one list, got {other:?}"),
+        }
+    }
+
+    /// `SSfAAALs7fy`, first checklist item, verbatim.
+    #[test]
+    fn the_break_that_terminates_an_li_is_dropped() {
+        let html = "<div data-section-style='7' class=\"\" style=\"\"><ul id='SSfACAKV4zR'>\
+                    <li id='SSfACA046uk' class='' style='' value='1'><span id='SSfACA046uk'>\
+                    Prize did round night in kind porloremips read is any do.</span>\n\n\
+                    <br/></li></ul></div>";
+        assert_eq!(
+            only_item_shape(html),
+            "Prize did round night in kind porloremips read is any do.",
+            "the `\\n\\n<br/>` before </li> is Quip's line terminator, not content"
+        );
+    }
+
+    /// `QGYAAAjicgG`, first body row, verbatim: a row-number `<td>` with
+    /// **no** terminator followed by two cells that have one. Both halves
+    /// matter — the rule must not touch the cell that never had a break.
+    #[test]
+    fn the_break_that_terminates_a_td_is_dropped_and_a_cell_without_one_is_untouched() {
+        let html = "<table id='temp:C:QGYfc8d4eb3ee71488795cd938e6' title='eager port' \
+             style='width: 96em'><tbody>\
+             <tr id='temp:C:QGYe66f22cd7b834833a7ee9dc58'>\
+             <td style='background-color:#f0f0f0'>1</td>\
+             <td id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d' \
+             style=''><span id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d'>\
+             as</span>\n\n<br/></td>\
+             <td id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGYf52ff49275694bfe880cf8613' \
+             style=''><span id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGYf52ff49275694bfe880cf8613'>\
+             no</span>\n\n<br/></td></tr></tbody></table>";
+        let parsed = blocks(html);
+        let [QuipBlock::Table { rows }] = parsed.as_slice() else { panic!("expected a table") };
+        let [row] = rows.as_slice() else { panic!("expected one row") };
+        let shapes: Vec<String> = row
+            .cells
+            .iter()
+            .map(|c| match c.blocks.as_slice() {
+                [QuipBlock::Para { spans, .. }] => spans_shape(spans),
+                other => panic!("expected one paragraph per cell, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(shapes, vec!["1", "as", "no"], "three cells, no break in any of them");
+    }
+
+    /// `QGYAAAjicgG`, a `<thead>` column header, verbatim. A `<th>` spells
+    /// the terminator with no whitespace at all — `A<br/></th>` — so the
+    /// scan cannot depend on the `\n\n` being there.
+    #[test]
+    fn the_break_that_terminates_a_th_is_dropped() {
+        let html = "<table id='temp:C:QGYfc8d4eb3ee71488795cd938e6' title='eager port' \
+             style='width: 96em'><thead><tr><th class='empty' style='width: 2em'/>\
+             <th id='temp:C:QGY04be7f796bf1483e87f847ed3' class='empty' style='width: 6em'>A<br/>\
+             </th></tr></thead></table>";
+        let parsed = blocks(html);
+        let [QuipBlock::Table { rows }] = parsed.as_slice() else { panic!("expected a table") };
+        let [row] = rows.as_slice() else { panic!("expected one row") };
+        assert!(row.cells.iter().all(|c| c.header), "both cells are <th>");
+        let shapes: Vec<String> = row
+            .cells
+            .iter()
+            .map(|c| match c.blocks.as_slice() {
+                [QuipBlock::Para { spans, .. }] => spans_shape(spans),
+                other => panic!("expected one paragraph per cell, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(shapes, vec!["", "A"], "the self-closing <th> stays empty; 'A' keeps no break");
+    }
+
+    /// **The load-bearing one.** Same verbatim `SSfAAALs7fy` item as
+    /// `the_break_that_terminates_an_li_is_dropped`, with one `<br/>`
+    /// added in the middle of the span. That break is something a human
+    /// typed and must survive; only the one before `</li>` goes.
+    ///
+    /// The corpus has no such item — every `<br>` outside a `<pre>` in all
+    /// five fixtures is a terminator, which is why this shape has to be
+    /// constructed. Constructed *from* a real item, not from scratch.
+    #[test]
+    fn a_mid_item_break_survives_while_the_terminator_goes() {
+        let html = "<div data-section-style='7' class=\"\" style=\"\"><ul id='SSfACAKV4zR'>\
+                    <li id='SSfACA046uk' class='' style='' value='1'><span id='SSfACA046uk'>\
+                    Prize did round night<br/>in kind porloremips read is any do.</span>\n\n\
+                    <br/></li></ul></div>";
+        assert_eq!(
+            only_item_shape(html),
+            "Prize did round night⏎in kind porloremips read is any do.",
+            "one break in, one break out: the mid-item break is authored content"
+        );
+    }
+
+    /// Two breaks in a row at the end: the last is the terminator, the one
+    /// before it is a blank line the author asked for. Exactly one goes.
+    #[test]
+    fn only_the_last_of_two_consecutive_trailing_breaks_is_dropped() {
+        let html = "<div data-section-style='7' class=\"\" style=\"\"><ul id='SSfACAKV4zR'>\
+                    <li id='SSfACA046uk' class='' style='' value='1'><span id='SSfACA046uk'>\
+                    Prize did round night in kind porloremips read is any do.</span>\n\n\
+                    <br/><br/></li></ul></div>";
+        // The trailing space is the `\n\n` before the first break, which is
+        // now *interior* to the run rather than at its end — `trim_spans`
+        // only ever trimmed the outermost span, and a surviving break is
+        // content that comes after it. Same shape any mid-content break
+        // produces; recorded rather than tidied so a future change to that
+        // trimming is visible here.
+        assert_eq!(
+            only_item_shape(html),
+            "Prize did round night in kind porloremips read is any do. ⏎",
+            "the inner break stays; a per-cell rule removes one terminator, not a run"
+        );
+    }
+
+    /// The whitespace-node case, stated on its own because it is the shape
+    /// the corpus actually has: `</span>\n\n<br/></li>`. A naive "is the
+    /// final child a `<br>`?" reading of *idealized* markup would work here
+    /// only by luck — the `\n\n` sits before the break — so this also pins
+    /// the mirror case, whitespace *after* the break, which the scan skips.
+    #[test]
+    fn whitespace_text_nodes_around_the_terminator_do_not_hide_it() {
+        let before = "<div data-section-style='7' class=\"\" style=\"\"><ul id='SSfACAKV4zR'>\
+                      <li id='SSfACA046uk' class='' style='' value='1'><span id='SSfACA046uk'>\
+                      Prize did round night in kind porloremips read is any do.</span>\n\n\
+                      <br/></li></ul></div>";
+        let after = "<div data-section-style='7' class=\"\" style=\"\"><ul id='SSfACAKV4zR'>\
+                     <li id='SSfACA046uk' class='' style='' value='1'><span id='SSfACA046uk'>\
+                     Prize did round night in kind porloremips read is any do.</span>\
+                     <br/>\n\n</li></ul></div>";
+        assert_eq!(only_item_shape(before), only_item_shape(after));
+        assert_eq!(
+            only_item_shape(after),
+            "Prize did round night in kind porloremips read is any do.",
+            "a trailing whitespace text node must not shield the terminator"
+        );
+    }
+
+    /// An `<li>` whose entire content is the terminator. **Decision: the
+    /// item survives as an empty one**, it is not dropped.
+    ///
+    /// Quip renders that markup as a bullet with nothing next to it — the
+    /// author pressed Enter and left the line blank — so the bullet is the
+    /// content and deleting it would silently renumber or shorten a list.
+    /// `flatten_list` already gives a body-less item an `empty_para()`, so
+    /// this falls out of the existing rule rather than needing one of its
+    /// own; the test exists to pin the choice, not the mechanism.
+    ///
+    /// Constructed by emptying the `<span>` of the same verbatim item.
+    #[test]
+    fn an_li_holding_only_the_terminator_stays_an_empty_item() {
+        let html = "<div data-section-style='7' class=\"\" style=\"\"><ul id='SSfACAKV4zR'>\
+                    <li id='SSfACA046uk' class='' style='' value='1'><br/></li></ul></div>";
+        let parsed = blocks(html);
+        let [QuipBlock::List { items, .. }] = parsed.as_slice() else {
+            panic!("expected one list, got {parsed:?}")
+        };
+        assert_eq!(items.len(), 1, "the empty bullet is still a bullet");
+        assert_eq!(items[0].blocks, vec![empty_para()], "with an empty body, not a hard break");
+    }
+
+    /// `AeOAAAcV1hg`'s whole bullet section, verbatim — the shape that makes
+    /// the *ordering* of the pass load-bearing, and the only mutation of
+    /// this fix the corpus net caught on its own.
+    ///
+    /// `<li class='parent'>…<br/></li><ul>…</ul>` is how Quip nests. #187
+    /// re-parents that sibling `<ul>` onto the end of the `<li>`, which puts
+    /// a `<ul>` *after* the terminator; run the terminator scan afterwards
+    /// and the break is no longer the item's last child, so it survives on
+    /// every parent item in the corpus. Hence `strip_cell_terminators` runs
+    /// before `normalize_quip_lists` — the question is asked of the markup
+    /// Quip wrote, not of the tree a later pass reshaped.
+    #[test]
+    fn a_parent_item_that_owns_a_nested_list_still_loses_its_terminator() {
+        let html = "<div data-section-style='5' class=\"\" style=\"\">\
+             <ul id='temp:C:AeO6b3a4714314f44579cbb3cf0c'>\
+             <li id='temp:C:AeObe85961cb2d4496ea374e229d' class='parent' style='' value='1'>\
+             <span id='temp:C:AeObe85961cb2d4496ea374e229d'>Broad</span>\n\n<br/></li><ul>\
+             <li id='temp:C:AeOff88d93bfbbd411981d8990df' class='' style=''>\
+             <span id='temp:C:AeOff88d93bfbbd411981d8990df'>\u{200b}</span>\n\n<br/></li>\
+             </ul></ul></div>";
+        let parsed = blocks(html);
+        let [QuipBlock::List { items, .. }] = parsed.as_slice() else {
+            panic!("expected one list, got {parsed:?}")
+        };
+        let [outer] = items.as_slice() else { panic!("expected one outer item, got {items:?}") };
+        let [QuipBlock::Para { spans, .. }, QuipBlock::List { items: inner, .. }] =
+            outer.blocks.as_slice()
+        else {
+            panic!("expected text then a nested list, got {:?}", outer.blocks)
+        };
+        assert_eq!(spans_shape(spans), "Broad", "the parent item's terminator is gone");
+        let [QuipBlock::Para { spans: inner_spans, .. }] = inner[0].blocks.as_slice() else {
+            panic!("expected a nested item paragraph, got {:?}", inner[0].blocks)
+        };
+        assert_eq!(
+            spans_shape(inner_spans),
+            "\u{200b}",
+            "and so is the nested item's — the U+200B spacer stays, the break goes"
+        );
+    }
+
+    /// The #184 boundary, asserted from this side: a `<br>` inside a
+    /// `<pre>` is a line separator and stays one, terminator rule or not.
+    /// `CVLAAAgSl7Q`'s code-block markup, shortened but otherwise verbatim.
+    #[test]
+    fn the_cell_terminator_rule_does_not_reach_into_a_pre() {
+        let html = "<pre id='temp:C:CVL09a9aeedb1db4947b4fabcc84' class='prettyprint'>\
+                    #[component]<br>pub fn GameDetail() {<br>}</pre>";
+        let parsed = blocks(html);
+        let [QuipBlock::Code { text, .. }] = parsed.as_slice() else {
+            panic!("expected a code block, got {parsed:?}")
+        };
+        assert_eq!(text, "#[component]\npub fn GameDetail() {\n}", "every <br> here is a newline");
+    }
+
+    /// And the same boundary with the `<pre>` inside a table cell, which is
+    /// where a future "unify the two `<br>` rules" change would do its
+    /// damage: the cell's last child is the `<pre>`, so there is no
+    /// terminator to remove and the code block's own breaks are untouched.
+    #[test]
+    fn a_pre_at_the_end_of_a_cell_keeps_all_of_its_line_breaks() {
+        let html = "<table><tbody><tr><td id='temp:s:temp:C:QGY4a3392935297410e89f835d1d' style=''>\
+                    <pre id='temp:C:CVL09a9aeedb1db4947b4fabcc84' class='prettyprint'>\
+                    a<br>b<br>c</pre></td></tr></tbody></table>";
+        let blocks = blocks(html);
+        let code: Vec<&String> = blocks
+            .iter()
+            .flat_map(|b| match b {
+                QuipBlock::Table { rows } => rows
+                    .iter()
+                    .flat_map(|r| r.cells.iter())
+                    .flat_map(|c| c.blocks.iter())
+                    .collect::<Vec<_>>(),
+                other => vec![other],
+            })
+            .filter_map(|b| match b {
+                QuipBlock::Code { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(code.len(), 1, "one code block, got {blocks:?}");
+        assert_eq!(code[0].lines().count(), 3, "all three lines survive: {:?}", code[0]);
     }
 
     #[test]
