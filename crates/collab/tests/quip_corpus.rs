@@ -55,7 +55,7 @@
 //! are raw HTML. That unwrapping happens in the **worker**
 //! (`crates/api/src/worker_mode.rs`), not in this crate — `from_quip_html`
 //! only ever sees HTML, so the fixtures here are the extracted bodies. Both
-//! staged spellings of each of these five threads were confirmed to carry a
+//! staged spellings of each of these six threads were confirmed to carry a
 //! byte-identical body.
 //!
 //! # Some assertions below encode CURRENT, BUGGY behaviour
@@ -69,20 +69,27 @@
 //! **No forecast is currently open.** #187 (nesting) and #188 (numbering)
 //! landed together in PR #200 and their assertions now record the fixed
 //! values, annotated `#NNN (PR #200)`. #189 (trailing breaks) has since
-//! landed too and its four assertions now record the achieved value — zero
-//! hard breaks in all five fixtures. #190 (section anchors) has now landed
-//! as well: the five `sections.len()` assertions went 11→71, 23→170, 44→46,
-//! 5→10 and 1→528, and every one of them is now stated as *achieved*.
+//! landed too and its assertions now record the achieved value — every
+//! terminator dropped, and (since `ffbAAA8eMpE`) every authored break kept.
+//! #190 (section anchors) has now landed as well: the five original
+//! `sections.len()` assertions went 11→71, 23→170, 44→46, 5→10 and 1→528,
+//! and every one of them is now stated as *achieved*.
 //!
 //! # Known coverage gaps in this fixture set
 //!
 //! Deliberate, so nobody mistakes a zero for a passing assertion: no fixture
-//! here contains `<hr>`, inline `<code>`, `<sup>`, a live-app payload (#191),
-//! a nested table, or `colspan`/`rowspan`. The corpus documents richest in
-//! images and external links are also the most personal (recruiter
-//! correspondence, financial holdings), and scrubbing their URLs would gut
-//! exactly what makes a link fixture meaningful — so image coverage here is
-//! the single benign image section in `ZaNAAAU4ELc`.
+//! here contains `<sup>`, a live-app payload (#191), a nested table, or
+//! `colspan`/`rowspan`. The corpus documents richest in images and external
+//! links are also the most personal (recruiter correspondence, financial
+//! holdings), and scrubbing their URLs would gut exactly what makes a link
+//! fixture meaningful — so image coverage here is the single benign image
+//! section in `ZaNAAAU4ELc`.
+//!
+//! `ffbAAA8eMpE` (#233) closed three of these: `<hr>`, inline `<code>`, and
+//! the authored mid-content `<br>` that the trailing-break rule has to leave
+//! alone. It was added for none of those — it is here because it is the
+//! corpus's only **prose table with a `<thead>`**, the shape #230's fix
+//! promised not to touch and that nothing here could previously check.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -93,9 +100,9 @@ use ogrenotes_collab::import_quip::{
 use yrs::types::xml::{XmlFragment, XmlOut};
 use yrs::{Any, Doc, Out, ReadTxn, Text, Transact, Xml, XmlElementRef};
 
-/// The five thread bodies checked in, in the order they are described above.
+/// The six thread bodies checked in, in the order they are described above.
 const CORPUS: &[&str] =
-    &["AeOAAAcV1hg", "CVLAAAgSl7Q", "ZaNAAAU4ELc", "SSfAAALs7fy", "QGYAAAjicgG"];
+    &["AeOAAAcV1hg", "CVLAAAgSl7Q", "ZaNAAAU4ELc", "SSfAAALs7fy", "QGYAAAjicgG", "ffbAAA8eMpE"];
 
 // ─── fixture loading ─────────────────────────────────────────────
 
@@ -104,6 +111,21 @@ fn fixture(thread_id: &str) -> String {
         .join("tests/fixtures/quip/corpus")
         .join(format!("{thread_id}.html"));
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// The fixture with its provenance comment removed. Those headers quote the
+/// markup they describe, so any test that *counts* markup has to read past
+/// them; the walker itself does not care, and `fixture` is what it is given.
+fn fixture_body(thread_id: &str) -> String {
+    let html = fixture(thread_id);
+    let mut out = String::new();
+    let mut tail = html.as_str();
+    while let Some(open) = tail.find("<!--") {
+        out.push_str(&tail[..open]);
+        tail = tail[open + 4..].split_once("-->").map_or("", |(_, t)| t);
+    }
+    out.push_str(tail);
+    out
 }
 
 // ─── the census ──────────────────────────────────────────────────
@@ -443,6 +465,53 @@ fn first_table_grid(doc: &Doc) -> Vec<Vec<(bool, String)>> {
 /// Column `index` of a grid, top to bottom.
 fn column(grid: &[Vec<(bool, String)>], index: usize) -> Vec<&str> {
     grid.iter().filter_map(|r| r.get(index)).map(|(_, t)| t.as_str()).collect()
+}
+
+/// Every `table` in the document, in document order, each row-major as
+/// `(is_header_cell, text)`. `first_table_grid` answers "where did this land";
+/// this answers the same question for a document with more than one table.
+fn all_table_grids(doc: &Doc) -> Vec<Vec<Vec<(bool, String)>>> {
+    fn collect<T: ReadTxn>(txn: &T, el: &XmlElementRef, out: &mut Vec<XmlElementRef>) {
+        if el.tag().as_ref() == "table" {
+            out.push(el.clone());
+        }
+        for i in 0..el.len(txn) {
+            if let Some(XmlOut::Element(child)) = el.get(txn, i) {
+                collect(txn, &child, out);
+            }
+        }
+    }
+
+    let txn = doc.transact();
+    let Some(frag) = txn.get_xml_fragment("content") else { return Vec::new() };
+    let mut tables = Vec::new();
+    for i in 0..frag.len(&txn) {
+        if let Some(XmlOut::Element(el)) = frag.get(&txn, i) {
+            collect(&txn, &el, &mut tables);
+        }
+    }
+    tables
+        .iter()
+        .map(|table| {
+            (0..table.len(&txn))
+                .filter_map(|r| match table.get(&txn, r) {
+                    Some(XmlOut::Element(row)) => Some(row),
+                    _ => None,
+                })
+                .map(|row| {
+                    (0..row.len(&txn))
+                        .filter_map(|c| match row.get(&txn, c) {
+                            Some(XmlOut::Element(cell)) => Some((
+                                cell.tag().as_ref() == "table_header",
+                                element_text(&txn, &cell),
+                            )),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
 }
 
 // ─── per-fixture assertions ──────────────────────────────────────
@@ -931,6 +1000,229 @@ fn the_same_grid_markup_imported_as_a_document_keeps_its_header_row() {
     assert_eq!(quip.sections.len(), 528, "no anchor is lost on the document path");
 }
 
+/// `ffbAAA8eMpE` — prose tables carrying the spreadsheet's grid chrome.
+///
+/// Five `data-section-style='13'` tables, every one with a real `<thead>`:
+/// the empty 2em corner `<th>`, then genuine headings, then a
+/// `#f0f0f0` row-number gutter down every body row. Byte-identical chrome to
+/// `QGYAAAjicgG`'s, on a `document` thread — the shape #230's fix must not
+/// touch, and the shape no other committed fixture had (#233).
+///
+/// It is also the corpus's first `<hr>`, first inline `<code>`, and first
+/// **authored** mid-content `<br>`: 73 of them, none a cell terminator. The
+/// other five fixtures cannot state that half of #189's contract because
+/// every `<br>` in them is a terminator.
+#[test]
+fn corpus_prose_tables_with_header_rows() {
+    let (html, quip, c) = import("ffbAAA8eMpE");
+
+    assert_eq!(c.headings.get("1"), Some(&1), "h1");
+    assert_eq!(c.headings.get("2"), Some(&6), "h2");
+    assert_eq!(c.headings.get("3"), Some(&13), "h3");
+    // 41 `<p>` + 73 `<li>` + 88 `<td>` + 20 `<th>`.
+    assert_eq!(c.paragraphs, 222, "paragraph blocks");
+
+    assert_eq!(c.tables, 5, "data-section-style='13' sections");
+    assert_eq!(c.table_rows, 27, "5 header rows + 22 body rows");
+    assert_eq!(c.table_cells, 88, "table_cell");
+    // The number this fixture was added for. `AeOAAAcV1hg` has tables but
+    // spells its header row with `<td class='bold'>`; this is the corpus's
+    // only real `<th>` heading outside the spreadsheet.
+    assert_eq!(c.table_headers, 20, "<th> — 5 empty corners + 15 real headings");
+
+    assert_eq!(c.bullet_lists, 21, "data-section-style='5' sections");
+    assert_eq!(c.list_items, 73, "list_item elements");
+    assert_eq!(c.ordered_lists, 0);
+    assert_eq!(c.task_lists, 0);
+    assert_eq!(c.max_list_depth, 1, "this document nests no list");
+
+    // The corpus's first horizontal rules — `<hr style='width:100%'>`, the
+    // only spelling Quip emits.
+    assert_eq!(c.horizontal_rules, 10, "<hr> blocks");
+    // Read past the provenance comment: it quotes both of these spellings.
+    let body = fixture_body("ffbAAA8eMpE");
+    assert_eq!(body.matches("<hr style='width:100%'>").count(), 10, "Quip's <hr> spelling");
+
+    assert_eq!(c.code_blocks, 0, "no <pre> here — the inline <code> is a mark");
+    assert_eq!(c.images, 0);
+    assert_eq!(quip.images.len(), 0);
+    assert_eq!(c.blockquotes, 0);
+    assert_eq!(c.mentions, 0);
+    assert_eq!(c.doc_mentions, 0);
+
+    // #189, the half the other five cannot state. The source has 227 `<br>`
+    // outside a `<pre>`: 154 terminate an `<li>`/`<td>`/`<th>` and go, and
+    // 73 are authored — a `<br>` between two lines of a `class='line'`
+    // paragraph, or leading the text of a table cell. Every one of those 73
+    // survives as a `hard_break` leaf, and none of them ends its block.
+    assert_eq!(c.hard_breaks, 73, "authored breaks survive (#189)");
+    assert_eq!(c.trailing_hard_breaks, 0, "no trailing hard_break survives (#189)");
+
+    assert_eq!(c.mark("bold"), 48, "bold runs");
+    assert_eq!(c.mark("italic"), 1, "italic run");
+    assert_eq!(c.mark("code"), 1, "the corpus's only inline <code>");
+    assert_eq!(c.mark("link"), 0, "this document has no anchor at all");
+    assert_eq!(body.matches("<code>").count(), 1, "Quip's inline code spelling");
+
+    // 418 `id` attributes; 155 of them are `<span>`s. 154 repeat their
+    // `<li>`/`<td>`/`<th>`'s id byte for byte (`spans_repeat_their_parents_id`)
+    // and resolve through it; the 155th is the comment-annotation span
+    // described at `every_uncaptured_source_id_is_one_of_the_three_known_
+    // residues`, and it is the one id in this document with nothing to
+    // resolve to. 418 - 155 = 263.
+    assert_eq!(source_id_count(&html), 418, "id attributes present in the source");
+    assert_eq!(quip.sections.len(), 263, "section ids captured (#190)");
+
+    assert_eq!(quip.formulas_dropped, 0, "no formula in a prose table");
+    assert_eq!(quip.live_apps_dropped, 0);
+    assert_eq!(quip.pending_links.len(), 0);
+    assert_eq!(quip.person_mentions.len(), 0);
+    assert_eq!(quip.deep_nesting_truncated, 0, "nothing exceeded MAX_NESTING_DEPTH");
+}
+
+/// **#233.** The property #230 promised not to break, on the real markup that
+/// made it a promise: five prose tables whose `<thead>` rows hold genuine
+/// headings, imported the way production imports them.
+///
+/// Twenty `<th>` across five tables. Every one keeps its text, and the
+/// `#f0f0f0` gutter that #230's fix strips from a sheet stays here as
+/// content. If the strip ever fires on a `document` thread, this is red.
+#[test]
+fn corpus_prose_table_headers_and_gutters_survive_the_document_path() {
+    let (_html, quip, c) = import("ffbAAA8eMpE");
+    let grids = all_table_grids(&quip.doc);
+    assert_eq!(grids.len(), 5, "five data-section-style='13' sections");
+
+    // Shape, table by table: header row plus body rows, uniform width.
+    let shape: Vec<(usize, usize)> =
+        grids.iter().map(|g| (g.len(), g.first().map_or(0, Vec::len))).collect();
+    assert_eq!(
+        shape,
+        vec![(5, 3), (6, 3), (5, 4), (5, 5), (6, 5)],
+        "rows × columns per table — the header row and the gutter are both present",
+    );
+    for (t, grid) in grids.iter().enumerate() {
+        let widths: Vec<usize> = grid.iter().map(Vec::len).collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0]),
+            "table {t} is ragged: {widths:?} — a partial strip looks exactly like this",
+        );
+    }
+
+    // Every cell of every first row is a `table_header`, and every one after
+    // the empty 2em corner carries text. This is the assertion the whole
+    // fixture exists for: `<th>` headings are content, not chrome.
+    let mut headings: Vec<&str> = Vec::new();
+    for (t, grid) in grids.iter().enumerate() {
+        assert!(
+            grid[0].iter().all(|(header, _)| *header),
+            "table {t}: the whole first row must still be <th>: {:?}",
+            grid[0],
+        );
+        assert_eq!(grid[0][0].1, "", "table {t}: the corner <th> is the empty 2em one");
+        for (_, text) in &grid[0][1..] {
+            assert!(!text.trim().is_empty(), "table {t}: an empty heading — the strip fired");
+            headings.push(text);
+        }
+    }
+    assert_eq!(headings.len(), 15, "headings, corners excluded");
+    assert_eq!(c.table_headers, 20, "<th> elements, the five corners included");
+
+    // The permissions table, spelled out. Scrubbed, so the words are filler
+    // of the source's lengths — `Access Level` / `Can Read Comments` /
+    // `Can Comment` / `Can Edit Document`, 12/17/11/17 characters. Their
+    // *presence and position* is the assertion; a strip takes the whole row.
+    assert_eq!(
+        grids[3][0].iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+        vec!["", "Oremip Treat", "Any Work Scingeli", "Any Ctetura", "Any Hear Mporlore"],
+        "the permissions table's header row, in order",
+    );
+    // Its body is the corpus's only U+2713/U+2717 content, and it sits one
+    // column right of the gutter — so a gutter strip would take the labels
+    // and leave the ticks.
+    assert_eq!(
+        column(&grids[3], 1)[1..],
+        ["Wire Oremip", "Hear", "Ctetura", "Pool long"],
+        "column B is the access-level labels, not the ticks",
+    );
+    assert_eq!(grids[3][1][2].1, "\u{2713}", "the check marks survive scrubbing and import");
+    assert_eq!(grids[3][4][3].1, "\u{2717}", "and so does the cross");
+
+    // The gutter, on every body row of every table: a non-header cell of
+    // digits in column A. Scrubbing rewrites the digits, so `1..N` is not
+    // recoverable here — that they are digits, in column A, and still cells
+    // at all, is what survives and what is being pinned.
+    for (t, grid) in grids.iter().enumerate() {
+        for (r, row) in grid.iter().enumerate().skip(1) {
+            let (header, text) = &row[0];
+            assert!(!header, "table {t} row {r}: the gutter cell must be a <td>");
+            assert!(
+                !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()),
+                "table {t} row {r}: gutter cell {text:?} is not the row-number ruler",
+            );
+        }
+    }
+    assert_eq!(c.table_cells, 88, "22 gutter cells + 66 data cells");
+    assert_eq!(c.table_rows, 27, "5 header rows + 22 body rows");
+}
+
+/// **#233, the sharp end.** These five prose tables satisfy #230's *shape*
+/// gate. The thread type is the only thing standing between their twenty
+/// headings and deletion.
+///
+/// The chrome here is the same bytes as the spreadsheet's — the assertions
+/// below check that against `QGYAAAjicgG` directly rather than asserting it
+/// in prose. So `is_spreadsheet_grid` says yes to all five, and pushing this
+/// document down the *spreadsheet* path really does delete every heading:
+/// 20 `<th>` → 0, 88 cells → 66, 27 rows → 22.
+///
+/// That is not a bug — no `document` thread ever takes that path — it is the
+/// measurement that says how much the thread-type discriminator is carrying.
+/// `the_same_grid_markup_imported_as_a_document_keeps_its_header_row` states
+/// the same discriminator from the other side, on the sheet's markup; this
+/// states it on a real prose table, which is the case #230's safety argument
+/// was actually about.
+#[test]
+fn the_prose_tables_shape_matches_the_sheets_and_only_the_thread_type_spares_them() {
+    let prose = fixture_body("ffbAAA8eMpE");
+    let sheet = fixture_body("QGYAAAjicgG");
+
+    // The chrome, byte for byte, in both documents.
+    for chrome in ["<th class='empty' style='width: 2em'/>", "<td style='background-color:#f0f0f0'>"]
+    {
+        assert!(prose.contains(chrome), "the prose fixture must carry {chrome}");
+        assert!(sheet.contains(chrome), "the sheet fixture must carry {chrome}");
+    }
+    assert_eq!(prose.matches("<th class='empty' style='width: 2em'/>").count(), 5, "five corners");
+    assert_eq!(
+        prose.matches("<td style='background-color:#f0f0f0'>").count(),
+        22,
+        "one gutter cell per body row",
+    );
+    assert_eq!(
+        sheet.matches("<th class='empty' style='width: 2em'/>").count(),
+        1,
+        "the sheet's single corner — the same bytes",
+    );
+
+    // The shape gate agrees with the sheet on all five — observed through
+    // the strip rather than by calling the private predicate.
+    let stripped = from_quip_html_as(&prose, QuipThreadKind::Spreadsheet);
+    let sc = census(&stripped.doc);
+    assert_eq!(sc.table_headers, 0, "every heading would go");
+    assert_eq!(sc.table_cells, 66, "88 - 22 gutter cells");
+    assert_eq!(sc.table_rows, 22, "27 - 5 header rows");
+    assert_eq!(sc.tables, 5, "all five tables are read as grids");
+
+    // And the document path — the one production uses for this thread —
+    // leaves all of it alone.
+    let kept = census(&from_quip_html(&prose).doc);
+    assert_eq!(kept.table_headers, 20);
+    assert_eq!(kept.table_cells, 88);
+    assert_eq!(kept.table_rows, 27);
+}
+
+
 // ─── cross-fixture invariants ────────────────────────────────────
 
 /// Whatever else changes, the corpus must keep parsing, must not truncate,
@@ -1004,17 +1296,17 @@ fn captured_section_ids_all_occur_in_the_source() {
     }
 }
 
-/// #190 stated as an exhaustive fact rather than five totals: after the fix,
+/// #190 stated as an exhaustive fact rather than six totals: after the fix,
 /// **every id a Quip anchor could name is a key in the section map**, bar
-/// thirteen in the whole corpus, both groups named and understood.
+/// fourteen in the whole corpus, all three groups named and understood.
 ///
 /// The totals asserted per fixture say *how many* anchors are recorded; they
 /// cannot say *which*, so a change that started dropping ten `<td>` ids while
 /// capturing ten others would keep them green. This one asks the question the
 /// back-patch will actually ask — "is this source id resolvable?" — for all
-/// 1481 of them, and reports the misses by tag.
+/// 1899 of them, and reports the misses by tag.
 ///
-/// Note what that makes of the 643 `<span>` ids: **none of them is a miss.**
+/// Note what that makes of the 797 `<span>` ids: **one of them is a miss.**
 /// Quip repeats the enclosing `<li>`/`<td>` id verbatim on the inner
 /// `<span>`, so a span's id is already a key — it maps to the item's block,
 /// which is where the anchor should land. They need no entry of their own,
@@ -1023,23 +1315,35 @@ fn captured_section_ids_all_occur_in_the_source() {
 /// `a_cell_span_repeats_its_parents_anchor_so_needs_no_entry_of_its_own` in
 /// `import_quip.rs` pins the behaviour.
 ///
-/// The thirteen genuine misses:
+/// The fourteen genuine misses:
 ///
 /// * **`ul` — 10, `CVLAAAgSl7Q` only.** The `'6'` continuation sections #188
 ///   (PR #200) merges away: emptied into the accumulating list and dropped
 ///   before the walker runs, so the section-level anchor has no block left.
 /// * **`control` — 3, `SSfAAALs7fy` only.** An inline entity wrapper, not a
 ///   section; two become `Mention` leaves, one is empty.
+/// * **`span` — 1, `ffbAAA8eMpE` only.** The one `<span>` in the corpus that
+///   does **not** repeat a parent's id:
+///   `<span annotationid="temp:C:ffbc9747…" class="c9 h2" id="temp:C:ffbc9747…">`,
+///   the highlight range of an inline *comment*. It is not a section — it is
+///   mid-paragraph inline markup, and comments are not imported at all — so
+///   there is no block for it to name. Unlike the `<span>`s that repeat a
+///   cell id, this one resolves to nothing; an anchor pointing at it would
+///   miss. That is a known limit of comment import, not of #190, and this
+///   entry is where it is recorded. Note it is double-quoted, so it is
+///   outside `spans_repeat_their_parents_id`'s single-quoted scan by
+///   construction — this map is what covers it.
 ///
-/// Both are explained in full at their fixture above.
+/// All three are explained in full at their fixture above.
 #[test]
-fn every_uncaptured_source_id_is_one_of_the_two_known_residues() {
+fn every_uncaptured_source_id_is_one_of_the_three_known_residues() {
     let expected: BTreeMap<&str, BTreeMap<&str, usize>> = BTreeMap::from([
         ("AeOAAAcV1hg", BTreeMap::new()),
         ("CVLAAAgSl7Q", BTreeMap::from([("ul", 10)])),
         ("ZaNAAAU4ELc", BTreeMap::new()),
         ("SSfAAALs7fy", BTreeMap::from([("control", 3)])),
         ("QGYAAAjicgG", BTreeMap::new()),
+        ("ffbAAA8eMpE", BTreeMap::from([("span", 1)])),
     ]);
 
     for thread_id in CORPUS {
@@ -1062,10 +1366,20 @@ fn every_uncaptured_source_id_is_one_of_the_two_known_residues() {
     }
 }
 
-/// The premise the `<span>` residue rests on: a `<span>` bearing an id
-/// always repeats its enclosing `<li>`/`<td>`'s id byte for byte. If Quip
-/// ever gives a span a distinct id, the residue above stops being harmless
-/// and spans need capturing in their own right.
+/// The premise the `<span>` residue rests on: a `<span id='…'>` — the
+/// per-item/per-cell wrapper, which Quip single-quotes — always repeats its
+/// enclosing `<li>`/`<td>`'s id byte for byte. If Quip ever gives one of
+/// those a distinct id, the residue above stops being harmless and spans need
+/// capturing in their own right.
+///
+/// The scan is deliberately the single-quoted spelling, which is the only one
+/// Quip uses for that wrapper. Its **double**-quoted `<span annotationid="…"
+/// id="…">` is a different element with a different job — an inline comment
+/// highlight, not a cell wrapper — and it does not repeat anything. There is
+/// exactly one in the corpus and
+/// `every_uncaptured_source_id_is_one_of_the_three_known_residues` above is
+/// what accounts for it; it is named there rather than folded in here so the
+/// two shapes do not get conflated.
 ///
 /// Asserted on the raw bytes rather than through the parser, because it is a
 /// claim about Quip's markup, not about the walker.
@@ -1095,7 +1409,10 @@ fn spans_repeat_their_parents_id() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 643, "every id-bearing <span> in the corpus was checked");
+    // 643 across the original five, plus `ffbAAA8eMpE`'s 154 (#233). A total,
+    // so it moves when a fixture is added; what it guards is that the scan
+    // still reaches every wrapper span rather than silently matching none.
+    assert_eq!(checked, 797, "every id-bearing <span> in the corpus was checked");
 }
 
 /// Quip's nesting spelling is a `<ul>` that is a **sibling** of the `<li>`.
@@ -1128,13 +1445,13 @@ fn the_corpus_nests_lists_as_a_sibling_ul_never_inside_the_li() {
 /// survive, so the fix discriminates by position, not by presence.
 ///
 /// **What this test can and cannot show.** Every single `<br>` outside a
-/// `<pre>` in all five fixtures is a terminator — 659 of them, zero authored
-/// mid-content breaks anywhere in this corpus. So these five prove the
-/// terminators go, and prove nothing about the mid-content breaks surviving.
-/// That half of the contract is pinned on verbatim markup by
+/// `<pre>` in these three fixtures is a terminator, so they prove the
+/// terminators go and prove nothing about the mid-content breaks surviving.
+/// The other half is now stated on real markup too — `ffbAAA8eMpE` carries 73
+/// authored breaks, pinned by `every_authored_break_survives_and_every_
+/// terminator_goes` below (#233) — as well as on verbatim markup by
 /// `a_mid_item_break_survives_while_the_terminator_goes` and its neighbours
-/// in `import_quip.rs`; if this file ever gains a fixture with an authored
-/// break, assert it here too.
+/// in `import_quip.rs`.
 #[test]
 fn every_list_item_and_cell_terminator_is_dropped() {
     for thread_id in ["AeOAAAcV1hg", "SSfAAALs7fy", "QGYAAAjicgG"] {
@@ -1149,13 +1466,35 @@ fn every_list_item_and_cell_terminator_is_dropped() {
 }
 
 /// The corpus half of the discrimination rule, stated as a source fact so it
-/// cannot silently stop being true: no `<br>` in these five documents sits
-/// anywhere but immediately before `</li>`, `</td>`, `</th>` — or inside a
-/// `<pre>`, where #184's opposite rule owns it. Should a future fixture break
-/// this, the assertion above stops being a valid statement of the fix and the
-/// new document's authored breaks need their own assertion.
+/// cannot silently stop being true: how many `<br>` outside a `<pre>` each
+/// document has, and how many of them sit immediately before `</li>`,
+/// `</td>` or `</th>`. (Inside a `<pre>` #184's opposite rule owns them.)
+///
+/// **This used to read `total == terminators` for every fixture, because it
+/// was true of all five.** `ffbAAA8eMpE` (#233) is the first corpus document
+/// with authored breaks — 73 of them, a `<br>` between two lines of a
+/// `class='line'` paragraph and a `<br>` leading a table cell's text — so the
+/// blanket form is no longer a true statement about the corpus. It is stated
+/// per document instead, which says strictly more: the five originals still
+/// assert exactly what they asserted before (authored = 0, i.e.
+/// `total == terminators`), and the sixth has to declare its number rather
+/// than being waved through. A seventh fixture must declare its own.
+///
+/// The counts are then handed to the import: authored breaks are exactly the
+/// `hard_break` leaves that survive. That is #189's contract in one line, and
+/// before this fixture the corpus could only state half of it.
 #[test]
-fn no_corpus_break_outside_a_pre_is_anything_but_a_terminator() {
+fn every_authored_break_survives_and_every_terminator_goes() {
+    // Authored (non-terminator) `<br>` outside a `<pre>`, per document.
+    let authored: BTreeMap<&str, usize> = BTreeMap::from([
+        ("AeOAAAcV1hg", 0),
+        ("CVLAAAgSl7Q", 0),
+        ("ZaNAAAU4ELc", 0),
+        ("SSfAAALs7fy", 0),
+        ("QGYAAAjicgG", 0),
+        ("ffbAAA8eMpE", 73),
+    ]);
+
     for thread_id in CORPUS {
         let html = fixture(thread_id);
         // Strip comments (the fixture headers themselves discuss `<br/>`)
@@ -1182,10 +1521,20 @@ fn no_corpus_break_outside_a_pre_is_anything_but_a_terminator() {
             + outside_pre.matches("<br/></td>").count()
             + outside_pre.matches("<br/></th>").count();
         assert_eq!(
-            total, terminators,
-            "{thread_id}: {} <br> outside <pre>, {terminators} of them terminators",
-            total
+            total - terminators,
+            authored[*thread_id],
+            "{thread_id}: {total} <br> outside <pre>, {terminators} of them terminators",
         );
+
+        // …and the import keeps exactly the authored ones. Every terminator
+        // goes (#189); nothing else does.
+        let (_h, _q, c) = import(thread_id);
+        assert_eq!(
+            c.hard_breaks, authored[*thread_id],
+            "{thread_id}: surviving hard_break leaves must be the authored breaks, no more \
+             and no fewer",
+        );
+        assert_eq!(c.trailing_hard_breaks, 0, "{thread_id}: no block ends in a hard_break");
     }
 }
 
