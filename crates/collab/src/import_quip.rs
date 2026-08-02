@@ -92,7 +92,22 @@ pub fn new_block_id() -> String {
 /// back-patch cross-document links, resolve section anchors).
 pub struct QuipDocument {
     pub doc: Doc,
-    /// Quip section id → minted blockId, in document order.
+    /// Quip anchor id → minted blockId, in document order.
+    ///
+    /// Two kinds of key, one meaning — "the Quip id `k` names content that
+    /// landed in block `v`":
+    ///
+    /// * a **section id**, from an element's `id` / `data-section-id`. The
+    ///   block *is* that element.
+    /// * a **comment anchor**, from an [`ANNOTATION_ATTR`] (#194 F-10). The
+    ///   block *contains* the commented range; see
+    ///   [`collect_comment_anchors`] for why that is all this can say.
+    ///
+    /// They share the map because they share Quip's id namespace — an
+    /// annotation id is repeated verbatim in the annotated span's own `id`,
+    /// so a `#…` deep link at commented text and a Phase-4 comment lookup
+    /// want the same answer. Callers key on the id and need not know which
+    /// kind it was.
     pub sections: Vec<(String, String)>,
     /// Images referenced by the source, to be side-loaded by the caller.
     pub images: Vec<QuipImageRef>,
