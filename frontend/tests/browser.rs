@@ -3572,6 +3572,61 @@ fn context_fit_heading_in_list_item() {
     assert_eq!(node.text_content(), "Title");
 }
 
+/// Max element nesting in a parsed model tree, measured iteratively
+/// (a recursive measure would trap on exactly the tree this test
+/// exists to characterize).
+fn model_nesting_depth(roots: &[Node]) -> usize {
+    let mut max = 0usize;
+    let mut stack: Vec<(&Node, usize)> = roots.iter().map(|n| (n, 1usize)).collect();
+    while let Some((node, depth)) = stack.pop() {
+        if depth > max {
+            max = depth;
+        }
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                stack.push((child, depth + 1));
+            }
+        }
+    }
+    max
+}
+
+/// #167 — deeply nested pasted HTML must not overflow the paste
+/// walker's stack, and must not lose the text it was carrying.
+///
+/// `<table><tr><td>` is the shape that matters: Chrome's HTML parser
+/// caps `<div>`/`<span>`/`<blockquote>`/`<ul><li>` nesting at 511
+/// levels but lets the implied-`<tbody>` table path grow without a
+/// bound (6 000 repeats → 6 383 levels), so the walker cannot rely on
+/// the browser to bound its recursion. Before the depth cap, this
+/// input trapped the wasm module outright — "index out of bounds",
+/// not a panic, so nothing downstream could catch it.
+///
+/// Failing soft is the contract: the deepest text survives, only the
+/// nesting is lost.
+#[wasm_bindgen_test]
+fn parse_html_deep_nesting_flattens_but_keeps_text() {
+    let html = format!("{}DEEPTEXT", "<table><tr><td>".repeat(400));
+    let slice = clipboard::parse_from_html(&html);
+
+    let text: String = slice
+        .content
+        .children
+        .iter()
+        .map(|c| c.text_content())
+        .collect();
+    assert!(
+        text.contains("DEEPTEXT"),
+        "the deepest text must survive flattening, got {text:?}"
+    );
+
+    let depth = model_nesting_depth(&slice.content.children);
+    assert!(
+        depth <= 200,
+        "parsed tree should be depth-capped, measured {depth} levels"
+    );
+}
+
 #[wasm_bindgen_test]
 fn parse_text_multiline_creates_paragraphs() {
     let slice = clipboard::parse_from_text("line one\nline two\nline three");

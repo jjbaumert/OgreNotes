@@ -55,6 +55,24 @@ fn parse_from_html_dom(html: &str) -> Slice {
         return Slice::empty();
     };
 
+    // Bound the tree BEFORE the recursive walk rather than threading a
+    // depth counter through `walk_dom_children`'s four recursion
+    // sites. The guarantee is then structural: whatever the walker
+    // receives is already shallower than MAX_NESTING_DEPTH, so every
+    // recursive pass over it is bounded by the same constant for
+    // free, and no future recursive pass can forget to check. Same
+    // shape as `ogrenotes_collab::import::from_html` (#158) and
+    // `import_quip` (#162).
+    let truncated = flatten_below_depth(&body);
+    if truncated > 0 {
+        super::debug::warn(
+            "paste",
+            &format!(
+                "flattened {truncated} subtree(s) nested past {MAX_NESTING_DEPTH} levels"
+            ),
+        );
+    }
+
     let mut nodes = Vec::new();
     walk_dom_children(&body, &[], &mut nodes, false);
 
@@ -62,6 +80,95 @@ fn parse_from_html_dom(html: &str) -> Slice {
         return Slice::empty();
     }
     Slice::new(Fragment::from(nodes), 0, 0)
+}
+
+/// Deepest element nesting the paste walker is ever allowed to
+/// descend.
+///
+/// **This is a tab-liveness bound, not a formatting preference.**
+/// `walk_dom_children` recurses once per DOM level (four Rust frames
+/// per level on the block path) over HTML that arrives straight off
+/// the system clipboard. Exhausting the wasm module's 1 MiB shadow
+/// stack is not a panic — it traps the module ("index out of
+/// bounds"), which kills the editor for the pasting user until they
+/// reload the tab, so no `catch_unwind` anywhere can contain it.
+///
+/// The browser's own parser is *not* a sufficient bound. Measured
+/// (#167): Chrome caps `DOMParser` output at 511 levels for
+/// `<div>` / `<span>` / `<b>` / `<blockquote>` / `<ul><li>` / `<font>`
+/// / custom elements — but **not** for `<table><tr><td>`, where the
+/// implied-`<tbody>` path grows without a bound (3 000 repeats →
+/// 3 383 levels, 6 000 → 6 383, at ~15 bytes of HTML per level).
+/// Firefox caps every shape at 511. Against that, the walker itself
+/// traps at roughly 2 000–4 000 levels in a release build and
+/// 400–600 in a debug build — so `parse_from_html` on a 3 KB
+/// `"<table><tr><td>".repeat(200)` string already trapped a debug
+/// build, and a ~50 KB paste reached the release threshold in
+/// Chrome.
+///
+/// 128 is deliberately the same number
+/// `ogrenotes_collab::import::MAX_NESTING_DEPTH` and
+/// `ogrenotes_collab::import_quip::MAX_NESTING_DEPTH` cap at for the
+/// same class of bug, so a reader has one number to learn across all
+/// three HTML walkers. It is mirrored rather than imported: this
+/// crate is outside the backend workspace and `ogrenotes-collab`
+/// pulls in tokio / fred / dashmap / html5ever, none of which belong
+/// in the wasm bundle for the sake of one `usize`. Authored
+/// documents are nowhere near it — our own copy-out HTML tops out in
+/// the tens even for deeply nested lists, and paste-artifact wrapper
+/// accumulation runs to tens, not hundreds.
+#[cfg(target_arch = "wasm32")]
+const MAX_NESTING_DEPTH: usize = 128;
+
+/// Replace every element nested deeper than [`MAX_NESTING_DEPTH`]
+/// with its own flattened text, returning how many subtrees were
+/// flattened.
+///
+/// **Fails soft: text survives, only the nesting is lost.** Dropping
+/// the subtree would silently delete the deepest content of a paste,
+/// and refusing the paste would turn a formatting quirk into lost
+/// work — so the content is kept and the loss is logged.
+///
+/// **Iterative, with an explicit stack.** A recursive implementation
+/// of the guard against unbounded recursion would trap on exactly
+/// the input it exists to survive. `text_content` / `set_text_content`
+/// do the flattening inside the browser's own (non-recursing) DOM
+/// code, which already survived building the tree.
+///
+/// Runs on the detached `DomParser` document, never on the live page.
+#[cfg(target_arch = "wasm32")]
+fn flatten_below_depth(root: &web_sys::Node) -> usize {
+    let mut truncated = 0usize;
+    let mut stack: Vec<(web_sys::Node, usize)> = vec![(root.clone(), 0)];
+    while let Some((node, depth)) = stack.pop() {
+        let children = node.child_nodes();
+        if depth >= MAX_NESTING_DEPTH {
+            let mut has_element_child = false;
+            for i in 0..children.length() {
+                if children.item(i).map(|c| c.node_type())
+                    == Some(web_sys::Node::ELEMENT_NODE)
+                {
+                    has_element_child = true;
+                    break;
+                }
+            }
+            if !has_element_child {
+                continue;
+            }
+            truncated += 1;
+            let text = node.text_content().unwrap_or_default();
+            node.set_text_content(if text.is_empty() { None } else { Some(&text) });
+            continue;
+        }
+        for i in 0..children.length() {
+            if let Some(child) = children.item(i) {
+                if child.node_type() == web_sys::Node::ELEMENT_NODE {
+                    stack.push((child, depth + 1));
+                }
+            }
+        }
+    }
+    truncated
 }
 
 /// Recursively walk DOM children and build model nodes.
