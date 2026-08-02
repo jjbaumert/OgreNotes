@@ -109,6 +109,35 @@ pub fn PresentPage() -> impl IntoView {
         set_idx.set(prev_index(idx.get_untracked()));
     };
 
+    // Swipe: left → next, right → previous. 48px threshold, and the
+    // gesture must be predominantly horizontal so a vertical scroll in
+    // the presenter panel doesn't change slides. `touches()` is empty by
+    // the time `touchend` fires (the lifted finger is no longer "on" the
+    // surface), so both endpoints are read via `changed_touches()`
+    // instead of `crate::touch::first_touch_xy` (which reads `touches()`
+    // and only suits touchstart/touchmove). The dominant-axis + threshold
+    // decision itself reuses `crate::touch::swipe_direction`, the same
+    // primitive spreadsheet touch handling is built on.
+    let (touch_start, set_touch_start) = signal::<Option<(f64, f64)>>(None);
+    let on_touch_start = move |ev: web_sys::TouchEvent| {
+        if let Some(t) = ev.changed_touches().get(0) {
+            set_touch_start.set(Some((t.client_x() as f64, t.client_y() as f64)));
+        }
+    };
+    let on_touch_end = move |ev: web_sys::TouchEvent| {
+        let Some((start_x, start_y)) = touch_start.get_untracked() else { return };
+        set_touch_start.set(None);
+        let Some(t) = ev.changed_touches().get(0) else { return };
+        let dir = crate::touch::swipe_direction(
+            start_x, start_y, t.client_x() as f64, t.client_y() as f64, 48.0,
+        );
+        match dir {
+            Some(crate::touch::SwipeDir::Left) => go_next(),
+            Some(crate::touch::SwipeDir::Right) => go_prev(),
+            _ => {}
+        }
+    };
+
     // Window-level keydown: the overlay owns the whole page, and a
     // container-scoped handler would need focus management the browser
     // fullscreen transition can steal. Same listener style as
@@ -325,6 +354,8 @@ pub fn PresentPage() -> impl IntoView {
             class="deck-present"
             class:deck-present--presenter=is_presenter_view
             on:click=move |_| go_next()
+            on:touchstart=on_touch_start
+            on:touchend=on_touch_end
         >
             <Show when=move || loaded.get() && deck.with(|d| !d.slides.is_empty())
                   fallback=|| view! { <div class="deck-present__empty">{crate::t!("deck-present-empty")}</div> }>

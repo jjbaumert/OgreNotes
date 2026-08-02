@@ -715,3 +715,36 @@
   color: #fff;
   cursor: pointer;
 }
+
+/* ─── Mobile (P2: view + present only; editing stays desktop) ── */
+@media (max-width: 640px) {
+  /* Presenter view can't afford a side panel on a phone: stack it
+   * under the stage and let the page scroll. */
+  .deck-present--presenter {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .deck-present--presenter .deck-present__stage {
+    max-width: 100vw;
+    width: 100%;
+  }
+
+  .deck-present__panel {
+    flex: 1 1 auto;
+    width: 100%;
+    min-width: 0;
+  }
+
+  /* The editor's three-column grid collapses to the canvas alone —
+   * the strip and pane are editing chrome. */
+  .deck-view {
+    grid-template-columns: 1fr;
+    grid-template-areas: "canvas";
+  }
+
+  .deck-view__strip,
+  .deck-view__pane {
+    display: none;
+  }
+}
