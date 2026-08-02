@@ -270,17 +270,24 @@ impl Span {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QuipCell {
     pub header: bool,
+    /// Anchor on the `<td>` / `<th>` itself — see [`section_id`].
+    pub section_id: Option<String>,
     pub blocks: Vec<QuipBlock>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QuipRow {
+    /// Anchor on the `<tr>` itself.
+    pub section_id: Option<String>,
     pub cells: Vec<QuipCell>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QuipItem {
     pub checked: Option<bool>,
+    /// Anchor on the `<li>` itself — the densest anchor site in the
+    /// corpus after `<td>`.
+    pub section_id: Option<String>,
     pub blocks: Vec<QuipBlock>,
 }
 
@@ -303,22 +310,29 @@ pub(crate) enum QuipBlock {
     List {
         ordered: bool,
         task: bool,
+        section_id: Option<String>,
         items: Vec<QuipItem>,
     },
     Quote {
+        section_id: Option<String>,
         blocks: Vec<QuipBlock>,
     },
     Code {
         language: String,
+        section_id: Option<String>,
         text: String,
     },
-    Rule,
+    Rule {
+        section_id: Option<String>,
+    },
     Table {
+        section_id: Option<String>,
         rows: Vec<QuipRow>,
     },
     Image {
         src: String,
         alt: String,
+        section_id: Option<String>,
     },
 }
 
@@ -336,7 +350,7 @@ impl QuipBlock {
             },
             QuipBlock::Quote { .. } => NodeType::Blockquote,
             QuipBlock::Code { .. } => NodeType::CodeBlock,
-            QuipBlock::Rule => NodeType::HorizontalRule,
+            QuipBlock::Rule { .. } => NodeType::HorizontalRule,
             QuipBlock::Table { .. } => NodeType::Table,
             QuipBlock::Image { .. } => NodeType::Image,
         }
@@ -1131,6 +1145,9 @@ fn walk_element(
             out.push(QuipBlock::List {
                 ordered: false,
                 task: false,
+                // The anchor rides on the item, not on the list we
+                // invented to hold it.
+                section_id: None,
                 items: vec![parse_item(handle)],
             });
         }
@@ -1140,18 +1157,19 @@ fn walk_element(
             let mut buf = InlineBuf::default();
             walk_children(handle, &mut inner, &Marks::default(), &mut buf);
             buf.flush(&mut inner, None);
-            out.push(QuipBlock::Quote { blocks: inner });
+            out.push(QuipBlock::Quote { section_id: section_id(handle), blocks: inner });
         }
         "pre" => {
             pending.flush(out, None);
             out.push(QuipBlock::Code {
                 language: code_language(handle),
+                section_id: section_id(handle),
                 text: raw_text(handle),
             });
         }
         "hr" => {
             pending.flush(out, None);
-            out.push(QuipBlock::Rule);
+            out.push(QuipBlock::Rule { section_id: section_id(handle) });
         }
         "table" => {
             pending.flush(out, None);
@@ -1167,6 +1185,7 @@ fn walk_element(
             out.push(QuipBlock::Image {
                 src: attr(handle, "src").unwrap_or_default(),
                 alt: attr(handle, "alt").unwrap_or_default(),
+                section_id: section_id(handle),
             });
         }
         // A hard line break inside a run of text. This is *not* folded
@@ -1377,7 +1396,7 @@ fn parse_list(handle: &markup5ever_rcdom::Handle, tag_is_ol: bool) -> QuipBlock 
         }
     }
 
-    QuipBlock::List { ordered, task, items }
+    QuipBlock::List { ordered, task, section_id: section_id(handle), items }
 }
 
 /// Gather the `<li>` children of a list, descending through wrapper
@@ -1408,13 +1427,13 @@ fn parse_item(handle: &markup5ever_rcdom::Handle) -> QuipItem {
     // text is appended last and document order is preserved: an item
     // reading `a <ul>…</ul> b` keeps `b` after the nested list.
     buf.flush(&mut blocks, None);
-    QuipItem { checked: checked_state(handle), blocks }
+    QuipItem { checked: checked_state(handle), section_id: section_id(handle), blocks }
 }
 
 fn parse_table(handle: &markup5ever_rcdom::Handle) -> QuipBlock {
     let mut rows = Vec::new();
     collect_rows(handle, &mut rows);
-    QuipBlock::Table { rows }
+    QuipBlock::Table { section_id: section_id(handle), rows }
 }
 
 fn collect_rows(handle: &markup5ever_rcdom::Handle, rows: &mut Vec<QuipRow>) {
@@ -1449,9 +1468,9 @@ fn parse_row(handle: &markup5ever_rcdom::Handle) -> QuipRow {
             // collapsed grid slot in the editor.
             blocks.push(empty_para());
         }
-        cells.push(QuipCell { header: tag == "th", blocks });
+        cells.push(QuipCell { header: tag == "th", section_id: section_id(child), blocks });
     }
-    QuipRow { cells }
+    QuipRow { section_id: section_id(handle), cells }
 }
 
 // ─── UNVERIFIED-MARKUP readers ───────────────────────────────────
@@ -1709,10 +1728,72 @@ fn language_from_classes(handle: &markup5ever_rcdom::Handle) -> Option<String> {
     })
 }
 
-/// **UNVERIFIED MARKUP.** The Quip section anchor of a block element.
-/// Assumed to be the plain `id` attribute; `data-section-id` is
-/// accepted as an alternative spelling. Quip section ids are opaque —
-/// no charset validation here on purpose.
+/// The Quip section anchor of a block element: the plain `id`
+/// attribute, with `data-section-id` accepted as an alternative
+/// spelling. Quip section ids are **opaque** — no charset validation,
+/// no case folding, no length assumption, and never a change to an
+/// interior byte. The corpus alone spells them three ways
+/// (`SSfACA046uk`, `temp:C:CVL146925f6…`, and the 78-byte composite
+/// `temp:s:temp:C:QGYe66f…_temp:C:QGY4a33…` a spreadsheet cell carries),
+/// so anything this function "knew" about their shape would be wrong for
+/// some document.
+///
+/// **One exception, and it is a trim, not a normalization.** Surrounding
+/// whitespace is stripped and an id that trims to nothing is treated as
+/// no id at all. Both are safe for the same reason: a URL fragment
+/// cannot carry raw whitespace and is matched against the attribute
+/// value as-is, so a padded `id` is markup noise that no anchor could
+/// ever name. Trimming makes the map key equal to the string a Quip
+/// anchor will actually carry — dropping it would file the entry under a
+/// key the back-patch can never look up. Pinned by
+/// `a_padded_id_is_trimmed_to_the_string_an_anchor_carries` and
+/// `an_empty_id_is_not_an_anchor`.
+///
+/// # Which elements carry one — measured, not assumed (#190)
+///
+/// Every block-producing element in the corpus carries an anchor, and
+/// each is now read: `<p>` `<h1>`–`<h6>` `<ul>`/`<ol>` `<li>` `<table>`
+/// `<tr>` `<td>` `<th>` `<pre>` `<blockquote>` `<img>` (and `<hr>`,
+/// which the corpus never emits). Counted across the five checked-in
+/// fixtures — 1481 `id` attributes:
+///
+/// | tag | ids | recorded |
+/// |---|---|---|
+/// | `span` | 643 | via its parent — see below |
+/// | `td` | 518 | yes |
+/// | `li` | 125 | yes |
+/// | `p` | 61 | yes (already) |
+/// | `tr` | 47 | yes |
+/// | `ul` | 36 | yes, bar 10 — see below |
+/// | `th` | 16 | yes |
+/// | `h1`/`h2`/`h3` | 23 | yes (already) |
+/// | `pre` | 4 | yes |
+/// | `table` | 3 | yes |
+/// | `control` | 3 | no — see below |
+/// | `blockquote` | 1 | yes |
+/// | `img` | 1 | yes |
+///
+/// **`<span>` needs no entry of its own.** Quip repeats the enclosing
+/// `<li>`/`<td>` id verbatim on the inner `<span>` — 643 of 643 span ids
+/// in the corpus are byte-identical to their parent's, with zero
+/// counter-examples. The map is keyed by section id, so a lookup of a
+/// span id already hits its parent's entry. Recording the span
+/// separately would add 643 duplicate keys pointing at the same block.
+///
+/// **Two residues, both measured and both deliberate.**
+///
+/// 1. Ten `<ul>` ids in `CVLAAAgSl7Q` (170 of 180 distinct ids
+///    captured). Those are the numbered sections
+///    [`merge_numbered_sections`] absorbs: the continuation `<ul>` is
+///    emptied into the accumulator and the now-contentless section is
+///    dropped before the walker ever sees it, so its id has no block to
+///    name. Corpus-wide that is 35 of 60 `'6'` sections — 0.24% of the
+///    14 439 source ids. Their *content* is untouched; only the
+///    section-level anchor on a list that no longer exists separately is.
+/// 2. Three `<control>` ids in `SSfAAALs7fy`. A `<control>` is an inline
+///    entity wrapper, not a section (see [`walk_control`]); two here
+///    become `Mention` leaves and the third is empty and materializes
+///    nothing at all. No corpus anchor targets one.
 fn section_id(handle: &markup5ever_rcdom::Handle) -> Option<String> {
     attr(handle, "id")
         .or_else(|| attr(handle, "data-section-id"))
@@ -1937,16 +2018,18 @@ fn split_for(blocks: Vec<QuipBlock>, parent: NodeType) -> (Vec<QuipBlock>, Vec<Q
 /// followed (or interleaved, for lists) by the hoisted blocks.
 fn flatten(block: QuipBlock) -> Vec<QuipBlock> {
     match block {
-        QuipBlock::Quote { blocks } => {
+        QuipBlock::Quote { section_id, blocks } => {
             let (kept, escaped) = split_for(blocks, NodeType::Blockquote);
-            let mut out = vec![QuipBlock::Quote { blocks: kept }];
+            let mut out = vec![QuipBlock::Quote { section_id, blocks: kept }];
             // A blockquote can't be split without changing what reads
             // as quoted, so escapees follow the quote.
             out.extend(escaped);
             out
         }
-        QuipBlock::List { ordered, task, items } => flatten_list(ordered, task, items),
-        QuipBlock::Table { rows } => flatten_table(rows),
+        QuipBlock::List { ordered, task, section_id, items } => {
+            flatten_list(ordered, task, section_id, items)
+        }
+        QuipBlock::Table { section_id, rows } => flatten_table(section_id, rows),
         other => vec![other],
     }
 }
@@ -1955,28 +2038,43 @@ fn flatten(block: QuipBlock) -> Vec<QuipBlock> {
 /// item can't contain, the list closes, the hoisted blocks are emitted,
 /// and a fresh list of the same kind resumes. That keeps document order
 /// exact at item granularity.
-fn flatten_list(ordered: bool, task: bool, items: Vec<QuipItem>) -> Vec<QuipBlock> {
+/// `section_id` names the source `<ul>`/`<ol>`, of which there was
+/// exactly one; a split produces several lists, so it rides on the
+/// **first** of them. Copying it onto each fragment would map one Quip
+/// anchor to several blocks, and the back-patch resolves an anchor to a
+/// single destination.
+fn flatten_list(
+    ordered: bool,
+    task: bool,
+    mut section_id: Option<String>,
+    items: Vec<QuipItem>,
+) -> Vec<QuipBlock> {
     let item_ctx = if task { NodeType::TaskItem } else { NodeType::ListItem };
     let mut out = Vec::new();
     let mut run: Vec<QuipItem> = Vec::new();
 
     for item in items {
-        let QuipItem { checked, blocks } = item;
+        let QuipItem { checked, section_id: item_section_id, blocks } = item;
         let (mut kept, escaped) = split_for(blocks, item_ctx);
         if kept.is_empty() {
             // An item whose entire content was hoisted still needs a
             // body — an empty item is legal but renders as a ghost.
             kept.push(empty_para());
         }
-        run.push(QuipItem { checked, blocks: kept });
+        run.push(QuipItem { checked, section_id: item_section_id, blocks: kept });
         if !escaped.is_empty() {
-            out.push(QuipBlock::List { ordered, task, items: std::mem::take(&mut run) });
+            out.push(QuipBlock::List {
+                ordered,
+                task,
+                section_id: section_id.take(),
+                items: std::mem::take(&mut run),
+            });
             out.extend(escaped);
         }
     }
 
     if !run.is_empty() {
-        out.push(QuipBlock::List { ordered, task, items: run });
+        out.push(QuipBlock::List { ordered, task, section_id: section_id.take(), items: run });
     }
     out
 }
@@ -1984,7 +2082,7 @@ fn flatten_list(ordered: bool, task: bool, items: Vec<QuipItem>) -> Vec<QuipBloc
 /// Tables can't be split the way lists can — closing a row mid-table
 /// would mangle the grid — so a cell's escapees are emitted *after*
 /// the whole table, in row-major order.
-fn flatten_table(rows: Vec<QuipRow>) -> Vec<QuipBlock> {
+fn flatten_table(section_id: Option<String>, rows: Vec<QuipRow>) -> Vec<QuipBlock> {
     let mut after = Vec::new();
     let mut clean_rows = Vec::new();
     for row in rows {
@@ -1996,11 +2094,11 @@ fn flatten_table(rows: Vec<QuipRow>) -> Vec<QuipBlock> {
                 kept.push(empty_para());
             }
             after.extend(escaped);
-            cells.push(QuipCell { header: cell.header, blocks: kept });
+            cells.push(QuipCell { header: cell.header, section_id: cell.section_id, blocks: kept });
         }
-        clean_rows.push(QuipRow { cells });
+        clean_rows.push(QuipRow { section_id: row.section_id, cells });
     }
-    let mut out = vec![QuipBlock::Table { rows: clean_rows }];
+    let mut out = vec![QuipBlock::Table { section_id, rows: clean_rows }];
     out.extend(after);
     out
 }
@@ -2531,42 +2629,48 @@ fn materialize_block(
             side.record_section(&*txn, &el, section_id.as_ref());
             insert_spans(txn, &el, NodeType::Heading, spans, side);
         }
-        QuipBlock::List { task, items, .. } => {
+        QuipBlock::List { task, items, section_id, .. } => {
             let list_type = block.node_type();
             let item_type = if *task { NodeType::TaskItem } else { NodeType::ListItem };
             let list = insert_block(txn, parent, parent_type, list_type);
+            side.record_section(&*txn, &list, section_id.as_ref());
             for item in items {
                 let li = insert_block(txn, &XmlOpenable::Element(list.clone()), list_type, item_type);
                 if item_type == NodeType::TaskItem {
                     li.insert_attribute(txn, "checked", item.checked.unwrap_or(false).to_string());
                 }
+                side.record_section(&*txn, &li, item.section_id.as_ref());
                 let scope = XmlOpenable::Element(li);
                 for child in &item.blocks {
                     materialize_block(txn, &scope, item_type, child, side);
                 }
             }
         }
-        QuipBlock::Quote { blocks } => {
+        QuipBlock::Quote { section_id, blocks } => {
             let el = insert_block(txn, parent, parent_type, NodeType::Blockquote);
+            side.record_section(&*txn, &el, section_id.as_ref());
             let scope = XmlOpenable::Element(el);
             for child in blocks {
                 materialize_block(txn, &scope, NodeType::Blockquote, child, side);
             }
         }
-        QuipBlock::Code { language, text } => {
+        QuipBlock::Code { language, section_id, text } => {
             let el = insert_block(txn, parent, parent_type, NodeType::CodeBlock);
             if !language.is_empty() {
                 el.insert_attribute(txn, "language", language.clone());
             }
+            side.record_section(&*txn, &el, section_id.as_ref());
             // A code block carries no marks (`NodeType::is_code`), so
             // the returned text handle is deliberately unused.
             insert_text(txn, &el, text);
         }
-        QuipBlock::Rule => {
-            insert_block(txn, parent, parent_type, NodeType::HorizontalRule);
+        QuipBlock::Rule { section_id } => {
+            let el = insert_block(txn, parent, parent_type, NodeType::HorizontalRule);
+            side.record_section(&*txn, &el, section_id.as_ref());
         }
-        QuipBlock::Table { rows } => {
+        QuipBlock::Table { section_id, rows } => {
             let table = insert_block(txn, parent, parent_type, NodeType::Table);
+            side.record_section(&*txn, &table, section_id.as_ref());
             for row in rows {
                 let row_el = insert_block(
                     txn,
@@ -2574,6 +2678,7 @@ fn materialize_block(
                     NodeType::Table,
                     NodeType::TableRow,
                 );
+                side.record_section(&*txn, &row_el, row.section_id.as_ref());
                 for cell in &row.cells {
                     let cell_type =
                         if cell.header { NodeType::TableHeader } else { NodeType::TableCell };
@@ -2583,6 +2688,7 @@ fn materialize_block(
                         NodeType::TableRow,
                         cell_type,
                     );
+                    side.record_section(&*txn, &cell_el, cell.section_id.as_ref());
                     let scope = XmlOpenable::Element(cell_el);
                     for child in &cell.blocks {
                         materialize_block(txn, &scope, cell_type, child, side);
@@ -2590,7 +2696,7 @@ fn materialize_block(
                 }
             }
         }
-        QuipBlock::Image { src, alt } => {
+        QuipBlock::Image { src, alt, section_id } => {
             let el = insert_block(txn, parent, parent_type, NodeType::Image);
             // Left as the raw Quip value on purpose — the blob
             // side-load pass rewrites it to a durable blob reference,
@@ -2599,6 +2705,7 @@ fn materialize_block(
             if !alt.is_empty() {
                 el.insert_attribute(txn, "alt", alt.clone());
             }
+            side.record_section(&*txn, &el, section_id.as_ref());
             side.images.push(QuipImageRef {
                 block_id: block_id_of(&*txn, &el),
                 src: src.clone(),
@@ -2722,7 +2829,7 @@ mod tests {
         assert!(matches!(b[0], QuipBlock::Heading { level: 2, .. }), "{b:?}");
         assert!(matches!(b[1], QuipBlock::List { ordered: false, .. }), "{b:?}");
         assert!(matches!(b[2], QuipBlock::Code { ref language, .. } if language == "rust"), "{b:?}");
-        assert!(matches!(b[3], QuipBlock::Rule), "{b:?}");
+        assert!(matches!(b[3], QuipBlock::Rule { .. }), "{b:?}");
     }
 
     #[test]
@@ -2761,7 +2868,7 @@ mod tests {
     #[test]
     fn blockquote_wraps_its_children() {
         let b = blocks("<blockquote><p>quoted</p></blockquote>");
-        let QuipBlock::Quote { blocks: inner } = &b[0] else { panic!("expected quote: {b:?}") };
+        let QuipBlock::Quote { blocks: inner, .. } = &b[0] else { panic!("expected quote: {b:?}") };
         assert!(matches!(inner[0], QuipBlock::Para { .. }), "{inner:?}");
     }
 
@@ -2802,7 +2909,7 @@ mod tests {
     #[test]
     fn a_table_cell_keeps_its_blocks_in_order() {
         let b = blocks("<table><tr><td>a<pre>code</pre>b</td></tr></table>");
-        let QuipBlock::Table { rows } = &b[0] else { panic!("expected table: {b:?}") };
+        let QuipBlock::Table { rows, .. } = &b[0] else { panic!("expected table: {b:?}") };
         let kinds: Vec<_> = rows[0].cells[0].blocks.iter().map(|x| x.node_type()).collect();
         assert_eq!(
             kinds,
@@ -2854,7 +2961,7 @@ mod tests {
             "<ul><li><input type=\"checkbox\" checked>done</li>\
              <li><input type=\"checkbox\">todo</li></ul>",
         );
-        let QuipBlock::List { ordered: _, task, items } = &b[0] else { panic!("expected list") };
+        let QuipBlock::List { ordered: _, task, items, .. } = &b[0] else { panic!("expected list") };
         assert!(*task, "a list whose items carry checkboxes is a task list");
         assert_eq!(items[0].checked, Some(true));
         assert_eq!(items[1].checked, Some(false));
@@ -2970,7 +3077,7 @@ mod tests {
     #[test]
     fn a_real_quip_checklist_section_is_a_task_list() {
         let b = blocks(REAL_CHECKLIST_SECTION);
-        let QuipBlock::List { ordered, task, items } = &b[0] else {
+        let QuipBlock::List { ordered, task, items, .. } = &b[0] else {
             panic!("expected a list, got {b:?}")
         };
         assert!(!*ordered);
@@ -2988,7 +3095,7 @@ mod tests {
         // The regression that matters: widening list detection must not
         // sweep in the 565 `5` sections that share the shape.
         let b = blocks(REAL_BULLET_SECTION_5);
-        let QuipBlock::List { ordered, task, items } = &b[0] else {
+        let QuipBlock::List { ordered, task, items, .. } = &b[0] else {
             panic!("expected a list, got {b:?}")
         };
         assert!(!*ordered, "data-section-style='5' is a bullet list: {b:?}");
@@ -3003,7 +3110,7 @@ mod tests {
             ("indented", REAL_ORDERED_SECTION_6_INDENTED),
         ] {
             let b = blocks(html);
-            let QuipBlock::List { ordered, task, items } = &b[0] else {
+            let QuipBlock::List { ordered, task, items, .. } = &b[0] else {
                 panic!("expected a list for {label}, got {b:?}")
             };
             assert!(*ordered, "{label}: data-section-style='6' means numbered: {b:?}");
@@ -3102,7 +3209,7 @@ mod tests {
     fn a_sibling_nested_list_lands_inside_the_item_that_owns_it() {
         let b = blocks(REAL_NESTED_LIST_SECTION);
         assert_eq!(b.len(), 1, "one list, not a list plus a hoisted one: {b:?}");
-        let QuipBlock::List { ordered, task, items } = &b[0] else {
+        let QuipBlock::List { ordered, task, items, .. } = &b[0] else {
             panic!("expected a list, got {b:?}")
         };
         assert!(!*ordered && !*task, "a '5' section is plain bullets: {b:?}");
@@ -3243,7 +3350,7 @@ mod tests {
         // Before the fix: seven separate `ordered_list` blocks, each
         // holding one item — so the reader saw "1." seven times.
         assert_eq!(b.len(), 1, "the seven sections must merge into one list: {b:?}");
-        let QuipBlock::List { ordered, task, items } = &b[0] else {
+        let QuipBlock::List { ordered, task, items, .. } = &b[0] else {
             panic!("expected a list, got {b:?}")
         };
         assert!(*ordered, "a '6' run is numbered: {b:?}");
@@ -3289,7 +3396,7 @@ mod tests {
             "item 1 keeps its text and gains the '5' section: {:?}",
             items[0].blocks
         );
-        let QuipBlock::List { ordered: sub_ordered, task: sub_task, items: sub } =
+        let QuipBlock::List { ordered: sub_ordered, task: sub_task, items: sub, .. } =
             &items[0].blocks[1]
         else {
             panic!("expected the '5' section nested under item 1: {:?}", items[0].blocks)
@@ -3431,7 +3538,7 @@ mod tests {
             "no numbered item gains the bullet section: {items:?}"
         );
 
-        let QuipBlock::List { ordered: o, task, items: bullets } = &b[1] else { panic!("{b:?}") };
+        let QuipBlock::List { ordered: o, task, items: bullets, .. } = &b[1] else { panic!("{b:?}") };
         assert!(!*o && !*task, "a '5' section is bullets: {b:?}");
         assert_eq!(item_texts(bullets), vec!["Message types (JSON):"], "{bullets:?}");
         // Its own `class='parent'` nesting still applies inside it.
@@ -3451,7 +3558,7 @@ mod tests {
         let b = blocks(&html);
         assert_eq!(b.len(), 2, "bullet sections must not merge: {b:?}");
         for block in &b {
-            let QuipBlock::List { ordered, task, items } = block else { panic!("{b:?}") };
+            let QuipBlock::List { ordered, task, items, .. } = block else { panic!("{b:?}") };
             assert!(!*ordered && !*task, "{b:?}");
             assert_eq!(items.len(), 2, "{b:?}");
             assert!(
@@ -3468,7 +3575,7 @@ mod tests {
         let html = format!("{REAL_NUMBERED_RUN}{REAL_CHECKLIST_SECTION}");
         let b = blocks(&html);
         assert_eq!(b.len(), 2, "{b:?}");
-        let QuipBlock::List { ordered, task, items } = &b[1] else { panic!("{b:?}") };
+        let QuipBlock::List { ordered, task, items, .. } = &b[1] else { panic!("{b:?}") };
         assert!(*task, "the '7' section is still a checklist: {b:?}");
         assert!(!*ordered, "{b:?}");
         assert_eq!(items.len(), 2, "{b:?}");
@@ -3623,12 +3730,388 @@ mod tests {
         assert_eq!(section_id.as_deref(), Some("S2"));
     }
 
+    // ─── #190: every block kind records its anchor ───────────
+    //
+    // Every `html` literal in this block is **verbatim** markup lifted
+    // out of `tests/fixtures/quip/corpus/`, thread id named in each
+    // test. That is the point: `<p>` and `<h1>` were the only two kinds
+    // handled before #190 precisely because they were the only two any
+    // hand-authored fixture ever put an id on, while 6763 of the real
+    // ids sit on `<li>`, `<td>`, `<ul>`, `<table>`, `<pre>` and `<img>`.
+    // A simplified re-spelling here would reproduce that blind spot.
+    //
+    // These assert on the parse stage (`QuipBlock`), which is where the
+    // anchor is captured; `from_quip_html` pairing it with a live
+    // blockId is asserted separately by
+    // `every_block_kinds_anchor_reaches_the_section_map`.
+
+    /// `CVLAAAgSl7Q`, one `data-section-style='5'` section, verbatim.
+    /// The `<ul>` and its `<li>` carry **different** ids, and the
+    /// `<span>` repeats the `<li>`'s byte for byte.
+    #[test]
+    fn a_list_and_each_of_its_items_record_their_own_anchor() {
+        let html = "<div data-section-style='5' class=\"\" style=\"\"><ul id='temp:C:CVL73809743db7745b7a64a37dc1'><li id='temp:C:CVLdf56cde36a9d40d6b910f0d53' class='' style='' value='1'><span id='temp:C:CVLdf56cde36a9d40d6b910f0d53'><b>Dozen-Turadipi</b>: Stand his ingelitse is ipisci-long dozen drop in Iusmodte.</span>\n\n<br/></li><li id='temp:C:CVL6a4f566a19aa4607b8dbe64a9' class='' style=''><span id='temp:C:CVL6a4f566a19aa4607b8dbe64a9'>Uradipis uradipiscinge, adipisci, man noon adipiscing.</span>\n\n<br/></li></ul></div>";
+        let b = blocks(html);
+        let QuipBlock::List { section_id, items, .. } = &b[0] else {
+            panic!("expected list: {b:?}")
+        };
+        assert_eq!(
+            section_id.as_deref(),
+            Some("temp:C:CVL73809743db7745b7a64a37dc1"),
+            "the <ul>'s own anchor"
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items.iter().map(|i| i.section_id.as_deref()).collect::<Vec<_>>(),
+            vec![
+                Some("temp:C:CVLdf56cde36a9d40d6b910f0d53"),
+                Some("temp:C:CVL6a4f566a19aa4607b8dbe64a9"),
+            ],
+            "each <li> carries its own anchor, distinct from the list's"
+        );
+    }
+
+    /// `SSfAAALs7fy`, the corpus's only checklist, verbatim. A
+    /// `task_item` is anchored exactly like a `list_item` — the two
+    /// take different `NodeType`s in `materialize_block`, so the
+    /// checklist path needs its own statement.
+    #[test]
+    fn a_checklist_item_records_its_anchor_like_any_other_item() {
+        let html = "<div data-section-style='7' class=\"\" style=\"\"><ul id='SSfACAKV4zR'><li id='SSfACA046uk' class='' style='' value='1'><span id='SSfACA046uk'>Prize did round night in kind porloremips read is any do.</span>\n\n<br/></li><li id='SSfACASS8II' class='' style=''><span id='SSfACASS8II'>White go kind like man hold white go for ctetura wait he you scingeli.</span>\n\n<br/></li></ul></div>";
+        let b = blocks(html);
+        let QuipBlock::List { task, section_id, items, .. } = &b[0] else {
+            panic!("expected list: {b:?}")
+        };
+        assert!(*task, "data-section-style='7' is a checklist");
+        assert_eq!(section_id.as_deref(), Some("SSfACAKV4zR"));
+        assert_eq!(
+            items.iter().map(|i| i.section_id.as_deref()).collect::<Vec<_>>(),
+            vec![Some("SSfACA046uk"), Some("SSfACASS8II")],
+        );
+    }
+
+    /// `AeOAAAcV1hg`, the head of one `data-section-style='13'` table
+    /// section, verbatim. Table, row and cell each carry a distinct
+    /// anchor; the cell's is the composite `temp:s:<row>_<col>` form.
+    #[test]
+    fn a_table_its_rows_and_its_cells_each_record_their_own_anchor() {
+        let html = "<div data-section-style='13'><table id='temp:C:AeOfdbce4eabb6e41df873200fa6' title='Iusmod' style='width: 39.0667em'><tbody><tr id='temp:C:AeO2f2ceb0afd0a41419a2e9fae8'><td id='temp:s:temp:C:AeO2f2ceb0afd0a41419a2e9fae8_temp:C:AeO641271c1e4ec417fa93c8d029' style='text-align: left;vertical-align: middle;' class='bold'><span id='temp:s:temp:C:AeO2f2ceb0afd0a41419a2e9fae8_temp:C:AeO641271c1e4ec417fa93c8d029'>Eiusmod</span>\n\n<br/></td></tr></tbody></table></div>";
+        let b = blocks(html);
+        let QuipBlock::Table { section_id, rows } = &b[0] else { panic!("expected table: {b:?}") };
+        assert_eq!(section_id.as_deref(), Some("temp:C:AeOfdbce4eabb6e41df873200fa6"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].section_id.as_deref(),
+            Some("temp:C:AeO2f2ceb0afd0a41419a2e9fae8"),
+            "the <tr>'s anchor — <tbody> is transparent and must not swallow it"
+        );
+        assert_eq!(
+            rows[0].cells[0].section_id.as_deref(),
+            Some(
+                "temp:s:temp:C:AeO2f2ceb0afd0a41419a2e9fae8_temp:C:AeO641271c1e4ec417fa93c8d029"
+            ),
+            "the <td>'s composite anchor, byte for byte"
+        );
+    }
+
+    /// `QGYAAAjicgG`'s `<thead>`, verbatim. Two things at once: a `<th>`
+    /// records its anchor, and the corner `<th class='empty'/>` — which
+    /// genuinely has no `id` — records **none**. The `<tr>` inside
+    /// `<thead>` has no id either, and must not inherit one.
+    #[test]
+    fn header_cells_record_their_anchor_and_an_id_less_one_records_none() {
+        let html = "<table id='temp:C:QGYcfc9c8f7c7714f4a9955e1b7f'><thead><tr><th class='empty' style='width: 2em'/><th id='temp:C:QGY04be7f796bf1483e87f847ed3' class='empty' style='width: 6em'>A<br/></th></tr></thead></table>";
+        let b = blocks(html);
+        let QuipBlock::Table { section_id, rows } = &b[0] else { panic!("expected table: {b:?}") };
+        assert_eq!(section_id.as_deref(), Some("temp:C:QGYcfc9c8f7c7714f4a9955e1b7f"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].section_id, None, "this <tr> has no id and must not invent one");
+        assert!(rows[0].cells.iter().all(|c| c.header), "both cells are <th>");
+        assert_eq!(
+            rows[0].cells.iter().map(|c| c.section_id.as_deref()).collect::<Vec<_>>(),
+            vec![None, Some("temp:C:QGY04be7f796bf1483e87f847ed3")],
+        );
+    }
+
+    /// `QGYAAAjicgG`'s first body row, verbatim: the row-number `<td>`
+    /// carries no `id` while every data cell does. 30 of the sheet's
+    /// 510 cells are this shape, so "a block with no id gains none" is
+    /// a real corpus case rather than a hypothetical.
+    #[test]
+    fn a_cell_without_an_id_records_no_anchor() {
+        let html = "<table><tbody><tr id='temp:C:QGYe66f22cd7b834833a7ee9dc58'><td style='background-color:#f0f0f0'>1</td><td id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d' style=''><span id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d'>as</span>\n\n<br/></td></tr></tbody></table>";
+        let b = blocks(html);
+        let QuipBlock::Table { section_id, rows } = &b[0] else { panic!("expected table: {b:?}") };
+        assert_eq!(section_id, &None, "this <table> has no id");
+        assert_eq!(rows[0].cells[0].section_id, None, "the row-number cell has no id");
+        assert_eq!(
+            rows[0].cells[1].section_id.as_deref(),
+            Some(
+                "temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d"
+            ),
+        );
+    }
+
+    /// `CVLAAAgSl7Q`, one `<pre class='prettyprint'>`, verbatim —
+    /// including the U+00A0 indentation and the `<br>` line separators
+    /// (#184), so capturing the anchor is asserted against the same
+    /// bytes the code-block path already has to survive.
+    #[test]
+    fn a_code_block_records_its_anchor() {
+        let html = "<pre id='temp:C:CVLab76d47d4f6b483da9a484729' class='prettyprint'>#[cingel(Itseddoei, Porloremips, Drain)]<br>can rsitam Note {<br>\u{a0}\u{a0} \u{a0}can note_if: Tempor,<br>}</pre>";
+        let b = blocks(html);
+        let QuipBlock::Code { section_id, text, .. } = &b[0] else {
+            panic!("expected code: {b:?}")
+        };
+        assert_eq!(section_id.as_deref(), Some("temp:C:CVLab76d47d4f6b483da9a484729"));
+        assert_eq!(text.lines().count(), 4, "the <br> separators still make lines: {text:?}");
+    }
+
+    /// `ZaNAAAU4ELc`, the corpus's one image section, verbatim. Quip
+    /// emits a bare `<img>` inside `data-section-style='11'` — never
+    /// wrapped in a `<p>` — so the anchor is on the `<img>` itself.
+    #[test]
+    fn an_image_records_its_anchor() {
+        let html = "<div data-section-style='11' style='max-width:100%' class='tall'><img src='https://quip.com/blob/ZaNAAAU4ELc/jG4ISoLLsz9JZ2nahGsoSg' id='temp:C:ZaNb6a7b9e7bd634c549b899bae4' alt=\"2555949508.had\"></img></div>";
+        let b = blocks(html);
+        let QuipBlock::Image { section_id, src, .. } = &b[0] else {
+            panic!("expected image: {b:?}")
+        };
+        assert_eq!(section_id.as_deref(), Some("temp:C:ZaNb6a7b9e7bd634c549b899bae4"));
+        assert_eq!(src, "https://quip.com/blob/ZaNAAAU4ELc/jG4ISoLLsz9JZ2nahGsoSg");
+    }
+
+    /// `ZaNAAAU4ELc`, the corpus's one blockquote, verbatim.
+    #[test]
+    fn a_blockquote_records_its_anchor() {
+        let html = "<blockquote id='temp:C:ZaN2ba9bae380d64c8392cc6ae88'>A ounce full a room in Split Cloud are beach stood if pull man let a alike.</blockquote>";
+        let b = blocks(html);
+        let QuipBlock::Quote { section_id, blocks: inner } = &b[0] else {
+            panic!("expected quote: {b:?}")
+        };
+        assert_eq!(section_id.as_deref(), Some("temp:C:ZaN2ba9bae380d64c8392cc6ae88"));
+        assert_eq!(inner.len(), 1, "the quoted paragraph survives");
+    }
+
+    /// **Not verbatim, and it cannot be.** `<hr>` occurs **zero** times
+    /// in all 56 staged documents (the gap is recorded in
+    /// `quip_corpus.rs`'s "known coverage gaps"), so no real anchor
+    /// spelling exists to copy. The id below is a corpus `temp:C:` id
+    /// moved onto an invented tag: it pins that the `hr` arm reads the
+    /// attribute at all, and nothing more. If a Quip document with a
+    /// divider ever lands, re-spell this from it.
+    #[test]
+    fn a_horizontal_rule_records_its_anchor() {
+        let b = blocks("<hr id='temp:C:ZaN0b3778496abe4a69842e91aff'>");
+        let QuipBlock::Rule { section_id } = &b[0] else { panic!("expected rule: {b:?}") };
+        assert_eq!(section_id.as_deref(), Some("temp:C:ZaN0b3778496abe4a69842e91aff"));
+        let b = blocks("<hr>");
+        assert_eq!(b, vec![QuipBlock::Rule { section_id: None }], "no id, no anchor");
+    }
+
+    /// An **empty** id is not an anchor. Quip writes empty attribute
+    /// values freely — every `<li>` in the corpus carries `class=''
+    /// style=''` — and while none of the five fixtures happens to spell
+    /// `id=''`, the walker now reads `id` off nine more element kinds
+    /// than it did, so the number of places one could appear went up
+    /// nine-fold. An `id=''` recorded as `Some("")` would put a key that
+    /// matches no anchor into the map and, worse, collide across every
+    /// block that had one.
+    #[test]
+    fn an_empty_id_is_not_an_anchor() {
+        let b = blocks(
+            "<ul id=''><li id='' class='' style='' value='1'><span>x</span></li></ul>\
+             <table id=''><tr id=''><td id=''>c</td></tr></table>\
+             <pre id=''>k</pre><blockquote id=''>q</blockquote>\
+             <img src='s' id=''><hr id=''>",
+        );
+        let out = from_quip_html(
+            "<ul id=''><li id='' class='' style='' value='1'><span>x</span></li></ul>\
+             <table id=''><tr id=''><td id=''>c</td></tr></table>\
+             <pre id=''>k</pre><blockquote id=''>q</blockquote>\
+             <img src='s' id=''><hr id=''>",
+        );
+        assert!(!b.is_empty(), "the content itself still parses");
+        assert_eq!(out.sections, Vec::new(), "an empty id records no anchor: {:?}", out.sections);
+    }
+
+    /// A padded id is trimmed down to the string an anchor can actually
+    /// name. `#temp:C:X` is matched against the attribute value as-is
+    /// and a URL fragment cannot carry raw whitespace, so `id=' X '`
+    /// could only ever be reached as `X` — filing it under `" X "` would
+    /// be a key the Phase-2b back-patch can never look up. The interior
+    /// is untouched, which the composite cell id here (spaces would be
+    /// invalid inside it, so its bytes must come through unchanged)
+    /// states alongside.
+    #[test]
+    fn a_padded_id_is_trimmed_to_the_string_an_anchor_carries() {
+        let b = blocks(
+            "<p id='  temp:C:ZaN06198313ef4a4ffc9068829e0\n  '>a</p>\
+             <p id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d'>b</p>",
+        );
+        let QuipBlock::Para { section_id, .. } = &b[0] else { panic!("expected para: {b:?}") };
+        assert_eq!(
+            section_id.as_deref(),
+            Some("temp:C:ZaN06198313ef4a4ffc9068829e0"),
+            "padding is stripped, so the key equals what a `#…` fragment carries"
+        );
+        let QuipBlock::Para { section_id, .. } = &b[1] else { panic!("expected para: {b:?}") };
+        assert_eq!(
+            section_id.as_deref(),
+            Some("temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d"),
+            "an unpadded id is passed through byte for byte"
+        );
+    }
+
+    /// A list that `enforce_containment` **splits** must not put its
+    /// anchor on both halves.
+    ///
+    /// `flatten_list` closes the list, emits the hoisted block and
+    /// resumes a fresh list of the same kind — so one source `<ul>`
+    /// becomes two `bullet_list` blocks with two different blockIds.
+    /// The `<ul>` carried one anchor, and an anchor resolves to one
+    /// destination, so `section_id.take()` gives it to the first
+    /// fragment only. Cloning it instead would put the **first
+    /// duplicate key** into the section map: the same Quip id mapped to
+    /// two blocks, with nothing to say which one a link should land on
+    /// — exactly the outcome the `<span>` decision was made to avoid.
+    ///
+    /// **Deliberately synthetic, and it has to be.** Quip never nests a
+    /// `<table>` inside an `<li>` — zero occurrences in 56 documents —
+    /// so no verbatim markup can reach this path at all. The ids are
+    /// real corpus ids (`CVLAAAgSl7Q`'s bullet section) so the *keys*
+    /// under test are the shape the map really holds; only the nesting
+    /// that triggers the split is invented.
+    #[test]
+    fn a_split_list_gives_its_anchor_to_the_first_fragment_only() {
+        let html = "<ul id='temp:C:CVL73809743db7745b7a64a37dc1'>\
+             <li id='temp:C:CVLdf56cde36a9d40d6b910f0d53'>a<table><tr><td>c</td></tr></table></li>\
+             <li id='temp:C:CVL6a4f566a19aa4607b8dbe64a9'>b</li></ul>";
+
+        // The split really happens: one <ul> in, two lists out.
+        let b = blocks(html);
+        assert_eq!(
+            b.iter().map(|x| x.node_type()).collect::<Vec<_>>(),
+            vec![NodeType::BulletList, NodeType::Table, NodeType::BulletList],
+            "the table is hoisted between two halves of the list: {b:?}"
+        );
+
+        let out = from_quip_html(html);
+        let ul = "temp:C:CVL73809743db7745b7a64a37dc1";
+        let landed: Vec<&str> =
+            out.sections.iter().filter(|(q, _)| q == ul).map(|(_, b)| b.as_str()).collect();
+        assert_eq!(
+            landed.len(),
+            1,
+            "the <ul>'s anchor must name exactly one block; it named {landed:?} — a duplicate \
+             key in the section map, which resolves to nothing decidable"
+        );
+
+        // Stated in full so the *whole* map is pinned, not just the count:
+        // both items keep their own anchors, and the split adds nothing.
+        assert_eq!(
+            out.sections.iter().map(|(q, _)| q.as_str()).collect::<Vec<_>>(),
+            vec![
+                ul,
+                "temp:C:CVLdf56cde36a9d40d6b910f0d53",
+                "temp:C:CVL6a4f566a19aa4607b8dbe64a9",
+            ],
+            "one entry per anchored block, in document order"
+        );
+
+        // The first fragment is the one that got it — the anchor should
+        // land where the list started, not where it resumed.
+        let txn = out.doc.transact();
+        let frag = crate::document::get_content_fragment(&txn).expect("content fragment");
+        let first_list = match frag.get(&txn, 0) {
+            Some(XmlOut::Element(el)) => el.get_attribute(&txn, "blockId").unwrap_or_default(),
+            other => panic!("expected a list first: {other:?}"),
+        };
+        assert_eq!(landed[0], first_list, "the anchor stayed on the first fragment");
+    }
+
+    /// The parse-stage tests above stop at `QuipBlock`; this one runs
+    /// the whole pipeline over one document containing every newly
+    /// covered kind and asserts each anchor reaches `sections` paired
+    /// with a **live** blockId. Markup is verbatim per fragment, from
+    /// the four fixtures named inline, concatenated.
+    #[test]
+    fn every_block_kinds_anchor_reaches_the_section_map() {
+        let html = concat!(
+            // CVLAAAgSl7Q — bullet section: <ul> + <li>
+            "<div data-section-style='5' class=\"\" style=\"\"><ul id='temp:C:CVL73809743db7745b7a64a37dc1'>",
+            "<li id='temp:C:CVLdf56cde36a9d40d6b910f0d53' class='' style='' value='1'>",
+            "<span id='temp:C:CVLdf56cde36a9d40d6b910f0d53'>Stand his ingelitse.</span>\n\n<br/></li></ul></div>",
+            // CVLAAAgSl7Q — <pre>
+            "<pre id='temp:C:CVLab76d47d4f6b483da9a484729' class='prettyprint'>can rsitam Note {<br>}</pre>",
+            // AeOAAAcV1hg — table section: <table> + <tr> + <td>
+            "<div data-section-style='13'><table id='temp:C:AeOfdbce4eabb6e41df873200fa6' title='Iusmod' style='width: 39.0667em'>",
+            "<tbody><tr id='temp:C:AeO2f2ceb0afd0a41419a2e9fae8'>",
+            "<td id='temp:s:temp:C:AeO2f2ceb0afd0a41419a2e9fae8_temp:C:AeO641271c1e4ec417fa93c8d029' style='text-align: left;vertical-align: middle;' class='bold'>",
+            "<span id='temp:s:temp:C:AeO2f2ceb0afd0a41419a2e9fae8_temp:C:AeO641271c1e4ec417fa93c8d029'>Eiusmod</span>\n\n<br/></td></tr></tbody></table></div>",
+            // ZaNAAAU4ELc — image section and blockquote
+            "<div data-section-style='11' style='max-width:100%' class='tall'><img src='https://quip.com/blob/ZaNAAAU4ELc/jG4ISoLLsz9JZ2nahGsoSg' id='temp:C:ZaNb6a7b9e7bd634c549b899bae4' alt=\"2555949508.had\"></img></div>",
+            "<blockquote id='temp:C:ZaN2ba9bae380d64c8392cc6ae88'>A ounce full a room.</blockquote>",
+        );
+        let out = from_quip_html(html);
+        let captured: Vec<&str> = out.sections.iter().map(|(q, _)| q.as_str()).collect();
+        assert_eq!(
+            captured,
+            vec![
+                "temp:C:CVL73809743db7745b7a64a37dc1", // <ul>
+                "temp:C:CVLdf56cde36a9d40d6b910f0d53", // <li> (and its <span>)
+                "temp:C:CVLab76d47d4f6b483da9a484729", // <pre>
+                "temp:C:AeOfdbce4eabb6e41df873200fa6", // <table>
+                "temp:C:AeO2f2ceb0afd0a41419a2e9fae8", // <tr>
+                "temp:s:temp:C:AeO2f2ceb0afd0a41419a2e9fae8_temp:C:AeO641271c1e4ec417fa93c8d029", // <td>
+                "temp:C:ZaNb6a7b9e7bd634c549b899bae4", // <img>
+                "temp:C:ZaN2ba9bae380d64c8392cc6ae88", // <blockquote>
+            ],
+            "document order, one entry per anchored block"
+        );
+
+        // Every recorded blockId names an element that exists.
+        let txn = out.doc.transact();
+        let frag = crate::document::get_content_fragment(&txn).expect("content fragment");
+        let mut ids = std::collections::HashSet::new();
+        for_each_element(&txn, &frag, &mut |txn, el| {
+            ids.insert(el.get_attribute(txn, "blockId").unwrap_or_default());
+        });
+        for (section, block_id) in &out.sections {
+            assert_eq!(block_id.len(), 10, "{section}: minted blockId shape");
+            assert!(ids.contains(block_id), "{section} points at a live blockId");
+        }
+    }
+
+    /// Quip repeats the `<li>`/`<td>` id verbatim on the inner
+    /// `<span>` — 643 of 643 span ids in the corpus, zero
+    /// counter-examples. So the span needs **no entry of its own**: a
+    /// lookup of the span's id already hits the item's entry. This
+    /// pins the reasoning, and would go red if Quip ever started
+    /// giving the span a distinct id (at which point spans need
+    /// capturing too).
+    #[test]
+    fn a_cell_span_repeats_its_parents_anchor_so_needs_no_entry_of_its_own() {
+        // QGYAAAjicgG, verbatim: <td id=X><span id=X>.
+        let html = "<table><tr id='temp:C:QGYe66f22cd7b834833a7ee9dc58'><td id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d' style=''><span id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d'>as</span>\n\n<br/></td></tr></table>";
+        let out = from_quip_html(html);
+        let captured: Vec<&str> = out.sections.iter().map(|(q, _)| q.as_str()).collect();
+        assert_eq!(
+            captured,
+            vec![
+                "temp:C:QGYe66f22cd7b834833a7ee9dc58",
+                "temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d",
+            ],
+            "the span's id resolves through its cell's entry, not a duplicate one"
+        );
+    }
+
     // ─── tables ──────────────────────────────────────────────
 
     #[test]
     fn table_rows_and_header_cells_parse() {
         let b = blocks("<table><tr><th>H</th></tr><tr><td>C</td></tr></table>");
-        let QuipBlock::Table { rows } = &b[0] else { panic!("expected table") };
+        let QuipBlock::Table { rows, .. } = &b[0] else { panic!("expected table") };
         assert_eq!(rows.len(), 2);
         assert!(rows[0].cells[0].header, "th -> header cell");
         assert!(!rows[1].cells[0].header);
@@ -3640,7 +4123,7 @@ mod tests {
             "<table><thead><tr><th>H</th></tr></thead>\
              <tbody><tr><td>C</td></tr></tbody></table>",
         );
-        let QuipBlock::Table { rows } = &b[0] else { panic!("expected table") };
+        let QuipBlock::Table { rows, .. } = &b[0] else { panic!("expected table") };
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].cells[0].header);
     }
@@ -3738,9 +4221,15 @@ mod tests {
         materialize(&[QuipBlock::List {
             ordered: false,
             task: false,
+            section_id: None,
             items: vec![QuipItem {
                 checked: None,
-                blocks: vec![QuipBlock::Image { src: "x".into(), alt: String::new() }],
+                section_id: None,
+                blocks: vec![QuipBlock::Image {
+                    src: "x".into(),
+                    alt: String::new(),
+                    section_id: None,
+                }],
             }],
         }]);
     }
@@ -3853,7 +4342,7 @@ mod tests {
              style=''><span id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGYf52ff49275694bfe880cf8613'>\
              no</span>\n\n<br/></td></tr></tbody></table>";
         let parsed = blocks(html);
-        let [QuipBlock::Table { rows }] = parsed.as_slice() else { panic!("expected a table") };
+        let [QuipBlock::Table { rows, .. }] = parsed.as_slice() else { panic!("expected a table") };
         let [row] = rows.as_slice() else { panic!("expected one row") };
         let shapes: Vec<String> = row
             .cells
@@ -3876,7 +4365,7 @@ mod tests {
              <th id='temp:C:QGY04be7f796bf1483e87f847ed3' class='empty' style='width: 6em'>A<br/>\
              </th></tr></thead></table>";
         let parsed = blocks(html);
-        let [QuipBlock::Table { rows }] = parsed.as_slice() else { panic!("expected a table") };
+        let [QuipBlock::Table { rows, .. }] = parsed.as_slice() else { panic!("expected a table") };
         let [row] = rows.as_slice() else { panic!("expected one row") };
         assert!(row.cells.iter().all(|c| c.header), "both cells are <th>");
         let shapes: Vec<String> = row
@@ -4046,7 +4535,7 @@ mod tests {
         let code: Vec<&String> = blocks
             .iter()
             .flat_map(|b| match b {
-                QuipBlock::Table { rows } => rows
+                QuipBlock::Table { rows, .. } => rows
                     .iter()
                     .flat_map(|r| r.cells.iter())
                     .flat_map(|c| c.blocks.iter())
