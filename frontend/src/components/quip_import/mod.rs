@@ -2099,9 +2099,7 @@ mod tests {
             "common-loading",
         ] {
             assert!(
-                EN_US
-                    .lines()
-                    .any(|l| l.starts_with(&format!("{key} ="))),
+                EN_US.lines().any(|l| l.starts_with(&format!("{key} ="))),
                 "en-US catalog is missing {key}",
             );
         }

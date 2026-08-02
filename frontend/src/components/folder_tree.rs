@@ -210,11 +210,7 @@ mod tests {
 
     #[test]
     fn an_unfetched_child_renders_a_placeholder_rather_than_vanishing() {
-        let folders = map(vec![folder(
-            "home",
-            "Home",
-            vec![child("work", "folder")],
-        )]);
+        let folders = map(vec![folder("home", "Home", vec![child("work", "folder")])]);
         let rows = rows_from("home", &folders, &expanded(&["home"]));
         assert_eq!(rows.len(), 2, "the pending child still occupies a row");
         assert!(!rows[1].is_loaded);
