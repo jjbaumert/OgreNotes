@@ -29,6 +29,7 @@ pub mod editor_width_toggle;
 pub mod file_browser;
 pub mod find_replace_bar;
 pub mod folder_picker;
+pub mod folder_tree;
 pub mod formula_keyboard;
 pub mod history_viewer;
 pub mod locale_selector;

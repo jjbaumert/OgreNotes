@@ -6,7 +6,8 @@ use leptos::prelude::*;
 
 use crate::a11y;
 use crate::api::client;
-use crate::api::folders::{self, ChildResponse, FolderResponse};
+use crate::api::folders::{self, FolderResponse};
+use crate::components::folder_tree::{self, FolderTreeRow};
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,51 +116,11 @@ pub fn FolderPickerDialog(
         on_pick.run(id);
     };
 
-    // Render a single folder node (recurses via indirection through expanded+folders).
-    // Uses flat rendering with indentation rather than nested components so the
+    // The flattening moved to `components::folder_tree` (#236 Unit 3) so the
+    // Quip import wizard's destination step can render the same tree without
+    // nesting this dialog inside its own modal. Rendering is unchanged: a flat
+    // row list with indentation, rather than a component per node, so the
     // signal graph stays simple.
-    fn render_tree(
-        root_id: &str,
-        folders: &HashMap<String, FolderResponse>,
-        expanded: &HashSet<String>,
-        out: &mut Vec<FolderRow>,
-        depth: u8,
-    ) {
-        let Some(folder) = folders.get(root_id) else {
-            // Placeholder row for a folder we haven't fetched yet (shouldn't
-            // normally happen because load is triggered on expand).
-            out.push(FolderRow {
-                id: root_id.to_string(),
-                title: crate::t!("common-loading"),
-                depth,
-                has_children: false,
-                is_expanded: false,
-                is_loaded: false,
-                is_trash: false,
-            });
-            return;
-        };
-        let child_folders: Vec<&ChildResponse> = folder
-            .children
-            .iter()
-            .filter(|c| c.child_type == "folder")
-            .collect();
-        out.push(FolderRow {
-            id: folder.id.clone(),
-            title: folder.title.clone(),
-            depth,
-            has_children: !child_folders.is_empty(),
-            is_expanded: expanded.contains(&folder.id),
-            is_loaded: true,
-            is_trash: folder.is_trash,
-        });
-        if !expanded.contains(&folder.id) {
-            return;
-        }
-        for child in child_folders {
-            render_tree(&child.child_id, folders, expanded, out, depth + 1);
-        }
-    }
 
     view! {
         <Show when=move || visible.get()>
@@ -193,11 +154,11 @@ pub fn FolderPickerDialog(
                     </div>
                     <div class="folder-picker-body">
                         {move || {
-                            let mut rows: Vec<FolderRow> = Vec::new();
+                            let mut rows: Vec<FolderTreeRow> = Vec::new();
                             if let Some(root) = root_id.get() {
                                 folders.with(|map| {
                                     expanded.with(|set| {
-                                        render_tree(&root, map, set, &mut rows, 0);
+                                        folder_tree::flatten_tree(&root, map, set, &mut rows, 0);
                                     });
                                 });
                             }
@@ -214,7 +175,14 @@ pub fn FolderPickerDialog(
                                         let row_id_for_toggle = row_id.clone();
                                         let is_selected = selected.get() == Some(row_id.clone());
                                         let indent = format!("padding-inline-start: {}px", (row.depth as u16) * 16 + 8);
-                                        let disabled = row.is_trash || !row.is_loaded;
+                                        let disabled = !row.is_selectable();
+                                        // The unloaded placeholder's wording is the
+                                        // caller's, not the tree's — see `folder_tree`.
+                                        let row_title = if row.is_loaded {
+                                            row.title.clone()
+                                        } else {
+                                            crate::t!("common-loading")
+                                        };
                                         let chevron = if !row.has_children {
                                             "".to_string()
                                         } else if row.is_expanded {
@@ -246,7 +214,7 @@ pub fn FolderPickerDialog(
                                                 </span>
                                                 <span class="folder-picker-icon">"\u{1F4C1}"</span>
                                                 <span class="folder-picker-title">
-                                                    {row.title}
+                                                    {row_title}
                                                     {if row.is_trash {
                                                         crate::t!("folder-picker-not-available")
                                                     } else {
@@ -284,14 +252,4 @@ pub fn FolderPickerDialog(
             </div>
         </Show>
     }
-}
-
-struct FolderRow {
-    id: String,
-    title: String,
-    depth: u8,
-    has_children: bool,
-    is_expanded: bool,
-    is_loaded: bool,
-    is_trash: bool,
 }
