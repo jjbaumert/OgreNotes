@@ -2660,20 +2660,40 @@ pub async fn import_one_thread(
 /// document's blob prefix, returning the `blockId -> new Image.src` map
 /// [`ogrenotes_collab::blob_ref::set_image_srcs`] applies.
 ///
-/// One unfetchable image must not cost the reader the whole document, so a
-/// failure maps that block to `None` (drop the `src`, keep the node and its
-/// `alt`), records the loss on the report, and the pass continues. The single
-/// exception is `Unauthorized`: that isn't "this image is broken", it's "the
-/// credential is dead", and every remaining fetch in the import would fail the
-/// same way — so it propagates and stops the run.
+/// One *permanently* unfetchable image must not cost the reader the whole
+/// document, so such a failure maps that block to `None` (drop the `src`, keep
+/// the node and its `alt`), records the loss on the report, and the pass
+/// continues.
 ///
-/// **A 403 is an image-drop, not a thread-skip.** It is tempting to treat
-/// blob-403 the way thread-403 is treated (#141's table reads that way), but
-/// the thread's HTML already came back `200`: the user can have this document,
-/// just not this one picture. Skipping the whole thread would lose strictly
-/// more than the policy every *other* blob failure already follows, and would
-/// make an attachment the user never had permission to see cost them the
-/// document they did.
+/// **A failure a later attempt could still recover propagates instead (#155).**
+/// Step 10 marks the thread `ContentDone` unconditionally and a re-run skips a
+/// `ContentDone` thread with zero Quip calls, so dropping the `src` on a Quip
+/// 503 or a timeout checkpointed the document image-less *permanently* — a
+/// rate-limit storm silently persisting a migration's worth of pictureless
+/// documents while reporting success. [`blob_failure_is_recoverable`] draws the
+/// line; the recoverable side returns `Err` before step 7 writes anything, so
+/// the thread stays `Pending` and #142's per-thread attempt budget bounds the
+/// retries exactly as it does for a failed thread-HTML fetch. This mirrors what
+/// [`PersonDirectory::resolve`] already does for an undecided mention, and for
+/// the same reason: costing one thread a retry is much cheaper than
+/// permanently degrading it.
+///
+/// The dispositions are `From<QuipError>`'s own rather than a parallel policy —
+/// a rate limit is never one thread's fault (`RunFailure`; the queue's backoff
+/// waits), a 5xx or a timeout is (`Transient`; charged to the thread).
+///
+/// Two failures that are *not* recoverable, and where checkpointing is
+/// therefore the right answer rather than a bug:
+///
+/// - **A 403 is an image-drop, not a thread-skip.** It is tempting to treat
+///   blob-403 the way thread-403 is treated (#141's table reads that way), but
+///   the thread's HTML already came back `200`: the user can have this
+///   document, just not this one picture. Skipping the whole thread would make
+///   an attachment the user never had permission to see cost them the document
+///   they did.
+/// - **`Unauthorized` is neither.** That isn't "this image is broken", it's
+///   "the credential is dead", and every remaining fetch in the import would
+///   fail the same way — so it propagates and stops the run.
 // `import_id`/`owner_id` ride along purely so an image drop can be recorded
 // on the REPORT row at the point the loss actually happens; same precedent as
 // `persist_imported_document` above.
@@ -2703,12 +2723,29 @@ async fn sideload_images(
         let bytes = match client.blob(token, blob_thread_id, blob_id).await {
             Ok(bytes) => bytes,
             Err(QuipError::Unauthorized) => return Err(ThreadImportError::TokenRejected),
+            // #155: a later attempt could still fetch this. Bail BEFORE step 7
+            // so the thread is not checkpointed with a loss it can recover;
+            // `From<QuipError>` decides who pays for the retry. The blob id is
+            // named in the log only — routing the error through `From` rather
+            // than hand-building a `Transient` keeps that variant's two-origin
+            // leak guarantee (see `ThreadImportError::transient`) intact.
+            Err(e) if blob_failure_is_recoverable(&e) => {
+                tracing::warn!(
+                    thread = %thread.quip_thread_id,
+                    blob_id,
+                    error = %e,
+                    "quip content: blob fetch failed recoverably; the thread stays retryable \
+                     rather than checkpointing without the image",
+                );
+                return Err(e.into());
+            }
             Err(e) => {
                 tracing::warn!(
                     thread = %thread.quip_thread_id,
                     blob_id,
                     error = %e,
-                    "quip content: blob fetch failed; keeping the image's alt text only",
+                    "quip content: blob fetch failed permanently; keeping the image's alt \
+                     text only",
                 );
                 updates.insert(image.block_id.clone(), None);
                 // `safe_quip_reason`, not `e` — `QuipError::Api` carries
@@ -2727,26 +2764,63 @@ async fn sideload_images(
                     Some(ogrenotes_collab::blob_ref::blob_ref(blob_id, &key)),
                 );
             }
+            // Our storage, not Quip's — and #155's shape verbatim: dropping the
+            // `src` here checkpointed the document image-less over an S3 blip
+            // that lasted seconds. `RunFailure`, matching every other S3/DynamoDB
+            // failure in this function (`stage html`, `put secmap`) and
+            // `LookupFault::Storage`: the pass aborts, the queue retries the job,
+            // and the thread is charged nothing — a storage blip must never spend
+            // an innocent thread's attempts.
             Err(e) => {
                 tracing::warn!(
                     thread = %thread.quip_thread_id,
                     blob_id,
                     error = %e,
-                    "quip content: blob upload failed; keeping the image's alt text only",
+                    "quip content: blob upload failed; the thread stays retryable",
                 );
-                updates.insert(image.block_id.clone(), None);
-                drop_image(
-                    ctx,
-                    import_id,
-                    owner_id,
-                    thread,
-                    &format!("image {blob_id}: it could not be stored"),
-                )
-                .await;
+                return Err(ThreadImportError::RunFailure(format!("side-load image: {e}")));
             }
         }
     }
     Ok(updates)
+}
+
+/// Whether a `GET /1/blob/…` failure is one a later attempt could still
+/// recover — and therefore one that must **not** be checkpointed (#155).
+///
+/// This is the whole judgement call in #155, because the two mistakes are not
+/// symmetric. Treating a recoverable failure as permanent loses the image
+/// forever and says nothing a re-run can act on. Treating a *permanent* failure
+/// as recoverable is worse: the thread climbs [`MAX_THREAD_ATTEMPTS`] and is
+/// marked `Failed`, so a document that would have imported fine-but-imageless
+/// does not import at all. The default therefore has to be "permanent", and a
+/// class earns `true` only by being genuinely retryable.
+///
+/// Class by class, for the endpoint [`QuipClient::blob`] actually is:
+///
+/// - `RateLimited` (Quip's 503) — the definition of "not now, ask again".
+/// - `Http` — reqwest could not complete the request: a timeout, a reset
+///   connection, a truncated body. Nothing about the blob is implicated.
+/// - `Api` 5xx and 429 — Quip failed to answer, or asked us to slow down.
+/// - `Api` 4xx (429 aside) — Quip understood the request and refused it; a 404
+///   is the common one, an attachment that is simply gone. No retry widens
+///   that. Same rule, same reasoning, as [`is_permanent_lookup_failure`].
+/// - `Parse` — **deterministically permanent here, and this is the class the
+///   issue got wrong.** `blob()` parses nothing: it returns raw bytes, and its
+///   only `Parse` producer is `check_blob_size` refusing a body over
+///   `MAX_BLOB_BYTES`. A 40 MiB attachment is 40 MiB on the next run too, so
+///   retrying it three times and then marking the thread `Failed` would trade a
+///   document with one missing picture for no document at all.
+/// - `Unauthorized` / `Forbidden` — decided elsewhere in `sideload_images`
+///   (run-terminal and image-drop respectively) and never reach here; spelled
+///   out anyway so the match stays exhaustive and no future variant can
+///   silently inherit either answer.
+fn blob_failure_is_recoverable(e: &QuipError) -> bool {
+    match e {
+        QuipError::RateLimited { .. } | QuipError::Http(_) => true,
+        QuipError::Api { status, .. } => *status >= 500 || *status == 429,
+        QuipError::Unauthorized | QuipError::Forbidden | QuipError::Parse(_) => false,
+    }
 }
 
 /// Record one dropped attachment on the report. Advisory, like every other
@@ -3045,6 +3119,66 @@ mod tests {
         let before = counters.len();
         counters.dedup();
         assert_eq!(before, counters.len(), "two counters share a key: {counters:?}");
+    }
+
+    /// #155's per-class decision, pinned. The classes that reach
+    /// `sideload_images` as a *drop* are the ones no retry can fix; everything
+    /// else must leave the thread retryable.
+    #[test]
+    fn only_a_genuinely_retryable_blob_failure_is_recoverable() {
+        assert!(blob_failure_is_recoverable(&QuipError::RateLimited { retry_after_ms: None }));
+        assert!(blob_failure_is_recoverable(&QuipError::Api {
+            status: 500,
+            message: String::new()
+        }));
+        assert!(blob_failure_is_recoverable(&QuipError::Api {
+            status: 503,
+            message: String::new()
+        }));
+        // 429 is a rate limit wearing a different status. `observe_and_check`
+        // only maps 503 to `RateLimited`, so this is the arm that catches it.
+        assert!(blob_failure_is_recoverable(&QuipError::Api {
+            status: 429,
+            message: String::new()
+        }));
+
+        // Quip understood and refused: the attachment is gone, or the request
+        // is wrong. Retrying to a `Failed` thread would cost the document.
+        for status in [400, 404, 410, 422] {
+            assert!(
+                !blob_failure_is_recoverable(&QuipError::Api { status, message: String::new() }),
+                "a {status} is a decision, not a delay",
+            );
+        }
+
+        // The class the issue named as in-scope and that measurably is not.
+        // `QuipClient::blob` returns raw bytes and parses nothing; its only
+        // `Parse` producer is the `MAX_BLOB_BYTES` refusal, and an oversized
+        // attachment is oversized on every future run too.
+        assert!(!blob_failure_is_recoverable(&QuipError::Parse("too big".into())));
+
+        // Decided before the classifier is consulted, but never by inheriting
+        // the permissive answer.
+        assert!(!blob_failure_is_recoverable(&QuipError::Unauthorized));
+        assert!(!blob_failure_is_recoverable(&QuipError::Forbidden));
+    }
+
+    /// The dispositions #155 hands to `From<QuipError>` are the ones #141/#142
+    /// already defined, not a parallel policy — which is what makes the
+    /// per-thread attempt bound apply to the new path for free.
+    #[test]
+    fn a_recoverable_blob_failure_carries_the_existing_dispositions() {
+        assert!(matches!(
+            ThreadImportError::from(QuipError::RateLimited { retry_after_ms: None }),
+            // Never one thread's fault: the queue's backoff waits, and the
+            // thread is charged nothing.
+            ThreadImportError::RunFailure(_),
+        ));
+        assert!(matches!(
+            ThreadImportError::from(QuipError::Api { status: 500, message: String::new() }),
+            // Charged to the thread, so `MAX_THREAD_ATTEMPTS` bounds it.
+            ThreadImportError::Transient(_),
+        ));
     }
 
     #[test]
