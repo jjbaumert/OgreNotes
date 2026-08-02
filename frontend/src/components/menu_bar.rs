@@ -23,6 +23,7 @@ pub enum DocAction {
     ToggleFocusMode,
     ExportCsv,
     ExportXlsx,
+    ExportPdf,
     /// #139: toggle block line numbers in the editor gutter.
     ToggleLineNumbers,
     /// #139: toggle page-break guides in the editor.
@@ -86,6 +87,7 @@ pub fn document_menu_entries(
                 doc(crate::t!("menubar-doc-export-markdown"), DocAction::ExportMarkdown),
                 doc(crate::t!("menubar-doc-export-csv"), DocAction::ExportCsv),
                 doc(crate::t!("menubar-doc-export-excel"), DocAction::ExportXlsx),
+                doc(crate::t!("menubar-doc-export-pdf"), DocAction::ExportPdf),
             ],
         ),
         MenuEntry::Separator,

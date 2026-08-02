@@ -49,6 +49,7 @@ enum ExportFormat {
     Markdown,
     Csv,
     Xlsx,
+    Pdf,
 }
 
 impl ExportFormat {
@@ -59,6 +60,7 @@ impl ExportFormat {
             Self::Markdown => "markdown",
             Self::Csv => "csv",
             Self::Xlsx => "xlsx",
+            Self::Pdf => "pdf",
         }
     }
 
@@ -69,6 +71,7 @@ impl ExportFormat {
             Self::Markdown => "md",
             Self::Csv => "csv",
             Self::Xlsx => "xlsx",
+            Self::Pdf => "pdf",
         }
     }
 }
@@ -2575,6 +2578,9 @@ pub fn DocumentPage() -> impl IntoView {
             }
             DocAction::ExportXlsx => {
                 spawn_export(current_id.get_untracked(), title.get_untracked(), ExportFormat::Xlsx);
+            }
+            DocAction::ExportPdf => {
+                spawn_export(current_id.get_untracked(), title.get_untracked(), ExportFormat::Pdf);
             }
             DocAction::Print => {
                 if let Some(window) = web_sys::window() {
