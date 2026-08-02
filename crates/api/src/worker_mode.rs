@@ -3508,12 +3508,27 @@ mod tests {
         assert_eq!(additional, vec!["of2".to_string()]);
     }
 
-    /// Phase 1 writes no `ogre_folder_id`, so every Quip folder resolves to the
-    /// import's target folder and a thread's multi-folder membership collapses
-    /// to a single destination. Flat, but correct — and pinned so the day
-    /// something populates `ogre_folder_id`, the change is visible here.
+    /// The unmapped fallback, which #236 changed the *meaning* of without
+    /// changing the behaviour asserted here.
+    ///
+    /// This test was written anticipating this work — "pinned so the day
+    /// something populates `ogre_folder_id`, the change is visible here" —
+    /// and the honest answer is that the change is **not** visible here,
+    /// because this exercises `FolderMapping` with an explicitly empty map.
+    /// What changed is who reaches that state. It used to be every import
+    /// (Phase 1 wrote `ogre_folder_id: None` for every folder, so this was
+    /// the whole story and the docs above described it as such); now it is
+    /// only a thread naming a folder outside the import's `FOLDER#` set —
+    /// a manifest written by an older inventory pass.
+    ///
+    /// So the assertions stand unchanged and the doc comment is what moves:
+    /// filing such a document flat under the destination is still strictly
+    /// better than failing an import over one thread's filing. Renamed from
+    /// `folders_for_collapses_to_the_target_folder_when_nothing_is_mapped`
+    /// because "when nothing is mapped" described the old normal case and now
+    /// describes an edge.
     #[test]
-    fn folders_for_collapses_to_the_target_folder_when_nothing_is_mapped() {
+    fn an_unmapped_quip_folder_still_files_under_the_imports_destination() {
         let m = mapping(&[], "target");
         let (primary, additional) = m.folders_for(&thread("qf1", &["qf1", "qf2"]));
         assert_eq!(primary, "target");

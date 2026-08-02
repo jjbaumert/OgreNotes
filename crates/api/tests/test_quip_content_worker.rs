@@ -22,8 +22,10 @@ use ogrenotes_api::worker_mode::{
 };
 use ogrenotes_quip_import::{QuipClient, QuipToken};
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
+use ogrenotes_storage::models::folder::FolderChild;
 use ogrenotes_storage::models::import_inventory::{ThreadRow, ThreadState};
-use ogrenotes_storage::models::DocType;
+use ogrenotes_storage::models::{ChildType, DocType};
+use std::collections::BTreeSet;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -237,21 +239,39 @@ async fn content_pass_creates_documents_with_quip_timestamps_and_folders() {
     assert_eq!(meta.created_at, 111, "created_at must be the Quip updated_usec");
     assert_eq!(meta.updated_at, 111, "updated_at must be the Quip updated_usec");
 
-    // Phase 1 leaves `ogre_folder_id` unset on every FOLDER# row, so the
-    // mapping falls back to the import's target folder for all threads
-    // (documented Phase-2a limitation: no mirrored folder tree yet).
-    assert_eq!(meta.folder_id.as_deref(), Some("target-folder"));
+    // #236 changed this, deliberately. It used to read `Some("target-folder")`
+    // with the comment "Phase 1 leaves `ogre_folder_id` unset on every FOLDER#
+    // row, so the mapping falls back to the import's target folder for all
+    // threads (documented Phase-2a limitation: no mirrored folder tree yet)".
+    // That limitation is what #236 removes: t1's `first_folder` is the Quip
+    // folder `root`, and `root` now has a mirrored OgreNotes folder under the
+    // destination, so t1 files into it.
+    //
+    // The claim this test still makes is unchanged and is the one worth
+    // keeping: the document is filed *somewhere real* and is really linked
+    // there. What changed is which folder that is — a behaviour change, made
+    // once, and pinned in full by
+    // `the_quip_folder_tree_is_mirrored_under_the_import_destination`.
+    let filed_in = meta.folder_id.clone().expect("t1 is filed somewhere");
+    assert_ne!(
+        filed_in, "target-folder",
+        "t1 belongs in the mirrored folder for Quip's `root`, not flat in the destination",
+    );
+    assert_eq!(
+        mirrored_folder(&app, &import_id, "root").await.as_deref(),
+        Some(filed_in.as_str()),
+    );
     assert!(
-        !meta.additional_folder_ids.contains(&"target-folder".to_string()),
+        !meta.additional_folder_ids.contains(&filed_in),
         "the primary folder must not be duplicated into additional_folder_ids"
     );
 
     // The doc is really linked into the folder — `additional_folder_ids`
     // alone does not create the CHILD# rows.
-    let children = app.state.folder_repo.list_children("target-folder").await.unwrap();
+    let children = app.state.folder_repo.list_children(&filed_in).await.unwrap();
     let child_ids: std::collections::BTreeSet<_> =
         children.iter().map(|c| c.child_id.clone()).collect();
-    assert!(child_ids.contains(&t1_doc_id), "t1's doc is linked into the target folder");
+    assert!(child_ids.contains(&t1_doc_id), "t1's doc is linked into the folder it is filed in");
 
     // The raw HTML was staged to S3 under the import's prefix *during* the
     // run, and swept when the import went terminal (#196 — the staged object
@@ -3087,4 +3107,294 @@ async fn a_staging_sweep_failure_does_not_change_the_imports_outcome() {
         "the import's outcome must be decided by the import, not by its cleanup",
     );
     assert_eq!(rec.phase, 2, "the pass still completed");
+}
+
+// ─── Mirroring the Quip folder tree (#236) ───────────────────────
+
+/// The `ogre_folder_id` recorded for one Quip folder on the import manifest.
+async fn mirrored_folder(app: &common::TestApp, import_id: &str, quip_id: &str) -> Option<String> {
+    app.state
+        .import_repo
+        .list_folders(import_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|f| f.quip_folder_id == quip_id)
+        .and_then(|f| f.ogre_folder_id)
+}
+
+/// Every folder (not document) currently linked under `parent`.
+async fn child_folder_ids(app: &common::TestApp, parent: &str) -> BTreeSet<String> {
+    app.state
+        .folder_repo
+        .list_children(parent)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.child_type == ChildType::Folder)
+        .map(|c| c.child_id)
+        .collect()
+}
+
+/// Unit 1's headline claim: the Quip tree comes across as a real OgreNotes
+/// tree under the import's destination, and documents file themselves into it
+/// off the mapping alone.
+///
+/// The shape asserted here is the one the inventory walk *records* for this
+/// fixture — `root` a selected root with no parent, `f2` discovered through
+/// `root` — not a tree hand-drawn to look tidy.
+#[tokio::test]
+async fn the_quip_folder_tree_is_mirrored_under_the_import_destination() {
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let ogre_root = mirrored_folder(&app, &import_id, "root").await.expect("root mirrored");
+    let ogre_sub = mirrored_folder(&app, &import_id, "f2").await.expect("f2 mirrored");
+    assert_ne!(ogre_root, ogre_sub);
+
+    // Quip's own names, and Quip's own nesting: `root` under the import's
+    // destination, `f2` under `root`.
+    let root_folder = app.state.folder_repo.get(&ogre_root).await.unwrap().expect("root folder");
+    assert_eq!(root_folder.title, "Root");
+    assert_eq!(root_folder.owner_id, "owner1");
+    assert_eq!(root_folder.parent_id.as_deref(), Some("target-folder"));
+
+    let sub_folder = app.state.folder_repo.get(&ogre_sub).await.unwrap().expect("sub folder");
+    assert_eq!(sub_folder.title, "Sub");
+    assert_eq!(sub_folder.parent_id.as_deref(), Some(ogre_root.as_str()));
+
+    // ...and the CHILD# edges really exist, which `parent_id` alone does not
+    // create — a folder listed by neither parent is invisible in the UI.
+    assert!(child_folder_ids(&app, "target-folder").await.contains(&ogre_root));
+    assert!(child_folder_ids(&app, &ogre_root).await.contains(&ogre_sub));
+
+    // Documents route themselves off the mapping. t1's `first_folder` is
+    // `root` (the BFS met it there first); t2 is only ever in `f2`.
+    let t1_doc = doc_id_for(&app, &import_id, "t1").await.expect("t1 imported");
+    let t2_doc = doc_id_for(&app, &import_id, "t2").await.expect("t2 imported");
+    let t1_meta = app.state.doc_repo.get(&t1_doc).await.unwrap().unwrap();
+    let t2_meta = app.state.doc_repo.get(&t2_doc).await.unwrap().unwrap();
+    assert_eq!(t1_meta.folder_id.as_deref(), Some(ogre_root.as_str()));
+    assert_eq!(t2_meta.folder_id.as_deref(), Some(ogre_sub.as_str()));
+
+    // Nothing lands in the flat destination any more — that was the pre-#236
+    // behaviour this replaces.
+    assert!(
+        [&t1_meta, &t2_meta]
+            .iter()
+            .all(|m| m.folder_id.as_deref() != Some("target-folder")),
+        "no document should still be filed flat",
+    );
+}
+
+/// **Negative control — passes before and after.** A re-run must create
+/// nothing new.
+///
+/// This is the guard whose failure spawns a duplicate tree on every retry,
+/// and the reaper re-runs crashed jobs, so "every retry" is not hypothetical.
+/// It asserts the *folder set under the destination is unchanged*, not merely
+/// that a mapping still exists — a second tree would leave the mapping
+/// pointing at the first tree while the duplicates piled up beside it.
+#[tokio::test]
+async fn re_running_an_import_creates_no_second_folder_tree() {
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+    let first_root = mirrored_folder(&app, &import_id, "root").await.expect("mirrored");
+    let first_sub = mirrored_folder(&app, &import_id, "f2").await.expect("mirrored");
+    let under_target = child_folder_ids(&app, "target-folder").await;
+    let under_root = child_folder_ids(&app, &first_root).await;
+
+    // The queue redelivering the job, or the user pressing start again.
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    assert_eq!(
+        mirrored_folder(&app, &import_id, "root").await.as_deref(),
+        Some(first_root.as_str()),
+        "the manifest must still name the folder the first run created",
+    );
+    assert_eq!(
+        mirrored_folder(&app, &import_id, "f2").await.as_deref(),
+        Some(first_sub.as_str()),
+    );
+    assert_eq!(
+        child_folder_ids(&app, "target-folder").await,
+        under_target,
+        "a re-run must add no folder under the destination",
+    );
+    assert_eq!(
+        child_folder_ids(&app, &first_root).await,
+        under_root,
+        "nor under any mirrored folder",
+    );
+}
+
+/// **Negative control — passes before and after, and the one a fix-only test
+/// cannot catch.**
+///
+/// Folder location is mutable after an import. The user moves an imported
+/// document; a later run must leave it where they put it. This is precisely
+/// what a well-meaning "re-file every thread into its mirrored folder on
+/// every run" implementation breaks, and it would break it while every
+/// mirroring assertion above stayed green.
+///
+/// The move is performed the way `routes::documents` performs one —
+/// `set_folder` plus the two CHILD# edges — so the state the second run meets
+/// is the state a real user leaves behind.
+#[tokio::test]
+async fn a_document_the_user_moved_after_importing_is_not_moved_back() {
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+    let doc_id = doc_id_for(&app, &import_id, "t1").await.expect("t1 imported");
+    let imported_into = app
+        .state
+        .doc_repo
+        .get(&doc_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .folder_id
+        .expect("filed somewhere");
+
+    // The user moves it somewhere of their own, outside the import entirely.
+    let now = ogrenotes_common::time::now_usec();
+    app.state.doc_repo.set_folder(&doc_id, "somewhere-else", now).await.unwrap();
+    app.state.folder_repo.remove_child(&imported_into, &doc_id).await.unwrap();
+    app.state
+        .folder_repo
+        .add_child(&FolderChild {
+            folder_id: "somewhere-else".to_string(),
+            child_id: doc_id.clone(),
+            child_type: ChildType::Doc,
+            added_at: now,
+        })
+        .await
+        .unwrap();
+
+    // The reaper re-runs the job.
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let meta = app.state.doc_repo.get(&doc_id).await.unwrap().unwrap();
+    assert_eq!(
+        meta.folder_id.as_deref(),
+        Some("somewhere-else"),
+        "a re-run must respect where the user put their document",
+    );
+    assert!(
+        !app.state
+            .folder_repo
+            .list_children(&imported_into)
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.child_id == doc_id),
+        "and must not re-link it under the folder it was imported into",
+    );
+}
+
+/// [`quip_content_server`] plus `f3`, a sub-folder of `root` whose only child
+/// is the chat thread `tc`. The second BFS level therefore fetches `f2,f3` in
+/// one batch, exactly as the real walker batches a level.
+async fn quip_server_with_a_chat_only_folder() -> MockServer {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/1/folders/"))
+        .and(query_param("ids", "root"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "root": {
+                "folder": {"id": "root", "title": "Root"},
+                "children": [ {"thread_id": "t1"}, {"folder_id": "f2"}, {"folder_id": "f3"} ]
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/1/folders/"))
+        .and(query_param("ids", "f2,f3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "f2": {
+                "folder": {"id": "f2", "title": "Sub"},
+                "children": [ {"thread_id": "t2"} ]
+            },
+            "f3": {
+                "folder": {"id": "f3", "title": "Chatter"},
+                "children": [ {"thread_id": "tc"} ]
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/1/threads/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "t1": {"thread": {"id": "t1", "title": "Doc A", "type": "document", "updated_usec": 111}},
+            "t2": {"thread": {"id": "t2", "title": "Sheet", "type": "spreadsheet", "updated_usec": 222}},
+            "tc": {"thread": {"id": "tc", "title": "Watercooler", "type": "chat", "updated_usec": 333}}
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/2/threads/t1/html"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(T1_HTML)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2/threads/t2/html"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(T2_HTML)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/1/blob/t1/b9"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(BLOB_BYTES.to_vec()))
+        .mount(&server)
+        .await;
+
+    server
+}
+
+/// A Quip folder whose only thread is a chat imports as an **empty** folder,
+/// not as no folder at all.
+///
+/// The rule, and the reason: the user asked for their structure. An empty
+/// folder is an honest account of what was there — Quip shows a folder, so
+/// OgreNotes shows a folder — while pruning it silently disagrees with the
+/// Quip window the user is comparing against, and does so exactly where the
+/// content is least visible.
+#[tokio::test]
+async fn a_quip_folder_holding_only_a_chat_is_still_mirrored_as_an_empty_folder() {
+    common::require_infra!();
+    let server = quip_server_with_a_chat_only_folder().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let ogre_root = mirrored_folder(&app, &import_id, "root").await.expect("root mirrored");
+    let ogre_chat = mirrored_folder(&app, &import_id, "f3").await.expect("f3 mirrored");
+
+    let chat_folder = app.state.folder_repo.get(&ogre_chat).await.unwrap().expect("folder exists");
+    assert_eq!(chat_folder.title, "Chatter");
+    assert_eq!(chat_folder.parent_id.as_deref(), Some(ogre_root.as_str()));
+    assert!(
+        app.state.folder_repo.list_children(&ogre_chat).await.unwrap().is_empty(),
+        "the chat was skipped, so the mirrored folder is empty — and still exists",
+    );
 }
