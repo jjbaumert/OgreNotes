@@ -110,7 +110,17 @@ pub struct StatusResponse {
 /// Mirrors `routes::imports::ReportDto`. Skips and failures are separate
 /// fields, not one "problems" list, because they mean different things to
 /// the person reading them — see [`ImportReport::skipped`] /
-/// [`ImportReport::failed`].
+/// [`ImportReport::failed`]. The same reasoning keeps the within-document
+/// losses (#208) one field per kind rather than a "degraded" bucket.
+///
+/// **Every field is `#[serde(default)]`, including the ones that predate
+/// #208.** A client newer than its server is the normal state during a
+/// rolling deploy, and it lasts minutes on every release: the new WASM
+/// bundle ships from CloudFront the moment it is uploaded, while ECS is
+/// still draining tasks that serve the old response shape. A missing field
+/// there must read as "this server does not report that yet", never as a
+/// decode error — an error would fail the whole status poll and freeze the
+/// wizard mid-import, which is a far worse outcome than a missing section.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportReport {
@@ -128,12 +138,48 @@ pub struct ImportReport {
     /// Quip chat threads. Counted, never named: chats are not documents.
     #[serde(default)]
     pub chat_threads_skipped: u64,
-    /// Row-global count of discarded notes, spanning kinds this wizard does
-    /// not render (dropped images, truncated nesting). **Deliberately not
-    /// used for the "and N more" line** — it cannot say which section lost
-    /// notes, and attributing an image-note drop to the document list would
-    /// be a new lie in place of the old one. [`Outcome::hidden`] is the
-    /// per-section truncation signal.
+    /// Attachments that could not be copied, in documents that otherwise
+    /// imported. `None` means "none were dropped, or this server predates
+    /// #208" — the two are indistinguishable on the wire and get the same
+    /// handling: draw no section. Guessing either way would be worse than
+    /// silence, and a server that cannot report a loss is not evidence of
+    /// one.
+    ///
+    /// **Counts images, not documents**, so one document losing eight
+    /// pictures reads as eight. The wording must match that unit.
+    #[serde(default)]
+    pub images_dropped: Option<Outcome>,
+    /// Documents whose deep nesting was flattened: the text survived, the
+    /// structure below the walker's depth cap did not. Counts documents.
+    #[serde(default)]
+    pub content_truncated: Option<Outcome>,
+    /// Documents in which at least one @mention lost its link and became
+    /// plain text. Counts documents.
+    ///
+    /// This kind's counter routinely runs far ahead of its notes — the
+    /// server writes a note only for the systemic cause, while the counter
+    /// also takes the per-document degradations. `hidden()` is therefore
+    /// normally large here even without truncation, which is correct: the
+    /// number of affected documents is the true claim, and the notes are
+    /// examples.
+    #[serde(default)]
+    pub mentions_degraded: Option<Outcome>,
+    /// Embedded Quip live-app blocks — Kanban boards, polls, calendars —
+    /// whose contents did not come across (#191). Counts **blocks**, not
+    /// documents.
+    #[serde(default)]
+    pub live_apps_dropped: Option<Outcome>,
+    /// Spreadsheet formulas that were not imported (#192): the cells keep
+    /// the last value Quip calculated and will not recalculate. Counts
+    /// **formulas**, while its notes are one per document — so `hidden()`
+    /// is normally very large here, and correctly so.
+    #[serde(default)]
+    pub spreadsheet_formulas_dropped: Option<Outcome>,
+    /// Row-global count of discarded notes, spanning **all** kinds.
+    /// **Deliberately not used for the "and N more" line** — it cannot say
+    /// which section lost notes, and attributing an image-note drop to the
+    /// document list would be a new lie in place of the old one.
+    /// [`Outcome::hidden`] is the per-section truncation signal.
     #[serde(default)]
     pub notes_dropped: u64,
 }

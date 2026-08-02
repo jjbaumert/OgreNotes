@@ -90,20 +90,64 @@ struct Completion {
     failed: Option<Section>,
     /// Chat threads, which are counted but never named.
     chat_skipped: u64,
+    /// Attachments that did not come across, in documents that did. Counts
+    /// **images**, not documents.
+    images_dropped: Option<Section>,
+    /// Documents whose deep nesting was flattened. Counts documents.
+    content_truncated: Option<Section>,
+    /// Documents whose @mentions became plain text. Counts documents.
+    mentions_degraded: Option<Section>,
+    /// Embedded live-app blocks that did not come across. Counts **blocks**.
+    live_apps_dropped: Option<Section>,
+    /// Spreadsheet formulas that did not come across. Counts **formulas**.
+    spreadsheet_formulas_dropped: Option<Section>,
 }
 
 /// Which outcome a [`Section`] is describing.
 ///
-/// An enum rather than a pair of key strings threaded through
-/// `section_view`: the two sections differ in wording and in their
-/// test-automation anchor, and both differences belong in one place where
-/// adding a third outcome is a compile error at every site that matters.
+/// An enum rather than a set of key strings threaded through
+/// `section_view`: the sections differ in wording, in their
+/// test-automation anchor, and in which tier they belong to, and all three
+/// differences belong in one place where adding an outcome is a compile
+/// error at every site that matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutcomeKind {
     /// Quip refused to serve these. The reader may be able to get access.
     Skipped,
     /// The importer tried, retried, and gave up. Retrying already happened.
     Failed,
+    /// Attachments that could not be copied out of Quip.
+    ImagesDropped,
+    /// Nesting flattened below the walker's depth cap.
+    ContentTruncated,
+    /// @mentions that lost their link and became plain text.
+    MentionsDegraded,
+    /// Embedded Quip live apps whose contents were not converted.
+    LiveAppsDropped,
+    /// Spreadsheet formulas that were not imported.
+    SpreadsheetFormulasDropped,
+}
+
+/// Which tier of the completion screen an [`OutcomeKind`] belongs to.
+///
+/// The screen has to carry seven outcomes and they are not equally
+/// important: a document that never arrived is a different order of loss
+/// from a picture that did not come with one that did. Flattening all seven
+/// into one list would make the reader rank them, and the ranking is
+/// exactly what we know and they do not.
+///
+/// Both tiers show their counts unconditionally. The tier is a *heading*,
+/// not a disclosure — nothing here is collapsed behind an extra click, and
+/// in particular no whole-document loss is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutcomeTier {
+    /// A document is missing from the destination folder. Nothing the user
+    /// does inside OgreNotes will find it; the remedy, if any, is in Quip.
+    Documents,
+    /// The document arrived and something inside it did not. The user has
+    /// the document and can see what is there — this tier tells them what
+    /// to look for.
+    WithinDocuments,
 }
 
 impl OutcomeKind {
@@ -113,14 +157,51 @@ impl OutcomeKind {
         match self {
             Self::Skipped => "skipped",
             Self::Failed => "failed",
+            Self::ImagesDropped => "images-dropped",
+            Self::ContentTruncated => "content-truncated",
+            Self::MentionsDegraded => "mentions-degraded",
+            Self::LiveAppsDropped => "live-apps-dropped",
+            Self::SpreadsheetFormulasDropped => "spreadsheet-formulas-dropped",
         }
     }
 
     /// The section's visible heading, localized.
+    ///
+    /// Each kind gets its own string rather than a shared "N problems"
+    /// template: the *unit* differs (images vs. documents) and so does the
+    /// remedy, and a reader who cannot tell "8 pictures" from "8 documents"
+    /// has been told a number and nothing else.
     fn label(self, count: u64) -> String {
         match self {
             Self::Skipped => crate::t!("quip-import-report-skipped", count = count as i64),
             Self::Failed => crate::t!("quip-import-report-failed", count = count as i64),
+            Self::ImagesDropped => {
+                crate::t!("quip-import-report-images", count = count as i64)
+            }
+            Self::ContentTruncated => {
+                crate::t!("quip-import-report-truncated", count = count as i64)
+            }
+            Self::MentionsDegraded => {
+                crate::t!("quip-import-report-mentions", count = count as i64)
+            }
+            Self::LiveAppsDropped => {
+                crate::t!("quip-import-report-live-apps", count = count as i64)
+            }
+            Self::SpreadsheetFormulasDropped => {
+                crate::t!("quip-import-report-formulas", count = count as i64)
+            }
+        }
+    }
+
+    /// Which tier this kind is grouped under. See [`OutcomeTier`].
+    fn tier(self) -> OutcomeTier {
+        match self {
+            Self::Skipped | Self::Failed => OutcomeTier::Documents,
+            Self::ImagesDropped
+            | Self::ContentTruncated
+            | Self::MentionsDegraded
+            | Self::LiveAppsDropped
+            | Self::SpreadsheetFormulasDropped => OutcomeTier::WithinDocuments,
         }
     }
 }
@@ -157,6 +238,31 @@ impl Section {
             hidden: outcome.hidden(),
         })
     }
+
+    /// The two numbers this section renders: the count on its heading, and
+    /// the "…and N more" count (`None` when nothing is unnamed).
+    ///
+    /// Pulled out of the `view!` so **the one property this whole feature
+    /// rests on is assertable natively**: both numbers come from the
+    /// server's uncapped counter, and neither is `named.len()`. There is no
+    /// DOM harness in this crate, so a number computed inline in the markup
+    /// would be checkable only by eye — and "the list silently stopped at
+    /// 25" is precisely the bug that survives an eyeball.
+    fn display_counts(&self) -> (u64, Option<u64>) {
+        (self.total, (self.hidden > 0).then_some(self.hidden))
+    }
+
+    /// `None` for an absent outcome, collapsing "the server sent nothing"
+    /// and "the server sent an empty outcome" to the same rendering.
+    ///
+    /// The server since #208 sends `null` for a kind that did not occur, so
+    /// the empty-but-present case should not arise from our own backend —
+    /// but a client does not get to assume its server's version, and a zero
+    /// section drawn on a clean run would be a new noise source rather than
+    /// a new signal.
+    fn from_optional(outcome: Option<&imports::Outcome>) -> Option<Self> {
+        outcome.and_then(Section::new)
+    }
 }
 
 impl Completion {
@@ -166,15 +272,54 @@ impl Completion {
             skipped: Section::new(&report.skipped),
             failed: Section::new(&report.failed),
             chat_skipped: report.chat_threads_skipped,
+            images_dropped: Section::from_optional(report.images_dropped.as_ref()),
+            content_truncated: Section::from_optional(report.content_truncated.as_ref()),
+            mentions_degraded: Section::from_optional(report.mentions_degraded.as_ref()),
+            live_apps_dropped: Section::from_optional(report.live_apps_dropped.as_ref()),
+            spreadsheet_formulas_dropped: Section::from_optional(
+                report.spreadsheet_formulas_dropped.as_ref(),
+            ),
         }
+    }
+
+    /// The sections of one tier, in a fixed order, skipping the ones that
+    /// did not happen.
+    ///
+    /// Order is severity-descending within each tier and is deliberate: a
+    /// document Quip refused is more actionable than one that failed; a
+    /// missing Kanban board or a dead formula is a bigger hole in a document
+    /// than a flattened list or an unlinked name.
+    fn sections(&self, tier: OutcomeTier) -> Vec<(OutcomeKind, Section)> {
+        [
+            (OutcomeKind::Skipped, &self.skipped),
+            (OutcomeKind::Failed, &self.failed),
+            (OutcomeKind::LiveAppsDropped, &self.live_apps_dropped),
+            (
+                OutcomeKind::SpreadsheetFormulasDropped,
+                &self.spreadsheet_formulas_dropped,
+            ),
+            (OutcomeKind::ImagesDropped, &self.images_dropped),
+            (OutcomeKind::ContentTruncated, &self.content_truncated),
+            (OutcomeKind::MentionsDegraded, &self.mentions_degraded),
+        ]
+        .into_iter()
+        .filter(|(kind, _)| kind.tier() == tier)
+        .filter_map(|(kind, section)| section.clone().map(|s| (kind, s)))
+        .collect()
     }
 
     /// True when the run finished with nothing to report beyond the
     /// documents it imported. Drives nothing on its own — it exists so
     /// the difference between a clean run and a lossy one is a single
     /// assertable predicate rather than an eyeball over the `view!`.
+    ///
+    /// Every kind counts here, not only the whole-document ones. A run that
+    /// dropped 400 images is not a clean run, and this predicate is the
+    /// codebase's one-line answer to "did this import lose anything".
     fn is_clean(&self) -> bool {
-        self.skipped.is_none() && self.failed.is_none() && self.chat_skipped == 0
+        self.sections(OutcomeTier::Documents).is_empty()
+            && self.sections(OutcomeTier::WithinDocuments).is_empty()
+            && self.chat_skipped == 0
     }
 }
 
@@ -784,16 +929,28 @@ pub fn QuipImportWizard(
 /// The completion state's body: what landed, then — only when there is
 /// something to say — what did not.
 ///
-/// Skips and failures get their own sections rather than one "problems"
-/// list because the two ask different things of the reader: a skip means
-/// Quip refused access, which the reader may be able to fix and re-run;
-/// a failure means the importer already retried and lost, which they
-/// cannot. Chat threads get a third, count-only line — they are not
-/// documents, and folding them into "skipped" would inflate a number the
-/// reader is meant to act on.
+/// Each kind gets its own section rather than one "problems" list because
+/// they ask different things of the reader: a skip means Quip refused
+/// access, which the reader may be able to fix and re-run; a failure means
+/// the importer already retried and lost, which they cannot; a dropped
+/// image means go and look at a document that is otherwise fine. Chat
+/// threads get a count-only line — they are not documents, and folding them
+/// into "skipped" would inflate a number the reader is meant to act on.
+///
+/// **Two tiers, seven sections (#208).** The whole-document losses come
+/// first, ungrouped and unheaded — they are the headline, and the reader
+/// must not have to get past a heading to reach them. The within-document
+/// losses follow under their own heading, which appears only when at least
+/// one of them happened. That heading is the only concession to the fact
+/// that seven sections is a lot of screen: it groups, it does not hide.
+/// Every section's count is on its `<summary>`, visible without expanding
+/// anything; only the *named examples* are behind the disclosure. No
+/// whole-document loss is ever collapsed out of view.
 fn completion_view(c: Completion) -> impl IntoView {
     let imported = c.imported;
     let chat = c.chat_skipped;
+    let documents = c.sections(OutcomeTier::Documents);
+    let within = c.sections(OutcomeTier::WithinDocuments);
     view! {
         <p
             class="quip-import-progress-line"
@@ -802,12 +959,23 @@ fn completion_view(c: Completion) -> impl IntoView {
         >
             {crate::t!("quip-import-report-imported", imported = imported as i64)}
         </p>
-        {c.skipped.map(|s| section_view(s, OutcomeKind::Skipped))}
-        {c.failed.map(|s| section_view(s, OutcomeKind::Failed))}
+        {documents.into_iter().map(|(kind, s)| section_view(s, kind)).collect::<Vec<_>>()}
         {(chat > 0).then(|| view! {
             <p class="quip-import-report-chat" data-quip-import-chat-skipped=chat>
                 {crate::t!("quip-import-report-chat", count = chat as i64)}
             </p>
+        })}
+        // The heading is drawn only alongside the sections it heads: a
+        // standing "some content didn't come across" over an empty region
+        // would announce a loss on every clean run.
+        {(!within.is_empty()).then(|| view! {
+            <p
+                class="quip-import-report-group-heading"
+                data-quip-import-report-group="within-documents"
+            >
+                {crate::t!("quip-import-report-within-heading")}
+            </p>
+            {within.into_iter().map(|(kind, s)| section_view(s, kind)).collect::<Vec<_>>()}
         })}
     }
 }
@@ -824,8 +992,10 @@ fn completion_view(c: Completion) -> impl IntoView {
 /// server-authored prose about a failure and must not be able to inject
 /// markup, however sanitized it already is upstream.
 fn section_view(s: Section, kind: OutcomeKind) -> impl IntoView {
-    let total = s.total;
-    let hidden = s.hidden;
+    // Both numbers from `display_counts`, which is counter-derived and
+    // pinned by test — never from `s.named.len()`, which stops at the
+    // storage row's per-kind budget.
+    let (total, hidden) = s.display_counts();
     view! {
         <details
             class="quip-import-report-section"
@@ -851,7 +1021,7 @@ fn section_view(s: Section, kind: OutcomeKind) -> impl IntoView {
                 // counter minus what it could name — never by the note
                 // list's own length, which stops at a storage budget and
                 // would otherwise let the list read as complete.
-                {(hidden > 0).then(|| view! {
+                {hidden.map(|hidden| view! {
                     <li
                         class="quip-import-report-more"
                         data-quip-import-outcome-hidden=hidden
@@ -1044,6 +1214,264 @@ mod tests {
         assert_eq!(s.named[0].0, "", "a folder-level loss names no thread");
     }
 
+    // ─── #208: every recorded loss is a visible loss ───────────
+
+    /// **The deliverable.** A run that lost images, flattened nesting,
+    /// degraded mentions, dropped a Kanban board or dropped formulas must
+    /// show each of them, with its own count and its own wording. Before
+    /// #208 all five reached the user only as an increment to `notesDropped`
+    /// — a number with no explanation attached.
+    #[test]
+    fn every_within_document_loss_gets_its_own_section() {
+        let c = Completion::from_report(&ImportReport {
+            imported: 47,
+            images_dropped: Some(outcome(8, vec![note("qi1", "image blob-9: not stored")])),
+            content_truncated: Some(outcome(3, vec![note("qc1", "nesting flattened")])),
+            mentions_degraded: Some(outcome(5, vec![note("qm1", "lookup rejected")])),
+            live_apps_dropped: Some(outcome(2, vec![note("ql1", "2 live app(s) dropped")])),
+            spreadsheet_formulas_dropped: Some(outcome(
+                300,
+                vec![note("qs1", "300 formula(s) not imported")],
+            )),
+            ..ImportReport::default()
+        });
+
+        let within = c.sections(OutcomeTier::WithinDocuments);
+        assert_eq!(within.len(), 5, "all five kinds must be drawn");
+        assert_eq!(
+            within.iter().map(|(k, s)| (*k, s.total)).collect::<Vec<_>>(),
+            vec![
+                (OutcomeKind::LiveAppsDropped, 2),
+                (OutcomeKind::SpreadsheetFormulasDropped, 300),
+                (OutcomeKind::ImagesDropped, 8),
+                (OutcomeKind::ContentTruncated, 3),
+                (OutcomeKind::MentionsDegraded, 5),
+            ],
+            "each kind keeps its own count — a shared total would be a new lie",
+        );
+        // Distinct anchors and distinct wording: two sections that read the
+        // same are one section with the wrong number on it twice.
+        let anchors: Vec<&str> = within.iter().map(|(k, _)| k.anchor()).collect();
+        let mut deduped = anchors.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(deduped.len(), anchors.len(), "anchors must be distinct");
+        assert!(!c.is_clean(), "a run that lost 8 images is not a clean run");
+    }
+
+    /// The tiering. Whole-document losses and within-document losses are
+    /// different orders of loss, and the screen says so — but a lost
+    /// *document* is never demoted into the second tier, where a reader
+    /// scanning the headline could miss it.
+    #[test]
+    fn a_lost_document_is_never_grouped_with_a_lost_picture() {
+        let c = Completion::from_report(&ImportReport {
+            imported: 47,
+            skipped: outcome(2, vec![note("qt1", "403")]),
+            failed: outcome(1, vec![note("qt9", "gave up")]),
+            images_dropped: Some(outcome(8, vec![note("qi1", "not stored")])),
+            ..ImportReport::default()
+        });
+
+        let documents = c.sections(OutcomeTier::Documents);
+        assert_eq!(
+            documents.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            vec![OutcomeKind::Skipped, OutcomeKind::Failed],
+            "the whole-document losses are the first tier, in severity order",
+        );
+        assert_eq!(
+            c.sections(OutcomeTier::WithinDocuments)
+                .iter()
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>(),
+            vec![OutcomeKind::ImagesDropped],
+        );
+        // Every kind lands in exactly one tier, so nothing can be dropped
+        // from the screen by a tier that forgot it.
+        for kind in [
+            OutcomeKind::Skipped,
+            OutcomeKind::Failed,
+            OutcomeKind::ImagesDropped,
+            OutcomeKind::ContentTruncated,
+            OutcomeKind::MentionsDegraded,
+            OutcomeKind::LiveAppsDropped,
+            OutcomeKind::SpreadsheetFormulasDropped,
+        ] {
+            assert!(
+                matches!(
+                    kind.tier(),
+                    OutcomeTier::Documents | OutcomeTier::WithinDocuments
+                ),
+                "{kind:?} must belong to a tier",
+            );
+        }
+    }
+
+    /// **The truncation property, on the new kinds.** 4 000 dropped images
+    /// yield 25 notes and a "…and 3 975 more" line. The total comes from the
+    /// server's counter; a section that reported `named.len()` would tell a
+    /// user who lost 4 000 images that 25 were lost — the original silence
+    /// with a smaller number on it.
+    #[test]
+    fn a_truncated_within_document_list_never_reads_as_complete() {
+        let named: Vec<ReportNote> = (0..25)
+            .map(|i| note(&format!("qi{i:04}"), "image blob-9: Quip denied access"))
+            .collect();
+        let c = Completion::from_report(&ImportReport {
+            imported: 47,
+            images_dropped: Some(outcome(4_000, named)),
+            ..ImportReport::default()
+        });
+
+        let s = c.images_dropped.expect("images section");
+        assert_eq!(s.total, 4_000, "the total comes from the uncapped counter");
+        assert_eq!(s.named.len(), 25, "the note list stops at the storage budget");
+        assert_eq!(
+            s.hidden, 3_975,
+            "the unnamed remainder must be stated, not swallowed",
+        );
+        // And the two numbers the section actually renders — the heading's
+        // count and the "…and N more" count — are both the counter's, not
+        // the list's. `section_view` reads exactly this pair.
+        assert_eq!(
+            s.display_counts(),
+            (4_000, Some(3_975)),
+            "both rendered numbers must be counter-derived",
+        );
+        let (heading, more) = s.display_counts();
+        assert_ne!(
+            heading,
+            s.named.len() as u64,
+            "the heading must be the true total, not the sample size",
+        );
+        assert!(more.is_some(), "a truncated list must disclose its remainder");
+    }
+
+    /// The complement, on a new kind: when every loss is named, no "…and N
+    /// more" line is drawn. Claiming a hidden remainder that does not exist
+    /// would be its own small lie.
+    #[test]
+    fn a_complete_within_document_list_renders_no_remainder_line() {
+        let c = Completion::from_report(&ImportReport {
+            content_truncated: Some(outcome(2, vec![note("qc1", "flattened"), note("qc2", "flattened")])),
+            ..ImportReport::default()
+        });
+        let s = c.content_truncated.expect("truncation section");
+        assert_eq!(s.display_counts(), (2, None));
+    }
+
+    /// `notesDropped` is row-global — it cannot say which section lost
+    /// notes. It was deliberately ignored when the skip/fail view was built
+    /// and must stay ignored now that there are five sections, where the
+    /// temptation to reach for it is five times larger. A report whose only
+    /// non-zero field is `notesDropped` draws nothing.
+    #[test]
+    fn the_row_global_drop_count_is_not_a_per_section_signal() {
+        let c = Completion::from_report(&ImportReport {
+            imported: 47,
+            notes_dropped: 900,
+            ..ImportReport::default()
+        });
+        assert!(c.sections(OutcomeTier::Documents).is_empty());
+        assert!(c.sections(OutcomeTier::WithinDocuments).is_empty());
+        assert!(
+            c.is_clean(),
+            "notesDropped alone cannot be attributed to any section, so it \
+             cannot make a section appear",
+        );
+    }
+
+    /// A kind that reports a count and names **nothing** still draws.
+    ///
+    /// This is not a corner case — it is the ordinary shape of
+    /// `mentionsDegraded`. The server writes a note only for the systemic
+    /// cause (the lookup endpoint refusing the run); the far more common
+    /// per-document degradation bumps the counter alone. A `Section::new`
+    /// that treated an empty note list as "nothing happened" would silence
+    /// the most common within-document loss on exactly the runs where
+    /// nothing else went wrong, and every other test here supplies a note.
+    #[test]
+    fn a_counter_with_no_named_examples_still_draws_its_section() {
+        let c = Completion::from_report(&ImportReport {
+            imported: 47,
+            mentions_degraded: Some(outcome(5, vec![])),
+            ..ImportReport::default()
+        });
+
+        let s = c.mentions_degraded.clone().expect(
+            "a counted loss with no named example is still a loss the user must be told about",
+        );
+        assert_eq!(s.total, 5, "the heading count is the counter's");
+        assert!(s.named.is_empty(), "precondition: the server named nothing");
+        assert_eq!(
+            s.display_counts(),
+            (5, Some(5)),
+            "all five are unnamed, so all five are disclosed as the remainder",
+        );
+        assert_eq!(
+            c.sections(OutcomeTier::WithinDocuments)
+                .iter()
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>(),
+            vec![OutcomeKind::MentionsDegraded],
+            "the section must reach the screen, not just the struct",
+        );
+        assert!(!c.is_clean(), "a run that degraded 5 documents' mentions is not clean");
+    }
+
+    /// A server that predates #208 sends no such fields at all. That must
+    /// decode — a hard error here would break the whole progress poll mid
+    /// rolling deploy, freezing the wizard on a live import — and must read
+    /// as "this server does not report that", i.e. draw nothing.
+    ///
+    /// Built from wire JSON rather than a struct literal on purpose: the
+    /// behaviour when a field is *missing* is the contract, and a struct
+    /// literal cannot express a missing field.
+    #[test]
+    fn a_report_from_a_server_without_the_new_fields_decodes_and_draws_nothing() {
+        let report: ImportReport = serde_json::from_value(serde_json::json!({
+            "imported": 47,
+            "skipped": { "total": 2, "notes": [{ "quipThreadId": "qt1", "detail": "403" }] },
+            "failed": { "total": 0, "notes": [] },
+            "chatThreadsSkipped": 12,
+            "notesDropped": 0,
+        }))
+        .expect("a pre-#208 report must decode");
+
+        assert!(report.images_dropped.is_none());
+        assert!(report.content_truncated.is_none());
+        assert!(report.mentions_degraded.is_none());
+        assert!(report.live_apps_dropped.is_none());
+        assert!(report.spreadsheet_formulas_dropped.is_none());
+
+        let c = Completion::from_report(&report);
+        assert_eq!(c.imported, 47, "the rest of the report must still decode");
+        assert_eq!(c.chat_skipped, 12);
+        assert_eq!(
+            c.sections(OutcomeTier::Documents).len(),
+            1,
+            "the sections that server does send must still draw",
+        );
+        assert!(c.sections(OutcomeTier::WithinDocuments).is_empty());
+    }
+
+    /// An explicit `null` — what the current server sends for a kind that
+    /// did not occur — reads identically to a missing field. Both mean
+    /// "draw nothing"; neither is evidence of a loss.
+    #[test]
+    fn an_explicitly_null_kind_draws_nothing() {
+        let report: ImportReport = serde_json::from_value(serde_json::json!({
+            "imported": 47,
+            "imagesDropped": null,
+            "contentTruncated": null,
+            "mentionsDegraded": null,
+            "liveAppsDropped": null,
+            "spreadsheetFormulasDropped": null,
+        }))
+        .expect("a null kind must decode");
+        assert!(Completion::from_report(&report).is_clean());
+    }
+
     /// Chat threads are counted, never named, and never folded into
     /// `skipped` — inflating an actionable number with content that was
     /// never in scope would make the skip count useless.
@@ -1135,6 +1563,11 @@ mod tests {
             ("quip-import-report-chat", "$count"),
             ("quip-import-report-note", "$detail"),
             ("quip-import-report-note-general", "$detail"),
+            ("quip-import-report-images", "$count"),
+            ("quip-import-report-truncated", "$count"),
+            ("quip-import-report-mentions", "$count"),
+            ("quip-import-report-live-apps", "$count"),
+            ("quip-import-report-formulas", "$count"),
         ] {
             let line = EN_US
                 .lines()
@@ -1151,5 +1584,58 @@ mod tests {
             .find(|l| l.starts_with("quip-import-report-note ="))
             .expect("quip-import-report-note");
         assert!(note_line.contains("$id"), "got {note_line:?}");
+        // The tier heading takes no arguments, so it is checked for
+        // existence only — but it must exist, or the group renders its raw
+        // key as a heading over the sections it is meant to introduce.
+        assert!(
+            EN_US
+                .lines()
+                .any(|l| l.starts_with("quip-import-report-within-heading =")),
+            "en-US catalog is missing quip-import-report-within-heading",
+        );
+    }
+
+    /// Every locale carries every `quip-import-report-*` key the component
+    /// can render, so no locale falls back to a raw key in the middle of the
+    /// one screen whose job is to be readable.
+    ///
+    /// The catalogs are compared to each other rather than to a hand-kept
+    /// list: a list would have to be updated alongside a new key, and the
+    /// failure of forgetting is silent in exactly the locales nobody on the
+    /// team reads.
+    #[test]
+    fn every_locale_carries_every_report_string() {
+        const CATALOGS: [(&str, &str); 6] = [
+            ("en-US", EN_US),
+            ("de", include_str!("../../../locales/de/main.ftl")),
+            ("es", include_str!("../../../locales/es/main.ftl")),
+            ("fr", include_str!("../../../locales/fr/main.ftl")),
+            ("it", include_str!("../../../locales/it/main.ftl")),
+            ("ar", include_str!("../../../locales/ar/main.ftl")),
+        ];
+
+        fn report_keys(catalog: &str) -> Vec<String> {
+            let mut keys: Vec<String> = catalog
+                .lines()
+                .filter_map(|l| l.split_once(" ="))
+                .map(|(k, _)| k.to_string())
+                .filter(|k| k.starts_with("quip-import-report-"))
+                .collect();
+            keys.sort();
+            keys
+        }
+
+        let expected = report_keys(EN_US);
+        assert!(
+            expected.len() >= 13,
+            "precondition: en-US should hold every report key; got {expected:?}",
+        );
+        for (name, catalog) in CATALOGS {
+            assert_eq!(
+                report_keys(catalog),
+                expected,
+                "{name} does not carry the same quip-import-report-* keys as en-US",
+            );
+        }
     }
 }

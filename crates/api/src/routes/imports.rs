@@ -479,7 +479,25 @@ struct Progress {
 /// Skips and failures are separate fields, not one "problems" bucket,
 /// because they are different situations with different remedies: a skip
 /// is "Quip refused to hand this over" (the user may be able to get
-/// access); a failure is "we tried and lost" (the user cannot).
+/// access); a failure is "we tried and lost" (the user cannot). The same
+/// reasoning splits the within-document losses below into one field per
+/// kind rather than a "degraded" bucket.
+///
+/// **Every kind the worker records has a field here (#208).** The rule the
+/// endpoint now holds to: a loss that was worth writing down is worth
+/// showing. Anything recorded but unprojected reaches the user only as an
+/// increment to `notes_dropped` — a number with no explanation attached,
+/// which is the silence this feature exists to remove.
+///
+/// The within-document fields are `Option` while `skipped` / `failed` are
+/// not. That asymmetry is deliberate on two counts. Adding them as
+/// non-optional would have changed the meaning of the *existing* shape for
+/// no gain, and `null` is the wire's way of saying "this kind did not
+/// happen" — distinct from a zero row, which is a section the wizard would
+/// have to decide not to draw. `skipped` / `failed` keep their pre-#208
+/// shape (always present, possibly zero) because that is what already
+/// shipped; the client collapses an all-zero outcome to "no section" on its
+/// side, so the two spellings agree in the rendering.
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReportDto {
@@ -494,11 +512,54 @@ struct ReportDto {
     /// number rather than inflating `skipped` (see
     /// `worker_mode`'s chat branch, which deliberately writes no note).
     chat_threads_skipped: u64,
-    /// How many notes the `REPORT` row discarded, across **all** kinds —
-    /// including kinds this DTO does not project (dropped images, truncated
-    /// nesting). Reported for completeness; it is *not* the per-section
-    /// truncation signal, because it cannot say which section lost notes.
-    /// `OutcomeDto::total` is that signal — see its doc.
+    /// Attachments that could not be copied out of Quip, in documents that
+    /// otherwise imported. `null` when none were dropped.
+    ///
+    /// **Counts images, not documents** — `report::IMAGES_DROPPED` is bumped
+    /// once per attachment, so one document losing eight pictures reads as
+    /// eight. The note names the thread each one belonged to.
+    images_dropped: Option<OutcomeDto>,
+    /// Documents whose nesting ran deeper than the walker descends, so the
+    /// structure below the cap was flattened. `null` when none were.
+    ///
+    /// **Counts documents** (`report::THREADS_TRUNCATED`). The text survived;
+    /// the shape below the cap did not — which is a fidelity loss inside a
+    /// document that did import, not a lost document.
+    content_truncated: Option<OutcomeDto>,
+    /// Documents in which at least one person mention lost its link and
+    /// became plain text. `null` when none did.
+    ///
+    /// **Counts documents** (`report::THREADS_MENTIONS_DEGRADED`), so a
+    /// chatty document cannot dominate the number. The counter runs far
+    /// ahead of the notes here by design: a note is written only for the
+    /// systemic cause (the lookup endpoint refusing the whole run), while
+    /// the counter also takes the per-document degradations that have no
+    /// story worth telling individually. `total > notes.len()` is the
+    /// normal case for this kind, not the truncation edge — and the
+    /// "…and N more" line reads correctly either way.
+    mentions_degraded: Option<OutcomeDto>,
+    /// Embedded Quip live-app blocks — Kanban boards, polls, calendars —
+    /// whose contents were not converted (#191). `null` when none were.
+    ///
+    /// **Counts blocks, not documents** (`report::LIVE_APPS_DROPPED`), so
+    /// one document with three boards reads as three. Unlike a dropped
+    /// image, the data was in the export and this importer chose not to
+    /// carry it yet — which is exactly why saying so is not optional.
+    live_apps_dropped: Option<OutcomeDto>,
+    /// Spreadsheet formulas that were not imported (#192): the cells keep
+    /// the last value Quip calculated and will not recalculate. `null` when
+    /// none were dropped.
+    ///
+    /// **Counts formulas** (`report::FORMULAS_DROPPED`), while its notes are
+    /// one per *document* with the per-document count in `detail` — a sheet
+    /// with 300 formulas must not spend 300 of the kind's 25 notes. The
+    /// counter is what stays true past that budget, which is why the total
+    /// is read from it and never from the note list.
+    spreadsheet_formulas_dropped: Option<OutcomeDto>,
+    /// How many notes the `REPORT` row discarded, across **all** kinds.
+    /// Reported for completeness; it is *not* the per-section truncation
+    /// signal, because it is row-global and cannot say which section lost
+    /// notes. `OutcomeDto::total` is that signal — see its doc.
     notes_dropped: u64,
 }
 
@@ -544,6 +605,11 @@ struct NoteDto {
 ///    matters: never claim completeness we cannot back.
 /// 2. Counter keys and note kinds come from `worker_mode::report`, not from
 ///    string literals typed here.
+/// 3. A kind that did not occur projects to `None`, not to a zero
+///    `OutcomeDto`. "Zero images were dropped" is not news; a section drawn
+///    for it is noise that pushes the sections that *are* news off the
+///    screen. `null` lets the client draw nothing without having to
+///    re-derive emptiness from two fields.
 fn project_report(row: ReportRow) -> ReportDto {
     let counter = |key: &str| row.counters.get(key).copied().unwrap_or(0);
     let notes_of = |kind: &str| -> Vec<NoteDto> {
@@ -563,12 +629,31 @@ fn project_report(row: ReportRow) -> ReportDto {
             notes,
         }
     };
+    // `total == 0` is the whole emptiness test, not a shorthand for one:
+    // `total` is `max(counter, notes.len())`, so a kind with any note at all
+    // has `total >= 1`. A kind that neither counted nor named anything did
+    // not happen, and projects to `null` rather than a zero section.
+    let occurred = |counter_key: &str, kind: &str| {
+        let o = outcome(counter_key, kind);
+        (o.total > 0).then_some(o)
+    };
 
     ReportDto {
         imported: counter(report::THREADS_IMPORTED),
         skipped: outcome(report::THREADS_SKIPPED_FORBIDDEN, report::KIND_THREAD_SKIPPED),
         failed: outcome(report::THREADS_FAILED, report::KIND_THREAD_FAILED),
         chat_threads_skipped: counter(report::THREADS_SKIPPED_CHAT),
+        images_dropped: occurred(report::IMAGES_DROPPED, report::KIND_IMAGE_DROPPED),
+        content_truncated: occurred(report::THREADS_TRUNCATED, report::KIND_CONTENT_TRUNCATED),
+        mentions_degraded: occurred(
+            report::THREADS_MENTIONS_DEGRADED,
+            report::KIND_MENTIONS_DEGRADED,
+        ),
+        live_apps_dropped: occurred(report::LIVE_APPS_DROPPED, report::KIND_LIVE_APP_DROPPED),
+        spreadsheet_formulas_dropped: occurred(
+            report::FORMULAS_DROPPED,
+            report::KIND_FORMULAS_DROPPED,
+        ),
         notes_dropped: row.notes_dropped,
     }
 }
@@ -652,4 +737,76 @@ async fn get_status(
         destination_folder_id: record.target_folder_id,
         report,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ogrenotes_storage::models::import_inventory::ReportNote;
+
+    fn row_with(counters: &[(&str, u64)], notes: Vec<ReportNote>) -> ReportRow {
+        ReportRow {
+            owner_id: "u1".to_string(),
+            counters: counters.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            notes,
+            notes_dropped: 0,
+        }
+    }
+
+    fn note(kind: &str, detail: &str) -> ReportNote {
+        ReportNote {
+            quip_thread_id: "qt1".to_string(),
+            kind: kind.to_string(),
+            detail: detail.to_string(),
+        }
+    }
+
+    /// **#208's whole invariant, checked over the roster rather than one
+    /// kind at a time.** Every `report::KIND_*` the worker can write must
+    /// come out of `project_report` somewhere a client can see it.
+    ///
+    /// The per-kind integration tests pin the seven kinds that exist today;
+    /// none of them fails when an *eighth* is added to `worker_mode::report`
+    /// and then projected nowhere — which is exactly the state #208 was
+    /// filed to end, and exactly the state a new `KIND_` reintroduces for
+    /// free. Driven off `ALL_KINDS`, which `report_keys!` derives from the
+    /// constants, so a kind cannot exist without being checked here.
+    ///
+    /// The assertion is on the serialized DTO rather than on named fields
+    /// because the question is "does this reach the wire at all", and a
+    /// field-by-field check would have to be extended by the same person
+    /// who forgot to project the kind.
+    #[test]
+    fn every_recorded_note_kind_reaches_the_wire() {
+        for kind in report::ALL_KINDS {
+            let detail = format!("sentinel detail for {kind}");
+            let json = serde_json::to_string(&project_report(row_with(
+                &[],
+                vec![note(kind, &detail)],
+            )))
+            .expect("ReportDto serializes");
+            assert!(
+                json.contains(&detail),
+                "note kind {kind:?} is recorded by the worker but projected nowhere on \
+                 the wire — a user sees it only as an increment to notesDropped: {json}",
+            );
+        }
+    }
+
+    /// A kind whose counter moved but which wrote **no note** must still
+    /// project. This is not a corner case: it is the ordinary shape of
+    /// `mentions_degraded`, which `worker_mode` bumps with `None` for every
+    /// document whose @mentions degraded without a systemic cause. A
+    /// projection that required a note to draw a section would silence the
+    /// most common within-document loss on the exact runs where nothing
+    /// else went wrong.
+    #[test]
+    fn a_counter_only_kind_still_projects_its_total() {
+        let dto = project_report(row_with(&[(report::THREADS_MENTIONS_DEGRADED, 5)], vec![]));
+        let mentions = dto
+            .mentions_degraded
+            .expect("a counter with no notes is still a loss the user must be told about");
+        assert_eq!(mentions.total, 5, "the total is the counter's, notes or not");
+        assert!(mentions.notes.is_empty(), "precondition: no notes were written");
+    }
 }
