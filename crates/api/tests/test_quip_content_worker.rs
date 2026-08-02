@@ -3423,3 +3423,386 @@ async fn a_quip_folder_holding_only_a_chat_is_still_mirrored_as_an_empty_folder(
         "the chat was skipped, so the mirrored folder is empty — and still exists",
     );
 }
+
+// ─── Multi-folder membership (#236 Unit 2) ───────────────────────
+
+/// A Quip account where `t1` genuinely lives in **three** folders, and the
+/// membership is what the BFS *records*, not what a fixture author drew:
+/// `root` offers it directly, and so do both of `root`'s sub-folders.
+///
+///   root -> [t1, f2, f3]
+///   f2   -> [t1, t2, t3]
+///   f3   -> [t1, t3]
+///
+/// Three, not two, because the interesting failures are plural: a bug that
+/// keeps only the primary and a bug that keeps only the *last* additional
+/// folder look identical at N = 2.
+///
+/// The second BFS level fetches `f2,f3` in one batch, which is how the walker
+/// batches a level; the fixture matches that ids string rather than inventing
+/// per-folder requests Quip would never receive.
+///
+/// Two threads, deliberately, because `first_folder` is stable in one and a
+/// coin-flip in the other. `QuipClient::folders` yields
+/// `HashMap::into_values()`, so *within* a level the fetch order is
+/// nondeterministic:
+///
+/// - `t1` is offered by `root` at depth 0, before anything at depth 1 can
+///   claim it — its primary is always `root`'s mirror.
+/// - `t3` is offered only by `f2` and `f3`, **both at depth 1**, so which one
+///   becomes its `first_folder` is not stable across runs.
+///
+/// Nothing below asserts which of `f2`/`f3` won either race.
+async fn quip_server_with_a_thread_in_three_folders() -> MockServer {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/1/folders/"))
+        .and(query_param("ids", "root"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "root": {
+                "folder": {"id": "root", "title": "Root"},
+                "children": [ {"thread_id": "t1"}, {"folder_id": "f2"}, {"folder_id": "f3"} ]
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/1/folders/"))
+        .and(query_param("ids", "f2,f3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "f2": {
+                "folder": {"id": "f2", "title": "Sub"},
+                "children": [ {"thread_id": "t1"}, {"thread_id": "t2"}, {"thread_id": "t3"} ]
+            },
+            "f3": {
+                "folder": {"id": "f3", "title": "Other"},
+                "children": [ {"thread_id": "t1"}, {"thread_id": "t3"} ]
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/1/threads/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "t1": {"thread": {"id": "t1", "title": "Doc A", "type": "document", "updated_usec": 111}},
+            "t2": {"thread": {"id": "t2", "title": "Sheet", "type": "spreadsheet", "updated_usec": 222}},
+            "t3": {"thread": {"id": "t3", "title": "Shared", "type": "document", "updated_usec": 333}}
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/2/threads/t1/html"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(T1_HTML)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2/threads/t2/html"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(T2_HTML)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2/threads/t3/html"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(T2_HTML)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/1/blob/t1/b9"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(BLOB_BYTES.to_vec()))
+        .mount(&server)
+        .await;
+
+    server
+}
+
+/// The `member_folders` the inventory walk recorded for a thread, as a set.
+/// Read back off the manifest so the expectation in a test is Quip's shape as
+/// *observed*, never a shape retyped by hand.
+async fn member_folders_of(
+    app: &common::TestApp,
+    import_id: &str,
+    thread: &str,
+) -> BTreeSet<String> {
+    app.state
+        .import_repo
+        .list_threads(import_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.quip_thread_id == thread)
+        .unwrap_or_else(|| panic!("thread {thread} is on the manifest"))
+        .member_folders
+        .into_iter()
+        .collect()
+}
+
+/// The native answer to "which folders is this document in": the primary
+/// union the additional set, exactly as `routes::documents::list_doc_folders`
+/// chains them.
+async fn doc_folder_set(app: &common::TestApp, doc_id: &str) -> BTreeSet<String> {
+    let meta = app.state.doc_repo.get(doc_id).await.unwrap().expect("document exists");
+    meta.folder_id.iter().chain(meta.additional_folder_ids.iter()).cloned().collect()
+}
+
+/// The folders whose `CHILD#` listing actually contains `doc_id`, out of
+/// `candidates`. This — not `additional_folder_ids` — is what a user browsing
+/// a folder sees, so the reachability claim has to be made here.
+async fn folders_listing_the_doc(
+    app: &common::TestApp,
+    candidates: &BTreeSet<String>,
+    doc_id: &str,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for folder in candidates {
+        let children = app.state.folder_repo.list_children(folder).await.unwrap();
+        if children.iter().any(|c| c.child_id == doc_id) {
+            out.insert(folder.clone());
+        }
+    }
+    out
+}
+
+/// Unit 2's headline claim: **a Quip thread that lives in several folders
+/// appears in all of them after import.**
+///
+/// Asserted three ways over the same set, because they fail independently:
+/// the manifest recorded every membership; `DocumentMeta` carries every
+/// membership; and every one of those folders really *lists* the document.
+/// The third is the one that matters to a user — `additional_folder_ids`
+/// alone creates no `CHILD#` edge, so a document can be "in" a folder by
+/// metadata and invisible in it.
+///
+/// The expected set is derived from `member_folders` on the THREAD# row
+/// mapped through the manifest's `ogre_folder_id`s, so the fixture cannot
+/// drift from what the walk saw.
+#[tokio::test]
+async fn a_thread_in_three_quip_folders_is_reachable_from_all_three_after_import() {
+    common::require_infra!();
+    let server = quip_server_with_a_thread_in_three_folders().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    // What the walk recorded — the source of the expectation.
+    let members = member_folders_of(&app, &import_id, "t1").await;
+    assert_eq!(
+        members,
+        BTreeSet::from(["root".to_string(), "f2".to_string(), "f3".to_string()]),
+        "the inventory walk must record every folder the thread appears in",
+    );
+
+    let mut expected = BTreeSet::new();
+    for quip_folder in &members {
+        expected.insert(
+            mirrored_folder(&app, &import_id, quip_folder)
+                .await
+                .unwrap_or_else(|| panic!("{quip_folder} is mirrored")),
+        );
+    }
+    assert_eq!(
+        expected.len(),
+        3,
+        "three distinct Quip folders mirror to three distinct OgreNotes folders",
+    );
+
+    let doc_id = doc_id_for(&app, &import_id, "t1").await.expect("t1 imported");
+
+    // 1. The native model carries all three.
+    assert_eq!(
+        doc_folder_set(&app, &doc_id).await,
+        expected,
+        "folder_id union additional_folder_ids must be every mirrored member folder",
+    );
+
+    // 2. The primary is never duplicated into the additional set — the two
+    //    are chained, so a repeat would list the same folder twice.
+    let meta = app.state.doc_repo.get(&doc_id).await.unwrap().unwrap();
+    let primary = meta.folder_id.clone().expect("filed somewhere");
+    assert!(!meta.additional_folder_ids.contains(&primary));
+    assert_eq!(
+        meta.additional_folder_ids.len(),
+        2,
+        "two additional memberships beside the primary, none repeated",
+    );
+
+    // 3. And every one of them really lists it. Set membership only — which
+    //    of the three became the primary is not asserted beyond it being one
+    //    of them, because within a BFS level the winner is not stable.
+    assert!(expected.contains(&primary));
+    assert_eq!(
+        folders_listing_the_doc(&app, &expected, &doc_id).await,
+        expected,
+        "every mirrored member folder must list the document, not just name it",
+    );
+
+    // The control: a single-folder thread in the same import gains nothing.
+    let t2_doc = doc_id_for(&app, &import_id, "t2").await.expect("t2 imported");
+    let t2_meta = app.state.doc_repo.get(&t2_doc).await.unwrap().unwrap();
+    assert!(
+        t2_meta.additional_folder_ids.is_empty(),
+        "a thread in one Quip folder must not acquire extra memberships",
+    );
+}
+
+/// The same claim where **which folder is primary is a coin-flip**: `t3` is
+/// offered by `f2` and `f3`, both in the same BFS level, and
+/// `QuipClient::folders` hands that level back as `HashMap::into_values()`.
+///
+/// The point is that the user-visible claim does not depend on the race. Both
+/// folders list the document either way; only the `is_primary` flag on
+/// `GET /documents/:id/folders` differs, and nothing here asserts which id
+/// won. A test that pinned the winner would pass locally and flake in CI on a
+/// different hash seed — the failure mode this one is shaped to avoid.
+#[tokio::test]
+async fn a_thread_shared_by_two_folders_in_one_bfs_level_lands_in_both_either_way() {
+    common::require_infra!();
+    let server = quip_server_with_a_thread_in_three_folders().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    assert_eq!(
+        member_folders_of(&app, &import_id, "t3").await,
+        BTreeSet::from(["f2".to_string(), "f3".to_string()]),
+        "both same-level parents must be recorded, whichever was fetched first",
+    );
+
+    let ogre_f2 = mirrored_folder(&app, &import_id, "f2").await.expect("f2 mirrored");
+    let ogre_f3 = mirrored_folder(&app, &import_id, "f3").await.expect("f3 mirrored");
+    let both = BTreeSet::from([ogre_f2.clone(), ogre_f3]);
+
+    let doc_id = doc_id_for(&app, &import_id, "t3").await.expect("t3 imported");
+    assert_eq!(doc_folder_set(&app, &doc_id).await, both);
+    assert_eq!(
+        folders_listing_the_doc(&app, &both, &doc_id).await,
+        both,
+        "both folders list it regardless of which one won the primary slot",
+    );
+
+    // One of them is the primary and exactly one is additional — the two are
+    // chained by the routes, so neither an empty nor a doubled primary is ok.
+    let meta = app.state.doc_repo.get(&doc_id).await.unwrap().unwrap();
+    assert!(both.contains(meta.folder_id.as_deref().expect("filed somewhere")));
+    assert_eq!(meta.additional_folder_ids.len(), 1);
+}
+
+/// Re-run safety for the plural case: a thread in three folders is in exactly
+/// three after a second run — not six, and not one.
+///
+/// Multi-folder membership is where a duplicate-edge bug surfaces first,
+/// because the second run has three chances to add an edge instead of one.
+#[tokio::test]
+async fn re_running_an_import_leaves_a_multi_folder_document_in_exactly_its_folders() {
+    common::require_infra!();
+    let server = quip_server_with_a_thread_in_three_folders().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+    let doc_id = doc_id_for(&app, &import_id, "t1").await.expect("t1 imported");
+    let before = doc_folder_set(&app, &doc_id).await;
+    assert_eq!(before.len(), 3);
+
+    // The queue redelivering the job, or the reaper re-running a crashed one.
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    assert_eq!(
+        doc_folder_set(&app, &doc_id).await,
+        before,
+        "the membership set must not change",
+    );
+    assert_eq!(
+        doc_id_for(&app, &import_id, "t1").await.as_deref(),
+        Some(doc_id.as_str()),
+        "and no second document should have been created for the same thread",
+    );
+    assert_eq!(folders_listing_the_doc(&app, &before, &doc_id).await, before);
+
+    // Counted, not merely present: an `add_child` that minted a fresh sort
+    // key per call would leave the same document listed twice in one folder.
+    for folder in &before {
+        let children = app.state.folder_repo.list_children(folder).await.unwrap();
+        assert_eq!(
+            children.iter().filter(|c| c.child_id == doc_id).count(),
+            1,
+            "{folder} must list the document exactly once after a re-run",
+        );
+    }
+}
+
+/// The multi-folder twin of "a document the user moved is not moved back":
+/// the user removes an imported document from *one* of its several folders,
+/// and a later run must not put it back.
+///
+/// **Not a before-and-after control, and deliberately not pretending to be.**
+/// Its setup needs a document that is in more than one folder, which is the
+/// very thing multi-folder membership provides, so it cannot run green
+/// against a worker that files nothing extra — it panics in setup instead.
+/// What it guards is the *next* change: a well-meaning "re-assert every
+/// thread's memberships on each run" repair pass, which would restore a
+/// membership the user deliberately dropped while every assertion in
+/// [`a_thread_in_three_quip_folders_is_reachable_from_all_three_after_import`]
+/// stayed green.
+///
+/// Removal is performed the way `routes::documents::remove_doc_from_folder`
+/// performs it — `remove_doc_folder` plus the `CHILD#` edge — so the state
+/// the second run meets is the state a real user leaves behind.
+#[tokio::test]
+async fn a_document_the_user_removed_from_one_folder_is_not_re_added_by_a_re_run() {
+    common::require_infra!();
+    let server = quip_server_with_a_thread_in_three_folders().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+    let doc_id = doc_id_for(&app, &import_id, "t1").await.expect("t1 imported");
+    let meta = app.state.doc_repo.get(&doc_id).await.unwrap().unwrap();
+
+    // Whichever additional folder happens to be first — the route refuses to
+    // remove the primary, so this is the only kind of removal available, and
+    // picking by position keeps the test off the nondeterministic ordering.
+    let dropped = meta
+        .additional_folder_ids
+        .first()
+        .cloned()
+        .expect("t1 must have an additional folder to remove");
+    let remaining: BTreeSet<String> = doc_folder_set(&app, &doc_id)
+        .await
+        .into_iter()
+        .filter(|f| f != &dropped)
+        .collect();
+
+    let now = ogrenotes_common::time::now_usec();
+    app.state.doc_repo.remove_doc_folder(&doc_id, &dropped, now).await.unwrap();
+    app.state.folder_repo.remove_child(&dropped, &doc_id).await.unwrap();
+
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    assert_eq!(
+        doc_folder_set(&app, &doc_id).await,
+        remaining,
+        "a re-run must not restore a membership the user removed",
+    );
+    assert!(
+        !app.state
+            .folder_repo
+            .list_children(&dropped)
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.child_id == doc_id),
+        "nor re-link the document under the folder they took it out of",
+    );
+    // The memberships they kept are untouched — the re-run neither restores
+    // nor prunes.
+    assert_eq!(folders_listing_the_doc(&app, &remaining, &doc_id).await, remaining);
+}
