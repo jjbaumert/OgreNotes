@@ -47,7 +47,7 @@
 //! meaningless — read the markup, not the words.
 //!
 //! Quip section ids (`temp:C:AeO6b3a…`, `SSfACAf6Nwn`) are opaque handles and
-//! are kept verbatim; capturing them is the subject of #190.
+//! are kept verbatim; capturing them was the subject of #190.
 //!
 //! # Two staging shapes
 //!
@@ -66,12 +66,13 @@
 //! Updating one of those numbers alongside its fix is correct; updating one
 //! without a corresponding fix is a regression.
 //!
-//! #187 (nesting) and #188 (numbering) landed together in PR #200 and their
-//! assertions now record the fixed values, annotated `#NNN (PR #200)`.
-//! #189 (trailing breaks) has since landed too and its four assertions now
-//! record the achieved value — zero hard breaks in all five fixtures. Only
-//! the #190 (section anchors) forecast is still open and still asserts the
-//! buggy behaviour.
+//! **No forecast is currently open.** #187 (nesting) and #188 (numbering)
+//! landed together in PR #200 and their assertions now record the fixed
+//! values, annotated `#NNN (PR #200)`. #189 (trailing breaks) has since
+//! landed too and its four assertions now record the achieved value — zero
+//! hard breaks in all five fixtures. #190 (section anchors) has now landed
+//! as well: the five `sections.len()` assertions went 11→71, 23→170, 44→46,
+//! 5→10 and 1→528, and every one of them is now stated as *achieved*.
 //!
 //! # Known coverage gaps in this fixture set
 //!
@@ -83,7 +84,7 @@
 //! exactly what makes a link fixture meaningful — so image coverage here is
 //! the single benign image section in `ZaNAAAU4ELc`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use ogrenotes_collab::import_quip::{from_quip_html, QuipDocument};
@@ -327,10 +328,19 @@ fn code_block_lines<T: ReadTxn>(txn: &T, el: &XmlElementRef) -> usize {
 
 /// Number of elements carrying an `id` attribute in the source HTML.
 ///
-/// This is the denominator for #190: `QuipDocument::sections` records a
-/// `section_id` for `Para` and `Heading` only, so today the walker captures a
-/// small fraction of the anchors a Quip link could target.
+/// This is the denominator for #190. It counts *elements*, not distinct
+/// ids, and Quip repeats an item's id on its inner `<span>` — so the
+/// captured count is never expected to equal this number. What it is
+/// expected to approach is the count of **distinct** ids, which
+/// [`source_ids_by_tag`] separates out.
 fn source_id_count(html: &str) -> usize {
+    source_ids_by_tag(html).len()
+}
+
+/// Every `(tag, id)` pair in the source, in document order — the shape
+/// needed to say *which* anchors a change stopped capturing, not merely
+/// how many.
+fn source_ids_by_tag(html: &str) -> Vec<(String, String)> {
     use html5ever::tendril::TendrilSink;
     use markup5ever_rcdom::{Handle, NodeData, RcDom};
 
@@ -339,19 +349,21 @@ fn source_id_count(html: &str) -> usize {
         .read_from(&mut html.as_bytes())
         .expect("html5ever parse is infallible");
 
-    fn walk(node: &Handle, n: &mut usize) {
-        if let NodeData::Element { attrs, .. } = &node.data
-            && attrs.borrow().iter().any(|a| a.name.local.as_ref().eq_ignore_ascii_case("id"))
-        {
-            *n += 1;
+    fn walk(node: &Handle, out: &mut Vec<(String, String)>) {
+        if let NodeData::Element { name, attrs, .. } = &node.data {
+            for a in attrs.borrow().iter() {
+                if a.name.local.as_ref().eq_ignore_ascii_case("id") {
+                    out.push((name.local.to_string(), a.value.to_string()));
+                }
+            }
         }
         for child in node.children.borrow().iter() {
-            walk(child, n);
+            walk(child, out);
         }
     }
-    let mut n = 0;
-    walk(&dom.document, &mut n);
-    n
+    let mut out = Vec::new();
+    walk(&dom.document, &mut out);
+    out
 }
 
 fn import(thread_id: &str) -> (String, QuipDocument, Census) {
@@ -417,11 +429,15 @@ fn corpus_nested_lists_and_tables() {
     assert_eq!(c.mark("link"), 0);
     assert_eq!(c.mark("code"), 0);
 
-    // #190: `section_id` rides on `Para` and `Heading` only, so the ids on
-    // `<ul>`, `<li>`, `<table>`, `<tr>`, `<td>` and `<span>` are all dropped.
-    // 11 captured = 4 headings + 7 paragraphs.
+    // #190 (achieved): every id-bearing element that becomes a block is now
+    // recorded. 11 → 71, which is **every distinct id in the document**:
+    // 4 headings + 7 `<p>` + 1 `<ul>` + 2 `<li>` + 2 `<table>` + 17 `<tr>`
+    // + 38 `<td>`. The 111 − 71 = 40 remaining `id` attributes are the
+    // `<span>` inside each `<li>`/`<td>`, and every one of them repeats its
+    // parent's id byte for byte — so those 40 anchors resolve through the
+    // 40 entries already recorded rather than needing their own.
     assert_eq!(source_id_count(&html), 111, "id attributes present in the source");
-    assert_eq!(quip.sections.len(), 11, "section ids captured — #190 will raise this");
+    assert_eq!(quip.sections.len(), 71, "section ids captured — every distinct id (#190)");
 
     assert_eq!(quip.deep_nesting_truncated, 0, "nothing exceeded MAX_NESTING_DEPTH");
 }
@@ -510,10 +526,18 @@ fn corpus_numbered_sequences_and_code_blocks() {
     assert_eq!(c.mark("link"), 1, "the one external <a href>");
     assert_eq!(c.mark("code"), 0, "Quip emits no inline <code> here");
 
-    // 23 captured = 16 headings + 7 paragraphs; the 276 ids on `<ul>`,
-    // `<li>`, `<pre>` and `<span>` are dropped (#190).
+    // #190 (achieved): 23 → 170. The document holds 180 distinct ids (299
+    // attributes less the 119 `<span>`s that repeat their `<li>`'s), so 170
+    // is 10 short — and those 10 are named and expected. They are the `<ul>`
+    // elements of the ten `'6'` continuation sections that #188 (PR #200)
+    // merges away: `merge_numbered_sections` empties each into the
+    // accumulating list and drops the now-contentless section before the
+    // walker runs, so its section-level anchor has no block left to name.
+    // Their *items* all survive with their own anchors — the 119 `<li>` ids
+    // are all here. `every_uncaptured_source_id_is_one_of_the_two_known_
+    // residues` below pins this exactly, so a new drop cannot hide in it.
     assert_eq!(source_id_count(&html), 299, "id attributes present in the source");
-    assert_eq!(quip.sections.len(), 23, "section ids captured — #190 will raise this");
+    assert_eq!(quip.sections.len(), 170, "section ids captured (#190)");
 
     assert_eq!(quip.pending_links.len(), 0, "the only anchor is external");
     assert_eq!(quip.person_mentions.len(), 0);
@@ -556,10 +580,13 @@ fn corpus_image_section_and_blockquote() {
     assert_eq!(c.mark("bold"), 0);
     assert_eq!(c.mark("link"), 0);
 
-    // 46 source ids, 44 captured: the two misses are the `<img>` (audit F-4
-    // counts one per image section) and the `<blockquote>`.
+    // #190 (achieved): 44 → 46. This document has no `<span>` id and no
+    // `<li>`/`<td>`, so source ids and distinct ids coincide; the two that
+    // used to be missed were the `<img>` (audit F-4 counts one per image
+    // section) and the `<blockquote>`, and both are now recorded. Every
+    // anchor in this document is addressable.
     assert_eq!(source_id_count(&html), 46, "id attributes present in the source");
-    assert_eq!(quip.sections.len(), 44, "section ids captured — #190 will raise this to 46");
+    assert_eq!(quip.sections.len(), 46, "section ids captured — all of them (#190)");
 
     assert_eq!(quip.deep_nesting_truncated, 0);
 }
@@ -617,10 +644,15 @@ fn corpus_checklist_and_control_wrappers() {
     assert_eq!(c.images, 0);
     assert_eq!(c.code_blocks, 0);
 
-    // 5 captured = h1 + 4 `<p>`; the `<ul>`, the four `<li>` and their
-    // `<span>`s and `<control>`s contribute nothing (#190).
+    // #190 (achieved): 5 → 10 = h1 + 4 `<p>` + the `<ul>` + its 4 `<li>`.
+    // Of the 17 − 10 = 7 remaining `id` attributes, 4 are the per-item
+    // `<span>`s repeating their `<li>`'s id and 3 are `<control>` wrappers.
+    // A `<control>` is an inline entity, not a section: two of these become
+    // `Mention` leaves and the third is the empty client-rendered date,
+    // which materializes nothing at all — so there is no block to name and
+    // no corpus anchor that targets one.
     assert_eq!(source_id_count(&html), 17, "id attributes present in the source");
-    assert_eq!(quip.sections.len(), 5, "section ids captured — #190 will raise this");
+    assert_eq!(quip.sections.len(), 10, "section ids captured (#190)");
 
     assert_eq!(quip.deep_nesting_truncated, 0);
 }
@@ -663,11 +695,19 @@ fn corpus_spreadsheet_section_id_density() {
     // survives.
     assert_eq!(html.matches("formula='").count(), 2, "formulas present in the source");
 
-    // The sharpest statement of #190 in the suite: only the `<h1>` is
-    // captured, so a Quip anchor pointing at any cell of this sheet can
-    // never be resolved by the Phase-2b back-patch.
+    // The sharpest statement of #190 in the suite, now the other way round:
+    // 1 → 528. Where only the `<h1>` used to be captured — so an anchor
+    // pointing at any cell of this sheet could never be resolved by the
+    // Phase-2b back-patch — every distinct id in the document is now
+    // recorded: 1 `<h1>` + 1 `<table>` + 30 `<tr>` + 480 `<td>` + 16 `<th>`.
+    // The other 480 `id` attributes are the per-cell `<span>`s repeating
+    // their `<td>`'s id, so every one of the 1008 anchors resolves.
+    //
+    // 528 entries is also the corpus's worst case for the `SECMAP#` rows:
+    // one chunk (`SECMAP_CHUNK_ENTRIES` = 2000), one write, ~62 KB against
+    // DynamoDB's 400 KB item cap.
     assert_eq!(source_id_count(&html), 1008, "id attributes present in the source");
-    assert_eq!(quip.sections.len(), 1, "section ids captured — #190 will raise this sharply");
+    assert_eq!(quip.sections.len(), 528, "section ids captured — every distinct id (#190)");
 
     assert_eq!(quip.deep_nesting_truncated, 0);
 }
@@ -703,6 +743,100 @@ fn captured_section_ids_all_occur_in_the_source() {
             assert_eq!(block_id.len(), 10, "{thread_id}: blockId shape");
         }
     }
+}
+
+/// #190 stated as an exhaustive fact rather than five totals: after the fix,
+/// **every id a Quip anchor could name is a key in the section map**, bar
+/// thirteen in the whole corpus, both groups named and understood.
+///
+/// The totals asserted per fixture say *how many* anchors are recorded; they
+/// cannot say *which*, so a change that started dropping ten `<td>` ids while
+/// capturing ten others would keep them green. This one asks the question the
+/// back-patch will actually ask — "is this source id resolvable?" — for all
+/// 1481 of them, and reports the misses by tag.
+///
+/// Note what that makes of the 643 `<span>` ids: **none of them is a miss.**
+/// Quip repeats the enclosing `<li>`/`<td>` id verbatim on the inner
+/// `<span>`, so a span's id is already a key — it maps to the item's block,
+/// which is where the anchor should land. They need no entry of their own,
+/// only the parent's. `spans_repeat_their_parents_id` below keeps that
+/// premise honest, and
+/// `a_cell_span_repeats_its_parents_anchor_so_needs_no_entry_of_its_own` in
+/// `import_quip.rs` pins the behaviour.
+///
+/// The thirteen genuine misses:
+///
+/// * **`ul` — 10, `CVLAAAgSl7Q` only.** The `'6'` continuation sections #188
+///   (PR #200) merges away: emptied into the accumulating list and dropped
+///   before the walker runs, so the section-level anchor has no block left.
+/// * **`control` — 3, `SSfAAALs7fy` only.** An inline entity wrapper, not a
+///   section; two become `Mention` leaves, one is empty.
+///
+/// Both are explained in full at their fixture above.
+#[test]
+fn every_uncaptured_source_id_is_one_of_the_two_known_residues() {
+    let expected: BTreeMap<&str, BTreeMap<&str, usize>> = BTreeMap::from([
+        ("AeOAAAcV1hg", BTreeMap::new()),
+        ("CVLAAAgSl7Q", BTreeMap::from([("ul", 10)])),
+        ("ZaNAAAU4ELc", BTreeMap::new()),
+        ("SSfAAALs7fy", BTreeMap::from([("control", 3)])),
+        ("QGYAAAjicgG", BTreeMap::new()),
+    ]);
+
+    for thread_id in CORPUS {
+        let (html, quip, _c) = import(thread_id);
+        let captured: BTreeSet<&str> = quip.sections.iter().map(|(s, _)| s.as_str()).collect();
+        let mut missing: BTreeMap<&str, usize> = BTreeMap::new();
+        for (tag, id) in source_ids_by_tag(&html) {
+            if !captured.contains(id.as_str()) {
+                // Leaked as a `&'static str` only to keep the expected map
+                // above readable; the test process is the only owner.
+                let tag: &'static str = Box::leak(tag.into_boxed_str());
+                *missing.entry(tag).or_default() += 1;
+            }
+        }
+        assert_eq!(
+            missing, expected[*thread_id],
+            "{thread_id}: uncaptured ids by tag changed — a new tag here is an anchor \
+             that stopped being addressable"
+        );
+    }
+}
+
+/// The premise the `<span>` residue rests on: a `<span>` bearing an id
+/// always repeats its enclosing `<li>`/`<td>`'s id byte for byte. If Quip
+/// ever gives a span a distinct id, the residue above stops being harmless
+/// and spans need capturing in their own right.
+///
+/// Asserted on the raw bytes rather than through the parser, because it is a
+/// claim about Quip's markup, not about the walker.
+#[test]
+fn spans_repeat_their_parents_id() {
+    let mut checked = 0usize;
+    for thread_id in CORPUS {
+        let html = fixture(thread_id);
+        // `<li id='X' …><span id='X'>` and `<td id='X' …><span id='X'>` are
+        // the only two shapes; walk each id-bearing span back to the
+        // nearest preceding `<li`/`<td`/`<th` open tag.
+        for (idx, _) in html.match_indices("<span id='") {
+            let rest = &html[idx + "<span id='".len()..];
+            let span_id = &rest[..rest.find('\'').expect("closing quote")];
+            let before = &html[..idx];
+            let owner = ["<li id='", "<td id='", "<th id='"]
+                .iter()
+                .filter_map(|open| before.rfind(open).map(|at| (at, *open)))
+                .max_by_key(|(at, _)| *at);
+            let Some((at, open)) = owner else { continue };
+            let tail = &html[at + open.len()..];
+            let owner_id = &tail[..tail.find('\'').expect("closing quote")];
+            assert_eq!(
+                span_id, owner_id,
+                "{thread_id}: a <span> id that does not repeat its cell's id"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 643, "every id-bearing <span> in the corpus was checked");
 }
 
 /// Quip's nesting spelling is a `<ul>` that is a **sibling** of the `<li>`.
