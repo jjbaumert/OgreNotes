@@ -1400,38 +1400,7 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                     return Some(pre.into());
                 }
                 NodeType::Image => {
-                    let el = doc.create_element("img").ok()?;
-                    if let Some(src) = attrs.get("src") {
-                        if let Some((blob_id, key)) = super::blob_ref::parse_blob_ref(src) {
-                            // Durable reference (fixes the 4h presigned-URL
-                            // expiry): resolve to a fresh presigned
-                            // URL. `resolve` returns synchronously on a
-                            // cache hit; otherwise the element is left
-                            // without a `src` until the async fetch (fired
-                            // at most once per (blob_id, key) for the
-                            // page's lifetime) calls back.
-                            match super::image_bridge::resolve(&blob_id, &key, {
-                                let el = el.clone();
-                                move |url| {
-                                    if is_safe_url(&url) {
-                                        let _ = el.set_attribute("src", &url);
-                                    }
-                                }
-                            }) {
-                                Some(url) if is_safe_url(&url) => {
-                                    el.set_attribute("src", &url).ok()?;
-                                }
-                                _ => {}
-                            }
-                        } else if is_safe_url(src) {
-                            // Legacy presigned URL or external absolute URL
-                            // — used verbatim (backward compatible).
-                            el.set_attribute("src", src).ok()?;
-                        }
-                    }
-                    if let Some(alt) = attrs.get("alt") {
-                        el.set_attribute("alt", alt).ok()?;
-                    }
+                    let el = build_image_element(doc, attrs)?;
                     return Some(el.into());
                 }
                 NodeType::Mention => {
@@ -1733,6 +1702,44 @@ fn create_mark_element(doc: &Document, mark: &Mark) -> Option<Element> {
 }
 
 /// Check that a URL uses a safe protocol.
+/// Build an `<img>` element for an `Image` node's attrs, including the
+/// durable blob-ref resolution path (fixes the 4h presigned-URL
+/// expiry): `resolve` returns synchronously on a cache hit; otherwise
+/// the element is left without a `src` until the async fetch (fired at
+/// most once per `(blob_id, key)` for the page's lifetime) calls back.
+/// Legacy presigned / external absolute URLs are used verbatim.
+/// Shared by the editor view and the deck canvas renderer
+/// (`components/deck_view.rs`) so both paths use one resolution cache.
+pub(crate) fn build_image_element(
+    doc: &Document,
+    attrs: &std::collections::HashMap<String, String>,
+) -> Option<web_sys::Element> {
+    let el = doc.create_element("img").ok()?;
+    if let Some(src) = attrs.get("src") {
+        if let Some((blob_id, key)) = super::blob_ref::parse_blob_ref(src) {
+            match super::image_bridge::resolve(&blob_id, &key, {
+                let el = el.clone();
+                move |url| {
+                    if is_safe_url(&url) {
+                        let _ = el.set_attribute("src", &url);
+                    }
+                }
+            }) {
+                Some(url) if is_safe_url(&url) => {
+                    el.set_attribute("src", &url).ok()?;
+                }
+                _ => {}
+            }
+        } else if is_safe_url(src) {
+            el.set_attribute("src", src).ok()?;
+        }
+    }
+    if let Some(alt) = attrs.get("alt") {
+        el.set_attribute("alt", alt).ok()?;
+    }
+    Some(el)
+}
+
 pub(crate) fn is_safe_url(url: &str) -> bool {
     let lower = url.trim().to_lowercase();
     lower.starts_with("https://")

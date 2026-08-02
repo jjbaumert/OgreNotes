@@ -728,6 +728,21 @@ jobs:
             --base-url http://127.0.0.1:3000 \
             --out ../../artifacts/doctor/deck-basics
 
+      # Frames render the full editor block set (spec:
+      # docs/superpowers/specs/2026-08-01-deck-frame-blocks-design.md):
+      # slash-menu mermaid insert inside a frame editor, image upload
+      # via filechooser with durable blob-ref resolution on the canvas,
+      # both surviving Escape and a full reload.
+      - name: Run deck-blocks scenario
+        id: deck-blocks
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario deck-blocks \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/deck-blocks
+
       # ─── Teardown / artifacts ─────────────────────────────────
       - name: Stop axum server
         if: always()

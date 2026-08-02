@@ -6718,6 +6718,167 @@ async function scenarioDeckBasics(ctx, collector) {
   await browser.close();
 }
 
+// ─── deck-blocks scenario ────────────────────────────────────────
+//
+// Frames render the full editor block set (spec:
+// docs/superpowers/specs/2026-08-01-deck-frame-blocks-design.md).
+// Exercises the two named-in-spec block types end to end:
+//   - slash-menu insert INSIDE a frame editor (the menu is page-level;
+//     its outside-click exemption and frame-state coordinate routing
+//     are exactly what regressed at launch) → mermaid diagram.
+//   - image upload through the slash menu's Image entry (filechooser),
+//     durable blob-ref resolution on the canvas render.
+//   - both survive Escape (read-only canvas render via
+//     `.deck-frame__content`) and a full reload.
+// Known limitation (documented): slash-menu keyboard nav (Up/Down/
+// Enter) is routed by the PAGE editor's keydown handler and does not
+// reach frame editors — selection here is click-based.
+async function scenarioDeckBlocks(ctx, collector) {
+  const { baseUrlA, baseUrl, emailA, outDir } = ctx;
+  const target = baseUrlA || baseUrl;
+
+  const tokens = await devLogin(
+    target,
+    emailA || `doctor-deckblocks-${Date.now()}@ogrenotes.example.com`
+  );
+  logJson({ at: "dev-login", userId: tokens.userId });
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    ...DOCTOR_CONTEXT_DEFAULTS,
+    recordHar: { path: join(outDir, "tab-a.har"), mode: "full" },
+  });
+  await seedAuth(context, tokens);
+
+  const page = await context.newPage();
+  instrument(context, page, "tab-a", collector);
+
+  const waitFor = async (pred, ms = 8000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (await pred().catch(() => false)) return true;
+      await page.waitForTimeout(150);
+    }
+    return false;
+  };
+
+  const steps = {};
+  try {
+    // ── Create via REST (creation UI is deck-basics' concern) ──
+    const doc = await createDocViaApi(target, tokens.accessToken, "Deck blocks probe", "presentation");
+    await page.goto(`${target}/d/${doc.id}`, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.locator('.deck-canvas[tabindex="0"]').first().waitFor({ timeout: 20000 }).catch(() => {});
+    // Poll the size: first paint can measure before flex layout settles.
+    steps.canvasRendered = await waitFor(async () => {
+      const box = await page.locator('.deck-canvas[tabindex="0"]').first().boundingBox();
+      return !!box && box.width > 300 && box.height > 150;
+    }, 20000);
+    await waitFor(async () => (await page.locator(".deck-slide-thumb").count()) >= 1);
+
+    // ── title-content slide; edit the body frame ──
+    await page.locator(".deck-add-slide-btn").click();
+    await page.locator(".deck-preset-picker__item", { hasText: "Title + Content" }).click();
+    steps.slideAdded = await waitFor(async () => (await page.locator(".deck-slide-thumb").count()) === 2);
+    const bodyFrame = page
+      .locator(".deck-frame[data-deck-frame-block-id]", { hasText: "Click to add text" })
+      .first();
+    await bodyFrame.dblclick();
+    steps.editorMounted = await page
+      .locator(".deck-frame--editing .editor-content[data-editor-ready]")
+      .waitFor({ timeout: 8000 }).then(() => true).catch(() => false);
+    await page.waitForTimeout(1000); // settle (first-keystroke gotcha)
+
+    // ── slash → Mermaid diagram (click select) ──
+    await page.keyboard.type("/mermaid");
+    const mermaidItem = page.locator("[data-at-menu-idx]", { hasText: "Mermaid diagram" }).first();
+    steps.slashMenuOpen = await mermaidItem.waitFor({ timeout: 5000 }).then(() => true).catch(() => false);
+    await mermaidItem.click();
+    steps.mermaidInserted = await page
+      .locator(".deck-frame--editing .mermaid-block svg")
+      .waitFor({ timeout: 8000 }).then(() => true).catch(() => false);
+    await page.screenshot({ path: join(outDir, "1-mermaid-in-editor.png") }).catch(() => {});
+    await page.keyboard.press("Escape");
+    await waitFor(async () => (await page.locator(".deck-frame--editing").count()) === 0);
+    steps.mermaidOnCanvas = await page
+      .locator('.deck-canvas[tabindex="0"] .deck-frame__content .mermaid-block svg')
+      .waitFor({ timeout: 8000 }).then(() => true).catch(() => false);
+
+    // ── slash → Image (filechooser upload) in the heading frame ──
+    const headingFrame = page
+      .locator(".deck-frame[data-deck-frame-block-id]", { hasText: "Click to add heading" })
+      .first();
+    await headingFrame.dblclick();
+    await page.locator(".deck-frame--editing .editor-content[data-editor-ready]")
+      .waitFor({ timeout: 8000 });
+    await page.waitForTimeout(1000);
+    const pngPath = join(outDir, "px.png");
+    writeFileSync(pngPath, Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+      "base64"
+    ));
+    await page.keyboard.type("/image");
+    const imageItem = page.locator("[data-at-menu-idx]", { hasText: "Image" }).first();
+    await imageItem.waitFor({ timeout: 5000 });
+    const chooserPromise = page.waitForEvent("filechooser", { timeout: 8000 });
+    await imageItem.click();
+    const chooser = await chooserPromise;
+    await chooser.setFiles(pngPath);
+    steps.imageUploaded = await page
+      .locator('.deck-frame--editing img[src]:not([src=""])')
+      .waitFor({ timeout: 15000 }).then(() => true).catch(() => false);
+    await page.keyboard.press("Escape");
+    await waitFor(async () => (await page.locator(".deck-frame--editing").count()) === 0);
+    steps.imageOnCanvas = await page
+      .locator('.deck-canvas[tabindex="0"] .deck-frame__content img[src]:not([src=""])')
+      .waitFor({ timeout: 15000 }).then(() => true).catch(() => false);
+    await page.screenshot({ path: join(outDir, "2-blocks-on-canvas.png") }).catch(() => {});
+    // Deterministic pre-reload gate: reloading while the (REST-fallback)
+    // persist is still in flight loses the tail edits — poll the server
+    // content until BOTH blocks are actually persisted.
+    steps.persistedBeforeReload = await waitFor(async () => {
+      const res = await fetch(`${target}/api/v1/documents/${doc.id}/content`, {
+        headers: { authorization: `Bearer ${tokens.accessToken}` },
+      });
+      if (!res.ok) return false;
+      const buf = Buffer.from(await res.arrayBuffer());
+      return buf.includes(Buffer.from("mermaid")) && buf.includes(Buffer.from("ogre-blob"));
+    }, 15000);
+
+    // ── reload persistence ──
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.locator('.deck-canvas[tabindex="0"]').first().waitFor({ timeout: 20000 });
+    await waitFor(async () => (await page.locator(".deck-slide-thumb").count()) === 2);
+    await page.locator(".deck-slide-thumb").nth(1).click();
+    steps.reloadMermaidPersisted = await page
+      .locator('.deck-canvas[tabindex="0"] .deck-frame__content .mermaid-block svg')
+      .waitFor({ timeout: 10000 }).then(() => true).catch(() => false);
+    steps.reloadImagePersisted = await page
+      .locator('.deck-canvas[tabindex="0"] .deck-frame__content img[src]:not([src=""])')
+      .waitFor({ timeout: 15000 }).then(() => true).catch(() => false);
+    await page.screenshot({ path: join(outDir, "3-after-reload.png") }).catch(() => {});
+  } catch (e) {
+    collector.stepError = `${e.message}`;
+  }
+
+  const tab = collector["tab-a"] || { errors: [], console: [] };
+  // `status of 409` — the REST-fallback persist's optimistic-concurrency
+  // conflict, which the client handles with retries; this scenario's
+  // rapid persist cadence (insert + escape x2) makes it routine noise.
+  const realErrors = (tab.console || []).filter(
+    (m) => m.type === "error" && !/Failed to fetch|loading was aborted|compilation aborted|status of 409 \(Conflict\)|Auto-save failed: HTTP 409/i.test(m.text || "")
+  );
+  steps.noConsoleErrors = realErrors.length === 0;
+
+  collector.scenario = {
+    name: collector.scenario?.name || "deck-blocks",
+    steps,
+  };
+
+  await page.screenshot({ path: join(outDir, "tab-a.png"), fullPage: false }).catch(() => {});
+  await context.close();
+  await browser.close();
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   const scenario = args.scenario || "collab-sync";
@@ -6744,7 +6905,7 @@ async function main() {
         "semantic-search|import-job-round-trip|" +
         "menu-export-downloads|pre-sync-edit-preserved|" +
         "sustained-type-reload|history-pane|delete-document|" +
-        "share-dialog|comment-popup|block-links|doc-mentions|deck-basics] " +
+        "share-dialog|comment-popup|block-links|doc-mentions|deck-basics|deck-blocks] " +
         "[--doc-id <docId>] [--email-a <addr>] [--email-b <addr>]"
     );
     process.exit(2);
@@ -6863,6 +7024,8 @@ async function main() {
       await scenarioDocMentions(ctx, collector);
     } else if (scenario === "deck-basics") {
       await scenarioDeckBasics(ctx, collector);
+    } else if (scenario === "deck-blocks") {
+      await scenarioDeckBlocks(ctx, collector);
     } else {
       throw new Error(`unknown scenario: ${scenario}`);
     }
@@ -7343,6 +7506,12 @@ async function main() {
       "slideAdded", "bodyFramePlaceholderVisible", "inlineEditorMounted",
       "editorClosedAfterEscape", "canvasRenderedAfterReload",
       "thumbCountPersisted", "typedTextPersisted", "noConsoleErrors",
+    ],
+    "deck-blocks": [
+      "canvasRendered", "slideAdded", "editorMounted", "slashMenuOpen",
+      "mermaidInserted", "mermaidOnCanvas", "imageUploaded",
+      "imageOnCanvas", "persistedBeforeReload", "reloadMermaidPersisted",
+      "reloadImagePersisted", "noConsoleErrors",
     ],
   };
   if (ok && Object.prototype.hasOwnProperty.call(requiredSteps, scenario)) {
