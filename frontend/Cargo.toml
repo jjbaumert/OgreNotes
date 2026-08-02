@@ -1,6 +1,10 @@
 [package]
 name = "ogrenotes-frontend"
-version = "0.1.2"
+# Keep in lockstep with the workspace version in the root `Cargo.toml`. This
+# crate is outside that workspace and does not inherit it, but this value is
+# what ships as `clientVersion` on every ws-token request and what the sidebar
+# and settings page display.
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 

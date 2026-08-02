@@ -21,7 +21,12 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+# Keep in lockstep with `frontend/Cargo.toml`. The frontend is outside this
+# workspace, so it does not inherit this value — but its own
+# `CARGO_PKG_VERSION` is what ships as `clientVersion` on every ws-token
+# request and what `classify_client_version` records. Letting the two drift
+# means the version the server sees is one no backend build ever had.
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Clean-room collaborative document, spreadsheet, and chat platform written in Rust."

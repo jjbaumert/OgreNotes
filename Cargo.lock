@@ -3713,7 +3713,7 @@ dependencies = [
 
 [[package]]
 name = "ogrenotes-api"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3765,7 +3765,7 @@ dependencies = [
 
 [[package]]
 name = "ogrenotes-auth"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -3785,7 +3785,7 @@ dependencies = [
 
 [[package]]
 name = "ogrenotes-collab"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "ammonia",
  "aws-config",
@@ -3823,7 +3823,7 @@ dependencies = [
 
 [[package]]
 name = "ogrenotes-common"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3840,7 +3840,7 @@ dependencies = [
 
 [[package]]
 name = "ogrenotes-embeddings"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "aws-sdk-bedrockruntime",
  "aws-smithy-http-client",
@@ -3872,7 +3872,7 @@ dependencies = [
 
 [[package]]
 name = "ogrenotes-notify"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "aws-sdk-dynamodb",
@@ -3890,7 +3890,7 @@ dependencies = [
 
 [[package]]
 name = "ogrenotes-quip-import"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "aws-sdk-ssm",
@@ -3908,7 +3908,7 @@ dependencies = [
 
 [[package]]
 name = "ogrenotes-search"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "serde",
@@ -3921,7 +3921,7 @@ dependencies = [
 
 [[package]]
 name = "ogrenotes-storage"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
@@ -3943,7 +3943,7 @@ dependencies = [
 
 [[package]]
 name = "ogrenotes-worker"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "fred",
