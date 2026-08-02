@@ -2359,8 +2359,21 @@ pub async fn import_one_thread(
         .await
         .map_err(|e| ThreadImportError::RunFailure(format!("stage html: {e}")))?;
 
-    // 5. Walk it.
-    let mut quip_doc = ogrenotes_collab::import_quip::from_quip_html(&html);
+    // 5. Walk it, telling the walker which kind of thread this is.
+    //
+    // Not a hint — the walker cannot work it out for itself. Quip renders a
+    // spreadsheet as a table wrapped in the grid's own rulers (a column-letter
+    // `<thead>`, a row-number gutter column), and it wraps ordinary document
+    // tables in the very same markup, so the body alone does not say which is
+    // which. Only `thread_type` does, and it arrives here rather than in the
+    // HTML (#230).
+    let mut quip_doc = ogrenotes_collab::import_quip::from_quip_html_as(
+        &html,
+        match doc_type {
+            DocType::Spreadsheet => ogrenotes_collab::import_quip::QuipThreadKind::Spreadsheet,
+            _ => ogrenotes_collab::import_quip::QuipThreadKind::Document,
+        },
+    );
 
     // Nesting deeper than the walker will descend is a named loss, reported
     // like a dropped image rather than passed over in silence. The cap itself
