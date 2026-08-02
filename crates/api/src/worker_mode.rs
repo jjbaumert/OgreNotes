@@ -1859,13 +1859,16 @@ fn is_endpoint_shape_failure(e: &QuipError) -> bool {
 /// Where an imported thread's document is filed.
 ///
 /// `THREAD#` rows carry **Quip** folder ids; documents need OgreNotes ones.
-/// The intended mapping is each `FOLDER#` row's `ogre_folder_id` — but Phase 1
-/// writes `None` there for every folder (it inventories the Quip tree, it does
-/// not mirror it), so in practice every thread resolves to `fallback`, the
-/// import's `target_folder_id`, and an import lands flat in one folder.
-/// Building the mirrored tree is a Phase-2a follow-up, deliberately out of
-/// scope here; the lookup is written mapping-first so it starts honoring
-/// `ogre_folder_id` the moment something populates it.
+/// The mapping is each `FOLDER#` row's `ogre_folder_id`, populated by
+/// [`mirror_folder_tree`] immediately before this is built (#236).
+///
+/// `fallback` — the import's `target_folder_id` — is what a thread resolves
+/// to when its folder has no mapping. That is no longer the *normal* case, as
+/// it was while Phase 1 wrote `ogre_folder_id: None` for every folder, but it
+/// stays reachable and stays correct: a `THREAD#` row can name a folder that
+/// is not in this import's `FOLDER#` set (a manifest written by an older
+/// inventory), and filing such a document flat under the destination beats
+/// failing the import over its filing.
 pub struct FolderMapping {
     by_quip_id: std::collections::HashMap<String, String>,
     fallback: String,
@@ -1928,6 +1931,264 @@ pub async fn build_folder_mapping(
         );
     }
     Ok(FolderMapping { by_quip_id, fallback })
+}
+
+// ─── Mirroring the Quip folder tree (#236) ───────────────────────
+
+/// Where one mirrored folder hangs, as decided by
+/// [`order_folders_parent_first`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MirrorParent<'a> {
+    /// Directly under the import's destination folder. A selected root, and
+    /// also the documented fallback for a folder whose parent cannot be
+    /// placed — see [`order_folders_parent_first`].
+    ImportRoot,
+    /// Under the OgreNotes folder mirroring this Quip folder, which the
+    /// ordering guarantees appears **earlier** in the returned sequence.
+    Quip(&'a str),
+}
+
+/// Order an import's `FOLDER#` rows so that no folder is created before the
+/// folder it hangs under, and say what each one hangs under.
+///
+/// `list_folders` returns rows in `SK` order — the Quip folder id's order,
+/// which says nothing about depth — so the creation order has to be derived
+/// here rather than assumed. Every input row appears in the output exactly
+/// once: a folder this function dropped would silently never be mirrored.
+///
+/// # The rule for a parent that cannot be placed
+///
+/// Two shapes reach it, and both resolve to [`MirrorParent::ImportRoot`]:
+///
+/// - **A parent outside the selected scope.** The user picked a sub-folder as
+///   an import root, or a folder's parent was simply not selected. Its
+///   `parent_quip_id` names a folder with no `FOLDER#` row.
+/// - **A cycle.** `walk_inventory` records the BFS *tree*, so it cannot emit
+///   one — but rows written by an older inventory pass, or half-migrated, are
+///   not covered by that argument, and "this terminates" must not rest on an
+///   invariant enforced in another crate.
+///
+/// **Re-parent, never drop.** A dropped folder takes its documents' filing
+/// with it and the user is never told which piece of their structure went
+/// missing; a re-parented folder is visibly present, at worst one level
+/// shallower than it was in Quip. That is a fidelity loss the user can see
+/// and fix in ten seconds, which is the strictly better failure.
+///
+/// Placement proceeds in waves, so the cost is O(rows × depth) — a few
+/// hundred folders at Quip-account scale, all in memory, no I/O.
+fn order_folders_parent_first(rows: &[FolderRow]) -> Vec<(&FolderRow, MirrorParent<'_>)> {
+    let in_scope: std::collections::HashSet<&str> =
+        rows.iter().map(|r| r.quip_folder_id.as_str()).collect();
+    let mut placed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut ordered: Vec<(&FolderRow, MirrorParent<'_>)> = Vec::with_capacity(rows.len());
+
+    // Sorted so two runs over the same manifest create folders in the same
+    // sequence, which keeps two runs' logs comparable.
+    let mut pending: Vec<&FolderRow> = rows.iter().collect();
+    pending.sort_by(|a, b| a.quip_folder_id.cmp(&b.quip_folder_id));
+
+    while !pending.is_empty() {
+        let mut deferred: Vec<&FolderRow> = Vec::new();
+        let mut progressed = false;
+        for row in pending {
+            let parent = match row.parent_quip_id.as_deref() {
+                // A selected root, or a parent nobody selected.
+                None => Some(MirrorParent::ImportRoot),
+                Some(p) if !in_scope.contains(p) => Some(MirrorParent::ImportRoot),
+                Some(p) if placed.contains(p) => Some(MirrorParent::Quip(p)),
+                // In scope but not placed yet — possibly later in this very
+                // wave, so try again next time round.
+                Some(_) => None,
+            };
+            match parent {
+                Some(parent) => {
+                    placed.insert(row.quip_folder_id.as_str());
+                    ordered.push((row, parent));
+                    progressed = true;
+                }
+                None => deferred.push(row),
+            }
+        }
+        if !progressed {
+            // Every survivor names an in-scope parent that will never be
+            // placed, i.e. they form one or more cycles. Same rule as an
+            // unselected parent — and this is the branch that makes the loop
+            // terminate rather than spin.
+            tracing::warn!(
+                folders = deferred.len(),
+                "quip content: folder rows form a cycle; \
+                 mirroring them directly under the import's destination",
+            );
+            ordered.extend(deferred.into_iter().map(|row| (row, MirrorParent::ImportRoot)));
+            break;
+        }
+        pending = deferred;
+    }
+    ordered
+}
+
+/// Create one OgreNotes folder per inventoried Quip folder, under the
+/// import's destination, and record each one on its `FOLDER#` row.
+/// [`build_folder_mapping`] reads those ids straight afterwards, so the
+/// documents file themselves into the mirrored tree with no further change.
+///
+/// # Idempotency — the property the whole pass turns on
+///
+/// The importer is re-startable and the reaper re-runs crashed jobs, so this
+/// runs many times for one import. `ogre_folder_id` is the idempotency key,
+/// used exactly as `routes::imports::ensure_import_folder` uses
+/// `import_folder_id`:
+///
+/// - **present** → a previous run already mirrored this folder; adopt it and
+///   create nothing.
+/// - **absent** → create the folder, *then* record the id under a conditional
+///   write ([`ImportRepo::record_ogre_folder`]). A concurrent loser reads the
+///   winner's id back and leaves its own folder as a harmless empty orphan,
+///   owned by the user and linked under its parent.
+///
+/// Ordering matters the same way it does in `ensure_import_folder`: the
+/// folder is materialized **before** its id is recorded, so a crash between
+/// the two can only leave an unreferenced folder — never a recorded id
+/// pointing at a folder that does not exist, which would file documents into
+/// a destination that is not there.
+///
+/// Two consequences worth being explicit about:
+///
+/// - **Resumability is free.** A run that dies half way through the tree
+///   leaves the folders it made recorded; the next run adopts them and picks
+///   up at the first unrecorded one.
+/// - **Nothing here touches a document.** Folder location is mutable after an
+///   import: if the user moves an imported document, a later run must respect
+///   that. There is deliberately no "repair the tree" step — a document is
+///   filed once, by the content pass, and only while its thread is still
+///   `Pending`.
+///
+/// # Empty folders are created anyway
+///
+/// A Quip folder holding only chats (skipped), only inaccessible threads, or
+/// nothing at all yields an empty OgreNotes folder, and that is the intended
+/// outcome. The user asked for their structure; an empty folder is an honest
+/// account of what was there, and pruning would quietly disagree with the
+/// Quip window the user is comparing against.
+///
+/// # Failure is run-terminal, on purpose
+///
+/// A folder that cannot be created returns `Err`, which fails the job and
+/// lets the queue retry it — rather than continuing with a partial tree.
+/// Continuing looks kinder and is not: the documents under the missing branch
+/// would file into the fallback, and because a re-run must never move a
+/// document that is already filed, that flattening would be **permanent**. An
+/// all-or-nothing tree with a retry behind it is the only version that can
+/// still come out right. It is also why this needs no new report note kind:
+/// there is no "folder we could not create" for a *completed* import to
+/// report.
+async fn mirror_folder_tree(
+    ctx: &WorkerCtx,
+    import_id: &str,
+    owner_id: &str,
+    record: &ogrenotes_storage::models::import::ImportRecord,
+) -> Result<(), String> {
+    use ogrenotes_storage::models::folder::{Folder, FolderChild};
+    use ogrenotes_storage::models::{ChildType, FolderType};
+
+    let rows = ctx
+        .import_repo
+        .list_folders(import_id)
+        .await
+        .map_err(|e| format!("list folders: {e}"))?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let destination = record.target_folder_id.clone().ok_or_else(|| {
+        format!("import {import_id} has no target_folder_id; its destination was never chosen")
+    })?;
+
+    // quip folder id -> the OgreNotes folder durably recorded for it. Built
+    // as we go, and read for a child's parent — which the ordering guarantees
+    // is already in here.
+    let mut mirrored: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut created = 0usize;
+
+    for (row, parent) in order_folders_parent_first(&rows) {
+        let quip_id = row.quip_folder_id.as_str();
+        // Fast path: a previous run already mirrored this folder.
+        if let Some(existing) = &row.ogre_folder_id {
+            mirrored.insert(quip_id, existing.clone());
+            continue;
+        }
+        let parent_id = match parent {
+            MirrorParent::ImportRoot => destination.clone(),
+            // `unwrap_or` rather than an unreachable: the ordering makes the
+            // miss impossible, and a stuck import is too high a price for
+            // being right about that.
+            MirrorParent::Quip(p) => mirrored.get(p).cloned().unwrap_or_else(|| {
+                tracing::warn!(
+                    import_id,
+                    quip_folder_id = quip_id,
+                    parent = p,
+                    "quip content: mirrored parent missing at creation time; \
+                     filing this folder under the import's destination",
+                );
+                destination.clone()
+            }),
+        };
+
+        let now = ogrenotes_common::time::now_usec();
+        let candidate = ogrenotes_common::id::new_id();
+        // Same create + link order as `routes::folders::create_folder` and
+        // `ensure_import_folder`: link under the parent first, so the folder
+        // is never orphaned, then write metadata + the owner MEMBER row.
+        ctx.folder_repo
+            .add_child(&FolderChild {
+                folder_id: parent_id.clone(),
+                child_id: candidate.clone(),
+                child_type: ChildType::Folder,
+                added_at: now,
+            })
+            .await
+            .map_err(|e| format!("link mirrored folder {quip_id}: {e}"))?;
+        ctx.folder_repo
+            .create(&Folder {
+                folder_id: candidate.clone(),
+                // Quip's own name for it. Empty titles do occur; "Untitled"
+                // matches what the content pass names an untitled document,
+                // so the two read as one import.
+                title: if row.title.trim().is_empty() { "Untitled" } else { &row.title }
+                    .to_string(),
+                color: 0,
+                parent_id: Some(parent_id),
+                owner_id: owner_id.to_string(),
+                folder_type: FolderType::User,
+                inherit_mode: ogrenotes_storage::models::InheritMode::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .map_err(|e| format!("create mirrored folder {quip_id}: {e}"))?;
+
+        let recorded = ctx
+            .import_repo
+            .record_ogre_folder(import_id, quip_id, &candidate)
+            .await
+            .map_err(|e| format!("record mirrored folder {quip_id}: {e}"))?;
+        if recorded != candidate {
+            tracing::info!(
+                import_id,
+                quip_folder_id = quip_id,
+                "quip content: another run recorded this folder first; adopting it",
+            );
+        }
+        mirrored.insert(quip_id, recorded);
+        created += 1;
+    }
+
+    tracing::info!(
+        import_id,
+        folders = rows.len(),
+        created,
+        "quip content: Quip folder tree mirrored under the import's destination",
+    );
+    Ok(())
 }
 
 /// Phase 2 content pass: turn every `Pending` thread into a document.
@@ -2025,6 +2286,12 @@ async fn run_content_pass(
     // for the whole handler, so this loop deliberately does no heartbeating of
     // its own — tying liveness to a per-N-threads tick made one slow thread
     // look like a dead worker.
+    // Mirror the Quip folder tree, then read the mapping it just recorded.
+    // In this order and adjacent, because the second reads exactly what the
+    // first writes; a run that mirrored after mapping would file its first
+    // pass of documents flat and — since a re-run never moves a filed
+    // document — leave them that way permanently.
+    mirror_folder_tree(ctx, import_id, owner_id, record).await?;
     let folders = build_folder_mapping(ctx, import_id, record).await?;
 
     let mut threads = ctx
@@ -3048,6 +3315,8 @@ async fn await_shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ogrenotes_storage::models::import_inventory::FolderRow;
+    use std::collections::BTreeSet;
 
     fn thread(first: &str, members: &[&str]) -> ThreadRow {
         ThreadRow {
@@ -3239,12 +3508,27 @@ mod tests {
         assert_eq!(additional, vec!["of2".to_string()]);
     }
 
-    /// Phase 1 writes no `ogre_folder_id`, so every Quip folder resolves to the
-    /// import's target folder and a thread's multi-folder membership collapses
-    /// to a single destination. Flat, but correct — and pinned so the day
-    /// something populates `ogre_folder_id`, the change is visible here.
+    /// The unmapped fallback, which #236 changed the *meaning* of without
+    /// changing the behaviour asserted here.
+    ///
+    /// This test was written anticipating this work — "pinned so the day
+    /// something populates `ogre_folder_id`, the change is visible here" —
+    /// and the honest answer is that the change is **not** visible here,
+    /// because this exercises `FolderMapping` with an explicitly empty map.
+    /// What changed is who reaches that state. It used to be every import
+    /// (Phase 1 wrote `ogre_folder_id: None` for every folder, so this was
+    /// the whole story and the docs above described it as such); now it is
+    /// only a thread naming a folder outside the import's `FOLDER#` set —
+    /// a manifest written by an older inventory pass.
+    ///
+    /// So the assertions stand unchanged and the doc comment is what moves:
+    /// filing such a document flat under the destination is still strictly
+    /// better than failing an import over one thread's filing. Renamed from
+    /// `folders_for_collapses_to_the_target_folder_when_nothing_is_mapped`
+    /// because "when nothing is mapped" described the old normal case and now
+    /// describes an edge.
     #[test]
-    fn folders_for_collapses_to_the_target_folder_when_nothing_is_mapped() {
+    fn an_unmapped_quip_folder_still_files_under_the_imports_destination() {
         let m = mapping(&[], "target");
         let (primary, additional) = m.folders_for(&thread("qf1", &["qf1", "qf2"]));
         assert_eq!(primary, "target");
@@ -3257,5 +3541,126 @@ mod tests {
         let (primary, additional) = m.folders_for(&thread("qf1", &["qf1", "qf2", "qf3", "qf2"]));
         assert_eq!(primary, "of1");
         assert_eq!(additional, vec!["of2".to_string()], "of2 appears once");
+    }
+
+    // ─── Ordering the mirrored tree (#236) ───────────────────────
+
+    fn folder_row(quip_id: &str, parent: Option<&str>) -> FolderRow {
+        FolderRow {
+            quip_folder_id: quip_id.into(),
+            owner_id: "u1".into(),
+            title: format!("Folder {quip_id}"),
+            parent_quip_id: parent.map(str::to_string),
+            ogre_folder_id: None,
+        }
+    }
+
+    /// `(quip id, the quip id of the parent it hangs under, or None for
+    /// "directly under the import's destination")`, in creation order.
+    fn placements(rows: &[FolderRow]) -> Vec<(&str, Option<&str>)> {
+        order_folders_parent_first(rows)
+            .into_iter()
+            .map(|(row, parent)| {
+                let parent = match parent {
+                    MirrorParent::ImportRoot => None,
+                    MirrorParent::Quip(p) => Some(p),
+                };
+                (row.quip_folder_id.as_str(), parent)
+            })
+            .collect()
+    }
+
+    /// Hazard 2: a child cannot be created before its parent. The rows come
+    /// back from DynamoDB in `SK` order, which is the Quip id's order and
+    /// says nothing about depth — so the order has to be re-derived, not
+    /// assumed.
+    #[test]
+    fn a_nested_tree_is_ordered_parent_before_child() {
+        // Depth 3, deliberately listed deepest-first so `SK` order is the
+        // exact reverse of a usable one.
+        let rows = vec![
+            folder_row("c", Some("b")),
+            folder_row("b", Some("a")),
+            folder_row("a", None),
+        ];
+        assert_eq!(
+            placements(&rows),
+            vec![("a", None), ("b", Some("a")), ("c", Some("b"))],
+        );
+    }
+
+    /// Hazard 3, first half: `parent_quip_id` names a folder outside the
+    /// selected scope — the user picked a sub-folder as a root, or a shared
+    /// folder's parent was never selected.
+    ///
+    /// **The rule: re-parent to the import's destination, never drop.** A
+    /// dropped folder takes its documents' filing with it and the user never
+    /// learns which structure went missing; a re-parented one is visibly
+    /// there, at worst one level shallower than in Quip.
+    #[test]
+    fn a_parent_outside_the_selected_scope_re_parents_to_the_import_root() {
+        let rows = vec![folder_row("child", Some("never-selected"))];
+        assert_eq!(placements(&rows), vec![("child", None)]);
+    }
+
+    /// Hazard 3, second half. The inventory walk cannot record a cycle (its
+    /// parentage is the BFS tree), but rows written by an older inventory,
+    /// or hand-edited, or half-migrated, are not covered by that argument —
+    /// and "terminates" is not a property to leave resting on an invariant
+    /// enforced in another crate.
+    ///
+    /// Same rule as an unselected parent: the whole cycle lands under the
+    /// import's destination rather than looping or vanishing.
+    #[test]
+    fn a_cycle_terminates_with_every_folder_under_the_import_root() {
+        let rows = vec![
+            folder_row("a", Some("b")),
+            folder_row("b", Some("a")),
+            folder_row("solo", Some("solo")),
+        ];
+        let placed = placements(&rows);
+        assert_eq!(placed.len(), 3, "every row is still placed: {placed:?}");
+        assert!(
+            placed.iter().all(|(_, parent)| parent.is_none()),
+            "a folder in a cycle has no placeable parent: {placed:?}",
+        );
+    }
+
+    /// The ordering must be total and injective: every row placed, exactly
+    /// once. A folder silently dropped here is a folder that never gets
+    /// mirrored and never gets reported either.
+    #[test]
+    fn every_row_is_placed_exactly_once_however_broken_the_graph() {
+        let rows = vec![
+            folder_row("root", None),
+            folder_row("kid", Some("root")),
+            folder_row("orphan", Some("gone")),
+            folder_row("loop_a", Some("loop_b")),
+            folder_row("loop_b", Some("loop_a")),
+        ];
+        let placed = placements(&rows);
+        let ids: BTreeSet<&str> = placed.iter().map(|(id, _)| *id).collect();
+        assert_eq!(placed.len(), rows.len(), "no duplicates: {placed:?}");
+        assert_eq!(ids.len(), rows.len(), "no drops: {placed:?}");
+    }
+
+    /// A placed parent always precedes the child that names it, which is the
+    /// property `mirror_folder_tree` reads the parent's freshly-created
+    /// OgreNotes id out of an accumulating map on.
+    #[test]
+    fn a_named_parent_always_precedes_its_child_in_the_order() {
+        let rows = vec![
+            folder_row("z", Some("m")),
+            folder_row("m", Some("a")),
+            folder_row("a", None),
+            folder_row("b", Some("a")),
+        ];
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for (id, parent) in placements(&rows) {
+            if let Some(p) = parent {
+                assert!(seen.contains(p), "{id} precedes its parent {p}");
+            }
+            seen.insert(id);
+        }
     }
 }

@@ -87,18 +87,96 @@ impl ImportRepo {
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
-    /// Write a folder row discovered during inventory BFS. Folders are
-    /// idempotent to re-write (unlike threads, they carry no progress
-    /// state that a re-run could downgrade), so a plain `put_item`
-    /// unconditionally upserts.
+    /// Write a folder row discovered during inventory BFS.
+    ///
+    /// Upserts the fields the *inventory walk* owns — title and parentage —
+    /// and deliberately does **not** touch [`OGRE_FOLDER_ID_ATTR`], which is
+    /// [`ImportRepo::record_ogre_folder`]'s alone. That split is the whole
+    /// reason this is an `update_item` and not the `put_item` it used to be
+    /// (#236).
+    ///
+    /// The failure it prevents: the inventory BFS re-runs on every job
+    /// attempt and always offers `ogre_folder_id: None`, because the walk has
+    /// no OgreNotes folder to offer. A whole-item put therefore *erased* the
+    /// mirrored-tree idempotency key on the second run, so the mirroring pass
+    /// read "not created yet" and built a second tree — every run, forever.
+    /// Folders were once described here as carrying "no progress state that a
+    /// re-run could downgrade"; `ogre_folder_id` is exactly such state, and it
+    /// is now the only field on the row that a re-run must not touch.
     pub async fn put_folder(&self, import_id: &str, f: &FolderRow) -> Result<(), RepoError> {
-        let mut item = folder_to_item(f);
-        item.insert("PK".to_string(), AttributeValue::S(format!("IMPORT#{import_id}")));
-        item.insert("SK".to_string(), AttributeValue::S(f.sk()));
+        let (expression, names, values) = folder_inventory_update(f);
         self.db
-            .put_item(item)
+            .update_item(
+                &format!("IMPORT#{import_id}"),
+                &f.sk(),
+                &expression,
+                values,
+                Some(names),
+            )
             .await
             .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Record the OgreNotes folder mirroring one Quip folder, and return the
+    /// id that is durably recorded — which is **not** necessarily `candidate`.
+    ///
+    /// This is [`ImportRepo::record_import_folder`]'s contract, per folder,
+    /// and for the same reason: it is the idempotency key of a create that a
+    /// crashed, reaped, or re-started import will attempt again. Present →
+    /// the caller adopts what is already there; absent → the caller's
+    /// freshly-created folder is recorded under a conditional write, and a
+    /// concurrent loser reads the winner's id back and leaves its own folder
+    /// as a harmless empty orphan (owned by the user, linked under its
+    /// parent, so listable and deletable — never a wedge).
+    ///
+    /// `attribute_exists(quip_folder_id)` is load-bearing and not belt-and-
+    /// braces: DynamoDB satisfies `attribute_not_exists(ogre_folder_id)`
+    /// against a *missing item*, so without it a mis-keyed call would create
+    /// a row carrying only the keys and this id — which `folder_from_item`
+    /// cannot decode, permanently poisoning `list_folders` for that import.
+    pub async fn record_ogre_folder(
+        &self,
+        import_id: &str,
+        quip_folder_id: &str,
+        candidate: &str,
+    ) -> Result<String, RepoError> {
+        let pk = format!("IMPORT#{import_id}");
+        let sk = format!("FOLDER#{quip_folder_id}");
+        let mut names = HashMap::new();
+        names.insert("#ogre".to_string(), OGRE_FOLDER_ID_ATTR.to_string());
+        names.insert("#quip".to_string(), QUIP_FOLDER_ID_ATTR.to_string());
+        let mut values = HashMap::new();
+        values.insert(":fid".to_string(), AttributeValue::S(candidate.to_string()));
+        let recorded = self
+            .db
+            .update_item_conditional(
+                &pk,
+                &sk,
+                "SET #ogre = :fid",
+                "attribute_exists(#quip) AND attribute_not_exists(#ogre)",
+                values,
+                Some(names),
+            )
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        if recorded {
+            return Ok(candidate.to_string());
+        }
+        // Lost the race (or this is a re-run): read back whatever is durable.
+        // A row that is missing entirely lands here too, and must surface as
+        // an error rather than as a silent "no mapping" — see the condition
+        // above.
+        let item = self
+            .db
+            .get_item(&pk, &sk)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?
+            .ok_or_else(|| {
+                RepoError::MissingField(format!("import {import_id} has no {sk} row"))
+            })?;
+        folder_from_item(&item)?
+            .ogre_folder_id
+            .ok_or_else(|| RepoError::MissingField(format!("{sk} ogre_folder_id")))
     }
 
     /// Insert-if-absent: a re-run must never downgrade a thread that has
@@ -941,36 +1019,86 @@ fn import_from_item(item: &HashMap<String, AttributeValue>) -> Result<ImportReco
     })
 }
 
+/// Attribute names on a `FOLDER#` row, named once so the writer, the reader
+/// and the two update expressions cannot drift apart. A drifted name here is
+/// silent: an unknown attribute reads as absent, i.e. "this folder was never
+/// mirrored", which is exactly the state that makes the mirroring pass build
+/// a duplicate tree.
+const QUIP_FOLDER_ID_ATTR: &str = "quip_folder_id";
+const PARENT_QUIP_ID_ATTR: &str = "parent_quip_id";
+/// The mirrored-tree idempotency key. Written by
+/// [`ImportRepo::record_ogre_folder`] and by nothing else — in particular
+/// **not** by [`ImportRepo::put_folder`], which the inventory re-runs.
+const OGRE_FOLDER_ID_ATTR: &str = "ogre_folder_id";
+
 fn folder_to_item(f: &FolderRow) -> HashMap<String, AttributeValue> {
     let mut item = HashMap::new();
     item.insert(
-        "quip_folder_id".to_string(),
+        QUIP_FOLDER_ID_ATTR.to_string(),
         AttributeValue::S(f.quip_folder_id.clone()),
     );
     item.insert("owner_id".to_string(), AttributeValue::S(f.owner_id.clone()));
     item.insert("title".to_string(), AttributeValue::S(f.title.clone()));
     if let Some(ref parent_quip_id) = f.parent_quip_id {
         item.insert(
-            "parent_quip_id".to_string(),
+            PARENT_QUIP_ID_ATTR.to_string(),
             AttributeValue::S(parent_quip_id.clone()),
         );
     }
     if let Some(ref ogre_folder_id) = f.ogre_folder_id {
         item.insert(
-            "ogre_folder_id".to_string(),
+            OGRE_FOLDER_ID_ATTR.to_string(),
             AttributeValue::S(ogre_folder_id.clone()),
         );
     }
     item
 }
 
+/// The `(expression, names, values)` [`ImportRepo::put_folder`] writes:
+/// every attribute [`folder_to_item`] produces **except**
+/// [`OGRE_FOLDER_ID_ATTR`], plus a `REMOVE` for a parent that has gone away
+/// so a re-rooted folder cannot keep a stale pointer.
+///
+/// Derived from `folder_to_item` rather than re-listing the attributes, so
+/// the writer and the reader stay one mapping. Split out from the async
+/// method purely so the exclusion can be asserted by a unit test — it is the
+/// property the whole idempotency design rests on.
+fn folder_inventory_update(
+    f: &FolderRow,
+) -> (String, HashMap<String, String>, HashMap<String, AttributeValue>) {
+    let mut names = HashMap::new();
+    let mut values = HashMap::new();
+    let mut sets: Vec<String> = Vec::new();
+    // Sorted first, so an arbitrary `HashMap` iteration order cannot make two
+    // runs writing the same row issue textually different updates.
+    let mut attrs: Vec<(String, AttributeValue)> = folder_to_item(f)
+        .into_iter()
+        .filter(|(attr, _)| attr != OGRE_FOLDER_ID_ATTR)
+        .collect();
+    attrs.sort_by(|a, b| a.0.cmp(&b.0));
+    for (n, (attr, value)) in attrs.into_iter().enumerate() {
+        // Every name is aliased: DynamoDB's reserved-word list is long and
+        // grows, and a row this code cannot write is a stuck import.
+        let (name, value_key) = (format!("#a{n}"), format!(":v{n}"));
+        sets.push(format!("{name} = {value_key}"));
+        names.insert(name, attr);
+        values.insert(value_key, value);
+    }
+    let mut expression = format!("SET {}", sets.join(", "));
+    if f.parent_quip_id.is_none() {
+        names.insert("#parent".to_string(), PARENT_QUIP_ID_ATTR.to_string());
+        expression.push_str(" REMOVE #parent");
+    }
+    (expression, names, values)
+}
+
 fn folder_from_item(item: &HashMap<String, AttributeValue>) -> Result<FolderRow, RepoError> {
     Ok(FolderRow {
-        quip_folder_id: get_s(item, "quip_folder_id")?,
+        quip_folder_id: get_s(item, QUIP_FOLDER_ID_ATTR)?,
         owner_id: get_s(item, "owner_id")?,
         title: get_s(item, "title")?,
-        parent_quip_id: item.get("parent_quip_id").and_then(|v| v.as_s().ok()).cloned(),
-        ogre_folder_id: item.get("ogre_folder_id").and_then(|v| v.as_s().ok()).cloned(),
+        parent_quip_id: item.get(PARENT_QUIP_ID_ATTR).and_then(|v| v.as_s().ok()).cloned(),
+        ogre_folder_id: item.get(OGRE_FOLDER_ID_ATTR).and_then(|v| v.as_s().ok()).cloned(),
     })
 }
 
@@ -1285,6 +1413,7 @@ fn report_from_item(item: &HashMap<String, AttributeValue>) -> Result<ReportRow,
 mod tests {
     use super::*;
     use aws_smithy_runtime::client::http::test_util::StaticReplayClient;
+    use std::collections::BTreeSet;
 
     fn record_fixture() -> ImportRecord {
         ImportRecord {
@@ -1390,6 +1519,61 @@ mod tests {
         let item = folder_to_item(&f);
         assert!(!item.contains_key("token") && !item.contains_key("secret"));
         assert_eq!(folder_from_item(&item).expect("from_item"), f);
+    }
+
+    /// The exclusion the mirrored-tree idempotency key rests on (#236): the
+    /// update `put_folder` issues must never mention `ogre_folder_id`, even
+    /// when handed a row that carries one. The inventory re-runs on every job
+    /// attempt with `ogre_folder_id: None`, and a write that reached the
+    /// attribute at all would clear it and make the mirroring pass build a
+    /// second tree.
+    #[test]
+    fn put_folders_update_never_reaches_the_mirrored_folder_id() {
+        let f = FolderRow {
+            quip_folder_id: "qf1".into(),
+            owner_id: "u1".into(),
+            title: "Root".into(),
+            parent_quip_id: Some("qp".into()),
+            ogre_folder_id: Some("of1".into()),
+        };
+        let (expression, names, values) = folder_inventory_update(&f);
+        assert!(
+            !names.values().any(|attr| attr == OGRE_FOLDER_ID_ATTR),
+            "no alias may point at the idempotency key: {names:?}",
+        );
+        assert!(
+            !expression.contains(OGRE_FOLDER_ID_ATTR),
+            "nor may the expression name it directly: {expression}",
+        );
+        assert!(
+            !values.values().any(|v| v.as_s().is_ok_and(|s| s == "of1")),
+            "nor may its value ride along: {values:?}",
+        );
+        // ...while the inventory-owned fields all do get written.
+        let written: BTreeSet<&str> = names.values().map(String::as_str).collect();
+        assert!(written.contains(QUIP_FOLDER_ID_ATTR), "{written:?}");
+        assert!(written.contains(PARENT_QUIP_ID_ATTR), "{written:?}");
+        assert!(written.contains("title"), "{written:?}");
+        assert!(written.contains("owner_id"), "{written:?}");
+    }
+
+    /// A folder that is no longer anyone's child must lose the attribute,
+    /// not keep pointing at the parent a previous run recorded.
+    #[test]
+    fn a_row_without_a_parent_removes_the_parent_attribute() {
+        let f = FolderRow {
+            quip_folder_id: "qf1".into(),
+            owner_id: "u1".into(),
+            title: "Root".into(),
+            parent_quip_id: None,
+            ogre_folder_id: None,
+        };
+        let (expression, names, _) = folder_inventory_update(&f);
+        assert!(expression.contains("REMOVE"), "{expression}");
+        assert!(
+            names.values().any(|attr| attr == PARENT_QUIP_ID_ATTR),
+            "{names:?}",
+        );
     }
 
     #[test]

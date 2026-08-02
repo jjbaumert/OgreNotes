@@ -503,7 +503,12 @@ struct Progress {
 struct ReportDto {
     /// Documents actually written into the destination folder.
     imported: u64,
-    /// Documents Quip refused to serve (HTTP 403).
+    /// Content Quip refused to serve (HTTP 403) — documents
+    /// (`THREADS_SKIPPED_FORBIDDEN`) **plus** selected folders the inventory
+    /// could not read (`FOLDERS_FORBIDDEN`, #236). Both file their notes
+    /// under `KIND_THREAD_SKIPPED`, and a folder note is recognisable by its
+    /// empty `quipThreadId`; the total sums both counters so it agrees with
+    /// the list beneath it rather than describing only part of it.
     skipped: OutcomeDto,
     /// Documents the content pass tried and gave up on.
     failed: OutcomeDto,
@@ -638,9 +643,29 @@ fn project_report(row: ReportRow) -> ReportDto {
         (o.total > 0).then_some(o)
     };
 
+    // `skipped` is the one bucket fed by two counters (#236). The inventory's
+    // forbidden-*folder* outcome files its notes under `KIND_THREAD_SKIPPED`
+    // — it is a Quip refusal like any other, and giving it its own note kind
+    // would spend the last of the eight the `REPORT` row allows — but it
+    // bumps its own counter, `FOLDERS_FORBIDDEN`.
+    //
+    // Until now that counter was projected **nowhere**: the only unprojected
+    // key in `ALL_COUNTERS`. The user still saw the note, so the *explanation*
+    // arrived, but the number came out as `max(thread_403s, notes.len())`,
+    // which is wrong in both directions — it under-reports once the note
+    // budget truncates, and before that it silently re-labels a forbidden
+    // folder as a forbidden document. Summing is what makes the number match
+    // the list the user is reading.
+    let skipped_notes = notes_of(report::KIND_THREAD_SKIPPED);
+    let skipped = OutcomeDto {
+        total: (counter(report::THREADS_SKIPPED_FORBIDDEN) + counter(report::FOLDERS_FORBIDDEN))
+            .max(skipped_notes.len() as u64),
+        notes: skipped_notes,
+    };
+
     ReportDto {
         imported: counter(report::THREADS_IMPORTED),
-        skipped: outcome(report::THREADS_SKIPPED_FORBIDDEN, report::KIND_THREAD_SKIPPED),
+        skipped,
         failed: outcome(report::THREADS_FAILED, report::KIND_THREAD_FAILED),
         chat_threads_skipped: counter(report::THREADS_SKIPPED_CHAT),
         images_dropped: occurred(report::IMAGES_DROPPED, report::KIND_IMAGE_DROPPED),
@@ -808,5 +833,51 @@ mod tests {
             .expect("a counter with no notes is still a loss the user must be told about");
         assert_eq!(mentions.total, 5, "the total is the counter's, notes or not");
         assert!(mentions.notes.is_empty(), "precondition: no notes were written");
+    }
+
+    /// #208's invariant for **counters**, which it only ever established for
+    /// note kinds (#236).
+    ///
+    /// `FOLDERS_FORBIDDEN` was the sole unprojected key: the worker bumped it
+    /// and nothing on the wire ever read it, so the number a user saw came
+    /// from the note list and was wrong the moment it mattered. That was a
+    /// one-line omission that no test could see, because the roster check
+    /// above walks `ALL_KINDS` and there was no equivalent walking
+    /// `ALL_COUNTERS`. There is now.
+    ///
+    /// Same technique as the kind roster: give one counter a value that
+    /// cannot occur by accident and look for it in the serialized DTO, so
+    /// "does this reach the wire at all" is answered without a field-by-field
+    /// list that the person who forgot to project a counter would also
+    /// forget to extend.
+    #[test]
+    fn every_recorded_counter_reaches_the_wire() {
+        const SENTINEL: u64 = 424_242;
+        for key in report::ALL_COUNTERS {
+            let json = serde_json::to_string(&project_report(row_with(&[(key, SENTINEL)], vec![])))
+                .expect("ReportDto serializes");
+            assert!(
+                json.contains(&SENTINEL.to_string()),
+                "counter {key:?} is bumped by the worker but projected nowhere on the wire — \
+                 a user is told a number that silently omits it: {json}",
+            );
+        }
+    }
+
+    /// The concrete shape of the bug the roster test above generalises: a run
+    /// whose only 403 was on a *folder* used to report the number of skipped
+    /// items as whatever the note list happened to be, so a counter that had
+    /// climbed past the note budget came out as the budget.
+    #[test]
+    fn a_forbidden_folder_counts_toward_skipped_alongside_forbidden_documents() {
+        let dto = project_report(row_with(
+            &[(report::THREADS_SKIPPED_FORBIDDEN, 3), (report::FOLDERS_FORBIDDEN, 30)],
+            vec![note(report::KIND_THREAD_SKIPPED, "a selected folder could not be read")],
+        ));
+        assert_eq!(
+            dto.skipped.total, 33,
+            "3 refused documents plus 30 refused folders, not the length of the note list",
+        );
+        assert_eq!(dto.skipped.notes.len(), 1, "the note list is still the bounded sample");
     }
 }
