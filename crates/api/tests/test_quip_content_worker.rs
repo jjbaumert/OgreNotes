@@ -3682,10 +3682,19 @@ async fn re_running_an_import_leaves_a_multi_folder_document_in_exactly_its_fold
     }
 }
 
-/// **Negative control — passes before and after.** The multi-folder twin of
-/// "a document the user moved is not moved back": the user removes an
-/// imported document from *one* of its several folders, and a later run must
-/// not put it back.
+/// The multi-folder twin of "a document the user moved is not moved back":
+/// the user removes an imported document from *one* of its several folders,
+/// and a later run must not put it back.
+///
+/// **Not a before-and-after control, and deliberately not pretending to be.**
+/// Its setup needs a document that is in more than one folder, which is the
+/// very thing multi-folder membership provides, so it cannot run green
+/// against a worker that files nothing extra — it panics in setup instead.
+/// What it guards is the *next* change: a well-meaning "re-assert every
+/// thread's memberships on each run" repair pass, which would restore a
+/// membership the user deliberately dropped while every assertion in
+/// [`a_thread_in_three_quip_folders_is_reachable_from_all_three_after_import`]
+/// stayed green.
 ///
 /// Removal is performed the way `routes::documents::remove_doc_from_folder`
 /// performs it — `remove_doc_folder` plus the `CHILD#` edge — so the state
