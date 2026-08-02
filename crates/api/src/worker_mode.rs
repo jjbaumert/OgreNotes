@@ -2367,6 +2367,11 @@ pub async fn import_one_thread(
     // tables in the very same markup, so the body alone does not say which is
     // which. Only `thread_type` does, and it arrives here rather than in the
     // HTML (#230).
+    //
+    // What that decides is now just the `<thead>`: a document's is real
+    // headings and a sheet's is `A B C …`, and nothing in the markup tells
+    // them apart. The gutter column needs no such help and is stripped on
+    // either kind — no author can produce an id-less cell (#232).
     let mut quip_doc = ogrenotes_collab::import_quip::from_quip_html_as(
         &html,
         match doc_type {
