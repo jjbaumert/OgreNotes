@@ -67,9 +67,11 @@
 //! without a corresponding fix is a regression.
 //!
 //! #187 (nesting) and #188 (numbering) landed together in PR #200 and their
-//! assertions now record the fixed values, annotated `#NNN (PR #200)`. The
-//! #189 (trailing breaks) and #190 (section anchors) forecasts are still
-//! open and still assert the buggy behaviour.
+//! assertions now record the fixed values, annotated `#NNN (PR #200)`.
+//! #189 (trailing breaks) has since landed too and its four assertions now
+//! record the achieved value — zero hard breaks in all five fixtures. Only
+//! the #190 (section anchors) forecast is still open and still asserts the
+//! buggy behaviour.
 //!
 //! # Known coverage gaps in this fixture set
 //!
@@ -130,7 +132,9 @@ struct Census {
     ordered_list_runs: Vec<usize>,
     hard_breaks: usize,
     /// `hard_break` elements that are the LAST child of their paragraph or
-    /// heading — the artifact #189 removes.
+    /// heading — the artifact #189 removed. Zero everywhere since that fix;
+    /// it is kept because it is the shape that distinguishes a terminator
+    /// from an authored break, so a regression shows up here specifically.
     trailing_hard_breaks: usize,
     code_blocks: usize,
     /// Total newline-separated lines across all `code_block` elements.
@@ -399,11 +403,14 @@ fn corpus_nested_lists_and_tables() {
     assert_eq!(c.horizontal_rules, 0);
     assert_eq!(c.blockquotes, 0);
 
-    // Every `<li>` and every `<td>` in the source ends in `<br/>`, and the
-    // walker keeps each one as a trailing `hard_break`. This document has no
-    // mid-line `<br>`, so both counts fall to 0 when #189 lands.
-    assert_eq!(c.hard_breaks, 40, "hard_break leaves");
-    assert_eq!(c.trailing_hard_breaks, 40, "spurious trailing hard_break — #189 will zero this");
+    // Every `<li>` and every `<td>` in the source ends in `<br/>` — 40 of
+    // them, which the walker used to keep as 40 trailing `hard_break`
+    // leaves. #189 drops the terminator; this document has no mid-content
+    // `<br>` at all, so nothing authored is left behind and both counts are
+    // 0. The 38 `table_cell` and 2 `list_item` counts above are unchanged by
+    // that, which is the point: a terminator went away, no content did.
+    assert_eq!(c.hard_breaks, 0, "hard_break leaves — every <br> here was a terminator (#189)");
+    assert_eq!(c.trailing_hard_breaks, 0, "no trailing hard_break survives (#189)");
 
     assert_eq!(c.mark("bold"), 18, "bold runs");
     assert_eq!(c.mark("italic"), 0);
@@ -490,11 +497,14 @@ fn corpus_numbered_sequences_and_code_blocks() {
     assert_eq!(c.blockquotes, 0);
     assert_eq!(c.horizontal_rules, 0);
 
-    // The source has 178 `<br>`: 119 terminate an `<li>` and the rest are
-    // code-block line separators, which are newlines rather than leaves.
-    // #189 will zero both counts.
-    assert_eq!(c.hard_breaks, 119, "hard_break leaves");
-    assert_eq!(c.trailing_hard_breaks, 119, "spurious trailing hard_break — #189 will zero this");
+    // The source has 178 `<br>`: 119 terminate an `<li>` and the other 59
+    // are code-block line separators, which are newlines rather than leaves.
+    // #189 drops the 119 terminators and leaves the 59 alone — `code_lines`
+    // above stays at 63 across the same 4 blocks, which is the proof that
+    // the two rules did not get unified. The `<br>` inside a `<pre>` is
+    // reached through `raw_text` (#184) and never through this path.
+    assert_eq!(c.hard_breaks, 0, "hard_break leaves — the 119 <li> terminators are gone (#189)");
+    assert_eq!(c.trailing_hard_breaks, 0, "no trailing hard_break survives (#189)");
 
     assert_eq!(c.mark("bold"), 73, "bold runs");
     assert_eq!(c.mark("link"), 1, "the one external <a href>");
@@ -597,9 +607,11 @@ fn corpus_checklist_and_control_wrappers() {
     // The empty `<control>` must contribute nothing and disturb nothing.
     assert!(html.contains("<control data-remapped=\"true\" id=\"SSfACAsTxeJ\"></control>"));
 
-    // #189 will zero both: one trailing `<br/>` per checklist item.
-    assert_eq!(c.hard_breaks, 4, "one trailing <br> per checklist item");
-    assert_eq!(c.trailing_hard_breaks, 4, "spurious trailing hard_break — #189 will zero this");
+    // #189 zeroed both: the source's one trailing `<br/>` per checklist item
+    // is a terminator, and a `task_item` is terminated exactly like an `<li>`
+    // — `task_items` above stays at 4.
+    assert_eq!(c.hard_breaks, 0, "the 4 per-item terminators are gone (#189)");
+    assert_eq!(c.trailing_hard_breaks, 0, "no trailing hard_break survives (#189)");
 
     assert_eq!(c.tables, 0);
     assert_eq!(c.images, 0);
@@ -636,9 +648,14 @@ fn corpus_spreadsheet_section_id_density() {
     assert_eq!(c.images, 0);
     assert_eq!(c.marks.len(), 0, "a spreadsheet carries no inline marks");
 
-    // #189 will zero both: every `<td>` and every `<th>` ends in `<br/>`.
-    assert_eq!(c.hard_breaks, 496, "hard_break leaves");
-    assert_eq!(c.trailing_hard_breaks, 496, "spurious trailing hard_break — #189 will zero this");
+    // #189 zeroed both. 496 terminators, not 527: the 30 row-number `<td>`
+    // and the corner `<th class='empty' style='width: 2em'/>` carry none —
+    // which is itself the discriminator working, since a cell without a
+    // terminating `<br/>` must come through unchanged. `table_cells` and
+    // `table_headers` above are untouched, and so is the paragraph count
+    // pinned by `zero_width_spacers_survive_as_paragraphs`.
+    assert_eq!(c.hard_breaks, 0, "hard_break leaves — 496 cell terminators dropped (#189)");
+    assert_eq!(c.trailing_hard_breaks, 0, "no trailing hard_break survives (#189)");
 
     // #192: `formula` is neither allowlisted nor `data-`-prefixed, so
     // ammonia strips it before the walker sees it. The attribute is still in
@@ -713,18 +730,68 @@ fn the_corpus_nests_lists_as_a_sibling_ul_never_inside_the_li() {
 }
 
 /// Quip terminates every `<li>`, `<td>` and `<th>` with a `<br/>` before the
-/// closing tag. That is a line terminator, not authored content — #189. A
-/// `<br>` in the middle of a cell IS authored content and must survive, so
-/// the fix has to discriminate by position, not by presence.
+/// closing tag. That is a line terminator, not authored content — #189, which
+/// dropped it. A `<br>` in the middle of a cell IS authored content and must
+/// survive, so the fix discriminates by position, not by presence.
+///
+/// **What this test can and cannot show.** Every single `<br>` outside a
+/// `<pre>` in all five fixtures is a terminator — 659 of them, zero authored
+/// mid-content breaks anywhere in this corpus. So these five prove the
+/// terminators go, and prove nothing about the mid-content breaks surviving.
+/// That half of the contract is pinned on verbatim markup by
+/// `a_mid_item_break_survives_while_the_terminator_goes` and its neighbours
+/// in `import_quip.rs`; if this file ever gains a fixture with an authored
+/// break, assert it here too.
 #[test]
-fn every_list_item_and_cell_in_the_corpus_ends_in_a_break() {
+fn every_list_item_and_cell_terminator_is_dropped() {
     for thread_id in ["AeOAAAcV1hg", "SSfAAALs7fy", "QGYAAAjicgG"] {
         let html = fixture(thread_id);
-        assert!(html.contains("<br/></li>") || html.contains("<br/></td>"), "{thread_id}");
+        assert!(
+            html.contains("<br/></li>") || html.contains("<br/></td>"),
+            "{thread_id}: the source must still carry the terminators being tested"
+        );
         let (_h, _q, c) = import(thread_id);
+        assert_eq!(c.hard_breaks, 0, "{thread_id}: every <br> here is a terminator and goes");
+    }
+}
+
+/// The corpus half of the discrimination rule, stated as a source fact so it
+/// cannot silently stop being true: no `<br>` in these five documents sits
+/// anywhere but immediately before `</li>`, `</td>`, `</th>` — or inside a
+/// `<pre>`, where #184's opposite rule owns it. Should a future fixture break
+/// this, the assertion above stops being a valid statement of the fix and the
+/// new document's authored breaks need their own assertion.
+#[test]
+fn no_corpus_break_outside_a_pre_is_anything_but_a_terminator() {
+    for thread_id in CORPUS {
+        let html = fixture(thread_id);
+        // Strip comments (the fixture headers themselves discuss `<br/>`)
+        // and `<pre>` bodies, then every remaining `<br>` must terminate a
+        // cell.
+        let mut rest = String::new();
+        let mut tail = html.as_str();
+        while let Some(open) = tail.find("<!--") {
+            rest.push_str(&tail[..open]);
+            tail = &tail[open + 4..];
+            tail = tail.split_once("-->").map(|(_, t)| t).unwrap_or("");
+        }
+        rest.push_str(tail);
+        let outside_pre: String = rest
+            .split("<pre")
+            .enumerate()
+            .map(|(i, chunk)| {
+                if i == 0 { chunk } else { chunk.split_once("</pre>").map_or("", |(_, t)| t) }
+            })
+            .collect();
+
+        let total = outside_pre.matches("<br").count();
+        let terminators = outside_pre.matches("<br/></li>").count()
+            + outside_pre.matches("<br/></td>").count()
+            + outside_pre.matches("<br/></th>").count();
         assert_eq!(
-            c.hard_breaks, c.trailing_hard_breaks,
-            "{thread_id}: every hard break here is a terminator, none is authored"
+            total, terminators,
+            "{thread_id}: {} <br> outside <pre>, {terminators} of them terminators",
+            total
         );
     }
 }
