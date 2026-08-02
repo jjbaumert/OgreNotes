@@ -328,6 +328,75 @@ pub fn threads_for_slide(deck: &Deck, slide: usize, threads: &[(String, String)]
 // than attempting a faithful read-only render of every block kind —
 // real in-frame editing (Task 11) replaces this wholesale.
 
+/// Mount an imperatively built `web_sys::Node` inside the declarative
+/// Leptos tree. The deck renderer needs this for the two DOM-producing
+/// paths that can't be expressed as `view!` markup: the shared image
+/// builder (`editor::view::build_image_element`, async blob-ref
+/// resolution mutates the element after mount) and the live-app block
+/// views (`editor::blocks::view_for`, which return ready-made DOM).
+/// The whole subtree is rebuilt by the surrounding reactive closure on
+/// content change, so a one-shot append is sufficient — the Effect
+/// guards against double-append on re-run.
+/// Render a delegated live-app block by SERIALIZING the DOM its block
+/// view builds and re-parsing it via `inner_html`. Imperative-mount
+/// approaches (NodeRef + Effect, NodeRef + rAF) both fail here: this
+/// runs inside render closures that re-run on every deck change, whose
+/// transient reactive owners dispose effects before they fire and
+/// whose NodeRefs never resolve. Serialization is safe — the block
+/// views build their DOM with escaped attributes (`set_attribute`) and
+/// renderer-generated SVG, and the canvas copy is display-only
+/// (`.deck-frame__content` is pointer-events:none), so no live
+/// listeners are lost.
+fn raw_dom_html(node: Option<web_sys::Node>) -> AnyView {
+    let html = node
+        .and_then(|n| n.dyn_ref::<web_sys::Element>().map(|el| el.outer_html()))
+        .unwrap_or_default();
+    view! { <div class="deck-raw-block" inner_html=html></div> }.into_any()
+}
+
+/// Bump-signal pair provided by `DeckView` (a STABLE owner) so async
+/// image resolution can re-run the canvas's readonly render closures.
+/// Per-render signals/effects don't survive here — the render closures
+/// re-run on every deck change and dispose whatever transient reactive
+/// state the previous run created (the same trap that broke the
+/// NodeRef/Effect mounting attempts for delegated blocks).
+#[derive(Clone, Copy)]
+struct DeckImgRefresh(ReadSignal<u32>, WriteSignal<u32>);
+
+/// Image rendering for the canvas: synchronous blob-ref cache hit →
+/// plain-string `src` (same `image_bridge` cache the editor warms). On
+/// a cache miss the resolve callback bumps the DeckView-scoped refresh
+/// signal — which this fn READS, subscribing the surrounding reactive
+/// render closure — so the canvas re-renders once the URL exists and
+/// takes the cache-hit path.
+fn render_frame_image(attrs: &std::collections::HashMap<String, String>) -> AnyView {
+    use crate::editor::view::is_safe_url;
+    let refresh = use_context::<DeckImgRefresh>();
+    if let Some(r) = &refresh {
+        r.0.get(); // subscribe the caller's render closure to bumps
+    }
+    let alt = attrs.get("alt").cloned().unwrap_or_default();
+    let mut src = String::new();
+    if let Some(s) = attrs.get("src") {
+        if let Some((blob_id, key)) = crate::editor::blob_ref::parse_blob_ref(s) {
+            let bump = refresh.map(|r| r.1);
+            match crate::editor::image_bridge::resolve(&blob_id, &key, move |url| {
+                if is_safe_url(&url) {
+                    if let Some(set) = bump {
+                        let _ = set.try_update(|v| *v = v.wrapping_add(1));
+                    }
+                }
+            }) {
+                Some(url) if is_safe_url(&url) => src = url,
+                _ => {}
+            }
+        } else if is_safe_url(s) {
+            src = s.clone();
+        }
+    }
+    view! { <img src=src alt=alt /> }.into_any()
+}
+
 fn render_node_readonly(node: &Node) -> AnyView {
     let Node::Element { node_type, attrs, content, .. } = node else {
         return view! { <span>{node.text_content()}</span> }.into_any();
@@ -351,26 +420,124 @@ fn render_node_readonly(node: &Node) -> AnyView {
             }
         }
         NodeType::BulletList => {
-            let items = content
-                .children
-                .iter()
-                .map(|c| view! { <li>{c.text_content()}</li> })
-                .collect::<Vec<_>>();
+            let items = render_list_items(content);
             view! { <ul>{items}</ul> }.into_any()
         }
         NodeType::OrderedList => {
+            let items = render_list_items(content);
+            view! { <ol>{items}</ol> }.into_any()
+        }
+        NodeType::TaskList => {
             let items = content
                 .children
                 .iter()
-                .map(|c| view! { <li>{c.text_content()}</li> })
+                .map(|c| {
+                    let checked = c
+                        .attrs()
+                        .get("checked")
+                        .map(|v| v == "true")
+                        .unwrap_or(false);
+                    let glyph = if checked { "\u{2611} " } else { "\u{2610} " };
+                    let body = render_frame_children(c);
+                    view! { <li class="deck-task-item">{glyph}{body}</li> }
+                })
                 .collect::<Vec<_>>();
-            view! { <ol>{items}</ol> }.into_any()
+            view! { <ul class="deck-task-list">{items}</ul> }.into_any()
+        }
+        NodeType::Blockquote => {
+            let body = render_frame_children(node);
+            view! { <blockquote>{body}</blockquote> }.into_any()
+        }
+        NodeType::CodeBlock => {
+            // Text-only on the canvas (no syntax highlighting) per the
+            // spec's out-of-scope list.
+            let text = node.text_content();
+            view! { <pre class="deck-code-block"><code>{text}</code></pre> }.into_any()
+        }
+        NodeType::HorizontalRule => view! { <hr /> }.into_any(),
+        NodeType::HardBreak => view! { <br /> }.into_any(),
+        NodeType::Table => {
+            let rows = content
+                .children
+                .iter()
+                .map(|row| {
+                    let cells = match row {
+                        Node::Element { content, .. } => content
+                            .children
+                            .iter()
+                            .map(|cell| {
+                                let is_header = cell.node_type() == Some(NodeType::TableHeader);
+                                let body = render_frame_children(cell);
+                                if is_header {
+                                    view! { <th>{body}</th> }.into_any()
+                                } else {
+                                    view! { <td>{body}</td> }.into_any()
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    };
+                    view! { <tr>{cells}</tr> }
+                })
+                .collect::<Vec<_>>();
+            view! { <table class="deck-table"><tbody>{rows}</tbody></table> }.into_any()
+        }
+        NodeType::Embed => {
+            // Link-card chip, never an iframe on the canvas (spec).
+            let label = embed_chip_label(attrs);
+            view! { <div class="deck-embed-chip">{label}</div> }.into_any()
+        }
+        NodeType::Image => render_frame_image(attrs),
+        NodeType::Mermaid | NodeType::Calendar | NodeType::Kanban => {
+            // Delegate to the live-app block views — the same DOM the
+            // document editor renders (mermaid SVG included), shown
+            // static here (see `.deck-frame__content` pointer-events).
+            let built = web_sys::window().and_then(|w| w.document()).and_then(|d| {
+                crate::editor::blocks::view_for(*node_type)
+                    .and_then(|b| b.render(&d, *node_type, attrs, content))
+            });
+            raw_dom_html(built)
         }
         other => {
             let label = format!("{other:?}");
             view! { <div class="deck-frame-placeholder">{label}</div> }.into_any()
         }
     }
+}
+
+/// Recursive list-item rendering so nested lists and non-text item
+/// children render instead of being flattened to `text_content()`.
+fn render_list_items(content: &Fragment) -> Vec<AnyView> {
+    content
+        .children
+        .iter()
+        .map(|c| {
+            let body = render_frame_children(c);
+            view! { <li>{body}</li> }.into_any()
+        })
+        .collect()
+}
+
+/// Render a node's children (paragraph unwrapped inline where the
+/// parent supplies the box, e.g. list items / table cells / quotes).
+fn render_frame_children(node: &Node) -> Vec<AnyView> {
+    match node {
+        Node::Element { content, .. } => {
+            content.children.iter().map(render_node_readonly).collect()
+        }
+        Node::Text { .. } => vec![view! { <span>{node.text_content()}</span> }.into_any()],
+    }
+}
+
+/// Chip text for an Embed on the canvas: title if present, else the
+/// URL, else a generic label.
+fn embed_chip_label(attrs: &std::collections::HashMap<String, String>) -> String {
+    attrs
+        .get("title")
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| attrs.get("url").filter(|u| !u.trim().is_empty()))
+        .cloned()
+        .unwrap_or_else(|| crate::i18n::translate("deck-embed-chip-fallback", None))
 }
 
 /// True when a frame's content carries no visible text anywhere —
@@ -382,7 +549,23 @@ fn fragment_is_visually_empty(content: &Fragment) -> bool {
     fn node_empty(node: &Node) -> bool {
         match node {
             Node::Text { text, .. } => text.trim().is_empty(),
-            Node::Element { content, .. } => content.children.iter().all(node_empty),
+            Node::Element { node_type, content, .. } => match node_type {
+                // Attr-driven / intrinsically visible blocks carry no
+                // text children but ARE content — a mermaid diagram's
+                // source lives in its attrs, an image in `src`, a
+                // divider is pure chrome. Classifying these as empty
+                // painted the placeholder hint over real content (the
+                // frame-blocks launch bug: an inserted mermaid
+                // "vanished" behind "Click to add text").
+                NodeType::Image
+                | NodeType::Mermaid
+                | NodeType::Calendar
+                | NodeType::Kanban
+                | NodeType::Embed
+                | NodeType::HorizontalRule
+                | NodeType::Table => false,
+                _ => content.children.iter().all(node_empty),
+            },
         }
     }
     content.children.iter().all(node_empty)
@@ -398,12 +581,19 @@ fn placeholder_key_for(content: &Fragment) -> &'static str {
     }
 }
 
-fn render_frame_content(content: &Fragment) -> Vec<AnyView> {
+fn render_frame_content(content: &Fragment) -> AnyView {
     if fragment_is_visually_empty(content) {
         let hint = crate::i18n::translate(placeholder_key_for(content), None);
-        return vec![view! { <div class="deck-frame-placeholder">{hint}</div> }.into_any()];
+        return view! { <div class="deck-frame-placeholder">{hint}</div> }.into_any();
     }
-    content.children.iter().map(render_node_readonly).collect()
+    let children: Vec<AnyView> = content.children.iter().map(render_node_readonly).collect();
+    // `.deck-frame__content` is pointer-events:none (presentation.css):
+    // delegated live-app blocks (kanban buttons, mermaid click targets)
+    // must not intercept frame selection/drag — blocks are interacted
+    // with by entering the frame editor, same model as text. The
+    // comment button and resize handles are siblings of this wrapper
+    // and stay clickable.
+    view! { <div class="deck-frame__content">{children}</div> }.into_any()
 }
 
 /// Render one slide's frames (sorted by `z`) as absolutely-positioned
@@ -494,6 +684,17 @@ pub fn DeckView(
     /// by the page from its `list_threads` fetch (Task 12) — drives
     /// the comment button's active/badge styling per frame below.
     frame_threads: ReadSignal<Vec<String>>,
+    /// Reports the OPEN frame editor's own `EditorState` (frame-local
+    /// document + real caret) up to the page on every inner
+    /// `on_state_change`, and `None` when the editor closes. The
+    /// page's slash/at-menu pipeline computes trigger ranges and
+    /// dispatches insert commands in the coordinates of whichever
+    /// state it reads — for a presentation the page-level
+    /// `editor_state` is the deck-shaped doc, whose positions mean
+    /// nothing to the frame editor that actually receives the
+    /// commands (via `toolbar_command` forwarding). This channel lets
+    /// the page target the editor that owns the caret.
+    on_frame_editor_state: Callback<Option<EditorState>>,
     /// Shared page-level toolbar-command channel (Task 11 review,
     /// Finding 3) — the same `toolbar_command`/`set_toolbar_command`
     /// pair `document.rs` already threads into `SpreadsheetView`. The
@@ -537,6 +738,9 @@ pub fn DeckView(
     let close_frame_editor = move || {
         set_editing_frame.set(None);
         set_toolbar_command.set(None);
+        // The page's menu pipeline must stop targeting the (now
+        // unmounted) frame editor's coordinates immediately.
+        on_frame_editor_state.run(None);
     };
 
     // Task 11 review, Finding 2 — every slide-strip mutation that can
@@ -558,6 +762,45 @@ pub fn DeckView(
     // editor_state change, cleared by the very next run of the doc→model
     // resync Effect below. Mirrors `spreadsheet_view.rs:1357`/`:2363`.
     let (persist_origin, set_persist_origin) = signal(false);
+    // Canvas image resolution refresh channel — see `DeckImgRefresh`.
+    let (img_refresh, set_img_refresh) = signal(0u32);
+    provide_context(DeckImgRefresh(img_refresh, set_img_refresh));
+
+    // The blob-URL resolver is normally installed by `EditorComponent`
+    // and CLEARED (resolver + cache) by its unmount cleanup
+    // (`clear_resolver_if`). On a document page the editor lives as
+    // long as the page, so that's invisible — but here the frame
+    // editor unmounts on every Escape, leaving the CANVAS render with
+    // no resolver: every blob image went permanently `src`-less after
+    // the first edit session (frame-blocks launch bug). Re-install a
+    // deck-scoped resolver whenever no frame editor is open; while one
+    // IS open, its own (identical-shape) install wins harmlessly. The
+    // Effect lives in DeckView's stable scope, so it runs AFTER the
+    // closing editor's cleanup in the same tick ordering.
+    {
+        let doc_id_for_resolver = doc_id.clone();
+        Effect::new(move |_| {
+            if editing_frame.get().is_none() {
+                let doc_id = doc_id_for_resolver.clone();
+                let resolver: crate::editor::image_bridge::Resolver = std::rc::Rc::new(
+                    move |blob_id: String,
+                          key: String,
+                          on_ready: Box<dyn FnOnce(Option<String>)>| {
+                        let doc_id = doc_id.clone();
+                        leptos::task::spawn_local(async move {
+                            let url = crate::api::blobs::request_download_url(
+                                &doc_id, &blob_id, &key,
+                            )
+                            .await
+                            .ok();
+                            on_ready(url);
+                        });
+                    },
+                );
+                crate::editor::image_bridge::set_resolver(Some(resolver));
+            }
+        });
+    }
     let (picker_open, set_picker_open) = signal(false);
     // The dragged slide's identity, not its position — Leptos's keyed
     // `<For>` never re-invokes a row's `children` when the list reorders
@@ -792,9 +1035,22 @@ pub fn DeckView(
     {
         let handle = window_event_listener_untyped("pointerdown", move |ev: web_sys::Event| {
             let Some(editing_id) = editing_frame.get_untracked() else { return };
-            let inside = ev
-                .target()
-                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+            let target = ev.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok());
+            // Page-level editor overlays are logically INSIDE the
+            // editing session even though they mount outside the frame's
+            // DOM subtree: the slash/at-menu (document.rs) dispatches
+            // insert commands INTO this frame's editor — closing the
+            // editor on the menu click would unmount the command's
+            // target mid-dispatch (the frame-blocks launch bug: every
+            // slash insert silently no-opped).
+            let in_editor_overlay = target
+                .as_ref()
+                .and_then(|el| el.closest(".at-menu").ok().flatten())
+                .is_some();
+            if in_editor_overlay {
+                return;
+            }
+            let inside = target
                 .and_then(|el| el.closest(&format!("[{FRAME_BLOCK_ID_ATTR}]")).ok().flatten())
                 .and_then(|el| el.get_attribute(FRAME_BLOCK_ID_ATTR))
                 .is_some_and(|id| id == editing_id);
@@ -1602,6 +1858,12 @@ pub fn DeckView(
                                                         // nothing to do here.
                                                         on_change: Callback::new(|_: Vec<u8>| {}),
                                                         on_state_change: Callback::new(move |st: EditorState| {
+                                                            // Frame-local state (real caret) up to the
+                                                            // page FIRST, so the slash/at-menu trigger
+                                                            // Effects see inner coordinates before the
+                                                            // deck-shaped `editor_state` write below
+                                                            // re-runs them.
+                                                            on_frame_editor_state.run(Some(st.clone()));
                                                             let content = match &st.doc {
                                                                 Node::Element { content, .. } => content.clone(),
                                                                 _ => return,
@@ -1651,7 +1913,7 @@ pub fn DeckView(
                                                         .map(|f| f.content.clone())
                                                 })
                                                 .unwrap_or_else(|| fallback_content.clone());
-                                            render_frame_content(&content)
+                                            vec![render_frame_content(&content)]
                                         }
                                     }
                                 };
@@ -1920,6 +2182,35 @@ mod tests {
                 Fragment::from(vec![Node::text("real text")]),
             ),
         ])));
+        // Attr-driven blocks are content even with zero text children
+        // (the frame-blocks launch bug: a mermaid "vanished" behind
+        // the placeholder hint).
+        for nt in [
+            NodeType::Mermaid,
+            NodeType::Image,
+            NodeType::Calendar,
+            NodeType::Kanban,
+            NodeType::Embed,
+            NodeType::HorizontalRule,
+            NodeType::Table,
+        ] {
+            assert!(
+                !fragment_is_visually_empty(&Fragment::from(vec![Node::element(nt)])),
+                "{nt:?} must not count as visually empty"
+            );
+        }
+    }
+
+    #[test]
+    fn embed_chip_prefers_title_then_url() {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("url".to_string(), "https://example.com/x".to_string());
+        assert_eq!(embed_chip_label(&attrs), "https://example.com/x");
+        attrs.insert("title".to_string(), "  ".to_string());
+        assert_eq!(embed_chip_label(&attrs), "https://example.com/x", "whitespace title ignored");
+        attrs.insert("title".to_string(), "Demo Video".to_string());
+        assert_eq!(embed_chip_label(&attrs), "Demo Video");
+        assert!(!embed_chip_label(&std::collections::HashMap::new()).is_empty(), "fallback label");
     }
 
     #[test]

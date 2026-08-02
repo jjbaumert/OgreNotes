@@ -190,6 +190,62 @@
   cursor: default;
 }
 
+/* Read-only frame content is display-only: delegated live-app blocks
+ * (kanban buttons, mermaid/calendar click targets) must not intercept
+ * frame selection/drag. Interaction happens inside the frame editor. */
+.deck-frame__content {
+  pointer-events: none;
+  height: 100%;
+}
+
+/* Blocks must fit the frame box, not overflow the slide. */
+.deck-frame__content img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.deck-frame__content svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.deck-frame__content .deck-code-block {
+  margin: 0;
+  padding: 0.4em 0.6em;
+  border-radius: var(--radius-sm);
+  background: rgba(127, 127, 127, 0.15);
+  font-size: 0.85em;
+  overflow: hidden;
+}
+
+.deck-frame__content .deck-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.9em;
+}
+
+.deck-frame__content .deck-table td,
+.deck-frame__content .deck-table th {
+  border: 1px solid var(--deck-accent);
+  padding: 0.15em 0.4em;
+  text-align: left;
+}
+
+.deck-frame__content .deck-embed-chip {
+  display: inline-block;
+  padding: 0.3em 0.7em;
+  border: 1px solid var(--deck-accent);
+  border-radius: var(--radius-md);
+  font-size: 0.85em;
+  opacity: 0.85;
+}
+
+.deck-frame__content .deck-task-list {
+  list-style: none;
+  padding-inline-start: 0.2em;
+}
+
 /* Task 11 — while a frame's embedded editor is mounted, the frame's
  * own `cursor: move` (a drag affordance) would sit visually on top of
  * the contenteditable's caret, which is misleading: this frame no

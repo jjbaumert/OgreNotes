@@ -49,7 +49,19 @@ pub async fn upload_to_s3(
     // raw bytes anywhere but an https endpoint, so a compromised or
     // misconfigured backend can't redirect the upload to http:// or an
     // attacker-controlled host.
-    if !presigned_url.starts_with("https://") {
+    //
+    // Dev-stack carve-out: when the app itself is served over plain
+    // http (local compose stack / CI playwright stack, where MinIO
+    // presigns http://127.0.0.1:9000 URLs), an https-only requirement
+    // on the upload leg protects nothing — the page, its script, and
+    // every API call already ride unencrypted http. Production serves
+    // over https, so the strict branch is the one real deployments
+    // take. This is what makes image upload exercisable at all in the
+    // local/CI doctor scenarios (deck-blocks).
+    let app_is_http = web_sys::window()
+        .map(|w| w.location().protocol().unwrap_or_default() == "http:")
+        .unwrap_or(false);
+    if !presigned_url.starts_with("https://") && !(app_is_http && presigned_url.starts_with("http://")) {
         return Err(ApiClientError::Network(
             "refusing non-https upload URL".to_string(),
         ));

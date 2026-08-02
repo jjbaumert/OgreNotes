@@ -339,6 +339,18 @@ pub fn DocumentPage() -> impl IntoView {
     let (updated_at, set_updated_at) = signal(0i64);
     let (details_visible, set_details_visible) = signal(false);
     let (editor_state, set_editor_state) = signal::<Option<EditorState>>(None);
+    // The open deck-frame editor's own state (frame-local doc + real
+    // caret), reported by DeckView; `None` outside presentations or
+    // when no frame editor is open. The slash/at-menu pipeline reads
+    // this in PREFERENCE to `editor_state`: for a presentation the
+    // page-level state is deck-shaped, so trigger ranges computed from
+    // it would be meaningless to the frame editor that receives the
+    // resulting commands (via the forwarded `toolbar_command`).
+    let (frame_editor_state, set_frame_editor_state) = signal::<Option<EditorState>>(None);
+    // One place defines "the state the menus target".
+    let menu_editor_state = move || frame_editor_state.get().or_else(|| editor_state.get());
+    let menu_editor_state_untracked =
+        move || frame_editor_state.get_untracked().or_else(|| editor_state.get_untracked());
     let (toolbar_command, set_toolbar_command) = signal::<Option<ToolbarCommand>>(None);
     // Remote document state — set by the collab callback, consumed by EditorComponent
     // to update the contenteditable DOM when a collaborator makes changes.
@@ -1784,7 +1796,9 @@ pub fn DocumentPage() -> impl IntoView {
     // and lets it be unit-tested in isolation.
     Effect::new(move |_| {
         // #94: @-menu Effect; use try_* on untracked reads.
-        let Some(state) = editor_state.get() else {
+        // `menu_editor_state`: the open frame editor's state when a
+        // deck frame is being edited, else the page editor's.
+        let Some(state) = menu_editor_state() else {
             return;
         };
         let pos = state.selection.from();
@@ -1819,7 +1833,8 @@ pub fn DocumentPage() -> impl IntoView {
     // #148 v2 slice 2 — parallel `/` slash-command trigger. Same
     // detector, different trigger char and signal set.
     Effect::new(move |_| {
-        let Some(state) = editor_state.get() else {
+        // Same frame-editor preference as the @-menu Effect above.
+        let Some(state) = menu_editor_state() else {
             return;
         };
         let pos = state.selection.from();
@@ -1877,7 +1892,10 @@ pub fn DocumentPage() -> impl IntoView {
     // — each of those closes its own menu, then calls this with
     // its own query length.
     let apply_menu_select = move |item: AtMenuItem, query_len: usize| {
-        let Some(state) = editor_state.get_untracked() else {
+        // Frame-editor preference, matching the trigger Effects: the
+        // range below must be in the coordinates of the editor that
+        // will receive the dispatched command.
+        let Some(state) = menu_editor_state_untracked() else {
             return;
         };
         if !state.selection.empty() {
@@ -3258,6 +3276,9 @@ pub fn DocumentPage() -> impl IntoView {
                                     doc_id=doc_id()
                                     readonly=!can_edit.get()
                                     on_request_frame_comment=request_frame_comment
+                                    on_frame_editor_state=Callback::new(move |st: Option<EditorState>| {
+                                        set_frame_editor_state.set(st);
+                                    })
                                     frame_threads=frame_threads
                                     // Task 11 review, Finding 3 — the same shared
                                     // toolbar-command channel `<Toolbar>` (mounted

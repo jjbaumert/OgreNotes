@@ -1174,6 +1174,7 @@ deck-placeholder-title = Click to add title
 deck-placeholder-subtitle = Click to add subtitle
 deck-placeholder-heading = Click to add heading
 deck-placeholder-body = Click to add text
+deck-embed-chip-fallback = Embedded content
 deck-placeholder-column = Click to add text
 deck-theme-slate-label = Slate
 deck-theme-paper-label = Paper
