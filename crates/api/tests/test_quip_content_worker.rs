@@ -454,6 +454,258 @@ async fn chat_threads_are_skipped_and_spreadsheets_become_spreadsheet_docs() {
     assert_eq!(meta.created_at, 222, "Quip's own updated_usec, not now");
 }
 
+// ─── #233 Gap 2 — the spreadsheet path, end to end ────────────────
+//
+// `T2_HTML` above is `<p>numbers</p>`. It proves a spreadsheet *thread*
+// becomes a `DocType::Spreadsheet` *document*, but it contains no table, so
+// the one thing #230 added to this worker — reading Quip's `thread_type` and
+// handing `QuipThreadKind` to the walker at the single call site in
+// `worker_mode::import_one_thread` — is never exercised against grid markup.
+// If that argument were dropped, or passed as `Document`, every imported
+// spreadsheet would silently take its grid chrome as data and every existing
+// test here would still pass.
+//
+// The collab crate pins the walker in isolation
+// (`quip_corpus::corpus_spreadsheet_grid_chrome_is_not_imported_as_data`).
+// What follows pins the *wiring*: Quip's JSON envelope → `thread_html` →
+// staging → `from_quip_html_as` → snapshot → DynamoDB, and back out again.
+
+/// The real `QGYAAAjicgG` spreadsheet body — Quip's own 31 × 17 grid,
+/// 30 × 16 of which is data.
+///
+/// Reached from this crate by relative path off `CARGO_MANIFEST_DIR`, the
+/// pattern the repo already uses to read across a crate boundary in a test:
+/// `crates/highlight/tests/css_palette_sync.rs` embeds
+/// `frontend/style/main.css` the same way, and `routes::ws`'s schema-duality
+/// test reads `frontend/src/collab/ws_client.rs` with the same `concat!`.
+/// `include_str!` rather than a runtime read on purpose — if the fixture is
+/// moved or renamed this crate stops *compiling*, instead of one test
+/// panicking at run time on a path nobody has looked at in a year.
+///
+/// **Do not replace this with hand-written markup.** Nine fidelity bugs in
+/// this importer (#169, #173, #175, #176, #184, #187, #189, #230, and the
+/// nested-list case) shared one root cause: fixtures encoding HTML Quip never
+/// emits, so the tests passed while real documents broke. This file is the
+/// bytes the worker actually staged from Quip, with only the prose scrubbed.
+const T2_GRID_HTML: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../collab/tests/fixtures/quip/corpus/QGYAAAjicgG.html"
+));
+
+/// [`quip_content_server`] with the spreadsheet thread's HTML fetch overridden
+/// to the real grid fixture. Higher priority (lower number) than the 200
+/// already mounted underneath, so no other test's expectations move.
+async fn quip_server_with_grid_t2_envelope() -> MockServer {
+    let server = quip_content_server().await;
+    Mock::given(method("GET"))
+        .and(path("/2/threads/t2/html"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(html_envelope(T2_GRID_HTML)))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// All text under `el`, descendants included, in document order.
+fn element_text<T: yrs::ReadTxn>(txn: &T, el: &yrs::XmlElementRef) -> String {
+    use yrs::types::xml::{XmlFragment, XmlOut};
+    use yrs::{Any, Out, Text};
+
+    let mut body = String::new();
+    for i in 0..el.len(txn) {
+        match el.get(txn, i) {
+            Some(XmlOut::Text(text)) => {
+                for delta in text.diff(txn, yrs::types::text::YChange::identity) {
+                    if let Out::Any(Any::String(s)) = &delta.insert {
+                        body.push_str(s.as_ref());
+                    }
+                }
+            }
+            Some(XmlOut::Element(child)) => body.push_str(&element_text(txn, &child)),
+            _ => {}
+        }
+    }
+    body
+}
+
+fn find_table<T: yrs::ReadTxn>(txn: &T, el: &yrs::XmlElementRef) -> Option<yrs::XmlElementRef> {
+    use yrs::types::xml::{XmlFragment, XmlOut};
+
+    if el.tag().as_ref() == "table" {
+        return Some(el.clone());
+    }
+    for i in 0..el.len(txn) {
+        if let Some(XmlOut::Element(child)) = el.get(txn, i)
+            && let Some(found) = find_table(txn, &child)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The stored document's first `table`, row-major, as `(is_header_cell, text)`.
+///
+/// The census-style assertions elsewhere in this file count blocks; counting
+/// cannot say *where* a value landed, and position is the whole of #230.
+fn first_table_grid(doc: &yrs::Doc) -> Vec<Vec<(bool, String)>> {
+    use yrs::types::xml::{XmlFragment, XmlOut};
+    use yrs::Transact;
+
+    let txn = doc.transact();
+    let Some(frag) = ogrenotes_collab::document::get_content_fragment(&txn) else {
+        return Vec::new();
+    };
+    let mut found = None;
+    for i in 0..frag.len(&txn) {
+        let Some(XmlOut::Element(el)) = frag.get(&txn, i) else { continue };
+        if let Some(t) = find_table(&txn, &el) {
+            found = Some(t);
+            break;
+        }
+    }
+    let Some(table) = found else { return Vec::new() };
+    let mut grid = Vec::new();
+    for r in 0..table.len(&txn) {
+        let Some(XmlOut::Element(row)) = table.get(&txn, r) else { continue };
+        let mut cells = Vec::new();
+        for c in 0..row.len(&txn) {
+            let Some(XmlOut::Element(cell)) = row.get(&txn, c) else { continue };
+            cells.push((cell.tag().as_ref() == "table_header", element_text(&txn, &cell)));
+        }
+        grid.push(cells);
+    }
+    grid
+}
+
+/// Column `index` of a grid, top to bottom.
+fn column(grid: &[Vec<(bool, String)>], index: usize) -> Vec<&str> {
+    grid.iter().filter_map(|r| r.get(index)).map(|(_, t)| t.as_str()).collect()
+}
+
+/// **#230 / #233.** A Quip spreadsheet imported by the *worker* lands
+/// unshifted — the column-letter header row and the `1..N` row-number gutter
+/// are chrome, and neither becomes data.
+///
+/// Every assertion below is written to separate two outcomes rather than to
+/// confirm the import merely succeeded, because both outcomes produce a
+/// document with a table in it:
+///
+/// | | `QuipThreadKind::Spreadsheet` (correct) | `Document` (regressed) |
+/// |---|---|---|
+/// | rows × columns | 30 × 16 | 31 × 17 |
+/// | header cells | 0 | 17 |
+/// | row 1, columns A–D | `a1 b1 c1 d1` | the column letters |
+/// | column A | data | `1`…`30` |
+/// | column D's filled rows | 1, 6, 8–11 | 2, 7, 9–12 |
+///
+/// So if the kind stopped being threaded through `import_one_thread`, or were
+/// passed as `Document`, this test goes red on the very first assertion and
+/// on four more after it. (Verified by mutation: passing `Document` at that
+/// call site fails `grid.len()` with `31 != 30`.)
+#[tokio::test]
+async fn content_pass_imports_a_spreadsheet_grid_unshifted() {
+    common::require_infra!();
+    let server = quip_server_with_grid_t2_envelope().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    // Precondition: this is the spreadsheet path. Quip typed t2
+    // `"spreadsheet"`, and the worker agreed — without this the grid
+    // assertions below could pass for the wrong reason.
+    let sheet_doc_id = doc_id_for(&app, &import_id, "t2").await.expect("t2 imported");
+    let meta = app.state.doc_repo.get(&sheet_doc_id).await.unwrap().expect("t2 document");
+    assert_eq!(
+        meta.doc_type,
+        DocType::Spreadsheet,
+        "precondition: the worker read Quip's thread_type as a spreadsheet",
+    );
+
+    let snapshot = app
+        .state
+        .doc_repo
+        .load_snapshot(&sheet_doc_id)
+        .await
+        .unwrap()
+        .expect("the sheet's snapshot must be persisted");
+    let doc = ogrenotes_collab::snapshot::deserialize(&snapshot).expect("decode snapshot");
+    let grid = first_table_grid(doc.inner());
+
+    // The source table is 31 × 17. The extra row is the column-letter
+    // `<thead>`; the extra column is the row-number gutter. Both are the
+    // grid's own rulers, not the user's data.
+    assert_eq!(
+        grid.len(),
+        30,
+        "body rows only — the column-letter row is chrome, not a 31st row of data",
+    );
+    assert_eq!(
+        grid.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![16; 30],
+        "data columns only — the row-number gutter is chrome, not a 17th column",
+    );
+
+    // Every `<th>` in this document was a column letter, so with the header
+    // row gone there is no header cell left anywhere.
+    assert!(
+        grid.iter().flatten().all(|(header, _)| !header),
+        "a stripped sheet keeps no header cell",
+    );
+
+    // The top-left data cell. The fixture is content-scrubbed — each word run
+    // became filler of the identical length — so Quip's `a1 b1 c1 d1` reads as
+    // four 2-character strings. Their *values* are meaningless; that they are
+    // the first four cells of the first row, rather than cells 2-5 of row 2,
+    // is the assertion.
+    assert_eq!(
+        grid[0][..4].iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+        vec!["as", "as", "no", "it"],
+        "row 1, columns A-D — Quip's a1..d1, unshifted",
+    );
+
+    // The shift was diagonal, so pin both axes. Under the bug column A held
+    // 30 row numbers.
+    let col_a = column(&grid, 0);
+    assert!(
+        !col_a.iter().all(|t| t.bytes().all(|b| b.is_ascii_digit())),
+        "column A is the sheet's own first column, not the row-number ruler: {col_a:?}",
+    );
+
+    // The other axis, down column D — the one column of this sheet with
+    // content spread through it. Quip has a value at D1 and D6 and a run of
+    // four numbers at D8-D11; every other cell is a U+200B-only spacer. Under
+    // the bug all of it read one row lower and one column right.
+    let col_d = column(&grid, 3);
+    let occupied: Vec<usize> = col_d
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !t.trim_matches('\u{200b}').is_empty())
+        .map(|(i, _)| i + 1)
+        .collect();
+    assert_eq!(occupied, vec![1, 6, 8, 9, 10, 11], "column D's filled rows, 1-based: {col_d:?}");
+}
+
+/// The input side of the test above, stated so a `30` there can never be read
+/// as "the fixture only ever had 30 rows".
+///
+/// If someone ever trims the chrome out of the fixture itself, the end-to-end
+/// assertions would still pass while testing nothing — this fails instead.
+#[test]
+fn the_grid_fixture_really_carries_the_chrome_being_stripped() {
+    assert_eq!(
+        T2_GRID_HTML.matches("<tr").count(),
+        31,
+        "31 source rows: the column-letter <thead> row plus 30 body rows",
+    );
+    assert!(
+        T2_GRID_HTML.contains("<thead>"),
+        "the column-letter header row must be present in the input",
+    );
+}
+
 #[tokio::test]
 async fn intra_quip_links_are_recorded_unresolved_for_phase_2b() {
     common::require_infra!();
