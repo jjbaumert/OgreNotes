@@ -60,6 +60,22 @@ pub(crate) fn just_resynced(was_synced: bool, synced: bool) -> bool {
     synced && !was_synced
 }
 
+/// Clears an `Rc<Cell<bool>>` when dropped.
+///
+/// Used for the reconnect in-flight guard (#210): the guarded async
+/// block has several exits (token-fetch error, missing window/origin,
+/// success) and one that forgets to clear the flag would wedge present
+/// mode offline for the rest of the session — no further reconnect
+/// attempt would ever get past the guard. RAII makes that
+/// unforgettable.
+pub(crate) struct ClearOnDrop(pub(crate) std::rc::Rc<std::cell::Cell<bool>>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 /// Whether a DOM event's target is a native interactive control (button,
 /// link, form field). Mirrors the tag-name checks other global keydown
 /// handlers use to yield to focused controls — e.g.
@@ -336,14 +352,33 @@ pub fn PresentPage() -> impl IntoView {
     // session.
     let (reconnect_trigger, set_reconnect_trigger) = signal(0u32);
 
+    // #210: guards the async gap between this Effect deciding to
+    // reconnect and `connect()` actually running (there's an `await` on
+    // `request_ws_token` in between, during which `is_connected()` still
+    // reads false). Without it, the 5s poll or a visibilitychange can
+    // bump the trigger again mid-flight and start a second token fetch,
+    // briefly putting two live sockets on one session_id — and the first
+    // of the two to close takes the survivor's server-side awareness
+    // entry with it.
+    let reconnect_in_flight = std::rc::Rc::new(std::cell::Cell::new(false));
+
     {
         let id = doc_id();
         let collab_for_connect = std::rc::Rc::clone(&collab_client);
         let synced_for_connect = std::sync::Arc::clone(&ws_synced_flag);
+        let in_flight = std::rc::Rc::clone(&reconnect_in_flight);
         Effect::new(move |_| {
             // The only dependency: this Effect's job is purely "(re)connect
             // now", it doesn't need to react to anything else on the page.
             let _trigger = reconnect_trigger.get();
+
+            // Already reconnecting — drop this run. The poll fires again
+            // in LIVENESS_POLL_MS, so a genuinely-needed reconnect that
+            // races an in-flight one is retried, not lost.
+            if in_flight.get() {
+                return;
+            }
+            in_flight.set(true);
 
             let has_client = collab_for_connect.borrow().is_some();
             if has_client {
@@ -358,6 +393,19 @@ pub fn PresentPage() -> impl IntoView {
                 if let Some(ref client) = *collab_for_connect.borrow() {
                     client.disconnect();
                 }
+                // #210: force the false→true edge the broadcast Effect's
+                // `just_resynced` detector needs, instead of hoping the
+                // 300ms poll below samples the gap. `ws_synced` is only
+                // ever written by that poll, so on the fast path — the
+                // visibilitychange listener reconnects immediately, and
+                // token fetch + handshake + SyncStep2 all land between
+                // two ticks — the poll only ever observes `true`, no
+                // edge is detected, `last_sent_block_id` still matches
+                // the unchanged slide, and the reconnected presenter
+                // never re-announces. That's #210's exact symptom:
+                // invisible to every follower until they happen to
+                // change slides.
+                set_ws_synced.set(false);
             } else {
                 let client = CollabClient::new(id.clone(), None);
                 // #211: capture this window's session_id once, at
@@ -376,7 +424,11 @@ pub fn PresentPage() -> impl IntoView {
             let id = id.clone();
             let collab_for_token = std::rc::Rc::clone(&collab_for_connect);
             let synced_for_token = std::sync::Arc::clone(&synced_for_connect);
+            let in_flight_for_token = std::rc::Rc::clone(&in_flight);
             leptos::task::spawn_local(async move {
+                // Cleared on *every* exit below (including the token
+                // error path) or the page could never reconnect again.
+                let _guard = ClearOnDrop(in_flight_for_token);
                 match crate::api::documents::request_ws_token(&id).await {
                     Ok(resp) => {
                         let origin = web_sys::window()
@@ -745,6 +797,7 @@ mod follow_tests {
             typing_thread_id: None,
             presenting: presenting.map(|s| s.to_string()),
             session_id: session.to_string(),
+            seq: 0,
         }
     }
 
@@ -824,6 +877,84 @@ mod tests {
         assert!(!just_resynced(true, true), "staying synced is not a resync");
         assert!(!just_resynced(false, false), "staying unsynced is not a resync");
         assert!(!just_resynced(true, false), "dropping is not itself a resync");
+    }
+
+    /// Count the re-announce opportunities the broadcast Effect gets,
+    /// by folding a sequence of observed `ws_synced` values through the
+    /// same `just_resynced` edge detector the Effect uses. Each edge is
+    /// one `last_sent_block_id` clear, i.e. one chance to re-announce
+    /// the (unchanged) current slide to the room.
+    ///
+    /// This models the Effect's loop rather than running it — the Effect
+    /// itself needs a live reactive runtime and a `CollabClient` — but
+    /// the detector under test is the real one.
+    fn re_announce_opportunities(observed: &[bool]) -> usize {
+        let mut was = false;
+        let mut edges = 0;
+        for &synced in observed {
+            if just_resynced(was, synced) {
+                edges += 1;
+            }
+            was = synced;
+        }
+        edges
+    }
+
+    /// #210: a reconnect MUST force `ws_synced` false rather than
+    /// relying on the 300ms poll to sample the gap.
+    ///
+    /// Nothing writes that signal except the poll, and
+    /// `CollabClient::disconnect()` doesn't drive it either. On the
+    /// visibilitychange path the reconnect is immediate, so if the token
+    /// fetch + handshake + SyncStep2 all complete between two poll
+    /// ticks, every sample the Effect ever sees is `true` — no edge, the
+    /// dedup guard still matches the unchanged slide, and the
+    /// reconnected presenter never re-announces. They're then invisible
+    /// to every follower until they happen to change slides.
+    #[test]
+    fn a_reconnect_that_lands_between_poll_ticks_is_invisible_without_a_forced_false() {
+        // Initial handshake, then a reconnect fast enough that the poll
+        // only ever samples `true`.
+        assert_eq!(
+            re_announce_opportunities(&[false, true, true, true]),
+            1,
+            "poll sampling alone gives ONE edge — the initial handshake. \
+             The reconnect goes unnoticed; this is the #210 symptom.",
+        );
+
+        // Same reconnect, with the connect Effect setting the signal
+        // false as it tears the old socket down.
+        assert_eq!(
+            re_announce_opportunities(&[false, true, false, true]),
+            2,
+            "forcing the signal false makes the reconnect's edge observable, \
+             so the current slide is re-announced",
+        );
+    }
+
+    /// #210: the in-flight guard must clear on every exit of the
+    /// reconnect task — token-fetch failure included. A path that
+    /// leaves it set wedges present mode offline permanently, since no
+    /// later reconnect attempt could get past the guard.
+    #[test]
+    fn clear_on_drop_releases_the_reconnect_guard_on_every_exit() {
+        let flag = std::rc::Rc::new(std::cell::Cell::new(false));
+
+        flag.set(true);
+        {
+            let _guard = ClearOnDrop(std::rc::Rc::clone(&flag));
+            assert!(flag.get(), "guard held for the duration of the task");
+        }
+        assert!(!flag.get(), "released on the normal path");
+
+        // Early return out of the guarded scope (the token-error path).
+        flag.set(true);
+        (|| {
+            let _guard = ClearOnDrop(std::rc::Rc::clone(&flag));
+            #[allow(clippy::needless_return)]
+            return;
+        })();
+        assert!(!flag.get(), "released on an early return too");
     }
 
     #[test]

@@ -244,6 +244,28 @@ pub struct RemoteCursor {
     /// fleet still gets a stable (if imprecise) key instead of panicking
     /// or being dropped.
     pub session_id: String,
+    /// Monotonic stamp recording *when* this cursor was last received,
+    /// assigned by `handle_awareness` on every insert (a session's entry
+    /// is replaced wholesale by each new frame, so it always carries the
+    /// stamp of that session's latest frame).
+    ///
+    /// Needed because `remote_cursors` is keyed by session_id (#211) and
+    /// handed to consumers as `HashMap::values()`, whose order is stable
+    /// but arbitrary. Pre-#211 the map was keyed by user_id, so a user's
+    /// latest frame simply overwrote the previous one and their cursor
+    /// tracked whichever tab they were typing in. Without this stamp,
+    /// `dedup_cursors_by_user` would pick an arbitrary session and could
+    /// pin a two-tab user's cursor to their *inactive* tab for the whole
+    /// session.
+    pub seq: u64,
+}
+
+/// Next value for `RemoteCursor::seq`. Process-wide and monotonic;
+/// wasm is single-threaded but the native `cargo test` build isn't, so
+/// this is an atomic rather than a `Cell`.
+fn next_cursor_seq() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Collapse a list of `RemoteCursor`s down to one entry per `user_id`,
@@ -254,16 +276,32 @@ pub struct RemoteCursor {
 /// mode's follow feature, `presenters()`), this is purely a render-time
 /// view.
 ///
-/// Which of a user's sessions "wins" when they have more than one open
-/// is arbitrary (whichever the input order happens to put first) — the
-/// pre-#211 behavior was equally arbitrary (whichever tab's frame
-/// happened to arrive last), so this isn't a regression, just a
-/// different arbitrary choice.
+/// The winner among a user's sessions is the one whose awareness frame
+/// arrived most recently (highest `RemoteCursor::seq`), which restores
+/// the pre-#211 behavior: a user with two tabs open shows one cursor,
+/// and it tracks the tab they're actually typing in. Picking by input
+/// order instead would be arbitrary — `remote_cursors.values()` is
+/// stable but unordered — and could pin a peer's cursor to their
+/// *inactive* tab permanently, since nothing would ever change the
+/// order.
+///
+/// Input order is otherwise preserved for the surviving entries.
 pub fn dedup_cursors_by_user(cursors: &[RemoteCursor]) -> Vec<RemoteCursor> {
-    let mut seen = std::collections::HashSet::new();
+    let mut newest: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for c in cursors {
+        let entry = newest.entry(c.user_id.as_str()).or_insert(c.seq);
+        if c.seq > *entry {
+            *entry = c.seq;
+        }
+    }
+    // `emitted` is belt-and-braces: seqs are unique per insert, so two
+    // entries for one user can't tie, but a tie must not double-emit.
+    let mut emitted = std::collections::HashSet::new();
     cursors
         .iter()
-        .filter(|c| seen.insert(c.user_id.clone()))
+        .filter(|c| {
+            newest.get(c.user_id.as_str()) == Some(&c.seq) && emitted.insert(c.user_id.as_str())
+        })
         .cloned()
         .collect()
 }
@@ -571,6 +609,9 @@ fn handle_awareness(
         typing_thread_id: state.typing_thread_id.clone(),
         presenting: state.presenting.clone(),
         session_id: session_id.clone(),
+        // Stamped on every insert so render-time dedup can tell which of
+        // a user's sessions spoke most recently — see `RemoteCursor::seq`.
+        seq: next_cursor_seq(),
     };
     remote_cursors.borrow_mut().insert(session_id, cursor);
 
@@ -672,6 +713,12 @@ pub struct CollabClient {
     /// Heartbeat interval — Some while the WebSocket is open. Cleared on
     /// `onclose` and `disconnect()` so the timer can't outlive the WS.
     heartbeat_handle: Rc<RefCell<Option<gloo_timers::callback::Interval>>>,
+    /// The `connected_flag` handed to the most recent `connect()` call.
+    /// Held so `disconnect()` can clear it synchronously: it detaches
+    /// the socket's handlers before dropping it (see `disconnect`), so
+    /// `onclose` — the only other writer of this flag — will never fire
+    /// for a deliberate disconnect.
+    connected_flag: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     /// #211/#212: this connection/window's identity, generated once per
     /// `CollabClient` instance (i.e. once per page mount) and sent on
     /// every awareness frame. Distinct from `user_id` — see the field
@@ -739,6 +786,7 @@ impl CollabClient {
             _update_sub: update_sub,
             last_activity_at: Rc::new(Cell::new(0.0)),
             heartbeat_handle: Rc::new(RefCell::new(None)),
+            connected_flag: RefCell::new(None),
             session_id: generate_session_id(),
         }
     }
@@ -856,6 +904,10 @@ impl CollabClient {
         // window starts fresh — otherwise an old, stale last_activity_at
         // could make the first heartbeat tick decide to disconnect.
         self.last_activity_at.set(now_ms());
+        // Remember the flag so `disconnect()` can clear it directly —
+        // it detaches `onclose` before dropping the socket, so the
+        // handler that would otherwise clear it never runs.
+        *self.connected_flag.borrow_mut() = Some(std::sync::Arc::clone(&connected_flag));
 
         // #2: on reconnect, tear down the previous socket before installing
         // new handlers, then drop its Closures — otherwise each reconnect
@@ -1222,11 +1274,31 @@ impl CollabClient {
         // Drop the heartbeat first so it can't fire during the close
         // sequence and try to send on a half-shut socket.
         self.heartbeat_handle.borrow_mut().take();
-        if let Some(ws) = self.ws.borrow().as_ref() {
+        // Detach the handlers BEFORE dropping our reference to the
+        // socket, mirroring the teardown in `connect()`. Dropping the
+        // reference with `onclose`/`onerror` still attached leaves the
+        // JS socket alive and armed while the next `connect()` clears
+        // `_closures` — and that clear happens on the `self.ws == None`
+        // path, which skips the defensive `set_onclose(None)` above it.
+        // A close/error event landing after that point invokes a
+        // dropped `Closure`: this repo's "closure invoked recursively
+        // or after being dropped" panic class.
+        if let Some(ws) = self.ws.borrow_mut().take() {
+            ws.set_onopen(None);
+            ws.set_onmessage(None);
+            ws.set_onclose(None);
+            ws.set_onerror(None);
             let _ = ws.close();
         }
-        *self.ws.borrow_mut() = None;
         *self.state.borrow_mut() = ConnectionState::Disconnected;
+        // `onclose` was the only writer that cleared this flag, and it
+        // can no longer fire for a deliberate disconnect — clear it here
+        // so a caller polling the flag doesn't see a stale `true`.
+        // Synchronous, so it's also strictly more prompt than waiting
+        // for the browser's async close event.
+        if let Some(flag) = self.connected_flag.borrow().as_ref() {
+            flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Whether the client is connected and synced.
@@ -1724,16 +1796,23 @@ mod tests {
     // ── Awareness departure (#9, reworked for session_id by #211/#212) ──
 
     fn test_cursor(user_id: &str, session_id: &str) -> RemoteCursor {
+        test_cursor_at(user_id, session_id, "block1", next_cursor_seq())
+    }
+
+    /// `seq` and cursor position explicit, for the dedup tests where
+    /// which session wins is the whole point.
+    fn test_cursor_at(user_id: &str, session_id: &str, block: &str, seq: u64) -> RemoteCursor {
         RemoteCursor {
             user_id: user_id.into(),
             name: user_id.into(),
             color: CURSOR_COLORS[0].to_string(),
-            cursor_block: Some(("block1".into(), 0)),
+            cursor_block: Some((block.into(), 0)),
             selection_anchor_block: None,
             selection_head_block: None,
             typing_thread_id: None,
             presenting: None,
             session_id: session_id.into(),
+            seq,
         }
     }
 
@@ -1839,6 +1918,72 @@ mod tests {
         let user_ids: std::collections::HashSet<_> =
             deduped.iter().map(|c| c.user_id.as_str()).collect();
         assert_eq!(user_ids, std::collections::HashSet::from(["presenter", "viewer"]));
+    }
+
+    /// #211 regression: the winner must be the session that spoke most
+    /// recently, not an arbitrary one. `remote_cursors.values()` order
+    /// is stable-but-arbitrary, so an order-based pick could freeze a
+    /// two-tab user's cursor at their *inactive* tab for the whole
+    /// session — pre-#211 (user_id-keyed map) the latest frame always
+    /// won and the cursor followed the tab being typed in.
+    ///
+    /// Both input orders are asserted: an implementation that keeps the
+    /// first entry passes one and fails the other.
+    #[test]
+    fn dedup_cursors_by_user_keeps_the_most_recently_updated_session() {
+        let stale = test_cursor_at("presenter", "sess-idle-tab", "block-idle", 1);
+        let fresh = test_cursor_at("presenter", "sess-active-tab", "block-typing", 2);
+
+        for (label, cursors) in [
+            ("stale first", vec![stale.clone(), fresh.clone()]),
+            ("fresh first", vec![fresh.clone(), stale.clone()]),
+        ] {
+            let deduped = dedup_cursors_by_user(&cursors);
+            assert_eq!(deduped.len(), 1, "{label}: one entry per user");
+            assert_eq!(
+                deduped[0].session_id, "sess-active-tab",
+                "{label}: the tab being typed in must win",
+            );
+            assert_eq!(
+                deduped[0].cursor_block.as_ref().map(|(b, _)| b.as_str()),
+                Some("block-typing"),
+                "{label}: and the rendered position is that tab's",
+            );
+        }
+    }
+
+    /// The stamp is what makes the above work, so pin that
+    /// `handle_awareness` actually assigns an increasing one: a second
+    /// frame from a *different* session must outrank the first.
+    #[test]
+    fn handle_awareness_stamps_each_insert_with_an_increasing_seq() {
+        let cursors = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let on_awareness: Rc<RefCell<Option<OnAwarenessUpdate>>> = Rc::new(RefCell::new(None));
+
+        let frame = |session: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "user_id": "presenter",
+                "name": "Presenter",
+                "color": 0,
+                "session_id": session,
+            }))
+            .unwrap()
+        };
+
+        handle_awareness(&frame("sess-idle-tab"), &cursors, &on_awareness);
+        handle_awareness(&frame("sess-active-tab"), &cursors, &on_awareness);
+
+        let idle = cursors.borrow()["sess-idle-tab"].seq;
+        let active = cursors.borrow()["sess-active-tab"].seq;
+        assert!(active > idle, "later frame must get the higher seq ({active} vs {idle})");
+
+        // And re-announcing from the idle tab flips the winner back —
+        // the stamp tracks the latest *frame*, not the first sighting.
+        handle_awareness(&frame("sess-idle-tab"), &cursors, &on_awareness);
+        let all: Vec<RemoteCursor> = cursors.borrow().values().cloned().collect();
+        let deduped = dedup_cursors_by_user(&all);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].session_id, "sess-idle-tab");
     }
 
     #[test]
