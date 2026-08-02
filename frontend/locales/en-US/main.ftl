@@ -161,6 +161,12 @@ quip-import-report-and-more = …and { $count } more
 quip-import-report-chat = { $count } chat threads were not imported — chats aren't documents
 quip-import-report-note = { $id } — { $detail }
 quip-import-report-note-general = { $detail }
+quip-import-report-within-heading = These documents imported, but some content inside them didn't come across
+quip-import-report-images = { $count } images couldn't be copied from Quip
+quip-import-report-truncated = { $count } documents had deeply nested content flattened
+quip-import-report-mentions = { $count } documents had @mentions imported as plain text
+quip-import-report-live-apps = { $count } embedded Quip apps (Kanban boards and similar) didn't come across
+quip-import-report-formulas = { $count } spreadsheet formulas weren't imported — those cells keep their last value and won't recalculate
 
 # ─── Notification panel ─────────────────────────────────────────
 
