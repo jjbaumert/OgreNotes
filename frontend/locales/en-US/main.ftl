@@ -1214,3 +1214,8 @@ deck-notes-drawer-label = Speaker notes
 
 deck-present = Present
 deck-present-empty = This deck has no slides yet.
+
+# ─── Presentations P2 (presenter view, Task 7) ───────────────────
+
+deck-present-next = Next
+deck-present-notes = Speaker notes

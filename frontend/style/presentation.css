@@ -651,3 +651,46 @@
 .deck-present__empty {
   color: rgba(255, 255, 255, 0.7);
 }
+
+/* Presenter view: stage left, panel right. Plain flex row — the stage
+ * keeps its own aspect box, so the panel just takes the remainder. */
+.deck-present--presenter {
+  flex-direction: row;
+  align-items: stretch;
+  justify-content: flex-start;
+  cursor: default;
+}
+
+.deck-present--presenter .deck-present__stage {
+  flex: 1 1 auto;
+  align-self: center;
+  width: auto;
+  max-width: 65vw;
+}
+
+.deck-present__panel {
+  flex: 0 0 30vw;
+  min-width: 260px;
+  overflow-y: auto;
+  padding: var(--space-md);
+  background: var(--color-surface);
+  color: var(--color-text);
+  cursor: default;
+}
+
+.deck-present__timer {
+  font-size: 2rem;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: var(--space-md);
+}
+
+.deck-present__next .deck-canvas {
+  max-width: 100%;
+  box-shadow: none;
+}
+
+.deck-present__note {
+  border-inline-start: 3px solid var(--color-border);
+  padding-inline-start: var(--space-sm);
+  margin-block: var(--space-sm);
+}
