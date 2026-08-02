@@ -4706,6 +4706,16 @@ mod tests {
             ],
             "the source shape",
         );
+
+        // Again through the public entry point rather than the pass, because
+        // `from_quip_html_as` is where the thread kind is read and a strip
+        // that ran only for spreadsheets would look identical above.
+        let xml = doc_xml(&from_quip_html(&html));
+        assert_eq!(xml.matches("<table_header").count(), 1, "the heading, not the corner: {xml}");
+        assert_eq!(xml.matches("<table_cell").count(), 1, "the data cell, not the ruler: {xml}");
+        let sheet_xml = doc_xml(&from_quip_html_as(&html, QuipThreadKind::Spreadsheet));
+        assert_eq!(sheet_xml.matches("<table_header").count(), 0, "{sheet_xml}");
+        assert_eq!(sheet_xml.matches("<table_cell").count(), 1, "{sheet_xml}");
     }
 
     /// **#232's negative control, and the sharpest one.** Byte-identical
@@ -4730,6 +4740,15 @@ mod tests {
         );
         assert_eq!(table_grid(&doc_blocks(&html)[0]), source, "the document path takes nothing");
         assert_eq!(table_grid(&sheet_blocks(&html)[0]), source, "nor does the spreadsheet path");
+
+        // And through the public entry point, for the same reason as above.
+        for xml in [
+            doc_xml(&from_quip_html(&html)),
+            doc_xml(&from_quip_html_as(&html, QuipThreadKind::Spreadsheet)),
+        ] {
+            assert_eq!(xml.matches("<table_header").count(), 2, "both <th> stay: {xml}");
+            assert_eq!(xml.matches("<table_cell").count(), 2, "both <td> stay: {xml}");
+        }
     }
 
     /// `AeOAAAcV1hg`'s table, verbatim — a prose table, no `<thead>`, no
