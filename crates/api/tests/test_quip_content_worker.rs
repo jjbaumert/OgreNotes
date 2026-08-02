@@ -734,6 +734,15 @@ async fn quip_server_with_grid_t1_envelope() -> MockServer {
 /// The collab crate pins the same pair on the walker
 /// (`the_same_grid_markup_imported_as_a_document_keeps_its_header_row`);
 /// this pins that the worker hands it the right side of that pair.
+///
+/// #232 narrowed what "the right side" means. When this test was written the
+/// document path stripped *nothing*, so it asserted 17 cells and a surviving
+/// digit column. The row-number gutter is not authored content on any path —
+/// nothing an author can type produces an id-less cell — so it is now stripped
+/// from document threads too, and only the `<th>` header row still depends on
+/// the thread kind. The header half of this test is unchanged and is what
+/// #230's contract is about; the gutter half was inverted, which is the
+/// behaviour change #232 makes.
 #[tokio::test]
 async fn the_same_grid_markup_in_a_document_thread_keeps_its_header_row() {
     common::require_infra!();
@@ -759,17 +768,22 @@ async fn the_same_grid_markup_in_a_document_thread_keeps_its_header_row() {
     assert_eq!(grid.len(), 31, "the header row is content in a document thread");
     assert_eq!(
         grid.iter().map(Vec::len).collect::<Vec<_>>(),
-        vec![17; 31],
-        "17 cells per row — nothing is stripped off a document thread",
+        vec![16; 31],
+        "16 cells per row — the header row stays, the ruler goes (#232)",
     );
     assert_eq!(
         grid[0].iter().filter(|(header, _)| *header).count(),
-        17,
+        16,
         "the whole first row survives as header cells",
     );
     assert!(
-        column(&grid, 0)[1..].iter().all(|t| t.bytes().all(|b| b.is_ascii_digit())),
-        "the leading column survives as content: {:?}",
+        grid[0].iter().all(|(_, t)| !t.trim().is_empty()),
+        "every column letter survives, and the empty corner went with the gutter: {:?}",
+        grid[0],
+    );
+    assert!(
+        !column(&grid, 0)[1..].iter().all(|t| t.bytes().all(|b| b.is_ascii_digit())),
+        "the row-number ruler is gone from column A on this path too (#232): {:?}",
         column(&grid, 0),
     );
 }
