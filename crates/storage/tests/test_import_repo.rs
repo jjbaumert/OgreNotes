@@ -15,7 +15,8 @@ use ogrenotes_common::time::now_usec;
 use ogrenotes_storage::dynamo::DynamoClient;
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
 use ogrenotes_storage::models::import_inventory::{
-    ReportNote, ReportRow, SecMapRow, ThreadRow, ThreadState, REPORT_MAX_NOTES_PER_KIND,
+    FolderRow, ReportNote, ReportRow, SecMapRow, ThreadRow, ThreadState,
+    REPORT_MAX_NOTES_PER_KIND,
 };
 use ogrenotes_storage::repo::import_repo::ImportRepo;
 
@@ -1039,4 +1040,122 @@ async fn set_phase_never_moves_backwards() {
     repo.set_phase(&record.import_id, 3).await.expect("phase 3");
     let rec = repo.get(&record.import_id).await.expect("get").expect("record");
     assert_eq!(rec.phase, 3);
+}
+
+// ─── FOLDER# rows: the mirrored-tree idempotency key (#236) ──────
+
+fn inv_folder(quip_id: &str, parent: Option<&str>) -> FolderRow {
+    FolderRow {
+        quip_folder_id: quip_id.to_string(),
+        owner_id: "owner1".to_string(),
+        title: format!("Folder {quip_id}"),
+        parent_quip_id: parent.map(str::to_string),
+        ogre_folder_id: None,
+    }
+}
+
+/// **The guard whose failure turns one bad run into a mess of duplicate
+/// trees.**
+///
+/// `run_inventory` re-walks and re-writes every `FOLDER#` row on every job
+/// run, and it writes `ogre_folder_id: None` because the walk has no OgreNotes
+/// folder to offer. If `put_folder` overwrote the row wholesale, the second
+/// run would erase the idempotency key the mirroring pass reads, the pass
+/// would conclude "no folder yet", and it would build a second tree — on
+/// every run, forever.
+///
+/// So `put_folder` refreshes the inventory-derived fields and leaves
+/// `ogre_folder_id` strictly alone. Recording it is `record_ogre_folder`'s
+/// job and nothing else's.
+#[tokio::test]
+async fn put_folder_refreshes_the_inventory_but_never_clears_the_mirrored_folder() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    repo.put_folder(&record.import_id, &inv_folder("qf1", None)).await.expect("first run");
+    let recorded = repo
+        .record_ogre_folder(&record.import_id, "qf1", "ogre-1")
+        .await
+        .expect("record");
+    assert_eq!(recorded, "ogre-1");
+
+    // A second inventory run: the same row, still no `ogre_folder_id` to
+    // offer, and a title Quip has since changed.
+    let mut renamed = inv_folder("qf1", None);
+    renamed.title = "Renamed in Quip".to_string();
+    repo.put_folder(&record.import_id, &renamed).await.expect("second run");
+
+    let rows = repo.list_folders(&record.import_id).await.expect("list");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].ogre_folder_id.as_deref(),
+        Some("ogre-1"),
+        "a re-run must not clear the mirrored folder id",
+    );
+    assert_eq!(rows[0].title, "Renamed in Quip", "inventory fields still refresh");
+}
+
+/// `record_ogre_folder` is `record_import_folder`'s shape, per folder: the
+/// first writer wins under a conditional write, and every later caller reads
+/// the winner's id back rather than adopting its own.
+#[tokio::test]
+async fn record_ogre_folder_is_first_writer_wins_and_reads_the_winner_back() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+    repo.put_folder(&record.import_id, &inv_folder("qf1", None)).await.expect("seed");
+
+    assert_eq!(
+        repo.record_ogre_folder(&record.import_id, "qf1", "winner").await.expect("first"),
+        "winner",
+    );
+    assert_eq!(
+        repo.record_ogre_folder(&record.import_id, "qf1", "loser").await.expect("second"),
+        "winner",
+        "the loser adopts the winner's folder rather than its own",
+    );
+    let rows = repo.list_folders(&record.import_id).await.expect("list");
+    assert_eq!(rows[0].ogre_folder_id.as_deref(), Some("winner"));
+}
+
+/// Parentage round-trips, and a row whose parent goes away loses the
+/// attribute rather than keeping a stale pointer.
+#[tokio::test]
+async fn put_folder_round_trips_parentage_and_clears_a_parent_that_went_away() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    repo.put_folder(&record.import_id, &inv_folder("qf2", Some("qf1"))).await.expect("put");
+    let rows = repo.list_folders(&record.import_id).await.expect("list");
+    assert_eq!(rows[0].parent_quip_id.as_deref(), Some("qf1"));
+
+    repo.put_folder(&record.import_id, &inv_folder("qf2", None)).await.expect("re-put");
+    let rows = repo.list_folders(&record.import_id).await.expect("list");
+    assert_eq!(rows[0].parent_quip_id, None, "a root must not keep a stale parent");
+}
+
+/// `record_ogre_folder` must not conjure a `FOLDER#` row out of nothing.
+/// `attribute_not_exists(ogre_folder_id)` is satisfied by a *missing item*
+/// too, so an update guarded on that alone would create a half-row carrying
+/// only the keys and the folder id — which `list_folders` then fails to
+/// decode, poisoning every later read of the import's folders.
+#[tokio::test]
+async fn record_ogre_folder_refuses_a_row_that_was_never_inventoried() {
+    require_infra!();
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+
+    repo.record_ogre_folder(&record.import_id, "never-inventoried", "ogre-1")
+        .await
+        .expect_err("recording against a row that does not exist must fail loudly");
+    assert!(
+        repo.list_folders(&record.import_id).await.expect("list").is_empty(),
+        "and must leave no undecodable half-row behind",
+    );
 }
