@@ -386,6 +386,37 @@ impl Transaction {
         let content = Fragment::from(vec![text_node]);
         let content_size = content.size();
 
+        // #195: a selection that spans block boundaries — the whole doc
+        // after Ctrl+A, or a drag across two paragraphs — cannot be
+        // replaced by a flat inline slice. `replace` descends only as far
+        // as the deepest node containing BOTH endpoints, so the text lands
+        // as a bare child of the Doc (or of a list/table container)
+        // alongside the surviving block halves. `EditorState::apply` then
+        // normalizes that back into a paragraph, which shifts every
+        // position inside it right by one — including the caret computed
+        // below, leaving it BEFORE the character just typed. The next
+        // keystroke then inserts ahead of it, which is how typing
+        // "PROBE TEXT ALPHA" over a select-all yielded "ROBE TEXT ALPHAP".
+        //
+        // `delete_selection` already knows how to collapse a cross-block
+        // range into a single well-formed block and leave a caret inside
+        // it (this is why Ctrl+A → Delete → type has always been correct),
+        // so route through it and then insert at that caret.
+        if from != to && !same_textblock(&self.doc, from, to) {
+            let txn = self.delete_selection()?;
+            let raw_pos = txn.selection.from();
+            let pos = match resolve_block_for_edit(&txn.doc, raw_pos) {
+                Some((_, resolved)) => resolved,
+                None => raw_pos,
+            };
+            let mut txn = txn.replace(pos, pos, Slice::new(content, 0, 0))?;
+            // Pure insertion at `pos` inside a textblock: the end of the
+            // inserted text is exactly `pos + content_size`.
+            txn.selection = Selection::cursor(pos + content_size);
+            txn.stored_marks = None; // consumed
+            return Ok(txn);
+        }
+
         // Replace selection with the text content
         let mut txn = self.replace(from, to, Slice::new(content, 0, 0))?;
 
@@ -1290,6 +1321,21 @@ pub fn find_block_at(doc: &Node, pos: usize) -> Option<BlockInfo> {
         return None;
     };
     find_block_in_children(&content.children, pos, 0)
+}
+
+/// Whether `a` and `b` both sit inside the content of the *same* textblock.
+///
+/// `false` means an edit spanning the two positions cannot be expressed as a
+/// flat inline replacement — it has to be resolved structurally, by merging
+/// the blocks the range crosses. See `insert_text`'s cross-block branch
+/// (#195). Positions that are not inside any textblock at all (the doc's own
+/// 0 / `content_size` boundaries, which is where a select-all range ends up)
+/// also answer `false`.
+fn same_textblock(doc: &Node, a: usize, b: usize) -> bool {
+    match (find_block_at(doc, a), find_block_at(doc, b)) {
+        (Some(x), Some(y)) => x.offset == y.offset,
+        _ => false,
+    }
 }
 
 fn find_block_in_children(
@@ -2206,6 +2252,187 @@ mod tests {
         assert_eq!(para.text_content(), "Goodbye world");
         // Cursor should be after "Goodbye" (1 + 7 = 8)
         assert_eq!(new_state.selection.head(), 8);
+    }
+
+    /// #195: typing over a Ctrl+A select-all must not relocate the first
+    /// typed character to the end of the text. A select-all spans the doc's
+    /// own boundaries (0..content_size), so the replace lands at the Doc
+    /// level and leaves a bare text node that `apply` normalizes back into a
+    /// paragraph — shifting every position inside it by one. If the caret
+    /// isn't remapped through that normalization it lands *before* the typed
+    /// character and every later keystroke inserts ahead of it, turning
+    /// "PROBE TEXT ALPHA" into "ROBE TEXT ALPHAP".
+    #[test]
+    fn typing_over_select_all_keeps_character_order() {
+        let base = EditorState::create_default(simple_doc());
+        let mut state = EditorState {
+            selection: Selection::all(&base.doc),
+            ..base
+        };
+
+        // One transaction per character — that is what real typing
+        // dispatches, and it is what exposes the caret bug.
+        for ch in "PROBE TEXT ALPHA".chars() {
+            let txn = state
+                .transaction()
+                .insert_text(&ch.to_string())
+                .unwrap();
+            state = state.apply(txn);
+        }
+
+        assert_eq!(state.doc.text_content(), "PROBE TEXT ALPHA");
+        assert_eq!(state.doc.child_count(), 1);
+        assert_eq!(
+            state.doc.child(0).unwrap().node_type(),
+            Some(NodeType::Paragraph)
+        );
+    }
+
+    /// #195, minimal form: after a single character replaces a select-all,
+    /// the caret must sit *after* that character.
+    #[test]
+    fn caret_lands_after_text_typed_over_select_all() {
+        let base = EditorState::create_default(simple_doc());
+        let state = EditorState {
+            selection: Selection::all(&base.doc),
+            ..base
+        };
+
+        let txn = state.transaction().insert_text("Xy").unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(new_state.doc.text_content(), "Xy");
+        // doc(paragraph("Xy")): 0 = before the paragraph, 1 = before "X",
+        // 3 = after "y".
+        assert_eq!(new_state.selection.head(), 3);
+        assert!(new_state.selection.empty());
+    }
+
+    /// #195 across blocks: a select-all over several paragraphs collapses to
+    /// one paragraph, and the caret still belongs after the typed text.
+    #[test]
+    fn typing_over_multi_block_select_all_keeps_character_order() {
+        let base = EditorState::create_default(two_para_doc());
+        let mut state = EditorState {
+            selection: Selection::all(&base.doc),
+            ..base
+        };
+
+        for ch in "ABC".chars() {
+            let txn = state
+                .transaction()
+                .insert_text(&ch.to_string())
+                .unwrap();
+            state = state.apply(txn);
+        }
+
+        assert_eq!(state.doc.text_content(), "ABC");
+    }
+
+    /// #195 is not specific to select-all: any selection that crosses a
+    /// block boundary hit the same flat-replace path. Drag from inside one
+    /// paragraph to inside the next and type.
+    #[test]
+    fn typing_over_a_cross_paragraph_selection_keeps_character_order() {
+        // doc[p("Hello"), p("World")]: "Hello" spans 1..6, "World" 8..13.
+        // 3..11 selects "llo" + the block seam + "Wor".
+        let base = EditorState::create_default(two_para_doc());
+        let mut state = EditorState {
+            selection: Selection::text(3, 11),
+            ..base
+        };
+
+        for ch in "XYZ".chars() {
+            let txn = state
+                .transaction()
+                .insert_text(&ch.to_string())
+                .unwrap();
+            state = state.apply(txn);
+        }
+
+        assert_eq!(shape(&state.doc), "Doc[Paragraph[\"HeXYZld\"]]");
+    }
+
+    /// Same gesture across two list items — `delete_selection` collapses
+    /// those at the item level, and the typed text must land in order
+    /// inside the surviving item.
+    #[test]
+    fn typing_over_a_cross_list_item_selection_keeps_character_order() {
+        // doc[ul[li[p("A")], li[p("B")]]]: "A" at 3..4, "B" at 8..9.
+        let base = EditorState::create_default(sibling_items_doc());
+        let mut state = EditorState {
+            selection: Selection::text(3, 9),
+            ..base
+        };
+
+        for ch in "XYZ".chars() {
+            let txn = state
+                .transaction()
+                .insert_text(&ch.to_string())
+                .unwrap();
+            state = state.apply(txn);
+        }
+
+        assert_eq!(
+            shape(&state.doc),
+            "Doc[BulletList[ListItem[Paragraph[\"XYZ\"]]]]",
+        );
+    }
+
+    /// A selection wholly inside one table cell stays on the plain
+    /// in-block path — this pins that the #195 branch does not capture it.
+    #[test]
+    fn typing_over_a_selection_inside_one_table_cell_keeps_character_order() {
+        // doc[table[tr[td[p("Hello world")]]]]: cell content starts at 3,
+        // the paragraph's text spans 4..15, so 4..9 is "Hello".
+        let doc = table_cell_doc(vec![Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("Hello world")]),
+        )]);
+        let base = EditorState::create_default(doc);
+        let mut state = EditorState {
+            selection: Selection::text(4, 9),
+            ..base
+        };
+
+        for ch in "Bye".chars() {
+            let txn = state
+                .transaction()
+                .insert_text(&ch.to_string())
+                .unwrap();
+            state = state.apply(txn);
+        }
+
+        assert_eq!(
+            shape(&state.doc),
+            "Doc[Table[TableRow[TableCell[Paragraph[\"Bye world\"]]]]]",
+        );
+    }
+
+    /// Select-all over a doc whose only block is a table: the whole table
+    /// goes, and the typed text lands in order in the replacement
+    /// paragraph rather than scrambled.
+    #[test]
+    fn typing_over_select_all_of_a_table_doc_keeps_character_order() {
+        let doc = table_cell_doc(vec![Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("cell")]),
+        )]);
+        let base = EditorState::create_default(doc);
+        let mut state = EditorState {
+            selection: Selection::all(&base.doc),
+            ..base
+        };
+
+        for ch in "XYZ".chars() {
+            let txn = state
+                .transaction()
+                .insert_text(&ch.to_string())
+                .unwrap();
+            state = state.apply(txn);
+        }
+
+        assert_eq!(shape(&state.doc), "Doc[Paragraph[\"XYZ\"]]");
     }
 
     #[test]
