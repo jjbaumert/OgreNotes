@@ -73,7 +73,10 @@
 //! terminator dropped, and (since `ffbAAA8eMpE`) every authored break kept.
 //! #190 (section anchors) has now landed as well: the five original
 //! `sections.len()` assertions went 11→71, 23→170, 44→46, 5→10 and 1→528,
-//! and every one of them is now stated as *achieved*.
+//! and every one of them is now stated as *achieved*. #194 F-10 (comment
+//! anchors) then moved `ffbAAA8eMpE`'s alone, 263→264 — the corpus's single
+//! `annotationid`, and the one id in these six documents that #190 could
+//! not make resolvable.
 //!
 //! # Known coverage gaps in this fixture set
 //!
@@ -1089,12 +1092,17 @@ fn corpus_prose_tables_with_header_rows() {
 
     // 418 `id` attributes; 155 of them are `<span>`s. 154 repeat their
     // `<li>`/`<td>`/`<th>`'s id byte for byte (`spans_repeat_their_parents_id`)
-    // and resolve through it; the 155th is the comment-annotation span
-    // described at `every_uncaptured_source_id_is_one_of_the_three_known_
-    // residues`, and it is the one id in this document with nothing to
-    // resolve to. 418 - 155 = 263.
+    // and resolve through it, so they need no entry of their own: 418 - 155
+    // = 263 entries from `id` attributes alone.
+    //
+    // The 264th is the comment-annotation span (#194 F-10). Its id is the
+    // 155th span id and used to be the one id in this document with nothing
+    // to resolve to; it is now captured under its `annotationid` spelling —
+    // byte-identical to its `id` — and points at the paragraph that contains
+    // the highlight. See
+    // `the_comment_annotation_anchor_resolves_to_the_block_that_contains_it`.
     assert_eq!(source_id_count(&html), 418, "id attributes present in the source");
-    assert_eq!(quip.sections.len(), 263, "section ids captured (#190)");
+    assert_eq!(quip.sections.len(), 264, "263 section ids + 1 comment anchor (#190, #194)");
 
     assert_eq!(quip.formulas_dropped, 0, "no formula in a prose table");
     assert_eq!(quip.live_apps_dropped, 0);
@@ -1246,7 +1254,7 @@ fn corpus_prose_table_gutter_is_not_imported_as_data() {
     // Anchors are untouched: the gutter `<td>` and the corner `<th>` are the
     // only cells in the document with no `id`, so removing them costs nothing
     // the Phase-2b back-patch could have resolved.
-    assert_eq!(quip.sections.len(), 263, "no anchor is lost with the chrome");
+    assert_eq!(quip.sections.len(), 264, "no anchor is lost with the chrome");
 }
 
 /// **#233, the sharp end.** These five prose tables satisfy the *shape* gate.
@@ -1475,7 +1483,7 @@ fn a_document_with_no_comment_annotation_records_no_extra_anchor() {
 
 /// #190 stated as an exhaustive fact rather than six totals: after the fix,
 /// **every id a Quip anchor could name is a key in the section map**, bar
-/// fourteen in the whole corpus, all three groups named and understood.
+/// thirteen in the whole corpus, both remaining groups named and understood.
 ///
 /// The totals asserted per fixture say *how many* anchors are recorded; they
 /// cannot say *which*, so a change that started dropping ten `<td>` ids while
@@ -1483,8 +1491,8 @@ fn a_document_with_no_comment_annotation_records_no_extra_anchor() {
 /// back-patch will actually ask — "is this source id resolvable?" — for all
 /// 1899 of them, and reports the misses by tag.
 ///
-/// Note what that makes of the 797 `<span>` ids: **one of them is a miss.**
-/// Quip repeats the enclosing `<li>`/`<td>` id verbatim on the inner
+/// Note what that makes of the 797 `<span>` ids: **not one of them is a
+/// miss.** Quip repeats the enclosing `<li>`/`<td>` id verbatim on the inner
 /// `<span>`, so a span's id is already a key — it maps to the item's block,
 /// which is where the anchor should land. They need no entry of their own,
 /// only the parent's. `spans_repeat_their_parents_id` below keeps that
@@ -1492,35 +1500,37 @@ fn a_document_with_no_comment_annotation_records_no_extra_anchor() {
 /// `a_cell_span_repeats_its_parents_anchor_so_needs_no_entry_of_its_own` in
 /// `import_quip.rs` pins the behaviour.
 ///
-/// The fourteen genuine misses:
+/// **The `span` residue is gone as of #194 F-10, and its old explanation was
+/// wrong in one respect worth recording.** It read: the annotated span "is
+/// not a section … comments are not imported at all … so there is no block
+/// for it to name." The first half is still true — it is a mid-paragraph
+/// inline range, not a block, and no block will ever be minted for it. The
+/// conclusion did not follow. An anchor does not need a block *of its own*
+/// to be resolvable; it needs the block it *lives in*, which is exactly what
+/// every one of the 797 wrapper spans already resolves to. Capturing it under
+/// its `annotationid` spelling costs one entry and gives Phase 4 the
+/// paragraph to hang a comment on. What is still unrecoverable is the range
+/// *within* that paragraph — see
+/// `the_comment_annotation_anchor_resolves_to_the_block_that_contains_it`.
+///
+/// The thirteen genuine misses:
 ///
 /// * **`ul` — 10, `CVLAAAgSl7Q` only.** The `'6'` continuation sections #188
 ///   (PR #200) merges away: emptied into the accumulating list and dropped
 ///   before the walker runs, so the section-level anchor has no block left.
 /// * **`control` — 3, `SSfAAALs7fy` only.** An inline entity wrapper, not a
 ///   section; two become `Mention` leaves, one is empty.
-/// * **`span` — 1, `ffbAAA8eMpE` only.** The one `<span>` in the corpus that
-///   does **not** repeat a parent's id:
-///   `<span annotationid="temp:C:ffbc9747…" class="c9 h2" id="temp:C:ffbc9747…">`,
-///   the highlight range of an inline *comment*. It is not a section — it is
-///   mid-paragraph inline markup, and comments are not imported at all — so
-///   there is no block for it to name. Unlike the `<span>`s that repeat a
-///   cell id, this one resolves to nothing; an anchor pointing at it would
-///   miss. That is a known limit of comment import, not of #190, and this
-///   entry is where it is recorded. Note it is double-quoted, so it is
-///   outside `spans_repeat_their_parents_id`'s single-quoted scan by
-///   construction — this map is what covers it.
 ///
-/// All three are explained in full at their fixture above.
+/// Both are explained in full at their fixture above.
 #[test]
-fn every_uncaptured_source_id_is_one_of_the_three_known_residues() {
+fn every_uncaptured_source_id_is_one_of_the_two_known_residues() {
     let expected: BTreeMap<&str, BTreeMap<&str, usize>> = BTreeMap::from([
         ("AeOAAAcV1hg", BTreeMap::new()),
         ("CVLAAAgSl7Q", BTreeMap::from([("ul", 10)])),
         ("ZaNAAAU4ELc", BTreeMap::new()),
         ("SSfAAALs7fy", BTreeMap::from([("control", 3)])),
         ("QGYAAAjicgG", BTreeMap::new()),
-        ("ffbAAA8eMpE", BTreeMap::from([("span", 1)])),
+        ("ffbAAA8eMpE", BTreeMap::new()),
     ]);
 
     for thread_id in CORPUS {
@@ -1543,20 +1553,20 @@ fn every_uncaptured_source_id_is_one_of_the_three_known_residues() {
     }
 }
 
-/// The premise the `<span>` residue rests on: a `<span id='…'>` — the
+/// The premise the wrapper `<span>`s rest on: a `<span id='…'>` — the
 /// per-item/per-cell wrapper, which Quip single-quotes — always repeats its
 /// enclosing `<li>`/`<td>`'s id byte for byte. If Quip ever gives one of
-/// those a distinct id, the residue above stops being harmless and spans need
-/// capturing in their own right.
+/// those a distinct id, resolving it through the parent stops being harmless
+/// and spans need capturing in their own right.
 ///
 /// The scan is deliberately the single-quoted spelling, which is the only one
 /// Quip uses for that wrapper. Its **double**-quoted `<span annotationid="…"
 /// id="…">` is a different element with a different job — an inline comment
 /// highlight, not a cell wrapper — and it does not repeat anything. There is
-/// exactly one in the corpus and
-/// `every_uncaptured_source_id_is_one_of_the_three_known_residues` above is
-/// what accounts for it; it is named there rather than folded in here so the
-/// two shapes do not get conflated.
+/// exactly one in the corpus; it is captured by the #194 F-10 anchor pass
+/// instead, and named at
+/// `the_comment_annotation_anchor_resolves_to_the_block_that_contains_it`
+/// rather than folded in here so the two shapes do not get conflated.
 ///
 /// Asserted on the raw bytes rather than through the parser, because it is a
 /// claim about Quip's markup, not about the walker.
