@@ -113,6 +113,23 @@ pub struct QuipDocument {
     /// A named loss, so the caller reports it the way it reports a dropped
     /// image rather than letting it pass silently.
     pub deep_nesting_truncated: usize,
+    /// Spreadsheet cells whose [`FORMULA_ATTR`] this import did not carry
+    /// into the document (#192).
+    ///
+    /// Quip keeps the formula on the cell's `<span>` and the last value it
+    /// computed as that span's text; only the text survives, so the imported
+    /// table shows the numbers Quip last calculated and nothing recomputes.
+    /// A named loss for the same reason `deep_nesting_truncated` is one: the
+    /// data was in the export and the import did not keep it.
+    pub formulas_dropped: usize,
+    /// Embedded Quip live-app blocks — Kanban boards and whatever else Quip
+    /// spells with [`LIVE_APP_ATTR_PREFIX`] — whose payload this import did
+    /// not convert (#191).
+    ///
+    /// The walker imports whatever ordinary HTML the block rendered into
+    /// (for a Kanban board, its column-heading row) and nothing of the
+    /// payload that holds the board's actual cards.
+    pub live_apps_dropped: usize,
 }
 
 /// An image the source referenced, keyed by the blockId of the
@@ -168,8 +185,13 @@ pub const PENDING_QUIP_URL_ATTR: &str = "pending_quip_url";
 /// The returned document's person mentions are **unfinished** — see
 /// [`QuipDocument::person_mentions`] and [`resolve_person_mentions`].
 pub fn from_quip_html(html: &str) -> QuipDocument {
-    let (blocks, truncated) = parse_quip_counting_truncations(html);
-    QuipDocument { deep_nesting_truncated: truncated, ..materialize(&blocks) }
+    let (blocks, losses) = parse_quip_counting_losses(html);
+    QuipDocument {
+        deep_nesting_truncated: losses.deep_nesting_truncated,
+        formulas_dropped: losses.formulas_dropped,
+        live_apps_dropped: losses.live_apps_dropped,
+        ..materialize(&blocks)
+    }
 }
 
 // ─── intermediate block model ────────────────────────────────────
@@ -397,10 +419,24 @@ fn allowed_tags() -> HashSet<&'static str> {
 /// Attributes the walker reads. Anything not listed here (and not
 /// `data-*`) is stripped before the DOM is built, so the walker never
 /// sees an event handler or a style payload.
+///
+/// `formula` is here for one reason and it is worth stating, because
+/// widening this set is the one edit in this file that moves the XSS
+/// boundary: without it the attribute is gone before the DOM exists, and
+/// [`count_unconverted_content`] cannot tell a spreadsheet that lost 30
+/// formulas from a table that never had one (#192). Its **value is never
+/// read** — nothing in this module calls `attr(_, "formula")`, so the string
+/// reaches no yrs node, no `ReportNote::detail`, and no log. What it admits
+/// is therefore an attribute that is (a) not an event handler, (b) not a URL
+/// carrier, so no scheme filter applies to it, (c) not `style`, and (d)
+/// re-emitted by ammonia with its value HTML-escaped in any case. A
+/// `data-`-prefixed spelling of the same attribute would already be admitted
+/// by `generic_attribute_prefixes` below, so this is the existing policy
+/// applied to the name Quip actually uses, not a new kind of allowance.
 fn allowed_attributes() -> HashSet<&'static str> {
     [
         "id", "href", "src", "alt", "title", "type", "checked", "value",
-        "colspan", "rowspan", "class", "start", "align",
+        "colspan", "rowspan", "class", "start", "align", "formula",
     ]
     .into_iter()
     .collect()
@@ -446,17 +482,49 @@ fn sanitize(html: &str) -> String {
 /// accumulation runs to tens, not hundreds.
 pub const MAX_NESTING_DEPTH: usize = 128;
 
+/// The attribute Quip puts on a spreadsheet cell's `<span>` to carry that
+/// cell's formula — `formula='=SUM(D8:D10)'` (#192). The span's *text* is
+/// the value Quip last computed from it.
+pub const FORMULA_ATTR: &str = "formula";
+
+/// Attribute-name prefix Quip uses for an embedded live app's own state
+/// (#191): `data-live-app-payload` holds a Kanban board's cards, and the
+/// prefix rather than the exact name is matched so a sibling spelling
+/// (`data-live-app-id`, `data-live-app-type`) counts the same block once.
+///
+/// **This prefix is the one thing here not pinned by a fixture.** No corpus
+/// document carries a live app — `tests/quip_corpus.rs` names that as a
+/// deliberate coverage gap, and the audit's Kanban thread (`dAcAAAm68OG`) was
+/// never checked in and its staging prefix has since been purged. The name
+/// comes from the audit finding recorded on issue #191. If it turns out to be
+/// wrong, the failure mode is the one we already have — a board imports with
+/// no note — never a false report, since nothing else in 5 real documents and
+/// 56 audited ones spells an attribute this way.
+pub const LIVE_APP_ATTR_PREFIX: &str = "data-live-app";
+
 /// Parse Quip HTML into the intermediate block model. Pure: no yrs
 /// transaction is live while the DOM is walked.
 pub(crate) fn parse_quip(html: &str) -> Vec<QuipBlock> {
-    parse_quip_counting_truncations(html).0
+    parse_quip_counting_losses(html).0
 }
 
-/// [`parse_quip`] plus the number of subtrees that were flattened for
-/// exceeding [`MAX_NESTING_DEPTH`]. Split out so `parse_quip` keeps the
-/// signature its unit tests use while [`from_quip_html`] can surface the loss
-/// on [`QuipDocument`] and the importer can report it.
-pub(crate) fn parse_quip_counting_truncations(html: &str) -> (Vec<QuipBlock>, usize) {
+/// Everything the parse knows it did not carry across. Each field is a
+/// *count of things the source had*, so a caller can name the loss to the
+/// user; none of them is an error, and none of them stops an import.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParseLosses {
+    /// Subtrees flattened for exceeding [`MAX_NESTING_DEPTH`].
+    pub deep_nesting_truncated: usize,
+    /// Cells carrying [`FORMULA_ATTR`] (#192).
+    pub formulas_dropped: usize,
+    /// Elements carrying a [`LIVE_APP_ATTR_PREFIX`] attribute (#191).
+    pub live_apps_dropped: usize,
+}
+
+/// [`parse_quip`] plus what the parse lost. Split out so `parse_quip` keeps
+/// the signature its unit tests use while [`from_quip_html`] can surface the
+/// losses on [`QuipDocument`] and the importer can report them.
+pub(crate) fn parse_quip_counting_losses(html: &str) -> (Vec<QuipBlock>, ParseLosses) {
     use html5ever::tendril::TendrilSink;
     use markup5ever_rcdom::RcDom;
 
@@ -465,6 +533,13 @@ pub(crate) fn parse_quip_counting_truncations(html: &str) -> (Vec<QuipBlock>, us
         .from_utf8()
         .read_from(&mut safe.as_bytes())
         .expect("html5ever parse is infallible on bytes");
+
+    // Count what this walker is about to not carry, on the tree as Quip
+    // wrote it. Before `flatten_below_depth` on purpose: that pass replaces
+    // an over-deep subtree with its flattened text, which would take a
+    // formula or a live-app payload with it and make the loss report the one
+    // thing it must never be — quieter than the loss.
+    let mut losses = count_unconverted_content(&dom.document);
 
     // Drop Quip's per-cell line terminators BEFORE anything reshapes the
     // tree. Order is load-bearing: `normalize_quip_lists` re-parents a
@@ -487,14 +562,72 @@ pub(crate) fn parse_quip_counting_truncations(html: &str) -> (Vec<QuipBlock>, us
     // MAX_NESTING_DEPTH, so every recursive pass over it — `walk_element`,
     // `enforce_containment`, `materialize_block` — is bounded by the same
     // constant for free, and no future recursive pass can forget to check.
-    let truncated = flatten_below_depth(&dom.document);
+    losses.deep_nesting_truncated = flatten_below_depth(&dom.document);
 
     let mut out = Vec::new();
     let mut pending = InlineBuf::default();
     walk_children(&dom.document, &mut out, &Marks::default(), &mut pending);
     pending.flush(&mut out, None);
 
-    (enforce_containment(out, NodeType::Doc), truncated)
+    (enforce_containment(out, NodeType::Doc), losses)
+}
+
+/// Count the two kinds of content this walker knowingly leaves behind:
+/// spreadsheet formulas (#192) and embedded live-app payloads (#191).
+///
+/// **A census, not a conversion.** Neither attribute's *value* is read — the
+/// job here is to let the importer say "this document had 30 formulas and
+/// none of them came over", which is the difference between a lossy import
+/// and a silent one. Nothing about a count can fail, so this returns no
+/// error and the caller has no branch to get wrong.
+///
+/// Both counts are per **element**: one element carrying any number of
+/// `data-live-app-*` attributes is one live app, and one element carrying
+/// `formula` is one formula. In Quip's markup the second of those is a cell
+/// — the attribute rides on the `<span>` inside a `<td>`, one per cell — but
+/// that is a fact about the input, not a rule this function enforces, and
+/// the corpus net states it as such by asserting `formulas_dropped` equals
+/// the source's `formula='` count.
+///
+/// Counted on the sanitized DOM, which is the only DOM there is — `formula`
+/// survives `sanitize` by being in `allowed_attributes`, and
+/// `data-live-app-*` by the `data-` prefix allowance.
+///
+/// **Iterative**, like `flatten_below_depth` and for the same reason: this
+/// runs *before* the depth bound is imposed, so it sees third-party HTML of
+/// unbounded depth, and a recursive census of it would abort the worker.
+fn count_unconverted_content(document: &markup5ever_rcdom::Handle) -> ParseLosses {
+    use markup5ever_rcdom::NodeData;
+
+    let mut losses = ParseLosses::default();
+    let mut stack: Vec<markup5ever_rcdom::Handle> = vec![document.clone()];
+    while let Some(node) = stack.pop() {
+        if let NodeData::Element { attrs, .. } = &node.data {
+            let attrs = attrs.borrow();
+            let mut names = attrs.iter().map(|a| a.name.local.as_ref());
+            if names.clone().any(|n| n.eq_ignore_ascii_case(FORMULA_ATTR)) {
+                losses.formulas_dropped += 1;
+            }
+            // `get`, never `n[..len]`. An attribute name is arbitrary
+            // third-party text: non-ASCII names are legal HTML, html5ever
+            // keeps them, and the whole `data-` namespace reaches here. A
+            // byte slice panics on any name whose 13th byte lands inside a
+            // multi-byte character — `data-emoji-🙂` is enough — and the
+            // worker's `catch_unwind` would turn that into a thread that
+            // burns its attempts and lands `Failed`. `get` returns `None`
+            // both out of bounds and off a char boundary, and `None` is the
+            // right answer either way: a name whose 13th byte is mid-character
+            // cannot start with an ASCII prefix.
+            if names.any(|n| {
+                n.get(..LIVE_APP_ATTR_PREFIX.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(LIVE_APP_ATTR_PREFIX))
+            }) {
+                losses.live_apps_dropped += 1;
+            }
+        }
+        stack.extend(node.children.borrow().iter().cloned());
+    }
+    losses
 }
 
 /// Replace every subtree rooted deeper than [`MAX_NESTING_DEPTH`] with a
@@ -862,7 +995,7 @@ fn append_child(parent: &markup5ever_rcdom::Handle, child: markup5ever_rcdom::Ha
 ///
 /// Runs as a DOM pre-pass rather than inside the walker so the question
 /// is answered against the markup Quip actually wrote; see the ordering
-/// comment in [`parse_quip_counting_truncations`]. Iterative for the same
+/// comment in [`parse_quip_counting_losses`]. Iterative for the same
 /// reason [`flatten_below_depth`] is: it runs on the un-bounded tree.
 ///
 /// # This is the exact opposite of #184 — deliberately, do not unify
@@ -2605,8 +2738,10 @@ fn materialize(blocks: &[QuipBlock]) -> QuipDocument {
         pending_links: side.pending_links,
         person_mentions: side.person_mentions,
         // Set by `from_quip_html`, which is the only caller that has the
-        // parse-time count; `materialize` alone cannot know.
+        // parse-time counts; `materialize` alone cannot know.
         deep_nesting_truncated: 0,
+        formulas_dropped: 0,
+        live_apps_dropped: 0,
     }
 }
 
@@ -2805,6 +2940,175 @@ mod tests {
 
     fn blocks(html: &str) -> Vec<QuipBlock> {
         parse_quip(html)
+    }
+
+    fn doc_xml(quip: &QuipDocument) -> String {
+        let txn = quip.doc.transact();
+        let root = txn.get_xml_fragment("content").expect("root fragment");
+        root.get_string(&txn)
+    }
+
+    // ─── content the import knows it does not carry (#191, #192) ──
+    //
+    // Both of these are *silent* losses today: the data is in the export,
+    // nothing reads it, and the imported document gives the reader no hint
+    // that anything is missing. The counts below are what lets the worker
+    // say so. They are counts and nothing more — neither attribute's value
+    // is read, and the assertions that the values do NOT reach the document
+    // are as load-bearing as the counts themselves.
+
+    /// Two spreadsheet cells, **verbatim** from
+    /// `tests/fixtures/quip/corpus/QGYAAAjicgG.html` — the `<span
+    /// formula=…>` inside a `<td>`, its text being the value Quip last
+    /// computed, and Quip's `<br/>` cell terminator. Byte-exact including
+    /// the `style=''`, the blank lines, and the `temp:s:temp:C:` ids.
+    const REAL_FORMULA_CELLS: &str = "<table><tr><td id='temp:s:temp:C:QGY02ded512fb3c4b019236db16b_temp:C:QGY2d8b7a16c9bb42f5bf0bc2efd' style=''><span id='temp:s:temp:C:QGY02ded512fb3c4b019236db16b_temp:C:QGY2d8b7a16c9bb42f5bf0bc2efd' formula='=D8*D9'>3</span>\n\n<br/></td><td id='temp:s:temp:C:QGY332cf016b08748b09637afc75_temp:C:QGY2d8b7a16c9bb42f5bf0bc2efd' style=''><span id='temp:s:temp:C:QGY332cf016b08748b09637afc75_temp:C:QGY2d8b7a16c9bb42f5bf0bc2efd' formula='=SUM(D8:D10)'>4</span>\n\n<br/></td></tr></table>";
+
+    #[test]
+    fn a_cell_formula_is_counted_as_a_named_loss() {
+        let quip = from_quip_html(REAL_FORMULA_CELLS);
+        assert_eq!(quip.formulas_dropped, 2, "one per `formula`-bearing cell");
+        assert_eq!(quip.live_apps_dropped, 0, "a spreadsheet is not a live app");
+    }
+
+    /// The other half of #192, and the half a count cannot state: the
+    /// formula does not silently become *content*. Only the value Quip
+    /// cached survives into the document, so the reader sees the same
+    /// numbers they saw in Quip — and the `=…` string, which would render
+    /// as literal text in a document table and as a live formula if the
+    /// table were ever loaded as a sheet, reaches nothing.
+    #[test]
+    fn a_formula_never_reaches_the_document_only_the_value_quip_cached_does() {
+        let quip = from_quip_html(REAL_FORMULA_CELLS);
+        let xml = doc_xml(&quip);
+        assert!(!xml.contains("=D8*D9"), "the formula string must not become content: {xml}");
+        assert!(!xml.contains("SUM("), "the formula string must not become content: {xml}");
+        assert!(!xml.contains("formula"), "no `formula` attribute reaches a yrs node: {xml}");
+        assert!(xml.contains('3') && xml.contains('4'), "the cached values survive: {xml}");
+    }
+
+    /// `formula` has to clear the sanitizer or the count above is always
+    /// zero — that is the whole reason it was added to `allowed_attributes`.
+    #[test]
+    fn the_sanitizer_admits_formula_so_the_loss_can_be_counted() {
+        let out = sanitize("<td><span formula='=D8*D9'>3</span></td>");
+        assert!(out.contains("formula="), "sanitize must keep `formula`: {out:?}");
+        assert_eq!(
+            from_quip_html("<td><span formula='=D8*D9'>3</span></td>").formulas_dropped,
+            1,
+            "a stripped attribute would make this a silent loss again",
+        );
+    }
+
+    /// **Synthetic markup, deliberately.** No corpus fixture carries a live
+    /// app (`tests/quip_corpus.rs` records that as a known coverage gap) and
+    /// the audit's Kanban thread `dAcAAAm68OG` was never checked in, so
+    /// there is no real board to pin this to and inventing one would only
+    /// pin the invention. What this asserts is the *mechanism*: an element
+    /// carrying `data-live-app-*` is counted once, whatever it renders as
+    /// and however many such attributes it has. See `LIVE_APP_ATTR_PREFIX`
+    /// for where the attribute name comes from and what happens if it is
+    /// wrong.
+    #[test]
+    fn a_live_app_block_is_counted_once_however_many_attributes_it_carries() {
+        let quip = from_quip_html(
+            "<div data-live-app-id='kanban' data-live-app-payload='{\"cards\":[]}'>\
+             <table><tr><th>To do</th><th>Done</th></tr></table></div>",
+        );
+        assert_eq!(quip.live_apps_dropped, 1, "one block, not one per attribute");
+        assert_eq!(quip.formulas_dropped, 0);
+        // The block's rendered scaffolding still imports; the count says
+        // what rode in the payload did not.
+        let xml = doc_xml(&quip);
+        assert!(xml.contains("<table"), "the headings Quip rendered still import: {xml}");
+    }
+
+    #[test]
+    fn two_live_app_blocks_are_two_losses() {
+        let quip = from_quip_html(
+            "<div data-live-app-payload='a'>x</div><div data-live-app-payload='b'>y</div>",
+        );
+        assert_eq!(quip.live_apps_dropped, 2);
+    }
+
+    /// An attribute name that is not ASCII must not take the importer down.
+    ///
+    /// `LIVE_APP_ATTR_PREFIX` is 13 bytes, and the prefix test used to be a
+    /// **byte** slice — `n[..13]` — which panics on any name whose 13th byte
+    /// falls inside a multi-byte character. `data-emoji-🙂` is exactly that:
+    /// `data-emoji-` is 11 bytes and the emoji occupies 11..15, so 13 splits
+    /// it. Nothing about the name is live-app-ish; it only has to be the
+    /// wrong length in the wrong place.
+    ///
+    /// This is reachable input, not a curiosity. Non-ASCII attribute names
+    /// are legal HTML, html5ever preserves them, and the whole `data-`
+    /// namespace is admitted by `generic_attribute_prefixes`, so the
+    /// sanitizer hands them straight to the census. The per-thread
+    /// `catch_unwind` in the worker would contain the panic, which is
+    /// precisely what makes it nasty: the import does not crash, the thread
+    /// just burns its attempts and lands `Failed`. A document that imports
+    /// today would stop importing — in the change whose entire purpose is to
+    /// stop losing content.
+    ///
+    /// `from_quip_html_never_panics` does not cover this: proptest is not
+    /// going to invent a 13-byte-prefixed attribute name.
+    #[test]
+    fn a_non_ascii_attribute_name_is_not_a_live_app_and_does_not_panic() {
+        // Names that must NOT match. The first two straddle byte 13 exactly
+        // — `data-emoji-` is 11 bytes and `data-live-ap` is 12, so the emoji
+        // spans it either way — and the rest are shorter than the prefix or
+        // diverge before it. Every one of these panicked before the fix.
+        for name in ["data-emoji-🙂", "data-live-ap🙂", "data-liv🙂-app-payload", "🙂", "data-🙂"] {
+            let html = format!("<div {name}='x'>hi</div>");
+            let quip = from_quip_html(&html);
+            assert_eq!(
+                quip.live_apps_dropped, 0,
+                "{name:?} is not a live app; it is only an awkward length",
+            );
+            assert_eq!(quip.formulas_dropped, 0, "{name:?}");
+        }
+
+        // Names that must still match — the fix must not turn the detector
+        // off. `data-live-app🙂` is one of these, not a near-miss: it really
+        // does begin with the 13 ASCII bytes of the prefix, and a prefix
+        // match is what this detector promises. What it is followed by,
+        // multi-byte or not, is the same "sibling spelling" case as
+        // `data-live-app-id`.
+        for name in ["data-live-app🙂", "data-live-app-payload", "DATA-LIVE-APP-PAYLOAD"] {
+            let html = format!("<div {name}='🙂'>hi</div>");
+            let quip = from_quip_html(&html);
+            assert_eq!(quip.live_apps_dropped, 1, "{name:?} carries the prefix");
+        }
+    }
+
+    /// The count has to be a *loss* signal, not a noise generator: an
+    /// ordinary document must report nothing, or the report teaches the
+    /// reader to ignore it.
+    #[test]
+    fn an_ordinary_document_reports_neither_loss() {
+        let quip = from_quip_html(
+            "<h1>Title</h1><p>text</p><table><tr><td>cell</td></tr></table>\
+             <div data-section-style='5'><ul><li>item</li></ul></div>",
+        );
+        assert_eq!(quip.formulas_dropped, 0);
+        assert_eq!(quip.live_apps_dropped, 0);
+    }
+
+    /// Both counts are of what the *source* had. `flatten_below_depth`
+    /// replaces an over-deep subtree with its text, which would take the
+    /// attributes with it — so the census runs first, and a document that
+    /// hides its spreadsheet under 200 wrappers still reports the formula
+    /// it lost rather than reporting only that it was deep.
+    #[test]
+    fn a_loss_below_the_depth_bound_is_still_counted() {
+        let deep = format!(
+            "{}<span formula='=A1+A2'>7</span>{}",
+            "<div>".repeat(MAX_NESTING_DEPTH + 20),
+            "</div>".repeat(MAX_NESTING_DEPTH + 20),
+        );
+        let quip = from_quip_html(&deep);
+        assert!(quip.deep_nesting_truncated > 0, "the fixture must actually exceed the bound");
+        assert_eq!(quip.formulas_dropped, 1, "the census must precede the flattening");
     }
 
     // ─── blockId ─────────────────────────────────────────────

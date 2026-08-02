@@ -661,8 +661,8 @@ fn corpus_checklist_and_control_wrappers() {
 ///
 /// The widest table in the corpus and the densest concentration of section
 /// anchors: 1008 `id` attributes, nearly all on `<td>` and `<span>`. It also
-/// carries two `formula` attributes, which the sanitizer strips today (#192),
-/// and 469 U+200B-only cells.
+/// carries two `formula` attributes, which the import now counts but still
+/// does not carry (#192), and 469 U+200B-only cells.
 #[test]
 fn corpus_spreadsheet_section_id_density() {
     let (html, quip, c) = import("QGYAAAjicgG");
@@ -689,11 +689,41 @@ fn corpus_spreadsheet_section_id_density() {
     assert_eq!(c.hard_breaks, 0, "hard_break leaves — 496 cell terminators dropped (#189)");
     assert_eq!(c.trailing_hard_breaks, 0, "no trailing hard_break survives (#189)");
 
-    // #192: `formula` is neither allowlisted nor `data-`-prefixed, so
-    // ammonia strips it before the walker sees it. The attribute is still in
-    // the fixture; when #192 lands, the cached value stops being all that
-    // survives.
+    // #192, source side. Two — not the "28–30" the remediation brief
+    // predicted, and not the issue's "30 across 2 documents" either: that
+    // number is over the 56-document audit corpus, of which these five are
+    // the checked-in sample. This is the whole formula population available
+    // in-repo, and it is what any fix here can be pinned against.
     assert_eq!(html.matches("formula='").count(), 2, "formulas present in the source");
+
+    // #192, import side. `formula` now clears the sanitizer, so the import
+    // can *count* what it does not carry (`import_quip::FORMULA_ATTR`) — the
+    // difference between a lossy import and a silent one. It still does not
+    // carry it: the cells hold the values Quip last computed, nothing
+    // recalculates, and the number below is what the worker turns into the
+    // user's report note.
+    //
+    // Landing the formulas looks closer than it may read. A native sheet has
+    // no `formula` attribute — the formula **is** the cell's text, re-parsed
+    // on load (`spreadsheet_view/persistence.rs` hydrates each cell with
+    // `engine.set_cell(addr, &cell_node.text_content())`), and both formulas
+    // here are inside the native grammar (`*`, `SUM`, A1 ranges). Quip
+    // reports this thread's type as `spreadsheet` and `worker_mode` already
+    // maps that to `DocType::Spreadsheet`, so writing the formula as the
+    // cell's text — rather than the cached value — is the shape of the fix,
+    // and it drives this assertion to 0.
+    //
+    // What still has to be settled first, and why this is a separate unit:
+    // the sheet attrs (`sheetName`, the grid bounds) are not emitted by this
+    // walker, Quip's cell geometry has to be mapped onto `(col, row)` past
+    // the row-number `<td>` and corner `<th>`, and a formula *outside* the
+    // native grammar needs the literal-text-plus-note fallback rather than a
+    // silently different answer. Note also that the same attribute can ride
+    // in a table embedded in an ordinary `document` thread, where there is no
+    // sheet to be live in and the cached value is the better import — so the
+    // fix is conditioned on the thread's type, not on the attribute alone.
+    assert_eq!(quip.formulas_dropped, 2, "both source formulas are reported as lost");
+    assert_eq!(quip.live_apps_dropped, 0, "a spreadsheet is not a live app");
 
     // The sharpest statement of #190 in the suite, now the other way round:
     // 1 → 528. Where only the `<h1>` used to be captured — so an anchor
@@ -725,6 +755,46 @@ fn every_corpus_fixture_parses_without_truncation() {
             "{thread_id}: nothing in the real corpus reaches MAX_NESTING_DEPTH"
         );
         assert!(!quip.sections.is_empty(), "{thread_id}: every document has at least one anchor");
+    }
+}
+
+/// The known-coverage-gap paragraph at the top of this file states that no
+/// fixture here carries a live-app payload (#191). That is a claim about the
+/// corpus, so it belongs in the corpus net rather than only in prose — and
+/// it is the *only* statement about #191 these five documents can make.
+///
+/// It earns its place twice over. It is the false-positive guard for
+/// `import_quip::LIVE_APP_ATTR_PREFIX`: five real documents, 166 KB of
+/// third-party markup, and the detector must fire on none of it. And it is
+/// the tripwire for the gap itself — the day a fixture with a real board is
+/// added, this assertion fails and whoever adds it is told, at exactly the
+/// right moment, that #191 finally has ground truth to be pinned against.
+#[test]
+fn no_corpus_fixture_carries_a_live_app_and_the_detector_agrees() {
+    for thread_id in CORPUS {
+        let (html, quip, _c) = import(thread_id);
+        assert!(
+            !html.contains(ogrenotes_collab::import_quip::LIVE_APP_ATTR_PREFIX),
+            "{thread_id}: a fixture with a live app has appeared — #191 now has a real \
+             payload to be designed against, and this assertion is the wrong shape for it"
+        );
+        assert_eq!(quip.live_apps_dropped, 0, "{thread_id}: nothing here is a live app");
+    }
+}
+
+/// Formulas are the one #192 signal these fixtures carry, and only one
+/// document carries any. Stated across the whole corpus so a detector that
+/// started counting `<td>`s, or `value=`, or every `<span>`, fails here
+/// rather than inflating a user's report by two orders of magnitude.
+#[test]
+fn only_the_spreadsheet_fixture_reports_a_dropped_formula() {
+    for thread_id in CORPUS {
+        let (html, quip, _c) = import(thread_id);
+        assert_eq!(
+            quip.formulas_dropped,
+            html.matches("formula='").count(),
+            "{thread_id}: every source formula is counted exactly once"
+        );
     }
 }
 
