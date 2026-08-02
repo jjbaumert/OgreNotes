@@ -4526,6 +4526,34 @@ fn paste_markdown_heading_creates_h1_in_dom() {
     cleanup(&container);
 }
 
+/// #220, end to end through the real paste handler: pasting over a
+/// selection that crosses a block boundary must merge the two halves into
+/// one paragraph and leave a collapsed caret after the pasted text. The old
+/// flat replace left three paragraphs and a still-open range, so the next
+/// keystroke replaced what had just been pasted.
+#[wasm_bindgen_test]
+fn paste_over_a_cross_paragraph_selection_merges_and_collapses_the_caret() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), two_para_doc());
+
+    // doc[p("Hello"), p("World")]: 3..11 covers "llo" + the seam + "Wor".
+    set_selection(&view, 3, 11);
+    dispatch_paste(&view, &txns, "PASTED");
+
+    let state = view.state();
+    assert_eq!(state.doc.child_count(), 1,
+        "the two paragraph halves should merge into one, got: {}",
+        normalized_html(&view));
+    assert_eq!(state.doc.child(0).unwrap().text_content(), "HePASTEDld");
+    assert!(state.selection.empty(),
+        "selection should collapse to a caret, got ({}, {})",
+        state.selection.from(), state.selection.to());
+    assert_eq!(state.selection.from(), 9,
+        "caret should sit just after the pasted text");
+
+    cleanup(&container);
+}
+
 #[wasm_bindgen_test]
 fn paste_markdown_bullet_list_creates_ul_in_dom() {
     let container = create_container();

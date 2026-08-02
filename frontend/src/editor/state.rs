@@ -242,6 +242,46 @@ impl Transaction {
     pub fn replace_selection(self, slice: Slice) -> Result<Self, StepError> {
         let from = self.selection.from();
         let to = self.selection.to();
+
+        // #220: pasting inline content over a selection that spans block
+        // boundaries — the whole doc after Ctrl+A, or a drag across two
+        // paragraphs or list items — is the paste-path twin of #195.
+        // `replace` descends only as far as the deepest node containing
+        // BOTH endpoints, so the pasted inline content lands as a bare
+        // child of the Doc (or of a list/table container) beside the
+        // surviving block halves. For a select-all `EditorState::apply`
+        // normalizes that back into a paragraph and the damage is only a
+        // stale, still-open selection; for a cross-paragraph range it
+        // leaves three paragraphs where there should be one, and for a
+        // cross-item range it splices a bare text node between two list
+        // items — the undeletable-orphan class of #143/#153, which
+        // `needs_normalize` does not look deep enough to catch.
+        //
+        // `delete_selection` already collapses such a range into a single
+        // well-formed block and leaves a caret inside it, so route through
+        // it and insert there — then place the caret at the end of what was
+        // pasted, which `replace_selection` never did (mapping an `All`
+        // selection through the step just yields another range, leaving the
+        // pasted text selected so the next keystroke replaces it).
+        //
+        // Only inline slices take this route. A slice carrying block nodes
+        // must keep landing at the block level: inserting it at an inline
+        // caret would nest paragraphs inside a paragraph.
+        if from != to && !same_textblock(&self.doc, from, to) && is_inline_slice(&slice) {
+            let content_size = slice.content.size();
+            let txn = self.delete_selection()?;
+            let raw_pos = txn.selection.from();
+            let pos = match resolve_block_for_edit(&txn.doc, raw_pos) {
+                Some((_, resolved)) => resolved,
+                None => raw_pos,
+            };
+            let mut txn = txn.replace(pos, pos, slice)?;
+            // Pure insertion at `pos` inside a textblock: the end of the
+            // inserted content is exactly `pos + content_size`.
+            txn.selection = Selection::cursor(pos + content_size);
+            return Ok(txn);
+        }
+
         self.replace(from, to, slice)
     }
 
@@ -1348,6 +1388,18 @@ fn same_textblock(doc: &Node, a: usize, b: usize) -> bool {
         (Some(x), Some(y)) => x.offset == y.offset,
         _ => false,
     }
+}
+
+/// Whether every top-level node of `slice` can live directly inside a
+/// textblock's inline content — text, and the inline leaves (hard break,
+/// mentions). `false` means the slice carries block structure and has to be
+/// spliced in at the block level, never at an inline caret. See
+/// `replace_selection`'s cross-block branch (#220).
+fn is_inline_slice(slice: &Slice) -> bool {
+    slice.content.children.iter().all(|child| match child {
+        Node::Text { .. } => true,
+        Node::Element { node_type, .. } => node_type.is_inline(),
+    })
 }
 
 fn find_block_in_children(
@@ -2474,6 +2526,162 @@ mod tests {
         let new_state = state_with_sel.apply(txn);
         let para = new_state.doc.child(0).unwrap();
         assert_eq!(para.text_content(), "Goodbye world");
+    }
+
+    /// #220: pasting over a Ctrl+A select-all must leave a collapsed caret
+    /// at the end of the pasted content. `replace_selection` never placed a
+    /// caret — it mapped the existing `All` selection through the step, and
+    /// a mapped range is still a range, so the pasted text stayed selected
+    /// and the next keystroke replaced it.
+    #[test]
+    fn paste_over_select_all_collapses_to_a_caret_after_the_pasted_text() {
+        let base = EditorState::create_default(simple_doc());
+        let state = EditorState {
+            selection: Selection::all(&base.doc),
+            ..base
+        };
+
+        let slice = Slice::new(Fragment::from(vec![Node::text("PASTED")]), 0, 0);
+        let txn = state.transaction().replace_selection(slice).unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(shape(&new_state.doc), "Doc[Paragraph[\"PASTED\"]]");
+        // doc(paragraph("PASTED")): 1 = before "P", 7 = after "D". The doc's
+        // own end (8) sits outside every textblock and is not a caret.
+        assert!(
+            new_state.selection.empty(),
+            "selection must collapse, got ({}, {})",
+            new_state.selection.from(),
+            new_state.selection.to(),
+        );
+        assert_eq!(new_state.selection.head(), 7);
+    }
+
+    /// #220, structural half: the same flat replace put the pasted text in
+    /// as a bare child of Doc, so a cross-paragraph paste split the document
+    /// into three paragraphs instead of merging the two halves around it.
+    #[test]
+    fn paste_over_a_cross_paragraph_selection_merges_into_one_block() {
+        // doc[p("Hello"), p("World")]: 3..11 selects "llo" + the seam + "Wor".
+        let base = EditorState::create_default(two_para_doc());
+        let state = EditorState {
+            selection: Selection::text(3, 11),
+            ..base
+        };
+
+        let slice = Slice::new(Fragment::from(vec![Node::text("PASTED")]), 0, 0);
+        let txn = state.transaction().replace_selection(slice).unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(shape(&new_state.doc), "Doc[Paragraph[\"HePASTEDld\"]]");
+        assert!(new_state.selection.empty());
+        assert_eq!(new_state.selection.head(), 9);
+    }
+
+    /// #220, worst case: across two list items the flat replace spliced a
+    /// bare text node in as a direct child of the list. `needs_normalize`
+    /// only inspects Doc's children and their immediate children, so that
+    /// orphan SURVIVES `apply` — the undeletable-content class of #143/#153.
+    #[test]
+    fn paste_over_a_cross_list_item_selection_does_not_orphan_the_text() {
+        // doc[ul[li[p("A")], li[p("B")]]]: "A" at 3..4, "B" at 8..9.
+        let base = EditorState::create_default(sibling_items_doc());
+        let state = EditorState {
+            selection: Selection::text(3, 9),
+            ..base
+        };
+
+        let slice = Slice::new(Fragment::from(vec![Node::text("PASTED")]), 0, 0);
+        let txn = state.transaction().replace_selection(slice).unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(
+            shape(&new_state.doc),
+            "Doc[BulletList[ListItem[Paragraph[\"PASTED\"]]]]",
+        );
+        assert!(new_state.selection.empty());
+        assert_eq!(new_state.selection.head(), 9);
+    }
+
+    /// Control: a paste at a collapsed caret must not be captured by the
+    /// #220 branch. Document and selection both stay exactly as they were
+    /// before the fix — including the fact that the pasted run is left
+    /// selected, which is the flat path's own long-standing behavior and
+    /// deliberately out of scope here.
+    #[test]
+    fn paste_at_a_collapsed_caret_takes_the_flat_path_unchanged() {
+        let base = EditorState::create_default(simple_doc());
+        let state = EditorState {
+            selection: Selection::cursor(6),
+            ..base
+        };
+
+        let slice = Slice::new(Fragment::from(vec![Node::text("PASTED")]), 0, 0);
+        let txn = state.transaction().replace_selection(slice).unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(shape(&new_state.doc), "Doc[Paragraph[\"HelloPASTED world\"]]");
+        assert_eq!(
+            (new_state.selection.from(), new_state.selection.to()),
+            (6, 12),
+        );
+    }
+
+    /// Control: a selection wholly inside one textblock also stays on the
+    /// flat path — one block in, one block out, positions unshifted.
+    #[test]
+    fn paste_over_a_selection_inside_one_textblock_takes_the_flat_path_unchanged() {
+        // doc[p("Hello world")]: 1..6 is "Hello".
+        let base = EditorState::create_default(simple_doc());
+        let state = EditorState {
+            selection: Selection::text(1, 6),
+            ..base
+        };
+
+        let slice = Slice::new(Fragment::from(vec![Node::text("PASTED")]), 0, 0);
+        let txn = state.transaction().replace_selection(slice).unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(shape(&new_state.doc), "Doc[Paragraph[\"PASTED world\"]]");
+        assert_eq!(
+            (new_state.selection.from(), new_state.selection.to()),
+            (1, 7),
+        );
+    }
+
+    /// Control: a slice carrying block nodes keeps landing at the block
+    /// level even over a select-all. Routing it through the #220 branch
+    /// would insert paragraphs at an inline caret, nesting them inside a
+    /// paragraph.
+    #[test]
+    fn paste_of_block_content_over_select_all_still_replaces_at_the_block_level() {
+        let base = EditorState::create_default(simple_doc());
+        let state = EditorState {
+            selection: Selection::all(&base.doc),
+            ..base
+        };
+
+        let slice = Slice::new(
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("AAA")]),
+                ),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("BBB")]),
+                ),
+            ]),
+            0,
+            0,
+        );
+        let txn = state.transaction().replace_selection(slice).unwrap();
+        let new_state = state.apply(txn);
+
+        assert_eq!(
+            shape(&new_state.doc),
+            "Doc[Paragraph[\"AAA\"],Paragraph[\"BBB\"]]",
+        );
     }
 
     #[test]
