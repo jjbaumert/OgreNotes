@@ -43,6 +43,40 @@ pub struct ClientHandle {
     pub sender: mpsc::UnboundedSender<Vec<u8>>,
 }
 
+/// The connection that stored an awareness cache entry.
+///
+/// `session_id` alone is *not* enough to decide who may forget an
+/// entry: the present-mode reconnect path (#210) deliberately reuses
+/// the same session id across reconnects, so a half-open socket that
+/// the load balancer only reaps ~60s later would otherwise run its
+/// disconnect cleanup and wipe the cursor of a presenter who has
+/// already reconnected and is live. Tagging the entry with the
+/// connection that stored it lets the cleanup ask "is this still
+/// mine?" — newest writer wins.
+///
+/// `client_id` is only unique within one `Room` on one API instance,
+/// so the instance id is part of the identity too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AwarenessOwner {
+    /// `RedisPubSub::instance_id()` of the API instance holding the
+    /// connection.
+    pub instance_id: u64,
+    /// The room-local `client_id` of the connection.
+    pub client_id: u64,
+}
+
+/// A cached awareness payload plus the connection that stored it.
+struct AwarenessEntry {
+    payload: Vec<u8>,
+    /// `None` for entries stored from a remote instance's Redis fanout
+    /// (`apply_remote_update`) — the owning connection lives on another
+    /// instance, so no local connection may claim it. That's the
+    /// desired behavior: a local connection finding `None` under its
+    /// session id learns that a newer writer (the reconnect that landed
+    /// on a different instance) took over, and stays silent.
+    owner: Option<AwarenessOwner>,
+}
+
 /// A collaboration room for a single document.
 pub struct Room {
     /// The server-side CRDT document.
@@ -78,7 +112,12 @@ pub struct Room {
     /// time in the consumers that want that (cursor overlay, spreadsheet
     /// view) — present mode's follow feature deliberately keeps the
     /// full per-session list.
-    awareness: RwLock<HashMap<String, Vec<u8>>>,
+    ///
+    /// Each entry is additionally tagged with the *owner* that stored it
+    /// (`AwarenessEntry::owner`) so a stale connection can't forget an
+    /// entry a newer connection has since re-stored — see
+    /// `AwarenessOwner`.
+    awareness: RwLock<HashMap<String, AwarenessEntry>>,
     /// Document ID.
     doc_id: String,
     /// Timestamp of the last edit (milliseconds since epoch).
@@ -387,15 +426,69 @@ impl Room {
     /// each awareness frame is broadcast so future joiners can be primed
     /// with the current cursor state. Keyed by `session_id` (#211/#212)
     /// — see the field doc on `awareness` for why.
+    /// Store an entry with no local owner. Used by
+    /// `apply_remote_update` for a frame that arrived over the Redis
+    /// fanout: the owning connection lives on another instance, so no
+    /// local connection may forget it via `forget_awareness_owned_by`.
     pub async fn store_awareness(&self, session_id: &str, payload: Vec<u8>) {
-        self.awareness.write().await.insert(session_id.to_string(), payload);
+        self.awareness
+            .write()
+            .await
+            .insert(session_id.to_string(), AwarenessEntry { payload, owner: None });
     }
 
-    /// Forget a session's awareness when it disconnects (or on a remote
-    /// `AwarenessLeave`). Two sessions of the same user are independent —
-    /// forgetting one never touches the other's entry.
+    /// Store an entry on behalf of a specific local connection, tagging
+    /// it so only that connection may later forget it. Newest writer
+    /// wins: re-storing under a session id another connection stored
+    /// transfers ownership, which is exactly what a reconnect (same
+    /// session id, new connection) needs — see `AwarenessOwner`.
+    pub async fn store_awareness_owned(
+        &self,
+        session_id: &str,
+        payload: Vec<u8>,
+        owner: AwarenessOwner,
+    ) {
+        self.awareness.write().await.insert(
+            session_id.to_string(),
+            AwarenessEntry { payload, owner: Some(owner) },
+        );
+    }
+
+    /// Forget a session's awareness unconditionally. Used for a remote
+    /// `AwarenessLeave` (the publishing instance already applied the
+    /// ownership check on its own side) and by tests. Two sessions of
+    /// the same user are independent — forgetting one never touches the
+    /// other's entry.
     pub async fn forget_awareness(&self, session_id: &str) {
         self.awareness.write().await.remove(session_id);
+    }
+
+    /// Forget a session's awareness **only if** `owner` still owns the
+    /// cached entry. Returns whether the entry was removed — i.e.
+    /// whether this connection is still the rightful source of a leave
+    /// announcement for `session_id`.
+    ///
+    /// `false` means a newer connection re-stored under the same
+    /// session id (a reconnect, which reuses the id by design) or a
+    /// remote instance's fanout took over the entry. The caller must
+    /// then suppress its leave entirely — see
+    /// `awareness::leave_actions`.
+    pub async fn forget_awareness_owned_by(
+        &self,
+        session_id: &str,
+        owner: AwarenessOwner,
+    ) -> bool {
+        let mut awareness = self.awareness.write().await;
+        match awareness.get(session_id) {
+            Some(entry) if entry.owner == Some(owner) => {
+                awareness.remove(session_id);
+                true
+            }
+            // Either nothing cached (nothing to announce a leave for)
+            // or someone else owns it now (announcing would wipe a live
+            // cursor).
+            _ => false,
+        }
     }
 
     /// Legacy fallback for an `AwarenessLeave` frame that carries only a
@@ -409,8 +502,8 @@ impl Room {
     /// during a rolling deploy.
     pub async fn forget_awareness_by_user(&self, user_id: &str) {
         let mut awareness = self.awareness.write().await;
-        awareness.retain(|_session_id, payload| {
-            match super::awareness::decode_awareness(payload) {
+        awareness.retain(|_session_id, entry| {
+            match super::awareness::decode_awareness(&entry.payload) {
                 Some(state) => state.user_id != user_id,
                 // Undecodable cached payload — shouldn't happen (we only
                 // ever cache what we successfully decoded), but keep it
@@ -433,7 +526,7 @@ impl Room {
             .read()
             .await
             .iter()
-            .filter_map(|(sid, v)| (sid != exclude_session).then(|| v.clone()))
+            .filter_map(|(sid, entry)| (sid != exclude_session).then(|| entry.payload.clone()))
             .collect()
     }
 
@@ -1159,6 +1252,84 @@ mod tests {
         assert_eq!(snap[0], mk("bob", "sess-bob-1"));
     }
 
+    // ── awareness entry ownership (#210 × #212 interaction) ────────
+
+    /// The reconnect path (#210) deliberately reuses the session id, so
+    /// after a half-open socket is replaced the *stale* connection must
+    /// not be able to forget the live one's entry. Newest writer wins.
+    #[tokio::test]
+    async fn awareness_reconnect_under_same_session_id_transfers_ownership() {
+        let room = Room::new_empty("doc-1".to_string());
+        let conn_a = AwarenessOwner { instance_id: 7, client_id: 1 };
+        let conn_b = AwarenessOwner { instance_id: 7, client_id: 2 };
+
+        // Connection A announces, then the browser reconnects as
+        // connection B reusing session S and re-announces.
+        room.store_awareness_owned("sess-S", b"a-state".to_vec(), conn_a).await;
+        room.store_awareness_owned("sess-S", b"b-state".to_vec(), conn_b).await;
+
+        // The ALB reaps A's half-open socket ~60s later. Its cleanup
+        // must be a no-op — and must report that it owns nothing, so the
+        // caller suppresses the leave announcement entirely.
+        let removed = room.forget_awareness_owned_by("sess-S", conn_a).await;
+        assert!(!removed, "a stale connection must not own the re-stored entry");
+        assert_eq!(
+            room.awareness_snapshot("nobody").await,
+            vec![b"b-state".to_vec()],
+            "the live reconnected connection's entry must survive",
+        );
+
+        // B, the real owner, can still clean itself up normally.
+        let removed = room.forget_awareness_owned_by("sess-S", conn_b).await;
+        assert!(removed, "the current owner forgets its own entry");
+        assert!(room.awareness_snapshot("nobody").await.is_empty());
+    }
+
+    /// The same race across API instances: the reconnect landed on a
+    /// different task, so this instance learned about session S through
+    /// the Redis fanout (`store_awareness`, owner `None`). The stale
+    /// local connection must still stand down.
+    #[tokio::test]
+    async fn awareness_remote_fanout_store_revokes_local_ownership() {
+        let room = Room::new_empty("doc-1".to_string());
+        let conn_a = AwarenessOwner { instance_id: 7, client_id: 1 };
+
+        room.store_awareness_owned("sess-S", b"a-state".to_vec(), conn_a).await;
+        // The reconnect landed on instance 8; its Awareness frame fanned
+        // out to us and overwrote the entry.
+        room.store_awareness("sess-S", b"remote-state".to_vec()).await;
+
+        let removed = room.forget_awareness_owned_by("sess-S", conn_a).await;
+        assert!(!removed, "an entry owned elsewhere is not ours to forget");
+        assert_eq!(
+            room.awareness_snapshot("nobody").await,
+            vec![b"remote-state".to_vec()],
+        );
+    }
+
+    #[tokio::test]
+    async fn awareness_forget_owned_by_is_false_when_nothing_is_cached() {
+        // A connection that never sent an awareness frame has nothing to
+        // announce a leave for.
+        let room = Room::new_empty("doc-1".to_string());
+        let owner = AwarenessOwner { instance_id: 7, client_id: 1 };
+        assert!(!room.forget_awareness_owned_by("sess-never-announced", owner).await);
+    }
+
+    #[tokio::test]
+    async fn awareness_ownership_is_scoped_to_the_instance_not_just_client_id() {
+        // client_id is only unique within one Room on one API instance,
+        // so two instances' client 1 must not be able to forget each
+        // other's entries.
+        let room = Room::new_empty("doc-1".to_string());
+        let on_instance_7 = AwarenessOwner { instance_id: 7, client_id: 1 };
+        let on_instance_8 = AwarenessOwner { instance_id: 8, client_id: 1 };
+
+        room.store_awareness_owned("sess-S", b"state".to_vec(), on_instance_7).await;
+        assert!(!room.forget_awareness_owned_by("sess-S", on_instance_8).await);
+        assert!(room.forget_awareness_owned_by("sess-S", on_instance_7).await);
+    }
+
     // ── apply_remote_update CommentEvent relay ─────────────────────
 
     #[tokio::test]
@@ -1301,6 +1472,35 @@ mod tests {
         rx1.try_recv().expect("alice should still get the frame despite the missing session_id");
         let snap = room.awareness_snapshot("someone-elses-session").await;
         assert_eq!(snap, vec![payload], "frame must be cached under the synthesized fallback key");
+    }
+
+    /// The `Awareness` arm's other early return: a payload that
+    /// `decode_awareness` rejects (malformed JSON, oversize field, over
+    /// the payload cap). There's no session_id to cache it under and no
+    /// reason to trust it, so it must be dropped *before* the shared
+    /// relay at the bottom of `apply_remote_update` — an undecodable
+    /// frame reaching local clients would just make them do the same
+    /// failed parse.
+    #[tokio::test]
+    async fn apply_remote_update_awareness_undecodable_payload_is_not_relayed() {
+        use super::super::protocol::encode_message;
+
+        let registry = RoomRegistry::new();
+        let room = registry.get_or_insert("doc-1", OgreDoc::new());
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        room.add_client(1, "alice".into(), tx1).await;
+
+        let frame = encode_message(MessageType::Awareness, b"this is not awareness json");
+        registry.apply_remote_update("doc-1", &frame).await;
+
+        assert!(
+            rx1.try_recv().is_err(),
+            "an undecodable Awareness payload must not be relayed to local clients",
+        );
+        assert!(
+            room.awareness_snapshot("nobody").await.is_empty(),
+            "and nothing may be cached for it",
+        );
     }
 
     #[tokio::test]

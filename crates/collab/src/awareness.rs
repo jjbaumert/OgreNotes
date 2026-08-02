@@ -244,6 +244,70 @@ fn state_has_oversize_field(s: &AwarenessState) -> bool {
         || over_opt(session_id)
 }
 
+// ─── Disconnect-time leave decision (#212) ──────────────────────
+
+/// Build the `AwarenessLeave` payload for a departing session.
+///
+/// Wire shape (#211/#212) is UTF-8 `"{session_id}\0{user_id}"`. The
+/// `\0` separator is load-bearing: every consumer (`room.rs`'s
+/// `apply_remote_update`, the frontend's `handle_awareness_leave`)
+/// keys off `split_once('\0')`, and a payload without one is treated
+/// as the pre-#211/#212 bare-`user_id` legacy shape and routed to a
+/// scan-by-user fallback. `user_id` rides along purely for
+/// logging/debug — nothing parses it for correctness.
+pub fn leave_payload(session_id: &str, user_id: &str) -> String {
+    format!("{session_id}\0{user_id}")
+}
+
+/// What a disconnecting connection should do about its awareness entry.
+///
+/// This is the decision that used to live inline in
+/// `routes::ws.rs`'s cleanup block as an `if !is_empty { broadcast;
+/// publish }`, which *was* the #212 bug: the very last local client
+/// leaving a room never told other API instances the session was
+/// gone, so the cursor/"Follow …" pill lingered forever on every
+/// other instance. Pulled out here so the rule is pinned by unit
+/// tests rather than by reading the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AwarenessLeaveActions {
+    /// Send the leave to this instance's other clients in the room.
+    /// Pure optimization — `Room::broadcast` over an empty client map
+    /// is already a no-op, so this only avoids the allocation.
+    pub broadcast_locally: bool,
+    /// Publish the leave to Redis for the other API instances. This
+    /// must NOT be gated on the room being non-empty (#212).
+    pub publish_remotely: bool,
+}
+
+/// Decide what a disconnecting connection does about its awareness
+/// entry.
+///
+/// * `owns_cached_entry` — whether the cache entry under this
+///   connection's `session_id` is still tagged as belonging to *this*
+///   connection. False means a newer connection re-stored under the
+///   same session id — the reconnect path deliberately reuses the
+///   session id, so a stale half-open socket being reaped by the load
+///   balancer 60s later must not announce a leave for a presenter who
+///   is live again. Nothing would re-announce them (the client's
+///   send-dedup still matches the unchanged slide), so they'd stay
+///   invisible indefinitely.
+/// * `room_is_empty` — whether the room has any local clients left
+///   after this connection was removed.
+pub fn leave_actions(owns_cached_entry: bool, room_is_empty: bool) -> AwarenessLeaveActions {
+    if !owns_cached_entry {
+        // Someone else owns this session id now. Emitting a leave —
+        // locally or over Redis — would wipe a live cursor.
+        return AwarenessLeaveActions {
+            broadcast_locally: false,
+            publish_remotely: false,
+        };
+    }
+    AwarenessLeaveActions {
+        broadcast_locally: !room_is_empty,
+        publish_remotely: true,
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -647,5 +711,77 @@ mod tests {
         );
         decode_awareness(json.as_bytes())
             .expect("multibyte string exactly at byte cap must be accepted");
+    }
+}
+
+// ─── Leave-decision tests (#212, #210 interaction) ──────────────
+
+#[cfg(test)]
+mod leave_decision_tests {
+    use super::*;
+
+    /// The wire shape every consumer parses with `split_once('\0')`.
+    /// A payload that loses the separator silently degrades to the
+    /// legacy scan-by-user path on both the backend and the frontend.
+    #[test]
+    fn leave_payload_uses_the_nul_separated_session_user_shape() {
+        let p = leave_payload("sess-abc", "user-42");
+        assert_eq!(p, "sess-abc\0user-42");
+        assert_eq!(
+            p.split_once('\0'),
+            Some(("sess-abc", "user-42")),
+            "consumers key off split_once('\\0')",
+        );
+    }
+
+    #[test]
+    fn leave_payload_is_not_a_bare_user_id() {
+        // The legacy shape is a payload with no separator at all;
+        // a current-shape payload must never be mistaken for it.
+        assert!(leave_payload("s", "u").contains('\0'));
+    }
+
+    /// **This is the #212 regression guard.** The original bug was
+    /// `if !is_empty { broadcast; publish }` — the Redis publish
+    /// skipped exactly when the last local client left the room,
+    /// which is precisely when the other instances still hold the
+    /// stale cursor. Restoring that structure fails here.
+    #[test]
+    fn leave_is_published_remotely_even_when_the_room_went_empty() {
+        let actions = leave_actions(true, true);
+        assert!(
+            actions.publish_remotely,
+            "the last client leaving a room MUST still tell other instances (#212)",
+        );
+        assert!(
+            !actions.broadcast_locally,
+            "nobody local left to broadcast to",
+        );
+    }
+
+    #[test]
+    fn leave_is_broadcast_and_published_when_peers_remain() {
+        let actions = leave_actions(true, false);
+        assert!(actions.broadcast_locally);
+        assert!(actions.publish_remotely);
+    }
+
+    /// **This is the #210×#212 interaction guard.** A reconnect
+    /// reuses the session id, so a stale half-open connection reaped
+    /// later must stay silent — otherwise its leave wipes the live
+    /// reconnected presenter and nothing re-announces them.
+    #[test]
+    fn a_stale_connection_that_no_longer_owns_the_session_emits_nothing() {
+        for room_is_empty in [true, false] {
+            let actions = leave_actions(false, room_is_empty);
+            assert!(
+                !actions.publish_remotely,
+                "stale owner must not publish a leave (room_is_empty={room_is_empty})",
+            );
+            assert!(
+                !actions.broadcast_locally,
+                "stale owner must not broadcast a leave (room_is_empty={room_is_empty})",
+            );
+        }
     }
 }

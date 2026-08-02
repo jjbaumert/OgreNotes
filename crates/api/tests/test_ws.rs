@@ -990,3 +990,237 @@ async fn ws_foreign_doc_subscribe_denied_sends_error_frame() {
 
     app.cleanup().await;
 }
+
+// ── Awareness leave fanout (#210 × #211/#212) ──────────────────────
+//
+// The unit-level rule lives in `ogrenotes_collab::awareness::
+// leave_actions`; these two drive the *real* `handle_ws` cleanup block
+// over a TCP socket and observe what it actually puts on Redis, which
+// is the part the collab-crate tests can't see (they publish
+// hand-written frames, so they exercise `apply_remote_update`, not
+// whether `ws.rs` still publishes).
+
+/// A second "API instance": its own `RedisPubSub` (so a distinct
+/// `instance_id`, i.e. it does NOT filter the test app's publishes as
+/// loopback), its own `RoomRegistry`, and one fake local client in the
+/// room. Everything the app publishes for `doc_id` arrives on the
+/// returned receiver. Mirrors the `cross_instance_*` tests in
+/// `crates/collab/src/redis_pubsub.rs`.
+async fn spawn_peer_instance(
+    doc_id: &str,
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use fred::prelude::*;
+    use std::sync::Arc;
+
+    let config = fred::types::RedisConfig::from_url("redis://127.0.0.1:6379").unwrap();
+    let client = fred::clients::RedisClient::new(config.clone(), None, None, None);
+    client.connect();
+    client.wait_for_connect().await.expect("peer redis connect");
+    let pubsub = ogrenotes_collab::redis_pubsub::RedisPubSub::new(Arc::new(client));
+
+    let subscriber = fred::types::Builder::from_config(config)
+        .build_subscriber_client()
+        .expect("build_subscriber_client");
+    subscriber.init().await.expect("peer subscriber init");
+
+    let registry = Arc::new(ogrenotes_collab::room::RoomRegistry::new());
+    let room = registry.get_or_insert(doc_id, ogrenotes_collab::document::OgreDoc::new());
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    room.add_client(1, "peer-viewer".to_string(), tx).await;
+
+    let handle = pubsub
+        .spawn_subscriber(subscriber, registry.clone())
+        .await
+        .expect("peer subscriber");
+    // Keep the registry (and therefore the room + its client handle)
+    // alive for the subscriber task's lifetime.
+    std::mem::forget(registry);
+    (rx, handle)
+}
+
+/// Await the next frame of `want` type on the peer instance, up to
+/// `timeout_ms`. Returns the payload, or `None` if none arrived.
+async fn peer_await_frame(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    want: ogrenotes_collab::protocol::MessageType,
+    timeout_ms: u64,
+) -> Option<Vec<u8>> {
+    use ogrenotes_collab::protocol::decode_message;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
+            Ok(Some(frame)) => {
+                if let Some((ty, payload)) = decode_message(&frame) {
+                    if ty == want {
+                        return Some(payload.to_vec());
+                    }
+                }
+            }
+            Ok(None) => return None,
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
+fn awareness_frame(session_id: &str, name: &str) -> Vec<u8> {
+    let json = serde_json::json!({
+        "user_id": "spoofed-ignored-by-server",
+        "name": name,
+        "color": 3,
+        "session_id": session_id,
+        "presenting": "slide-1",
+    });
+    ogrenotes_collab::protocol::encode_message(
+        ogrenotes_collab::protocol::MessageType::Awareness,
+        serde_json::to_vec(&json).unwrap().as_slice(),
+    )
+}
+
+async fn open_ws(
+    addr: std::net::SocketAddr,
+    doc_id: &str,
+    ws_token: &str,
+) -> tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let url = format!("ws://{addr}/api/v1/documents/{doc_id}/ws?token={ws_token}");
+    let mut request = url.as_str().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("origin", "http://localhost:8080".parse().unwrap());
+    let (ws, _resp) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("ws handshake should succeed");
+    ws
+}
+
+/// #212 regression, at the call site. The original bug wrapped BOTH the
+/// local broadcast and the Redis publish in `if !is_empty`, so the last
+/// client leaving a room — exactly the case where every *other*
+/// instance still holds the stale cursor — never announced its leave
+/// and the "Follow …" pill lingered forever cross-instance. Here the
+/// disconnecting client is the only one in the room on the app's
+/// instance, so `is_empty` is true and the old structure publishes
+/// nothing.
+#[tokio::test]
+async fn ws_last_client_leaving_still_publishes_awareness_leave_cross_instance() {
+    use futures_util::SinkExt;
+    use ogrenotes_collab::protocol::MessageType;
+
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let addr = serve_router(&app).await;
+
+    let token = app.create_user_token("ws-leave-fanout@test.com").await;
+    let doc_id = app.create_doc(&token, "Leave Fanout", None).await;
+    let ws_token = fetch_ws_token(&app, &token, &doc_id).await;
+
+    let (mut peer_rx, peer_task) = spawn_peer_instance(&doc_id).await;
+
+    let mut ws = open_ws(addr, &doc_id, &ws_token).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        awareness_frame("sess-presenter", "Presenter").into(),
+    ))
+    .await
+    .unwrap();
+
+    // The awareness itself crosses instances (#212's other half).
+    let seen = peer_await_frame(&mut peer_rx, MessageType::Awareness, 5_000).await;
+    let seen = seen.expect("the peer instance should receive the Awareness frame");
+    let state = ogrenotes_collab::awareness::decode_awareness(&seen)
+        .expect("relayed awareness decodes");
+    assert_eq!(state.session_id.as_deref(), Some("sess-presenter"));
+
+    // Now the only client in the room disconnects.
+    let _ = ws.close(None).await;
+    drop(ws);
+
+    let leave = peer_await_frame(&mut peer_rx, MessageType::AwarenessLeave, 10_000).await;
+    let leave = leave.expect(
+        "the LAST client leaving must still publish an AwarenessLeave to other instances (#212)",
+    );
+    let text = String::from_utf8(leave).expect("leave payload is utf8");
+    let (session, user) = text
+        .split_once('\0')
+        .expect("leave payload keeps the `session_id\\0user_id` shape");
+    assert_eq!(session, "sess-presenter");
+    assert!(!user.is_empty(), "user_id rides along for logging");
+
+    peer_task.abort();
+    app.cleanup().await;
+}
+
+/// #210 × #212. Reconnect reuses the session id by design, so a stale
+/// connection reaped later must NOT announce a leave for a session a
+/// newer connection has re-announced — that would wipe a presenter who
+/// is live, and nothing re-announces them (the client's send-dedup
+/// still matches the unchanged slide).
+#[tokio::test]
+async fn ws_stale_connection_does_not_publish_leave_for_a_reconnected_session() {
+    use futures_util::SinkExt;
+    use ogrenotes_collab::protocol::MessageType;
+
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let addr = serve_router(&app).await;
+
+    let token = app.create_user_token("ws-stale-leave@test.com").await;
+    let doc_id = app.create_doc(&token, "Stale Leave", None).await;
+
+    let (mut peer_rx, peer_task) = spawn_peer_instance(&doc_id).await;
+
+    // The original connection announces session S.
+    let ws_token_a = fetch_ws_token(&app, &token, &doc_id).await;
+    let mut ws_a = open_ws(addr, &doc_id, &ws_token_a).await;
+    ws_a.send(tokio_tungstenite::tungstenite::Message::Binary(
+        awareness_frame("sess-S", "Presenter A").into(),
+    ))
+    .await
+    .unwrap();
+    peer_await_frame(&mut peer_rx, MessageType::Awareness, 5_000)
+        .await
+        .expect("first announce crosses instances");
+
+    // The browser saw `onclose`, reconnected, and re-announced under the
+    // SAME session id — a new server-side connection now owns S while
+    // the original socket is still half-open server-side.
+    let ws_token_b = fetch_ws_token(&app, &token, &doc_id).await;
+    let mut ws_b = open_ws(addr, &doc_id, &ws_token_b).await;
+    ws_b.send(tokio_tungstenite::tungstenite::Message::Binary(
+        awareness_frame("sess-S", "Presenter A").into(),
+    ))
+    .await
+    .unwrap();
+    peer_await_frame(&mut peer_rx, MessageType::Awareness, 5_000)
+        .await
+        .expect("re-announce crosses instances");
+
+    // The load balancer finally reaps the stale socket.
+    let _ = ws_a.close(None).await;
+    drop(ws_a);
+
+    let stray = peer_await_frame(&mut peer_rx, MessageType::AwarenessLeave, 3_000).await;
+    assert!(
+        stray.is_none(),
+        "a stale connection must not publish a leave for a session a live \
+         connection re-announced — that wipes a presenter who is still live",
+    );
+
+    // Positive control: the observer is still working, and the *owning*
+    // connection's leave does get published.
+    let _ = ws_b.close(None).await;
+    drop(ws_b);
+    let leave = peer_await_frame(&mut peer_rx, MessageType::AwarenessLeave, 10_000)
+        .await
+        .expect("the owning connection's leave IS published");
+    let text = String::from_utf8(leave).unwrap();
+    assert!(text.starts_with("sess-S\0"), "got {text:?}");
+
+    peer_task.abort();
+    app.cleanup().await;
+}
