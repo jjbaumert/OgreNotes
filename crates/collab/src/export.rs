@@ -3503,6 +3503,75 @@ mod tests {
         assert!(a < b, "slides must render in document order");
     }
 
+    /// One slide: a `role="content"` frame with "VISIBLE-CONTENT" and a
+    /// `role="notes"` frame with "SECRET-NOTES". Speaker notes must
+    /// never reach the PDF.
+    #[cfg(feature = "pdf")]
+    fn fixture_deck_with_notes() -> Doc {
+        doc_with(|txn, frag| {
+            let slide = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
+
+            let content = slide.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+            content.insert_attribute(txn, "role", "content");
+            let c_p = content.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &c_p, "VISIBLE-CONTENT");
+
+            let notes = slide.insert(txn, 1, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+            notes.insert_attribute(txn, "role", "notes");
+            let n_p = notes.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &n_p, "SECRET-NOTES");
+        })
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn deck_pdf_excludes_notes_frames() {
+        let doc = fixture_deck_with_notes();
+        let bytes = to_pdf(&doc);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("VISIBLE-CONTENT"), "content frame text must render");
+        assert!(!text.contains("SECRET-NOTES"), "notes frame text must never reach the PDF");
+    }
+
+    /// One slide, two content frames whose TREE order is the opposite
+    /// of their z order (mirrors `fixture_deck`'s HTML/Markdown
+    /// counterpart, but with distinctive text for a PDF byte-order
+    /// assertion): the z=1 frame is inserted first in the tree, the
+    /// z=0 frame second.
+    #[cfg(feature = "pdf")]
+    fn fixture_deck_z_inverted() -> Doc {
+        doc_with(|txn, frag| {
+            let slide = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
+
+            // Tree position 0, but z=1 — must PAINT (render) after the
+            // z=0 frame, i.e. its text appears LATER in the content stream.
+            let high = slide.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+            high.insert_attribute(txn, "z", "1");
+            let high_p = high.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &high_p, "Z-HIGH-TEXT");
+
+            // Tree position 1, but z=0 — must paint BEFORE the z=1 frame.
+            let low = slide.insert(txn, 1, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+            low.insert_attribute(txn, "z", "0");
+            let low_p = low.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &low_p, "Z-LOW-TEXT");
+        })
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn deck_pdf_paints_frames_in_z_order() {
+        let doc = fixture_deck_z_inverted();
+        let bytes = to_pdf(&doc);
+        let text = String::from_utf8_lossy(&bytes);
+        let low = text.find("Z-LOW-TEXT").expect("z=0 frame text present");
+        let high = text.find("Z-HIGH-TEXT").expect("z=1 frame text present");
+        assert!(
+            low < high,
+            "z=0 frame must paint (appear in the content stream) before the z=1 frame despite tree order"
+        );
+    }
+
     #[cfg(feature = "pdf")]
     #[test]
     fn non_deck_pdf_is_unchanged_by_the_slide_path() {
