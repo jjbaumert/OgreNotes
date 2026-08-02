@@ -119,6 +119,18 @@ pub fn PresentPage() -> impl IntoView {
     // decision itself reuses `crate::touch::swipe_direction`, the same
     // primitive spreadsheet touch handling is built on.
     let (touch_start, set_touch_start) = signal::<Option<(f64, f64)>>(None);
+    // The outer `.deck-present` div also has `on:click=go_next` (tap
+    // anywhere to advance, non-presenter view). Mobile browsers replay a
+    // handled touch as a compatibility `click` ~shortly after `touchend`
+    // unless that default is prevented — belt-and-suspenders here:
+    // `prevent_default()` on the touchend that resolves to a swipe asks
+    // the browser not to synthesize one, and this flag is the software
+    // fallback for engines that fire it anyway. It self-clears on the
+    // next click (whether synthetic or a genuine subsequent tap) or,
+    // failing that, after 400ms — comfortably past the ~300ms window
+    // mobile browsers use for the synthetic click — so a real tap that
+    // follows isn't silently swallowed.
+    let (suppress_next_click, set_suppress_next_click) = signal(false);
     let on_touch_start = move |ev: web_sys::TouchEvent| {
         if let Some(t) = ev.changed_touches().get(0) {
             set_touch_start.set(Some((t.client_x() as f64, t.client_y() as f64)));
@@ -131,11 +143,29 @@ pub fn PresentPage() -> impl IntoView {
         let dir = crate::touch::swipe_direction(
             start_x, start_y, t.client_x() as f64, t.client_y() as f64, 48.0,
         );
-        match dir {
-            Some(crate::touch::SwipeDir::Left) => go_next(),
-            Some(crate::touch::SwipeDir::Right) => go_prev(),
-            _ => {}
+        // Only a horizontal swipe navigates; a vertical one (dy-dominant,
+        // e.g. scrolling the presenter panel) is left alone entirely — no
+        // navigation, no prevent_default, no click suppression.
+        let navigate: Option<bool> = match dir {
+            Some(crate::touch::SwipeDir::Left) => Some(true),
+            Some(crate::touch::SwipeDir::Right) => Some(false),
+            _ => None,
+        };
+        let Some(is_next) = navigate else { return };
+        ev.prevent_default();
+        set_suppress_next_click.set(true);
+        leptos::task::spawn_local(async move {
+            gloo_timers::future::TimeoutFuture::new(400).await;
+            set_suppress_next_click.set(false);
+        });
+        if is_next { go_next() } else { go_prev() }
+    };
+    let on_stage_click = move |_: web_sys::MouseEvent| {
+        if suppress_next_click.get_untracked() {
+            set_suppress_next_click.set(false);
+            return;
         }
+        go_next();
     };
 
     // Window-level keydown: the overlay owns the whole page, and a
@@ -353,7 +383,7 @@ pub fn PresentPage() -> impl IntoView {
         <div
             class="deck-present"
             class:deck-present--presenter=is_presenter_view
-            on:click=move |_| go_next()
+            on:click=on_stage_click
             on:touchstart=on_touch_start
             on:touchend=on_touch_end
         >

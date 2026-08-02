@@ -736,15 +736,56 @@
     min-width: 0;
   }
 
-  /* The editor's three-column grid collapses to the canvas alone —
-   * the strip and pane are editing chrome. */
+  /* The editor's three-column grid collapses to the canvas alone — the
+   * strip (slide list) is pure editing chrome. The pane also hosts
+   * `.deck-present-btn` though, which is the *only* in-app entry point to
+   * `/d/:id/present` (it deliberately sits outside deck_view.rs's
+   * `Show when=!readonly` gate because presenting is a read operation,
+   * not an edit) — hiding the whole pane would strand the one
+   * mobile-reachable way to present. Only the pane's genuinely
+   * editing-only children (add-text-frame, theme picker) are hidden. */
   .deck-view {
     grid-template-columns: 1fr;
     grid-template-areas: "canvas";
   }
 
-  .deck-view__strip,
-  .deck-view__pane {
+  .deck-view__strip {
     display: none;
+  }
+
+  /* Fixed, not grid-flowed: `document.rs` mounts the shared doc `Toolbar`
+   * above `DeckView` unconditionally for every doc_type, and on mobile
+   * `responsive.css` pins THAT toolbar to the true viewport bottom
+   * (`position: fixed; z-index: 80`, `--mobile-toolbar-height: 44px`) —
+   * a rule aimed at ordinary document editing, but it still applies
+   * here since deck editing being out of scope doesn't stop the shared
+   * chrome from rendering. A grid-flowed pane would get squeezed under
+   * that (and under the also-unresponsive menu bar above it) to
+   * near-zero height, making Present unreachable again just less
+   * obviously than `display: none`. Pinning the pane above the mobile
+   * toolbar instead — same `--mobile-toolbar-height` offset
+   * `.spreadsheet-wrapper` already uses to clear it — decouples Present's
+   * reachability from that chrome entirely. */
+  .deck-view__pane {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: calc(var(--mobile-toolbar-height) + env(safe-area-inset-bottom));
+    z-index: 21;
+    display: flex;
+    justify-content: center;
+    padding: var(--space-sm);
+    border-top: 1px solid var(--color-border);
+    background: var(--color-surface);
+  }
+
+  .deck-view__pane > :not(.deck-present-btn) {
+    display: none;
+  }
+
+  .deck-present-btn {
+    width: 100%;
+    max-width: 320px;
+    min-height: var(--touch-target-min);
   }
 }
