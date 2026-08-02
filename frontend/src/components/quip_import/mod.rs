@@ -383,6 +383,9 @@ pub fn QuipImportWizard(
     let dest_folders: RwSignal<HashMap<String, FolderResponse>> = RwSignal::new(HashMap::new());
     let dest_expanded: RwSignal<HashSet<String>> = RwSignal::new(HashSet::new());
     let dest_selected: RwSignal<Option<String>> = RwSignal::new(None);
+    // Where the import is going, right now — the single derivation both the
+    // `start` call and the DOM anchor read. See [`effective_target`].
+    let target_folder_id = effective_target(destination, home_folder_id);
     let (starting, set_starting) = signal(false);
     let (started, set_started) = signal(false);
     // Gate for the poll loop below: flipped false to stop it early
@@ -603,17 +606,11 @@ pub fn QuipImportWizard(
         let Some(resp) = response.get_untracked() else {
             return;
         };
-        // The one place the destination becomes a wire value. Home when the
-        // user never opened the destination step; `None` only when the
-        // `/users/me` lookup has not landed, which also keeps Continue
-        // disabled — starting an import with no parent at all would 400.
-        let Some(target) = start_target_folder_id(
-            destination
-                .get_untracked()
-                .as_ref()
-                .map(|(id, _)| id.as_str()),
-            home_folder_id.get_untracked().as_deref(),
-        ) else {
+        // The destination becomes a wire value. Home when the user never
+        // opened the destination step; `None` only when the `/users/me`
+        // lookup has not landed, which also keeps Continue disabled —
+        // starting an import with no parent at all would 400.
+        let Some(target) = target_folder_id.get_untracked() else {
             return;
         };
         let roots: Vec<String> = selected
@@ -1026,14 +1023,7 @@ pub fn QuipImportWizard(
                                             <p
                                                 class="quip-import-target-home"
                                                 data-quip-import-target=move || {
-                                                    start_target_folder_id(
-                                                        destination
-                                                            .get()
-                                                            .as_ref()
-                                                            .map(|(id, _)| id.as_str()),
-                                                        home_folder_id.get().as_deref(),
-                                                    )
-                                                        .unwrap_or_default()
+                                                    target_folder_id.get().unwrap_or_default()
                                                 }
                                             >
                                                 {move || match destination.get() {
@@ -1388,6 +1378,35 @@ fn start_target_folder_id(chosen: Option<&str>, home: Option<&str>) -> Option<St
             .map(str::to_string)
     }
     usable(chosen).or_else(|| usable(home))
+}
+
+/// The wizard's live destination, as one derived signal over the two signals
+/// that determine it: the folder the user picked, and the Home folder from
+/// `/users/me`.
+///
+/// A function over signals rather than a closure inside the component so that
+/// **the read is testable, not just the rule**. `start_target_folder_id` alone
+/// leaves a gap no test of it can see: a call site that applies the rule
+/// correctly but feeds it the wrong signal — `None` where the user's choice
+/// belongs — sends every import to Home and passes every test of the pure
+/// function. Pulling the reads in here closes that; the construction
+/// `QuipImportWizard` uses is the one
+/// `the_wizards_live_destination_follows_the_users_choice` drives.
+///
+/// One derivation, two consumers, deliberately: the `data-quip-import-target`
+/// attribute reads it tracked so the anchor re-renders, `do_start` reads it
+/// untracked at the moment of the click. They cannot disagree about where the
+/// import is going.
+fn effective_target(
+    destination: RwSignal<Option<(String, String)>>,
+    home_folder_id: ReadSignal<Option<String>>,
+) -> Signal<Option<String>> {
+    Signal::derive(move || {
+        start_target_folder_id(
+            destination.get().as_ref().map(|(id, _)| id.as_str()),
+            home_folder_id.get().as_deref(),
+        )
+    })
 }
 
 fn open_folder_destination(status: &imports::StatusResponse) -> Option<String> {
@@ -1979,6 +1998,53 @@ mod tests {
         assert_eq!(
             start_target_folder_id(Some("folder-projects"), None).as_deref(),
             Some("folder-projects"),
+        );
+    }
+
+    /// **The read, not just the rule.** The tests above pin
+    /// `start_target_folder_id`; this one pins that the wizard feeds it the
+    /// signal the user's choice actually lives in. Without it, a `do_start`
+    /// that applied the rule perfectly to `None` — sending every import to
+    /// Home no matter what was picked — would pass every other test here.
+    ///
+    /// Drives the same construction the component does: `effective_target`
+    /// over the wizard's two destination signals. Leptos signals need no DOM,
+    /// so this much of the wiring is reachable natively. The click that
+    /// writes `destination` is not.
+    #[test]
+    fn the_wizards_live_destination_follows_the_users_choice() {
+        let destination: RwSignal<Option<(String, String)>> = RwSignal::new(None);
+        let (home_folder_id, set_home_folder_id) = signal::<Option<String>>(None);
+        let target = effective_target(destination, home_folder_id);
+
+        assert_eq!(
+            target.get_untracked(),
+            None,
+            "before /users/me lands there is nothing to start",
+        );
+
+        set_home_folder_id.set(Some("folder-home".to_string()));
+        assert_eq!(
+            target.get_untracked().as_deref(),
+            Some("folder-home"),
+            "an untouched wizard imports to Home",
+        );
+
+        destination.set(Some((
+            "folder-projects".to_string(),
+            "Projects".to_string(),
+        )));
+        assert_eq!(
+            target.get_untracked().as_deref(),
+            Some("folder-projects"),
+            "the folder the user picked is the folder the import goes to",
+        );
+
+        destination.set(None);
+        assert_eq!(
+            target.get_untracked().as_deref(),
+            Some("folder-home"),
+            "and the default returns if the choice is cleared",
         );
     }
 
