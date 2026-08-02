@@ -858,6 +858,18 @@ impl Transaction {
             txn.selection = Selection::cursor(cursor_pos);
             Ok(txn)
         } else {
+            // #153: deleting `block`'s own node alone stranded the
+            // container it was the last textblock of — Backspace out of
+            // a single-paragraph `Blockquote` merged the text but left
+            // `Blockquote[]` standing, with no textblock inside for
+            // `find_block_at` to reach. Same orphan class the
+            // code-block guard and `join_forward`'s cross-container
+            // branch already cure, so this path shares the cure:
+            // `empty_shell_range` widens the removal through every
+            // ancestor it empties, and stops at the first that keeps
+            // anything else (a quote's other paragraphs stay put).
+            let (shell_from, shell_to) =
+                empty_shell_range(&self.doc, block.offset, block.offset + block.node_size);
             let inserted = block.content.size();
             let txn = if inserted > 0 {
                 let inline_slice = Slice::new(block.content.clone(), 0, 0);
@@ -865,11 +877,11 @@ impl Transaction {
             } else {
                 self
             };
-            let new_block_offset = block.offset + inserted;
-            let mut txn = txn.delete(
-                new_block_offset,
-                new_block_offset + block.node_size,
-            )?;
+            // `prev` lies outside the shell — it is the block *before*
+            // the container, or in one of its own — so the splice at
+            // `prev_content_end` precedes both ends of the widened
+            // range and shifts them equally.
+            let mut txn = txn.delete(shell_from + inserted, shell_to + inserted)?;
             txn.selection = Selection::cursor(cursor_pos);
             Ok(txn)
         }
@@ -4387,13 +4399,12 @@ mod tests {
     /// blockquote via its `block.offset - 2` fallback and merges. This
     /// predates #145 entirely.
     ///
-    /// It also leaves an **empty `Blockquote`** behind, because its
-    /// cross-container branch deletes only the block's own node — the
-    /// same orphan class as the code-block guard, uncured on this path.
-    /// Pinned as-is rather than fixed: `join_backward` is out of scope
-    /// here (see `join_backward_still_declines_at_a_list_item_start`),
-    /// and the residue is reachable today without any of #145. Reported
-    /// separately; this assertion is what a future fix has to update.
+    /// #153 updated the second half of this test. It used to leave an
+    /// empty `Blockquote` standing — the cross-container branch deleted
+    /// only the block's own node — and pinned that residue as the
+    /// present behaviour while #145 stayed scoped to `join_forward`.
+    /// That branch shares `empty_shell_range` now, so the emptied quote
+    /// goes with the paragraph, exactly as the forward half below.
     #[test]
     fn join_backward_already_crossed_a_blockquote_boundary() {
         let doc = para_then_blockquote_doc();
@@ -4404,8 +4415,81 @@ mod tests {
             .apply(state.transaction().join_backward().unwrap());
         assert_eq!(
             shape(&merged.doc),
-            "Doc[Paragraph[\"AB\"],Blockquote]",
-            "crosses the boundary, but strands an empty quote",
+            "Doc[Paragraph[\"AB\"]]",
+            "crosses the boundary and takes the emptied quote with it",
+        );
+        assert_eq!(merged.selection.from(), 2, "caret at the merge seam");
+        assert!(
+            find_block_at(&merged.doc, merged.selection.from()).is_some(),
+            "caret lands in a reachable block",
+        );
+    }
+
+    /// #153, the no-widening half: a quote that still holds a paragraph
+    /// after the merge keeps standing. `empty_shell_range` widens only
+    /// through ancestors the removal empties completely, so nothing
+    /// outside the caret's own block is ever discarded.
+    #[test]
+    fn join_backward_out_of_a_blockquote_keeps_its_other_paragraphs() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("A")]),
+                ),
+                Node::element_with_content(
+                    NodeType::Blockquote,
+                    Fragment::from(vec![
+                        Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("B")]),
+                        ),
+                        Node::element_with_content(
+                            NodeType::Paragraph,
+                            Fragment::from(vec![Node::text("C")]),
+                        ),
+                    ]),
+                ),
+            ]),
+        );
+        // The quote's first paragraph has content 5..6.
+        let state = at_cursor(doc, 5);
+        let merged = state
+            .clone()
+            .apply(state.transaction().join_backward().unwrap());
+        assert_eq!(
+            shape(&merged.doc),
+            "Doc[Paragraph[\"AB\"],Blockquote[Paragraph[\"C\"]]]",
+        );
+    }
+
+    /// #153, the empty-block half: nothing is spliced into `prev`, so
+    /// the widened range needs no shift. The quote still goes.
+    #[test]
+    fn join_backward_out_of_an_empty_quoted_paragraph_removes_the_quote() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("A")]),
+                ),
+                Node::element_with_content(
+                    NodeType::Blockquote,
+                    Fragment::from(vec![Node::element(NodeType::Paragraph)]),
+                ),
+            ]),
+        );
+        // The quote's empty paragraph: its only content position is 5.
+        let state = at_cursor(doc, 5);
+        let merged = state
+            .clone()
+            .apply(state.transaction().join_backward().unwrap());
+        assert_eq!(shape(&merged.doc), "Doc[Paragraph[\"A\"]]");
+        assert!(
+            find_block_at(&merged.doc, merged.selection.from()).is_some(),
+            "caret lands in a reachable block",
         );
     }
 
