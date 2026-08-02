@@ -7071,14 +7071,41 @@ async function scenarioDeckPresent(ctx, collector) {
     steps.timerAdvances = t0 !== "" && t1 !== "" && t0 !== t1;
 
     // ── PDF slide export over the API ──
+    // CI's playwright.yml deliberately builds the API with
+    // `--no-default-features --features "dev-login,xlsx,docx"` — no
+    // `pdf` — to skip ~70 crates of pdf-extract/printpdf compile time
+    // (see crates/api/Cargo.toml's `default` feature comment). With
+    // the feature off, documents.rs's export handler hits its
+    // `#[cfg(not(feature = "pdf"))]` arm and returns 400 with the body
+    // "PDF export not compiled into this build" — that's the backend's
+    // own explicit signal, not an error to paper over. Do NOT "fix"
+    // this by asserting 200 unconditionally: locally (default features)
+    // this always takes the real-PDF branch; in CI it always takes the
+    // skip branch, and both are legitimate. `pdfExportDownloads` is
+    // required truthy in `requiredSteps` either way — the separate
+    // `pdfExportSkippedNoFeature` key plus the logJson line make the
+    // skip visible in CI output instead of silently green.
     const pdfRes = await fetch(`${target}/api/v1/documents/${doc.id}/export/pdf`, {
       headers: { authorization: `Bearer ${tokens.accessToken}` },
     });
     const pdfBuf = Buffer.from(await pdfRes.arrayBuffer());
-    steps.pdfExportDownloads =
+    const pdfIsRealPdf =
       pdfRes.ok &&
       (pdfRes.headers.get("content-type") || "").includes("application/pdf") &&
       pdfBuf.slice(0, 5).toString("latin1") === "%PDF-";
+    const pdfNotCompiled =
+      pdfRes.status === 400 && pdfBuf.toString("utf8").includes("not compiled into this build");
+    if (pdfIsRealPdf) {
+      steps.pdfExportDownloads = true;
+      steps.pdfExportSkippedNoFeature = false;
+    } else if (pdfNotCompiled) {
+      steps.pdfExportDownloads = true;
+      steps.pdfExportSkippedNoFeature = true;
+      logJson({ at: "deck-present", pdf: "skipped-no-feature" });
+    } else {
+      steps.pdfExportDownloads = false;
+      steps.pdfExportSkippedNoFeature = false;
+    }
   } catch (e) {
     collector.stepError = `${e.message}`;
   }
