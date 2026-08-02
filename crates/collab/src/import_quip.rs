@@ -3087,6 +3087,27 @@ mod tests {
         parse_quip(html)
     }
 
+    /// [`blocks`], as a **spreadsheet** thread — the grid-chrome strip of
+    /// #230 applied, which is the only thing the thread kind changes.
+    fn sheet_blocks(html: &str) -> Vec<QuipBlock> {
+        let (mut b, _) = parse_quip_counting_losses(html);
+        strip_spreadsheet_grid_chrome(&mut b);
+        b
+    }
+
+    /// A table's cells as `(is_header, text)`, row-major.
+    fn table_grid(block: &QuipBlock) -> Vec<Vec<(bool, String)>> {
+        let QuipBlock::Table { rows, .. } = block else { panic!("expected a table: {block:?}") };
+        rows.iter()
+            .map(|r| {
+                r.cells
+                    .iter()
+                    .map(|c| (c.header, single_para_text(c).unwrap_or_else(|| "<multi>".into())))
+                    .collect()
+            })
+            .collect()
+    }
+
     fn doc_xml(quip: &QuipDocument) -> String {
         let txn = quip.doc.transact();
         let root = txn.get_xml_fragment("content").expect("root fragment");
@@ -4575,6 +4596,61 @@ mod tests {
         let QuipBlock::Table { rows, .. } = &b[0] else { panic!("expected table") };
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].cells[0].header);
+    }
+
+    // ─── #230: the grid-chrome detector declines ─────────────
+    //
+    // The positive case — a whole real sheet losing its chrome — is pinned
+    // against the committed fixture in `tests/quip_corpus.rs`. What belongs
+    // here is the other half: the tables the detector must NOT touch even
+    // when the thread *is* a spreadsheet. Every input below is markup that
+    // already appears verbatim in this file, so each is a shape Quip is
+    // known to emit rather than one invented to make a branch fire.
+
+    /// `AeOAAAcV1hg`'s table, verbatim — a prose table, no `<thead>`, no
+    /// gutter — pushed through the **spreadsheet** path.
+    ///
+    /// Nothing about it may move. This is the test that says the strip is
+    /// gated on the table's shape and not merely on the thread's type: a
+    /// spreadsheet thread that also holds an ordinary table keeps it whole.
+    #[test]
+    fn a_spreadsheet_threads_non_grid_table_is_left_alone() {
+        let html = "<div data-section-style='13'><table id='temp:C:AeOfdbce4eabb6e41df873200fa6' title='Iusmod' style='width: 39.0667em'><tbody><tr id='temp:C:AeO2f2ceb0afd0a41419a2e9fae8'><td id='temp:s:temp:C:AeO2f2ceb0afd0a41419a2e9fae8_temp:C:AeO641271c1e4ec417fa93c8d029' style='text-align: left;vertical-align: middle;' class='bold'><span id='temp:s:temp:C:AeO2f2ceb0afd0a41419a2e9fae8_temp:C:AeO641271c1e4ec417fa93c8d029'>Eiusmod</span>\n\n<br/></td></tr></tbody></table></div>";
+        assert_eq!(
+            table_grid(&sheet_blocks(html)[0]),
+            table_grid(&blocks(html)[0]),
+            "a prose table imports identically either way",
+        );
+    }
+
+    /// `QGYAAAjicgG`'s `<thead>` with no `<tbody>` after it, verbatim — the
+    /// same slice `header_cells_record_their_anchor_and_an_id_less_one_
+    /// records_none` asserts against.
+    ///
+    /// Half the chrome is not the chrome. A header row alone says nothing
+    /// about whether the row beneath it is a ruler or data, and a detector
+    /// that stripped on this alone would eat the first row of any table
+    /// whose header happened to start with an empty cell.
+    #[test]
+    fn a_header_row_with_no_body_row_is_not_a_grid() {
+        let html = "<table id='temp:C:QGYcfc9c8f7c7714f4a9955e1b7f'><thead><tr><th class='empty' style='width: 2em'/><th id='temp:C:QGY04be7f796bf1483e87f847ed3' class='empty' style='width: 6em'>A<br/></th></tr></thead></table>";
+        let grid = table_grid(&sheet_blocks(html)[0]);
+        assert_eq!(grid.len(), 1, "the header row survives: {grid:?}");
+        assert_eq!(grid[0], vec![(true, String::new()), (true, "A".into())]);
+    }
+
+    /// `QGYAAAjicgG`'s first body row with no `<thead>` above it, verbatim —
+    /// the same slice `a_cell_without_an_id_records_no_anchor` uses.
+    ///
+    /// The other half, and the more dangerous one: a numeric leading column
+    /// is an ordinary thing for a table to have. Without the column-letter
+    /// header row above it there is nothing to say those numbers are a
+    /// ruler, so they stay.
+    #[test]
+    fn a_numeric_leading_column_with_no_header_row_is_not_a_grid() {
+        let html = "<table><tbody><tr id='temp:C:QGYe66f22cd7b834833a7ee9dc58'><td style='background-color:#f0f0f0'>1</td><td id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d' style=''><span id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d'>as</span>\n\n<br/></td></tr></tbody></table>";
+        let grid = table_grid(&sheet_blocks(html)[0]);
+        assert_eq!(grid, vec![vec![(false, "1".into()), (false, "as".into())]], "{grid:?}");
     }
 
     // ─── containment / hoisting ──────────────────────────────
