@@ -244,6 +244,11 @@ impl ImportRepo {
     /// `SECMAP#<thread>#<chunk>` rows in numeric chunk order. Must not
     /// rely on the SK's lexicographic order — `#10` sorts before `#2` as
     /// strings — so chunks are sorted by the parsed `chunk` field.
+    ///
+    /// Also the lookup for a Quip **comment anchor** since #194 F-10 — see
+    /// [`SecMapRow`] for why the two share one map. A Phase-4 caller holding
+    /// an `annotationid` from Quip's comment API finds its block here and
+    /// needs nothing else from this repo.
     pub async fn get_secmap(
         &self,
         import_id: &str,

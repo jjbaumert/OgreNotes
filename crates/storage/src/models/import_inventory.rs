@@ -75,6 +75,14 @@ impl ThreadRow {
 /// DynamoDB's 400 KB item cap. Task 6 (the content-pass caller) splits a
 /// thread's full section→block map into chunks of this size before
 /// calling `put_secmap` once per chunk.
+///
+/// #194 F-10's comment anchors do not move this bound. The chunker slices on
+/// entry *count*, and an anchor entry is the same shape as a section entry —
+/// two opaque `temp:C:` ids — so it consumes exactly one slot and the
+/// per-entry size the 2 000 was chosen against is unchanged. All it can do
+/// is push a thread over a chunk boundary one entry sooner, and the measured
+/// density is four anchors across the whole 56-thread staged corpus against
+/// a densest-thread section count of 528.
 pub const SECMAP_CHUNK_ENTRIES: usize = 2_000;
 
 /// One chunk of a thread's section-id → block-id map, built during the
@@ -82,12 +90,22 @@ pub const SECMAP_CHUNK_ENTRIES: usize = 2_000;
 /// Quip anchor (`#section-id`) into the Ogre block it landed on. SK =
 /// `SECMAP#<quip_thread_id>#<chunk>`. Chunked because a thread with many
 /// sections could otherwise blow the per-item size cap.
+///
+/// Since #194 F-10 an entry's key is either a Quip **section id** (the block
+/// *is* that element) or a Quip **comment-anchor id** — the `annotationid`
+/// of a commented inline range, whose block merely *contains* it. Both are
+/// ids from the same Quip namespace and both answer the same question, so
+/// they share one map and a reader keys on the id without caring which it
+/// was. What that buys is that Phase 4 needs no row kind of its own:
+/// `ImportRepo::get_secmap` already returns the anchor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SecMapRow {
     pub quip_thread_id: String,
     pub chunk: u32,
     pub owner_id: String,
-    /// `(quip_section_id, ogre_block_id)` pairs, in the order encountered.
+    /// `(quip_anchor_id, ogre_block_id)` pairs, in the order encountered.
+    /// The attribute names on the wire still read `quip_section_id` — the
+    /// stored shape is unchanged, only what may key it has widened.
     pub entries: Vec<(String, String)>,
 }
 

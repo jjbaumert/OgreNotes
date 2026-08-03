@@ -92,7 +92,22 @@ pub fn new_block_id() -> String {
 /// back-patch cross-document links, resolve section anchors).
 pub struct QuipDocument {
     pub doc: Doc,
-    /// Quip section id → minted blockId, in document order.
+    /// Quip anchor id → minted blockId, in document order.
+    ///
+    /// Two kinds of key, one meaning — "the Quip id `k` names content that
+    /// landed in block `v`":
+    ///
+    /// * a **section id**, from an element's `id` / `data-section-id`. The
+    ///   block *is* that element.
+    /// * a **comment anchor**, from an [`ANNOTATION_ATTR`] (#194 F-10). The
+    ///   block *contains* the commented range; see
+    ///   [`collect_comment_anchors`] for why that is all this can say.
+    ///
+    /// They share the map because they share Quip's id namespace — an
+    /// annotation id is repeated verbatim in the annotated span's own `id`,
+    /// so a `#…` deep link at commented text and a Phase-4 comment lookup
+    /// want the same answer. Callers key on the id and need not know which
+    /// kind it was.
     pub sections: Vec<(String, String)>,
     /// Images referenced by the source, to be side-loaded by the caller.
     pub images: Vec<QuipImageRef>,
@@ -230,14 +245,20 @@ pub fn from_quip_html(html: &str) -> QuipDocument {
 /// treated as presentation; its row-number gutter is stripped either way —
 /// see [`QuipThreadKind`] and [`strip_grid_chrome`].
 pub fn from_quip_html_as(html: &str, kind: QuipThreadKind) -> QuipDocument {
-    let (mut blocks, losses) = parse_quip_counting_losses(html);
+    let (mut blocks, losses, anchors) = parse_quip_counting_losses(html);
     strip_grid_chrome(&mut blocks, kind);
-    QuipDocument {
+    let mut out = QuipDocument {
         deep_nesting_truncated: losses.deep_nesting_truncated,
         formulas_dropped: losses.formulas_dropped,
         live_apps_dropped: losses.live_apps_dropped,
         ..materialize(&blocks)
-    }
+    };
+    // After `materialize`, because an anchor can only be resolved once the
+    // blockIds exist; after `strip_grid_chrome`, so an annotation inside a
+    // stripped gutter cell resolves to nothing rather than to a block that
+    // is no longer in the document.
+    resolve_comment_anchors(&mut out.sections, &anchors);
+    out
 }
 
 // ─── intermediate block model ────────────────────────────────────
@@ -479,10 +500,20 @@ fn allowed_tags() -> HashSet<&'static str> {
 /// `data-`-prefixed spelling of the same attribute would already be admitted
 /// by `generic_attribute_prefixes` below, so this is the existing policy
 /// applied to the name Quip actually uses, not a new kind of allowance.
+///
+/// [`ANNOTATION_ATTR`] is here for the same reason and clears the same bar
+/// (#194 F-10): not an event handler, not a URL carrier, not `style`, and
+/// re-emitted HTML-escaped. It differs from `formula` in one respect — its
+/// value *is* read, by [`collect_comment_anchors`], and lands in
+/// [`QuipDocument::sections`] and from there in a `SECMAP#` row. It reaches
+/// no yrs node and no rendered HTML, so the string is stored and compared,
+/// never interpreted; the same is already true of every `id` this allowlist
+/// admits, which is the identical trust question.
 fn allowed_attributes() -> HashSet<&'static str> {
     [
         "id", "href", "src", "alt", "title", "type", "checked", "value",
         "colspan", "rowspan", "class", "start", "align", "formula",
+        ANNOTATION_ATTR,
     ]
     .into_iter()
     .collect()
@@ -548,11 +579,39 @@ pub const FORMULA_ATTR: &str = "formula";
 /// 56 audited ones spells an attribute this way.
 pub const LIVE_APP_ATTR_PREFIX: &str = "data-live-app";
 
+/// The attribute Quip puts on the `<span>` wrapping a **commented** range —
+/// `annotationid="temp:C:ffbc9747…"` (#194 F-10). Its value is the id Quip's
+/// comment API keys a comment thread by, so it is the join a future Phase 4
+/// needs between a fetched comment and the place in the document it belongs.
+///
+/// **Measured, in all four occurrences across the 56-document staged
+/// corpus** (only two documents carry any): the shape is invariant —
+/// `<span annotationid="X" class="c9 h2" id="X">`, double-quoted where
+/// almost every other Quip attribute in the corpus is single-quoted, and the
+/// value is repeated verbatim in the span's own `id`. That repetition is why
+/// this belongs in the section map rather than in a table of its own: the
+/// annotation id *is* an anchor id in Quip's own namespace, so a
+/// `#temp:C:…` deep link at the commented text and a Phase-4 comment lookup
+/// are the same question with the same answer.
+///
+/// Four occurrences is thin evidence and is stated as such. What rests on
+/// the shape being right is only whether an anchor is captured; nothing
+/// about the imported *content* changes, and an attribute that never appears
+/// yields an empty pass.
+pub const ANNOTATION_ATTR: &str = "annotationid";
+
 /// Parse Quip HTML into the intermediate block model. Pure: no yrs
 /// transaction is live while the DOM is walked.
 pub(crate) fn parse_quip(html: &str) -> Vec<QuipBlock> {
     parse_quip_counting_losses(html).0
 }
+
+/// One commented range found in the source: the [`ANNOTATION_ATTR`] value,
+/// paired with the id of the **nearest enclosing element that carries an
+/// anchor** — which is the id [`QuipDocument::sections`] already knows how to
+/// turn into a blockId. Resolved to that blockId by
+/// [`resolve_comment_anchors`] once materialization has minted one.
+type CommentAnchor = (String, String);
 
 /// Everything the parse knows it did not carry across. Each field is a
 /// *count of things the source had*, so a caller can name the loss to the
@@ -570,7 +629,9 @@ pub(crate) struct ParseLosses {
 /// [`parse_quip`] plus what the parse lost. Split out so `parse_quip` keeps
 /// the signature its unit tests use while [`from_quip_html`] can surface the
 /// losses on [`QuipDocument`] and the importer can report them.
-pub(crate) fn parse_quip_counting_losses(html: &str) -> (Vec<QuipBlock>, ParseLosses) {
+pub(crate) fn parse_quip_counting_losses(
+    html: &str,
+) -> (Vec<QuipBlock>, ParseLosses, Vec<CommentAnchor>) {
     use html5ever::tendril::TendrilSink;
     use markup5ever_rcdom::RcDom;
 
@@ -610,12 +671,102 @@ pub(crate) fn parse_quip_counting_losses(html: &str) -> (Vec<QuipBlock>, ParseLo
     // constant for free, and no future recursive pass can forget to check.
     losses.deep_nesting_truncated = flatten_below_depth(&dom.document);
 
+    // Deliberately AFTER every reshaping pass above, unlike
+    // `count_unconverted_content`. That one is a census of the source and
+    // must see the tree as Quip wrote it; this one records an ancestor
+    // relationship the walker is about to act on, so it has to read the same
+    // tree the walker reads or the ancestor it names may no longer be there.
+    let anchors = collect_comment_anchors(&dom.document);
+
     let mut out = Vec::new();
     let mut pending = InlineBuf::default();
     walk_children(&dom.document, &mut out, &Marks::default(), &mut pending);
     pending.flush(&mut out, None);
 
-    (enforce_containment(out, NodeType::Doc), losses)
+    (enforce_containment(out, NodeType::Doc), losses, anchors)
+}
+
+/// Pair every [`ANNOTATION_ATTR`] in the tree with the anchor id of the
+/// nearest ancestor that has one (#194 F-10), in document order.
+///
+/// **The span itself is not a candidate.** It carries an `id` equal to its
+/// own annotation id, so counting it would resolve the anchor to itself and
+/// answer nothing; the question is which *containing* anchor the highlight
+/// sits inside, and the answer starts at the parent.
+///
+/// **Iterative**, like [`count_unconverted_content`] and
+/// [`flatten_below_depth`], and for the same reason — though this one runs
+/// after the depth bound is imposed, a recursive pass over third-party HTML
+/// is a habit worth not acquiring here. Children are pushed in reverse so
+/// the stack pops them in document order.
+///
+/// An annotation whose nearest anchored ancestor did not survive as a block
+/// resolves to nothing and is dropped by [`resolve_comment_anchors`]; that is
+/// zero occurrences in the corpus, where all four sit directly inside a
+/// `<p id='…' class='line'>`.
+fn collect_comment_anchors(document: &markup5ever_rcdom::Handle) -> Vec<CommentAnchor> {
+    use markup5ever_rcdom::NodeData;
+
+    let mut found = Vec::new();
+    // (node, the nearest anchored ancestor's id) still to inspect.
+    let mut stack: Vec<(markup5ever_rcdom::Handle, Option<String>)> =
+        vec![(document.clone(), None)];
+    while let Some((node, enclosing)) = stack.pop() {
+        let mut inner = enclosing.clone();
+        if let NodeData::Element { attrs, .. } = &node.data {
+            let annotation = attrs
+                .borrow()
+                .iter()
+                .find(|a| a.name.local.as_ref().eq_ignore_ascii_case(ANNOTATION_ATTR))
+                .map(|a| a.value.trim().to_string())
+                .filter(|v| !v.is_empty());
+            if let (Some(annotation), Some(enclosing)) = (annotation, enclosing) {
+                found.push((annotation, enclosing));
+            }
+            // Only now does this element become the enclosing anchor for its
+            // descendants — see the doc above on why not for itself.
+            if let Some(own) = section_id(&node) {
+                inner = Some(own);
+            }
+        }
+        stack.extend(
+            node.children.borrow().iter().rev().map(|c| (c.clone(), inner.clone())),
+        );
+    }
+    found
+}
+
+/// Fold the comment anchors into `sections`, replacing each one's enclosing
+/// *anchor id* with the blockId that anchor was minted onto.
+///
+/// Each anchor is spliced in **immediately after** the entry it resolved
+/// through, so `sections` stays in document order — the property
+/// `SecMapRow::entries` documents and the order the chunker slices on.
+///
+/// Two entries are dropped rather than written: an annotation whose
+/// enclosing anchor never became a block (nothing to point at), and one
+/// whose id already keys the map (a duplicate would make the lookup
+/// order-dependent, and a section map with an ambiguous key is worse than
+/// one missing a row).
+fn resolve_comment_anchors(sections: &mut Vec<(String, String)>, anchors: &[CommentAnchor]) {
+    if anchors.is_empty() {
+        return;
+    }
+    let mut known: HashSet<&str> = sections.iter().map(|(s, _)| s.as_str()).collect();
+    let mut by_section: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (annotation, enclosing) in anchors {
+        if known.insert(annotation.as_str()) {
+            by_section.entry(enclosing.as_str()).or_default().push(annotation.as_str());
+        }
+    }
+    let mut out = Vec::with_capacity(sections.len() + anchors.len());
+    for (section, block) in sections.iter() {
+        out.push((section.clone(), block.clone()));
+        for annotation in by_section.remove(section.as_str()).unwrap_or_default() {
+            out.push((annotation.to_string(), block.clone()));
+        }
+    }
+    *sections = out;
 }
 
 /// Count the two kinds of content this walker knowingly leaves behind:
@@ -3124,7 +3275,7 @@ mod tests {
     /// [`blocks`], as a **spreadsheet** thread — the full grid-chrome strip
     /// of #230 applied: header row and gutter both.
     fn sheet_blocks(html: &str) -> Vec<QuipBlock> {
-        let (mut b, _) = parse_quip_counting_losses(html);
+        let (mut b, _, _) = parse_quip_counting_losses(html);
         strip_grid_chrome(&mut b, QuipThreadKind::Spreadsheet);
         b
     }
@@ -3134,7 +3285,7 @@ mod tests {
     /// Distinct from [`blocks`], which is the raw walker with no strip at
     /// all and so cannot say what production produces.
     fn doc_blocks(html: &str) -> Vec<QuipBlock> {
-        let (mut b, _) = parse_quip_counting_losses(html);
+        let (mut b, _, _) = parse_quip_counting_losses(html);
         strip_grid_chrome(&mut b, QuipThreadKind::Document);
         b
     }
@@ -5335,6 +5486,192 @@ mod tests {
         for (_, block_id) in &out.sections {
             assert_eq!(block_id.len(), 10, "maps to a minted blockId");
         }
+    }
+
+    // ─── comment anchors (#194 F-10) ─────────────────────────
+
+    /// Verbatim from the corpus fixture `ffbAAA8eMpE`: the annotated
+    /// `<span>` and the `<p class='line'>` that encloses it, truncated after
+    /// the highlight ends. Every tag, attribute, quote style and byte of the
+    /// markup is Quip's; only the prose was scrubbed length-for-length when
+    /// the fixture was staged, and ids were kept byte-exact.
+    ///
+    /// Note the highlight starts **mid-word** — `my` | `dipisc` — which is
+    /// what a comment anchor really looks like and why no block can be minted
+    /// for the range.
+    const REAL_COMMENT_ANNOTATION: &str =
+        "<p id='temp:C:ffb3d38c909e3d64493943c51b07' class='line'>Oeiusmodt rloremipsu \
+         eturadipis elitsedd head him mporloremipsu seddoei stare. Scingeli his \
+         <b>cingelit umdolorsitame</b> ectetura he my\
+         <span annotationid=\"temp:C:ffbc97475333a3d4bafaeed9f717\" class=\"c9 h2\" \
+         id=\"temp:C:ffbc97475333a3d4bafaeed9f717\">dipisc modtemp video — node Oeiusmodt \
+         moral <i>etconsec</i>. Album </span>ctetura come metcon a sectet ctetur stare.</p>";
+
+    /// Verbatim from the staged raw document `GDXAAAe8Rw0`, the only other of
+    /// the 56 that carries an annotation — and the one that carries **three**,
+    /// two of them inside a single paragraph, which the committed corpus
+    /// cannot show. Markup byte-exact, prose truncated after the second
+    /// highlight closes.
+    const REAL_TWO_ANNOTATIONS_ONE_PARAGRAPH: &str =
+        "<p id='temp:C:GDX14131f9a1b1f426f8eff01cc4' class='line'><b>Multi-Layer \
+         Strategic/Tactical System</b>\
+         <span annotationid=\"temp:C:GDX2c3e642d6fdc46d8922064007\" class=\"c9 h2\" \
+         id=\"temp:C:GDX2c3e642d6fdc46d8922064007\"><b>s</b> – The game operates on more \
+         than one scale</span>nstrai\
+         <span annotationid=\"temp:C:GDXec185fd3ce4643808781c75da\" class=\"c9 h2\" \
+         id=\"temp:C:GDXec185fd3ce4643808781c75da\">n outcome</span>s at another.</p>";
+
+    /// [`ANNOTATION_ATTR`] has to clear the sanitizer before anything can
+    /// read it — the same relationship `formula` has to its loss count, and
+    /// the reason both names are in `allowed_attributes`. Without this the
+    /// attribute is gone before the DOM exists and the anchor pass is
+    /// permanently, silently empty.
+    #[test]
+    fn the_sanitizer_admits_annotationid_so_the_anchor_can_be_captured() {
+        let out = sanitize(REAL_COMMENT_ANNOTATION);
+        assert!(out.contains("annotationid="), "sanitize must keep `annotationid`: {out:?}");
+        assert_eq!(
+            from_quip_html(REAL_COMMENT_ANNOTATION).sections.len(),
+            2,
+            "a stripped attribute would leave only the paragraph's own anchor",
+        );
+    }
+
+    /// The anchor resolves to the block the highlight lives **in**. There is
+    /// no block for the range itself and there never will be — it is inline,
+    /// and here it does not even start on a word boundary — so the paragraph
+    /// is the honest answer and the offsets are a stated loss, not a silent
+    /// one.
+    #[test]
+    fn a_comment_annotation_resolves_to_the_paragraph_that_contains_it() {
+        let out = from_quip_html(REAL_COMMENT_ANNOTATION);
+        let by_id: HashMap<&str, &str> =
+            out.sections.iter().map(|(s, b)| (s.as_str(), b.as_str())).collect();
+        let para = by_id["temp:C:ffb3d38c909e3d64493943c51b07"];
+        assert_eq!(
+            by_id.get("temp:C:ffbc97475333a3d4bafaeed9f717"),
+            Some(&para),
+            "the annotation must name the paragraph's block: {:?}",
+            out.sections
+        );
+        assert_eq!(para.len(), 10, "a real minted blockId");
+    }
+
+    /// Document order survives the splice: the anchor is inserted directly
+    /// after the entry it resolved through, not appended to the tail. The
+    /// chunker slices `sections` in order, so a tail append would scatter a
+    /// document's anchors across chunk boundaries in a way the source never
+    /// suggests.
+    #[test]
+    fn a_comment_anchor_is_spliced_in_document_order_not_appended() {
+        let html = format!("{REAL_COMMENT_ANNOTATION}<p id='temp:C:ffbfollowing'>after</p>");
+        let out = from_quip_html(&html);
+        let ids: Vec<&str> = out.sections.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "temp:C:ffb3d38c909e3d64493943c51b07",
+                "temp:C:ffbc97475333a3d4bafaeed9f717",
+                "temp:C:ffbfollowing",
+            ],
+        );
+    }
+
+    /// Two comments on one paragraph are two anchors on one block — the
+    /// relationship is many-to-one, and the map is keyed the way Phase 4 will
+    /// read it (annotation id in, block out), so both resolve without
+    /// colliding.
+    #[test]
+    fn two_annotations_in_one_paragraph_both_name_that_paragraphs_block() {
+        let out = from_quip_html(REAL_TWO_ANNOTATIONS_ONE_PARAGRAPH);
+        let by_id: HashMap<&str, &str> =
+            out.sections.iter().map(|(s, b)| (s.as_str(), b.as_str())).collect();
+        let para = by_id["temp:C:GDX14131f9a1b1f426f8eff01cc4"];
+        assert_eq!(by_id.get("temp:C:GDX2c3e642d6fdc46d8922064007"), Some(&para));
+        assert_eq!(by_id.get("temp:C:GDXec185fd3ce4643808781c75da"), Some(&para));
+        assert_eq!(out.sections.len(), 3, "one paragraph, two anchors: {:?}", out.sections);
+    }
+
+    /// The annotated `<span>` alone, with the enclosing `<p id='…'>` cut
+    /// away — the same real bytes, minus the ancestor. Nothing to resolve
+    /// through means nothing recorded: the pass never invents a key, and in
+    /// particular never falls back to the span's own id, which would map the
+    /// anchor to itself and answer nothing.
+    #[test]
+    fn an_annotation_with_no_anchored_ancestor_records_nothing() {
+        let orphan = REAL_COMMENT_ANNOTATION
+            .split_once("ectetura he my")
+            .expect("the fixture text before the highlight")
+            .1;
+        let out = from_quip_html(&format!("<p>{orphan}"));
+        assert!(
+            out.sections.is_empty(),
+            "no ancestor anchor, so no entry: {:?}",
+            out.sections
+        );
+        let xml = doc_xml(&out);
+        assert!(xml.contains("dipisc modtemp"), "the highlighted text still imports: {xml}");
+    }
+
+    /// An annotation id that already keys the map is dropped, not appended.
+    ///
+    /// **Asserted on `resolve_comment_anchors` directly rather than through
+    /// markup, deliberately.** No document in the 56-thread staged corpus
+    /// spells a duplicate — all four `annotationid`s are distinct — and
+    /// inventing the Quip markup for one would only pin the invention. The
+    /// join is a pure function over `(id, id)` pairs, so the rule can be
+    /// stated on its real inputs without guessing at HTML that may not exist.
+    ///
+    /// The rule matters because `sections` is read as a lookup table: a
+    /// repeated key makes the answer depend on which entry the reader happens
+    /// to hit, and a Phase-4 comment resolving to a different block on
+    /// different runs is worse than one that does not resolve at all.
+    #[test]
+    fn a_duplicate_anchor_id_is_dropped_rather_than_making_the_map_ambiguous() {
+        let mut sections = vec![("sec-1".to_string(), "blockAAAAAA".to_string())];
+        let anchors = vec![
+            ("ann-1".to_string(), "sec-1".to_string()),
+            // The same annotation seen twice, and one colliding with a
+            // section id that is already a key.
+            ("ann-1".to_string(), "sec-1".to_string()),
+            ("sec-1".to_string(), "sec-1".to_string()),
+        ];
+        resolve_comment_anchors(&mut sections, &anchors);
+        assert_eq!(
+            sections,
+            vec![
+                ("sec-1".to_string(), "blockAAAAAA".to_string()),
+                ("ann-1".to_string(), "blockAAAAAA".to_string()),
+            ],
+        );
+    }
+
+    /// An anchor whose enclosing id never became a block is dropped, and
+    /// takes nothing with it — the pass must not shift or lose an ordinary
+    /// section entry while failing to place an anchor. Same rationale as
+    /// above for testing the join directly: the shape (an annotation inside
+    /// the `'6'` continuation `<ul>` that #188 merges away, say) does not
+    /// occur in the corpus.
+    #[test]
+    fn an_anchor_whose_enclosing_section_never_became_a_block_is_dropped() {
+        let mut sections = vec![
+            ("sec-1".to_string(), "blockAAAAAA".to_string()),
+            ("sec-2".to_string(), "blockBBBBBB".to_string()),
+        ];
+        let before = sections.clone();
+        resolve_comment_anchors(&mut sections, &[("ann-1".to_string(), "gone".to_string())]);
+        assert_eq!(sections, before, "an unplaceable anchor changes nothing");
+    }
+
+    /// The attribute is metadata for a side-table and must not leak into the
+    /// document, exactly as `formula` must not. It reaches `sections` and
+    /// stops there.
+    #[test]
+    fn an_annotation_id_reaches_the_section_map_and_no_yrs_node() {
+        let xml = doc_xml(&from_quip_html(REAL_COMMENT_ANNOTATION));
+        assert!(!xml.contains("annotationid"), "no `annotationid` attribute on a node: {xml}");
+        assert!(!xml.contains("ffbc9747"), "the anchor value is not content: {xml}");
+        assert!(xml.contains("dipisc modtemp"), "the highlighted text is: {xml}");
     }
 
     #[test]
