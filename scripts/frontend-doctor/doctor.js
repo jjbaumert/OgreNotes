@@ -3423,7 +3423,9 @@ async function scenarioCommentPopup(ctx, collector) {
     await page.locator('[data-row="0"][data-col="0"]').first().click({ button: "right" });
     await page.waitForSelector(".ui-menu", { timeout: 3000 });
     await clickCtxMenuItem(page, /comment/i, /add comment/i);
-    await page.waitForSelector(".comment-popup", { timeout: 5000 });
+    // The popup opens once the thread POST returns; under CI Firefox that
+    // took ~7s (2026-09-03 run), so wait like the other selectors do.
+    await page.waitForSelector(".comment-popup", { timeout: 15000 });
     steps.popupShown = true;
     await page.waitForTimeout(500);
 
@@ -6128,13 +6130,15 @@ async function scenarioMenuExportDownloads(ctx, collector) {
 
     // Each Document → Export submenu entry — visible label and the
     // file extension we expect the browser to suggest in the download.
-    // Covers text formats (markdown/html/csv) and binary (xlsx) so a
-    // future binary-handling regression also surfaces.
+    // Covers a text format (html/csv) and binary (xlsx) so a future
+    // binary-handling regression also surfaces. Markdown is deliberately
+    // absent: since #119 it copies to the clipboard ("Markdown (copy)")
+    // instead of downloading. PDF needs the `pdf` server feature, which
+    // the CI server is built without.
     const formats = [
-      { label: "Markdown", ext: "md" },
-      { label: "HTML", ext: "html" },
-      { label: "CSV", ext: "csv" },
-      { label: "Excel (.xlsx)", ext: "xlsx" },
+      { label: /^HTML$/, ext: "html" },
+      { label: /^CSV$/, ext: "csv" },
+      { label: /^Excel \(\.xlsx\)$/, ext: "xlsx" },
     ];
 
     for (const { label, ext } of formats) {
@@ -6143,10 +6147,9 @@ async function scenarioMenuExportDownloads(ctx, collector) {
         .click();
       const [download] = await Promise.all([
         page.waitForEvent("download", { timeout: 15000 }),
-        // Menu items render as buttons whose visible text is the
-        // label with leading spaces for the submenu indent — using
-        // a substring match keeps the selector resilient to that.
-        page.getByText(label, { exact: false }).first().click(),
+        // Export is a submenu of the shared menu primitive: hover the
+        // parent so the leaf becomes visible, then click it.
+        clickCtxMenuItem(page, /^Export$/, label),
       ]);
       const filename = await download.suggestedFilename();
       if (!filename.toLowerCase().endsWith(`.${ext}`)) {
@@ -7854,9 +7857,14 @@ async function main() {
   // captured-and-ignored in the other fifty. Allowlist by scenario
   // name only when a scenario knowingly provokes an error.
   const PAGEERROR_ALLOWLIST = new Set([]);
+  // Environmental, not a bug: a navigation that starts while the WASM
+  // module is still streaming aborts that fetch, and the browser reports
+  // it as a pageerror. Nothing in the app ran.
+  const ENVIRONMENTAL_PAGEERROR = /WebAssembly compilation aborted: Network error/;
   if (!PAGEERROR_ALLOWLIST.has(scenario)) {
     for (const tag of Object.keys(collector)) {
-      const errs = (collector[tag] && Array.isArray(collector[tag].errors)) ? collector[tag].errors : [];
+      const errs = ((collector[tag] && Array.isArray(collector[tag].errors)) ? collector[tag].errors : [])
+        .filter((e) => !ENVIRONMENTAL_PAGEERROR.test(String(e && e.message)));
       if (errs.length > 0) {
         console.error(`[doctor] ${errs.length} page error(s) on ${tag}; failing run`);
         for (const e of errs) console.error(`  - ${e.message}`);

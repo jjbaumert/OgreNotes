@@ -1,0 +1,245 @@
+{
+  "marks": [
+    "Bold",
+    "Code",
+    "Italic",
+    "Link",
+    "Mention",
+    "Strike",
+    "Subscript",
+    "Superscript",
+    "Underline"
+  ],
+  "nodes": {
+    "Blockquote": {
+      "children": [
+        "Blockquote",
+        "BulletList",
+        "CodeBlock",
+        "Heading",
+        "HorizontalRule",
+        "Image",
+        "OrderedList",
+        "Paragraph",
+        "TaskList"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "BulletList": {
+      "children": [
+        "ListItem"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "Calendar": {
+      "children": [
+        "CalendarEvent"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "CalendarEvent": {
+      "children": [],
+      "inline": false,
+      "leaf": true
+    },
+    "CodeBlock": {
+      "children": [],
+      "inline": false,
+      "leaf": false
+    },
+    "Doc": {
+      "children": [
+        "Blockquote",
+        "BulletList",
+        "Calendar",
+        "CodeBlock",
+        "Embed",
+        "Heading",
+        "HorizontalRule",
+        "Image",
+        "Kanban",
+        "Mermaid",
+        "OrderedList",
+        "Paragraph",
+        "Slide",
+        "Table",
+        "TaskList"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "DocMention": {
+      "children": [],
+      "inline": true,
+      "leaf": true
+    },
+    "Embed": {
+      "children": [],
+      "inline": false,
+      "leaf": true
+    },
+    "Frame": {
+      "children": [
+        "Blockquote",
+        "BulletList",
+        "Calendar",
+        "CodeBlock",
+        "Embed",
+        "Heading",
+        "HorizontalRule",
+        "Image",
+        "Kanban",
+        "Mermaid",
+        "OrderedList",
+        "Paragraph",
+        "Table",
+        "TaskList"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "HardBreak": {
+      "children": [],
+      "inline": true,
+      "leaf": true
+    },
+    "Heading": {
+      "children": [],
+      "inline": false,
+      "leaf": false
+    },
+    "HorizontalRule": {
+      "children": [],
+      "inline": false,
+      "leaf": true
+    },
+    "Image": {
+      "children": [],
+      "inline": false,
+      "leaf": true
+    },
+    "Kanban": {
+      "children": [
+        "KanbanColumn"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "KanbanCard": {
+      "children": [],
+      "inline": false,
+      "leaf": true
+    },
+    "KanbanColumn": {
+      "children": [
+        "KanbanCard"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "ListItem": {
+      "children": [
+        "Blockquote",
+        "BulletList",
+        "CodeBlock",
+        "OrderedList",
+        "Paragraph",
+        "TaskList"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "Mention": {
+      "children": [],
+      "inline": true,
+      "leaf": true
+    },
+    "Mermaid": {
+      "children": [],
+      "inline": false,
+      "leaf": true
+    },
+    "OrderedList": {
+      "children": [
+        "ListItem"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "Paragraph": {
+      "children": [],
+      "inline": false,
+      "leaf": false
+    },
+    "Slide": {
+      "children": [
+        "Frame"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "Table": {
+      "children": [
+        "TableRow"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "TableCell": {
+      "children": [
+        "Blockquote",
+        "BulletList",
+        "CodeBlock",
+        "Heading",
+        "OrderedList",
+        "Paragraph",
+        "TaskList"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "TableHeader": {
+      "children": [
+        "Blockquote",
+        "BulletList",
+        "CodeBlock",
+        "Heading",
+        "OrderedList",
+        "Paragraph",
+        "TaskList"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "TableRow": {
+      "children": [
+        "TableCell",
+        "TableHeader"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "TaskItem": {
+      "children": [
+        "Blockquote",
+        "BulletList",
+        "CodeBlock",
+        "OrderedList",
+        "Paragraph",
+        "TaskList"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "TaskList": {
+      "children": [
+        "TaskItem"
+      ],
+      "inline": false,
+      "leaf": false
+    }
+  }
+}

@@ -278,6 +278,47 @@ proptest! {
 // calamine/zip/quick-xml bump that introduces a panic on malformed input
 // would fail here rather than silently crash the import worker.
 
+use ogrenotes_collab::import_spreadsheet::from_csv;
+use ogrenotes_collab::validate::schema_violations;
+
+fn assert_schema_valid(doc: &yrs::Doc, importer: &str, src: &str) -> Result<(), TestCaseError> {
+    let v = schema_violations(doc);
+    prop_assert!(
+        v.is_empty(),
+        "{importer} produced an invalid tree for {src:?}:\n{}",
+        v.join("\n")
+    );
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(600))]
+
+    /// Every text importer leaves a tree the canonical schema accepts —
+    /// the generic form of the orphan-container guard that only the Quip
+    /// path had.
+    #[test]
+    fn text_importers_emit_schema_valid_trees(s in "\\PC*") {
+        assert_schema_valid(&from_markdown(&s), "from_markdown", &s)?;
+        assert_schema_valid(&from_html(&s), "from_html", &s)?;
+        assert_schema_valid(&from_quip_html(&s).doc, "from_quip_html", &s)?;
+        assert_schema_valid(&from_csv(&s), "from_csv", &s)?;
+    }
+
+    /// Markup that *looks* like the shapes that produced past orphans:
+    /// text and blocks directly inside list / table containers.
+    #[test]
+    fn html_importer_never_strands_text_in_containers(
+        pre in "[a-z ]{0,8}", inner in "[a-z ]{0,8}", post in "[a-z ]{0,8}",
+        container in prop::sample::select(vec!["ul", "ol", "table", "tr", "blockquote", "li"]),
+    ) {
+        let html = format!("<{container}>{pre}<p>{inner}</p>{post}</{container}>");
+        assert_schema_valid(&from_html(&html), "from_html", &html)?;
+        let md_ish = format!("- {pre}\n\n{inner}\n  - {post}\n");
+        assert_schema_valid(&from_markdown(&md_ish), "from_markdown", &md_ish)?;
+    }
+}
+
 #[cfg(all(feature = "xlsx", feature = "docx"))]
 mod binary {
     use super::*;

@@ -159,8 +159,40 @@ fn needs_normalize(doc: &Node) -> bool {
             || (node_type.is_textblock() && child_content.children.iter().any(|gc| {
                 matches!(gc, Node::Element { node_type: nt, .. } if nt.is_block() && !nt.is_inline())
             }))
+            // Deep rule: orphans inside list containers at any depth.
+            || has_list_orphan(child)
         }
     })
+}
+
+/// A list container may hold only its item type. Bare text or any other
+/// block directly inside it is the orphan-container class: unreachable by
+/// `find_block_at`, undeletable in the UI. `normalize_node` already wraps
+/// such children with `ensure_list_item`; this is the trigger that was
+/// missing — the top-level check above only looked two levels deep, so
+/// every past instance had to be patched on its own path.
+fn has_list_orphan(node: &Node) -> bool {
+    let Node::Element { node_type, content, .. } = node else { return false };
+    let item = match node_type {
+        NodeType::BulletList | NodeType::OrderedList => Some(NodeType::ListItem),
+        NodeType::TaskList => Some(NodeType::TaskItem),
+        _ => None,
+    };
+    if let Some(item) = item {
+        // The schema requires at least one item: a list emptied by a
+        // cross-item delete is invalid content, and `normalize_node`
+        // removes it.
+        if content.children.is_empty() {
+            return true;
+        }
+        let stray = content.children.iter().any(|c| {
+            !matches!(c, Node::Element { node_type: nt, .. } if *nt == item)
+        });
+        if stray {
+            return true;
+        }
+    }
+    content.children.iter().any(has_list_orphan)
 }
 
 /// A transaction describes a state change.
@@ -5971,5 +6003,93 @@ mod tests {
             remap_block_anchor("a", 0, 2, std::slice::from_ref(&map), &old, &new),
             None,
         );
+    }
+}
+
+#[cfg(test)]
+mod deep_normalize_tests {
+    use super::*;
+    use crate::editor::model::Fragment;
+    use crate::editor::schema::default_schema;
+
+    fn p(text: &str) -> Node {
+        Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text(text)]))
+    }
+    fn li(children: Vec<Node>) -> Node {
+        Node::element_with_content(NodeType::ListItem, Fragment::from(children))
+    }
+    fn doc(children: Vec<Node>) -> Node {
+        Node::element_with_content(NodeType::Doc, Fragment::from(children))
+    }
+
+    /// `needs_normalize` used to look two levels deep, so bare text or a
+    /// bare paragraph directly inside a list (depth 3) survived `apply`.
+    /// Every past instance was patched per-path; this is the generic cure.
+    #[test]
+    fn apply_self_heals_a_bare_text_orphan_nested_inside_a_list() {
+        let corrupt = doc(vec![Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![li(vec![p("A")]), Node::text("orphan"), p("bare")]),
+        )]);
+        assert!(default_schema().validate(&corrupt).is_err(), "precondition: corrupt");
+
+        let state = EditorState::create_default(corrupt);
+        let healed = state.apply(state.transaction());
+
+        assert!(
+            default_schema().validate(&healed.doc).is_ok(),
+            "apply must leave a schema-valid doc: {:?}",
+            healed.doc
+        );
+        let list = healed.doc.child(0).unwrap();
+        assert_eq!(list.child_count(), 3, "orphan text and bare paragraph each became an item");
+        assert!(healed.doc.text_content().contains("orphan"), "no content lost");
+    }
+
+    /// The same shape one level deeper (a list inside a blockquote).
+    #[test]
+    fn apply_self_heals_a_list_orphan_under_a_blockquote() {
+        let corrupt = doc(vec![Node::element_with_content(
+            NodeType::Blockquote,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::BulletList,
+                Fragment::from(vec![li(vec![p("A")]), Node::text("deep")]),
+            )]),
+        )]);
+        let state = EditorState::create_default(corrupt);
+        let healed = state.apply(state.transaction());
+        assert!(default_schema().validate(&healed.doc).is_ok(), "{:?}", healed.doc);
+        assert!(healed.doc.text_content().contains("deep"));
+    }
+
+    /// Found by `structural_props`: deleting across nested items left an
+    /// empty BulletList inside a ListItem.
+    #[test]
+    fn apply_removes_a_nested_list_emptied_by_a_delete() {
+        let corrupt = doc(vec![Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![
+                li(vec![p("intro")]),
+                li(vec![Node::element(NodeType::BulletList)]),
+                li(vec![p("outro")]),
+            ]),
+        )]);
+        assert!(default_schema().validate(&corrupt).is_err(), "precondition: corrupt");
+        let state = EditorState::create_default(corrupt);
+        let healed = state.apply(state.transaction());
+        assert!(default_schema().validate(&healed.doc).is_ok(), "{:?}", healed.doc);
+        assert_eq!(healed.doc.child(0).unwrap().child_count(), 3, "the emptied item stays, with a paragraph");
+        assert_eq!(healed.doc.text_content(), "introoutro");
+    }
+
+    #[test]
+    fn apply_is_a_no_op_on_a_valid_doc() {
+        let ok = doc(vec![Node::element_with_content(
+            NodeType::BulletList,
+            Fragment::from(vec![li(vec![p("A")]), li(vec![p("B")])]),
+        )]);
+        let state = EditorState::create_default(ok.clone());
+        let after = state.apply(state.transaction());
+        assert_eq!(after.doc, ok);
     }
 }

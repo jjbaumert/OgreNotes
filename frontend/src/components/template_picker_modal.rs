@@ -128,14 +128,31 @@ pub fn TemplatePickerModal(
         }
     };
 
+    // Same modal hygiene as every other dialog: focus trap, Escape, and
+    // closes deferred one microtask past the click so the <Show> teardown
+    // never runs inside the handler that triggered it (the "closure
+    // invoked recursively or after being dropped" class).
+    let dialog_ref = NodeRef::<leptos::html::Div>::new();
+    crate::a11y::install_focus_trap(dialog_ref, visible.into());
+
     view! {
         <Show when=move || visible.get()>
-            <div class="confirm-backdrop" on:click=move |_| on_close.run(())>
+            <div class="confirm-backdrop" on:click=move |_| crate::a11y::defer_close(on_close)>
             <div
+                node_ref=dialog_ref
                 class="folder-picker-dialog template-picker-dialog"
                 role="dialog"
                 aria-modal="true"
                 on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
+                on:keydown=move |e: web_sys::KeyboardEvent| {
+                    if e.key() == "Escape" {
+                        crate::a11y::defer_close(on_close);
+                        return;
+                    }
+                    if let Some(node) = dialog_ref.get() {
+                        crate::a11y::handle_tab_trap(&e, node.as_ref());
+                    }
+                }
             >
                 {move || {
                     if let Some(t) = picked.get() {
@@ -153,7 +170,7 @@ pub fn TemplatePickerModal(
                                 <button
                                     class="toolbar-btn"
                                     aria-label=crate::t!("modal-close")
-                                    on:click=move |_| on_close.run(())
+                                    on:click=move |_| crate::a11y::defer_close(on_close)
                                 >"\u{00D7}"</button>
                             </div>
                             <div class="folder-picker-body template-picker-body template-picker-fill">
@@ -209,7 +226,7 @@ pub fn TemplatePickerModal(
                                 <button
                                     class="toolbar-btn"
                                     aria-label=crate::t!("modal-close")
-                                    on:click=move |_| on_close.run(())
+                                    on:click=move |_| crate::a11y::defer_close(on_close)
                                 >"\u{00D7}"</button>
                             </div>
                             <div class="folder-picker-body template-picker-body">

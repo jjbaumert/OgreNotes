@@ -20,3 +20,4 @@ pub mod room;
 pub mod schema;
 pub mod snapshot;
 pub mod themes;
+pub mod validate;

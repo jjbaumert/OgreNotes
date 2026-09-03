@@ -58,6 +58,13 @@ pub enum MarkType {
 }
 
 impl MarkType {
+    /// Every variant, for exhaustive tests (see `NodeType::ALL`).
+    pub const ALL: &'static [MarkType] = &[
+        MarkType::Link, MarkType::Bold, MarkType::Italic, MarkType::Underline,
+        MarkType::Strike, MarkType::Code, MarkType::TextColor, MarkType::Highlight,
+        MarkType::Subscript, MarkType::Superscript, MarkType::Mention,
+    ];
+
     /// #143: the mutually-exclusive partner, if any. A character can't be both
     /// subscript and superscript, so applying one strips the other.
     pub fn exclusive_partner(&self) -> Option<MarkType> {
@@ -209,6 +216,18 @@ pub enum NodeType {
 }
 
 impl NodeType {
+    /// Every variant, for exhaustive tests. A new variant must be added
+    /// here; `schema_duality_fixture_matches_this_crate` counts them.
+    pub const ALL: &'static [NodeType] = &[
+        NodeType::Doc, NodeType::Paragraph, NodeType::Heading, NodeType::BulletList,
+        NodeType::OrderedList, NodeType::ListItem, NodeType::TaskList, NodeType::TaskItem,
+        NodeType::Blockquote, NodeType::CodeBlock, NodeType::HorizontalRule, NodeType::HardBreak,
+        NodeType::Image, NodeType::Table, NodeType::TableRow, NodeType::TableCell,
+        NodeType::TableHeader, NodeType::Embed, NodeType::Calendar, NodeType::CalendarEvent,
+        NodeType::Kanban, NodeType::KanbanColumn, NodeType::KanbanCard, NodeType::Mention,
+        NodeType::DocMention, NodeType::Mermaid, NodeType::Slide, NodeType::Frame,
+    ];
+
     /// Whether this is a leaf node (no children).
     pub fn is_leaf(&self) -> bool {
         matches!(
