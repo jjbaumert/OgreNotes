@@ -239,6 +239,16 @@ fn code_block_rule() -> InputRule {
             if !tag.is_empty() {
                 attrs.insert("language".to_string(), tag.to_string());
             }
+            // SetNodeType replaces the attrs wholesale, so carry the
+            // paragraph's blockId over: the yrs bridge asserts every
+            // container carries one, and a converted block that loses
+            // its identity also loses comment anchors and block links.
+            // Found by the code-block-enter doctor scenario.
+            if let Some(id) = crate::editor::state::find_block_at(&state.doc, from)
+                .and_then(|b| b.attrs.get("blockId").cloned())
+            {
+                attrs.insert("blockId".to_string(), id);
+            }
             let txn = state
                 .transaction()
                 .delete(from, to)
@@ -1780,5 +1790,32 @@ mod tests {
         let new_state = state.apply(txn);
         // Should be a bullet list, not anything else
         assert_eq!(new_state.doc.child(0).unwrap().node_type(), Some(NodeType::BulletList));
+    }
+}
+
+#[cfg(test)]
+mod fence_block_id_tests {
+    use super::*;
+    use crate::editor::model::{Fragment, Node};
+    use crate::editor::selection::Selection;
+    use crate::editor::state::EditorState;
+
+    /// Found by the code-block-enter doctor scenario: the converted code
+    /// block had no blockId, and yrs_bridge's write latch panicked.
+    #[test]
+    fn triple_backtick_keeps_the_paragraphs_block_id() {
+        let para = Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text("``` ")]));
+        let id = para.block_id().expect("paragraphs get a blockId").to_string();
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![para]));
+        let state = EditorState {
+            selection: Selection::cursor(5),
+            ..EditorState::create_default(doc)
+        };
+        let rules = default_input_rules();
+        let txn = check_input_rules(&rules, &state, "``` ", 1).expect("fence rule fires");
+        let new_state = state.apply(txn);
+        let block = new_state.doc.child(0).unwrap();
+        assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+        assert_eq!(block.block_id(), Some(id.as_str()), "blockId must survive the conversion");
     }
 }
