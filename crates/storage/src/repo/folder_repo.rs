@@ -126,10 +126,33 @@ impl FolderRepo {
 
         let update_expr = format!("SET {}", expr_parts.join(", "));
 
-        self.db
-            .update_item(&pk, Folder::sk(), &update_expr, values, None)
+        // Guard with attribute_exists(PK): a bare update_item upserts, so a
+        // folder deleted between the caller's ownership check and this write
+        // would otherwise resurrect a partial row that `folder_from_item`
+        // can never decode again. Mirrors DocRepo::update_metadata.
+        match self
+            .db
+            .inner()
+            .update_item()
+            .table_name(self.db.table_name())
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S(Folder::sk().to_string()))
+            .update_expression(&update_expr)
+            .condition_expression("attribute_exists(PK)")
+            .set_expression_attribute_values(Some(values))
+            .send()
             .await
-            .map_err(|e| RepoError::Dynamo(e.to_string()))
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let svc = e.into_service_error();
+                if svc.is_conditional_check_failed_exception() {
+                    Err(RepoError::NotFound(format!("folder {folder_id} no longer exists")))
+                } else {
+                    Err(RepoError::Dynamo(svc.to_string()))
+                }
+            }
+        }
     }
 
     /// Delete a folder (metadata only; children should be moved first).
@@ -566,3 +589,43 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use crate::test_support::{
+        replaying_dynamo, replaying_dynamo_with_status, request_body, CONDITIONAL_CHECK_FAILED,
+    };
+
+    /// A bare `update_item` upserts. A rename racing a delete used to leave
+    /// a row holding only `updated_at` (+ title), which `folder_from_item`
+    /// then rejects on every later read — a permanently unreadable folder.
+    /// Mirrors `DocRepo::update_metadata`'s guard.
+    #[tokio::test]
+    async fn update_sends_attribute_exists_guard() {
+        let (db, replay) = replaying_dynamo(vec!["{}"]);
+        let repo = FolderRepo::new(db);
+
+        repo.update("f1", Some("Renamed"), None, None, None, 42)
+            .await
+            .expect("update");
+
+        let body = request_body(&replay, 0);
+        assert!(
+            body.contains(r#""ConditionExpression":"attribute_exists(PK)""#),
+            "update must be guarded: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_of_a_deleted_folder_is_not_found() {
+        let (db, _replay) = replaying_dynamo_with_status(vec![(400, CONDITIONAL_CHECK_FAILED)]);
+        let repo = FolderRepo::new(db);
+
+        let err = repo
+            .update("f1", Some("Renamed"), None, None, None, 42)
+            .await
+            .expect_err("guard must refuse");
+        assert!(matches!(err, RepoError::NotFound(_)), "got {err:?}");
+    }
+}

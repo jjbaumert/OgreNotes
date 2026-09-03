@@ -331,7 +331,14 @@ async fn update_folder(
             now_usec(),
         )
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(|e| match e {
+            // The guarded write found no row: deleted between our
+            // ownership check and the update. A clean 404, not a 500.
+            ogrenotes_storage::repo::RepoError::NotFound(_) => {
+                ApiError::NotFound("Folder not found".to_string())
+            }
+            other => ApiError::Internal(other.to_string()),
+        })?;
 
     // #37: drop the cached inherit_mode so a Restrict/inherit change takes
     // effect on the next REST access check instead of lingering for the TTL.
