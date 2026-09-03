@@ -298,8 +298,10 @@ async fn add_member(
         return Err(ApiError::Conflict("User is already a member".to_string()));
     }
 
+    let target = body.user_id.clone();
+    let role_label = body.role.as_str().to_string();
     let member = WorkspaceMember {
-        workspace_id: id,
+        workspace_id: id.clone(),
         user_id: body.user_id,
         role: body.role,
         joined_at: now_usec(),
@@ -310,6 +312,20 @@ async fn add_member(
         .add_member(&member)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Workspace membership is the widest grant in the system (it feeds
+    // link-sharing audience); audit it like ShareGranted. Subject = the
+    // added member, actor = the admin.
+    crate::routes::audit::record_security_event_by_actor(
+        &state,
+        &target,
+        &user_id,
+        ogrenotes_storage::models::security_audit::SecurityAuditAction::WorkspaceMemberAdded {
+            workspace_id: id,
+            target: target.clone(),
+            role: role_label,
+        },
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -331,6 +347,17 @@ async fn remove_member(
         .remove_member(&id, &target_user_id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Mirror of the add path: subject = removed member, actor = admin.
+    crate::routes::audit::record_security_event_by_actor(
+        &state,
+        &target_user_id,
+        &user_id,
+        ogrenotes_storage::models::security_audit::SecurityAuditAction::WorkspaceMemberRemoved {
+            workspace_id: id,
+            target: target_user_id.clone(),
+        },
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }
