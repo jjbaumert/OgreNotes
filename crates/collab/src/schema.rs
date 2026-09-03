@@ -510,28 +510,30 @@ mod tests {
     //
     // See "Schema Duality" in design/mvp-detailed-design.md.
 
-    /// Render this crate's schema as the duality fixture. Sorted maps and
-    /// child lists so the JSON is byte-stable.
+    /// Render this crate's schema as the duality fixture. Every object is a
+    /// `BTreeMap` (not `json!({..})`) so key order is alphabetical whether
+    /// or not some other crate in the build graph turns on serde_json's
+    /// `preserve_order` feature — the workspace build does, a crate-alone
+    /// build doesn't, and the file must be byte-stable under both.
     fn duality_fixture_json() -> String {
         use std::collections::BTreeMap;
-        let mut nodes = BTreeMap::new();
+        let mut nodes: BTreeMap<String, BTreeMap<&str, serde_json::Value>> = BTreeMap::new();
         for nt in ALL_NODE_TYPES {
             let mut children: Vec<String> =
                 nt.valid_children().iter().map(|c| format!("{c:?}")).collect();
             children.sort();
-            nodes.insert(
-                format!("{nt:?}"),
-                serde_json::json!({
-                    "children": children,
-                    "leaf": nt.is_leaf(),
-                    "inline": nt.is_inline(),
-                }),
-            );
+            let mut entry = BTreeMap::new();
+            entry.insert("children", serde_json::Value::from(children));
+            entry.insert("leaf", serde_json::Value::from(nt.is_leaf()));
+            entry.insert("inline", serde_json::Value::from(nt.is_inline()));
+            nodes.insert(format!("{nt:?}"), entry);
         }
         let mut marks: Vec<String> = ALL_MARK_TYPES.iter().map(|m| format!("{m:?}")).collect();
         marks.sort();
-        let v = serde_json::json!({ "nodes": nodes, "marks": marks });
-        serde_json::to_string_pretty(&v).expect("serialize fixture") + "\n"
+        let mut top: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+        top.insert("nodes", serde_json::to_value(nodes).expect("nodes"));
+        top.insert("marks", serde_json::Value::from(marks));
+        serde_json::to_string_pretty(&top).expect("serialize fixture") + "\n"
     }
 
     /// The fixture at `crates/collab/schema-duality.json` is what the
