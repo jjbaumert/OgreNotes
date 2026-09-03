@@ -211,6 +211,19 @@ pub enum SecurityAuditAction {
     /// A workspace admin revoked (disabled) a SCIM provisioning token.
     /// `token_id` is the opaque handle. Keyed on the workspace id.
     WorkspaceScimTokenRevoked { token_id: String },
+    /// A document was restored to an earlier version
+    /// (`POST /documents/{id}/versions/{v}/restore`). Destructive: the
+    /// pending UPDATE# rows newer than the target are discarded, so
+    /// collaborators' unflushed edits vanish. `user_id` PK is the doc
+    /// owner (subject); `actor_id` is the restorer. Mirrors `DocDeleted`.
+    DocRestored { doc_id: String, from_version: u64, to_version: u64 },
+    /// A workspace admin added a member. Workspace membership is the
+    /// widest grant in the system (it feeds link-sharing audience), so
+    /// it is audited like `ShareGranted`. `user_id` PK is the added
+    /// member (subject); `actor_id` is the admin.
+    WorkspaceMemberAdded { workspace_id: String, target: String, role: String },
+    /// A workspace admin removed a member. Subject = removed member.
+    WorkspaceMemberRemoved { workspace_id: String, target: String },
 }
 
 impl SecurityAuditAction {
@@ -248,6 +261,9 @@ impl SecurityAuditAction {
             Self::WorkspaceMfaRequiredChanged { .. } => "workspaceMfaRequiredChanged",
             Self::WorkspaceScimTokenIssued { .. } => "workspaceScimTokenIssued",
             Self::WorkspaceScimTokenRevoked { .. } => "workspaceScimTokenRevoked",
+            Self::DocRestored { .. } => "docRestored",
+            Self::WorkspaceMemberAdded { .. } => "workspaceMemberAdded",
+            Self::WorkspaceMemberRemoved { .. } => "workspaceMemberRemoved",
         }
     }
 
@@ -324,6 +340,15 @@ impl SecurityAuditAction {
             }
             Self::WorkspaceScimTokenRevoked { token_id } => {
                 json!({ "tokenId": token_id })
+            }
+            Self::DocRestored { doc_id, from_version, to_version } => {
+                json!({ "docId": doc_id, "fromVersion": from_version, "toVersion": to_version })
+            }
+            Self::WorkspaceMemberAdded { workspace_id, target, role } => {
+                json!({ "workspaceId": workspace_id, "target": target, "role": role })
+            }
+            Self::WorkspaceMemberRemoved { workspace_id, target } => {
+                json!({ "workspaceId": workspace_id, "target": target })
             }
         }
     }
@@ -478,6 +503,28 @@ impl SecurityAuditAction {
             }),
             "workspaceScimTokenRevoked" => Ok(Self::WorkspaceScimTokenRevoked {
                 token_id: get_str("tokenId", Some("token_id"))?,
+            }),
+            "docRestored" => {
+                let get_u64 = |key: &str| -> Result<u64, String> {
+                    detail
+                        .get(key)
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| format!("{tag}: missing detail.{key} (u64)"))
+                };
+                Ok(Self::DocRestored {
+                    doc_id: get_str("docId", None)?,
+                    from_version: get_u64("fromVersion")?,
+                    to_version: get_u64("toVersion")?,
+                })
+            }
+            "workspaceMemberAdded" => Ok(Self::WorkspaceMemberAdded {
+                workspace_id: get_str("workspaceId", None)?,
+                target: get_str("target", None)?,
+                role: get_str("role", None)?,
+            }),
+            "workspaceMemberRemoved" => Ok(Self::WorkspaceMemberRemoved {
+                workspace_id: get_str("workspaceId", None)?,
+                target: get_str("target", None)?,
             }),
             other => Err(format!("unknown security audit action: {other}")),
         }
@@ -726,6 +773,43 @@ mod tests {
                 .unwrap_or_else(|e| panic!("roundtrip failed for {original:?}: {e}"));
             assert_eq!(back, original, "roundtrip mismatch on {original:?}");
         }
+    }
+
+    #[test]
+    fn restore_and_workspace_membership_actions_round_trip_through_storage() {
+        let cases = [
+            SecurityAuditAction::DocRestored {
+                doc_id: "d1".to_string(),
+                from_version: 7,
+                to_version: 8,
+            },
+            SecurityAuditAction::WorkspaceMemberAdded {
+                workspace_id: "ws1".to_string(),
+                target: "u2".to_string(),
+                role: "member".to_string(),
+            },
+            SecurityAuditAction::WorkspaceMemberRemoved {
+                workspace_id: "ws1".to_string(),
+                target: "u2".to_string(),
+            },
+        ];
+        for original in cases {
+            let detail = original.detail_json();
+            let back = SecurityAuditAction::from_storage(original.as_str(), &detail)
+                .unwrap_or_else(|e| panic!("roundtrip failed for {original:?}: {e}"));
+            assert_eq!(back, original, "roundtrip mismatch on {original:?}");
+        }
+        assert_eq!(
+            SecurityAuditAction::DocRestored { doc_id: "d".into(), from_version: 1, to_version: 2 }.as_str(),
+            "docRestored"
+        );
+        // The camelCase detail keys are public wire shape (GET /admin/audit
+        // re-emits them verbatim); pin them.
+        let d = SecurityAuditAction::DocRestored { doc_id: "d".into(), from_version: 1, to_version: 2 }
+            .detail_json();
+        assert_eq!(d["docId"], "d");
+        assert_eq!(d["fromVersion"], 1);
+        assert_eq!(d["toVersion"], 2);
     }
 
     #[test]
