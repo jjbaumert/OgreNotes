@@ -3423,9 +3423,15 @@ async function scenarioCommentPopup(ctx, collector) {
     await page.locator('[data-row="0"][data-col="0"]').first().click({ button: "right" });
     await page.waitForSelector(".ui-menu", { timeout: 3000 });
     await clickCtxMenuItem(page, /comment/i, /add comment/i);
-    // The popup opens once the thread POST returns; under CI Firefox that
-    // took ~7s (2026-09-03 run), so wait like the other selectors do.
-    await page.waitForSelector(".comment-popup", { timeout: 15000 });
+    // Wait for the dialog to be attached rather than "visible": under CI
+    // Firefox the visible-state wait logged "resolved to visible" and
+    // still never returned (2026-09-03 runs), while the popup was on
+    // screen in the end-of-run screenshot. Visibility is asserted below.
+    const popup = page.locator(".comment-popup").first();
+    await popup.waitFor({ state: "attached", timeout: 15000 });
+    if (!(await popup.isVisible())) {
+      throw new Error("comment popup attached but not visible");
+    }
     steps.popupShown = true;
     await page.waitForTimeout(500);
 
@@ -4739,8 +4745,11 @@ async function scenarioCodeBlockEnter(ctx, collector) {
     // input rule. Per-key typing (not clipboard paste) so beforeinput
     // fires for every character, exactly like a real user.
     await page.keyboard.type("```python ", { delay: 20 });
+    // `attached`, not the default `visible`: a fresh code block holds
+    // only a sentinel <br>, so the inline <code> has no box yet and a
+    // visibility wait never resolves before text is typed.
     const codeBlockAppeared = await page
-      .waitForSelector("pre > code.language-python", { timeout: 5000 })
+      .waitForSelector("pre > code.language-python", { state: "attached", timeout: 5000 })
       .then(() => true)
       .catch(() => false);
     steps.aCodeBlockCreated = codeBlockAppeared;
@@ -4781,22 +4790,18 @@ async function scenarioCodeBlockEnter(ctx, collector) {
     steps.cSinglePre = preCountC === 1;
     evidence.cSinglePre = `pre count: ${preCountC}`;
 
+    // Enter after a Python block opener (':') auto-indents one unit,
+    // so the new line carries four spaces (editor-style newlineInCode;
+    // see split_block's CodeBlock branch). The block stays one <pre>.
     const codeTextC = await page.locator("pre > code").first().textContent();
-    steps.cTextContent = codeTextC === "class PythonClass:\n";
+    steps.cTextContent = codeTextC === "class PythonClass:\n    ";
     evidence.cTextContent = JSON.stringify(codeTextC);
 
-    const sentinelC = await page
-      .locator("pre > code")
-      .first()
-      .evaluate((code) => {
-        const last = code.lastElementChild;
-        return !!(last && last.tagName === "BR" && last.hasAttribute("data-sentinel"));
-      })
-      .catch(() => false);
-    steps.cSentinelBr = sentinelC;
-    evidence.cSentinelBr = sentinelC
-      ? "last element child is br[data-sentinel]"
-      : "last element child is not br[data-sentinel]";
+    const autoIndentC = codeTextC !== null && codeTextC.endsWith("\n    ");
+    steps.cAutoIndent = autoIndentC;
+    evidence.cAutoIndent = autoIndentC
+      ? "new line auto-indented by one unit"
+      : "new line not auto-indented";
 
     const selInPreC = await page.evaluate(() => {
       const sel = window.getSelection();
@@ -4812,14 +4817,17 @@ async function scenarioCodeBlockEnter(ctx, collector) {
     await page.waitForTimeout(150);
 
     const codeTextD = await page.locator("pre > code").first().textContent();
-    steps.dTextContent = codeTextD === "class PythonClass:\npass";
+    steps.dTextContent = codeTextD === "class PythonClass:\n    pass";
     evidence.dTextContent = JSON.stringify(codeTextD);
 
     const preCountD = await page.locator("pre").count();
     steps.dSinglePre = preCountD === 1;
     evidence.dSinglePre = `pre count: ${preCountD}`;
 
-    // ── Step e: blank line (Enter twice) exits the code block.
+    // ── Step e: the user-tuned triple-Enter escape — two Enters leave
+    // two whitespace-only trailing lines (auto-indent keeps the
+    // spaces), the third strips them and exits to a paragraph below.
+    await page.keyboard.press("Enter");
     await page.keyboard.press("Enter");
     await page.keyboard.press("Enter");
     await page.waitForTimeout(200);
@@ -4859,7 +4867,7 @@ async function scenarioCodeBlockEnter(ctx, collector) {
     evidence.eSelection = selE;
 
     const codeTextE = await page.locator("pre > code").first().textContent();
-    steps.eTextContentUnchanged = codeTextE === "class PythonClass:\npass";
+    steps.eTextContentUnchanged = codeTextE === "class PythonClass:\n    pass";
     evidence.eTextContent = JSON.stringify(codeTextE);
   } catch (e) {
     collector.stepError = `${e.message}\n${e.stack || ""}`;
@@ -6135,10 +6143,12 @@ async function scenarioMenuExportDownloads(ctx, collector) {
     // absent: since #119 it copies to the clipboard ("Markdown (copy)")
     // instead of downloading. PDF needs the `pdf` server feature, which
     // the CI server is built without.
+    // Submenu parents render "Export" + an arrow glyph in one element
+    // and leaves may carry a shortcut span, so anchor at the start only.
     const formats = [
-      { label: /^HTML$/, ext: "html" },
-      { label: /^CSV$/, ext: "csv" },
-      { label: /^Excel \(\.xlsx\)$/, ext: "xlsx" },
+      { label: /^HTML/, ext: "html" },
+      { label: /^CSV/, ext: "csv" },
+      { label: /^Excel/, ext: "xlsx" },
     ];
 
     for (const { label, ext } of formats) {
@@ -6149,7 +6159,7 @@ async function scenarioMenuExportDownloads(ctx, collector) {
         page.waitForEvent("download", { timeout: 15000 }),
         // Export is a submenu of the shared menu primitive: hover the
         // parent so the leaf becomes visible, then click it.
-        clickCtxMenuItem(page, /^Export$/, label),
+        clickCtxMenuItem(page, /^Export/, label),
       ]);
       const filename = await download.suggestedFilename();
       if (!filename.toLowerCase().endsWith(`.${ext}`)) {
@@ -7795,7 +7805,7 @@ async function main() {
     ],
     "code-block-enter": [
       "editorReady", "aCodeBlockCreated", "aChipShowsPython",
-      "bKeywordSpan", "cSinglePre", "cTextContent", "cSentinelBr",
+      "bKeywordSpan", "cSinglePre", "cTextContent", "cAutoIndent",
       "cSelectionInPre", "dTextContent", "dSinglePre",
       "eParagraphAfterPre", "eSelectionInParagraph",
       "eTextContentUnchanged", "noPageErrors", "noConsoleErrors",
