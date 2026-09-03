@@ -58,7 +58,11 @@ async fn check(
     // Clamp so a request at the exact bucket boundary doesn't quote a
     // full-window Retry-After (the next INCR would land in a fresh
     // bucket; the cap immediately resets).
-    let secs_until_next = (window_secs - (now % window_secs)).clamp(1, window_secs - 1);
+    // `clamp(min, max)` panics when min > max; a 1-second window would
+    // hit that. Every current caller passes 60, but make the arithmetic
+    // total rather than rely on it.
+    let secs_until_next =
+        (window_secs - (now % window_secs)).clamp(1, window_secs.saturating_sub(1).max(1));
     let key = format!("ratelimit:{scope}:{identifier}:{bucket}");
 
     // Fixed-window counter: INCR then unconditionally EXPIRE. The
@@ -187,4 +191,38 @@ pub fn ip_identifier(headers: &axum::http::HeaderMap) -> String {
         .and_then(|v| v.split(',').next())
         .map(|v| v.trim().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn ip_identifier_takes_first_xff_hop_and_trims() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", " 203.0.113.9 , 10.0.0.1".parse().unwrap());
+        assert_eq!(ip_identifier(&h), "203.0.113.9");
+    }
+
+    #[test]
+    fn ip_identifier_defaults_to_unknown_without_header() {
+        assert_eq!(ip_identifier(&HeaderMap::new()), "unknown");
+    }
+
+    #[test]
+    fn scope_label_covers_every_enforce_call_site() {
+        // Every scope string passed to `enforce` in the crate. A new
+        // caller that forgets to add its scope here lands in "other"
+        // and its metrics vanish into one bucket.
+        for scope in [
+            "auth_login", "auth_refresh", "search", "sharing", "admin_mut",
+            "scim_request", "mfa_verify", "comments", "content_write", "import",
+            "bulk_op", "bulk_export", "ws_upgrade", "dev_login", "client_telemetry",
+            "rum", "saml_acs",
+        ] {
+            assert_ne!(scope_label(scope), "other", "scope {scope} must have a label");
+        }
+        assert_eq!(scope_label("doc-abc123"), "other");
+    }
 }

@@ -369,6 +369,20 @@ async fn delete_folder(
         return Err(ApiError::Forbidden);
     }
 
+    // Children are edges under FOLDER#<id>/CHILD#…; deleting the parent
+    // row alone strands every child outside the tree (unreachable, not
+    // trashed). Callers move or trash children first.
+    let children = state
+        .folder_repo
+        .list_children(&id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if !children.is_empty() {
+        return Err(ApiError::Conflict(
+            "Folder is not empty; move or delete its contents first".to_string(),
+        ));
+    }
+
     state
         .folder_repo
         .delete(&id)
