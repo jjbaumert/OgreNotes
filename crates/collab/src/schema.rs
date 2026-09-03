@@ -510,6 +510,56 @@ mod tests {
     //
     // See "Schema Duality" in design/mvp-detailed-design.md.
 
+    /// Render this crate's schema as the duality fixture. Sorted maps and
+    /// child lists so the JSON is byte-stable.
+    fn duality_fixture_json() -> String {
+        use std::collections::BTreeMap;
+        let mut nodes = BTreeMap::new();
+        for nt in ALL_NODE_TYPES {
+            let mut children: Vec<String> =
+                nt.valid_children().iter().map(|c| format!("{c:?}")).collect();
+            children.sort();
+            nodes.insert(
+                format!("{nt:?}"),
+                serde_json::json!({
+                    "children": children,
+                    "leaf": nt.is_leaf(),
+                    "inline": nt.is_inline(),
+                }),
+            );
+        }
+        let mut marks: Vec<String> = ALL_MARK_TYPES.iter().map(|m| format!("{m:?}")).collect();
+        marks.sort();
+        let v = serde_json::json!({ "nodes": nodes, "marks": marks });
+        serde_json::to_string_pretty(&v).expect("serialize fixture") + "\n"
+    }
+
+    /// The fixture at `crates/collab/schema-duality.json` is what the
+    /// frontend's `schema_duality_fixture_matches_this_crate` asserts
+    /// against. This side regenerates it from the canonical schema; a
+    /// mismatch means either this crate drifted from the fixture or the
+    /// fixture needs a deliberate update (paste the printed JSON), after
+    /// which the frontend test tells you what still has to move there.
+    #[test]
+    fn schema_duality_fixture_matches_this_crate() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/schema-duality.json");
+        let on_disk = std::fs::read_to_string(path).expect("schema-duality.json must exist");
+        let expected = duality_fixture_json();
+        assert!(
+            on_disk == expected,
+            "schema-duality.json is out of date. Expected contents:\n{expected}"
+        );
+    }
+
+    /// Every mark's attribute name round-trips; the older
+    /// `cross_schema_mark_attr_names` pins only seven of nine.
+    #[test]
+    fn every_mark_attr_name_round_trips() {
+        for m in ALL_MARK_TYPES {
+            assert_eq!(MarkType::from_attr(m.attr_name()), Some(*m), "{m:?}");
+        }
+    }
+
     /// All node types. Must match frontend/src/editor/model.rs NodeType enum.
     const ALL_NODE_TYPES: &[NodeType] = &[
         NodeType::Doc,
