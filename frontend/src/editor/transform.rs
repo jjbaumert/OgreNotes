@@ -957,10 +957,22 @@ fn set_node_type_at(
                 let size = child.node_size();
                 if offset == pos {
                     match child {
-                        Node::Element { content: cc, marks: cm, .. } => {
+                        Node::Element { attrs: old_attrs, content: cc, marks: cm, .. } => {
+                            // A type change replaces the attrs (ProseMirror
+                            // setNodeMarkup semantics) but must never drop
+                            // the block identity: the yrs bridge assumes every
+                            // container carries a blockId (write_node's #92
+                            // latch), and callers like the ``` input rule and
+                            // set_paragraph pass only the new type's attrs.
+                            let mut attrs = new_attrs.clone();
+                            if new_type.needs_block_id() {
+                                if let Some(id) = old_attrs.get("blockId") {
+                                    attrs.entry("blockId".to_string()).or_insert_with(|| id.clone());
+                                }
+                            }
                             new_children.push(Node::Element {
                                 node_type: *new_type,
-                                attrs: new_attrs.clone(),
+                                attrs,
                                 content: cc.clone(),
                                 marks: cm.clone(),
                             });
@@ -1975,5 +1987,36 @@ mod swap_remap_prop_tests {
             }
             prop_assert_eq!(map.map(old_size, 1), new.content_size());
         }
+    }
+}
+
+#[cfg(test)]
+mod set_node_type_block_id_tests {
+    use super::*;
+    use crate::editor::model::{Fragment, Node, NodeType};
+
+    /// Found by the code-block-enter doctor scenario: the ``` input rule
+    /// and `set_paragraph` pass only the new type's attrs, so the block
+    /// lost its blockId and the yrs bridge's write latch fired.
+    #[test]
+    fn set_node_type_keeps_the_existing_block_id() {
+        let para = Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text("x")]));
+        let id = para.block_id().expect("paragraphs get a blockId").to_string();
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![para]));
+
+        let out = set_node_type_at(&doc, 0, &NodeType::CodeBlock, &HashMap::new()).expect("set type");
+        let block = out.child(0).unwrap();
+        assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+        assert_eq!(block.block_id(), Some(id.as_str()), "blockId must survive a type change");
+    }
+
+    #[test]
+    fn set_node_type_prefers_an_explicit_block_id_in_the_new_attrs() {
+        let para = Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text("x")]));
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![para]));
+        let mut attrs = HashMap::new();
+        attrs.insert("blockId".to_string(), "explicit00".to_string());
+        let out = set_node_type_at(&doc, 0, &NodeType::Heading, &attrs).expect("set type");
+        assert_eq!(out.child(0).unwrap().block_id(), Some("explicit00"));
     }
 }
