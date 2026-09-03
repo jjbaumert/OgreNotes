@@ -1045,22 +1045,37 @@ impl Transaction {
             let list_node = list_slice.content.children.first()
                 .ok_or_else(|| StepError("expected list element".into()))?;
 
-            // Find previous item index and offset
+            // Find previous item index and offset by walking the list's
+            // children. The item must be a direct child of this list; when
+            // the two lookups disagree (an item of a nested list under an
+            // outer container, reachable after outdent + range-split), the
+            // old `item.offset - prev.node_size()` fallback underflowed —
+            // a panic in debug builds and a wrapped garbage offset in
+            // release wasm. Refuse cleanly instead so the command is a
+            // no-op rather than corrupting the tree.
             let mut prev_item_idx = 0;
+            let mut prev_item_offset = container.offset + 1;
             let mut child_offset = container.offset + 1;
+            let mut found = false;
             for i in 0..list_node.child_count() {
                 let child = list_node.child(i)
                     .ok_or_else(|| StepError("missing list child".into()))?;
                 if child_offset == item.offset {
+                    found = true;
                     break;
                 }
                 prev_item_idx = i;
+                prev_item_offset = child_offset;
                 child_offset += child.node_size();
+            }
+            if !found {
+                return Err(StepError(
+                    "lift_from_list: item is not a direct child of its list container".into(),
+                ));
             }
 
             let prev_item_node = list_node.child(prev_item_idx)
                 .ok_or_else(|| StepError("no previous item".into()))?;
-            let prev_item_offset = item.offset - prev_item_node.node_size();
 
             // Merge: take prev item's children, append current block content to last paragraph
             let mut merged_children: Vec<Node> = Vec::new();

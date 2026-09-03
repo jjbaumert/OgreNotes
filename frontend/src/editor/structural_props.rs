@@ -163,3 +163,24 @@ proptest! {
         }
     }
 }
+
+/// Shrunk case the property found (persisted in proptest-regressions):
+/// three list toggles inside a blockquote, an outdent, then a range
+/// split underflowed `lift_from_list`'s previous-item arithmetic.
+#[test]
+fn regression_range_split_after_outdent_in_quoted_list_does_not_panic() {
+    let ops = [
+        Op::ToggleBullet,
+        Op::ToggleBullet,
+        Op::ToggleBullet,
+        Op::ShiftTab,
+        Op::Select(0, 10),
+        Op::Split,
+    ];
+    let schema = default_schema();
+    let mut state = EditorState::create_default(seeds()[2].clone());
+    for op in &ops {
+        state = step(state, op);
+        assert!(schema.validate(&state.doc).is_ok(), "after {op:?}: {:?}", state.doc);
+    }
+}
