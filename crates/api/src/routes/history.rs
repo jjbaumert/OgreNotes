@@ -280,6 +280,20 @@ async fn restore_version(
     // the same fix `import_file` applies for its wholesale-replace path.
     let _ = state.doc_repo.delete_updates_before(&id, now_usec()).await;
 
+    // Durable SecurityAudit row: a restore discards every collaborator's
+    // unflushed edits newer than the target, so it is destructive doc
+    // state like delete/lock/compact. Subject = owner, actor = restorer.
+    crate::routes::audit::record_security_event_by_actor(
+        &state,
+        &meta.owner_id,
+        &user_id,
+        ogrenotes_storage::models::security_audit::SecurityAuditAction::DocRestored {
+            doc_id: id.clone(),
+            from_version: version,
+            to_version: new_version,
+        },
+    );
+
     // Record activity event
     let activity_repo = state.activity_repo.clone();
     let act_doc_id = id.clone();
