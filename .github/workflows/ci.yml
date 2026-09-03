@@ -68,6 +68,34 @@ jobs:
       - name: Workspace lib tests
         run: cargo test --workspace --lib --locked
 
+      # The `tests/` directories of the non-api crates were never run in
+      # CI (only `--lib` above and the api crate's suite below), so 78
+      # passing-locally tests had no enforcement: collab import_fuzz +
+      # quip_corpus, highlight partition/dispatch/css-sync, search props,
+      # worker integration_queue. collab's xlsx/docx/pdf importers are
+      # off by default and only compile in the --workspace run because
+      # the api crate's defaults unify them on, so name them here.
+      # storage's tests/ needs DynamoDB Local and runs in the
+      # integration job instead. REDIS_URL points at the service
+      # container above; OGRE_REQUIRE_REDIS makes the worker suite
+      # panic instead of skipping green if it is unreachable.
+      - name: Workspace integration-target tests (non-api)
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+          OGRE_REQUIRE_REDIS: "1"
+        run: |
+          cargo test --locked --tests \
+            -p ogrenotes-collab -p ogrenotes-highlight \
+            -p ogrenotes-search -p ogrenotes-worker \
+            --features ogrenotes-collab/xlsx,ogrenotes-collab/docx,ogrenotes-collab/pdf
+
+      # Nothing else compiles bins, examples, or benches: mermaid_cli,
+      # the mermaid gallery examples, collab's replay bin, and the
+      # yrs_ops benches could rot without a red check. `check` rather
+      # than `clippy -D warnings` so pre-existing warnings don't block.
+      - name: Workspace check (all targets)
+        run: cargo check --workspace --all-targets --locked
+
       - name: Frontend lib tests
         working-directory: frontend
         run: cargo test --lib --locked
@@ -167,6 +195,13 @@ jobs:
       # until a probe confirms in-process verify works here.
       - name: API integration tests
         run: cargo test -p ogrenotes-api --locked --no-fail-fast
+
+      # storage's tests/test_import_repo.rs (25 tests, incl. the import
+      # runner-lease contract) needs DynamoDB Local and was never run
+      # in CI. Its require_infra! panics when CI is set and infra is
+      # down, so a missing service fails loud here.
+      - name: Storage integration tests
+        run: cargo test -p ogrenotes-storage --tests --locked --no-fail-fast
 
       - name: Compose logs on failure
         if: failure()
