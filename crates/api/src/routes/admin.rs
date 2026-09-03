@@ -300,6 +300,18 @@ async fn disable_user(
     // Revoke all active sessions so the user is logged out immediately
     let _ = state.session_repo.delete_all_for_user(&id).await;
 
+    // Mirror the SCIM deprovision path: the session kill is a security
+    // event on the victim's account (subject = victim, actor = admin),
+    // separate from the AdminAudit row that records the admin's action.
+    crate::routes::audit::record_security_event_by_actor(
+        &state,
+        &id,
+        &auth.user_id,
+        ogrenotes_storage::models::security_audit::SecurityAuditAction::SessionRevoked {
+            reason: "admin_disable".to_string(),
+        },
+    );
+
     record_admin_action(
         &state,
         &auth.user_id,
