@@ -402,3 +402,90 @@ impl DynamoClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::{replaying_dynamo, request_body};
+
+    fn page(n: usize, start: usize, more: bool) -> String {
+        let items: Vec<String> = (start..start + n)
+            .map(|i| format!(r#"{{"PK":{{"S":"P"}},"SK":{{"S":"S{i:04}"}}}}"#))
+            .collect();
+        let lek = if more {
+            format!(
+                r#","LastEvaluatedKey":{{"PK":{{"S":"P"}},"SK":{{"S":"S{:04}"}}}}"#,
+                start + n - 1
+            )
+        } else {
+            String::new()
+        };
+        format!(r#"{{"Items":[{}]{}}}"#, items.join(","), lek)
+    }
+
+    /// `limit` is a cap on the total across pages: three pages of 40 with
+    /// a cap of 50 yields exactly 50, and the second request asks DynamoDB
+    /// for only the 10 still needed.
+    #[tokio::test]
+    async fn query_index_caps_total_across_pages() {
+        let (p1, p2, p3) = (page(40, 0, true), page(40, 40, true), page(40, 80, true));
+        let (db, replay) = replaying_dynamo(vec![&p1, &p2, &p3]);
+        let items = db
+            .query_index("gsi", "gsi_pk", "v", None, None, true, Some(50))
+            .await
+            .expect("query_index");
+        assert_eq!(items.len(), 50);
+        assert_eq!(replay.actual_requests().count(), 2, "third page must not be fetched");
+        assert!(request_body(&replay, 0).contains(r#""Limit":50"#));
+        assert!(request_body(&replay, 1).contains(r#""Limit":10"#));
+        assert!(request_body(&replay, 1).contains(r#""ExclusiveStartKey""#));
+    }
+
+    #[tokio::test]
+    async fn query_index_with_zero_limit_makes_no_request() {
+        let (db, replay) = replaying_dynamo(vec![]);
+        let items = db
+            .query_index("gsi", "gsi_pk", "v", None, None, true, Some(0))
+            .await
+            .expect("query_index");
+        assert!(items.is_empty());
+        assert_eq!(replay.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn query_concatenates_all_pages_in_order() {
+        let (p1, p2) = (page(2, 0, true), page(2, 2, false));
+        let (db, replay) = replaying_dynamo(vec![&p1, &p2]);
+        let items = db.query("P", None).await.expect("query");
+        let sks: Vec<String> = items
+            .iter()
+            .map(|i| i["SK"].as_s().unwrap().clone())
+            .collect();
+        assert_eq!(sks, vec!["S0000", "S0001", "S0002", "S0003"]);
+        assert_eq!(replay.actual_requests().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn scan_with_filter_reports_truncation_only_when_rows_remain() {
+        // Exact fill, no continuation → not truncated.
+        let p = page(3, 0, false);
+        let (db, _r) = replaying_dynamo(vec![&p]);
+        let (items, truncated) = db.scan_with_filter("a", "v", 3).await.expect("scan");
+        assert_eq!(items.len(), 3);
+        assert!(!truncated);
+
+        // Over-full page → truncated, capped.
+        let p = page(5, 0, false);
+        let (db, _r) = replaying_dynamo(vec![&p]);
+        let (items, truncated) = db.scan_with_filter("a", "v", 3).await.expect("scan");
+        assert_eq!(items.len(), 3);
+        assert!(truncated);
+
+        // Exact fill but server offers another page → truncated.
+        let p = page(3, 0, true);
+        let (db, r) = replaying_dynamo(vec![&p]);
+        let (items, truncated) = db.scan_with_filter("a", "v", 3).await.expect("scan");
+        assert_eq!(items.len(), 3);
+        assert!(truncated);
+        assert_eq!(r.actual_requests().count(), 1, "cap reached: must not fetch the next page");
+    }
+}

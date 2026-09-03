@@ -102,10 +102,12 @@ impl NotificationRepo {
     ///
     /// The SK range query scopes the scan to notifications newer than the
     /// cutoff; the `is_read = false` filter is applied server-side so the
-    /// handler sees only candidate digest rows. `limit` is applied after
-    /// filtering, so a low limit can under-count if many recent reads sit
-    /// above the window — fine for digests, which are best-effort summary
-    /// emails.
+    /// handler sees only candidate digest rows. `limit` caps the unread
+    /// rows returned. DynamoDB applies `Limit` *before* `FilterExpression`,
+    /// so a single request whose newest `limit` rows were all read would
+    /// return nothing while unread rows existed; the query therefore
+    /// follows `LastEvaluatedKey` until it has `limit` unread rows or the
+    /// range is exhausted.
     pub async fn list_unread_since(
         &self,
         user_id: &str,
@@ -118,28 +120,52 @@ impl NotificationRepo {
         // NOTIF# row regardless of the 20-digit prefix and trailing id.
         let sk_end = "NOTIF#~".to_string();
 
-        let result = self
-            .db
-            .inner()
-            .query()
-            .table_name(self.db.table_name())
-            .key_condition_expression("PK = :pk AND SK BETWEEN :start AND :end")
-            .filter_expression("is_read = :false")
-            .expression_attribute_values(":pk", AttributeValue::S(pk))
-            .expression_attribute_values(":start", AttributeValue::S(sk_start))
-            .expression_attribute_values(":end", AttributeValue::S(sk_end))
-            .expression_attribute_values(":false", AttributeValue::Bool(false))
-            .scan_index_forward(false)
-            .limit(limit as i32)
-            .send()
-            .await
-            .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+        let mut out: Vec<Notification> = Vec::new();
+        let mut last_key: Option<HashMap<String, AttributeValue>> = None;
 
-        let items = result.items.unwrap_or_default();
-        items
-            .iter()
-            .map(|item| notif_from_item(item, user_id))
-            .collect()
+        loop {
+            let remaining = limit.saturating_sub(out.len());
+            if remaining == 0 {
+                break;
+            }
+            let mut builder = self
+                .db
+                .inner()
+                .query()
+                .table_name(self.db.table_name())
+                .key_condition_expression("PK = :pk AND SK BETWEEN :start AND :end")
+                .filter_expression("is_read = :false")
+                .expression_attribute_values(":pk", AttributeValue::S(pk.clone()))
+                .expression_attribute_values(":start", AttributeValue::S(sk_start.clone()))
+                .expression_attribute_values(":end", AttributeValue::S(sk_end.clone()))
+                .expression_attribute_values(":false", AttributeValue::Bool(false))
+                .scan_index_forward(false)
+                // `Limit` bounds rows *read* before the filter, so it is a
+                // page size, not a result cap — hence the loop.
+                .limit(remaining as i32);
+            if let Some(start) = last_key.take() {
+                builder = builder.set_exclusive_start_key(Some(start));
+            }
+
+            let result = builder
+                .send()
+                .await
+                .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+
+            for item in result.items.unwrap_or_default().iter() {
+                if out.len() >= limit {
+                    break;
+                }
+                out.push(notif_from_item(item, user_id)?);
+            }
+
+            match result.last_evaluated_key {
+                Some(key) if out.len() < limit => last_key = Some(key),
+                _ => break,
+            }
+        }
+
+        Ok(out)
     }
 
     /// Mark a specific notification as read.
@@ -614,5 +640,62 @@ mod tests {
             }
             other => panic!("expected MissingField, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+    use crate::test_support::{replaying_dynamo, request_body};
+
+    fn unread_item(created_at: i64, id: &str) -> String {
+        format!(
+            r#"{{"PK":{{"S":"USER#u1"}},"SK":{{"S":"NOTIF#{created_at:020}#{id}"}},"notif_id":{{"S":"{id}"}},"notif_type":{{"S":"mentioned"}},"actor_id":{{"S":"u2"}},"message":{{"S":"hi"}},"is_read":{{"BOOL":false}},"created_at":{{"N":"{created_at}"}}}}"#
+        )
+    }
+
+    /// DynamoDB applies `Limit` to items *read*, then `FilterExpression`.
+    /// A user whose `limit` newest rows were all read used to get an empty
+    /// unread list while unread rows existed on the next page. The loop
+    /// must follow `LastEvaluatedKey` until it has `limit` unread rows or
+    /// the range is exhausted.
+    #[tokio::test]
+    async fn list_unread_since_pages_past_filtered_out_rows() {
+        let page2 = format!(r#"{{"Items":[{}]}}"#, unread_item(800, "n8"));
+        let (db, replay) = replaying_dynamo(vec![
+            // Page 1: every row was read → filtered to nothing, but more exist.
+            r#"{"Items":[],"LastEvaluatedKey":{"PK":{"S":"USER#u1"},"SK":{"S":"NOTIF#00000000000000000900#r9"}}}"#,
+            // Page 2: one unread row.
+            &page2,
+        ]);
+        let repo = NotificationRepo::new(db);
+
+        let rows = repo.list_unread_since("u1", 0, 5).await.expect("list");
+
+        assert_eq!(rows.len(), 1, "the unread row on page 2 must be returned");
+        assert_eq!(rows[0].notif_id, "n8");
+        let second = request_body(&replay, 1);
+        assert!(
+            second.contains(r#""ExclusiveStartKey""#),
+            "page 2 must resume from page 1's LastEvaluatedKey: {second}"
+        );
+    }
+
+    /// Once `limit` unread rows are in hand the loop stops even if the
+    /// server offers another page.
+    #[tokio::test]
+    async fn list_unread_since_stops_at_limit() {
+        let page = format!(
+            r#"{{"Items":[{},{}],"LastEvaluatedKey":{{"PK":{{"S":"USER#u1"}},"SK":{{"S":"NOTIF#00000000000000000700#n7"}}}}}}"#,
+            unread_item(900, "n9"),
+            unread_item(800, "n8")
+        );
+        let (db, replay) = replaying_dynamo(vec![&page]);
+        let repo = NotificationRepo::new(db);
+
+        let rows = repo.list_unread_since("u1", 0, 2).await.expect("list");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(replay.actual_requests().count(), 1, "no second page once limit is met");
     }
 }

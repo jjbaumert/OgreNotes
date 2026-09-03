@@ -26,6 +26,18 @@ ignore = [
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7: unused legacy AWS acceptor path; no 0.101.x fix" },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7: unused legacy AWS acceptor path; no 0.101.x fix" },
 
+    # h2 "unbounded empty DATA frames" (peer-driven memory DoS). Patched
+    # only on the 0.4 line (>= 0.4.16, which Cargo.lock now carries for our
+    # hyper-1 / reqwest path). The 0.3.x line has no fixed release and is
+    # pulled ONLY by aws-smithy-http-client's legacy hyper-0.14 client — a
+    # *client* that connects exclusively to AWS service endpoints (or
+    # DynamoDB Local / MinIO in dev), never to untrusted peers, so a
+    # malicious-server DoS isn't a realistic exposure. Removable when the
+    # AWS SDK drops the hyper-0.14 connector. Re-check on each aws-config
+    # bump. NOTE: `ignore` is advisory-wide, so this also silences a future
+    # regression on the 0.4 line — keep h2 0.4 at or above 0.4.16.
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27: legacy AWS hyper-0.14 client to trusted endpoints only; no 0.3.x fix" },
+
     # Unmaintained transitive crates with no upgrade path. None are direct
     # workspace dependencies; all arrive via the AWS SDK or samael (SAML).
     { id = "RUSTSEC-2023-0019", reason = "kuchiki unmaintained (via samael); no replacement release" },

@@ -331,7 +331,14 @@ async fn update_folder(
             now_usec(),
         )
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(|e| match e {
+            // The guarded write found no row: deleted between our
+            // ownership check and the update. A clean 404, not a 500.
+            ogrenotes_storage::repo::RepoError::NotFound(_) => {
+                ApiError::NotFound("Folder not found".to_string())
+            }
+            other => ApiError::Internal(other.to_string()),
+        })?;
 
     // #37: drop the cached inherit_mode so a Restrict/inherit change takes
     // effect on the next REST access check instead of lingering for the TTL.
@@ -360,6 +367,20 @@ async fn delete_folder(
 
     if folder.folder_type == FolderType::System {
         return Err(ApiError::Forbidden);
+    }
+
+    // Children are edges under FOLDER#<id>/CHILD#…; deleting the parent
+    // row alone strands every child outside the tree (unreachable, not
+    // trashed). Callers move or trash children first.
+    let children = state
+        .folder_repo
+        .list_children(&id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if !children.is_empty() {
+        return Err(ApiError::Conflict(
+            "Folder is not empty; move or delete its contents first".to_string(),
+        ));
     }
 
     state

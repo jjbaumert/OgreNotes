@@ -620,3 +620,51 @@ async fn ws_message_rate_limit_denies_after_budget() {
 
     app.cleanup().await;
 }
+
+/// Chat `send_message` writes to the same thread_repo as comments but was
+/// uncapped. It now draws from the shared "comments" budget (5/min in the
+/// test config) so a chatty user can't amplify DDB writes by switching
+/// surfaces.
+#[tokio::test]
+async fn chat_send_message_is_rate_limited_per_user() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (_, token_a) = app.create_user("ratelimit-chat-a@test.com").await;
+    let (bob_id, _) = app.create_user("ratelimit-chat-b@test.com").await;
+    let (status, chat) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/chats",
+            Some(&token_a),
+            Some(serde_json::json!({ "chatType": "chat", "title": "RL", "memberIds": [bob_id] })),
+        )
+        .await;
+    assert_eq!(status, 201);
+    let chat_id = chat["id"].as_str().unwrap().to_string();
+
+    common::align_rate_limit_window().await;
+    for i in 0..5 {
+        let (status, _) = app
+            .json_request(
+                Method::POST,
+                &format!("/api/v1/chats/{chat_id}/messages"),
+                Some(&token_a),
+                Some(serde_json::json!({ "content": format!("msg {i}") })),
+            )
+            .await;
+        assert!(status < 400, "iter {i}: under-cap message must succeed (status {status})");
+    }
+
+    let (status, json) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/chats/{chat_id}/messages"),
+            Some(&token_a),
+            Some(serde_json::json!({ "content": "one too many" })),
+        )
+        .await;
+    assert_eq!(status, 429, "6th chat message must be rate limited: {json}");
+
+    app.cleanup().await;
+}

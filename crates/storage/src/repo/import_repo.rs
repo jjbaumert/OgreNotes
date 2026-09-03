@@ -259,7 +259,15 @@ impl ImportRepo {
             .query(&format!("IMPORT#{import_id}"), Some(&format!("SECMAP#{quip_thread_id}#")))
             .await
             .map_err(|e| RepoError::Dynamo(e.to_string()))?;
-        let mut rows: Vec<SecMapRow> = items.iter().map(secmap_from_item).collect::<Result<_, _>>()?;
+        let mut rows: Vec<SecMapRow> = items
+            .iter()
+            .map(secmap_from_item)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            // The SK prefix cannot separate `abc` from `abc#0`; the row's
+            // own attribute can.
+            .filter(|r| r.quip_thread_id == quip_thread_id)
+            .collect();
         rows.sort_by_key(|r| r.chunk);
         Ok(rows.into_iter().flat_map(|r| r.entries).collect())
     }
@@ -1909,6 +1917,23 @@ mod tests {
     /// DynamoDB Local cannot express the difference (it serves every read
     /// from one store), so the live integration tests pass either way. This
     /// asserts the request the SDK actually puts on the wire instead.
+    /// `SECMAP#<thread>#` is a prefix query, so a thread id that itself
+    /// contains `#` (e.g. `abc#0`) is returned by the query for thread
+    /// `abc`. The row carries `quip_thread_id`; filter on it rather than
+    /// trusting the prefix — `list_unresolved` already regroups by the
+    /// attribute for the same reason.
+    #[tokio::test]
+    async fn get_secmap_ignores_rows_from_a_prefix_colliding_thread() {
+        let (repo, _replay) = replaying_repo(vec![
+            r#"{"Items":[
+              {"PK":{"S":"IMPORT#imp1"},"SK":{"S":"SECMAP#abc#0"},"quip_thread_id":{"S":"abc"},"chunk":{"N":"0"},"owner_id":{"S":"u1"},"entries":{"L":[{"M":{"quip_section_id":{"S":"s1"},"ogre_block_id":{"S":"b1"}}}]}},
+              {"PK":{"S":"IMPORT#imp1"},"SK":{"S":"SECMAP#abc#0#0"},"quip_thread_id":{"S":"abc#0"},"chunk":{"N":"0"},"owner_id":{"S":"u1"},"entries":{"L":[{"M":{"quip_section_id":{"S":"s2"},"ogre_block_id":{"S":"b2"}}}]}}
+            ]}"#,
+        ]);
+        let entries = repo.get_secmap("imp1", "abc").await.expect("get_secmap");
+        assert_eq!(entries, vec![("s1".to_string(), "b1".to_string())]);
+    }
+
     #[tokio::test]
     async fn the_report_read_modify_write_reads_consistently() {
         let (repo, replay) = replaying_repo(vec![

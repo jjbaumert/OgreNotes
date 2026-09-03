@@ -7848,6 +7848,24 @@ async function main() {
     }
   }
 
+  // Any uncaught page error (a WASM panic surfaces as one) fails the
+  // run, not just the four scenarios that opted in via `panicRe`. The
+  // "closure invoked recursively or after being dropped" class was
+  // captured-and-ignored in the other fifty. Allowlist by scenario
+  // name only when a scenario knowingly provokes an error.
+  const PAGEERROR_ALLOWLIST = new Set([]);
+  if (!PAGEERROR_ALLOWLIST.has(scenario)) {
+    for (const tag of Object.keys(collector)) {
+      const errs = (collector[tag] && Array.isArray(collector[tag].errors)) ? collector[tag].errors : [];
+      if (errs.length > 0) {
+        console.error(`[doctor] ${errs.length} page error(s) on ${tag}; failing run`);
+        for (const e of errs) console.error(`  - ${e.message}`);
+        if (ok) errMsg = `${scenario}: ${errs.length} page error(s) on ${tag}: ${errs[0].message}`;
+        ok = false;
+      }
+    }
+  }
+
   const report = {
     ok,
     error: errMsg,

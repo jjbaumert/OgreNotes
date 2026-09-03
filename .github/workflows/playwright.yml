@@ -756,6 +756,122 @@ jobs:
             --base-url http://127.0.0.1:3000 \
             --out ../../artifacts/doctor/deck-present
 
+      # ─── Previously orphaned scenarios ─────────────────────────
+      # These existed in doctor.js but were never invoked by any
+      # workflow. Wired 2026-09-02. Still NOT wired, because the CI
+      # server can't satisfy their preconditions: admin-console
+      # (ADMIN_EMAILS), mfa-flow (MFA key config), semantic-search
+      # (qdrant + embeddings), import-job-round-trip (worker process),
+      # collab-sync (needs a pre-created --doc-id and two-tab setup).
+
+      # Atom caret class: typing past a block atom must not swallow or
+      # duplicate the keystroke.
+      - name: Run type-past-atom scenario
+        id: type-past-atom
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario type-past-atom \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/type-past-atom
+
+      - name: Run code-block-enter scenario
+        id: code-block-enter
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario code-block-enter \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/code-block-enter
+
+      - name: Run calendar-block scenario
+        id: calendar-block
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario calendar-block \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/calendar-block
+
+      - name: Run kanban-block scenario
+        id: kanban-block
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario kanban-block \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/kanban-block
+
+      - name: Run kanban-drag scenario
+        id: kanban-drag
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario kanban-drag \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/kanban-drag
+
+      - name: Run kanban-wip-limit scenario
+        id: kanban-wip-limit
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario kanban-wip-limit \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/kanban-wip-limit
+
+      - name: Run kanban-column-reorder scenario
+        id: kanban-column-reorder
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario kanban-column-reorder \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/kanban-column-reorder
+
+      - name: Run kanban-card-metadata scenario
+        id: kanban-card-metadata
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario kanban-card-metadata \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/kanban-card-metadata
+
+      # Firefox-only: same modal-close panic class as history-pane,
+      # exercised through the comment composer's ✕ and backdrop.
+      - name: Run comment-popup scenario (Firefox)
+        id: comment-popup
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        env:
+          DOCTOR_BROWSER: firefox
+        run: |
+          node doctor.js \
+            --scenario comment-popup \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/comment-popup
+
+      # Document → Export must download via authenticated fetch, not a
+      # bearer-less window.open (2026-05-28 401 class).
+      - name: Run menu-export-downloads scenario
+        id: menu-export-downloads
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario menu-export-downloads \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/menu-export-downloads
+
       # ─── Teardown / artifacts ─────────────────────────────────
       - name: Stop axum server
         if: always()

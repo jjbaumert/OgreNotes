@@ -515,3 +515,39 @@ async fn test_add_child_requires_access_to_child() {
 
     app.cleanup().await;
 }
+
+/// `delete_folder` dropped the folder row and left every child edge in
+/// place: documents inside became unreachable from the tree without
+/// being trashed. The repo's own doc-comment says "children should be
+/// moved first"; the handler now enforces it with 409.
+#[tokio::test]
+async fn test_delete_folder_with_children_is_refused() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let token = app.create_user_token("alice@test.com").await;
+    let folder_id = app.create_folder(&token, "Full", None).await;
+    let doc_id = app.create_doc(&token, "Inside", Some(&folder_id)).await;
+
+    let (status, json) = app
+        .json_request(
+            Method::DELETE,
+            &format!("/api/v1/folders/{folder_id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 409, "non-empty folder must not be deleted: {json}");
+
+    let (status, _) = app
+        .json_request(Method::GET, &format!("/api/v1/documents/{doc_id}"), Some(&token), None)
+        .await;
+    assert_eq!(status, 200, "the document is untouched");
+
+    let (status, _) = app
+        .json_request(Method::GET, &format!("/api/v1/folders/{folder_id}"), Some(&token), None)
+        .await;
+    assert_eq!(status, 200, "the folder is untouched");
+
+    app.cleanup().await;
+}

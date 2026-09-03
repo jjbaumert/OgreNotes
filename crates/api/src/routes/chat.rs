@@ -459,6 +459,17 @@ async fn send_message(
 
     check_chat_member(&thread, &user_id)?;
 
+    // Shares the comments budget: both surfaces write to thread_repo and
+    // a per-surface cap could be gamed by alternating between them.
+    crate::middleware::rate_limit::enforce(
+        &state.redis,
+        "comments",
+        &user_id,
+        state.config.rate_limit_comments_per_min,
+        60,
+    )
+    .await?;
+
     if body.content.trim().is_empty() {
         return Err(ApiError::BadRequest("Message cannot be empty".to_string()));
     }

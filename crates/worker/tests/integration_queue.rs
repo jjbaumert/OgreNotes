@@ -17,11 +17,22 @@ use fred::prelude::*;
 use ogrenotes_worker::{Job, JobProducer, JobQueue, JobStatus, RetryOutcome};
 use tokio::time::sleep;
 
+/// Locally, skips (with a stderr note) when `REDIS_URL` is unset. When
+/// `OGRE_REQUIRE_REDIS` is set (CI does this), panics instead — the
+/// whole queue-durability contract lives in this file, and a silently
+/// green run with redis missing is exactly the false signal CI must not
+/// produce.
 macro_rules! require_redis {
     () => {
         match std::env::var("REDIS_URL") {
             Ok(url) => url,
             Err(_) => {
+                if std::env::var("OGRE_REQUIRE_REDIS").is_ok() {
+                    panic!(
+                        "REDIS_URL not set but OGRE_REQUIRE_REDIS is: the queue \
+                         integration suite must run in this environment"
+                    );
+                }
                 eprintln!("REDIS_URL not set; skipping integration test");
                 return;
             }

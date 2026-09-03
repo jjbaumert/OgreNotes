@@ -23,6 +23,23 @@ use hyper::Method;
 use ogrenotes_storage::models::activity::ActivityEventType;
 use ogrenotes_storage::models::security_audit::{SecurityAudit, SecurityAuditAction};
 use ogrenotes_storage::models::LinkSharingMode;
+use yrs::types::xml::{XmlElementPrelim, XmlFragment, XmlTextPrelim};
+use yrs::{ReadTxn, Text, Transact, WriteTxn};
+
+/// Build Y.Doc state bytes with a single paragraph containing `text`
+/// (same shape as `test_history.rs`).
+fn make_doc_bytes(text: &str) -> Vec<u8> {
+    let doc = yrs::Doc::new();
+    {
+        let mut txn = doc.transact_mut();
+        let frag = txn.get_or_insert_xml_fragment("content");
+        let p = frag.insert(&mut txn, 0, XmlElementPrelim::empty("paragraph"));
+        let t = p.insert(&mut txn, 0, XmlTextPrelim::new(""));
+        t.push(&mut txn, text);
+    }
+    let txn = doc.transact();
+    txn.encode_state_as_update_v1(&yrs::StateVector::default())
+}
 
 /// Poll the SecurityAudit table for a matching row. The writer
 /// fires via tokio::spawn so the response can race the DDB write.
@@ -840,4 +857,201 @@ async fn create_scim_token_writes_audit_row() {
     if let SecurityAuditAction::WorkspaceScimTokenIssued { token_id: t } = &row.action {
         assert_ne!(t, secret, "audit must store the handle, not the secret");
     }
+}
+
+// ─── 2026-09-02 survey: audit gaps on destructive / identity paths ──
+
+/// A restore discards collaborators' unflushed UPDATE# rows — the one
+/// endpoint that silently throws away someone else's work — and had no
+/// SecurityAudit row while every sibling destructive path (delete, lock,
+/// compact) did.
+#[tokio::test]
+async fn restore_version_writes_doc_restored_audit_row() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (owner_id, token) = app.create_user("restore-audit@test.com").await;
+    let doc_id = app.create_doc(&token, "Restore Audit", None).await;
+
+    let (status, _) = app
+        .bytes_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{doc_id}/content"),
+            Some(&token),
+            make_doc_bytes("Version one"),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 204);
+    let v1 = app.state.doc_repo.get(&doc_id).await.unwrap().unwrap().snapshot_version;
+
+    let (status, _) = app
+        .bytes_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{doc_id}/content"),
+            Some(&token),
+            make_doc_bytes("Version two"),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 204);
+    let current = app.state.doc_repo.get(&doc_id).await.unwrap().unwrap().snapshot_version;
+    assert_ne!(current, v1, "second PUT must create a new version");
+
+    let (status, _) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/documents/{doc_id}/versions/{v1}/restore"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let row = wait_for_audit_row(&app, &owner_id, |a| {
+        matches!(a, SecurityAuditAction::DocRestored { doc_id: d, .. } if d == &doc_id)
+    })
+    .await;
+    match row.action {
+        SecurityAuditAction::DocRestored { from_version, to_version, .. } => {
+            assert_eq!(from_version, v1, "fromVersion is the restore target");
+            assert_eq!(to_version, current + 1, "toVersion is the newly written version");
+        }
+        other => panic!("unexpected action {other:?}"),
+    }
+    assert_eq!(row.actor_id, owner_id);
+
+    app.cleanup().await;
+}
+
+/// Workspace membership is the widest grant in the system (it feeds the
+/// link-sharing audience) yet add/remove were unaudited while doc and
+/// folder ShareGranted/ShareRevoked are.
+#[tokio::test]
+async fn workspace_add_member_writes_audit_row() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (admin_id, admin_token) = app.create_user("ws-add-admin@test.com").await;
+    let (bob_id, _) = app.create_user("ws-add-bob@test.com").await;
+    let (_, ws_json) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(&admin_token),
+            Some(serde_json::json!({ "name": "Audited Members" })),
+        )
+        .await;
+    let ws_id = ws_json["id"].as_str().unwrap().to_string();
+
+    let (status, _) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws_id}/members"),
+            Some(&admin_token),
+            Some(serde_json::json!({ "userId": bob_id, "role": "member" })),
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let row = wait_for_audit_row(&app, &bob_id, |a| {
+        matches!(a, SecurityAuditAction::WorkspaceMemberAdded { workspace_id, target, role }
+            if workspace_id == &ws_id && target == &bob_id && role == "member")
+    })
+    .await;
+    assert_eq!(row.actor_id, admin_id);
+    assert_eq!(row.user_id, bob_id, "row is keyed on the member (subject)");
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn workspace_remove_member_writes_audit_row() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (admin_id, admin_token) = app.create_user("ws-rm-admin@test.com").await;
+    let (bob_id, _) = app.create_user("ws-rm-bob@test.com").await;
+    let (_, ws_json) = app
+        .json_request(
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(&admin_token),
+            Some(serde_json::json!({ "name": "Audited Removal" })),
+        )
+        .await;
+    let ws_id = ws_json["id"].as_str().unwrap().to_string();
+    let (status, _) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws_id}/members"),
+            Some(&admin_token),
+            Some(serde_json::json!({ "userId": bob_id, "role": "member" })),
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let (status, _) = app
+        .json_request(
+            Method::DELETE,
+            &format!("/api/v1/workspaces/{ws_id}/members/{bob_id}"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let row = wait_for_audit_row(&app, &bob_id, |a| {
+        matches!(a, SecurityAuditAction::WorkspaceMemberRemoved { workspace_id, target }
+            if workspace_id == &ws_id && target == &bob_id)
+    })
+    .await;
+    assert_eq!(row.actor_id, admin_id);
+
+    app.cleanup().await;
+}
+
+/// SCIM deprovision writes `SessionRevoked` at the same semantic point
+/// and tests it; the admin path called `delete_all_for_user` and wrote
+/// nothing. Also pins that the victim's live bearer is dead *through the
+/// admin endpoint* (the existing auth test flips the row directly).
+#[tokio::test]
+async fn admin_disable_revokes_sessions_and_writes_security_audit_row() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (admin_id, _) = app.create_user("admin-revoke@test.com").await;
+    let _ = app.state.user_repo.set_admin(&admin_id, true).await;
+    let (_, admin_token) = app.create_user("admin-revoke@test.com").await;
+    let (victim_id, victim_token) = app.create_user("victim-revoke@test.com").await;
+
+    let (status, _) = app
+        .json_request(Method::GET, "/api/v1/users/me", Some(&victim_token), None)
+        .await;
+    assert_eq!(status, 200, "victim's token works before disable");
+
+    let (status, _) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/admin/users/{victim_id}/disable"),
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    let row = wait_for_audit_row(&app, &victim_id, |a| {
+        matches!(a, SecurityAuditAction::SessionRevoked { reason } if reason == "admin_disable")
+    })
+    .await;
+    assert_eq!(row.actor_id, admin_id);
+
+    // Per-request user refresh: a disabled row is rejected on the very
+    // next request (403, matching test_auth's direct-flip case).
+    let (status, _) = app
+        .json_request(Method::GET, "/api/v1/users/me", Some(&victim_token), None)
+        .await;
+    assert_eq!(status, 403, "disabled user's bearer must be rejected");
+
+    app.cleanup().await;
 }
