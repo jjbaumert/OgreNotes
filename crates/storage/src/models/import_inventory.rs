@@ -506,3 +506,29 @@ mod tests {
         assert_eq!(row.counters["images_dropped"], 2);
     }
 }
+
+#[cfg(test)]
+mod secmap_prefix_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn prefix_for(thread: &str) -> String {
+        format!("SECMAP#{thread}#")
+    }
+
+    proptest! {
+        /// Documents (does not fix) that the SK prefix alone cannot
+        /// separate thread ids when one is a `#`-extension of another.
+        /// `ImportRepo::get_secmap` therefore filters on the attribute.
+        #[test]
+        fn a_hash_extended_thread_id_shares_the_prefix(base in "[a-zA-Z0-9]{1,12}", ext in "[a-zA-Z0-9]{1,4}") {
+            let row = SecMapRow {
+                quip_thread_id: format!("{base}#{ext}"),
+                chunk: 0,
+                owner_id: "u1".into(),
+                entries: vec![],
+            };
+            prop_assert!(row.sk().starts_with(&prefix_for(&base)));
+        }
+    }
+}
