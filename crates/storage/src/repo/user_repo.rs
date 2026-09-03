@@ -135,8 +135,19 @@ impl UserRepo {
                 }
 
                 match resp.unprocessed_keys {
-                    Some(unprocessed) if !unprocessed.is_empty() && attempt < 5 => {
+                    Some(unprocessed) if !unprocessed.is_empty() => {
+                        if attempt >= 5 {
+                            // A short map here would be indistinguishable
+                            // from "those users don't exist"; fail instead.
+                            return Err(RepoError::Dynamo(format!(
+                                "batch_get_item left {} key group(s) unprocessed after {attempt} retries",
+                                unprocessed.len()
+                            )));
+                        }
                         attempt += 1;
+                        // Linear backoff so a throttled table gets a chance
+                        // to recover instead of five back-to-back retries.
+                        tokio::time::sleep(std::time::Duration::from_millis(50 * attempt as u64)).await;
                         request_items = unprocessed;
                     }
                     _ => break,
@@ -1328,5 +1339,31 @@ mod tests {
             }
             other => panic!("expected MissingField(...), got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use crate::test_support::replaying_dynamo;
+
+    fn throttled_page() -> String {
+        r#"{"Responses":{"test-table":[]},"UnprocessedKeys":{"test-table":{"Keys":[{"PK":{"S":"USER#u1"},"SK":{"S":"PROFILE"}}]}}}"#.to_string()
+    }
+
+    /// After the retry budget is spent the old code `break`ed and returned
+    /// a short map — indistinguishable from "that user does not exist".
+    /// Share dialogs then rendered real members as absent.
+    #[tokio::test]
+    async fn get_by_ids_errors_when_keys_stay_unprocessed() {
+        let pages: Vec<String> = (0..6).map(|_| throttled_page()).collect();
+        let (db, _replay) = replaying_dynamo(pages.iter().map(String::as_str).collect());
+        let repo = UserRepo::new(db);
+
+        let err = repo
+            .get_by_ids(&["u1".to_string()])
+            .await
+            .expect_err("persistent UnprocessedKeys must not look like absence");
+        assert!(matches!(err, RepoError::Dynamo(ref m) if m.contains("unprocessed")), "got {err:?}");
     }
 }
