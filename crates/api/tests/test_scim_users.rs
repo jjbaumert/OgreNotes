@@ -513,6 +513,10 @@ async fn scim_create_truncates_long_but_acceptable_display_name() {
 async fn scim_endpoint_rate_limit_caps_per_workspace() {
     common::require_infra!();
     let app = common::TestApp::new().await;
+    // Fixed-window limiter: a minute boundary between the 5th and 6th
+    // request resets the bucket and the cap never trips (flaked in CI
+    // 2026-09-26). Align to a fresh window like the other cap tests.
+    common::align_rate_limit_window().await;
     let (_, ws_a, bearer_a) =
         setup_workspace_with_scim_token(&app, "scim-rl-a@test.com").await;
     let (_, ws_b, bearer_b) =
