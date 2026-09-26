@@ -109,8 +109,16 @@ impl DiagramKind {
 
 /// XML-escape a user-supplied string before interpolating into SVG.
 /// Order matters: `&` first so earlier escapes aren't double-escaped.
+///
+/// Control characters other than tab / newline / carriage return are
+/// illegal in XML 1.0 even as entities, and a document carrying one is
+/// unparseable (the browser renders nothing for `set_inner_html`). They
+/// carry no meaning in a label, so they are dropped rather than escaped.
 pub(crate) fn escape_xml(s: &str) -> String {
-    s.replace('&', "&amp;")
+    s.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+        .collect::<String>()
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")

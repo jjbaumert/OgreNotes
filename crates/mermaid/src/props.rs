@@ -426,3 +426,31 @@ fn every_diagram_type_escapes_user_text() {
         );
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Control characters are illegal in XML 1.0 even when escaped; a label
+    /// carrying one must not reach the SVG. Every fuzz alphabet above
+    /// excludes them (`NOISE` is printable ASCII, `\\PC*` is "not Other"),
+    /// so this is the only property that can see the hole.
+    #[test]
+    fn labels_with_control_chars_produce_legal_xml(
+        label in "[a-z]{1,4}[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f][a-z]{0,4}",
+        kind in 0usize..4,
+    ) {
+        let src = match kind {
+            0 => format!("flowchart TD\n    A[\"{label}\"] --> B"),
+            1 => format!("sequenceDiagram\n    A->>B: {label}"),
+            2 => format!("pie\n    \"{label}\" : 5"),
+            _ => format!("mindmap\n  root(({label}))"),
+        };
+        assert_render_invariants(&src)?;
+        if let Some(svg) = crate::render(&src).svg {
+            prop_assert!(
+                !svg.chars().any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r')),
+                "control char survived into SVG for {src:?}"
+            );
+        }
+    }
+}
