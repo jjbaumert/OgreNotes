@@ -13,15 +13,22 @@ services:
       - "127.0.0.1:8000:8000"
     command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
 
+  # `minio/minio` disappeared from Docker Hub (pull access denied,
+  # 2026-09-26; quay.io/minio/minio and ghcr.io mirrors were never
+  # public). Bitnami's frozen legacy build (MinIO 2025.5.24) is the one
+  # image still pullable without a login. It honours the same
+  # MINIO_ROOT_USER / MINIO_ROOT_PASSWORD env and serves the S3 API on
+  # 9000 (console on 9001); its own entrypoint starts the server, so no
+  # `command:` here. Pinned by digest — "latest" on a frozen repo is
+  # whatever was last pushed.
   minio:
-    image: minio/minio:latest
+    image: bitnamilegacy/minio@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c
     ports:
       - "127.0.0.1:9000:9000"
       - "127.0.0.1:9001:9001"
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9001"
 
   # MailHog — local SMTP catcher for M4 email notifications. The notify
   # crate speaks SMTP; set SMTP_HOST=localhost SMTP_PORT=1025 and browse
