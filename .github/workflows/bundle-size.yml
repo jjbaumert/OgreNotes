@@ -114,10 +114,14 @@ jobs:
             frontend -> target
           shared-key: bundle-size
 
+      # Pinned: `version: latest` resolved to trunk 0.19.1 on one runner and
+      # 0.21.14 on another ten minutes apart (2026-09-26). 0.19.1 ignores
+      # index.html's data-wasm-opt-params, so its wasm-opt 116 rejected the
+      # bulk-memory ops rustc now emits for wasm32. 0.21.14 matches local dev.
       - name: Install trunk
         uses: jetli/trunk-action@v0.5.0
         with:
-          version: latest
+          version: v0.21.14
 
       - name: Install wasm-bindgen-cli (matches trunk's invocation)
         uses: jetli/wasm-bindgen-action@v0.2.0
