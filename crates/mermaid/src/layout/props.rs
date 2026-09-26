@@ -126,3 +126,54 @@ proptest! {
         }
     }
 }
+
+/// `arb_input` builds every cluster with `parent: None`; production
+/// (flowchart subgraphs, C4 boundaries) nests them, and `cluster.rs`
+/// carries `expect("child clusters are built before their parent")`
+/// guarded only by build ordering. This strategy assigns each cluster
+/// `i > 0` a random parent `j < i` (always acyclic) and a random
+/// direction override.
+fn arb_nested_input() -> impl Strategy<Value = LayoutInput> {
+    arb_input().prop_flat_map(|input| {
+        let n = input.clusters.len();
+        let parents = proptest::collection::vec(any::<u16>(), n);
+        let dirs = proptest::collection::vec(0u8..5, n);
+        (Just(input), parents, dirs).prop_map(|(mut input, parents, dirs)| {
+            for i in 1..input.clusters.len() {
+                input.clusters[i].parent = Some(parents[i] as usize % i);
+            }
+            for (c, d) in input.clusters.iter_mut().zip(dirs) {
+                c.direction = match d {
+                    0 => Some(Direction::TB),
+                    1 => Some(Direction::BT),
+                    2 => Some(Direction::LR),
+                    3 => Some(Direction::RL),
+                    _ => None,
+                };
+            }
+            input
+        })
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Nested clusters at any depth: never panic, and every coordinate
+    /// the pipeline emits is finite with one path per edge.
+    #[test]
+    fn nested_clusters_never_panic_and_stay_finite(input in arb_nested_input()) {
+        if let Ok(l) = run(&input) {
+            for (x, y) in &l.node_centers {
+                prop_assert!(x.is_finite() && y.is_finite());
+            }
+            for ep in &l.edge_paths {
+                for (x, y) in &ep.points {
+                    prop_assert!(x.is_finite() && y.is_finite());
+                }
+            }
+            prop_assert!(l.size.0.is_finite() && l.size.1.is_finite());
+            prop_assert_eq!(l.edge_paths.len(), input.edges.len());
+        }
+    }
+}
