@@ -27,7 +27,12 @@ use crate::sequence::{Event, Head, LineStyle, SeqDiagram};
 fn marker_id(h: Head) -> Option<&'static str> {
     match h {
         Head::None => None,
-        Head::Arrow => Some("mmd-arrow"),
+        // Sequence arrowheads are smaller than flowchart/state's
+        // (markerWidth 7 vs 12) so the id must differ: two diagrams on
+        // one page share a DOM and `url(#id)` resolves to the *first*
+        // definition — a shared `mmd-arrow` gave the second diagram the
+        // wrong arrowhead size.
+        Head::Arrow => Some("mmd-seq-arrow"),
         Head::Cross => Some("mmd-cross"),
         Head::Async => Some("mmd-async"),
     }
@@ -109,7 +114,7 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
     // 2. defs: arrow/cross/async markers.
     out.push_str(concat!(
         "<defs>",
-        r#"<marker id="mmd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>"#,
+        r#"<marker id="mmd-seq-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker>"#,
         r#"<marker id="mmd-cross" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 1 1 L 9 9 M 9 1 L 1 9" stroke="currentColor" stroke-width="1.5" fill="none"/></marker>"#,
         r#"<marker id="mmd-async" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10" stroke="currentColor" stroke-width="1.5" fill="none"/></marker>"#,
         "</defs>",
@@ -319,7 +324,7 @@ mod tests {
         let svg = render_sequence("sequenceDiagram\nparticipant A as Alice\nA->>B: Hello\nB-->>A: Hi").unwrap();
         assert!(svg.starts_with("<svg"));
         assert!(svg.contains("Alice") && svg.contains("Hello"));
-        assert!(svg.contains("mmd-arrow"));
+        assert!(svg.contains("mmd-seq-arrow"));
         assert!(svg.contains("stroke-dasharray=\"3 3\"")); // lifelines
         // top + bottom participant boxes: each display appears twice
         assert!(svg.matches(">Alice<").count() >= 2);
@@ -330,7 +335,7 @@ mod tests {
         let svg = render_sequence("sequenceDiagram\nA-xB: c\nA-)B: a\nA->>B: n").unwrap();
         assert!(svg.contains("url(#mmd-cross)"));
         assert!(svg.contains("url(#mmd-async)"));
-        assert!(svg.contains("url(#mmd-arrow)"));
+        assert!(svg.contains("url(#mmd-seq-arrow)"));
     }
 
     #[test]
@@ -342,8 +347,8 @@ mod tests {
     #[test]
     fn bidirectional_message_has_markers_both_ends() {
         let svg = render_sequence("sequenceDiagram\nA<<->>B: both").unwrap();
-        assert!(svg.contains(r##"marker-start="url(#mmd-arrow)""##), "{svg}");
-        assert!(svg.contains(r##"marker-end="url(#mmd-arrow)""##), "{svg}");
+        assert!(svg.contains(r##"marker-start="url(#mmd-seq-arrow)""##), "{svg}");
+        assert!(svg.contains(r##"marker-end="url(#mmd-seq-arrow)""##), "{svg}");
     }
 
     #[test]
