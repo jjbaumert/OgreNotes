@@ -45,7 +45,11 @@ fn source_strategy(
         .prop_map(move |v| format!("{header}\n{}", v.join("\n")))
 }
 
-fn assert_render_invariants(src: &str) -> Result<(), TestCaseError> {
+/// The invariants every render must satisfy, shared by every family's
+/// fuzz module: `svg` XOR `error`; no NaN/inf leaked into coordinates;
+/// and the SVG is well-formed XML (it is handed to `set_inner_html`
+/// verbatim, where a malformed document renders as nothing).
+pub(crate) fn assert_render_invariants(src: &str) -> Result<(), TestCaseError> {
     let out = crate::render(src);
     prop_assert!(
         out.svg.is_some() != out.error.is_some(),
@@ -54,6 +58,17 @@ fn assert_render_invariants(src: &str) -> Result<(), TestCaseError> {
     if let Some(svg) = &out.svg {
         prop_assert!(!svg.contains("NaN"), "NaN leaked into SVG for source:\n{src}");
         prop_assert!(!svg.contains("inf"), "inf leaked into SVG for source:\n{src}");
+        let mut reader = quick_xml::Reader::from_str(svg);
+        loop {
+            match reader.read_event() {
+                Ok(quick_xml::events::Event::Eof) => break,
+                Ok(_) => {}
+                Err(e) => prop_assert!(
+                    false,
+                    "SVG is not well-formed XML ({e}) for source:\n{src}\n--- svg ---\n{svg}"
+                ),
+            }
+        }
     }
     Ok(())
 }
@@ -409,5 +424,33 @@ fn every_diagram_type_escapes_user_text() {
             svg.contains("&lt;script&gt;&amp;"),
             "{name}: escaped payload missing from SVG — label dropped or double-escaped"
         );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Control characters are illegal in XML 1.0 even when escaped; a label
+    /// carrying one must not reach the SVG. Every fuzz alphabet above
+    /// excludes them (`NOISE` is printable ASCII, `\\PC*` is "not Other"),
+    /// so this is the only property that can see the hole.
+    #[test]
+    fn labels_with_control_chars_produce_legal_xml(
+        label in "[a-z]{1,4}[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f][a-z]{0,4}",
+        kind in 0usize..4,
+    ) {
+        let src = match kind {
+            0 => format!("flowchart TD\n    A[\"{label}\"] --> B"),
+            1 => format!("sequenceDiagram\n    A->>B: {label}"),
+            2 => format!("pie\n    \"{label}\" : 5"),
+            _ => format!("mindmap\n  root(({label}))"),
+        };
+        assert_render_invariants(&src)?;
+        if let Some(svg) = crate::render(&src).svg {
+            prop_assert!(
+                !svg.chars().any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r')),
+                "control char survived into SVG for {src:?}"
+            );
+        }
     }
 }

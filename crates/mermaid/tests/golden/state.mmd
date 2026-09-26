@@ -1,0 +1,9 @@
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Done: finish
+    Done --> [*]
+    state Running {
+        [*] --> Working
+        Working --> Waiting: pause
+        Waiting --> Working: resume
+    }

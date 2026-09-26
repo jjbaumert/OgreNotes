@@ -133,3 +133,33 @@ mod tests {
         assert_eq!(resolve(&[], Some("fill:red"), &defs).as_deref(), Some("fill:red"));
     }
 }
+
+#[cfg(test)]
+mod boundary_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// `sanitize_style` output is interpolated into a `style="..."`
+        /// attribute reached from classDef/style/linkStyle in four
+        /// families: it must never carry an attribute or tag delimiter,
+        /// and every property it emits must be on the allowlist.
+        #[test]
+        fn sanitized_style_is_attribute_safe_and_allowlisted(s in "\\PC*") {
+            let out = sanitize_style(&s);
+            prop_assert!(
+                !out.contains(['"', '<', '>', '&']),
+                "delimiter in sanitized style {out:?} from {s:?}"
+            );
+            for decl in out.split(';').filter(|d| !d.trim().is_empty()) {
+                let (prop, _) = decl.split_once(':').unwrap_or((decl, ""));
+                prop_assert!(
+                    STYLE_PROPS.contains(&prop.trim()),
+                    "non-allowlisted property {prop:?} in {out:?} from {s:?}"
+                );
+            }
+        }
+    }
+}

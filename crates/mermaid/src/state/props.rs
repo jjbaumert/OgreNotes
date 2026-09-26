@@ -57,3 +57,15 @@ proptest! {
         }
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// The crate-wide invariants (`svg` XOR `error`, no NaN/inf, and
+    /// well-formed XML) over this family's own grammar; the fuzz net in
+    /// `src/props.rs` only drives the chart-style kinds through them.
+    #[test]
+    fn render_output_satisfies_crate_invariants(src in arb_source()) {
+        crate::props::assert_render_invariants(&src)?;
+    }
+}

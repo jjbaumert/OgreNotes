@@ -1,0 +1,9 @@
+C4Context
+    title System
+    Person(p, "P", "d")
+    System_Boundary(b1, "B") {
+        System(s, "S")
+        SystemDb(db, "DB", "pg")
+    }
+    Rel(p, s, "uses", "https")
+    Rel(s, db, "reads")
