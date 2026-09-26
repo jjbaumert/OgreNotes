@@ -45,7 +45,11 @@ fn source_strategy(
         .prop_map(move |v| format!("{header}\n{}", v.join("\n")))
 }
 
-fn assert_render_invariants(src: &str) -> Result<(), TestCaseError> {
+/// The invariants every render must satisfy, shared by every family's
+/// fuzz module: `svg` XOR `error`; no NaN/inf leaked into coordinates;
+/// and the SVG is well-formed XML (it is handed to `set_inner_html`
+/// verbatim, where a malformed document renders as nothing).
+pub(crate) fn assert_render_invariants(src: &str) -> Result<(), TestCaseError> {
     let out = crate::render(src);
     prop_assert!(
         out.svg.is_some() != out.error.is_some(),
@@ -54,6 +58,17 @@ fn assert_render_invariants(src: &str) -> Result<(), TestCaseError> {
     if let Some(svg) = &out.svg {
         prop_assert!(!svg.contains("NaN"), "NaN leaked into SVG for source:\n{src}");
         prop_assert!(!svg.contains("inf"), "inf leaked into SVG for source:\n{src}");
+        let mut reader = quick_xml::Reader::from_str(svg);
+        loop {
+            match reader.read_event() {
+                Ok(quick_xml::events::Event::Eof) => break,
+                Ok(_) => {}
+                Err(e) => prop_assert!(
+                    false,
+                    "SVG is not well-formed XML ({e}) for source:\n{src}\n--- svg ---\n{svg}"
+                ),
+            }
+        }
     }
     Ok(())
 }
