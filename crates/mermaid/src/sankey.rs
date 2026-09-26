@@ -144,6 +144,30 @@ struct Placed {
     layer: usize,
 }
 
+/// Six hex digits of FNV-1a over the diagram's nodes and links: stable for
+/// identical diagrams (whose gradient definitions are identical anyway)
+/// and distinct across different ones, so gradient ids don't collide
+/// between sankeys on one page.
+fn gradient_tag(s: &Sankey) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for n in &s.nodes {
+        feed(n.as_bytes());
+        feed(&[0]);
+    }
+    for l in &s.links {
+        feed(&l.from.to_le_bytes());
+        feed(&l.to.to_le_bytes());
+        feed(&l.value.to_bits().to_le_bytes());
+    }
+    format!("{:06x}", h & 0xff_ffff)
+}
+
 pub(crate) fn render_svg(s: &Sankey) -> String {
     let n = s.nodes.len();
     // Longest-path layer per node (Bellman-Ford-style relaxation, capped so a
@@ -248,13 +272,17 @@ pub(crate) fn render_svg(s: &Sankey) -> String {
     );
 
     // Gradient defs: each ribbon fades left-to-right from the source node's
-    // color to the target node's color (Mermaid parity).
+    // color to the target node's color (Mermaid parity). The ids carry a
+    // per-diagram hash: two sankeys on one page share a DOM, and
+    // `url(#sk0)` would resolve to whichever rendered first, giving the
+    // second the first's colours.
+    let tag = gradient_tag(s);
     out.push_str("<defs>");
     for (li, l) in s.links.iter().enumerate() {
         let x0 = placed[l.from].x + NODE_W;
         let x1 = placed[l.to].x;
         out.push_str(&format!(
-            r#"<linearGradient id="sk{li}" gradientUnits="userSpaceOnUse" x1="{x0:.1}" y1="0" x2="{x1:.1}" y2="0"><stop offset="0" stop-color="{}"/><stop offset="1" stop-color="{}"/></linearGradient>"#,
+            r#"<linearGradient id="sk{tag}-{li}" gradientUnits="userSpaceOnUse" x1="{x0:.1}" y1="0" x2="{x1:.1}" y2="0"><stop offset="0" stop-color="{}"/><stop offset="1" stop-color="{}"/></linearGradient>"#,
             PALETTE[l.from % PALETTE.len()],
             PALETTE[l.to % PALETTE.len()],
         ));
@@ -280,7 +308,7 @@ pub(crate) fn render_svg(s: &Sankey) -> String {
             y0t + th,
         );
         out.push_str(&format!(
-            r#"<path d="{d}" fill="url(#sk{li})" fill-opacity="0.5"/>"#
+            r#"<path d="{d}" fill="url(#sk{tag}-{li})" fill-opacity="0.5"/>"#
         ));
     }
 
@@ -362,8 +390,13 @@ mod tests {
     fn ribbons_use_gradients_and_nodes_show_values() {
         let svg = render_svg(&parse("sankey-beta\n Coal,Elec,25\n Elec,Homes,25").unwrap());
         // A source->target linear gradient per ribbon, used as the ribbon fill.
-        assert!(svg.contains(r#"<linearGradient id="sk0""#), "gradient def: {svg}");
-        assert!(svg.contains(r#"fill="url(#sk0)""#), "ribbon gradient fill: {svg}");
+        // Ids are `sk<6-hex-diagram-tag>-<link index>`; the first ribbon's
+        // fill must reference the first gradient's id.
+        let def_start = svg.find(r#"<linearGradient id="sk"#).expect("gradient def");
+        let id_start = def_start + r#"<linearGradient id=""#.len();
+        let id = &svg[id_start..id_start + svg[id_start..].find('"').unwrap()];
+        assert!(id.ends_with("-0") && id.len() == "sk".len() + 6 + 2, "gradient id shape: {id}");
+        assert!(svg.contains(&format!(r#"fill="url(#{id})""#)), "ribbon gradient fill: {svg}");
         // Each node is labeled with its value (Coal outflow 25).
         assert!(svg.contains(">25<"), "node value label: {svg}");
     }

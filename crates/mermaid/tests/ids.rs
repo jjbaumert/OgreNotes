@@ -67,18 +67,11 @@ fn defs_with_ids(svg: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Known collisions, each a real bug whose fix would change an existing
-/// test's pinned string (immutable per project policy — surfaced as
-/// findings in the 2026-09-26 mermaid output-pinning PR):
-///
-/// - `mmd-arrow`: sequence defines it with markerWidth/Height 7,
-///   flowchart and state with 12. Two of those on one page render the
-///   second's arrowheads at the wrong size. Fix = rename the sequence
-///   marker (e.g. `mmd-seq-arrow`), which changes the literal
-///   `url(#mmd-arrow)` asserted by sequence/svg.rs tests.
-///
-/// Anything NOT listed here that collides fails this test.
-const KNOWN_COLLISIONS: &[&str] = &["mmd-arrow"];
+/// Ids that are allowed to differ between kinds. Empty: the `mmd-arrow`
+/// size collision (sequence 7 vs flowchart/state 12) was fixed by giving
+/// the sequence marker its own id, and sankey gradients carry a
+/// per-diagram tag. Anything that collides fails this test.
+const KNOWN_COLLISIONS: &[&str] = &[];
 
 #[test]
 fn definition_ids_are_unique_across_diagram_kinds() {
@@ -106,8 +99,27 @@ fn definition_ids_are_unique_across_diagram_kinds() {
     }
 }
 
-// Not asserted: sankey's per-link gradients use `id="sk{n}"`, so two
-// sankeys on one page share `sk0`, `sk1`, … and the second takes the
-// first's colours. The fix (a per-render prefix) changes the literal
-// `<linearGradient id="sk0"` pinned by sankey.rs's own test — surfaced
-// as a finding alongside `mmd-arrow` above.
+/// Instance-specific definitions (sankey's per-link gradients) must not
+/// share ids between two different diagrams either.
+#[test]
+fn instance_specific_ids_differ_between_two_sankeys() {
+    let a = ogrenotes_mermaid::render("sankey-beta\n    a,b,5\n    b,c,2\n").svg.unwrap();
+    let b = ogrenotes_mermaid::render("sankey-beta\n    x,y,7\n").svg.unwrap();
+    let ids_a: BTreeSet<String> = defs_with_ids(&a).into_iter().map(|(id, _)| id).collect();
+    let ids_b: BTreeSet<String> = defs_with_ids(&b).into_iter().map(|(id, _)| id).collect();
+    assert!(!ids_a.is_empty(), "sankey defines gradients: {a}");
+    let shared: Vec<_> = ids_a.intersection(&ids_b).collect();
+    assert!(shared.is_empty(), "gradient ids shared between two sankeys: {shared:?}");
+}
+
+/// And the sequence arrow marker no longer shares an id (at a different
+/// size) with flowchart's.
+#[test]
+fn sequence_arrow_marker_has_its_own_id() {
+    let seq = ogrenotes_mermaid::render("sequenceDiagram\n    A->>B: hi\n").svg.unwrap();
+    let flow = ogrenotes_mermaid::render("flowchart TD\n    A --> B\n").svg.unwrap();
+    assert!(seq.contains(r#"<marker id="mmd-seq-arrow""#), "{seq}");
+    assert!(seq.contains("url(#mmd-seq-arrow)"), "{seq}");
+    assert!(!seq.contains(r#"<marker id="mmd-arrow""#), "{seq}");
+    assert!(flow.contains(r#"<marker id="mmd-arrow""#), "{flow}");
+}
