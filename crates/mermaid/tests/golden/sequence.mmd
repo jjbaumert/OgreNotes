@@ -1,0 +1,9 @@
+sequenceDiagram
+    participant A as Alice
+    participant B as Bob
+    A->>B: Hello
+    B-->>A: Hi
+    loop Every minute
+        A->>B: Ping
+    end
+    Note over A,B: done

@@ -1,0 +1,7 @@
+erDiagram
+    CUSTOMER ||--o{ ORDER : places
+    ORDER ||--|{ LINE : contains
+    CUSTOMER {
+        string name
+        int id
+    }

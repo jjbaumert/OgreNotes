@@ -1,0 +1,7 @@
+architecture-beta
+    group api(cloud)[api]
+    service db(database)[db] in api
+    service srv(server)[srv] in api
+    service lone(disk)[lone]
+    db:L -- R:srv
+    db:T --> B:lone
