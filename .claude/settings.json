@@ -1,4 +1,8 @@
 {
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
   "permissions": {
     "allow": [
       "Bash(gh run view:*)",
@@ -62,8 +66,6 @@
       "Bash(cargo clippy:*)"
     ],
     "deny": [
-      "Bash(git push)",
-      "Bash(git push:*)",
       "Bash(sed -i:*)",
       "Bash(sed --in-place:*)"
     ]

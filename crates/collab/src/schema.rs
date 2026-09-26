@@ -510,6 +510,58 @@ mod tests {
     //
     // See "Schema Duality" in design/mvp-detailed-design.md.
 
+    /// Render this crate's schema as the duality fixture. Every object is a
+    /// `BTreeMap` (not `json!({..})`) so key order is alphabetical whether
+    /// or not some other crate in the build graph turns on serde_json's
+    /// `preserve_order` feature — the workspace build does, a crate-alone
+    /// build doesn't, and the file must be byte-stable under both.
+    fn duality_fixture_json() -> String {
+        use std::collections::BTreeMap;
+        let mut nodes: BTreeMap<String, BTreeMap<&str, serde_json::Value>> = BTreeMap::new();
+        for nt in ALL_NODE_TYPES {
+            let mut children: Vec<String> =
+                nt.valid_children().iter().map(|c| format!("{c:?}")).collect();
+            children.sort();
+            let mut entry = BTreeMap::new();
+            entry.insert("children", serde_json::Value::from(children));
+            entry.insert("leaf", serde_json::Value::from(nt.is_leaf()));
+            entry.insert("inline", serde_json::Value::from(nt.is_inline()));
+            nodes.insert(format!("{nt:?}"), entry);
+        }
+        let mut marks: Vec<String> = ALL_MARK_TYPES.iter().map(|m| format!("{m:?}")).collect();
+        marks.sort();
+        let mut top: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+        top.insert("nodes", serde_json::to_value(nodes).expect("nodes"));
+        top.insert("marks", serde_json::Value::from(marks));
+        serde_json::to_string_pretty(&top).expect("serialize fixture") + "\n"
+    }
+
+    /// The fixture at `crates/collab/schema-duality.json` is what the
+    /// frontend's `schema_duality_fixture_matches_this_crate` asserts
+    /// against. This side regenerates it from the canonical schema; a
+    /// mismatch means either this crate drifted from the fixture or the
+    /// fixture needs a deliberate update (paste the printed JSON), after
+    /// which the frontend test tells you what still has to move there.
+    #[test]
+    fn schema_duality_fixture_matches_this_crate() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/schema-duality.json");
+        let on_disk = std::fs::read_to_string(path).expect("schema-duality.json must exist");
+        let expected = duality_fixture_json();
+        assert!(
+            on_disk == expected,
+            "schema-duality.json is out of date. Expected contents:\n{expected}"
+        );
+    }
+
+    /// Every mark's attribute name round-trips; the older
+    /// `cross_schema_mark_attr_names` pins only seven of nine.
+    #[test]
+    fn every_mark_attr_name_round_trips() {
+        for m in ALL_MARK_TYPES {
+            assert_eq!(MarkType::from_attr(m.attr_name()), Some(*m), "{m:?}");
+        }
+    }
+
     /// All node types. Must match frontend/src/editor/model.rs NodeType enum.
     const ALL_NODE_TYPES: &[NodeType] = &[
         NodeType::Doc,

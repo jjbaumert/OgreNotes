@@ -164,7 +164,7 @@ pub fn FindReplaceBar(
                     {crate::t!("find-replace-all")}
                 </button>
                 <button class="find-btn find-close" title=crate::t!("common-close")
-                    aria-label=crate::t!("common-close") on:click=move |_| on_close.run(())
+                    aria-label=crate::t!("common-close") on:click=move |_| crate::a11y::defer_close(on_close)
                 >"\u{2715}"</button>
             </div>
         </Show>

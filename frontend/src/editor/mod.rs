@@ -21,3 +21,7 @@ pub mod state;
 pub mod transform;
 pub mod view;
 pub mod yrs_bridge;
+
+// Native-only: proptest doesn't build for wasm32 (see frontend/Cargo.toml).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod structural_props;

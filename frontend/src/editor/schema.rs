@@ -200,6 +200,11 @@ impl Schema {
     }
 
     /// Get the node spec for a node type.
+    /// Every node type this schema has a spec for.
+    pub fn node_types(&self) -> Vec<NodeType> {
+        self.nodes.keys().copied().collect()
+    }
+
     pub fn node_spec(&self, node_type: NodeType) -> Option<&NodeSpec> {
         self.nodes.get(&node_type)
     }
@@ -454,7 +459,9 @@ pub fn default_schema() -> Schema {
                 NodeType::CodeBlock,
                 NodeType::HorizontalRule,
                 NodeType::Image,
-                NodeType::Table,
+                // `Table` was listed here but not in the canonical collab
+                // schema (schema-duality.json); `insert_table` never
+                // places a table inside a quote, so the entry was dead.
             ],
             inline_content: false,
             block: true,
@@ -1433,5 +1440,94 @@ mod tests {
         // NodeType::Doc with mark Bold -- allowed_marks is Some(vec![])
         let s = schema();
         assert!(!s.can_apply_mark(NodeType::Doc, MarkType::Bold));
+    }
+}
+
+#[cfg(test)]
+mod duality_fixture_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// The canonical schema lives in `crates/collab/src/schema.rs`; that
+    /// crate regenerates `crates/collab/schema-duality.json` from it and
+    /// this test holds the parallel schema to the same file. Drift on
+    /// either side fails that side's own test. Every mismatch is collected
+    /// before failing so one run shows the whole gap.
+    const FIXTURE: &str = include_str!("../../../crates/collab/schema-duality.json");
+
+    /// Marks the editor applies that the collab schema deliberately does
+    /// not validate: loose per-text formatting stored as raw CRDT text
+    /// attributes (`textColor` / `highlight`), see the doc comment on
+    /// `ALL_MARK_TYPES` in `crates/collab/src/schema.rs`. Growing this set
+    /// is a deliberate decision on both sides.
+    const FRONTEND_ONLY_MARKS: &[MarkType] = &[MarkType::TextColor, MarkType::Highlight];
+
+    #[test]
+    fn schema_duality_fixture_matches_this_crate() {
+        let v: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+        let nodes = v["nodes"].as_object().expect("nodes map");
+        let schema = default_schema();
+        let mut diffs: Vec<String> = Vec::new();
+
+        if nodes.len() != NodeType::ALL.len() {
+            diffs.push(format!("node count: fixture {} vs NodeType::ALL {}", nodes.len(), NodeType::ALL.len()));
+        }
+        if schema.node_types().len() != NodeType::ALL.len() {
+            diffs.push(format!("spec count: schema {} vs NodeType::ALL {}", schema.node_types().len(), NodeType::ALL.len()));
+        }
+
+        for nt in NodeType::ALL {
+            let name = format!("{nt:?}");
+            let Some(entry) = nodes.get(&name) else {
+                diffs.push(format!("{name}: missing from fixture"));
+                continue;
+            };
+            let Some(spec) = schema.node_spec(*nt) else {
+                diffs.push(format!("{name}: no NodeSpec in default_schema"));
+                continue;
+            };
+            let want: BTreeSet<String> = entry["children"]
+                .as_array()
+                .expect("children")
+                .iter()
+                .map(|c| c.as_str().unwrap().to_string())
+                .collect();
+            let have: BTreeSet<String> =
+                spec.valid_children.iter().map(|c| format!("{c:?}")).collect();
+            if have != want {
+                let only_here: Vec<_> = have.difference(&want).cloned().collect();
+                let only_collab: Vec<_> = want.difference(&have).cloned().collect();
+                diffs.push(format!(
+                    "{name}.valid_children: frontend-only {only_here:?}, collab-only {only_collab:?}"
+                ));
+            }
+            if spec.leaf != entry["leaf"].as_bool().unwrap() {
+                diffs.push(format!("{name}.leaf: frontend {} vs collab {}", spec.leaf, entry["leaf"]));
+            }
+            if nt.is_inline() != entry["inline"].as_bool().unwrap() {
+                diffs.push(format!("{name}.inline: frontend {} vs collab {}", nt.is_inline(), entry["inline"]));
+            }
+        }
+
+        let collab_marks: BTreeSet<String> = v["marks"]
+            .as_array()
+            .expect("marks")
+            .iter()
+            .map(|m| m.as_str().unwrap().to_string())
+            .collect();
+        let frontend_marks: BTreeSet<String> =
+            MarkType::ALL.iter().map(|m| format!("{m:?}")).collect();
+        let allowed_extra: BTreeSet<String> =
+            FRONTEND_ONLY_MARKS.iter().map(|m| format!("{m:?}")).collect();
+        let extra: BTreeSet<String> = frontend_marks.difference(&collab_marks).cloned().collect();
+        if extra != allowed_extra {
+            diffs.push(format!("frontend-only marks {extra:?} != documented exception {allowed_extra:?}"));
+        }
+        let missing: Vec<_> = collab_marks.difference(&frontend_marks).collect();
+        if !missing.is_empty() {
+            diffs.push(format!("collab marks missing on the frontend: {missing:?}"));
+        }
+
+        assert!(diffs.is_empty(), "schema duality drift:\n  {}", diffs.join("\n  "));
     }
 }

@@ -997,9 +997,11 @@ pub fn HomePage() -> impl IntoView {
                         leptos::task::spawn_local(async move {
                             match folders::delete_folder(&folder_id).await {
                                 Ok(()) => refresh(),
-                                Err(e) => web_sys::console::error_1(
-                                    &format!("Folder delete failed: {e}").into(),
-                                ),
+                                // The pre-check above can race a document
+                                // being added; the backend's 409 is the
+                                // authoritative answer and must reach the
+                                // user, not just the console.
+                                Err(e) => set_error.set(Some(folder_delete_error_message(&e))),
                             }
                         });
                     }
@@ -1223,4 +1225,34 @@ async fn import_dropped_async(
     crate::api::documents::import_document_via_job(file, folder_id)
         .await
         .map_err(|e| format!("import failed: {e}"))
+}
+
+/// User-facing message for a failed folder delete. A 409 means the backend
+/// found children (it never cascades); everything else falls back to the
+/// client error's safe display form.
+fn folder_delete_error_message(e: &crate::api::client::ApiClientError) -> String {
+    match e {
+        crate::api::client::ApiClientError::Http(409, _) => crate::t!("folder-delete-not-empty"),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod folder_delete_message_tests {
+    use super::folder_delete_error_message;
+    use crate::api::client::ApiClientError;
+
+    #[test]
+    fn conflict_maps_to_the_not_empty_notice() {
+        let msg = folder_delete_error_message(&ApiClientError::Http(409, None));
+        assert_eq!(msg, crate::t!("folder-delete-not-empty"));
+    }
+
+    #[test]
+    fn other_errors_keep_their_own_display() {
+        let e = ApiClientError::Http(500, None);
+        assert_eq!(folder_delete_error_message(&e), e.to_string());
+        let e = ApiClientError::Network("offline".into());
+        assert_eq!(folder_delete_error_message(&e), e.to_string());
+    }
 }

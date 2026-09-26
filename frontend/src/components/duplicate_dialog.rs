@@ -63,23 +63,33 @@ pub fn DuplicateDialog(
                     return;
                 }
             };
-            me_id.set(me.user_id);
+            // Every access below happens after an await: the dialog (and
+            // its signals) may have been disposed meanwhile — the present
+            // route unmounts it — and a disposed read/write panics in wasm.
+            // The try_ forms turn that into a silent no-op.
+            if me_id.try_set(me.user_id).is_some() {
+                return;
+            }
             let home = me.home_folder_id;
             match folders::get_folder(&home).await {
                 Ok(f) => {
-                    root_id.set(Some(home.clone()));
-                    expanded.update(|s| {
+                    if root_id.try_set(Some(home.clone())).is_some() {
+                        return;
+                    }
+                    let _ = expanded.try_update(|s| {
                         s.insert(home.clone());
                     });
-                    folders.update(|m| {
+                    let _ = folders.try_update(|m| {
                         m.insert(home.clone(), f);
                     });
                     // Default to Home when nothing's picked yet.
-                    if selected.get_untracked().is_none() {
-                        selected.set(Some(home));
+                    if selected.try_get_untracked().flatten().is_none() {
+                        let _ = selected.try_set(Some(home));
                     }
                 }
-                Err(e) => error.set(Some(e.to_string())),
+                Err(e) => {
+                    let _ = error.try_set(Some(e.to_string()));
+                }
             }
         });
     });

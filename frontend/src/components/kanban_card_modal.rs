@@ -322,15 +322,21 @@ fn render_modal(
                                     assignee_query_seq.get_untracked()
                                 };
                                 gloo_timers::callback::Timeout::new(250, move || {
-                                    if assignee_query_seq.get_untracked() != seq_now {
+                                    // The modal may have closed (and its
+                                    // signals been disposed) while the
+                                    // debounce or the request was in
+                                    // flight; a disposed read/write panics
+                                    // in wasm, so use the try_ forms and
+                                    // just drop the stale result.
+                                    if assignee_query_seq.try_get_untracked() != Some(seq_now) {
                                         return;
                                     }
                                     leptos::task::spawn_local(async move {
                                         if let Ok(resp) =
                                             crate::api::users::search_users(&v).await
                                         {
-                                            if assignee_query_seq.get_untracked() == seq_now {
-                                                set_assignee_results.set(resp.users);
+                                            if assignee_query_seq.try_get_untracked() == Some(seq_now) {
+                                                let _ = set_assignee_results.try_set(resp.users);
                                             }
                                         }
                                     });

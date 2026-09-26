@@ -2374,6 +2374,35 @@ fn item_type_for_list(list_type: NodeType) -> NodeType {
 
 /// Wrap selected textblocks in a list.
 /// If the selection spans multiple blocks, all blocks become list items in one list.
+/// How a top-level block may enter a list item when wrapping.
+#[derive(Debug, PartialEq, Eq)]
+enum ListItemChild {
+    /// Legal as-is per `valid_children`.
+    AsIs,
+    /// A heading: keep the text, drop the level.
+    AsParagraph,
+    /// Never legal inside an item (tables, LiveApp blocks); don't wrap.
+    Never,
+}
+
+fn list_item_child_kind(
+    schema: &crate::editor::schema::Schema,
+    block: NodeType,
+    item_type: NodeType,
+) -> ListItemChild {
+    let allowed = schema
+        .node_spec(item_type)
+        .map(|spec| spec.valid_children.contains(&block))
+        .unwrap_or(false);
+    if allowed {
+        ListItemChild::AsIs
+    } else if block == NodeType::Heading {
+        ListItemChild::AsParagraph
+    } else {
+        ListItemChild::Never
+    }
+}
+
 fn wrap_in_list(
     state: &EditorState,
     list_type: NodeType,
@@ -2405,7 +2434,24 @@ fn wrap_in_list(
             structure: true,
         };
 
-        return state.transaction().step(step).ok();
+        // A list item may not hold every block (schema: Paragraph, lists,
+        // Blockquote, CodeBlock). A heading becomes a paragraph on the way
+        // in — content kept, level dropped; anything else an item can't
+        // hold (a table, a LiveApp block) is left alone rather than
+        // wrapped into an invalid tree.
+        let txn = state.transaction();
+        let txn = match list_item_child_kind(&state.schema, block.node_type, item_type) {
+            ListItemChild::AsIs => txn,
+            ListItemChild::AsParagraph => txn
+                .step(Step::SetNodeType {
+                    pos: block.offset,
+                    node_type: NodeType::Paragraph,
+                    attrs: HashMap::new(),
+                })
+                .ok()?,
+            ListItemChild::Never => return None,
+        };
+        return txn.step(step).ok();
     }
 
     // Multiple blocks: wrap each as a ListItem, then replace the range with a single list
@@ -2416,6 +2462,16 @@ fn wrap_in_list(
     for block in &blocks {
         // Clone the block and wrap it in a ListItem
         let block_node = extract_node_at(&state.doc, block.offset)?;
+        let block_node = match list_item_child_kind(&state.schema, block.node_type, item_type) {
+            ListItemChild::AsIs => block_node,
+            ListItemChild::AsParagraph => {
+                let Node::Element { attrs, content, .. } = &block_node else { return None };
+                let mut attrs = attrs.clone();
+                attrs.remove("level");
+                Node::element_with_attrs(NodeType::Paragraph, attrs, content.clone())
+            }
+            ListItemChild::Never => return None,
+        };
         items.push(Node::element_with_content(
             item_type,
             Fragment::from(vec![block_node]),
@@ -6303,5 +6359,73 @@ mod tests {
             move_kanban_card("B", "A2", Some(999), s, d)).unwrap();
         let new_state = state.apply(txn);
         assert_eq!(col_card_ids(&new_state.doc, "B"), vec!["B1", "A2"]);
+    }
+}
+
+#[cfg(test)]
+mod list_wrap_containment_tests {
+    use super::*;
+    use crate::editor::model::Fragment;
+    use crate::editor::schema::default_schema;
+    use crate::editor::state::EditorState;
+    use std::cell::RefCell;
+
+    fn apply(state: &EditorState, f: impl Fn(&EditorState, Option<&dyn Fn(Transaction)>) -> bool) -> EditorState {
+        let captured: RefCell<Option<Transaction>> = RefCell::new(None);
+        let dispatch = |txn: Transaction| {
+            *captured.borrow_mut() = Some(txn);
+        };
+        f(state, Some(&dispatch));
+        match captured.into_inner() {
+            Some(txn) => state.apply(txn),
+            None => state.clone(),
+        }
+    }
+
+    fn heading(text: &str) -> Node {
+        Node::element_with_attrs(
+            NodeType::Heading,
+            [("level".to_string(), "2".to_string())].into_iter().collect(),
+            Fragment::from(vec![Node::text(text)]),
+        )
+    }
+
+    /// Found by `structural_props`: wrapping a heading put a Heading
+    /// inside a ListItem, which neither schema allows.
+    #[test]
+    fn toggle_list_on_a_heading_wraps_it_as_a_paragraph_item() {
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![heading("Title")]));
+        let state = EditorState {
+            selection: Selection::cursor(1),
+            ..EditorState::create_default(doc)
+        };
+        let after = apply(&state, |s, d| toggle_list(NodeType::BulletList, NodeType::ListItem, s, d));
+        assert!(default_schema().validate(&after.doc).is_ok(), "{:?}", after.doc);
+        let list = after.doc.child(0).unwrap();
+        assert_eq!(list.node_type(), Some(NodeType::BulletList));
+        let item = list.child(0).unwrap();
+        let inner = item.child(0).unwrap();
+        assert_eq!(inner.node_type(), Some(NodeType::Paragraph));
+        assert_eq!(inner.text_content(), "Title");
+    }
+
+    #[test]
+    fn toggle_list_across_a_heading_and_a_paragraph_keeps_both_as_items() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                heading("Title"),
+                Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text("body")])),
+            ]),
+        );
+        let size = doc.content_size();
+        let state = EditorState {
+            selection: Selection::text(1, size - 1),
+            ..EditorState::create_default(doc)
+        };
+        let after = apply(&state, |s, d| toggle_list(NodeType::BulletList, NodeType::ListItem, s, d));
+        assert!(default_schema().validate(&after.doc).is_ok(), "{:?}", after.doc);
+        assert_eq!(after.doc.child(0).unwrap().child_count(), 2);
+        assert_eq!(after.doc.text_content(), "Titlebody");
     }
 }

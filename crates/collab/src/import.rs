@@ -81,13 +81,19 @@ pub fn from_markdown(md: &str) -> Doc {
                     }
                     Tag::Heading { level, .. } => {
                         let parent = current_parent(&fragment, &stack, &txn);
-                        let el = insert_at_end(
-                            &mut txn,
-                            &parent,
-                            NodeType::Heading,
-                        );
-                        stack.push(el);
-                        current_heading_level = Some(heading_level_to_u8(level));
+                        // CommonMark reads a bare `-`/`=` line under a list
+                        // item's text as a setext heading, but a heading is
+                        // not a legal child of a list item (or a table
+                        // cell). Keep the text as a paragraph there rather
+                        // than emit an orphan the editor can't reach.
+                        if parent_type(&parent).valid_children().contains(&NodeType::Heading) {
+                            let el = insert_at_end(&mut txn, &parent, NodeType::Heading);
+                            stack.push(el);
+                            current_heading_level = Some(heading_level_to_u8(level));
+                        } else {
+                            let el = insert_at_end(&mut txn, &parent, NodeType::Paragraph);
+                            stack.push(el);
+                        }
                     }
                     Tag::BlockQuote(_) => {
                         let parent = current_parent(&fragment, &stack, &txn);
@@ -209,7 +215,11 @@ pub fn from_markdown(md: &str) -> Doc {
                 }
                 Event::Rule => {
                     let parent = current_parent(&fragment, &stack, &txn);
-                    insert_at_end(&mut txn, &parent, NodeType::HorizontalRule);
+                    // A rule is decorative; where the parent can't hold
+                    // one (a list item), dropping it beats an orphan.
+                    if parent_type(&parent).valid_children().contains(&NodeType::HorizontalRule) {
+                        insert_at_end(&mut txn, &parent, NodeType::HorizontalRule);
+                    }
                 }
                 Event::Html(_) | Event::InlineHtml(_) => {
                     // Raw HTML inside Markdown is dropped in v1 — the
@@ -363,7 +373,12 @@ pub fn from_html(html: &str) -> Doc {
     {
         let mut txn = doc.transact_mut();
         let fragment = txn.get_or_insert_xml_fragment("content");
-        walk_html(&mut txn, &dom.document, &XmlOpenable::Fragment(&fragment));
+        walk_html(
+            &mut txn,
+            &dom.document,
+            &XmlOpenable::Fragment(&fragment),
+            &mut InlineSink::default(),
+        );
     }
     doc
 }
@@ -526,17 +541,68 @@ fn allowed_html_tags() -> std::collections::HashSet<&'static str> {
     .collect()
 }
 
+/// Auto-created paragraph for stray inline content inside a container
+/// that may not hold text directly (a list, a list item, a blockquote).
+/// Consecutive text runs and inline passthrough elements share one
+/// paragraph; it is reset whenever a block child lands in the same
+/// container, so text after a block starts a fresh paragraph.
+#[derive(Default)]
+struct InlineSink {
+    para: Option<XmlElementRef>,
+}
+
+fn parent_type(parent: &XmlOpenable<'_>) -> NodeType {
+    match parent {
+        XmlOpenable::Fragment(_) => NodeType::Doc,
+        XmlOpenable::Element(e) => NodeType::from_tag(e.tag().as_ref()).unwrap_or(NodeType::Doc),
+    }
+}
+
+/// A node that holds text directly (Paragraph, Heading, CodeBlock).
+fn is_textblock(nt: NodeType) -> bool {
+    !nt.is_leaf() && nt.valid_children().is_empty() && !nt.is_inline()
+}
+
+fn is_list_container(nt: NodeType) -> bool {
+    matches!(nt, NodeType::BulletList | NodeType::OrderedList | NodeType::TaskList)
+}
+
+/// The paragraph stray inline content under `parent` should land in,
+/// creating it (and, under a list container, the list item around it)
+/// on first use. Never called for a textblock parent.
+fn sink_paragraph(
+    txn: &mut yrs::TransactionMut<'_>,
+    parent: &XmlOpenable<'_>,
+    sink: &mut InlineSink,
+) -> XmlElementRef {
+    if let Some(p) = &sink.para {
+        return p.clone();
+    }
+    let host = if is_list_container(parent_type(parent)) {
+        XmlOpenable::Element(insert_at_end(txn, parent, NodeType::ListItem))
+    } else {
+        match parent {
+            XmlOpenable::Fragment(f) => XmlOpenable::Fragment(f),
+            XmlOpenable::Element(e) => XmlOpenable::Element(e.clone()),
+        }
+    };
+    let p = insert_at_end(txn, &host, NodeType::Paragraph);
+    sink.para = Some(p.clone());
+    p
+}
+
 fn walk_html<'a>(
     txn: &mut yrs::TransactionMut<'_>,
     handle: &markup5ever_rcdom::Handle,
     parent: &XmlOpenable<'a>,
+    sink: &mut InlineSink,
 ) {
     use markup5ever_rcdom::NodeData;
 
     match &handle.data {
         NodeData::Document => {
             for child in handle.children.borrow().iter() {
-                walk_html(txn, child, parent);
+                walk_html(txn, child, parent, sink);
             }
         }
         NodeData::Element { name, .. } => {
@@ -546,30 +612,81 @@ fn walk_html<'a>(
             // matching NodeType.
             if matches!(tag, "html" | "head" | "body") {
                 for child in handle.children.borrow().iter() {
-                    walk_html(txn, child, parent);
+                    walk_html(txn, child, parent, sink);
                 }
                 return;
             }
-            if let Some(nt) = map_html_tag(tag) {
-                let el = insert_at_end(txn, parent, nt);
-                // Heading carries a level attribute on its element,
-                // not just on the tag. Recover it from the original
-                // tag name.
-                if nt == NodeType::Heading {
-                    if let Some(level) = heading_level_from_tag(tag) {
-                        el.insert_attribute(txn, "level", level.to_string());
-                    }
-                }
-                let scope = XmlOpenable::Element(el);
-                for child in handle.children.borrow().iter() {
-                    walk_html(txn, child, &scope);
-                }
-            } else {
+            let Some(nt) = map_html_tag(tag) else {
                 // Transparent passthrough — unknown tag, walk
                 // children in the same parent context.
                 for child in handle.children.borrow().iter() {
-                    walk_html(txn, child, parent);
+                    walk_html(txn, child, parent, sink);
                 }
+                return;
+            };
+            let ptype = parent_type(parent);
+
+            if nt.is_inline() {
+                // `<br>`: legal inside a textblock; elsewhere it rides in
+                // the same auto paragraph stray text would.
+                let host = if is_textblock(ptype) || ptype == NodeType::Doc {
+                    match parent {
+                        XmlOpenable::Fragment(f) => XmlOpenable::Fragment(f),
+                        XmlOpenable::Element(e) => XmlOpenable::Element(e.clone()),
+                    }
+                } else {
+                    XmlOpenable::Element(sink_paragraph(txn, parent, sink))
+                };
+                insert_at_end(txn, &host, nt);
+                return;
+            }
+
+            // Containment (mirrors the Quip importer's `enforce_containment`
+            // and the editor's `ensure_list_item`): a block the parent may
+            // not hold either gets a list item around it (under a list) or
+            // is unwrapped so its content lands in the parent instead.
+            // Either way the tree stays inside `valid_children` — a stray
+            // block or text under a list is the orphan-container class.
+            let host: XmlOpenable<'_> = if ptype.valid_children().contains(&nt) {
+                match parent {
+                    XmlOpenable::Fragment(f) => XmlOpenable::Fragment(f),
+                    XmlOpenable::Element(e) => XmlOpenable::Element(e.clone()),
+                }
+            } else if is_list_container(ptype) && nt != NodeType::ListItem {
+                XmlOpenable::Element(insert_at_end(txn, parent, NodeType::ListItem))
+            } else {
+                // Illegal here and no wrapper helps: unwrap.
+                for child in handle.children.borrow().iter() {
+                    walk_html(txn, child, parent, sink);
+                }
+                return;
+            };
+            // A block child ends any auto paragraph in this container.
+            sink.para = None;
+
+            if !parent_type(&host).valid_children().contains(&nt) {
+                // Wrapped in a list item but still illegal there (e.g. a
+                // heading): unwrap into the item.
+                let mut inner = InlineSink::default();
+                for child in handle.children.borrow().iter() {
+                    walk_html(txn, child, &host, &mut inner);
+                }
+                return;
+            }
+
+            let el = insert_at_end(txn, &host, nt);
+            // Heading carries a level attribute on its element,
+            // not just on the tag. Recover it from the original
+            // tag name.
+            if nt == NodeType::Heading {
+                if let Some(level) = heading_level_from_tag(tag) {
+                    el.insert_attribute(txn, "level", level.to_string());
+                }
+            }
+            let scope = XmlOpenable::Element(el);
+            let mut inner = InlineSink::default();
+            for child in handle.children.borrow().iter() {
+                walk_html(txn, child, &scope, &mut inner);
             }
         }
         NodeData::Text { contents } => {
@@ -581,10 +698,10 @@ fn walk_html<'a>(
             if trimmed.trim().is_empty() {
                 return;
             }
-            // Insert as text leaf under the current open element. If
-            // we're at fragment scope, wrap in a paragraph first —
-            // a bare text node at top level is otherwise unschematic.
+            let ptype = parent_type(parent);
             match parent {
+                // Fragment scope: wrap in a paragraph — a bare text node at
+                // top level is otherwise unschematic.
                 XmlOpenable::Fragment(f) => {
                     let p = {
                         let pos = f.len(txn);
@@ -599,9 +716,19 @@ fn walk_html<'a>(
                     let pos = p.len(txn);
                     p.insert(txn, pos, XmlTextPrelim::new(trimmed));
                 }
-                XmlOpenable::Element(e) => {
+                XmlOpenable::Element(e) if is_textblock(ptype) => {
                     let pos = e.len(txn);
                     e.insert(txn, pos, XmlTextPrelim::new(trimmed));
+                }
+                XmlOpenable::Element(_) if ptype.is_leaf() => {
+                    // A void element can't hold text; nothing to keep.
+                }
+                XmlOpenable::Element(_) => {
+                    // Text directly inside a container (list, item,
+                    // blockquote): route it into an auto paragraph.
+                    let p = sink_paragraph(txn, parent, sink);
+                    let pos = p.len(txn);
+                    p.insert(txn, pos, XmlTextPrelim::new(trimmed));
                 }
             }
         }
@@ -1050,5 +1177,95 @@ mod tests {
         // Children are XmlText runs separated by the (dropped) mark
         // wrappers. Count > 0 and no element children.
         assert!(p.len(&txn) >= 1);
+    }
+}
+
+#[cfg(test)]
+mod containment_tests {
+    use super::*;
+    use crate::validate::schema_violations;
+    use yrs::types::xml::XmlOut;
+    use yrs::{GetString, ReadTxn};
+
+    /// Render the tree as `tag(child,child,"text")` for shape assertions.
+    fn shape(doc: &Doc) -> String {
+        fn el<T: ReadTxn>(txn: &T, e: &XmlElementRef) -> String {
+            let mut parts = Vec::new();
+            for i in 0..e.len(txn) {
+                match e.get(txn, i) {
+                    Some(XmlOut::Element(c)) => parts.push(el(txn, &c)),
+                    Some(XmlOut::Text(t)) => parts.push(format!("{:?}", t.get_string(txn))),
+                    _ => {}
+                }
+            }
+            format!("{}({})", e.tag(), parts.join(","))
+        }
+        let txn = doc.transact();
+        let frag = txn.get_xml_fragment("content").unwrap();
+        let mut out = Vec::new();
+        for i in 0..frag.len(&txn) {
+            if let Some(XmlOut::Element(e)) = frag.get(&txn, i) {
+                out.push(el(&txn, &e));
+            }
+        }
+        out.join(";")
+    }
+
+    #[test]
+    fn text_in_a_list_item_is_wrapped_in_a_paragraph() {
+        let doc = from_html("<ul><li>a <b>b</b> c</li><li>d</li></ul>");
+        assert_eq!(
+            shape(&doc),
+            r#"bullet_list(list_item(paragraph("a ","b"," c")),list_item(paragraph("d")))"#
+        );
+        assert!(schema_violations(&doc).is_empty());
+    }
+
+    #[test]
+    fn stray_block_and_text_under_a_list_get_their_own_items() {
+        let doc = from_html("<ul>lead<p>x</p><li>y</li></ul>");
+        assert_eq!(
+            shape(&doc),
+            r#"bullet_list(list_item(paragraph("lead")),list_item(paragraph("x")),list_item(paragraph("y")))"#
+        );
+        assert!(schema_violations(&doc).is_empty());
+    }
+
+    #[test]
+    fn text_after_a_nested_list_starts_a_new_paragraph() {
+        let doc = from_html("<ul><li>a<ul><li>b</li></ul>c</li></ul>");
+        assert_eq!(
+            shape(&doc),
+            r#"bullet_list(list_item(paragraph("a"),bullet_list(list_item(paragraph("b"))),paragraph("c")))"#
+        );
+        assert!(schema_violations(&doc).is_empty());
+    }
+
+    #[test]
+    fn markdown_setext_heading_inside_a_list_item_becomes_a_paragraph() {
+        // "  - " under the item text parses as a setext H2 in CommonMark.
+        let doc = from_markdown("- a\n  - \n");
+        assert_eq!(shape(&doc), r#"bullet_list(list_item(paragraph("a")))"#);
+        assert!(schema_violations(&doc).is_empty());
+        // At top level the same shape is still a heading.
+        let doc = from_markdown("a\n---\n");
+        assert_eq!(shape(&doc), r#"heading("a")"#);
+    }
+
+    #[test]
+    fn markdown_rule_inside_a_list_item_is_dropped_not_orphaned() {
+        let doc = from_markdown("- a\n\n  ***\n\n  b\n");
+        assert!(schema_violations(&doc).is_empty(), "{}", shape(&doc));
+        assert!(shape(&doc).contains(r#"paragraph("b")"#), "{}", shape(&doc));
+    }
+
+    #[test]
+    fn blockquote_text_and_illegal_heading_in_item_are_kept_as_paragraph_text() {
+        let doc = from_html("<blockquote>bare</blockquote><ol><li><h2>t</h2></li></ol>");
+        assert_eq!(
+            shape(&doc),
+            r#"blockquote(paragraph("bare"));ordered_list(list_item(paragraph("t")))"#
+        );
+        assert!(schema_violations(&doc).is_empty());
     }
 }
