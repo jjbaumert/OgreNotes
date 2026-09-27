@@ -779,16 +779,13 @@ fn is_deck(doc: &Doc) -> bool {
 }
 
 /// One frame flattened for PDF: geometry already clamped, text already
-/// extracted. `is_heading` drives font size and color choice. `h` is
-/// carried for interface parity with the frame's persisted geometry
-/// (a future pass may clip/wrap text to frame height); the renderer
-/// doesn't consume it yet, hence the `allow`.
+/// extracted. `is_heading` drives font size and color choice. `h` bounds
+/// the frame's text: lines past the frame's bottom edge are clipped (#228).
 #[cfg(feature = "pdf")]
 struct PdfFrame {
     x: f64,
     y: f64,
     w: f64,
-    #[allow(dead_code)]
     h: f64,
     text: String,
     is_heading: bool,

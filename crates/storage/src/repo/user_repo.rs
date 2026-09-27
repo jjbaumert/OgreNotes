@@ -41,19 +41,18 @@ impl UserRepo {
                 "failed to write email pointer on create; get_by_email falls \
                  back to a scan until backfill_email_pointers runs"
             );
-            // #178: this user now has no pointer, so the "every profile has
-            // a pointer" marker is false. Clearing it re-enables the scan
+            // #178: this user now has no pointer, so "every profile has a
+            // pointer" is false. Marking the marker dirty re-enables the scan
             // fallback, without which a pointer-less user would read as
             // absent and a later sign-in would create a duplicate account.
-            if let Err(e) = self
-                .db
-                .delete_item(EMAIL_POINTERS_COMPLETE_PK, EMAIL_POINTERS_COMPLETE_SK)
-                .await
-            {
+            // An unconditional overwrite (not a delete) so that it also
+            // defeats a backfill that is running right now: the backfill
+            // only completes the marker if its own run id is still there.
+            if let Err(e) = self.put_email_pointers_marker(MARKER_DIRTY, None).await {
                 tracing::error!(
                     user_id = %user.user_id,
                     error = %e,
-                    "failed to clear the email-pointer completeness marker after a \
+                    "failed to mark the email-pointer completeness marker dirty after a \
                      failed pointer write; run backfill_email_pointers"
                 );
             }
@@ -221,7 +220,28 @@ impl UserRepo {
             .get_item(EMAIL_POINTERS_COMPLETE_PK, EMAIL_POINTERS_COMPLETE_SK)
             .await
             .map_err(|e| RepoError::Dynamo(e.to_string()))?
-            .is_some())
+            .is_some_and(|item| get_s(&item, "state").is_ok_and(|s| s == MARKER_COMPLETE)))
+    }
+
+    /// Overwrite the completeness marker with `state` (and `run_id`, when a
+    /// backfill owns it).
+    async fn put_email_pointers_marker(
+        &self,
+        state: &str,
+        run_id: Option<&str>,
+    ) -> Result<(), RepoError> {
+        let mut item = HashMap::from([
+            ("PK".to_string(), AttributeValue::S(EMAIL_POINTERS_COMPLETE_PK.to_string())),
+            ("SK".to_string(), AttributeValue::S(EMAIL_POINTERS_COMPLETE_SK.to_string())),
+            ("state".to_string(), AttributeValue::S(state.to_string())),
+        ]);
+        if let Some(run_id) = run_id {
+            item.insert("run_id".to_string(), AttributeValue::S(run_id.to_string()));
+        }
+        self.db
+            .put_item(item)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
     /// Legacy full-table `Scan` for `get_by_email`, used only until the
@@ -282,6 +302,13 @@ impl UserRepo {
     /// Idempotent (pointers are put-overwrites) — safe to re-run. Returns
     /// `(profiles_scanned, pointers_written)`.
     pub async fn backfill_email_pointers(&self) -> Result<(usize, usize), RepoError> {
+        // Claim the marker for this run before scanning. A create whose
+        // pointer write fails while we scan overwrites it as dirty (and
+        // drops our run id), and the conditional write at the end then
+        // refuses to mark the table complete.
+        let run_id = ogrenotes_common::id::new_id();
+        self.put_email_pointers_marker(MARKER_BACKFILLING, Some(&run_id)).await?;
+
         let mut scanned = 0usize;
         let mut written = 0usize;
         let mut start_key: Option<HashMap<String, AttributeValue>> = None;
@@ -318,15 +345,37 @@ impl UserRepo {
         }
 
         // Every profile now has a pointer, so a pointer miss is a real miss
-        // and `get_by_email` can stop scanning (#178). Written only after a
-        // pass with no error: any failure above returned early.
-        let mut marker = HashMap::new();
-        marker.insert("PK".to_string(), AttributeValue::S(EMAIL_POINTERS_COMPLETE_PK.to_string()));
-        marker.insert("SK".to_string(), AttributeValue::S(EMAIL_POINTERS_COMPLETE_SK.to_string()));
-        self.db
-            .put_item(marker)
-            .await
-            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        // and `get_by_email` can stop scanning (#178). Reached only after a
+        // pass with no error (any failure above returned early), and written
+        // only if the marker still carries this run's id: a create that
+        // failed its pointer write meanwhile marked it dirty, and the table
+        // must then keep scanning until a later backfill.
+        let completed = self
+            .db
+            .inner()
+            .put_item()
+            .table_name(self.db.table_name())
+            .item("PK", AttributeValue::S(EMAIL_POINTERS_COMPLETE_PK.to_string()))
+            .item("SK", AttributeValue::S(EMAIL_POINTERS_COMPLETE_SK.to_string()))
+            .item("state", AttributeValue::S(MARKER_COMPLETE.to_string()))
+            .condition_expression("run_id = :run")
+            .expression_attribute_values(":run", AttributeValue::S(run_id))
+            .send()
+            .await;
+        match completed {
+            Ok(_) => {}
+            Err(e) => {
+                let e = e.into_service_error();
+                if e.is_conditional_check_failed_exception() {
+                    tracing::warn!(
+                        "backfill_email_pointers: a pointer write failed during the pass; \
+                         the table stays in scan mode until the next backfill"
+                    );
+                } else {
+                    return Err(RepoError::Dynamo(e.to_string()));
+                }
+            }
+        }
         Ok((scanned, written))
     }
 
@@ -900,12 +949,20 @@ impl UserRepo {
 /// Sort key for the email→user pointer item (#36).
 const EMAIL_POINTER_SK: &str = "POINTER";
 
-/// Marker row meaning "every PROFILE has an `EMAIL#` pointer" (#178).
-/// Written by `backfill_email_pointers` after a full pass; deleted when a
-/// create fails to write its pointer. While present, `get_by_email` treats
-/// a pointer miss as authoritative instead of scanning the table.
+/// Marker row recording whether every PROFILE has an `EMAIL#` pointer
+/// (#178). Only `state = complete` lets `get_by_email` treat a pointer miss
+/// as authoritative instead of scanning the table.
+///
+/// `backfill_email_pointers` sets `backfilling` with a fresh `run_id`, then
+/// `complete` at the end, conditioned on that `run_id` still being there. A
+/// create whose pointer write fails overwrites it as `dirty` (no `run_id`),
+/// which both re-enables the scan and stops a concurrent backfill from
+/// completing it.
 const EMAIL_POINTERS_COMPLETE_PK: &str = "META#EMAIL_POINTERS";
 const EMAIL_POINTERS_COMPLETE_SK: &str = "COMPLETE";
+const MARKER_COMPLETE: &str = "complete";
+const MARKER_BACKFILLING: &str = "backfilling";
+const MARKER_DIRTY: &str = "dirty";
 
 /// Partition key for the `EMAIL#<lowercased> → user_id` pointer item (#36).
 /// The caller lowercases + trims the email first, matching the old scan's

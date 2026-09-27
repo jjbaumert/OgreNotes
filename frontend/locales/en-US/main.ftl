@@ -396,7 +396,6 @@ duplicate-name-label = Name
 duplicate-destination-label = Destination folder
 duplicate-confirm = Duplicate
 duplicate-share-warning = This folder is shared — { $count } other people have access, so they'll be able to see the copy.
-duplicate-failed = Couldn't duplicate the document. Please try again.
 # Focus/expand toggle (#134)
 document-focus-enter = Focus mode
 document-focus-exit = Exit focus mode

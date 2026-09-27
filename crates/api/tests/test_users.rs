@@ -813,3 +813,38 @@ async fn get_by_email_miss_is_authoritative_after_a_complete_backfill() {
 
     app.cleanup().await;
 }
+
+/// #178 review fix: a `dirty` marker (what a create writes when its pointer
+/// write fails) keeps `get_by_email` scanning, so a pointer-less user is
+/// still found; a later complete backfill makes misses authoritative again.
+#[tokio::test]
+async fn a_dirty_email_pointer_marker_keeps_the_scan_fallback() {
+    common::require_infra!();
+    use aws_sdk_dynamodb::types::AttributeValue;
+    let app = common::TestApp::new().await;
+
+    let (dana_id, _) = app.create_user("dana.dirty@test.com").await;
+    app.state.user_repo.backfill_email_pointers().await.unwrap();
+
+    // Simulate a failed pointer write: the pointer is missing and the
+    // marker has been overwritten as dirty.
+    delete_email_pointer(&app, "dana.dirty@test.com").await;
+    app.dynamo_client()
+        .put_item()
+        .table_name(&app.table_name)
+        .item("PK", AttributeValue::S("META#EMAIL_POINTERS".to_string()))
+        .item("SK", AttributeValue::S("COMPLETE".to_string()))
+        .item("state", AttributeValue::S("dirty".to_string()))
+        .send()
+        .await
+        .expect("write dirty marker");
+
+    let found = app.state.user_repo.get_by_email("dana.dirty@test.com").await.unwrap();
+    assert_eq!(
+        found.map(|u| u.user_id),
+        Some(dana_id),
+        "a dirty marker must not make a pointer miss authoritative",
+    );
+
+    app.cleanup().await;
+}

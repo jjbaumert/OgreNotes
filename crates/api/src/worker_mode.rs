@@ -367,7 +367,14 @@ async fn reaper_loop(
             tracing::debug!(consumer, "worker mode: reaper at capacity; skipping this tick");
             continue;
         }
-        match queue.claim_stale(&consumer, REAPER_MIN_IDLE_MS, free).await {
+        // Entries this reaper is already running go idle-stale again after
+        // REAPER_MIN_IDLE_MS (nothing refreshes them), and XAUTOCLAIM
+        // returns them first (it walks from the oldest id). Ask for enough
+        // to see past every one of them, or they would fill the whole batch
+        // and starve the orphaned entries the reaper exists to recover.
+        // `admit` still starts at most `free` jobs and skips the running ones.
+        let want = free + slots.running();
+        match queue.claim_stale(&consumer, REAPER_MIN_IDLE_MS, want).await {
             Ok(entries) if entries.is_empty() => {}
             Ok(entries) => {
                 tracing::info!(
@@ -419,8 +426,12 @@ impl ReaperSlots {
     }
 
     fn free(&self) -> usize {
-        let running = self.in_flight.lock().unwrap_or_else(|p| p.into_inner()).len();
-        self.capacity.saturating_sub(running)
+        self.capacity.saturating_sub(self.running())
+    }
+
+    /// How many reclaimed jobs are running now.
+    fn running(&self) -> usize {
+        self.in_flight.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// A slot for `stream_id`, or `None` when that entry is already running
@@ -1481,6 +1492,29 @@ async fn record_report_by(
     }
 }
 
+/// Longest title a report note carries, in characters (#161). The note list
+/// is budgeted (25 per kind) but a single pathological title should not
+/// bloat the REPORT row either.
+const REPORT_TITLE_MAX_CHARS: usize = 120;
+
+/// The thread's title as a report note shows it (#161): control characters
+/// dropped, whitespace collapsed, capped at [`REPORT_TITLE_MAX_CHARS`];
+/// `None` when nothing is left. It is the same Quip-authored text the
+/// imported document's own title is made from, so it carries nothing the
+/// user cannot already see.
+fn report_title(thread: &ThreadRow) -> Option<String> {
+    // Drop control characters first, so one sitting between two spaces
+    // cannot leave a double space behind; then collapse whitespace.
+    let visible: String = thread.title.chars().filter(|c| !c.is_control()).collect();
+    let cleaned = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.is_empty() {
+        return None;
+    }
+    let mut chars = cleaned.chars();
+    let head: String = chars.by_ref().take(REPORT_TITLE_MAX_CHARS).collect();
+    Some(if chars.next().is_some() { format!("{head}…") } else { head })
+}
+
 /// A short, class-only description of a [`QuipError`], safe to persist in a
 /// user-visible `THREAD#.reason` or [`ReportNote::detail`].
 ///
@@ -1498,33 +1532,6 @@ async fn record_report_by(
 /// `quip-import`'s client tests — but they are spelled out here rather than
 /// borrowed from `Display` so that no future variant can quietly inherit the
 /// permissive branch.
-/// Longest title a report note carries, in characters (#161). The note list
-/// is budgeted (25 per kind) but a single pathological title should not
-/// bloat the REPORT row either.
-const REPORT_TITLE_MAX_CHARS: usize = 120;
-
-/// The thread's title as a report note shows it (#161): control characters
-/// dropped, whitespace collapsed, capped at [`REPORT_TITLE_MAX_CHARS`];
-/// `None` when nothing is left. It is the same Quip-authored text the
-/// imported document's own title is made from, so it carries nothing the
-/// user cannot already see.
-fn report_title(thread: &ThreadRow) -> Option<String> {
-    let cleaned: String = thread
-        .title
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect();
-    if cleaned.is_empty() {
-        return None;
-    }
-    let mut chars = cleaned.chars();
-    let head: String = chars.by_ref().take(REPORT_TITLE_MAX_CHARS).collect();
-    Some(if chars.next().is_some() { format!("{head}…") } else { head })
-}
-
 fn safe_quip_reason(e: &QuipError) -> String {
     match e {
         QuipError::Unauthorized => "Quip rejected the import's credential (HTTP 401)".to_string(),
@@ -3537,6 +3544,11 @@ mod tests {
     fn report_title_is_cleaned_and_capped() {
         assert_eq!(report_title(&thread_titled("  Q3\n plan \t")).as_deref(), Some("Q3 plan"));
         assert_eq!(report_title(&thread_titled("a\u{7}b")).as_deref(), Some("ab"));
+        assert_eq!(
+            report_title(&thread_titled("a \u{7} b")).as_deref(),
+            Some("a b"),
+            "a control char between spaces leaves no double space",
+        );
         assert_eq!(report_title(&thread_titled("   ")), None);
         let long = "x".repeat(REPORT_TITLE_MAX_CHARS + 5);
         let capped = report_title(&thread_titled(&long)).unwrap();
@@ -3564,6 +3576,7 @@ mod tests {
         let a = slots.admit("a").unwrap();
         let _b = slots.admit("b").unwrap();
         assert_eq!(slots.free(), 0);
+        assert_eq!(slots.running(), 2);
         assert!(slots.admit("c").is_none(), "no slot past capacity");
         drop(a);
         assert_eq!(slots.free(), 1);

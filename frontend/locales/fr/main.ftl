@@ -272,7 +272,6 @@ duplicate-name-label = Nom
 duplicate-destination-label = Dossier de destination
 duplicate-confirm = Dupliquer
 duplicate-share-warning = Ce dossier est partagé — { $count } autres personnes y ont accès et verront la copie.
-duplicate-failed = Impossible de dupliquer le document. Veuillez réessayer.
 # Focus/expand toggle (#134)
 document-focus-enter = Mode focus
 document-focus-exit = Quitter le mode focus
