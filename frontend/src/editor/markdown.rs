@@ -2004,34 +2004,11 @@ mod tests {
                 find_block_at(&state.doc, pos).map(|b| b.node_type).unwrap_or(NodeType::Doc)
             };
             let fitted = fit_slice_to_context(slice, parent_type);
-            // Mirror view.rs: when has_blocks but no enclosing block is
-            // found (cursor outside any block in a malformed doc), fall
-            // through to replace_selection rather than panicking.
-            let block_branch = has_blocks.then(|| find_block_at(&state.doc, pos)).flatten();
-            if let Some(block) = block_branch {
-                let offset = pos.saturating_sub(block.content_start).min(block.content.size());
-                let before_content = block.content.cut(0, offset);
-                let after_content = block.content.cut(offset, block.content.size());
-                let mut nodes = Vec::new();
-                if !before_content.children.is_empty()
-                    && before_content.children.iter().any(|n| !n.text_content().is_empty())
-                {
-                    nodes.push(Node::Element {
-                        node_type: block.node_type,
-                        attrs: block.attrs.clone(),
-                        content: before_content,
-                        marks: vec![],
-                    });
-                }
-                nodes.extend(fitted.content.children);
-                if !after_content.children.is_empty()
-                    && after_content.children.iter().any(|n| !n.text_content().is_empty())
-                {
-                    nodes.push(Node::element_with_content(NodeType::Paragraph, after_content));
-                }
-                let block_slice = Slice::new(Fragment::from(nodes), 0, 0);
-                state.transaction()
-                    .replace(block.offset, block.offset + block.node_size, block_slice).unwrap()
+            // Same calls as view.rs's paste handler: block content goes
+            // through `paste_blocks`, inline content through
+            // `replace_selection`.
+            if has_blocks {
+                state.transaction().paste_blocks(fitted).unwrap()
             } else {
                 state.transaction().replace_selection(fitted).unwrap()
             }

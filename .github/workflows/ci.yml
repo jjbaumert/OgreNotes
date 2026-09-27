@@ -96,9 +96,13 @@ jobs:
       - name: Workspace check (all targets)
         run: cargo check --workspace --all-targets --locked
 
+      # `--bins` as well as `--lib`: the `components` module is declared
+      # only in main.rs, so its ~800 unit tests live in the bin target and
+      # `--lib` alone never ran them (#240). The step name is unchanged
+      # because .claude/agents/test-triage-doctor.md refers to it.
       - name: Frontend lib tests
         working-directory: frontend
-        run: cargo test --lib --locked
+        run: cargo test --lib --bins --locked
 
   # ─── Supply-chain audit: cargo-deny ─────────────────────────────
   # License policy + RUSTSEC advisories + source allow-list, driven by

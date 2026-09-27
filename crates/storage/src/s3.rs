@@ -119,9 +119,17 @@ impl S3Client {
 
     /// Delete every object under a prefix (list + batched delete, up to 1000
     /// per batch). Used for permanent document purges.
+    ///
+    /// `DeleteObjects` can answer HTTP 200 while failing individual keys,
+    /// reporting them only in the response's `Errors` list. Those are
+    /// collected across every page and returned as `Err`, so a caller that
+    /// audits a purge never records "deleted" for an object that survived.
+    /// A per-key failure does not stop the sweep: the remaining pages are
+    /// still deleted before the error is returned.
     pub async fn delete_prefix(&self, prefix: &str) -> Result<(), S3Error> {
         use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 
+        let mut failed: Vec<aws_sdk_s3::types::Error> = Vec::new();
         let mut continuation: Option<String> = None;
         loop {
             let mut builder = self
@@ -150,13 +158,15 @@ impl S3Client {
                     .set_objects(Some(keys))
                     .build()
                     .map_err(|e| S3Error::Operation(e.to_string()))?;
-                self.client
+                let out = self
+                    .client
                     .delete_objects()
                     .bucket(&self.bucket)
                     .delete(del)
                     .send()
                     .await
                     .map_err(|e| S3Error::Operation(e.into_service_error().to_string()))?;
+                failed.extend(out.errors.unwrap_or_default());
             }
 
             if page.is_truncated.unwrap_or(false) {
@@ -169,7 +179,10 @@ impl S3Client {
             }
         }
 
-        Ok(())
+        match describe_delete_failures(prefix, &failed) {
+            Some(msg) => Err(S3Error::Operation(msg)),
+            None => Ok(()),
+        }
     }
 
     /// Server-side copy of one object to another key in the same bucket.
@@ -245,6 +258,38 @@ fn encode_copy_source_key(key: &str) -> String {
     out
 }
 
+/// Summarize the per-key failures a `DeleteObjects` sweep collected, or
+/// `None` when every key was deleted. Names the first few keys (with S3's
+/// code) so the caller's log line is actionable without flooding it.
+fn describe_delete_failures(prefix: &str, failed: &[aws_sdk_s3::types::Error]) -> Option<String> {
+    const SHOWN: usize = 3;
+    if failed.is_empty() {
+        return None;
+    }
+    let shown: Vec<String> = failed
+        .iter()
+        .take(SHOWN)
+        .map(|e| {
+            format!(
+                "{} ({})",
+                e.key().unwrap_or("<no key>"),
+                e.code().unwrap_or("<no code>"),
+            )
+        })
+        .collect();
+    let more = failed.len().saturating_sub(SHOWN);
+    let tail = if more > 0 {
+        format!(", and {more} more")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "delete_prefix {prefix}: {} object(s) were not deleted: {}{tail}",
+        failed.len(),
+        shown.join(", "),
+    ))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum S3Error {
     #[error("presigning error: {0}")]
@@ -256,7 +301,46 @@ pub enum S3Error {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_copy_source_key;
+    use super::{describe_delete_failures, encode_copy_source_key};
+    use aws_sdk_s3::types::Error as KeyError;
+
+    fn key_error(key: &str, code: &str) -> KeyError {
+        KeyError::builder()
+            .key(key)
+            .code(code)
+            .message("denied")
+            .build()
+    }
+
+    #[test]
+    fn delete_failures_none_when_every_key_was_deleted() {
+        assert_eq!(describe_delete_failures("docs/d1/", &[]), None);
+    }
+
+    #[test]
+    fn delete_failures_name_the_surviving_keys() {
+        let msg =
+            describe_delete_failures("blobs/d1/", &[key_error("blobs/d1/a.png", "AccessDenied")])
+                .expect("a per-key failure must surface as an error (#166)");
+        assert!(msg.contains("blobs/d1/"), "{msg}");
+        assert!(msg.contains("1 object(s)"), "{msg}");
+        assert!(msg.contains("blobs/d1/a.png (AccessDenied)"), "{msg}");
+    }
+
+    #[test]
+    fn delete_failures_cap_the_listed_keys_and_count_the_rest() {
+        let failed: Vec<KeyError> = (0..5)
+            .map(|i| key_error(&format!("docs/d1/k{i}"), "InternalError"))
+            .collect();
+        let msg = describe_delete_failures("docs/d1/", &failed).unwrap();
+        assert!(msg.contains("5 object(s)"), "{msg}");
+        assert!(msg.contains("docs/d1/k2"), "{msg}");
+        assert!(
+            !msg.contains("docs/d1/k3"),
+            "only the first three keys are listed: {msg}"
+        );
+        assert!(msg.ends_with("and 2 more"), "{msg}");
+    }
 
     #[test]
     fn copy_source_key_encodes_specials_but_keeps_path_separators() {
