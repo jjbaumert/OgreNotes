@@ -3806,3 +3806,121 @@ async fn a_document_the_user_removed_from_one_folder_is_not_re_added_by_a_re_run
     // nor prunes.
     assert_eq!(folders_listing_the_doc(&app, &remaining, &doc_id).await, remaining);
 }
+
+/// #179: a person `/1/users/` omits (deactivated, cross-org, or hidden from
+/// the token) and that resolves as neither a thread nor a folder degrades to
+/// their name, instead of becoming a "Missing document" chip.
+#[tokio::test]
+async fn an_omitted_person_that_is_no_document_degrades_to_the_name() {
+    common::require_infra!();
+    // `/1/users/` answers, but says nothing about the person.
+    let server = quip_mention_server_with_users(
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
+    )
+    .await;
+    // The generic `/1/threads/` mock only knows "tm", so the person id is
+    // not a thread; `/1/folders/` does not know it either.
+    Mock::given(method("GET"))
+        .and(path("/1/folders/"))
+        .and(query_param("ids", QUIP_PERSON_ID))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_mention_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let doc_id = doc_id_for(&app, &import_id, "tm").await.expect("tm imported");
+    let html = imported_html(&app, &doc_id).await;
+
+    assert!(html.contains("@Joel"), "the person degrades to their name: {html}");
+    assert_eq!(
+        html.matches("doc-mention").count(),
+        1,
+        "only the folder link is a doc link; the person must not be one: {html}",
+    );
+    assert!(!html.contains(QUIP_PERSON_ID), "{html}");
+    let unresolved = app.state.import_repo.list_unresolved(&import_id).await.unwrap();
+    let links: Vec<String> = unresolved
+        .iter()
+        .flat_map(|u| u.links.iter().map(|l| l.target_quip_thread_id.clone()))
+        .collect();
+    assert_eq!(links, vec!["JAdAOAxYGcQ".to_string()], "no pending link for the person");
+}
+
+/// #179, the other side: an omitted id that Quip resolves as a **thread** is
+/// a document chip and stays a back-patchable document link.
+#[tokio::test]
+async fn an_omitted_id_that_resolves_as_a_thread_stays_a_document_link() {
+    common::require_infra!();
+    let server = quip_mention_server_with_users(
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
+    )
+    .await;
+    // Outranks the fixture's generic `/1/threads/` mock for this id.
+    Mock::given(method("GET"))
+        .and(path("/1/threads/"))
+        .and(query_param("ids", QUIP_PERSON_ID))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            QUIP_PERSON_ID: {"thread": {"id": "tother", "title": "Other doc", "type": "document", "updated_usec": 1}}
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_mention_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let doc_id = doc_id_for(&app, &import_id, "tm").await.expect("tm imported");
+    let html = imported_html(&app, &doc_id).await;
+
+    assert_eq!(html.matches("doc-mention").count(), 2, "both chips are doc links: {html}");
+    assert!(!html.contains("@Joel"), "a document must not degrade to plain text: {html}");
+    let unresolved = app.state.import_repo.list_unresolved(&import_id).await.unwrap();
+    let mut links: Vec<String> = unresolved
+        .iter()
+        .flat_map(|u| u.links.iter().map(|l| l.target_quip_thread_id.clone()))
+        .collect();
+    links.sort();
+    assert_eq!(
+        links,
+        vec!["JAdAOAxYGcQ".to_string(), QUIP_PERSON_ID.to_string()],
+        "the thread chip is recorded for the back-patch",
+    );
+}
+
+/// #161: skipped and failed notes carry their thread's title, so the report
+/// names the document instead of an opaque Quip id.
+#[tokio::test]
+async fn report_notes_carry_the_thread_title() {
+    common::require_infra!();
+    let server = quip_server_with_thread_html_status("t1", 403).await;
+    Mock::given(method("GET"))
+        .and(path("/2/threads/t2/html"))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    run_like_the_queue(&ctx, &import_id, "owner1").await;
+
+    let report = app.state.import_repo.get_report(&import_id).await.unwrap().expect("report");
+    let title_of = |id: &str| {
+        report
+            .notes
+            .iter()
+            .find(|n| n.quip_thread_id == id)
+            .unwrap_or_else(|| panic!("{id} must be named: {report:?}"))
+            .title
+            .clone()
+    };
+    assert_eq!(title_of("t1").as_deref(), Some("Doc A"), "the skipped thread is named");
+    assert_eq!(title_of("t2").as_deref(), Some("Sheet"), "the failed thread is named");
+}

@@ -41,6 +41,22 @@ impl UserRepo {
                 "failed to write email pointer on create; get_by_email falls \
                  back to a scan until backfill_email_pointers runs"
             );
+            // #178: this user now has no pointer, so the "every profile has
+            // a pointer" marker is false. Clearing it re-enables the scan
+            // fallback, without which a pointer-less user would read as
+            // absent and a later sign-in would create a duplicate account.
+            if let Err(e) = self
+                .db
+                .delete_item(EMAIL_POINTERS_COMPLETE_PK, EMAIL_POINTERS_COMPLETE_SK)
+                .await
+            {
+                tracing::error!(
+                    user_id = %user.user_id,
+                    error = %e,
+                    "failed to clear the email-pointer completeness marker after a \
+                     failed pointer write; run backfill_email_pointers"
+                );
+            }
         }
         Ok(())
     }
@@ -157,13 +173,17 @@ impl UserRepo {
         Ok(out)
     }
 
-    /// Get a user by email (scans USER#/PROFILE items).
+    /// Get a user by email.
     ///
-    /// A DynamoDB scan returns at most 1MB per call; matching items past that
-    /// boundary are only reachable via `LastEvaluatedKey` continuation. The
-    /// loop here walks every page until either a match is found or the scan
-    /// is exhausted. Without it, a live table >1MB can silently miss an
-    /// existing user and cause `find_or_create_user` to insert a duplicate.
+    /// Resolves the `EMAIL#<lc>` pointer with a `GetItem` (#36). On a pointer
+    /// miss, the answer depends on whether every profile is known to have a
+    /// pointer (the marker `backfill_email_pointers` writes after a full
+    /// pass, #178):
+    /// - marker present: the miss is authoritative and returns `None` without
+    ///   touching the rest of the table;
+    /// - marker absent: fall back to [`Self::get_by_email_scan`], which also
+    ///   repairs the pointer when it finds the user.
+    ///
     /// Email is lowercased to match the canonical form written by
     /// `find_or_create_user`.
     pub async fn get_by_email(&self, email: &str) -> Result<Option<User>, RepoError> {
@@ -187,11 +207,36 @@ impl UserRepo {
             }
         }
 
+        if self.email_pointers_complete().await? {
+            return Ok(None);
+        }
         self.get_by_email_scan(&email_lc).await
     }
 
-    /// Legacy full-table `Scan` for `get_by_email`, retained as the pointer
-    /// fallback (#36). `email_lc` must already be trimmed + lowercased.
+    /// Whether `backfill_email_pointers` has completed a full pass and no
+    /// create has since failed to write its pointer (#178).
+    async fn email_pointers_complete(&self) -> Result<bool, RepoError> {
+        Ok(self
+            .db
+            .get_item(EMAIL_POINTERS_COMPLETE_PK, EMAIL_POINTERS_COMPLETE_SK)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?
+            .is_some())
+    }
+
+    /// Legacy full-table `Scan` for `get_by_email`, used only until the
+    /// pointers are known to be complete (#36, #178). `email_lc` must already
+    /// be trimmed + lowercased.
+    ///
+    /// The filter selects PROFILE rows only and the email is compared here,
+    /// not in the `filter_expression`: a DynamoDB validation error can echo
+    /// the expression back, and the address must not reach an error or log
+    /// (#178). A hit repairs the missing pointer so the next lookup is a
+    /// `GetItem`.
+    ///
+    /// A scan page is at most 1MB; the loop follows `LastEvaluatedKey` so a
+    /// match past the first page is not missed (a miss here makes
+    /// `find_or_create_user` insert a duplicate).
     async fn get_by_email_scan(&self, email_lc: &str) -> Result<Option<User>, RepoError> {
         let mut last_key: Option<HashMap<String, AttributeValue>> = None;
         loop {
@@ -200,9 +245,8 @@ impl UserRepo {
                 .inner()
                 .scan()
                 .table_name(self.db.table_name())
-                .filter_expression("SK = :sk AND email = :email")
-                .expression_attribute_values(":sk", AttributeValue::S("PROFILE".to_string()))
-                .expression_attribute_values(":email", AttributeValue::S(email_lc.to_string()));
+                .filter_expression("SK = :sk")
+                .expression_attribute_values(":sk", AttributeValue::S("PROFILE".to_string()));
             if let Some(key) = last_key.take() {
                 builder = builder.set_exclusive_start_key(Some(key));
             }
@@ -211,10 +255,19 @@ impl UserRepo {
                 .await
                 .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
 
-            if let Some(items) = result.items {
-                if let Some(item) = items.into_iter().next() {
-                    return Ok(Some(user_from_item(&item)?));
+            let hit = result.items.unwrap_or_default().into_iter().find(|item| {
+                get_s(item, "email").is_ok_and(|e| e.trim().to_lowercase() == email_lc)
+            });
+            if let Some(item) = hit {
+                let user = user_from_item(&item)?;
+                if let Err(e) = self.put_email_pointer(&user.email, &user.user_id).await {
+                    tracing::warn!(
+                        user_id = %user.user_id,
+                        error = %e,
+                        "get_by_email: could not repair the missing email pointer",
+                    );
                 }
+                return Ok(Some(user));
             }
 
             match result.last_evaluated_key {
@@ -263,6 +316,17 @@ impl UserRepo {
                 None => break,
             }
         }
+
+        // Every profile now has a pointer, so a pointer miss is a real miss
+        // and `get_by_email` can stop scanning (#178). Written only after a
+        // pass with no error: any failure above returned early.
+        let mut marker = HashMap::new();
+        marker.insert("PK".to_string(), AttributeValue::S(EMAIL_POINTERS_COMPLETE_PK.to_string()));
+        marker.insert("SK".to_string(), AttributeValue::S(EMAIL_POINTERS_COMPLETE_SK.to_string()));
+        self.db
+            .put_item(marker)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
         Ok((scanned, written))
     }
 
@@ -835,6 +899,13 @@ impl UserRepo {
 
 /// Sort key for the email→user pointer item (#36).
 const EMAIL_POINTER_SK: &str = "POINTER";
+
+/// Marker row meaning "every PROFILE has an `EMAIL#` pointer" (#178).
+/// Written by `backfill_email_pointers` after a full pass; deleted when a
+/// create fails to write its pointer. While present, `get_by_email` treats
+/// a pointer miss as authoritative instead of scanning the table.
+const EMAIL_POINTERS_COMPLETE_PK: &str = "META#EMAIL_POINTERS";
+const EMAIL_POINTERS_COMPLETE_SK: &str = "COMPLETE";
 
 /// Partition key for the `EMAIL#<lowercased> → user_id` pointer item (#36).
 /// The caller lowercases + trims the email first, matching the old scan's

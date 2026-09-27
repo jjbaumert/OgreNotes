@@ -1352,14 +1352,18 @@ fn report_to_item(r: &ReportRow) -> HashMap<String, AttributeValue> {
                 r.notes
                     .iter()
                     .map(|n| {
-                        AttributeValue::M(HashMap::from([
+                        let mut m = HashMap::from([
                             (
                                 "quip_thread_id".to_string(),
                                 AttributeValue::S(n.quip_thread_id.clone()),
                             ),
                             ("kind".to_string(), AttributeValue::S(n.kind.clone())),
                             ("detail".to_string(), AttributeValue::S(n.detail.clone())),
-                        ]))
+                        ]);
+                        if let Some(title) = &n.title {
+                            m.insert("title".to_string(), AttributeValue::S(title.clone()));
+                        }
+                        AttributeValue::M(m)
                     })
                     .collect(),
             ),
@@ -1401,6 +1405,8 @@ fn report_from_item(item: &HashMap<String, AttributeValue>) -> Result<ReportRow,
                 .map(|m| {
                     Ok(ReportNote {
                         quip_thread_id: get_s(m, "quip_thread_id")?,
+                        // Optional (#161): notes written before it carry none.
+                        title: get_s(m, "title").ok(),
                         kind: get_s(m, "kind")?,
                         detail: get_s(m, "detail")?,
                     })
@@ -1742,11 +1748,13 @@ mod tests {
         r.bump_counter("threads_skipped", 2);
         r.push_note(ReportNote {
             quip_thread_id: "qt1".into(),
+            title: None,
             kind: "skipped".into(),
             detail: "403 forbidden".into(),
         });
         r.push_note(ReportNote {
             quip_thread_id: "qt2".into(),
+            title: None,
             kind: "image_dropped".into(),
             detail: "blob too large".into(),
         });
@@ -1794,6 +1802,7 @@ mod tests {
         for i in 0..REPORT_MAX_NOTES_PER_KIND + 3 {
             r.push_note(ReportNote {
                 quip_thread_id: format!("qt{i}"),
+                title: None,
                 kind: "failed".into(),
                 detail: "boom".into(),
             });
@@ -1819,12 +1828,14 @@ mod tests {
         for i in 0..REPORT_MAX_NOTES_PER_KIND * 4 {
             r.push_note(ReportNote {
                 quip_thread_id: format!("qt{i}"),
+                title: None,
                 kind: "image_dropped".into(),
                 detail: "blob 403".into(),
             });
         }
         r.push_note(ReportNote {
             quip_thread_id: "qt-late".into(),
+            title: None,
             kind: "skipped".into(),
             detail: "403 forbidden".into(),
         });

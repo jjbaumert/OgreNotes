@@ -1498,6 +1498,33 @@ async fn record_report_by(
 /// `quip-import`'s client tests — but they are spelled out here rather than
 /// borrowed from `Display` so that no future variant can quietly inherit the
 /// permissive branch.
+/// Longest title a report note carries, in characters (#161). The note list
+/// is budgeted (25 per kind) but a single pathological title should not
+/// bloat the REPORT row either.
+const REPORT_TITLE_MAX_CHARS: usize = 120;
+
+/// The thread's title as a report note shows it (#161): control characters
+/// dropped, whitespace collapsed, capped at [`REPORT_TITLE_MAX_CHARS`];
+/// `None` when nothing is left. It is the same Quip-authored text the
+/// imported document's own title is made from, so it carries nothing the
+/// user cannot already see.
+fn report_title(thread: &ThreadRow) -> Option<String> {
+    let cleaned: String = thread
+        .title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let mut chars = cleaned.chars();
+    let head: String = chars.by_ref().take(REPORT_TITLE_MAX_CHARS).collect();
+    Some(if chars.next().is_some() { format!("{head}…") } else { head })
+}
+
 fn safe_quip_reason(e: &QuipError) -> String {
     match e {
         QuipError::Unauthorized => "Quip rejected the import's credential (HTTP 401)".to_string(),
@@ -1738,6 +1765,90 @@ impl LookupFault {
 }
 
 impl PersonDirectory {
+    /// Decide ids that `/1/users/` omitted (#179).
+    ///
+    /// `<control>` wraps folder and thread chips as well as people, and an
+    /// omission is how Quip says "not a user you can see". That covers
+    /// documents, but also people who are deactivated, cross-org, or hidden
+    /// from this token, and rendering *those* as a "Missing document" chip is
+    /// the bug the person-mention feature exists to fix. So ask once more,
+    /// batched: an id Quip resolves as a thread or a folder is a document
+    /// ([`PersonFact::NotAPerson`]); an id it resolves as neither is a person
+    /// we cannot see, and degrades to their name ([`PersonFact::NoAccount`]).
+    ///
+    /// Conservative on failure. Only two *successful* answers that both omit
+    /// the id make it a person. A permanent rejection of either lookup keeps
+    /// the pre-#179 answer (a document link), so a document link can never
+    /// be lost to this extra step; a transient failure leaves the ids
+    /// undecided and returns the fault, like a failed `/1/users/` batch.
+    async fn classify_omitted(
+        &mut self,
+        import_id: &str,
+        client: &QuipClient,
+        token: &QuipToken,
+        omitted: &[String],
+    ) -> Option<LookupFault> {
+        let as_documents = |dir: &mut Self, ids: &[String]| {
+            for id in ids {
+                dir.known.insert(id.clone(), PersonFact::NotAPerson);
+            }
+        };
+        let threads = match client.thread_ids_that_resolve(token, omitted).await {
+            Ok(found) => found,
+            Err(e) => return self.omitted_lookup_failed(import_id, omitted, e, as_documents),
+        };
+        let rest: Vec<String> = omitted.iter().filter(|id| !threads.contains(*id)).cloned().collect();
+        let folders = match client.folder_ids_that_resolve(token, &rest).await {
+            Ok(found) => found,
+            Err(e) => {
+                let docs: Vec<String> =
+                    omitted.iter().filter(|id| threads.contains(*id)).cloned().collect();
+                as_documents(self, &docs);
+                return self.omitted_lookup_failed(import_id, &rest, e, as_documents);
+            }
+        };
+        for id in omitted {
+            let fact = if threads.contains(id) || folders.contains(id) {
+                PersonFact::NotAPerson
+            } else {
+                PersonFact::NoAccount
+            };
+            self.known.insert(id.clone(), fact);
+        }
+        None
+    }
+
+    /// A disambiguation lookup failed for `ids`. Permanent (a 4xx no retry
+    /// can change, including 403): keep the pre-#179 document answer.
+    /// Otherwise leave them undecided and report the fault.
+    fn omitted_lookup_failed(
+        &mut self,
+        import_id: &str,
+        ids: &[String],
+        e: QuipError,
+        as_documents: impl Fn(&mut Self, &[String]),
+    ) -> Option<LookupFault> {
+        tracing::warn!(
+            import_id,
+            ids = ids.len(),
+            error = %safe_quip_reason(&e),
+            "quip content: could not tell omitted person ids from documents",
+        );
+        match e {
+            QuipError::Unauthorized => Some(LookupFault::TokenRejected),
+            QuipError::RateLimited { .. } => Some(LookupFault::RateLimited),
+            QuipError::Forbidden => {
+                as_documents(self, ids);
+                None
+            }
+            e if is_permanent_lookup_failure(&e) => {
+                as_documents(self, ids);
+                None
+            }
+            _ => Some(LookupFault::Quip),
+        }
+    }
+
     /// Resolve `wanted` Quip person ids to OgreNotes user ids, consulting
     /// the cache first and asking Quip only about the remainder.
     ///
@@ -1865,14 +1976,16 @@ impl PersonDirectory {
                     continue;
                 }
             };
+            let omitted: Vec<String> =
+                chunk.iter().filter(|id| !profiles.contains_key(*id)).cloned().collect();
+            if !omitted.is_empty() {
+                if let Some(f) = self.classify_omitted(import_id, client, token, &omitted).await {
+                    fault = fault.max(Some(f));
+                }
+            }
             for id in chunk {
-                // Quip returned no profile for this id. It is not a person:
-                // `<control>` also wraps folder and thread chips, and this is
-                // the signal that tells them apart. No retry widens that, so
-                // decide it — and decide it as a *document*, which is what
-                // the walker would have produced without the wrapper.
+                // No profile: classified above by `classify_omitted`.
                 let Some(profile) = profiles.get(id) else {
-                    self.known.insert(id.clone(), PersonFact::NotAPerson);
                     continue;
                 };
                 // A profile came back, so this IS a person — just one we
@@ -2471,6 +2584,7 @@ async fn run_content_pass(
                     report::THREADS_SKIPPED_FORBIDDEN,
                     Some(ReportNote {
                         quip_thread_id: thread.quip_thread_id.clone(),
+                        title: report_title(thread),
                         kind: report::KIND_THREAD_SKIPPED.to_string(),
                         detail: reason.clone(),
                     }),
@@ -2521,6 +2635,7 @@ async fn run_content_pass(
                         report::THREADS_FAILED,
                         Some(ReportNote {
                             quip_thread_id: thread.quip_thread_id.clone(),
+                            title: report_title(thread),
                             kind: report::KIND_THREAD_FAILED.to_string(),
                             detail,
                         }),
@@ -2749,6 +2864,7 @@ pub async fn import_one_thread(
             report::THREADS_TRUNCATED,
             Some(ReportNote {
                 quip_thread_id: thread.quip_thread_id.clone(),
+                title: report_title(thread),
                 kind: report::KIND_CONTENT_TRUNCATED.to_string(),
                 detail: format!(
                     "nesting deeper than {} levels was flattened in {} place(s); \
@@ -2780,6 +2896,7 @@ pub async fn import_one_thread(
             quip_doc.live_apps_dropped as u64,
             Some(ReportNote {
                 quip_thread_id: thread.quip_thread_id.clone(),
+                title: report_title(thread),
                 kind: report::KIND_LIVE_APP_DROPPED.to_string(),
                 detail: format!(
                     "{} embedded Quip live app(s) — a Kanban board or similar — could not be \
@@ -2800,6 +2917,7 @@ pub async fn import_one_thread(
             quip_doc.formulas_dropped as u64,
             Some(ReportNote {
                 quip_thread_id: thread.quip_thread_id.clone(),
+                title: report_title(thread),
                 kind: report::KIND_FORMULAS_DROPPED.to_string(),
                 detail: format!(
                     "{} spreadsheet formula(s) were not imported; the cells keep the values \
@@ -2871,6 +2989,7 @@ pub async fn import_one_thread(
                 report::THREADS_MENTIONS_DEGRADED,
                 Some(ReportNote {
                     quip_thread_id: thread.quip_thread_id.clone(),
+                    title: report_title(thread),
                     kind: report::KIND_MENTIONS_DEGRADED.to_string(),
                     detail: "the Quip person-lookup endpoint rejected this import's requests; \
                              @mentions from here on are imported as plain text names rather \
@@ -3205,6 +3324,7 @@ async fn drop_image(
         report::IMAGES_DROPPED,
         Some(ReportNote {
             quip_thread_id: thread.quip_thread_id.clone(),
+            title: report_title(thread),
             kind: report::KIND_IMAGE_DROPPED.to_string(),
             detail: detail.to_string(),
         }),
@@ -3300,6 +3420,7 @@ async fn mark_quip_failure(
                     // refused. The empty id is what "not thread-scoped" looks
                     // like on a `ReportNote`.
                     quip_thread_id: String::new(),
+                    title: None,
                     kind: report::KIND_THREAD_SKIPPED.to_string(),
                     detail: format!(
                         "{}; a selected folder could not be read, so the import could not be \
@@ -3406,6 +3527,22 @@ mod tests {
     use super::*;
     use ogrenotes_storage::models::import_inventory::FolderRow;
     use std::collections::BTreeSet;
+
+    fn thread_titled(title: &str) -> ThreadRow {
+        ThreadRow { title: title.to_string(), ..thread("t1", &[]) }
+    }
+
+    /// #161: the title a report note shows is cleaned and capped.
+    #[test]
+    fn report_title_is_cleaned_and_capped() {
+        assert_eq!(report_title(&thread_titled("  Q3\n plan \t")).as_deref(), Some("Q3 plan"));
+        assert_eq!(report_title(&thread_titled("a\u{7}b")).as_deref(), Some("ab"));
+        assert_eq!(report_title(&thread_titled("   ")), None);
+        let long = "x".repeat(REPORT_TITLE_MAX_CHARS + 5);
+        let capped = report_title(&thread_titled(&long)).unwrap();
+        assert_eq!(capped.chars().count(), REPORT_TITLE_MAX_CHARS + 1, "cap plus the ellipsis");
+        assert!(capped.ends_with('…'));
+    }
 
     // #144: the reaper spawns reclaimed jobs instead of running them
     // inline. These pin the bookkeeping that keeps that bounded and

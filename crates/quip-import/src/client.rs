@@ -278,6 +278,52 @@ impl QuipClient {
         Ok(body.into_values().map(|env| env.thread).collect())
     }
 
+    /// Which of `ids` Quip resolves as a **thread** (`/1/threads/`), keyed by
+    /// the id as asked (a thread id or a URL secret path). An id Quip omits
+    /// is not a thread this token can see. Used to tell an unresolvable
+    /// person id from a document id (#179).
+    pub async fn thread_ids_that_resolve(
+        &self,
+        t: &QuipToken,
+        ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, QuipError> {
+        self.ids_that_resolve(t, "/1/threads/", ids).await
+    }
+
+    /// Which of `ids` Quip resolves as a **folder** (`/1/folders/`). See
+    /// [`Self::thread_ids_that_resolve`].
+    pub async fn folder_ids_that_resolve(
+        &self,
+        t: &QuipToken,
+        ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, QuipError> {
+        self.ids_that_resolve(t, "/1/folders/", ids).await
+    }
+
+    /// The keys of a batch `?ids=` response: the ids Quip answered for. The
+    /// bodies are not parsed, only skipped.
+    async fn ids_that_resolve(
+        &self,
+        t: &QuipToken,
+        endpoint: &str,
+        ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, QuipError> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        self.throttle.acquire().await;
+        let resp = self
+            .http
+            .get(format!("{}{endpoint}", self.base))
+            .bearer_auth(t.expose())
+            .query(&[("ids", ids.join(","))])
+            .send()
+            .await?;
+        let body: std::collections::HashMap<String, serde::de::IgnoredAny> =
+            self.observe_and_check(resp).await?.json_body().await?;
+        Ok(body.into_keys().collect())
+    }
+
     /// `GET /1/users/?ids=<comma-joined>` — look several Quip people up at
     /// once, keyed by the id that was asked for.
     ///

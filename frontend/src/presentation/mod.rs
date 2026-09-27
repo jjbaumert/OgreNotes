@@ -4,6 +4,7 @@
 //! canvas editor. See `design/presentations.md`.
 
 pub mod geometry;
+pub mod handoff;
 pub mod liveness;
 pub mod model;
 pub mod nav;

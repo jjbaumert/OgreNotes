@@ -29,6 +29,41 @@ pub(crate) fn presenters<'a>(cursors: &'a [RemoteCursor], my_session_id: &str) -
     cursors.iter().filter(|c| c.presenting.is_some() && c.session_id != my_session_id).collect()
 }
 
+/// The presenters this viewer is offered a "Follow" button for (#227).
+///
+/// [`presenters`] keeps a presenter's two windows (projector and
+/// `?presenter=1` control view) as separate sessions, which is what #211
+/// needs for the presenter's *own* windows. To anyone else, though, the two
+/// were indistinguishable identical pills. So sessions of **other** users
+/// collapse to one per user, the most recently heard from (`seq`); the
+/// viewer's own other sessions all stay, so a presenter can still pick
+/// which of their windows to drive.
+pub(crate) fn followable_presenters<'a>(
+    cursors: &'a [RemoteCursor],
+    my_session_id: &str,
+    my_user_id: &str,
+) -> Vec<&'a RemoteCursor> {
+    let all = presenters(cursors, my_session_id);
+    let mut latest: std::collections::HashMap<&str, &RemoteCursor> = std::collections::HashMap::new();
+    for c in all.iter().copied().filter(|c| c.user_id != my_user_id) {
+        latest
+            .entry(c.user_id.as_str())
+            .and_modify(|kept| {
+                if c.seq > kept.seq {
+                    *kept = c;
+                }
+            })
+            .or_insert(c);
+    }
+    // Keep `presenters`' order, dropping the non-latest sessions of others.
+    all.into_iter()
+        .filter(|c| {
+            c.user_id == my_user_id
+                || latest.get(c.user_id.as_str()).is_some_and(|k| k.session_id == c.session_id)
+        })
+        .collect()
+}
+
 /// The slide index a follower should be on, given the presenter's
 /// broadcast id. `None` when not following, when the presenter is gone,
 /// or when the id names a slide this deck no longer has (a concurrent
@@ -152,10 +187,18 @@ pub fn PresentPage() -> impl IntoView {
         crate::api::client::get_auth().map(|a| a.user_id).unwrap_or_default(),
     );
 
-    // Fetch once. Present mode is a read-only view of the deck as it
+    // Load once. Present mode is a read-only view of the deck as it
     // stands when the presenter opens it; live content sync arrives
     // with follow-the-presenter (next task).
-    {
+    //
+    // #209: coming from the editor, take the deck it was showing. A REST
+    // fetch here races the editor's WS persistence of the last edit and
+    // could load a half-persisted deck (an extra empty slide). REST remains
+    // the path for a direct load or refresh of this URL.
+    if let Some(node) = crate::presentation::handoff::take(&doc_id()) {
+        deck.set(deck_from_doc(&node));
+        set_loaded.set(true);
+    } else {
         let id = doc_id();
         leptos::task::spawn_local(async move {
             if let Ok(bytes) = crate::api::documents::get_content(&id).await {
@@ -693,15 +736,16 @@ pub fn PresentPage() -> impl IntoView {
                 <div class="deck-present__counter">
                     {move || format!("{} / {}", idx.get() + 1, deck.with(|d| d.slides.len()))}
                 </div>
-                <Show when=move || !presenters(&remote_cursors.get(), &my_session_id.get()).is_empty()>
+                <Show when=move || !my_user_id.with_value(|me| followable_presenters(&remote_cursors.get(), &my_session_id.get(), me).is_empty())>
                     <div class="deck-present__follow">
                         <Show
                             when=move || following.get().is_some() && paused.get()
                             fallback=move || view! {
                                 <For each=move || {
                                             let my_sid = my_session_id.get();
-                                            presenters(&remote_cursors.get(), &my_sid)
-                                                .into_iter().map(|c| (c.session_id.clone(), c.name.clone())).collect::<Vec<_>>()
+                                            let cursors = remote_cursors.get();
+                                            my_user_id.with_value(|me| followable_presenters(&cursors, &my_sid, me)
+                                                .into_iter().map(|c| (c.session_id.clone(), c.name.clone())).collect::<Vec<_>>())
                                         }
                                          key=|(session_id, _)| session_id.clone()
                                          children=move |(session_id, name)| {
@@ -839,6 +883,34 @@ mod follow_tests {
         let sessions: std::collections::HashSet<_> = p.iter().map(|c| c.session_id.as_str()).collect();
         assert_eq!(sessions, std::collections::HashSet::from(["sess-control", "them-sess"]));
         assert!(!sessions.contains("sess-projector"), "own session must be excluded");
+    }
+
+    /// #227: a third party sees one Follow button per presenter, for that
+    /// presenter's most recently heard-from window.
+    #[test]
+    fn followable_presenters_collapses_another_users_windows_to_the_latest() {
+        let mut projector = cursor_with_session("alice", "a-projector", Some("s1"));
+        projector.seq = 5;
+        let mut control = cursor_with_session("alice", "a-control", Some("s1"));
+        control.seq = 9;
+        let cs = vec![projector, control, cursor("bob", Some("s2"))];
+        let p = followable_presenters(&cs, "viewer-sess", "viewer");
+        let sessions: Vec<&str> = p.iter().map(|c| c.session_id.as_str()).collect();
+        assert_eq!(sessions, vec!["a-control", "bob-sess"], "one pill per other presenter");
+    }
+
+    /// #227 must not undo #211: the viewer's OWN other windows all stay
+    /// followable, so a presenter can pick which window to drive.
+    #[test]
+    fn followable_presenters_keeps_every_one_of_my_own_other_windows() {
+        let cs = vec![
+            cursor_with_session("me", "sess-projector", Some("s1")),
+            cursor_with_session("me", "sess-control", Some("s1")),
+            cursor_with_session("me", "sess-third", Some("s1")),
+        ];
+        let p = followable_presenters(&cs, "sess-projector", "me");
+        let sessions: std::collections::HashSet<_> = p.iter().map(|c| c.session_id.as_str()).collect();
+        assert_eq!(sessions, std::collections::HashSet::from(["sess-control", "sess-third"]));
     }
 
     #[test]

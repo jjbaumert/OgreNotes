@@ -594,6 +594,11 @@ struct NoteDto {
     /// forbidden-folder note uses an empty id — no single thread is to
     /// blame). A client shows `detail` alone in that case.
     quip_thread_id: String,
+    /// The thread's title when the worker recorded one (#161); omitted
+    /// otherwise, including for notes written before #161. Quip-authored
+    /// plain text: a client renders it as text, never as markup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
     detail: String,
 }
 
@@ -623,6 +628,7 @@ fn project_report(row: ReportRow) -> ReportDto {
             .filter(|n| n.kind == kind)
             .map(|n| NoteDto {
                 quip_thread_id: n.quip_thread_id.clone(),
+                title: n.title.clone(),
                 detail: n.detail.clone(),
             })
             .collect()
@@ -778,9 +784,27 @@ mod tests {
         }
     }
 
+    /// #161: the note's title reaches the wire when the worker recorded one
+    /// and is omitted (not `null`) when it did not.
+    #[test]
+    fn a_note_title_is_serialized_only_when_present() {
+        let mut titled = note(report::KIND_THREAD_SKIPPED, "denied");
+        titled.title = Some("Q3 plan".into());
+        let untitled = note(report::KIND_THREAD_SKIPPED, "denied");
+        let json = serde_json::to_value(project_report(row_with(
+            &[(report::THREADS_SKIPPED_FORBIDDEN, 2)],
+            vec![titled, untitled],
+        )))
+        .unwrap();
+        let notes = json["skipped"]["notes"].as_array().expect("skipped notes");
+        assert_eq!(notes[0]["title"], "Q3 plan");
+        assert!(notes[1].get("title").is_none(), "{json}");
+    }
+
     fn note(kind: &str, detail: &str) -> ReportNote {
         ReportNote {
             quip_thread_id: "qt1".to_string(),
+            title: None,
             kind: kind.to_string(),
             detail: detail.to_string(),
         }

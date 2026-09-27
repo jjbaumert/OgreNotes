@@ -750,3 +750,66 @@ async fn get_by_email_resolves_via_pointer_and_backfills() {
 
     app.cleanup().await;
 }
+
+/// Delete the `EMAIL#<lc>` pointer row directly, simulating a user created
+/// before #36 or whose pointer write failed.
+async fn delete_email_pointer(app: &common::TestApp, email_lc: &str) {
+    use aws_sdk_dynamodb::types::AttributeValue;
+    app.dynamo_client()
+        .delete_item()
+        .table_name(&app.table_name)
+        .key("PK", AttributeValue::S(format!("EMAIL#{email_lc}")))
+        .key("SK", AttributeValue::S("POINTER".to_string()))
+        .send()
+        .await
+        .expect("delete pointer");
+}
+
+/// #178: until the pointers are known complete, a pointer-less user is still
+/// found (by the fallback scan, which no longer puts the email in a filter
+/// expression), and the lookup repairs the pointer.
+#[tokio::test]
+async fn get_by_email_scan_fallback_finds_and_repairs_a_missing_pointer() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (bob_id, _) = app.create_user("bob.repair@test.com").await;
+    delete_email_pointer(&app, "bob.repair@test.com").await;
+
+    let found = app.state.user_repo.get_by_email("bob.repair@test.com").await.unwrap();
+    assert_eq!(found.map(|u| u.user_id), Some(bob_id.clone()), "the scan must still find the user");
+
+    // The pointer was repaired: after the backfill marker makes misses
+    // authoritative, the lookup still resolves (via the repaired pointer).
+    app.state.user_repo.backfill_email_pointers().await.unwrap();
+    let again = app.state.user_repo.get_by_email("bob.repair@test.com").await.unwrap();
+    assert_eq!(again.map(|u| u.user_id), Some(bob_id));
+
+    app.cleanup().await;
+}
+
+/// #178: once `backfill_email_pointers` has completed a pass, a pointer miss
+/// is authoritative: `get_by_email` returns `None` without scanning. The
+/// deliberately deleted pointer below shows the scan is really skipped (a
+/// scan would have found this user).
+#[tokio::test]
+async fn get_by_email_miss_is_authoritative_after_a_complete_backfill() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+
+    let (_carol_id, _) = app.create_user("carol.marker@test.com").await;
+    app.state.user_repo.backfill_email_pointers().await.unwrap();
+
+    // An unknown address is a plain miss.
+    assert!(app.state.user_repo.get_by_email("nobody@nowhere.test").await.unwrap().is_none());
+
+    // Remove Carol's pointer behind the repo's back: with the marker
+    // present the lookup trusts the (now missing) pointer and does not scan.
+    delete_email_pointer(&app, "carol.marker@test.com").await;
+    assert!(
+        app.state.user_repo.get_by_email("carol.marker@test.com").await.unwrap().is_none(),
+        "with the completeness marker set, a pointer miss must not fall back to a scan"
+    );
+
+    app.cleanup().await;
+}

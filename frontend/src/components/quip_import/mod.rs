@@ -225,7 +225,9 @@ impl OutcomeKind {
 struct Section {
     /// The true total, from the server's uncapped counter.
     total: u64,
-    /// `(quip_thread_id, detail)` — a bounded prefix of `total`. Both are
+    /// `(label, detail)` — a bounded prefix of `total`. The label is the
+    /// document's title when the server sent one (#161), else its Quip
+    /// thread id, else empty for a loss that is not thread-scoped. Both are
     /// plain text and are rendered through text nodes.
     named: Vec<(String, String)>,
     /// `total - named.len()`: how many are in the total but unnamed. Any
@@ -246,7 +248,16 @@ impl Section {
             named: outcome
                 .notes
                 .iter()
-                .map(|n| (n.quip_thread_id.clone(), n.detail.clone()))
+                .map(|n| {
+                    // #161: name the document, not its opaque id, when we can.
+                    let label = n
+                        .title
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map_or_else(|| n.quip_thread_id.clone(), str::to_string);
+                    (label, n.detail.clone())
+                })
                 .collect(),
             hidden: outcome.hidden(),
         })
@@ -1466,8 +1477,31 @@ mod tests {
     fn note(id: &str, detail: &str) -> ReportNote {
         ReportNote {
             quip_thread_id: id.to_string(),
+            title: None,
             detail: detail.to_string(),
         }
+    }
+
+    /// #161: a note that carries its document's title is labeled by the
+    /// title; one without (or with a blank title) falls back to the id.
+    #[test]
+    fn a_note_is_labeled_by_its_title_when_the_server_sent_one() {
+        let titled = ReportNote { title: Some("Q3 plan".into()), ..note("qt1", "denied") };
+        let blank = ReportNote { title: Some("   ".into()), ..note("qt2", "denied") };
+        let s = Section::new(&outcome(3, vec![titled, blank, note("qt3", "denied")])).unwrap();
+        let labels: Vec<&str> = s.named.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, vec!["Q3 plan", "qt2", "qt3"]);
+    }
+
+    /// Reports written before #161 carry no `title` and must still decode.
+    #[test]
+    fn a_note_without_a_title_field_still_decodes() {
+        let n: ReportNote =
+            serde_json::from_str(r#"{"quipThreadId":"qt1","detail":"x"}"#).unwrap();
+        assert_eq!(n.title, None);
+        let n: ReportNote =
+            serde_json::from_str(r#"{"quipThreadId":"qt1","title":"Doc","detail":"x"}"#).unwrap();
+        assert_eq!(n.title.as_deref(), Some("Doc"));
     }
 
     fn outcome(total: u64, notes: Vec<ReportNote>) -> Outcome {
