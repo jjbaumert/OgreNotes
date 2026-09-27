@@ -314,7 +314,20 @@ impl Transaction {
             return Ok(txn);
         }
 
-        self.replace(from, to, slice)
+        // #222: the flat path — a collapsed caret, or a range inside one
+        // textblock — had the same missing caret: the prior selection was
+        // only mapped through the step, leaving the pasted run selected.
+        // For an inline slice the insertion is flat at `from`, so the end
+        // of the pasted content is `from + size`. Block slices keep the
+        // mapped selection; they are placed at the block level by the
+        // caller (view.rs) and their end is not a caret position.
+        let inline = is_inline_slice(&slice);
+        let content_size = slice.content.size();
+        let mut txn = self.replace(from, to, slice)?;
+        if inline {
+            txn.selection = Selection::cursor(from + content_size);
+        }
+        Ok(txn)
     }
 
     /// Delete the current selection.
@@ -2668,9 +2681,11 @@ mod tests {
         let new_state = state.apply(txn);
 
         assert_eq!(shape(&new_state.doc), "Doc[Paragraph[\"HelloPASTED world\"]]");
+        // #222: a collapsed caret after the pasted run, not the run
+        // selected (was pinned as (6, 12) before the fix).
         assert_eq!(
             (new_state.selection.from(), new_state.selection.to()),
-            (6, 12),
+            (12, 12),
         );
     }
 
@@ -2690,9 +2705,10 @@ mod tests {
         let new_state = state.apply(txn);
 
         assert_eq!(shape(&new_state.doc), "Doc[Paragraph[\"PASTED world\"]]");
+        // #222: collapsed caret after the pasted run (was pinned as (1, 7)).
         assert_eq!(
             (new_state.selection.from(), new_state.selection.to()),
-            (1, 7),
+            (7, 7),
         );
     }
 
