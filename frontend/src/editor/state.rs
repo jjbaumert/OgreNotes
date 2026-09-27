@@ -496,10 +496,14 @@ impl Transaction {
         // replace-what-is-selected, and both endpoints must stay put.
         let raw_from = self.selection.from();
         let raw_to = self.selection.to();
+        let mut no_textblock = false;
         let (from, to) = if raw_from == raw_to {
             match resolve_block_for_edit(&self.doc, raw_from) {
                 Some((_, resolved)) => (resolved, resolved),
-                None => (raw_from, raw_to),
+                None => {
+                    no_textblock = true;
+                    (raw_from, raw_to)
+                }
             }
         } else {
             (raw_from, raw_to)
@@ -525,6 +529,20 @@ impl Transaction {
 
         let content = Fragment::from(vec![text_node]);
         let content_size = content.size();
+
+        // No textblock to type into at all: the caret sits in a container
+        // with no textblock inside it (an emptied blockquote, found by the
+        // structural proptest) or in a doc of only leaf blocks. Splicing a
+        // bare text node there puts inline content directly in a block
+        // container, which the schema forbids. Wrap it in a new paragraph
+        // and put the caret at the end of the typed text inside it.
+        if no_textblock {
+            let para = Node::element_with_content(NodeType::Paragraph, content);
+            let mut txn = self.replace(from, from, Slice::new(Fragment::from(vec![para]), 0, 0))?;
+            txn.selection = Selection::cursor(from + 1 + content_size);
+            txn.stored_marks = None; // consumed
+            return Ok(txn);
+        }
 
         // #195: a selection that spans block boundaries — the whole doc
         // after Ctrl+A, or a drag across two paragraphs — cannot be
@@ -2860,6 +2878,34 @@ mod tests {
         assert_eq!(
             shape(&new_state.doc),
             "Doc[Paragraph[\"Hello\"],Heading[\"Title\"],Paragraph[\" world\"]]",
+        );
+    }
+
+    /// Typing with no textblock to type into — here an emptied
+    /// blockquote, the state the structural proptest reached — wraps the
+    /// text in a new paragraph instead of splicing bare text into the
+    /// block container, which the schema forbids.
+    #[test]
+    fn insert_text_into_an_empty_blockquote_wraps_it_in_a_paragraph() {
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Blockquote,
+                Fragment::empty(),
+            )]),
+        );
+        let base = EditorState::create_default(doc);
+        let state = EditorState {
+            selection: Selection::cursor(1),
+            ..base
+        };
+        let txn = state.transaction().insert_text("x").unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(shape(&new_state.doc), "Doc[Blockquote[Paragraph[\"x\"]]]");
+        // Caret right after the typed character, inside the new paragraph.
+        assert_eq!(
+            (new_state.selection.from(), new_state.selection.to()),
+            (3, 3),
         );
     }
 
