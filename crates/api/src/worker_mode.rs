@@ -367,7 +367,14 @@ async fn reaper_loop(
             tracing::debug!(consumer, "worker mode: reaper at capacity; skipping this tick");
             continue;
         }
-        match queue.claim_stale(&consumer, REAPER_MIN_IDLE_MS, free).await {
+        // Entries this reaper is already running go idle-stale again after
+        // REAPER_MIN_IDLE_MS (nothing refreshes them), and XAUTOCLAIM
+        // returns them first (it walks from the oldest id). Ask for enough
+        // to see past every one of them, or they would fill the whole batch
+        // and starve the orphaned entries the reaper exists to recover.
+        // `admit` still starts at most `free` jobs and skips the running ones.
+        let want = free + slots.running();
+        match queue.claim_stale(&consumer, REAPER_MIN_IDLE_MS, want).await {
             Ok(entries) if entries.is_empty() => {}
             Ok(entries) => {
                 tracing::info!(
@@ -419,8 +426,12 @@ impl ReaperSlots {
     }
 
     fn free(&self) -> usize {
-        let running = self.in_flight.lock().unwrap_or_else(|p| p.into_inner()).len();
-        self.capacity.saturating_sub(running)
+        self.capacity.saturating_sub(self.running())
+    }
+
+    /// How many reclaimed jobs are running now.
+    fn running(&self) -> usize {
+        self.in_flight.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// A slot for `stream_id`, or `None` when that entry is already running
@@ -3564,6 +3575,7 @@ mod tests {
         let a = slots.admit("a").unwrap();
         let _b = slots.admit("b").unwrap();
         assert_eq!(slots.free(), 0);
+        assert_eq!(slots.running(), 2);
         assert!(slots.admit("c").is_none(), "no slot past capacity");
         drop(a);
         assert_eq!(slots.free(), 1);
