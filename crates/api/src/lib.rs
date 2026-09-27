@@ -2,6 +2,7 @@
 
 pub mod audit_retention;
 pub mod auth_policy;
+pub mod blob_reconcile;
 pub mod backfill;
 pub mod claude;
 pub mod compaction;
