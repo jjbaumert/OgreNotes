@@ -272,6 +272,7 @@ duplicate-name-label = Name
 duplicate-destination-label = Zielordner
 duplicate-confirm = Duplizieren
 duplicate-share-warning = Dieser Ordner ist freigegeben — { $count } weitere Personen haben Zugriff und sehen somit die Kopie.
+duplicate-failed = Das Dokument konnte nicht dupliziert werden. Bitte versuchen Sie es erneut.
 # Focus/expand toggle (#134)
 document-focus-enter = Fokusmodus
 document-focus-exit = Fokusmodus beenden
