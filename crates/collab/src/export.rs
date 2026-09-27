@@ -859,6 +859,19 @@ fn collect_slides(doc: &Doc) -> Vec<Vec<PdfFrame>> {
     slides
 }
 
+/// Number of text lines whose baselines fit between `top_pt` and
+/// `bottom_pt` (PDF points, y growing upward). The first baseline sits
+/// one font `size` below the top and each later one `line_h` lower; a
+/// line is kept while its baseline is at or above the bottom edge.
+#[cfg(feature = "pdf")]
+fn lines_that_fit(top_pt: f32, bottom_pt: f32, size: f32, line_h: f32) -> usize {
+    let first_baseline = top_pt - size;
+    if first_baseline < bottom_pt || line_h <= 0.0 {
+        return 0;
+    }
+    1 + ((first_baseline - bottom_pt) / line_h).floor() as usize
+}
+
 /// Render a slide deck to PDF: one landscape page per slide, frames
 /// positioned by their normalized `x`/`y`/`w`/`h` geometry and painted
 /// in z order. Comments are not rendered (see the call site).
@@ -911,6 +924,13 @@ fn to_pdf_slides(doc: &Doc) -> Vec<u8> {
             let x_pt = Pt::from(Mm(PAGE_W_MM * frame.x as f32)).0;
             // Model y is top-down; PDF y is bottom-up.
             let top_pt = Pt::from(Mm(PAGE_H_MM * (1.0 - frame.y as f32))).0;
+            // #228: the editor clips a frame (`.deck-frame` is
+            // `overflow: hidden`), so stop at the frame's bottom edge (or
+            // the page's, whichever is higher) rather than flowing past it.
+            let frame_h_pt = Pt::from(Mm(PAGE_H_MM * frame.h as f32)).0;
+            let bottom_pt = (top_pt - frame_h_pt).max(0.0);
+            let fit = lines_that_fit(top_pt, bottom_pt, size, size * LINE_RATIO);
+            let lines = lines.into_iter().take(fit);
 
             ops.push(Op::SetFillColor { col: Color::Rgb(Rgb::new(fr, fg, fb, None)) });
             ops.push(Op::StartTextSection);
@@ -3600,6 +3620,46 @@ mod tests {
         let doc = fixture_deck_bad_geometry();
         let bytes = to_pdf(&doc); // must not panic
         assert!(bytes.starts_with(b"%PDF-"));
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn lines_that_fit_counts_baselines_inside_the_box() {
+        // First baseline at 100 - 10 = 90, then 78, 66, 54, …
+        assert_eq!(lines_that_fit(100.0, 60.0, 10.0, 12.0), 3, "90, 78, 66 fit; 54 does not");
+        assert_eq!(lines_that_fit(100.0, 66.0, 10.0, 12.0), 3, "a baseline on the edge is kept");
+        assert_eq!(lines_that_fit(100.0, 95.0, 10.0, 12.0), 0, "box shorter than one line");
+        assert_eq!(lines_that_fit(100.0, 60.0, 10.0, 0.0), 0, "degenerate leading never loops");
+    }
+
+    /// One slide, one body frame of height `h` holding 120 distinct
+    /// words, "W000" through "W119": far more than a short frame holds.
+    #[cfg(feature = "pdf")]
+    fn fixture_deck_overflowing_frame(h: &str) -> Doc {
+        let words: Vec<String> = (0..120).map(|i| format!("W{i:03}")).collect();
+        let text = words.join(" ");
+        doc_with(|txn, frag| {
+            let slide = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
+            let frame = slide.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+            frame.insert_attribute(txn, "y", "0.0");
+            frame.insert_attribute(txn, "h", h);
+            let p = frame.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            insert_text(txn, &p, &text);
+        })
+    }
+
+    /// #228: text past a frame's bottom edge is clipped, matching the
+    /// editor's `overflow: hidden`, instead of running down the page.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn deck_pdf_clips_frame_text_to_the_frame_height() {
+        let short = String::from_utf8_lossy(&to_pdf(&fixture_deck_overflowing_frame("0.1"))).into_owned();
+        assert!(short.contains("W000"), "the first line must still render");
+        assert!(!short.contains("W119"), "text past the frame's bottom must be clipped");
+
+        // Control: the same text in a full-height frame is not clipped.
+        let tall = String::from_utf8_lossy(&to_pdf(&fixture_deck_overflowing_frame("1.0"))).into_owned();
+        assert!(tall.contains("W119"), "a frame tall enough keeps every line");
     }
 
     #[cfg(feature = "pdf")]
