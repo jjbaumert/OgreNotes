@@ -330,6 +330,61 @@ impl Transaction {
         Ok(txn)
     }
 
+    /// Paste a slice carrying block nodes (heading, list, table…), already
+    /// fitted to the Doc context, at the block level.
+    ///
+    /// The block containing the caret is split at the caret and the pasted
+    /// blocks are sandwiched between its non-empty halves, so a paragraph
+    /// is never nested inside a paragraph.
+    ///
+    /// #223: this used to live inline in view.rs's paste handler, where it
+    /// (a) silently dropped the paste when the caret was not inside a
+    /// block — every select-all, since position 0 sits on the document
+    /// boundary — and (b) ignored the rest of a range selection, pasting
+    /// at its start and leaving the selected content in place. A range
+    /// is now collapsed first with `delete_selection` (the same route
+    /// typing and inline paste take over a range, #195/#220), and the
+    /// caret is resolved with `resolve_block_for_edit`, which snaps a
+    /// caret on a structural seam into the adjacent block.
+    pub fn paste_blocks(self, fitted: Slice) -> Result<Self, StepError> {
+        let txn = if self.selection.from() != self.selection.to() {
+            self.delete_selection()?
+        } else {
+            self
+        };
+        let raw_pos = txn.selection.from();
+        let Some((block, pos)) = resolve_block_for_edit(&txn.doc, raw_pos) else {
+            // No textblock anywhere to anchor on: insert the blocks where
+            // the caret is. They are Doc-fitted, so this is only reached
+            // for a doc with no textblock at all.
+            return txn.replace(raw_pos, raw_pos, fitted);
+        };
+
+        let offset = pos.saturating_sub(block.content_start).min(block.content.size());
+        let before_content = block.content.cut(0, offset);
+        let after_content = block.content.cut(offset, block.content.size());
+        let has_text = |f: &Fragment| {
+            !f.children.is_empty() && f.children.iter().any(|n| !n.text_content().is_empty())
+        };
+
+        let mut nodes = Vec::new();
+        if has_text(&before_content) {
+            nodes.push(Node::Element {
+                node_type: block.node_type,
+                attrs: block.attrs.clone(),
+                content: before_content,
+                marks: vec![],
+            });
+        }
+        nodes.extend(fitted.content.children);
+        if has_text(&after_content) {
+            nodes.push(Node::element_with_content(NodeType::Paragraph, after_content));
+        }
+
+        let block_slice = Slice::new(Fragment::from(nodes), 0, 0);
+        txn.replace(block.offset, block.offset + block.node_size, block_slice)
+    }
+
     /// Delete the current selection.
     /// When the selection spans multiple blocks, merges the remaining content
     /// of the first and last blocks into a single block.
@@ -2744,6 +2799,67 @@ mod tests {
         assert_eq!(
             shape(&new_state.doc),
             "Doc[Paragraph[\"AAA\"],Paragraph[\"BBB\"]]",
+        );
+    }
+
+    fn heading_slice(text: &str) -> Slice {
+        Slice::new(
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Heading,
+                Fragment::from(vec![Node::text(text)]),
+            )]),
+            0,
+            0,
+        )
+    }
+
+    /// #223: block paste over a select-all used to be dropped silently —
+    /// position 0 is outside every textblock, so view.rs found no block
+    /// and did nothing. It must replace the document.
+    #[test]
+    fn paste_blocks_over_select_all_replaces_the_document() {
+        let base = EditorState::create_default(two_para_doc());
+        let state = EditorState {
+            selection: Selection::all(&base.doc),
+            ..base
+        };
+        let txn = state.transaction().paste_blocks(heading_slice("Title")).unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(shape(&new_state.doc), "Doc[Heading[\"Title\"]]");
+    }
+
+    /// #223: a range inside one paragraph is replaced, not left in place
+    /// with the blocks pasted at its start.
+    #[test]
+    fn paste_blocks_over_a_range_deletes_the_range() {
+        // doc[p("Hello world")]: 1..6 is "Hello".
+        let base = EditorState::create_default(simple_doc());
+        let state = EditorState {
+            selection: Selection::text(1, 6),
+            ..base
+        };
+        let txn = state.transaction().paste_blocks(heading_slice("Title")).unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(
+            shape(&new_state.doc),
+            "Doc[Heading[\"Title\"],Paragraph[\" world\"]]",
+        );
+    }
+
+    /// Control: at a collapsed caret mid-paragraph the block is split and
+    /// the pasted blocks land between the halves (unchanged behaviour).
+    #[test]
+    fn paste_blocks_at_a_caret_splits_the_block() {
+        let base = EditorState::create_default(simple_doc());
+        let state = EditorState {
+            selection: Selection::cursor(6),
+            ..base
+        };
+        let txn = state.transaction().paste_blocks(heading_slice("Title")).unwrap();
+        let new_state = state.apply(txn);
+        assert_eq!(
+            shape(&new_state.doc),
+            "Doc[Paragraph[\"Hello\"],Heading[\"Title\"],Paragraph[\" world\"]]",
         );
     }
 

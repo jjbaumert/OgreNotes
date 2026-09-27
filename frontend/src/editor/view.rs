@@ -1028,51 +1028,11 @@ impl EditorView {
                 let fitted = super::clipboard::fit_slice_to_context(slice, parent_type);
 
                 if has_blocks {
-                    // Block-level paste: replace at the block level, not inside the paragraph.
-                    // Split the current block at the cursor, sandwich pasted blocks between halves.
-                    if let Some(block) = super::state::find_block_at(&state_with_sel.doc, pos) {
-                        let offset = pos.saturating_sub(block.content_start).min(block.content.size());
-                        let before_content = block.content.cut(0, offset);
-                        let after_content = block.content.cut(offset, block.content.size());
-
-                        let mut nodes = Vec::new();
-
-                        // Add the "before" part of the current block if it has content
-                        if !before_content.children.is_empty()
-                            && before_content.children.iter().any(|n| !n.text_content().is_empty())
-                        {
-                            nodes.push(super::model::Node::Element {
-                                node_type: block.node_type,
-                                attrs: block.attrs.clone(),
-                                content: before_content,
-                                marks: vec![],
-                            });
-                        }
-
-                        // Add all pasted blocks
-                        nodes.extend(fitted.content.children);
-
-                        // Add the "after" part of the current block if it has content
-                        if !after_content.children.is_empty()
-                            && after_content.children.iter().any(|n| !n.text_content().is_empty())
-                        {
-                            nodes.push(super::model::Node::element_with_content(
-                                super::model::NodeType::Paragraph,
-                                after_content,
-                            ));
-                        }
-
-                        let block_slice = super::model::Slice::new(
-                            super::model::Fragment::from(nodes),
-                            0,
-                            0,
-                        );
-                        if let Ok(txn) = state_with_sel
-                            .transaction()
-                            .replace(block.offset, block.offset + block.node_size, block_slice)
-                        {
-                            dispatch_paste(txn);
-                        }
+                    // Block-level paste: split the caret's block and sandwich
+                    // the pasted blocks between its halves (#223: a range
+                    // selection, including select-all, is deleted first).
+                    if let Ok(txn) = state_with_sel.transaction().paste_blocks(fitted) {
+                        dispatch_paste(txn);
                     }
                 } else {
                     // Inline paste: insert into the current block
