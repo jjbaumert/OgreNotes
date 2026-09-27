@@ -185,6 +185,89 @@ impl S3Client {
         }
     }
 
+    /// One page of the child "directories" directly under `parent` (which
+    /// must end in `/`): for keys `blobs/a/x`, `blobs/a/y` and `blobs/b/z`,
+    /// `list_child_names("blobs/", None, _)` is `["a", "b"]`. Names come
+    /// back in key order, starting after `after` when given, at most `max`
+    /// of them. The `bool` is whether more follow.
+    ///
+    /// Used by the orphan sweep (`blob_reconcile`) to walk every document's
+    /// prefix a page at a time.
+    pub async fn list_child_names(
+        &self,
+        parent: &str,
+        after: Option<&str>,
+        max: i32,
+    ) -> Result<(Vec<String>, bool), S3Error> {
+        let mut builder = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(parent)
+            .delimiter("/")
+            .max_keys(max);
+        if let Some(after) = after {
+            // Past every key of `after`'s own group: `parent/after/…` sorts
+            // below `parent/after0` because '/' (0x2F) < '0' (0x30), and any
+            // later child `parent/after…` sorts at or above it. Starting at
+            // `parent/after/` would hand the same group back again.
+            builder = builder.start_after(format!("{parent}{after}0"));
+        }
+        let page = builder
+            .send()
+            .await
+            .map_err(|e| S3Error::Operation(e.into_service_error().to_string()))?;
+        let names = page
+            .common_prefixes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|p| p.prefix)
+            .filter_map(|p| {
+                p.strip_prefix(parent)
+                    .and_then(|rest| rest.strip_suffix('/'))
+                    .map(str::to_string)
+            })
+            .collect();
+        Ok((names, page.is_truncated.unwrap_or(false)))
+    }
+
+    /// Every object under `prefix` with its last-modified time in
+    /// microseconds since the epoch (0 when S3 omits it).
+    pub async fn list_objects_modified(&self, prefix: &str) -> Result<Vec<(String, i64)>, S3Error> {
+        let mut out = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut builder = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix);
+            if let Some(tok) = continuation.as_ref() {
+                builder = builder.continuation_token(tok);
+            }
+            let page = builder
+                .send()
+                .await
+                .map_err(|e| S3Error::Operation(e.into_service_error().to_string()))?;
+            out.extend(page.contents.unwrap_or_default().into_iter().filter_map(|o| {
+                let modified = o
+                    .last_modified
+                    .map(|t| t.secs() * 1_000_000 + i64::from(t.subsec_nanos() / 1_000))
+                    .unwrap_or(0);
+                o.key.map(|k| (k, modified))
+            }));
+            continuation = if page.is_truncated.unwrap_or(false) {
+                page.next_continuation_token
+            } else {
+                None
+            };
+            if continuation.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Server-side copy of one object to another key in the same bucket.
     ///
     /// This is S3's `CopyObject` — the bytes never travel through this

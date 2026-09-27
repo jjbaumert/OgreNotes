@@ -286,6 +286,12 @@ async fn main() {
     let _trash_cleanup_handle =
         ogrenotes_api::trash_cleanup::spawn_scheduler(state.clone());
 
+    // Start the hourly orphaned-object sweep. Safe when
+    // BLOB_RECONCILE_ENABLED is false (the default); dry-run unless
+    // BLOB_RECONCILE_DRY_RUN=false. (#166.)
+    let _blob_reconcile_handle =
+        ogrenotes_api::blob_reconcile::spawn_scheduler(state.clone());
+
     // Start the Redis pub/sub subscriber: receive updates from other API
     // instances and fan them out to local clients of the same room.
     // Required for correctness when running with >1 API instance; no-op
@@ -302,6 +308,32 @@ async fn main() {
                     ?e,
                     "failed to start Redis pub/sub subscriber — cross-instance sync disabled"
                 );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Index the documents the worker creates (#138): it can't reach this
+    // process's search index, so it names them on a Redis stream. Its own
+    // connection — `XREAD BLOCK` holds it for the block window.
+    let _search_reindex_handle = if redis_connected {
+        let reindex_client = fred::prelude::RedisClient::new(
+            fred::types::RedisConfig::from_url(&config.redis_url).expect("invalid REDIS_URL"),
+            None,
+            None,
+            None,
+        );
+        reindex_client.connect();
+        match reindex_client.wait_for_connect().await {
+            Ok(()) => Some(ogrenotes_api::search_reindex::spawn_consumer(
+                state.clone(),
+                reindex_client,
+                ogrenotes_api::search_reindex::stream_key(&config.job_stream_name),
+            )),
+            Err(e) => {
+                tracing::warn!(error = %e, "search reindex consumer disabled; worker imports won't be indexed");
                 None
             }
         }
@@ -338,15 +370,21 @@ async fn main() {
             .await
             {
                 Ok(queue) => {
-                    let ctx = std::sync::Arc::new(ogrenotes_api::worker_mode::WorkerCtx::new(
-                        state.doc_repo.clone(),
-                        state.folder_repo.clone(),
-                        state.doc_repo.s3().clone(),
-                        state.import_repo.clone(),
-                        state.user_repo.clone(),
-                        state.quip_token_store.clone(),
-                        None,
-                    ));
+                    let ctx = std::sync::Arc::new(
+                        ogrenotes_api::worker_mode::WorkerCtx::new(
+                            state.doc_repo.clone(),
+                            state.folder_repo.clone(),
+                            state.doc_repo.s3().clone(),
+                            state.import_repo.clone(),
+                            state.user_repo.clone(),
+                            state.quip_token_store.clone(),
+                            None,
+                        )
+                        .with_reindex(ogrenotes_api::search_reindex::ReindexPublisher::new(
+                            state.redis.clone(),
+                            ogrenotes_api::search_reindex::stream_key(&config.job_stream_name),
+                        )),
+                    );
                     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
                     ogrenotes_api::worker_mode::spawn_workers(
                         queue,

@@ -356,3 +356,127 @@ async fn test_search_count_above_cap_is_clamped() {
 
     app.cleanup().await;
 }
+
+// ─── #138: documents the worker creates reach the search index ──────
+
+/// A doc whose content is written straight to storage — the way the
+/// worker persists an import — so no API write path indexes it.
+async fn doc_written_behind_the_index(app: &common::TestApp, word: &str) -> (String, String) {
+    let (user_id, token) = app.create_user(&format!("{word}@test.com")).await;
+    let doc_id = app.create_doc(&token, "Imported", None).await;
+    app.state
+        .doc_repo
+        .save_snapshot(
+            &doc_id,
+            &make_doc_bytes(&format!("imported body {word}")),
+            2,
+            ogrenotes_common::time::now_usec(),
+            &user_id,
+        )
+        .await
+        .expect("write content behind the index");
+    (doc_id, token)
+}
+
+async fn search_ids(app: &common::TestApp, token: &str, word: &str) -> Vec<String> {
+    let (status, json) = app
+        .json_request(Method::GET, &format!("/api/v1/search?q={word}"), Some(token), None)
+        .await;
+    assert_eq!(status, 200, "{json}");
+    json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Poll until `word` finds `doc_id`, or give up after ~10s.
+async fn eventually_found(app: &common::TestApp, token: &str, word: &str, doc_id: &str) -> bool {
+    for _ in 0..100 {
+        if search_ids(app, token, word).await.iter().any(|id| id == doc_id) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
+}
+
+async fn redis_client() -> fred::prelude::RedisClient {
+    use fred::prelude::*;
+    let client = RedisClient::new(
+        RedisConfig::from_url("redis://127.0.0.1:6379").unwrap(),
+        None,
+        None,
+        None,
+    );
+    client.connect();
+    client.wait_for_connect().await.expect("redis");
+    client
+}
+
+fn unique_stream() -> String {
+    ogrenotes_api::search_reindex::stream_key(&format!(
+        "test-{}",
+        ogrenotes_common::id::new_id()
+    ))
+}
+
+#[tokio::test]
+async fn test_reindex_stream_indexes_a_document_published_while_running() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let (doc_id, token) = doc_written_behind_the_index(&app, "quokkalive").await;
+    assert!(
+        search_ids(&app, &token, "quokkalive").await.is_empty(),
+        "precondition: nothing indexed the content"
+    );
+
+    let stream = unique_stream();
+    let consumer = ogrenotes_api::search_reindex::spawn_consumer(
+        app.state.clone(),
+        redis_client().await,
+        stream.clone(),
+    );
+    // Give it time to take its starting position on the empty stream.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let publisher_client = std::sync::Arc::new(redis_client().await);
+    ogrenotes_api::search_reindex::ReindexPublisher::new(publisher_client.clone(), stream.clone())
+        .request(&doc_id)
+        .await;
+
+    let found = eventually_found(&app, &token, "quokkalive", &doc_id).await;
+    consumer.abort();
+    let _: i64 = fred::prelude::KeysInterface::del(&*publisher_client, &stream).await.unwrap();
+    assert!(found, "the consumer must index a document named on the stream");
+
+    app.cleanup().await;
+}
+
+/// The catch-up half: an entry published while no consumer was running is
+/// indexed by the next consumer to start.
+#[tokio::test]
+async fn test_reindex_stream_catches_up_on_entries_published_before_it_started() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let (doc_id, token) = doc_written_behind_the_index(&app, "quokkalate").await;
+
+    let stream = unique_stream();
+    let publisher_client = std::sync::Arc::new(redis_client().await);
+    ogrenotes_api::search_reindex::ReindexPublisher::new(publisher_client.clone(), stream.clone())
+        .request(&doc_id)
+        .await;
+
+    let consumer = ogrenotes_api::search_reindex::spawn_consumer(
+        app.state.clone(),
+        redis_client().await,
+        stream.clone(),
+    );
+    let found = eventually_found(&app, &token, "quokkalate", &doc_id).await;
+    consumer.abort();
+    let _: i64 = fred::prelude::KeysInterface::del(&*publisher_client, &stream).await.unwrap();
+    assert!(found, "a consumer must replay what was published before it started");
+
+    app.cleanup().await;
+}

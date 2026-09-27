@@ -287,6 +287,16 @@ pub struct AppConfig {
     /// committing to deletions.
     pub trash_cleanup_dry_run: bool,
 
+    // #166 orphaned-object sweep (`blob_reconcile`).
+    /// Enable the hourly sweep that deletes S3 objects whose document (or
+    /// import job) is gone. Off by default, like the other destructive
+    /// schedulers.
+    pub blob_reconcile_enabled: bool,
+    /// When true (the default), the sweep logs what it WOULD delete and
+    /// deletes nothing — the first-rollout posture. Set
+    /// BLOB_RECONCILE_DRY_RUN=false once the logs look right.
+    pub blob_reconcile_dry_run: bool,
+
     // ─── LiveApp CRDT-write pre-apply gate ────────────────────────
     /// Rollout state for the LiveApp attribute pre-apply validator.
     /// Values: "off" | "log" | "reject". Default "reject" as of
@@ -398,6 +408,8 @@ impl fmt::Debug for AppConfig {
             .field("trash_retention_days", &self.trash_retention_days)
             .field("trash_cleanup_hour_utc", &self.trash_cleanup_hour_utc)
             .field("trash_cleanup_dry_run", &self.trash_cleanup_dry_run)
+            .field("blob_reconcile_enabled", &self.blob_reconcile_enabled)
+            .field("blob_reconcile_dry_run", &self.blob_reconcile_dry_run)
             .field("job_stream_name", &self.job_stream_name)
             .field("worker_concurrency", &self.worker_concurrency)
             .field("email_digest_enabled", &self.email_digest_enabled)
@@ -603,6 +615,9 @@ impl AppConfig {
                 .filter(|h: &u8| *h < 24)
                 .unwrap_or_else(|| panic!("TRASH_CLEANUP_HOUR_UTC must be 0-23")),
             trash_cleanup_dry_run: env_or("TRASH_CLEANUP_DRY_RUN", "false") == "true",
+            blob_reconcile_enabled: env_or("BLOB_RECONCILE_ENABLED", "false") == "true",
+            // Anything but an explicit "false" keeps it dry.
+            blob_reconcile_dry_run: env_or("BLOB_RECONCILE_DRY_RUN", "true") != "false",
             job_stream_name: env_or("JOB_STREAM_NAME", "ogrenotes-jobs"),
             worker_concurrency: env_or("WORKER_CONCURRENCY", "4")
                 .parse()
@@ -830,6 +845,8 @@ mod tests {
             trash_retention_days: 30,
             trash_cleanup_hour_utc: 3,
             trash_cleanup_dry_run: false,
+            blob_reconcile_enabled: false,
+            blob_reconcile_dry_run: true,
             job_stream_name: "ogrenotes-jobs".into(),
             worker_concurrency: 4,
             liveapp_strict_validation: "log".into(),
@@ -1043,6 +1060,8 @@ mod tests {
             trash_retention_days: 30,
             trash_cleanup_hour_utc: 3,
             trash_cleanup_dry_run: false,
+            blob_reconcile_enabled: false,
+            blob_reconcile_dry_run: true,
             job_stream_name: "ogrenotes-jobs".into(),
             worker_concurrency: 4,
             liveapp_strict_validation: "reject".into(),

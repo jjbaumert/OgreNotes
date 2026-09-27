@@ -397,6 +397,9 @@ impl TestApp {
             trash_retention_days: 30,
             trash_cleanup_hour_utc: 3,
             trash_cleanup_dry_run: false,
+            // #166 sweep: off; its tests call `sweep` directly.
+            blob_reconcile_enabled: false,
+            blob_reconcile_dry_run: true,
             // Worker subsystem defaults — integration tests that
             // exercise the queue use a per-test stream suffix so
             // concurrent runs don't collide on this shared name.

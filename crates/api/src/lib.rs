@@ -2,6 +2,7 @@
 
 pub mod audit_retention;
 pub mod auth_policy;
+pub mod blob_reconcile;
 pub mod backfill;
 pub mod claude;
 pub mod compaction;
@@ -15,6 +16,7 @@ pub mod observability;
 pub mod redis_session;
 pub mod routes;
 pub mod scim;
+pub mod search_reindex;
 pub mod seed;
 pub mod state;
 pub mod trash_cleanup;

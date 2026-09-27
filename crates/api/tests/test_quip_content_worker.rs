@@ -3924,3 +3924,50 @@ async fn report_notes_carry_the_thread_title() {
     assert_eq!(title_of("t1").as_deref(), Some("Doc A"), "the skipped thread is named");
     assert_eq!(title_of("t2").as_deref(), Some("Sheet"), "the failed thread is named");
 }
+
+/// #138: every document the content pass creates is named on the search
+/// reindex stream, so the API processes (which own the search index the
+/// worker can't reach) index it.
+#[tokio::test]
+async fn content_pass_asks_the_api_to_index_every_document_it_creates() {
+    use fred::prelude::*;
+    common::require_infra!();
+    let server = quip_content_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+
+    let client = RedisClient::new(
+        RedisConfig::from_url("redis://127.0.0.1:6379").unwrap(),
+        None,
+        None,
+        None,
+    );
+    client.connect();
+    client.wait_for_connect().await.expect("redis");
+    let client = std::sync::Arc::new(client);
+    let stream = ogrenotes_api::search_reindex::stream_key(&format!(
+        "test-{}",
+        ogrenotes_common::id::new_id()
+    ));
+    let ctx = worker_ctx_with_quip(&app, server.uri()).with_reindex(
+        ogrenotes_api::search_reindex::ReindexPublisher::new(client.clone(), stream.clone()),
+    );
+    execute_start_quip_import(&ctx, &import_id, "owner1").await.unwrap();
+
+    let entries: Vec<(String, std::collections::HashMap<String, String>)> =
+        client.xrange(&stream, "-", "+", None).await.unwrap();
+    let _: i64 = client.del(&stream).await.unwrap();
+    let published: BTreeSet<String> =
+        entries.into_iter().filter_map(|(_, mut f)| f.remove("doc_id")).collect();
+    let created: BTreeSet<String> = app
+        .state
+        .import_repo
+        .list_threads(&import_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|t| t.ogre_doc_id)
+        .collect();
+    assert!(!created.is_empty(), "precondition: the pass created documents");
+    assert_eq!(published, created, "every created document must be published, and nothing else");
+}
