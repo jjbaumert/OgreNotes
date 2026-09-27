@@ -12,7 +12,7 @@ use leptos::prelude::*;
 use leptos_router::hooks::{use_navigate, use_params_map, use_query_map};
 use wasm_bindgen::JsCast;
 
-use crate::collab::ws_client::{CollabClient, RemoteCursor};
+use crate::collab::ws_client::{dedup_cursors_by_user, CollabClient, RemoteCursor};
 use crate::components::deck_view::{ensure_presentation_css, render_deck_canvas, render_frame_content};
 use crate::editor::yrs_bridge::ydoc_bytes_to_doc;
 use crate::presentation::model::{deck_from_doc, Deck, FrameRole, DEFAULT_THEME};
@@ -35,32 +35,37 @@ pub(crate) fn presenters<'a>(cursors: &'a [RemoteCursor], my_session_id: &str) -
 /// `?presenter=1` control view) as separate sessions, which is what #211
 /// needs for the presenter's *own* windows. To anyone else, though, the two
 /// were indistinguishable identical pills. So sessions of **other** users
-/// collapse to one per user, the most recently heard from (`seq`); the
-/// viewer's own other sessions all stay, so a presenter can still pick
-/// which of their windows to drive.
-pub(crate) fn followable_presenters<'a>(
-    cursors: &'a [RemoteCursor],
+/// collapse to one per user via [`dedup_cursors_by_user`] (the most recently
+/// heard from), except that the session this viewer is `following` always
+/// stands for its user: otherwise the pill would flip to the other window
+/// whenever that one sent a newer frame, and stop matching what the viewer
+/// follows. The viewer's own other sessions all stay, so a presenter can
+/// still pick which of their windows to drive.
+pub(crate) fn followable_presenters(
+    cursors: &[RemoteCursor],
     my_session_id: &str,
     my_user_id: &str,
-) -> Vec<&'a RemoteCursor> {
+    following: Option<&str>,
+) -> Vec<RemoteCursor> {
     let all = presenters(cursors, my_session_id);
-    let mut latest: std::collections::HashMap<&str, &RemoteCursor> = std::collections::HashMap::new();
-    for c in all.iter().copied().filter(|c| c.user_id != my_user_id) {
-        latest
-            .entry(c.user_id.as_str())
-            .and_modify(|kept| {
-                if c.seq > kept.seq {
-                    *kept = c;
-                }
-            })
-            .or_insert(c);
-    }
-    // Keep `presenters`' order, dropping the non-latest sessions of others.
+    let followed = following.and_then(|f| {
+        all.iter().find(|c| c.session_id == f && c.user_id != my_user_id).copied()
+    });
+    let others: Vec<RemoteCursor> = all
+        .iter()
+        .filter(|c| c.user_id != my_user_id)
+        .filter(|c| followed.is_none_or(|f| c.user_id != f.user_id))
+        .map(|c| (*c).clone())
+        .collect();
+    let mut keep: std::collections::HashSet<String> = dedup_cursors_by_user(&others)
+        .into_iter()
+        .map(|c| c.session_id)
+        .collect();
+    keep.extend(followed.map(|f| f.session_id.clone()));
+    // Keep `presenters`' order.
     all.into_iter()
-        .filter(|c| {
-            c.user_id == my_user_id
-                || latest.get(c.user_id.as_str()).is_some_and(|k| k.session_id == c.session_id)
-        })
+        .filter(|c| c.user_id == my_user_id || keep.contains(&c.session_id))
+        .cloned()
         .collect()
 }
 
@@ -736,7 +741,7 @@ pub fn PresentPage() -> impl IntoView {
                 <div class="deck-present__counter">
                     {move || format!("{} / {}", idx.get() + 1, deck.with(|d| d.slides.len()))}
                 </div>
-                <Show when=move || !my_user_id.with_value(|me| followable_presenters(&remote_cursors.get(), &my_session_id.get(), me).is_empty())>
+                <Show when=move || !my_user_id.with_value(|me| followable_presenters(&remote_cursors.get(), &my_session_id.get(), me, following.get().as_deref()).is_empty())>
                     <div class="deck-present__follow">
                         <Show
                             when=move || following.get().is_some() && paused.get()
@@ -744,7 +749,7 @@ pub fn PresentPage() -> impl IntoView {
                                 <For each=move || {
                                             let my_sid = my_session_id.get();
                                             let cursors = remote_cursors.get();
-                                            my_user_id.with_value(|me| followable_presenters(&cursors, &my_sid, me)
+                                            my_user_id.with_value(|me| followable_presenters(&cursors, &my_sid, me, following.get().as_deref())
                                                 .into_iter().map(|c| (c.session_id.clone(), c.name.clone())).collect::<Vec<_>>())
                                         }
                                          key=|(session_id, _)| session_id.clone()
@@ -894,9 +899,23 @@ mod follow_tests {
         let mut control = cursor_with_session("alice", "a-control", Some("s1"));
         control.seq = 9;
         let cs = vec![projector, control, cursor("bob", Some("s2"))];
-        let p = followable_presenters(&cs, "viewer-sess", "viewer");
+        let p = followable_presenters(&cs, "viewer-sess", "viewer", None);
         let sessions: Vec<&str> = p.iter().map(|c| c.session_id.as_str()).collect();
         assert_eq!(sessions, vec!["a-control", "bob-sess"], "one pill per other presenter");
+    }
+
+    /// #227 review fix: the window a viewer follows keeps its pill even
+    /// when the presenter's other window sent a newer frame.
+    #[test]
+    fn followable_presenters_keeps_the_followed_window_for_its_user() {
+        let mut projector = cursor_with_session("alice", "a-projector", Some("s1"));
+        projector.seq = 9;
+        let mut control = cursor_with_session("alice", "a-control", Some("s1"));
+        control.seq = 5;
+        let cs = vec![projector, control];
+        let p = followable_presenters(&cs, "viewer-sess", "viewer", Some("a-control"));
+        let sessions: Vec<&str> = p.iter().map(|c| c.session_id.as_str()).collect();
+        assert_eq!(sessions, vec!["a-control"], "the followed window, not the newest");
     }
 
     /// #227 must not undo #211: the viewer's OWN other windows all stay
@@ -908,7 +927,7 @@ mod follow_tests {
             cursor_with_session("me", "sess-control", Some("s1")),
             cursor_with_session("me", "sess-third", Some("s1")),
         ];
-        let p = followable_presenters(&cs, "sess-projector", "me");
+        let p = followable_presenters(&cs, "sess-projector", "me", None);
         let sessions: std::collections::HashSet<_> = p.iter().map(|c| c.session_id.as_str()).collect();
         assert_eq!(sessions, std::collections::HashSet::from(["sess-control", "sess-third"]));
     }
