@@ -11,6 +11,11 @@ use crate::models::import_inventory::{
 };
 use crate::repo::{RepoError, get_n, get_n_u64, get_s};
 
+/// How many times a `REPORT` write retries after losing a race (#156).
+/// A lost race needs a second writer, which the `runner_claim` lease
+/// admits only briefly, so a handful is generous.
+const REPORT_WRITE_ATTEMPTS: usize = 5;
+
 /// Repository for the Quip import manifest (`IMPORT#<id>` / `META`).
 ///
 /// Deliberately narrow: this repo never reads or writes a token. The Quip
@@ -545,9 +550,9 @@ impl ImportRepo {
     /// `DynamoClient::get_item` never sets `ConsistentRead`, and the
     /// default eventually-consistent read can serve a replica that has not
     /// yet seen the last write — which would make
-    /// [`mutate_report`](Self::mutate_report)'s read-modify-write lose
-    /// increments *with no concurrency at all*: two `bump_report_counter`
-    /// calls milliseconds apart from the same single runner are enough. So
+    /// [`append_report_note`](Self::append_report_note)'s read-modify-write
+    /// build on a stale row *with no concurrency at all*: two calls
+    /// milliseconds apart from the same single runner are enough. So
     /// this reaches through `DynamoClient::inner()` for a raw builder, the
     /// same escape hatch [`bump_thread_attempts`](Self::bump_thread_attempts)
     /// uses.
@@ -581,6 +586,20 @@ impl ImportRepo {
     /// by the number of distinct keys the callers use, which is a small
     /// compile-time set.
     ///
+    /// **Atomic on the server** (#156). This is called once per imported
+    /// thread, so it must not be a read-modify-write of the whole item —
+    /// that cost a full read and write of the note list per thread, and in
+    /// a lease-takeover overlap (see [`append_report_note`](Self::append_report_note))
+    /// a stale whole-item write dropped the other runner's increments. The
+    /// counters stay a nested map for readability: `ADD` cannot reach into
+    /// a map, but `SET counters.#k = if_not_exists(counters.#k, :zero) + :by`
+    /// can, as long as the `counters` map itself exists. So the first
+    /// attempt is guarded on `attribute_exists(counters)`; when the map is
+    /// absent a second write creates it with this counter in it, guarded on
+    /// `attribute_not_exists(counters)`. Losing that race to another
+    /// creator just means the map now exists, and the loop goes round to
+    /// the first form again.
+    ///
     /// **Callers must treat a failure here as advisory.** The report
     /// describes an import; it must never be able to *stop* one. A
     /// corrupt or unwritable report row that propagated into the content
@@ -594,8 +613,60 @@ impl ImportRepo {
         key: &str,
         by: u64,
     ) -> Result<(), RepoError> {
-        self.mutate_report(import_id, owner_id, |row| row.bump_counter(key, by))
-            .await
+        let pk = format!("IMPORT#{import_id}");
+        let names = HashMap::from([("#k".to_string(), key.to_string())]);
+        for _ in 0..REPORT_WRITE_ATTEMPTS {
+            let values = HashMap::from([
+                (":owner".to_string(), AttributeValue::S(owner_id.to_string())),
+                (":zero".to_string(), AttributeValue::N("0".to_string())),
+                (":by".to_string(), AttributeValue::N(by.to_string())),
+            ]);
+            let bumped = self
+                .db
+                .update_item_conditional(
+                    &pk,
+                    ReportRow::sk(),
+                    "SET owner_id = if_not_exists(owner_id, :owner), \
+                     counters.#k = if_not_exists(counters.#k, :zero) + :by",
+                    "attribute_exists(counters)",
+                    values,
+                    Some(names.clone()),
+                )
+                .await
+                .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+            if bumped {
+                return Ok(());
+            }
+
+            let values = HashMap::from([
+                (":owner".to_string(), AttributeValue::S(owner_id.to_string())),
+                (
+                    ":init".to_string(),
+                    AttributeValue::M(HashMap::from([(
+                        key.to_string(),
+                        AttributeValue::N(by.to_string()),
+                    )])),
+                ),
+            ]);
+            let created = self
+                .db
+                .update_item_conditional(
+                    &pk,
+                    ReportRow::sk(),
+                    "SET owner_id = if_not_exists(owner_id, :owner), counters = :init",
+                    "attribute_not_exists(counters)",
+                    values,
+                    None,
+                )
+                .await
+                .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+            if created {
+                return Ok(());
+            }
+        }
+        Err(RepoError::Dynamo(format!(
+            "report counter {key:?} not written after {REPORT_WRITE_ATTEMPTS} attempts"
+        )))
     }
 
     /// Append one named loss/fallback to the `REPORT` row, creating the row
@@ -613,68 +684,92 @@ impl ImportRepo {
     /// [`bump_report_counter`](Self::bump_report_counter) — the note list is
     /// a sample, the counters are the tally. Failures here are advisory,
     /// exactly as for `bump_report_counter`.
+    ///
+    /// The budgets are evaluated in Rust, so this is a read-modify-write —
+    /// but an **optimistic** one that writes only `notes`/`notes_dropped`
+    /// (never `counters`, which [`bump_report_counter`](Self::bump_report_counter)
+    /// updates atomically) and only if neither changed since the read. The
+    /// content pass is single-writer per import under the `runner_claim`
+    /// lease, so the guard normally never fires; it exists for the brief
+    /// two-runner overlap a stale-heartbeat takeover admits (there is no
+    /// fencing token), where a blind write would silently drop the other
+    /// runner's notes (#156). On a lost race the read is repeated.
+    ///
+    /// The read is strongly consistent (see [`get_report`](Self::get_report)),
+    /// so a mutation is never built from a stale row.
     pub async fn append_report_note(
         &self,
         import_id: &str,
         owner_id: &str,
         note: ReportNote,
     ) -> Result<(), RepoError> {
-        self.mutate_report(import_id, owner_id, |row| row.push_note(note))
-            .await
-    }
+        let pk = format!("IMPORT#{import_id}");
+        for _ in 0..REPORT_WRITE_ATTEMPTS {
+            let seen = self.get_report(import_id).await?;
+            let (seen_notes, seen_dropped) = seen
+                .as_ref()
+                .map_or((0, 0), |r| (r.notes.len(), r.notes_dropped));
+            let mut row = seen.unwrap_or_else(|| ReportRow::new(owner_id));
+            row.push_note(note.clone());
 
-    /// Shared read-modify-write body for the `REPORT` mutators.
-    ///
-    /// **This is a plain read-modify-write, and it is only safe because of
-    /// the `runner_claim` lease.** The content pass is single-writer per
-    /// import — `claim_runner`/`heartbeat_runner` admit one runner at a time
-    /// — so no second writer can interleave between the read and the write.
-    /// A future caller that writes the report from *outside* that lease
-    /// (an API handler, a second worker pass, a parallel per-thread task)
-    /// turns this into a lost-update bug: the loser's counters and notes
-    /// vanish silently. If that day comes, the fix is to make each mutation
-    /// atomic on the server — `ADD` for the counters (mirroring
-    /// [`bump_thread_attempts`](Self::bump_thread_attempts)) and a
-    /// `list_append` guarded by `size(notes) < :cap` for the notes — not to
-    /// add a lock here.
-    ///
-    /// Two caveats worth knowing even today. First, lease takeover after a
-    /// stale heartbeat can briefly overlap two runners (see
-    /// `clear_runner_claim`'s owner check — the superseded runner is still
-    /// executing and nothing revokes its ability to write; there is no
-    /// fencing token). What a lost update costs in that window is **not**
-    /// one line: this writes the whole item, so the loser's *entire*
-    /// mutation is dropped — every note **and every counter increment**
-    /// the other writer committed between our read and our put. The
-    /// counters are the worse half. They are what "…and 9 800 more" is
-    /// computed from, so a lost increment makes the report silently
-    /// **under-report** the losses — the exact failure this row exists to
-    /// prevent, arriving quietly and looking like good news. It is still
-    /// never document data: the report is derived from the `THREAD#` rows,
-    /// which are written by their own conditional/forward-only paths.
-    ///
-    /// Second, and for the same reason, a mutation must never be built
-    /// from a stale in-memory `ReportRow` — always go through these
-    /// methods, which re-read (consistently) first.
-    async fn mutate_report(
-        &self,
-        import_id: &str,
-        owner_id: &str,
-        mutate: impl FnOnce(&mut ReportRow),
-    ) -> Result<(), RepoError> {
-        let mut row = self
-            .get_report(import_id)
-            .await?
-            .unwrap_or_else(|| ReportRow::new(owner_id));
-        mutate(&mut row);
+            // `report_to_item` owns the attribute encoding; take just the
+            // two attributes this write is allowed to touch. Either may be
+            // absent (sparse), in which case it is left unset.
+            let item = report_to_item(&row);
+            let mut sets = vec!["owner_id = if_not_exists(owner_id, :owner)"];
+            let mut values = HashMap::from([(
+                ":owner".to_string(),
+                AttributeValue::S(owner_id.to_string()),
+            )]);
+            if let Some(notes) = item.get("notes") {
+                sets.push("notes = :notes");
+                values.insert(":notes".to_string(), notes.clone());
+            }
+            if let Some(dropped) = item.get("notes_dropped") {
+                sets.push("notes_dropped = :dropped");
+                values.insert(":dropped".to_string(), dropped.clone());
+            }
 
-        let mut item = report_to_item(&row);
-        item.insert("PK".to_string(), AttributeValue::S(format!("IMPORT#{import_id}")));
-        item.insert("SK".to_string(), AttributeValue::S(ReportRow::sk().to_string()));
-        self.db
-            .put_item(item)
-            .await
-            .map_err(|e| RepoError::Dynamo(e.to_string()))
+            // Unchanged since the read. `size(notes)` identifies the list
+            // because notes are only ever appended.
+            let notes_guard = if seen_notes == 0 {
+                "attribute_not_exists(notes)"
+            } else {
+                values.insert(
+                    ":seen_notes".to_string(),
+                    AttributeValue::N(seen_notes.to_string()),
+                );
+                "size(notes) = :seen_notes"
+            };
+            let dropped_guard = if seen_dropped == 0 {
+                "attribute_not_exists(notes_dropped)"
+            } else {
+                values.insert(
+                    ":seen_dropped".to_string(),
+                    AttributeValue::N(seen_dropped.to_string()),
+                );
+                "notes_dropped = :seen_dropped"
+            };
+
+            let written = self
+                .db
+                .update_item_conditional(
+                    &pk,
+                    ReportRow::sk(),
+                    &format!("SET {}", sets.join(", ")),
+                    &format!("{notes_guard} AND {dropped_guard}"),
+                    values,
+                    None,
+                )
+                .await
+                .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+            if written {
+                return Ok(());
+            }
+        }
+        Err(RepoError::Dynamo(format!(
+            "report note not written after {REPORT_WRITE_ATTEMPTS} attempts"
+        )))
     }
 
     /// Record the total thread count discovered by inventory BFS, on `META`.
@@ -1945,52 +2040,136 @@ mod tests {
         assert_eq!(entries, vec![("s1".to_string(), "b1".to_string())]);
     }
 
+    /// The note path is still a read-modify-write (the per-kind budgets
+    /// are evaluated in Rust), so its read must be strongly consistent and
+    /// its write must build on what was read. Since #156 the write is a
+    /// guarded `UpdateItem` of the note attributes only, never a whole-item
+    /// `PutItem` that could carry stale counters.
     #[tokio::test]
     async fn the_report_read_modify_write_reads_consistently() {
         let (repo, replay) = replaying_repo(vec![
             // The existing row the RMW reads back...
-            r#"{"Item":{"owner_id":{"S":"u1"},"counters":{"M":{"threads_failed":{"N":"4"}}}}}"#,
-            // ...and the PutItem response.
+            r#"{"Item":{"owner_id":{"S":"u1"},"counters":{"M":{"threads_failed":{"N":"4"}}},"notes":{"L":[{"M":{"quip_thread_id":{"S":"t0"},"kind":{"S":"k"},"detail":{"S":"first"}}}]}}}"#,
+            // ...and the UpdateItem response.
             "{}",
         ]);
+
+        repo.append_report_note(
+            "imp1",
+            "u1",
+            ReportNote {
+                quip_thread_id: "t1".into(),
+                title: None,
+                kind: "k".into(),
+                detail: "second".into(),
+            },
+        )
+        .await
+        .expect("append_report_note");
+
+        let reqs: Vec<_> = replay.actual_requests().collect();
+        assert_eq!(reqs.len(), 2, "an RMW is exactly one read then one write");
+        let read_target = crate::test_support::request_target(&replay, 0);
+        let read_body = crate::test_support::request_body(&replay, 0);
+        let write_target = crate::test_support::request_target(&replay, 1);
+        let write_body = crate::test_support::request_body(&replay, 1);
+
+        assert!(read_target.ends_with("GetItem"), "first call must be the read: {read_target}");
+        assert!(
+            read_body.contains(r#""ConsistentRead":true"#),
+            "the RMW's read must be strongly consistent, else a note can be \
+             built on a stale row with no concurrency at all: {read_body}",
+        );
+
+        assert!(write_target.ends_with("UpdateItem"), "second call must be the write: {write_target}");
+        assert!(
+            write_body.contains("first") && write_body.contains("second"),
+            "the write must append to the list that was read: {write_body}",
+        );
+        assert!(
+            write_body.contains("size(notes) = :seen_notes"),
+            "the write must be guarded on the list being unchanged: {write_body}",
+        );
+        assert!(
+            !write_body.contains("counters"),
+            "a note write must never touch the counters: {write_body}",
+        );
+    }
+
+    /// #156: a counter bump is one atomic `UpdateItem` into the nested
+    /// map — no read, and no whole-item write.
+    #[tokio::test]
+    async fn a_report_counter_bump_is_one_atomic_update() {
+        let (repo, replay) = replaying_repo(vec!["{}"]);
+
+        repo.bump_report_counter("imp1", "u1", "threads_imported", 3)
+            .await
+            .expect("bump_report_counter");
+
+        let reqs: Vec<_> = replay.actual_requests().collect();
+        assert_eq!(reqs.len(), 1, "a bump is a single write");
+        assert!(crate::test_support::request_target(&replay, 0).ends_with("UpdateItem"));
+        let body = crate::test_support::request_body(&replay, 0);
+        assert!(
+            body.contains("counters.#k = if_not_exists(counters.#k, :zero) + :by"),
+            "{body}"
+        );
+        assert!(body.contains(r##""#k":"threads_imported""##), "{body}");
+        assert!(body.contains(r#"":by":{"N":"3"}"#), "{body}");
+        assert!(body.contains("attribute_exists(counters)"), "{body}");
+    }
+
+    /// A first bump finds no `counters` map (the in-place form's guard
+    /// fails), so it creates the map holding just this counter.
+    #[tokio::test]
+    async fn the_first_report_counter_bump_creates_the_map() {
+        let (db, replay) = crate::test_support::replaying_dynamo_with_status(vec![
+            (400, crate::test_support::CONDITIONAL_CHECK_FAILED),
+            (200, "{}"),
+        ]);
+        let repo = ImportRepo::new(db);
 
         repo.bump_report_counter("imp1", "u1", "threads_failed", 1)
             .await
             .expect("bump_report_counter");
 
-        // Everything is read off the captured requests inline: they are
-        // smithy's own `Request` type, which this crate has no direct
-        // dependency on to name in a helper's signature.
-        let reqs: Vec<_> = replay.actual_requests().collect();
-        assert_eq!(reqs.len(), 2, "an RMW is exactly one read then one write");
-        let read_target = reqs[0].headers().get("x-amz-target").unwrap_or_default();
-        let read_body =
-            String::from_utf8(reqs[0].body().bytes().expect("in-memory body").to_vec())
-                .expect("utf-8 body");
-        let write_target = reqs[1].headers().get("x-amz-target").unwrap_or_default();
-        let write_body =
-            String::from_utf8(reqs[1].body().bytes().expect("in-memory body").to_vec())
-                .expect("utf-8 body");
+        let body = crate::test_support::request_body(&replay, 1);
+        assert!(body.contains("counters = :init"), "{body}");
+        assert!(body.contains("attribute_not_exists(counters)"), "{body}");
+        assert!(body.contains(r#""threads_failed":{"N":"1"}"#), "{body}");
+    }
 
-        assert!(
-            read_target.ends_with("GetItem"),
-            "first call must be the read: {read_target}"
-        );
-        assert!(
-            read_body.contains(r#""ConsistentRead":true"#),
-            "the RMW's read must be strongly consistent, else an increment can \
-             be lost with no concurrency at all: {read_body}",
-        );
+    /// A note write that loses its guard (another runner wrote in between)
+    /// re-reads and tries again rather than overwriting.
+    #[tokio::test]
+    async fn a_report_note_retries_after_losing_a_race() {
+        let (db, replay) = crate::test_support::replaying_dynamo_with_status(vec![
+            (200, r#"{}"#),
+            (400, crate::test_support::CONDITIONAL_CHECK_FAILED),
+            (200, r#"{"Item":{"owner_id":{"S":"u1"},"notes":{"L":[{"M":{"quip_thread_id":{"S":"t0"},"kind":{"S":"k"},"detail":{"S":"theirs"}}}]}}}"#),
+            (200, "{}"),
+        ]);
+        let repo = ImportRepo::new(db);
 
-        // ...and the write really did merge what the read returned, rather
-        // than starting from an empty row.
+        repo.append_report_note(
+            "imp1",
+            "u1",
+            ReportNote {
+                quip_thread_id: "t1".into(),
+                title: None,
+                kind: "k".into(),
+                detail: "mine".into(),
+            },
+        )
+        .await
+        .expect("append_report_note");
+
+        let first = crate::test_support::request_body(&replay, 1);
+        assert!(first.contains("attribute_not_exists(notes)"), "{first}");
+        let retry = crate::test_support::request_body(&replay, 3);
         assert!(
-            write_target.ends_with("PutItem"),
-            "second call must be the write: {write_target}"
-        );
-        assert!(
-            write_body.contains(r#""threads_failed":{"N":"5"}"#),
-            "the write must carry 4 + 1: {write_body}",
+            retry.contains("theirs") && retry.contains("mine"),
+            "the retry must keep the other runner's note: {retry}"
         );
     }
 

@@ -915,6 +915,57 @@ async fn report_counters_accumulate_across_calls() {
     assert_eq!(row.notes_dropped, 0);
 }
 
+/// #156: concurrent writers must not lose each other's work. A counter
+/// bump is one atomic update into the nested map, and a note write is
+/// guarded on the list being unchanged since its read, so both survive the
+/// two-runner overlap a stale-heartbeat takeover admits. Interleaved with
+/// notes, the bumps also prove a note write never carries stale counters.
+#[tokio::test]
+async fn concurrent_report_writes_lose_nothing() {
+    require_infra!();
+    const BUMPS: usize = 20;
+    const NOTES: usize = 3;
+    let (repo, _table) = test_repo().await;
+    let record = sample_record();
+    repo.create(&record).await.expect("create");
+    let repo = std::sync::Arc::new(repo);
+
+    let mut tasks = Vec::new();
+    for i in 0..BUMPS {
+        let (repo, id, owner) = (repo.clone(), record.import_id.clone(), record.owner_id.clone());
+        tasks.push(tokio::spawn(async move {
+            repo.bump_report_counter(&id, &owner, "threads_imported", 1).await?;
+            if i < NOTES {
+                repo.append_report_note(
+                    &id,
+                    &owner,
+                    ReportNote {
+                        quip_thread_id: format!("qt{i}"),
+                        title: None,
+                        kind: format!("kind{i}"),
+                        detail: "lost".to_string(),
+                    },
+                )
+                .await?;
+            }
+            Ok::<_, ogrenotes_storage::repo::RepoError>(())
+        }));
+    }
+    for t in tasks {
+        t.await.expect("task").expect("report write");
+    }
+
+    let row = repo
+        .get_report(&record.import_id)
+        .await
+        .expect("get_report")
+        .expect("row");
+    assert_eq!(row.counters["threads_imported"], BUMPS as u64, "no increment may be lost");
+    let mut ids: Vec<_> = row.notes.iter().map(|n| n.quip_thread_id.clone()).collect();
+    ids.sort();
+    assert_eq!(ids, (0..NOTES).map(|i| format!("qt{i}")).collect::<Vec<_>>(), "no note may be lost");
+}
+
 /// The load-bearing bound, end to end through Dynamo: an import that loses
 /// far more threads than the note cap keeps a bounded list *and* an
 /// accurate count, so the report can say "…and N more" instead of either
