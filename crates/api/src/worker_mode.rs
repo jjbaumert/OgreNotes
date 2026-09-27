@@ -155,6 +155,10 @@ const REAPER_INTERVAL_SECS: u64 = 30;
 /// threshold.
 const REAPER_MIN_IDLE_MS: u64 = 60_000;
 
+/// Most stale entries the reaper claims in one tick. It never claims more
+/// than it has free slots for (see [`ReaperSlots`]).
+const REAPER_BATCH: usize = 16;
+
 /// Inventory-lease staleness cutoff (ms). Deliberately kept BELOW
 /// [`REAPER_MIN_IDLE_MS`] (60s) so a crashed worker's DynamoDB lease looks
 /// stale by the time the Redis reaper redelivers the orphaned entry (~60s):
@@ -275,7 +279,8 @@ pub fn spawn_workers(
         let q = queue.clone();
         let consumer = format!("{consumer_prefix}-reaper");
         let rx = shutdown_rx.clone();
-        handles.push(tokio::spawn(reaper_loop(q, consumer, rx, Arc::clone(&ctx))));
+        let slots = ReaperSlots::new(concurrency.max(1) as usize);
+        handles.push(tokio::spawn(reaper_loop(q, consumer, rx, Arc::clone(&ctx), slots)));
     }
     handles
 }
@@ -315,13 +320,25 @@ async fn consume_loop(
     }
 }
 
+/// Detect stale entries and run each reclaimed job on its own task (#144).
+///
+/// The reaper used to execute reclaimed jobs inline, so one long recovery
+/// (a multi-hour Quip import pass) left the fleet with no reaper for its
+/// whole duration. Now the loop only claims and spawns, so its cadence is
+/// independent of any job's length. Spawned work is bounded by
+/// [`ReaperSlots`]: at most `concurrency` reclaimed jobs at once, and an
+/// entry this reaper is already running is not started a second time when
+/// it goes idle-stale again (import jobs are also guarded by their lease,
+/// but other job kinds are not).
 async fn reaper_loop(
     queue: JobQueue,
     consumer: String,
     mut shutdown: watch::Receiver<bool>,
     ctx: Arc<WorkerCtx>,
+    slots: ReaperSlots,
 ) {
     tracing::info!(consumer, "worker mode: reaper started");
+    let mut running = tokio::task::JoinSet::new();
     let mut tick = tokio::time::interval(Duration::from_secs(REAPER_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // First tick fires immediately; skip it so the first reap waits
@@ -332,13 +349,25 @@ async fn reaper_loop(
             _ = tick.tick() => {},
             _ = shutdown.changed() => {
                 tracing::info!(consumer, "worker mode: reaper exiting");
+                // Let reclaimed jobs finish; the caller's drain deadline
+                // bounds this, same as an inline job before.
+                while running.join_next().await.is_some() {}
                 return;
             }
         }
         if *shutdown.borrow() {
+            while running.join_next().await.is_some() {}
             return;
         }
-        match queue.claim_stale(&consumer, REAPER_MIN_IDLE_MS, 16).await {
+        // Collect finished tasks so the set does not grow without bound.
+        while running.try_join_next().is_some() {}
+
+        let free = slots.free().min(REAPER_BATCH);
+        if free == 0 {
+            tracing::debug!(consumer, "worker mode: reaper at capacity; skipping this tick");
+            continue;
+        }
+        match queue.claim_stale(&consumer, REAPER_MIN_IDLE_MS, free).await {
             Ok(entries) if entries.is_empty() => {}
             Ok(entries) => {
                 tracing::info!(
@@ -347,13 +376,73 @@ async fn reaper_loop(
                     "worker mode: reaper claimed stale entries",
                 );
                 for claimed in entries {
-                    execute_and_finalize(&queue, claimed, &ctx).await;
+                    let Some(slot) = slots.admit(&claimed.stream_id) else {
+                        // Already running here (or, defensively, no slot):
+                        // leave it pending for a later tick.
+                        continue;
+                    };
+                    let q = queue.clone();
+                    let c = Arc::clone(&ctx);
+                    running.spawn(async move {
+                        execute_and_finalize(&q, claimed, &c).await;
+                        drop(slot);
+                    });
                 }
             }
             Err(e) => {
                 tracing::warn!(consumer, error = %e, "claim_stale failed");
             }
         }
+    }
+}
+
+/// Bookkeeping for the reaper's spawned jobs: a fixed number of slots, and
+/// the stream ids currently running. Cloning shares the same state.
+#[derive(Clone)]
+struct ReaperSlots {
+    capacity: usize,
+    in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// Held while a reclaimed job runs; frees its slot and stream id on drop.
+struct ReaperSlot {
+    stream_id: String,
+    in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl ReaperSlots {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            in_flight: Arc::default(),
+        }
+    }
+
+    fn free(&self) -> usize {
+        let running = self.in_flight.lock().unwrap_or_else(|p| p.into_inner()).len();
+        self.capacity.saturating_sub(running)
+    }
+
+    /// A slot for `stream_id`, or `None` when that entry is already running
+    /// or every slot is taken.
+    fn admit(&self, stream_id: &str) -> Option<ReaperSlot> {
+        let mut set = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        if set.len() >= self.capacity || !set.insert(stream_id.to_string()) {
+            return None;
+        }
+        Some(ReaperSlot {
+            stream_id: stream_id.to_string(),
+            in_flight: Arc::clone(&self.in_flight),
+        })
+    }
+}
+
+impl Drop for ReaperSlot {
+    fn drop(&mut self) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.stream_id);
     }
 }
 
@@ -3317,6 +3406,32 @@ mod tests {
     use super::*;
     use ogrenotes_storage::models::import_inventory::FolderRow;
     use std::collections::BTreeSet;
+
+    // #144: the reaper spawns reclaimed jobs instead of running them
+    // inline. These pin the bookkeeping that keeps that bounded and
+    // prevents a second start of an entry it is already running.
+
+    #[test]
+    fn reaper_slots_refuse_an_entry_that_is_already_running() {
+        let slots = ReaperSlots::new(4);
+        let first = slots.admit("1-0").expect("a free slot");
+        assert!(slots.admit("1-0").is_none(), "the same entry must not start twice");
+        assert!(slots.admit("2-0").is_some(), "a different entry still gets a slot");
+        drop(first);
+        assert!(slots.admit("1-0").is_some(), "finishing frees the entry for a later reclaim");
+    }
+
+    #[test]
+    fn reaper_slots_are_bounded_by_capacity() {
+        let slots = ReaperSlots::new(2);
+        let a = slots.admit("a").unwrap();
+        let _b = slots.admit("b").unwrap();
+        assert_eq!(slots.free(), 0);
+        assert!(slots.admit("c").is_none(), "no slot past capacity");
+        drop(a);
+        assert_eq!(slots.free(), 1);
+        assert!(slots.admit("c").is_some());
+    }
 
     fn thread(first: &str, members: &[&str]) -> ThreadRow {
         ThreadRow {
