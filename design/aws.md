@@ -113,7 +113,7 @@ Qdrant provides the vector store for semantic search. It runs as a separate ECS 
 - **Deployment:** Single Qdrant container (256MB RAM / 0.25 vCPU for small corpus). Use `qdrant/qdrant:latest` image.
 - **Persistence:** EFS-backed volume mounted at `/qdrant/storage` so vectors survive task restarts.
 - **Ports:** gRPC on 6334 (used by the Axum server via `qdrant-client`), REST on 6333 (Qdrant dashboard for debugging).
-- **Networking:** Private subnet only. Security group allows inbound 6334 from the Axum ECS task security group.
+- **Networking:** Public subnet with a public IP, like every task in this stack (there are no private subnets — see Networking below). Its security group admits only the Axum ECS task security group, on 6333/6334.
 - **Disabled by default:** When the `QDRANT_URL` env var is not set, the embedding pipeline is skipped entirely and search uses keyword-only mode. No Qdrant infrastructure needed.
 
 ### Amazon Bedrock (Optional — Embeddings)
@@ -292,7 +292,7 @@ If you want to ship fast, the smallest viable version is:
 | DynamoDB | On-demand, one table, PITR enabled | ~$5 |
 | Storage | One S3 bucket, Intelligent-Tiering | ~$1 |
 | Search | Tantivy in-process (no extra service) | $0 |
-| Networking | VPC with public/private subnets, VPC endpoints | ~$10 |
+| Networking | VPC with public subnets only, gateway VPC endpoints for DynamoDB/S3, no NAT | ~$10 |
 | **Base total** | | **~$70/month** |
 
 **Optional add-ons for search and AI features:**
@@ -302,8 +302,8 @@ If you want to ship fast, the smallest viable version is:
 | Vector Search | Qdrant on Fargate, 256MB / 0.25 vCPU + EFS | ~$15 |
 | Embeddings | Bedrock Titan Embed, pay-per-call | ~$5 |
 | AI Assistant | Anthropic Claude API, pay-per-call | ~$20 |
-| NAT Gateway | Required for outbound Anthropic API calls | ~$32 |
-| **AI/Search total** | | **~$70/month** |
+| NAT Gateway | Not used — tasks reach the Anthropic API over the internet gateway via their public IPs (`natGateways: 0`) | $0 |
+| **AI/Search total** | | **~$40/month** |
 
 Deployable in an afternoon with Terraform or CDK. The base system scales horizontally by increasing ECS task count. Qdrant and the AI assistant can be enabled later by setting environment variables — no code changes required.
 
@@ -341,7 +341,7 @@ For early testing with a small number of users, everything can run on a single E
 | Qdrant | Separate ECS Fargate task | Docker container on the same instance |
 | TLS | ALB terminates SSL | Let's Encrypt + nginx reverse proxy (or skip TLS for localhost testing) |
 | Availability | 2+ tasks across AZs | Single instance, no failover |
-| Networking | VPC with private subnets, VPC endpoints, NAT | Public subnet, direct internet access |
+| Networking | VPC with public subnets only, gateway VPC endpoints, no NAT; security groups isolate | Public subnet, direct internet access |
 
 ### Cost Breakdown
 
