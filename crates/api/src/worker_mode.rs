@@ -49,6 +49,8 @@ use ogrenotes_storage::repo::import_repo::ImportRepo;
 use ogrenotes_storage::repo::user_repo::UserRepo;
 use ogrenotes_storage::s3::S3Client;
 use ogrenotes_worker::{ClaimedJob, Job, JobQueue, RetryOutcome};
+
+use crate::search_reindex::ReindexPublisher;
 use tokio::sync::watch;
 
 /// Handles the import jobs need to persist a document: S3 to fetch the
@@ -82,6 +84,10 @@ pub struct WorkerCtx {
     /// Base URL override for the per-import Quip client. `None` in prod
     /// (real `platform.quip.com`); a wiremock URI in integration tests.
     quip_base: Option<String>,
+    /// Asks the API processes to index each document this worker creates
+    /// (#138) — the worker can't reach their local search indexes. `None`
+    /// without Redis, and in tests that don't exercise search.
+    reindex: Option<ReindexPublisher>,
 }
 
 impl WorkerCtx {
@@ -94,7 +100,31 @@ impl WorkerCtx {
         quip_token_store: Arc<dyn TokenStore>,
         quip_base: Option<String>,
     ) -> Self {
-        Self { doc_repo, folder_repo, s3, import_repo, user_repo, quip_token_store, quip_base }
+        Self {
+            doc_repo,
+            folder_repo,
+            s3,
+            import_repo,
+            user_repo,
+            quip_token_store,
+            quip_base,
+            reindex: None,
+        }
+    }
+
+    /// Publish a search reindex request for every document this worker
+    /// creates. See [`crate::search_reindex`].
+    pub fn with_reindex(mut self, reindex: ReindexPublisher) -> Self {
+        self.reindex = Some(reindex);
+        self
+    }
+
+    /// Ask the API processes to index `doc_id`. Advisory; a no-op without a
+    /// publisher.
+    async fn request_reindex(&self, doc_id: &str) {
+        if let Some(reindex) = &self.reindex {
+            reindex.request(doc_id).await;
+        }
     }
 }
 
@@ -199,6 +229,26 @@ pub async fn run(config: AppConfig) {
         .await
         .expect("worker mode: queue init failed");
 
+    // Its own connection: the queue's is held by `XREADGROUP BLOCK`, which
+    // would stall a publish queued behind it.
+    let reindex_client = RedisClient::new(
+        fred::types::RedisConfig::from_url(&config.redis_url).expect("invalid REDIS_URL"),
+        None,
+        None,
+        None,
+    );
+    reindex_client.connect();
+    let reindex = match reindex_client.wait_for_connect().await {
+        Ok(()) => Some(ReindexPublisher::new(
+            Arc::new(reindex_client),
+            crate::search_reindex::stream_key(&config.job_stream_name),
+        )),
+        Err(e) => {
+            tracing::warn!(error = %e, "worker mode: reindex publisher disabled; imports won't be searchable");
+            None
+        }
+    };
+
     // Build the persistence context. Same AWS client construction the
     // server-mode path in `main` uses — the worker process never runs
     // both, so each builds its own clients.
@@ -225,7 +275,7 @@ pub async fn run(config: AppConfig) {
     };
 
     let user_repo = Arc::new(UserRepo::new(dynamo.clone()));
-    let ctx = Arc::new(WorkerCtx::new(
+    let mut ctx = WorkerCtx::new(
         Arc::new(DocRepo::new(dynamo.clone(), s3.clone())),
         Arc::new(FolderRepo::new(dynamo)),
         s3,
@@ -233,7 +283,11 @@ pub async fn run(config: AppConfig) {
         user_repo,
         quip_token_store,
         None,
-    ));
+    );
+    if let Some(reindex) = reindex {
+        ctx = ctx.with_reindex(reindex);
+    }
+    let ctx = Arc::new(ctx);
     tracing::info!("worker mode: persistence context ready");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -576,6 +630,7 @@ async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<JobDisposition, Strin
                 owner_id,
             )
             .await?;
+            ctx.request_reindex(&doc_id).await;
             tracing::info!(doc_id, owner_id, "docx imported");
             Ok(JobDisposition::Done(Some(
                 serde_json::json!({ "docId": doc_id }).to_string(),
@@ -598,6 +653,7 @@ async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<JobDisposition, Strin
                 owner_id,
             )
             .await?;
+            ctx.request_reindex(&doc_id).await;
             tracing::info!(doc_id, owner_id, "pdf imported");
             Ok(JobDisposition::Done(Some(
                 serde_json::json!({ "docId": doc_id }).to_string(),
@@ -3081,6 +3137,7 @@ pub async fn import_one_thread(
     )
     .await
     .map_err(ThreadImportError::RunFailure)?;
+    ctx.request_reindex(&doc_id).await;
 
     // 8. Section map, chunked — a thread with thousands of anchors would
     //    otherwise blow DynamoDB's per-item size cap.

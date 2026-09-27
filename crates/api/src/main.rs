@@ -309,6 +309,32 @@ async fn main() {
         None
     };
 
+    // Index the documents the worker creates (#138): it can't reach this
+    // process's search index, so it names them on a Redis stream. Its own
+    // connection — `XREAD BLOCK` holds it for the block window.
+    let _search_reindex_handle = if redis_connected {
+        let reindex_client = fred::prelude::RedisClient::new(
+            fred::types::RedisConfig::from_url(&config.redis_url).expect("invalid REDIS_URL"),
+            None,
+            None,
+            None,
+        );
+        reindex_client.connect();
+        match reindex_client.wait_for_connect().await {
+            Ok(()) => Some(ogrenotes_api::search_reindex::spawn_consumer(
+                state.clone(),
+                reindex_client,
+                ogrenotes_api::search_reindex::stream_key(&config.job_stream_name),
+            )),
+            Err(e) => {
+                tracing::warn!(error = %e, "search reindex consumer disabled; worker imports won't be indexed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Start the EMF emitter (every 60s) and the state sampler (every 30s).
     observability::spawn(state.clone(), config.deploy_env.clone(), state.rolling_users.clone());
 
@@ -338,15 +364,21 @@ async fn main() {
             .await
             {
                 Ok(queue) => {
-                    let ctx = std::sync::Arc::new(ogrenotes_api::worker_mode::WorkerCtx::new(
-                        state.doc_repo.clone(),
-                        state.folder_repo.clone(),
-                        state.doc_repo.s3().clone(),
-                        state.import_repo.clone(),
-                        state.user_repo.clone(),
-                        state.quip_token_store.clone(),
-                        None,
-                    ));
+                    let ctx = std::sync::Arc::new(
+                        ogrenotes_api::worker_mode::WorkerCtx::new(
+                            state.doc_repo.clone(),
+                            state.folder_repo.clone(),
+                            state.doc_repo.s3().clone(),
+                            state.import_repo.clone(),
+                            state.user_repo.clone(),
+                            state.quip_token_store.clone(),
+                            None,
+                        )
+                        .with_reindex(ogrenotes_api::search_reindex::ReindexPublisher::new(
+                            state.redis.clone(),
+                            ogrenotes_api::search_reindex::stream_key(&config.job_stream_name),
+                        )),
+                    );
                     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
                     ogrenotes_api::worker_mode::spawn_workers(
                         queue,

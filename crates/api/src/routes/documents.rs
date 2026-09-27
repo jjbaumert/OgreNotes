@@ -4681,12 +4681,19 @@ fn spawn_delete_embeddings(state: &AppState, doc_id: String) {
 /// Loads the latest snapshot + pending updates, extracts text, and indexes
 /// in both Tantivy (BM25) and the embedding pipeline (vectors).
 pub(crate) fn spawn_index_document(state: &AppState, meta: DocumentMeta) {
-    let doc_repo = state.doc_repo.clone();
-    let search_index = state.search_index.clone();
-    let state_for_embed = state.clone();
-    let meta_for_embed = meta.clone();
+    let state = state.clone();
+    tokio::spawn(async move { index_document_now(&state, meta, true).await });
+}
+
+/// The body of [`spawn_index_document`], awaited in place. `embed = false`
+/// updates only this process's Tantivy index and leaves the shared vector
+/// store alone — for callers that re-index documents some other process
+/// already embedded (the #138 reindex stream's boot catch-up).
+pub(crate) async fn index_document_now(state: &AppState, meta: DocumentMeta, embed: bool) {
+    let doc_repo = &state.doc_repo;
+    let search_index = &state.search_index;
     let max_pending_bytes = state.config.max_pending_updates_bytes;
-    tokio::spawn(async move {
+    {
         let snapshot = match doc_repo.load_snapshot(&meta.doc_id).await {
             Ok(Some(s)) => s,
             _ => return,
@@ -4739,8 +4746,10 @@ pub(crate) fn spawn_index_document(state: &AppState, meta: DocumentMeta) {
             tracing::error!(doc_id = %meta.doc_id, error = %e, "failed to index document");
         }
 
-        spawn_embed_document(&state_for_embed, meta_for_embed, plain_text);
-    });
+        if embed {
+            spawn_embed_document(state, meta, plain_text);
+        }
+    }
 }
 
 /// Fire-and-forget: index a document from raw state bytes (no snapshot load needed).

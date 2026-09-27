@@ -15,6 +15,7 @@ pub mod observability;
 pub mod redis_session;
 pub mod routes;
 pub mod scim;
+pub mod search_reindex;
 pub mod seed;
 pub mod state;
 pub mod trash_cleanup;
