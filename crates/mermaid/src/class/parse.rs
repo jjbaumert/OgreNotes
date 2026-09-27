@@ -391,6 +391,13 @@ impl Parser {
         if rest.contains('[') {
             return None;
         }
+        // Same for a member block: `class A { }` / `class A {}` would
+        // otherwise split into ids `A {` / `A` and a style named `}` /
+        // `{}` — the second silently tagging A with a bogus class.
+        // Braces never appear in an assignment either.
+        if rest.contains('{') {
+            return None;
+        }
         // Declaration form (single id, optional `{` / `["label"]`): not an
         // assignment. Assignment needs a trailing style name after a space.
         let (ids, name) = rest.rsplit_once(char::is_whitespace)?;
@@ -459,6 +466,19 @@ impl Parser {
         }
         if after == "{" {
             self.block = Some((idx, self.line));
+            return Ok(());
+        }
+        // The whole block on one line: `class A {}`, `class A { }`, or
+        // `class A { +x int }` (one member — the multi-line block is the
+        // only form that separates several).
+        if let Some(body) = after.strip_prefix('{').and_then(|b| b.strip_suffix('}')) {
+            let body = body.trim();
+            if body.contains('{') || body.contains('}') {
+                return Err(self.err("nested `{` in a class member block is not supported"));
+            }
+            if !body.is_empty() {
+                Self::apply_member(&mut self.g.classes[idx], body);
+            }
             return Ok(());
         }
         Err(self.err(format!("unexpected text after class id: {after:?}")))
@@ -904,6 +924,28 @@ mod tests {
         // Markdown-string label: backticks stripped.
         let g3 = p("classDiagram\nclass C[\"`Markdown`\"]");
         assert_eq!(g3.classes[0].display.as_deref(), Some("Markdown"));
+    }
+
+    /// #32: the member block on the same line as `class`. `class A {}`
+    /// used to be read as a style assignment, tagging A with a bogus
+    /// class named `{}`; `class A { }` errored on the id `A {`.
+    #[test]
+    fn same_line_member_block() {
+        for src in ["classDiagram\nclass A {}", "classDiagram\nclass A { }"] {
+            let g = p(src);
+            assert_eq!(g.classes.len(), 1, "{src}");
+            assert_eq!(g.classes[0].id, "A");
+            assert!(g.classes[0].classes.is_empty(), "no style class from the braces: {src}");
+            assert!(g.classes[0].attributes.is_empty() && g.classes[0].methods.is_empty());
+        }
+        let g = p("classDiagram\nclass A { +x int }\nA --> B");
+        assert_eq!(g.classes[0].attributes, vec!["+x int"]);
+        let g = p("classDiagram\nclass A { +run() }");
+        assert_eq!(g.classes[0].methods.len(), 1);
+        assert!(parse("classDiagram\nclass A { { }").is_err());
+        // An open block is still the multi-line form.
+        let g = p("classDiagram\nclass A {\n+y int\n}");
+        assert_eq!(g.classes[0].attributes, vec!["+y int"]);
     }
 
     #[test]

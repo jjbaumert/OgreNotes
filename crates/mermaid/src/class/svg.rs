@@ -17,11 +17,17 @@ use crate::escape_xml;
 use crate::layout::Layout;
 use crate::measure;
 
-/// Position of a relation-end multiplicity label: 14px along the path
-/// inward from the endpoint, offset 10px perpendicular, computed from
+/// Position of a relation-end multiplicity label: up to 14px along the
+/// path inward from the endpoint, offset 10px perpendicular, computed from
 /// the first (resp. last) segment's unit vector. Zero-length segments
 /// (and paths too short to have a segment at all) fall back to the
 /// endpoint itself.
+///
+/// The perpendicular is taken against the edge's own start→end direction
+/// at *both* ends, so the two labels sit on the same side of the line
+/// (#32: taking it against the inward direction flipped the side between
+/// the ends). The along-path offset is capped at half the segment, so a
+/// short segment can't carry the label past its far end (#32).
 fn mult_pos(points: &[(f64, f64)], at_start: bool) -> (f64, f64) {
     if points.len() < 2 {
         return points.first().copied().unwrap_or((0.0, 0.0));
@@ -37,10 +43,19 @@ fn mult_pos(points: &[(f64, f64)], at_start: bool) -> (f64, f64) {
     if len < 1e-9 {
         return p0;
     }
+    // Inward unit vector, from the endpoint along its segment.
     let (ux, uy) = (dx / len, dy / len);
-    let (px, py) = (-uy, ux);
-    (p0.0 + ux * 14.0 + px * 10.0, p0.1 + uy * 14.0 + py * 10.0)
+    // Edge direction: inward at the start, outward at the end.
+    let (ex, ey) = if at_start { (ux, uy) } else { (-ux, -uy) };
+    let (px, py) = (-ey, ex);
+    let along = MULT_ALONG.min(len / 2.0);
+    (p0.0 + ux * along + px * MULT_ACROSS, p0.1 + uy * along + py * MULT_ACROSS)
 }
+
+/// How far a multiplicity label sits along the path from its endpoint.
+const MULT_ALONG: f64 = 14.0;
+/// How far it sits off the path, perpendicular.
+const MULT_ACROSS: f64 = 10.0;
 
 /// Post-layout note-box geometry: an attached note sits to the right of its
 /// class; floating notes tile in a row below the diagram. Notes only extend
@@ -320,6 +335,38 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
 #[cfg(test)]
 mod tests {
     use crate::class::render_class;
+
+    use super::mult_pos;
+
+    /// Signed side of `pt` relative to the directed line a→b.
+    fn side(a: (f64, f64), b: (f64, f64), pt: (f64, f64)) -> f64 {
+        (b.0 - a.0) * (pt.1 - a.1) - (b.1 - a.1) * (pt.0 - a.0)
+    }
+
+    /// #32: both ends' labels sit on the same side of the edge.
+    #[test]
+    fn multiplicities_sit_on_the_same_side_of_the_edge() {
+        for pts in [
+            vec![(0.0, 0.0), (100.0, 0.0)],
+            vec![(0.0, 0.0), (0.0, 100.0)],
+            vec![(0.0, 0.0), (50.0, 0.0), (50.0, 80.0)],
+        ] {
+            let n = pts.len();
+            let s = side(pts[0], pts[1], mult_pos(&pts, true));
+            let e = side(pts[n - 2], pts[n - 1], mult_pos(&pts, false));
+            assert!(s * e > 0.0, "same side for {pts:?}: {s} vs {e}");
+        }
+    }
+
+    /// #32: a short segment can't carry the label past its far end.
+    #[test]
+    fn multiplicity_stays_within_a_short_segment() {
+        let pts = [(0.0, 0.0), (10.0, 0.0)];
+        let (x, _) = mult_pos(&pts, true);
+        assert!(x <= 5.0 + 1e-9, "capped at half the 10px segment: {x}");
+        let (x, _) = mult_pos(&pts, false);
+        assert!(x >= 5.0 - 1e-9, "{x}");
+    }
 
     #[test]
     fn class_with_members_renders_compartments() {
