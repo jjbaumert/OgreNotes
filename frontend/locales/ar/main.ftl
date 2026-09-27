@@ -277,6 +277,7 @@ duplicate-name-label = الاسم
 duplicate-destination-label = مجلد الوجهة
 duplicate-confirm = تكرار
 duplicate-share-warning = هذا المجلد مشترك — لدى { $count } أشخاص آخرين حق الوصول وسيرون النسخة.
+duplicate-failed = تعذّر تكرار المستند. يُرجى المحاولة مرة أخرى.
 # Focus/expand toggle (#134)
 document-focus-enter = وضع التركيز
 document-focus-exit = إنهاء وضع التركيز

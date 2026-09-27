@@ -3602,44 +3602,69 @@ pub fn DocumentPage() -> impl IntoView {
                 on_confirm=Callback::new(move |(new_name, folder): (String, String)| {
                     set_duplicate_dialog_visible.set(false);
                     let old_id = current_id.get_untracked();
-                    let source_doc_type = doc_type.get_untracked();
-                    // Snapshot the *current in-memory* content. get_content(old_id)
-                    // races the source's async WS persistence and could return
-                    // content without the just-typed edits (duplicateCopiedContent
-                    // doctor failure). The live editor_state always has them.
-                    let local_bytes = editor_state
-                        .get_untracked()
-                        .map(|s| crate::editor::yrs_bridge::doc_to_ydoc_bytes(&s.doc));
+                    // #140: duplicate through the server's /copy, which
+                    // re-homes image blobs under the new doc id (a client-side
+                    // create + put_content left `blobs/{old_id}/…` refs and
+                    // blank images). /copy reads the server snapshot, which
+                    // can lag the source's async WS persistence
+                    // (duplicateCopiedContent), so an editor first flushes
+                    // the live in-memory state: a 2xx means the snapshot
+                    // holds the click-time content, and CRDT idempotence
+                    // makes any later-replayed updates a no-op.
+                    let flush_bytes = if can_edit.get_untracked() {
+                        editor_state
+                            .get_untracked()
+                            .map(|s| crate::editor::yrs_bridge::doc_to_ydoc_bytes(&s.doc))
+                    } else {
+                        // A viewer holds no unsaved edits of their own, and
+                        // put_content would 403; copy what the server has.
+                        None
+                    };
                     leptos::task::spawn_local(async move {
-                        let created = match source_doc_type.as_str() {
-                            "spreadsheet" => {
-                                documents::create_spreadsheet(&new_name, Some(&folder)).await
+                        let alert_failed = || {
+                            if let Some(w) = web_sys::window() {
+                                let _ = w.alert_with_message(&crate::t!("duplicate-failed"));
                             }
-                            "presentation" => {
-                                documents::create_presentation(&new_name, Some(&folder)).await
-                            }
-                            _ => documents::create_document(&new_name, Some(&folder)).await,
                         };
-                        match created {
-                            Ok(doc) => {
-                                // Prefer the local snapshot; fall back to the server
-                                // copy only if the editor state wasn't available.
-                                let bytes = match local_bytes {
-                                    Some(b) => Some(b),
-                                    None => documents::get_content(&old_id).await.ok(),
-                                };
-                                if let Some(bytes) = bytes {
-                                    if let Err(e) = documents::put_content(&doc.id, &bytes).await {
+                        if let Some(bytes) = flush_bytes {
+                            // Retry a concurrent-writer 409 the way autosave
+                            // does. Never fall back to a plain /copy after a
+                            // failed flush: that silently drops the unsaved
+                            // edits the flush exists to capture.
+                            let mut attempts = 0;
+                            loop {
+                                attempts += 1;
+                                match documents::put_content(&old_id, &bytes).await {
+                                    Ok(()) => break,
+                                    Err(crate::api::client::ApiClientError::Http(409, _))
+                                        if attempts < 3 =>
+                                    {
+                                        gloo_timers::future::TimeoutFuture::new(100).await;
+                                    }
+                                    Err(e) => {
                                         web_sys::console::error_1(
-                                            &format!("Duplicate: put_content failed: {e}").into(),
+                                            &format!("Duplicate: flushing the source failed: {e}")
+                                                .into(),
                                         );
+                                        alert_failed();
+                                        return;
                                     }
                                 }
-                                hard_navigate(&format!("/d/{}", doc.id));
                             }
-                            Err(e) => web_sys::console::error_1(
-                                &format!("Duplicate failed: {e}").into(),
-                            ),
+                        }
+                        let req = documents::CopyDocumentRequest {
+                            title: Some(new_name),
+                            folder_id: Some(folder),
+                            values: None,
+                        };
+                        match documents::copy_document(&old_id, &req).await {
+                            Ok(doc) => hard_navigate(&format!("/d/{}", doc.id)),
+                            Err(e) => {
+                                web_sys::console::error_1(
+                                    &format!("Duplicate failed: {e}").into(),
+                                );
+                                alert_failed();
+                            }
                         }
                     });
                 })

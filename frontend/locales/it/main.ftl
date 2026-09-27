@@ -272,6 +272,7 @@ duplicate-name-label = Nome
 duplicate-destination-label = Cartella di destinazione
 duplicate-confirm = Duplica
 duplicate-share-warning = Questa cartella è condivisa: altre { $count } persone hanno accesso e vedranno la copia.
+duplicate-failed = Impossibile duplicare il documento. Riprova.
 # Focus/expand toggle (#134)
 document-focus-enter = Modalità focus
 document-focus-exit = Esci dalla modalità focus

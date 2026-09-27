@@ -16,11 +16,9 @@ const DEFAULT_BASE: &str = "https://platform.quip.com";
 /// pathological attachment exhausting worker memory, mirroring
 /// `crates/collab/src/import_pdf.rs`'s `MAX_PDF_BYTES` posture. Checked
 /// against `Content-Length` when present (short-circuits before download)
-/// and again against the actual received length. A chunked or
-/// header-less response skips the short-circuit and is only caught by
-/// the post-read check, meaning `reqwest` will have buffered the full
-/// (oversized) body into memory before the error is raised — accepted,
-/// same posture as `import_pdf.rs`, given Quip is a fixed trusted host.
+/// and again while the body is read: `read_capped` pulls it chunk by
+/// chunk and stops at the cap, so a chunked or header-less response is
+/// never buffered past it (#159).
 const MAX_BLOB_BYTES: usize = 32 * 1024 * 1024;
 
 /// Upper bound on the number of `/2/threads/{id}/html` pages fetched for a
@@ -30,6 +28,20 @@ const MAX_BLOB_BYTES: usize = 32 * 1024 * 1024;
 /// document we cannot fetch in full is a failure, not something to truncate
 /// silently) rather than returning a partial body.
 const MAX_HTML_PAGES: usize = 100;
+
+/// Upper bound on any one JSON API response body, including a single
+/// `/2/threads/{id}/html` page. Read in chunks and refused as soon as it is
+/// crossed, so an oversized body is never buffered whole (#159).
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Upper bound on a thread's HTML summed across every page. Without it the
+/// per-page cap times `MAX_HTML_PAGES` would still allow ~1.6 GB. Over the
+/// cap is a per-thread failure, the same as the page cap (#159).
+const MAX_THREAD_HTML_BYTES: usize = 16 * 1024 * 1024;
+
+/// How much of a non-2xx response body is kept as the error message. The
+/// rest is dropped: it is diagnostic text, not data (#159).
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 // ─── Error ─────────────────────────────────────────────────────
 
@@ -361,6 +373,7 @@ impl QuipClient {
 
             let page: ThreadHtmlPage = self.observe_and_check(resp).await?.json_body().await?;
             html.push_str(&page.html);
+            check_thread_html_size(html.len())?;
 
             cursor = page.response_metadata.next_cursor;
             if cursor.is_empty() {
@@ -435,7 +448,7 @@ impl QuipClient {
             });
         }
 
-        let message = resp.text().await.unwrap_or_default();
+        let message = read_error_body(resp).await;
         Err(QuipError::Api {
             status: status.as_u16(),
             message,
@@ -450,25 +463,12 @@ struct Checked(reqwest::Response);
 
 impl Checked {
     async fn json_body<T: for<'de> Deserialize<'de>>(self) -> Result<T, QuipError> {
-        self.0
-            .json::<T>()
-            .await
-            .map_err(|e| QuipError::Parse(e.to_string()))
-    }
-
-    async fn text_body(self) -> Result<String, QuipError> {
-        self.0
-            .text()
-            .await
-            .map_err(|e| QuipError::Parse(e.to_string()))
+        let bytes = read_capped(self.0, MAX_RESPONSE_BYTES).await?;
+        serde_json::from_slice(&bytes).map_err(|e| QuipError::Parse(e.to_string()))
     }
 
     async fn bytes_body(self) -> Result<Vec<u8>, QuipError> {
-        self.0
-            .bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| QuipError::Parse(e.to_string()))
+        read_capped(self.0, MAX_BLOB_BYTES).await
     }
 
     /// The `Content-Length` response header, if present and parseable.
@@ -476,6 +476,60 @@ impl Checked {
     fn content_length(&self) -> Option<u64> {
         self.0.content_length()
     }
+}
+
+/// Read a response body, refusing it once it passes `max` bytes. The
+/// `Content-Length` header short-circuits before anything is read; the body
+/// is then pulled chunk by chunk so a chunked or header-less response that
+/// lies about (or omits) its length is stopped at the cap rather than
+/// buffered whole (#159). Exactly `max` bytes is allowed.
+async fn read_capped(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>, QuipError> {
+    if let Some(len) = resp.content_length()
+        && len > max as u64
+    {
+        return Err(QuipError::Parse(format!(
+            "response is {len} bytes (Content-Length); exceeds the {max}-byte limit"
+        )));
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| QuipError::Parse(e.to_string()))?
+    {
+        if buf.len() + chunk.len() > max {
+            return Err(QuipError::Parse(format!(
+                "response exceeds the {max}-byte limit"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// The text of a non-2xx response, truncated to `MAX_ERROR_BODY_BYTES`.
+/// Never fails: an unreadable body yields what was read so far.
+async fn read_error_body(mut resp: reqwest::Response) -> String {
+    let mut buf = Vec::new();
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        let room = MAX_ERROR_BODY_BYTES - buf.len();
+        buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if buf.len() >= MAX_ERROR_BODY_BYTES {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Refuse a thread whose HTML, summed across pages, passes
+/// `MAX_THREAD_HTML_BYTES`.
+fn check_thread_html_size(total_len: usize) -> Result<(), QuipError> {
+    if total_len > MAX_THREAD_HTML_BYTES {
+        return Err(QuipError::Parse(format!(
+            "thread HTML is over {MAX_THREAD_HTML_BYTES} bytes; refusing to import it"
+        )));
+    }
+    Ok(())
 }
 
 /// Enforce the `MAX_BLOB_BYTES` ceiling. Split out of `blob()` so both
@@ -890,6 +944,58 @@ mod tests {
             .unwrap_err();
         assert!(matches!(e, QuipError::Unauthorized));
         assert!(!format!("{e}").contains("SEEKRET"));
+    }
+
+    async fn get_body(server: &MockServer, body: Vec<u8>) -> reqwest::Response {
+        Mock::given(path("/body"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(server)
+            .await;
+        reqwest::get(format!("{}/body", server.uri())).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_capped_allows_a_body_exactly_at_the_cap() {
+        let server = MockServer::start().await;
+        let resp = get_body(&server, vec![b'x'; 100]).await;
+        assert_eq!(read_capped(resp, 100).await.unwrap().len(), 100);
+    }
+
+    #[tokio::test]
+    async fn read_capped_refuses_a_body_over_the_cap() {
+        let server = MockServer::start().await;
+        let resp = get_body(&server, vec![b'x'; 101]).await;
+        let e = read_capped(resp, 100).await.unwrap_err();
+        assert!(matches!(e, QuipError::Parse(ref m) if m.contains("100-byte limit")), "{e}");
+    }
+
+    #[tokio::test]
+    async fn an_error_body_is_truncated_not_buffered_whole() {
+        let server = MockServer::start().await;
+        Mock::given(path("/2/threads/t1/html"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_bytes(vec![b'e'; MAX_ERROR_BODY_BYTES * 2]),
+            )
+            .mount(&server)
+            .await;
+        let c = QuipClient::new(Some(server.uri()));
+        let e = c.thread_html(&QuipToken::new("tok".into()), "t1").await.unwrap_err();
+        match e {
+            QuipError::Api { status, message } => {
+                assert_eq!(status, 500);
+                assert_eq!(message.len(), MAX_ERROR_BODY_BYTES, "#159: the error text is capped");
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thread_html_total_is_capped() {
+        assert!(check_thread_html_size(MAX_THREAD_HTML_BYTES).is_ok());
+        assert!(matches!(
+            check_thread_html_size(MAX_THREAD_HTML_BYTES + 1),
+            Err(QuipError::Parse(_))
+        ));
     }
 
     // `check_blob_size` is extracted from `blob()` specifically so the cap
