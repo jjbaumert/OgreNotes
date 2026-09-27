@@ -144,6 +144,12 @@ pub struct CopyDocumentRequest {
     pub folder_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub values: Option<serde_json::Value>,
+    /// #140: the document state to copy (standard base64 of Y.Doc state
+    /// bytes) when the caller holds a newer one than the server, e.g. the
+    /// editor's in-memory document. Absent → the server copies its own
+    /// current state of the source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 /// #142: duplicate a document the caller can read. Returns the new doc's
