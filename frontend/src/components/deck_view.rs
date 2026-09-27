@@ -2148,7 +2148,14 @@ pub fn DeckView(
             <div class="deck-view__pane">
                 <button
                     class="deck-present-btn"
-                    on:click=move |_| crate::nav_bridge::go(&format!("/d/{}/present", doc_id_for_present))
+                    on:click=move |_| {
+                        // #209: hand present mode the deck as shown here; a
+                        // REST re-fetch can race this edit's WS persistence.
+                        if let Some(state) = editor_state.get_untracked() {
+                            crate::presentation::handoff::stash(&doc_id_for_present, state.doc.clone());
+                        }
+                        crate::nav_bridge::go(&format!("/d/{}/present", doc_id_for_present))
+                    }
                 >
                     {crate::t!("deck-present")}
                 </button>

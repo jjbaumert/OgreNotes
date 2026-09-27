@@ -187,10 +187,18 @@ pub fn PresentPage() -> impl IntoView {
         crate::api::client::get_auth().map(|a| a.user_id).unwrap_or_default(),
     );
 
-    // Fetch once. Present mode is a read-only view of the deck as it
+    // Load once. Present mode is a read-only view of the deck as it
     // stands when the presenter opens it; live content sync arrives
     // with follow-the-presenter (next task).
-    {
+    //
+    // #209: coming from the editor, take the deck it was showing. A REST
+    // fetch here races the editor's WS persistence of the last edit and
+    // could load a half-persisted deck (an extra empty slide). REST remains
+    // the path for a direct load or refresh of this URL.
+    if let Some(node) = crate::presentation::handoff::take(&doc_id()) {
+        deck.set(deck_from_doc(&node));
+        set_loaded.set(true);
+    } else {
         let id = doc_id();
         leptos::task::spawn_local(async move {
             if let Ok(bytes) = crate::api::documents::get_content(&id).await {
