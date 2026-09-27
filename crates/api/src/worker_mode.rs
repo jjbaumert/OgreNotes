@@ -1738,6 +1738,90 @@ impl LookupFault {
 }
 
 impl PersonDirectory {
+    /// Decide ids that `/1/users/` omitted (#179).
+    ///
+    /// `<control>` wraps folder and thread chips as well as people, and an
+    /// omission is how Quip says "not a user you can see". That covers
+    /// documents, but also people who are deactivated, cross-org, or hidden
+    /// from this token, and rendering *those* as a "Missing document" chip is
+    /// the bug the person-mention feature exists to fix. So ask once more,
+    /// batched: an id Quip resolves as a thread or a folder is a document
+    /// ([`PersonFact::NotAPerson`]); an id it resolves as neither is a person
+    /// we cannot see, and degrades to their name ([`PersonFact::NoAccount`]).
+    ///
+    /// Conservative on failure. Only two *successful* answers that both omit
+    /// the id make it a person. A permanent rejection of either lookup keeps
+    /// the pre-#179 answer (a document link), so a document link can never
+    /// be lost to this extra step; a transient failure leaves the ids
+    /// undecided and returns the fault, like a failed `/1/users/` batch.
+    async fn classify_omitted(
+        &mut self,
+        import_id: &str,
+        client: &QuipClient,
+        token: &QuipToken,
+        omitted: &[String],
+    ) -> Option<LookupFault> {
+        let as_documents = |dir: &mut Self, ids: &[String]| {
+            for id in ids {
+                dir.known.insert(id.clone(), PersonFact::NotAPerson);
+            }
+        };
+        let threads = match client.thread_ids_that_resolve(token, omitted).await {
+            Ok(found) => found,
+            Err(e) => return self.omitted_lookup_failed(import_id, omitted, e, as_documents),
+        };
+        let rest: Vec<String> = omitted.iter().filter(|id| !threads.contains(*id)).cloned().collect();
+        let folders = match client.folder_ids_that_resolve(token, &rest).await {
+            Ok(found) => found,
+            Err(e) => {
+                let docs: Vec<String> =
+                    omitted.iter().filter(|id| threads.contains(*id)).cloned().collect();
+                as_documents(self, &docs);
+                return self.omitted_lookup_failed(import_id, &rest, e, as_documents);
+            }
+        };
+        for id in omitted {
+            let fact = if threads.contains(id) || folders.contains(id) {
+                PersonFact::NotAPerson
+            } else {
+                PersonFact::NoAccount
+            };
+            self.known.insert(id.clone(), fact);
+        }
+        None
+    }
+
+    /// A disambiguation lookup failed for `ids`. Permanent (a 4xx no retry
+    /// can change, including 403): keep the pre-#179 document answer.
+    /// Otherwise leave them undecided and report the fault.
+    fn omitted_lookup_failed(
+        &mut self,
+        import_id: &str,
+        ids: &[String],
+        e: QuipError,
+        as_documents: impl Fn(&mut Self, &[String]),
+    ) -> Option<LookupFault> {
+        tracing::warn!(
+            import_id,
+            ids = ids.len(),
+            error = %safe_quip_reason(&e),
+            "quip content: could not tell omitted person ids from documents",
+        );
+        match e {
+            QuipError::Unauthorized => Some(LookupFault::TokenRejected),
+            QuipError::RateLimited { .. } => Some(LookupFault::RateLimited),
+            QuipError::Forbidden => {
+                as_documents(self, ids);
+                None
+            }
+            e if is_permanent_lookup_failure(&e) => {
+                as_documents(self, ids);
+                None
+            }
+            _ => Some(LookupFault::Quip),
+        }
+    }
+
     /// Resolve `wanted` Quip person ids to OgreNotes user ids, consulting
     /// the cache first and asking Quip only about the remainder.
     ///
@@ -1865,14 +1949,16 @@ impl PersonDirectory {
                     continue;
                 }
             };
+            let omitted: Vec<String> =
+                chunk.iter().filter(|id| !profiles.contains_key(*id)).cloned().collect();
+            if !omitted.is_empty() {
+                if let Some(f) = self.classify_omitted(import_id, client, token, &omitted).await {
+                    fault = fault.max(Some(f));
+                }
+            }
             for id in chunk {
-                // Quip returned no profile for this id. It is not a person:
-                // `<control>` also wraps folder and thread chips, and this is
-                // the signal that tells them apart. No retry widens that, so
-                // decide it — and decide it as a *document*, which is what
-                // the walker would have produced without the wrapper.
+                // No profile: classified above by `classify_omitted`.
                 let Some(profile) = profiles.get(id) else {
-                    self.known.insert(id.clone(), PersonFact::NotAPerson);
                     continue;
                 };
                 // A profile came back, so this IS a person — just one we

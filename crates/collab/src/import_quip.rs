@@ -2960,19 +2960,15 @@ pub enum PersonOutcome {
     User(String),
     /// Quip confirms this is a person, but no OgreNotes account matches.
     NoAccount,
-    /// Quip returned no profile for the id — it is a folder or a thread that
-    /// happened to be wrapped in `<control>`.
+    /// Quip returned no profile for the id and resolved it as a thread or a
+    /// folder: a document chip that happened to be wrapped in `<control>`.
     ///
-    /// **KNOWN GAP (ticketed).** "Quip showed us no profile" is not only
-    /// true of non-people: a **deactivated, cross-org, or token-invisible
-    /// person** is omitted the same way, and lands here — becoming a
-    /// missing-document chip titled with their name, which is the literal
-    /// symptom #175 exists to fix. The two are separable with one extra
-    /// batched request per run: ask `/1/threads/?ids=` about the omitted
-    /// ids; an id that *is* a thread is a document, and an id that is
-    /// neither a user nor a thread is an invisible person and should degrade
-    /// to plain text. Deliberately not done on this branch — it is new API
-    /// surface, and shipping the verified part first was the call.
+    /// An omitted id is not automatically a document: a deactivated,
+    /// cross-org, or token-invisible person is omitted the same way. The
+    /// worker (`PersonDirectory::classify_omitted`, #179) asks `/1/threads/`
+    /// and `/1/folders/` about omitted ids and reports an id neither
+    /// resolves as [`Self::NoAccount`], so that person degrades to their
+    /// name instead of becoming a missing-document chip.
     NotAPerson,
 }
 
