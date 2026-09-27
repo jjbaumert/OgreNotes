@@ -59,7 +59,7 @@ pub fn DuplicateDialog(
             let me = match client::api_get::<UserMeResponse>("/users/me").await {
                 Ok(me) => me,
                 Err(e) => {
-                    error.set(Some(e.to_string()));
+                    let _ = error.try_set(Some(e.to_string()));
                     return;
                 }
             };
@@ -108,8 +108,9 @@ pub fn DuplicateDialog(
         if let Some(src) = src {
             if !folders.with_untracked(|m| m.contains_key(&src)) {
                 leptos::task::spawn_local(async move {
+                    // After an await: the dialog may be disposed (#235).
                     if let Ok(f) = folders::get_folder(&src).await {
-                        folders.update(|m| {
+                        let _ = folders.try_update(|m| {
                             m.insert(src, f);
                         });
                     }
@@ -130,16 +131,21 @@ pub fn DuplicateDialog(
         let me = me_id.get();
         leptos::task::spawn_local(async move {
             let result = crate::api::sharing::list_members(&folder).await;
-            if selected.get_untracked().as_deref() != Some(folder.as_str()) {
+            // After an await: a disposed dialog reads as `None` and bails
+            // here, and the writes below are no-ops (#235).
+            let Some(current) = selected.try_get_untracked() else {
+                return;
+            };
+            if current.as_deref() != Some(folder.as_str()) {
                 return;
             }
-            match result {
+            let _ = match result {
                 Ok(resp) => {
                     let others = resp.members.iter().filter(|m| m.user_id != me).count();
-                    share_others.set((others > 0).then_some(others));
+                    share_others.try_set((others > 0).then_some(others))
                 }
-                Err(_) => share_others.set(None),
-            }
+                Err(_) => share_others.try_set(None),
+            };
         });
     });
 
@@ -148,11 +154,16 @@ pub fn DuplicateDialog(
             return;
         }
         leptos::task::spawn_local(async move {
+            // After an await: the dialog may be disposed (#235).
             match folders::get_folder(&id).await {
-                Ok(f) => folders.update(|m| {
-                    m.insert(id, f);
-                }),
-                Err(e) => error.set(Some(e.to_string())),
+                Ok(f) => {
+                    let _ = folders.try_update(|m| {
+                        m.insert(id, f);
+                    });
+                }
+                Err(e) => {
+                    let _ = error.try_set(Some(e.to_string()));
+                }
             }
         });
     };
