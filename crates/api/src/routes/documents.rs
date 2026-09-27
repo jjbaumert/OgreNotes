@@ -1549,7 +1549,22 @@ async fn purge_document(
             .await;
     }
 
-    state.doc_repo.hard_delete(&id).await?;
+    // An S3 error from `hard_delete` means every DynamoDB row is already
+    // gone (it deletes those first), so the doc can no longer be reached —
+    // not even by a retry of this route, which 404s on the access check.
+    // Tidy the trash entry and the search index anyway, or they would
+    // point at a doc that no longer exists forever (#166). The error is
+    // still returned and no "purged" audit row is written.
+    if let Err(e) = state.doc_repo.hard_delete(&id).await {
+        if matches!(e, ogrenotes_storage::repo::RepoError::S3(_)) {
+            let _ = state
+                .folder_repo
+                .remove_child(&user.trash_folder_id, &id)
+                .await;
+            spawn_delete_from_index(&state, id);
+        }
+        return Err(e.into());
+    }
 
     let _ = state
         .folder_repo
