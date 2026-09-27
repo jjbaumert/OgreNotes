@@ -34,6 +34,15 @@ const MAX_HTML_PAGES: usize = 100;
 /// crossed, so an oversized body is never buffered whole (#159).
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Upper bound on a **batch** `?ids=` response (`/1/threads/`,
+/// `/1/folders/`, `/1/users/`). A `/1/threads/` batch carries every
+/// thread's full HTML alongside its metadata, so a 100-thread metadata
+/// chunk of ordinary documents can legitimately pass
+/// [`MAX_RESPONSE_BYTES`]. Refusing it would fail the whole metadata fetch
+/// (a regression from before #159), so batches get a larger, still finite,
+/// ceiling.
+const MAX_BATCH_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+
 /// Upper bound on a thread's HTML summed across every page. Without it the
 /// per-page cap times `MAX_HTML_PAGES` would still allow ~1.6 GB. Over the
 /// cap is a per-thread failure, the same as the page cap (#159).
@@ -244,7 +253,7 @@ impl QuipClient {
             .await?;
 
         let body: std::collections::HashMap<String, FolderEnvelope> =
-            self.observe_and_check(resp).await?.json_body().await?;
+            self.observe_and_check(resp).await?.json_batch_body().await?;
 
         Ok(body
             .into_values()
@@ -273,7 +282,7 @@ impl QuipClient {
             .await?;
 
         let body: std::collections::HashMap<String, ThreadEnvelope> =
-            self.observe_and_check(resp).await?.json_body().await?;
+            self.observe_and_check(resp).await?.json_batch_body().await?;
 
         Ok(body.into_values().map(|env| env.thread).collect())
     }
@@ -320,7 +329,7 @@ impl QuipClient {
             .send()
             .await?;
         let body: std::collections::HashMap<String, serde::de::IgnoredAny> =
-            self.observe_and_check(resp).await?.json_body().await?;
+            self.observe_and_check(resp).await?.json_batch_body().await?;
         Ok(body.into_keys().collect())
     }
 
@@ -368,7 +377,7 @@ impl QuipClient {
             .await?;
 
         let body: std::collections::HashMap<String, serde_json::Value> =
-            self.observe_and_check(resp).await?.json_body().await?;
+            self.observe_and_check(resp).await?.json_batch_body().await?;
 
         Ok(body
             .into_iter()
@@ -509,7 +518,17 @@ struct Checked(reqwest::Response);
 
 impl Checked {
     async fn json_body<T: for<'de> Deserialize<'de>>(self) -> Result<T, QuipError> {
-        let bytes = read_capped(self.0, MAX_RESPONSE_BYTES).await?;
+        self.json_capped(MAX_RESPONSE_BYTES).await
+    }
+
+    /// [`Self::json_body`] for a batch `?ids=` response; see
+    /// [`MAX_BATCH_RESPONSE_BYTES`].
+    async fn json_batch_body<T: for<'de> Deserialize<'de>>(self) -> Result<T, QuipError> {
+        self.json_capped(MAX_BATCH_RESPONSE_BYTES).await
+    }
+
+    async fn json_capped<T: for<'de> Deserialize<'de>>(self, max: usize) -> Result<T, QuipError> {
+        let bytes = read_capped(self.0, max).await?;
         serde_json::from_slice(&bytes).map_err(|e| QuipError::Parse(e.to_string()))
     }
 
