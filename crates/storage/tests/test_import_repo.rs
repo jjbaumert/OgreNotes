@@ -894,6 +894,7 @@ async fn report_counters_accumulate_across_calls() {
         owner,
         ReportNote {
             quip_thread_id: "qt1".to_string(),
+            title: None,
             kind: "skipped".to_string(),
             detail: "403 forbidden".to_string(),
         },
@@ -937,6 +938,7 @@ async fn report_notes_truncate_at_the_cap_while_counters_keep_counting() {
             owner,
             ReportNote {
                 quip_thread_id: format!("qt{i:04}"),
+                title: None,
                 kind: "failed".to_string(),
                 detail: "403 forbidden after 3 attempts".to_string(),
             },
@@ -954,6 +956,7 @@ async fn report_notes_truncate_at_the_cap_while_counters_keep_counting() {
         owner,
         ReportNote {
             quip_thread_id: "qt-late".to_string(),
+            title: None,
             kind: "skipped".to_string(),
             detail: "chat thread".to_string(),
         },

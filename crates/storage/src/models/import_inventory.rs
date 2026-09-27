@@ -247,6 +247,11 @@ pub struct ReportRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportNote {
     pub quip_thread_id: String,
+    /// The thread's title, stamped when the note is written (#161) so the
+    /// report names the document instead of an opaque id. `None` for notes
+    /// that are not thread-scoped and for notes written before #161.
+    /// Quip-authored text: render it as text, never as markup.
+    pub title: Option<String>,
     /// Coarse outcome class, e.g. `"skipped"`, `"failed"`,
     /// `"image_dropped"`, `"flat_folder_fallback"`.
     pub kind: String,
@@ -353,6 +358,7 @@ mod tests {
     fn note(kind: &str, i: usize) -> ReportNote {
         ReportNote {
             quip_thread_id: format!("qt{i:04}"),
+            title: None,
             kind: kind.to_string(),
             detail: "403 forbidden".into(),
         }

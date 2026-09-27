@@ -535,6 +535,7 @@ async fn get_status_surfaces_true_counter_totals_alongside_the_bounded_notes() {
             &owner_id,
             ReportNote {
                 quip_thread_id: format!("qt{i:04}"),
+                title: None,
                 kind: KIND_THREAD_SKIPPED.to_string(),
                 detail: "Quip denied access to this content (HTTP 403)".to_string(),
             },
@@ -548,6 +549,7 @@ async fn get_status_surfaces_true_counter_totals_alongside_the_bounded_notes() {
             &owner_id,
             ReportNote {
                 quip_thread_id: format!("qf{i}"),
+                title: None,
                 kind: KIND_THREAD_FAILED.to_string(),
                 detail: "Quip returned HTTP 500; gave up after 3 attempts".to_string(),
             },
@@ -661,6 +663,7 @@ async fn get_status_surfaces_every_recorded_loss_kind() {
             &owner_id,
             ReportNote {
                 quip_thread_id: id.to_string(),
+                title: None,
                 kind: kind.to_string(),
                 detail: detail.to_string(),
             },
@@ -772,6 +775,7 @@ async fn a_truncated_within_document_kind_still_reports_its_true_total() {
             &owner_id,
             ReportNote {
                 quip_thread_id: format!("qi{i:04}"),
+                title: None,
                 kind: KIND_IMAGE_DROPPED.to_string(),
                 detail: "image blob-9: Quip denied access (HTTP 403)".to_string(),
             },
@@ -859,6 +863,7 @@ async fn report_response_never_carries_a_token_field() {
             &owner_id,
             ReportNote {
                 quip_thread_id: "qt1".to_string(),
+                title: None,
                 kind: kind.to_string(),
                 detail: "Quip denied access to this content (HTTP 403)".to_string(),
             },

@@ -3892,3 +3892,35 @@ async fn an_omitted_id_that_resolves_as_a_thread_stays_a_document_link() {
         "the thread chip is recorded for the back-patch",
     );
 }
+
+/// #161: skipped and failed notes carry their thread's title, so the report
+/// names the document instead of an opaque Quip id.
+#[tokio::test]
+async fn report_notes_carry_the_thread_title() {
+    common::require_infra!();
+    let server = quip_server_with_thread_html_status("t1", 403).await;
+    Mock::given(method("GET"))
+        .and(path("/2/threads/t2/html"))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1").await;
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+
+    run_like_the_queue(&ctx, &import_id, "owner1").await;
+
+    let report = app.state.import_repo.get_report(&import_id).await.unwrap().expect("report");
+    let title_of = |id: &str| {
+        report
+            .notes
+            .iter()
+            .find(|n| n.quip_thread_id == id)
+            .unwrap_or_else(|| panic!("{id} must be named: {report:?}"))
+            .title
+            .clone()
+    };
+    assert_eq!(title_of("t1").as_deref(), Some("Doc A"), "the skipped thread is named");
+    assert_eq!(title_of("t2").as_deref(), Some("Sheet"), "the failed thread is named");
+}

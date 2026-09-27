@@ -217,6 +217,11 @@ pub struct ReportNote {
     /// inventory could not read). Rendered as `detail` alone in that case.
     #[serde(default)]
     pub quip_thread_id: String,
+    /// The thread's title, when the server recorded one (#161). Absent for
+    /// notes that are not thread-scoped and for reports written before #161.
+    /// Quip-authored plain text, rendered through a text node.
+    #[serde(default)]
+    pub title: Option<String>,
     #[serde(default)]
     pub detail: String,
 }

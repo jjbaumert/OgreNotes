@@ -1498,6 +1498,33 @@ async fn record_report_by(
 /// `quip-import`'s client tests — but they are spelled out here rather than
 /// borrowed from `Display` so that no future variant can quietly inherit the
 /// permissive branch.
+/// Longest title a report note carries, in characters (#161). The note list
+/// is budgeted (25 per kind) but a single pathological title should not
+/// bloat the REPORT row either.
+const REPORT_TITLE_MAX_CHARS: usize = 120;
+
+/// The thread's title as a report note shows it (#161): control characters
+/// dropped, whitespace collapsed, capped at [`REPORT_TITLE_MAX_CHARS`];
+/// `None` when nothing is left. It is the same Quip-authored text the
+/// imported document's own title is made from, so it carries nothing the
+/// user cannot already see.
+fn report_title(thread: &ThreadRow) -> Option<String> {
+    let cleaned: String = thread
+        .title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let mut chars = cleaned.chars();
+    let head: String = chars.by_ref().take(REPORT_TITLE_MAX_CHARS).collect();
+    Some(if chars.next().is_some() { format!("{head}…") } else { head })
+}
+
 fn safe_quip_reason(e: &QuipError) -> String {
     match e {
         QuipError::Unauthorized => "Quip rejected the import's credential (HTTP 401)".to_string(),
@@ -2557,6 +2584,7 @@ async fn run_content_pass(
                     report::THREADS_SKIPPED_FORBIDDEN,
                     Some(ReportNote {
                         quip_thread_id: thread.quip_thread_id.clone(),
+                        title: report_title(thread),
                         kind: report::KIND_THREAD_SKIPPED.to_string(),
                         detail: reason.clone(),
                     }),
@@ -2607,6 +2635,7 @@ async fn run_content_pass(
                         report::THREADS_FAILED,
                         Some(ReportNote {
                             quip_thread_id: thread.quip_thread_id.clone(),
+                            title: report_title(thread),
                             kind: report::KIND_THREAD_FAILED.to_string(),
                             detail,
                         }),
@@ -2835,6 +2864,7 @@ pub async fn import_one_thread(
             report::THREADS_TRUNCATED,
             Some(ReportNote {
                 quip_thread_id: thread.quip_thread_id.clone(),
+                title: report_title(thread),
                 kind: report::KIND_CONTENT_TRUNCATED.to_string(),
                 detail: format!(
                     "nesting deeper than {} levels was flattened in {} place(s); \
@@ -2866,6 +2896,7 @@ pub async fn import_one_thread(
             quip_doc.live_apps_dropped as u64,
             Some(ReportNote {
                 quip_thread_id: thread.quip_thread_id.clone(),
+                title: report_title(thread),
                 kind: report::KIND_LIVE_APP_DROPPED.to_string(),
                 detail: format!(
                     "{} embedded Quip live app(s) — a Kanban board or similar — could not be \
@@ -2886,6 +2917,7 @@ pub async fn import_one_thread(
             quip_doc.formulas_dropped as u64,
             Some(ReportNote {
                 quip_thread_id: thread.quip_thread_id.clone(),
+                title: report_title(thread),
                 kind: report::KIND_FORMULAS_DROPPED.to_string(),
                 detail: format!(
                     "{} spreadsheet formula(s) were not imported; the cells keep the values \
@@ -2957,6 +2989,7 @@ pub async fn import_one_thread(
                 report::THREADS_MENTIONS_DEGRADED,
                 Some(ReportNote {
                     quip_thread_id: thread.quip_thread_id.clone(),
+                    title: report_title(thread),
                     kind: report::KIND_MENTIONS_DEGRADED.to_string(),
                     detail: "the Quip person-lookup endpoint rejected this import's requests; \
                              @mentions from here on are imported as plain text names rather \
@@ -3291,6 +3324,7 @@ async fn drop_image(
         report::IMAGES_DROPPED,
         Some(ReportNote {
             quip_thread_id: thread.quip_thread_id.clone(),
+            title: report_title(thread),
             kind: report::KIND_IMAGE_DROPPED.to_string(),
             detail: detail.to_string(),
         }),
@@ -3386,6 +3420,7 @@ async fn mark_quip_failure(
                     // refused. The empty id is what "not thread-scoped" looks
                     // like on a `ReportNote`.
                     quip_thread_id: String::new(),
+                    title: None,
                     kind: report::KIND_THREAD_SKIPPED.to_string(),
                     detail: format!(
                         "{}; a selected folder could not be read, so the import could not be \
@@ -3492,6 +3527,22 @@ mod tests {
     use super::*;
     use ogrenotes_storage::models::import_inventory::FolderRow;
     use std::collections::BTreeSet;
+
+    fn thread_titled(title: &str) -> ThreadRow {
+        ThreadRow { title: title.to_string(), ..thread("t1", &[]) }
+    }
+
+    /// #161: the title a report note shows is cleaned and capped.
+    #[test]
+    fn report_title_is_cleaned_and_capped() {
+        assert_eq!(report_title(&thread_titled("  Q3\n plan \t")).as_deref(), Some("Q3 plan"));
+        assert_eq!(report_title(&thread_titled("a\u{7}b")).as_deref(), Some("ab"));
+        assert_eq!(report_title(&thread_titled("   ")), None);
+        let long = "x".repeat(REPORT_TITLE_MAX_CHARS + 5);
+        let capped = report_title(&thread_titled(&long)).unwrap();
+        assert_eq!(capped.chars().count(), REPORT_TITLE_MAX_CHARS + 1, "cap plus the ellipsis");
+        assert!(capped.ends_with('…'));
+    }
 
     // #144: the reaper spawns reclaimed jobs instead of running them
     // inline. These pin the bookkeeping that keeps that bounded and
