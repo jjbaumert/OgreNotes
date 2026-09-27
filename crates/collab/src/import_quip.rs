@@ -421,6 +421,10 @@ pub(crate) enum QuipBlock {
     Image {
         src: String,
         alt: String,
+        /// Authored display size in CSS pixels, when the source gave a
+        /// usable one (#194 F-11). See [`image_dimension`].
+        width: Option<u32>,
+        height: Option<u32>,
         section_id: Option<String>,
     },
 }
@@ -509,11 +513,14 @@ fn allowed_tags() -> HashSet<&'static str> {
 /// no yrs node and no rendered HTML, so the string is stored and compared,
 /// never interpreted; the same is already true of every `id` this allowlist
 /// admits, which is the identical trust question.
+///
+/// `width` and `height` (#194 F-11) clear the same bar, and are only read
+/// through [`image_dimension`], which keeps nothing but a bounded integer.
 fn allowed_attributes() -> HashSet<&'static str> {
     [
         "id", "href", "src", "alt", "title", "type", "checked", "value",
         "colspan", "rowspan", "class", "start", "align", "formula",
-        ANNOTATION_ATTR,
+        "width", "height", ANNOTATION_ATTR,
     ]
     .into_iter()
     .collect()
@@ -1515,6 +1522,8 @@ fn walk_element(
             out.push(QuipBlock::Image {
                 src: attr(handle, "src").unwrap_or_default(),
                 alt: attr(handle, "alt").unwrap_or_default(),
+                width: attr(handle, "width").as_deref().and_then(image_dimension),
+                height: attr(handle, "height").as_deref().and_then(image_dimension),
                 section_id: section_id(handle),
             });
         }
@@ -2230,6 +2239,27 @@ fn is_quip_host(host: &str) -> bool {
 }
 
 // ─── DOM helpers ─────────────────────────────────────────────────
+
+/// Largest image dimension kept from the source. Anything bigger is
+/// not a real authored size, and the view caps display width at the
+/// column anyway.
+const MAX_IMAGE_DIMENSION: u32 = 20_000;
+
+/// Parse an `<img>` `width`/`height` value into CSS pixels (#194 F-11).
+/// HTML allows a bare non-negative integer; a trailing `px` is accepted
+/// because it costs nothing. Percentages, zero, fractions, and anything
+/// over [`MAX_IMAGE_DIMENSION`] are dropped — the image then renders at
+/// its natural size, which is what happened before this was read at all.
+fn image_dimension(raw: &str) -> Option<u32> {
+    let v = raw.trim();
+    let v = v.strip_suffix("px").unwrap_or(v).trim_end();
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    v.parse::<u32>()
+        .ok()
+        .filter(|n| (1..=MAX_IMAGE_DIMENSION).contains(n))
+}
 
 fn attr(handle: &markup5ever_rcdom::Handle, name: &str) -> Option<String> {
     use markup5ever_rcdom::NodeData;
@@ -3157,7 +3187,7 @@ fn materialize_block(
                 }
             }
         }
-        QuipBlock::Image { src, alt, section_id } => {
+        QuipBlock::Image { src, alt, width, height, section_id } => {
             let el = insert_block(txn, parent, parent_type, NodeType::Image);
             // Left as the raw Quip value on purpose — the blob
             // side-load pass rewrites it to a durable blob reference,
@@ -3165,6 +3195,12 @@ fn materialize_block(
             el.insert_attribute(txn, "src", src.clone());
             if !alt.is_empty() {
                 el.insert_attribute(txn, "alt", alt.clone());
+            }
+            if let Some(w) = width {
+                el.insert_attribute(txn, "width", w.to_string());
+            }
+            if let Some(h) = height {
+                el.insert_attribute(txn, "height", h.to_string());
             }
             side.record_section(&*txn, &el, section_id.as_ref());
             side.images.push(QuipImageRef {
@@ -4945,6 +4981,34 @@ mod tests {
         assert_eq!(grid, vec![vec![(false, "1".into()), (false, "as".into())]], "{grid:?}");
     }
 
+    // ─── image dimensions (#194 F-11) ─────────────────────────
+
+    #[test]
+    fn an_image_keeps_its_authored_dimensions() {
+        let out = from_quip_html("<img src='https://quip.com/blob/T/b' width='320' height='180'>");
+        let xml = doc_xml(&out);
+        assert!(xml.contains("width=\"320\""), "{xml}");
+        assert!(xml.contains("height=\"180\""), "{xml}");
+    }
+
+    #[test]
+    fn an_image_without_dimensions_gets_no_size_attributes() {
+        let out = from_quip_html("<img src='https://quip.com/blob/T/b'>");
+        let xml = doc_xml(&out);
+        assert!(!xml.contains("width="), "{xml}");
+        assert!(!xml.contains("height="), "{xml}");
+    }
+
+    #[test]
+    fn image_dimension_keeps_only_bounded_pixel_integers() {
+        assert_eq!(image_dimension("320"), Some(320));
+        assert_eq!(image_dimension(" 320px "), Some(320));
+        assert_eq!(image_dimension("20000"), Some(20_000));
+        for bad in ["", "0", "50%", "12.5", "-4", "20001", "1e3", "px", "99999999999"] {
+            assert_eq!(image_dimension(bad), None, "{bad:?}");
+        }
+    }
+
     // ─── containment / hoisting ──────────────────────────────
 
     #[test]
@@ -5045,6 +5109,8 @@ mod tests {
                 blocks: vec![QuipBlock::Image {
                     src: "x".into(),
                     alt: String::new(),
+                    width: None,
+                    height: None,
                     section_id: None,
                 }],
             }],

@@ -1697,6 +1697,14 @@ pub(crate) fn build_image_element(
     if let Some(alt) = attrs.get("alt") {
         el.set_attribute("alt", alt).ok()?;
     }
+    // Authored display size (Quip import, #194 F-11). Only a positive
+    // integer is passed through; the stylesheet keeps `max-width: 100%`
+    // with `height: auto`, so a wide image still fits its column.
+    for dim in ["width", "height"] {
+        if let Some(n) = attrs.get(dim).and_then(|v| v.parse::<u32>().ok()).filter(|n| *n > 0) {
+            el.set_attribute(dim, &n.to_string()).ok()?;
+        }
+    }
     Some(el)
 }
 
