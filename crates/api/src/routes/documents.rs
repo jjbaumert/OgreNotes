@@ -109,7 +109,8 @@ pub fn router() -> Router<AppState> {
         // #142: mark / unmark a doc as a template; copy any source doc into
         // a new doc in the caller's Private folder.
         .route("/{id}/template", put(set_template))
-        .route("/{id}/copy", post(copy_document))
+        .route("/{id}/copy", post(copy_document)
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_COPY_BODY_SIZE)))
         .route("/{id}/request-access", post(request_access))
         // #144: star / unstar a document for the current user.
         .route("/{id}/favorite", put(add_favorite).delete(remove_favorite))
@@ -1635,6 +1636,53 @@ async fn get_content(
 }
 
 /// PUT /documents/:id/content -- save Y.Doc state as binary.
+/// Phase 2a — LiveApp attribute gate for a whole document state uploaded
+/// over REST (`put_content`, and `/copy` with client-supplied content).
+/// Walk the reconstructed doc and enforce block-attribute schema in the
+/// same three states as the WS path (off / log / reject).
+fn check_liveapp_rest(state: &AppState, doc_id: &str, doc: &OgreDoc) -> Result<(), ApiError> {
+    // REST full-state uploads are lower-cadence than WS incremental
+    // updates, so the walk cost is not on any hot path.
+    //
+    // gap-001 exemption: same escape hatch as the WS handler — if
+    // this doc's id is in the operator-set exempt list, skip the
+    // gate entirely for this write. Lets an operator repair a
+    // doc whose current attrs would block every WS write.
+    let liveapp_mode = if state.config.liveapp_gate_exempt_doc_ids.contains(doc_id) {
+        counter::inc(MetricKey::new(
+            "liveapp.gate_exempted_total",
+            &[("path", "rest"), ("doc_id", doc_id)],
+        ));
+        ogrenotes_collab::blocks::LiveAppValidationMode::Off
+    } else {
+        ogrenotes_collab::blocks::LiveAppValidationMode::from_env_value(
+            Some(state.config.liveapp_strict_validation.as_str()),
+        )
+    };
+    if liveapp_mode != ogrenotes_collab::blocks::LiveAppValidationMode::Off {
+        // The REST path uploads a whole new state, not an
+        // incremental update. There is no "changed" subtree to
+        // scope down to — every element of the reconstructed doc
+        // is effectively new from the server's perspective. Use
+        // walk_doc unconditionally, ignoring the WalkScope knob
+        // (which is only meaningful when the update is a delta).
+        let violations = ogrenotes_collab::blocks::walk_liveapp_violations(doc.inner());
+        if let Some(first) = ogrenotes_collab::blocks::emit_violations_and_should_reject(
+            &violations,
+            liveapp_mode,
+            &[("path", "rest")],
+        ) {
+            return Err(ApiError::BadRequest(format!(
+                "liveapp validation rejected {} content: {}: {}",
+                first.node_type.tag_name(),
+                first.field,
+                first.reason,
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn put_content(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
@@ -1686,48 +1734,8 @@ async fn put_content(
     // Validate that the bytes are a valid Y.Doc state
     let _doc = OgreDoc::from_state_bytes(&body)?;
 
-    // Phase 2a — LiveApp attribute gate. Walk the reconstructed
-    // doc and enforce block-attribute schema in the same three
-    // states as the WS path (off / log / reject). REST full-state
-    // uploads are lower-cadence than WS incremental updates, so
-    // the walk cost is not on any hot path.
-    //
-    // gap-001 exemption: same escape hatch as the WS handler — if
-    // this doc's id is in the operator-set exempt list, skip the
-    // gate entirely for this write. Lets an operator repair a
-    // doc whose current attrs would block every WS write.
-    let liveapp_mode = if state.config.liveapp_gate_exempt_doc_ids.contains(&id) {
-        counter::inc(MetricKey::new(
-            "liveapp.gate_exempted_total",
-            &[("path", "rest"), ("doc_id", id.as_str())],
-        ));
-        ogrenotes_collab::blocks::LiveAppValidationMode::Off
-    } else {
-        ogrenotes_collab::blocks::LiveAppValidationMode::from_env_value(
-            Some(state.config.liveapp_strict_validation.as_str()),
-        )
-    };
-    if liveapp_mode != ogrenotes_collab::blocks::LiveAppValidationMode::Off {
-        // The REST path uploads a whole new state, not an
-        // incremental update. There is no "changed" subtree to
-        // scope down to — every element of the reconstructed doc
-        // is effectively new from the server's perspective. Use
-        // walk_doc unconditionally, ignoring the WalkScope knob
-        // (which is only meaningful when the update is a delta).
-        let violations = ogrenotes_collab::blocks::walk_liveapp_violations(_doc.inner());
-        if let Some(first) = ogrenotes_collab::blocks::emit_violations_and_should_reject(
-            &violations,
-            liveapp_mode,
-            &[("path", "rest")],
-        ) {
-            return Err(ApiError::BadRequest(format!(
-                "liveapp validation rejected {} content: {}: {}",
-                first.node_type.tag_name(),
-                first.field,
-                first.reason,
-            )));
-        }
-    }
+    // Phase 2a — LiveApp attribute gate (see `check_liveapp_rest`).
+    check_liveapp_rest(&state, &id, &_doc)?;
 
     // Optimistic-locked snapshot write: bump the version only if no
     // concurrent writer advanced it. The repo owns the S3 write, the
@@ -3813,7 +3821,20 @@ pub(crate) struct CopyDocumentRequest {
     /// `crates/collab/src/mail_merge.rs` for the substitution rules.
     #[serde(default)]
     values: Option<serde_json::Value>,
+    /// #140: the document state to copy, as standard base64 of Y.Doc state
+    /// bytes, when the caller holds a newer state than the server. The
+    /// editor's Duplicate sends its in-memory document here: the server's
+    /// copy of the source can lag the WebSocket persistence of the last
+    /// edit, and writing the editor's state back to the *source* first is
+    /// not safe (see the reverted b7f8c2d). Absent → the server's current
+    /// state of the source is copied, as before.
+    #[serde(default)]
+    content: Option<String>,
 }
+
+/// Largest `/copy` request body: the base64 of a [`MAX_CONTENT_SIZE`]
+/// document (4/3 of it) plus room for the other JSON fields.
+const MAX_COPY_BODY_SIZE: usize = MAX_CONTENT_SIZE / 3 * 4 + 64 * 1024;
 
 /// POST /documents/:id/copy — duplicate a document (#142).
 ///
@@ -3875,7 +3896,32 @@ async fn copy_document(
     // the last put_content — not just the last-persisted snapshot. Without
     // the merge, copying a doc whose edits still live in UPDATE# rows would
     // produce a blank new doc even without mail merge.
-    let mut og = load_current_doc_state(&state, &src_id).await?;
+    //
+    // #140: or copy the caller-supplied state instead. The caller has View
+    // on the source, and supplied content can only ever become the *new*
+    // document (never written to the source), so this grants nothing that
+    // create + put_content does not; it gets the same size cap and LiveApp
+    // gate put_content applies. Blob re-homing below still copies only
+    // objects under the source's own prefix.
+    let mut og = match req.content.as_deref() {
+        Some(b64) => {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|_| ApiError::BadRequest("content is not valid base64".to_string()))?;
+            if bytes.len() > MAX_CONTENT_SIZE {
+                return Err(ApiError::BadRequest(format!(
+                    "Content too large: {} bytes (max {})",
+                    bytes.len(),
+                    MAX_CONTENT_SIZE
+                )));
+            }
+            let doc = OgreDoc::from_state_bytes(&bytes)?;
+            check_liveapp_rest(&state, &src_id, &doc)?;
+            doc
+        }
+        None => load_current_doc_state(&state, &src_id).await?,
+    };
 
     // Apply mail-merge substitution before re-encoding, if requested.
     if let Some(values) = req.values.as_ref().filter(|v| !v.is_null()) {

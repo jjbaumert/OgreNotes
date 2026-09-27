@@ -3414,3 +3414,131 @@ async fn test_put_content_concurrent_writers_conflict_409() {
 
     app.cleanup().await;
 }
+
+// ─── #140: copy with caller-supplied content (Duplicate) ────────
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// #140: Duplicate sends the editor's in-memory state as `content`. The copy
+/// must be built from that state (not the server's possibly-stale one), its
+/// image re-homed under the copy's prefix, and the **source left untouched**
+/// (the reverted b7f8c2d wrote to the source and could corrupt it).
+#[tokio::test]
+async fn test_copy_with_supplied_content_copies_it_and_leaves_the_source_alone() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("copy-content@test.com").await;
+    let src_id = app.create_doc(&token, "Source", None).await;
+
+    let blob_id = "b-dup-1";
+    let src_key = format!("blobs/{src_id}/{blob_id}/photo.png");
+    app.s3_client()
+        .put_object()
+        .bucket(&app.bucket)
+        .key(&src_key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(b"PNG".to_vec()))
+        .send()
+        .await
+        .expect("stage the source blob object");
+
+    // The server's copy of the source has no image yet; the editor's
+    // in-memory state (supplied below) does.
+    let (status, before) = app
+        .bytes_request(
+            Method::GET,
+            &format!("/api/v1/documents/{src_id}/content"),
+            Some(&token),
+            Vec::new(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (local, _) = build_doc_with_blob_ref_image(&src_id, blob_id, "Unsaved photo");
+
+    let (status, body) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/documents/{src_id}/copy"),
+            Some(&token),
+            Some(serde_json::json!({ "title": "Dup", "content": b64(&local.to_state_bytes()) })),
+        )
+        .await;
+    assert_eq!(status, 201, "copy with content: {body}");
+    let new_id = body["id"].as_str().unwrap().to_string();
+
+    let (copied_blob_id, copied_key) = only_blob_ref(&app, &token, &new_id).await;
+    assert_eq!(copied_blob_id, blob_id);
+    assert_eq!(
+        copied_key,
+        format!("blobs/{new_id}/{blob_id}/photo.png"),
+        "the supplied content's image is re-homed under the copy",
+    );
+
+    let (status, after) = app
+        .bytes_request(
+            Method::GET,
+            &format!("/api/v1/documents/{src_id}/content"),
+            Some(&token),
+            Vec::new(),
+            "application/octet-stream",
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(after, before, "the source document must not be written to");
+
+    app.cleanup().await;
+}
+
+/// #140: the reverted flush broke Duplicate on a locked source (put_content
+/// 403s). Copying with supplied content writes nothing to the source, so a
+/// locked source copies fine.
+#[tokio::test]
+async fn test_copy_with_supplied_content_works_on_a_locked_source() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("copy-locked@test.com").await;
+    let src_id = app.create_doc(&token, "Locked source", None).await;
+    let (status, body) = app
+        .json_request(
+            Method::PUT,
+            &format!("/api/v1/documents/{src_id}/lock"),
+            Some(&token),
+            Some(serde_json::json!({ "locked": true })),
+        )
+        .await;
+    assert_eq!(status, 204, "lock: {body}");
+
+    let local = OgreDoc::new();
+    let (status, body) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/documents/{src_id}/copy"),
+            Some(&token),
+            Some(serde_json::json!({ "content": b64(&local.to_state_bytes()) })),
+        )
+        .await;
+    assert_eq!(status, 201, "a locked source can still be duplicated: {body}");
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_copy_rejects_content_that_is_not_base64() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("copy-bad64@test.com").await;
+    let src_id = app.create_doc(&token, "Source", None).await;
+    let (status, _) = app
+        .json_request(
+            Method::POST,
+            &format!("/api/v1/documents/{src_id}/copy"),
+            Some(&token),
+            Some(serde_json::json!({ "content": "not base64 !!" })),
+        )
+        .await;
+    assert_eq!(status, 400);
+    app.cleanup().await;
+}

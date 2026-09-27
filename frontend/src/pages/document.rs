@@ -3602,7 +3602,6 @@ pub fn DocumentPage() -> impl IntoView {
                 on_confirm=Callback::new(move |(new_name, folder): (String, String)| {
                     set_duplicate_dialog_visible.set(false);
                     let old_id = current_id.get_untracked();
-                    let source_doc_type = doc_type.get_untracked();
                     // Snapshot the *current in-memory* content. get_content(old_id)
                     // races the source's async WS persistence and could return
                     // content without the just-typed edits (duplicateCopiedContent
@@ -3610,33 +3609,24 @@ pub fn DocumentPage() -> impl IntoView {
                     let local_bytes = editor_state
                         .get_untracked()
                         .map(|s| crate::editor::yrs_bridge::doc_to_ydoc_bytes(&s.doc));
+                    // #140: copy through the server's /copy so image blobs are
+                    // re-homed under the new document (a client-side create +
+                    // put_content left them pointing at the source, blank).
+                    // The in-memory state rides along as `content`, so the copy
+                    // has the just-typed edits without the source ever being
+                    // written to (writing it back first can corrupt the source;
+                    // see the reverted b7f8c2d). The server keeps the doc type.
                     leptos::task::spawn_local(async move {
-                        let created = match source_doc_type.as_str() {
-                            "spreadsheet" => {
-                                documents::create_spreadsheet(&new_name, Some(&folder)).await
-                            }
-                            "presentation" => {
-                                documents::create_presentation(&new_name, Some(&folder)).await
-                            }
-                            _ => documents::create_document(&new_name, Some(&folder)).await,
+                        use base64::Engine;
+                        let req = documents::CopyDocumentRequest {
+                            title: Some(new_name),
+                            folder_id: Some(folder),
+                            values: None,
+                            content: local_bytes
+                                .map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
                         };
-                        match created {
-                            Ok(doc) => {
-                                // Prefer the local snapshot; fall back to the server
-                                // copy only if the editor state wasn't available.
-                                let bytes = match local_bytes {
-                                    Some(b) => Some(b),
-                                    None => documents::get_content(&old_id).await.ok(),
-                                };
-                                if let Some(bytes) = bytes {
-                                    if let Err(e) = documents::put_content(&doc.id, &bytes).await {
-                                        web_sys::console::error_1(
-                                            &format!("Duplicate: put_content failed: {e}").into(),
-                                        );
-                                    }
-                                }
-                                hard_navigate(&format!("/d/{}", doc.id));
-                            }
+                        match documents::copy_document(&old_id, &req).await {
+                            Ok(doc) => hard_navigate(&format!("/d/{}", doc.id)),
                             Err(e) => web_sys::console::error_1(
                                 &format!("Duplicate failed: {e}").into(),
                             ),
