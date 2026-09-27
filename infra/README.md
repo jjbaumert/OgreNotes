@@ -118,16 +118,28 @@ GIT_STAMP=$(git rev-parse --short HEAD) npm run deploy -- -c env=test -c prefix=
 > changes until that's fixed. (`--hotswap` is dev/test only regardless; it
 > drifts CloudFormation — never use it for prod.)
 
-## 4. Tear down
+## 4. Stop and start the test stack
 
 ```bash
-set -a && source ../scripts/aws-test-config.env && set +a
-npm run destroy -- -c env=test -c prefix=test1-
+scripts/test-stack-stop.sh    # cdk destroy; table + bucket survive
+scripts/test-stack-start.sh   # bring it back (or just deploy, if it's up)
 ```
 
+Run both from the repo root; they source `scripts/aws-test-config.env`
+themselves.
+
 `destroy` removes the stack, but the **DynamoDB table and S3 bucket are
-RETAINed even in test** (a data-loss backstop — see `data.ts`); they survive
-and must be deleted by hand if you really want them gone:
+RETAINed even in test** (a data-loss backstop — see `data.ts`). A plain
+`deploy` onto a destroyed stack then fails early validation with
+`... already exists`, and `cdk import` can't adopt them (CloudFormation
+rejects the stack Tags/RoleArn CDK sends with an import). `test-stack-start.sh`
+handles it: when the stack is gone it imports the surviving table and bucket
+with a raw CloudFormation `IMPORT` change set, then runs the normal full
+deploy. It also clears the empty `REVIEW_IN_PROGRESS` stack a failed create
+leaves behind. A start after a stop takes ~6 min, and the Qdrant search index
+comes up empty (it isn't retained).
+
+To delete the retained data for real:
 
 ```bash
 aws dynamodb delete-table --table-name test1-ogrenote --region us-east-1

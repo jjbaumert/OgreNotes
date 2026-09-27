@@ -87,6 +87,11 @@ export class ComputeConstruct extends Construct {
       props;
     const prefix = config.prefix;
     const region = Stack.of(this).region;
+    // The api/worker log groups have fixed names (#50), so a RETAINed group
+    // outlives `destroy` and blocks the next create of the stack ("already
+    // exists"). Keep them in prod; in test they go with the stack.
+    const logRemovalPolicy =
+      config.deployEnv === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY;
 
     const cluster = new ecs.Cluster(this, 'Cluster', {
       clusterName: `${prefix}ogrenote`,
@@ -297,12 +302,10 @@ export class ComputeConstruct extends Construct {
           // replacement, leaving orphaned groups the scoped diagnostic
           // read-only IAM policy (and aws-test-logs.sh) can never match by
           // a stable ARN. A fixed name makes both target it reliably.
-          // RETAIN (the LogGroup default) matches the table/bucket policy —
-          // teardown leaves it for manual cleanup rather than losing logs.
           logGroup: new logs.LogGroup(this, 'ApiLogGroup', {
             logGroupName: `/ecs/${prefix}ogrenote-api`,
             retention: logs.RetentionDays.TWO_WEEKS,
-            removalPolicy: RemovalPolicy.RETAIN,
+            removalPolicy: logRemovalPolicy,
           }),
         }),
       },
@@ -416,7 +419,7 @@ export class ComputeConstruct extends Construct {
         logGroup: new logs.LogGroup(this, 'WorkerLogGroup', {
           logGroupName: `/ecs/${prefix}ogrenote-worker`,
           retention: logs.RetentionDays.TWO_WEEKS,
-          removalPolicy: RemovalPolicy.RETAIN,
+          removalPolicy: logRemovalPolicy,
         }),
       }),
     });
