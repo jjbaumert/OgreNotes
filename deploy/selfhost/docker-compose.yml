@@ -23,13 +23,11 @@ x-app: &app
     FRONTEND_ORIGIN: https://${OGRENOTES_DOMAIN}
     OAUTH_REDIRECT_URI: https://${OGRENOTES_DOMAIN}/api/v1/auth/callback
     SEARCH_INDEX_PATH: /data/search-index
-    # Keys set in ogrenotes.env win; left out, the SDK falls back to this
-    # profile in the host's AWS config.
-    AWS_PROFILE: ${OGRENOTES_AWS_PROFILE:-default}
-    AWS_CONFIG_FILE: /aws/config
+    # Keys set in ogrenotes.env win; left out, the SDK falls back to the one
+    # profile aws-creds.sh copied here (none unless OGRENOTES_AWS_PROFILE).
     AWS_SHARED_CREDENTIALS_FILE: /aws/credentials
   volumes:
-    - ${AWS_DIR:-${HOME}/.aws}:/aws:ro
+    - ./aws/app:/aws:ro
   restart: unless-stopped
   depends_on:
     - redis
@@ -38,7 +36,7 @@ services:
   api:
     <<: *app
     volumes:
-      - ${AWS_DIR:-${HOME}/.aws}:/aws:ro
+      - ./aws/app:/aws:ro
       - search-index:/data/search-index
 
   worker:
@@ -59,16 +57,14 @@ services:
     env_file: caddy.env
     environment:
       OGRENOTES_DOMAIN: ${OGRENOTES_DOMAIN}
-      # Same fallback as the app: keys in caddy.env, else this profile.
-      AWS_PROFILE: ${CADDY_AWS_PROFILE:-default}
-      AWS_CONFIG_FILE: /aws/config
+      # Same fallback as the app: keys in caddy.env, else aws/caddy.
       AWS_SHARED_CREDENTIALS_FILE: /aws/credentials
     ports:
       - "80:80"
       - "443:443"
       - "443:443/udp"
     volumes:
-      - ${AWS_DIR:-${HOME}/.aws}:/aws:ro
+      - ./aws/caddy:/aws:ro
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config

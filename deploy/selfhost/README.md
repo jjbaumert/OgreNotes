@@ -65,7 +65,10 @@ Everything here runs from `deploy/selfhost/`.
    - `ogrenotes-dns` can only edit your Route 53 zone.
 
    Put each user's access key in `ogrenotes.env` and `caddy.env`
-   respectively. **Only these keys live on the machine.** Every other
+   respectively. Or, if you keep them as profiles in `~/.aws`, name the
+   profiles in `.env` (`OGRENOTES_AWS_PROFILE`, `CADDY_AWS_PROFILE`) and run
+   `./aws-creds.sh`. It copies only those two profiles into `aws/`, one per
+   container. **Only these keys live on the machine.** Every other
    secret is read from SSM at startup.
 
 4. Start everything:
@@ -149,5 +152,6 @@ from S3.
   (`CARGO_FEATURES=xlsx,docx,pdf`), and `DEV_MODE` is forced to `false`.
 - Rotating `JWT_SECRET` in SSM signs everyone out on the next restart.
 - Rotate the two IAM access keys periodically:
-  `aws iam create-access-key`, update the env file, run
+  `aws iam create-access-key`, update the env file (or the profile, then
+  run `./aws-creds.sh`), run
   `docker compose up -d`, then delete the old key.
