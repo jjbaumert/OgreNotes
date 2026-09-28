@@ -89,6 +89,10 @@ crates/
 
 ## Local Development
 
+This section sets up a development environment: local containers, and a
+dev-login shortcut with no real authentication. To run OgreNotes for real
+use on your own server, see [Self-Hosting](#self-hosting).
+
 ### Prerequisites
 
 - Rust (edition 2024)
@@ -225,6 +229,27 @@ When `QDRANT_URL` is set, the server connects to Qdrant on startup, creates an `
 | `ADMIN_EMAILS` | *(empty)* | Comma-separated emails that are auto-promoted to admin on login (e.g., `alice@example.com,bob@example.com`). Takes effect on the user's next login. |
 
 When a user whose email matches `ADMIN_EMAILS` logs in, their account is automatically granted admin privileges. Admins can then manage other users via the `/api/v1/admin/*` endpoints — list users, disable/enable accounts, and promote/demote other admins. Disabled users are blocked from logging in and have all active sessions revoked.
+
+## Self-Hosting
+
+To run OgreNotes for real use on your own machine, follow
+[`deploy/selfhost/README.md`](deploy/selfhost/README.md). One home server
+runs the app, Redis and Caddy under Docker Compose, and your data lives in
+AWS: DynamoDB for records and S3 for files.
+
+- **HTTPS with dynamic DNS.** Caddy keeps a Route 53 record pointed at your
+  home IP and gets its certificate through Route 53, so no port 80 is needed.
+- **Secrets stay in AWS.** They are read from SSM Parameter Store at startup.
+  Only two least-privilege IAM access keys live on the machine.
+- **Production settings.** `DEV_MODE=false`, and the image is built without
+  the dev-login endpoint.
+- **Backups.** DynamoDB point-in-time recovery, S3 versioning, and an hourly
+  snapshot of the local search index to S3.
+- **Offline handling.** When the internet drops, the app says it can't save,
+  keeps unsaved edits, and saves them when the connection returns.
+
+A one-time `setup.sh`, run with your admin AWS profile, creates the bucket,
+table, secrets and IAM policies.
 
 ## AWS Deployment
 
