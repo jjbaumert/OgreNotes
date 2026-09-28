@@ -90,6 +90,9 @@ ogrenotes-storage = { workspace = true }
 # this adds no new transitive resolution.
 tokio-tungstenite = "0.28"
 futures-util = "0.3"
+# On-disk search index for the snapshot round-trip test
+# (test_search_backup.rs); already in the lockfile via ogrenotes-search.
+tempfile = "3"
 # SAML happy-path test (test_saml_acs_happy.rs) mints a SHA-256-signed
 # SAMLResponse by shelling out to the `xmlsec1` CLI (the same xmlsec
 # engine the server verifies with), then POSTs it to the ACS route.

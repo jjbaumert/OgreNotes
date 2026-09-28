@@ -1,0 +1,30 @@
+# TLS + dynamic DNS for OgreNotes, both through Route 53.
+# Credentials come from caddy.env (a DNS-only IAM user — see iam/).
+{
+	email {$ACME_EMAIL}
+
+	# Keep {$OGRENOTES_DOMAIN}'s A record pointed at this network's public
+	# IP. `domains` is <hosted zone> <record name(s)>; "@" is the apex.
+	dynamic_dns {
+		provider route53
+		domains {
+			{$DNS_ZONE} {$DNS_RECORD}
+		}
+		ip_source simple_http https://api64.ipify.org
+		ip_source simple_http https://icanhazip.com
+		versions ipv4
+		check_interval 5m
+		ttl 5m
+	}
+}
+
+{$OGRENOTES_DOMAIN} {
+	# Certificates via the DNS-01 challenge: no inbound port 80 needed, and
+	# it works while the A record is still propagating.
+	tls {
+		dns route53
+	}
+	encode zstd gzip
+	# WebSockets (collaborative editing) pass through reverse_proxy as-is.
+	reverse_proxy api:3000
+}

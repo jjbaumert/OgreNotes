@@ -297,6 +297,12 @@ pub struct AppConfig {
     /// BLOB_RECONCILE_DRY_RUN=false once the logs look right.
     pub blob_reconcile_dry_run: bool,
 
+    /// How often (minutes) to back the local search index up to S3, so a
+    /// lost or replaced disk restores search instead of starting empty.
+    /// 0 (the default) turns it off; a single-server self-hosted install
+    /// sets it. See `crates/api/src/search_backup.rs`.
+    pub search_backup_interval_mins: u32,
+
     // ─── LiveApp CRDT-write pre-apply gate ────────────────────────
     /// Rollout state for the LiveApp attribute pre-apply validator.
     /// Values: "off" | "log" | "reject". Default "reject" as of
@@ -410,6 +416,7 @@ impl fmt::Debug for AppConfig {
             .field("trash_cleanup_dry_run", &self.trash_cleanup_dry_run)
             .field("blob_reconcile_enabled", &self.blob_reconcile_enabled)
             .field("blob_reconcile_dry_run", &self.blob_reconcile_dry_run)
+            .field("search_backup_interval_mins", &self.search_backup_interval_mins)
             .field("job_stream_name", &self.job_stream_name)
             .field("worker_concurrency", &self.worker_concurrency)
             .field("email_digest_enabled", &self.email_digest_enabled)
@@ -618,6 +625,9 @@ impl AppConfig {
             blob_reconcile_enabled: env_or("BLOB_RECONCILE_ENABLED", "false") == "true",
             // Anything but an explicit "false" keeps it dry.
             blob_reconcile_dry_run: env_or("BLOB_RECONCILE_DRY_RUN", "true") != "false",
+            search_backup_interval_mins: env_or("SEARCH_BACKUP_INTERVAL_MINS", "0")
+                .parse()
+                .unwrap_or_else(|_| panic!("SEARCH_BACKUP_INTERVAL_MINS must be a whole number of minutes")),
             job_stream_name: env_or("JOB_STREAM_NAME", "ogrenotes-jobs"),
             worker_concurrency: env_or("WORKER_CONCURRENCY", "4")
                 .parse()
@@ -847,6 +857,7 @@ mod tests {
             trash_cleanup_dry_run: false,
             blob_reconcile_enabled: false,
             blob_reconcile_dry_run: true,
+            search_backup_interval_mins: 0,
             job_stream_name: "ogrenotes-jobs".into(),
             worker_concurrency: 4,
             liveapp_strict_validation: "log".into(),
@@ -1062,6 +1073,7 @@ mod tests {
             trash_cleanup_dry_run: false,
             blob_reconcile_enabled: false,
             blob_reconcile_dry_run: true,
+            search_backup_interval_mins: 0,
             job_stream_name: "ogrenotes-jobs".into(),
             worker_concurrency: 4,
             liveapp_strict_validation: "reject".into(),

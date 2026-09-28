@@ -1,0 +1,4 @@
+# Real configuration — keep out of git.
+.env
+ogrenotes.env
+caddy.env

@@ -17,6 +17,15 @@ FROM rust:slim-bookworm AS backend-builder
 # mount so amd64 and arm64 builds on the same host don't share one target dir.
 ARG TARGETARCH
 
+# Cargo features for ogrenotes-api. Empty (the default) builds the crate's
+# default features, which include `dev-login` — kept as the default so the
+# AWS test stack's optional DEV_MODE=true flow keeps working. A build for
+# anything reachable by other people should drop it:
+#   --build-arg CARGO_FEATURES=xlsx,docx,pdf
+# (deploy/selfhost/docker-compose.yml does), so the endpoint is compiled
+# out rather than merely switched off by DEV_MODE=false.
+ARG CARGO_FEATURES=""
+
 # Phase 4 M-E4: samael's `xmlsec` feature wraps libxml2 + xmlsec1 for
 # SAML response signature verification. Build-time needs the -dev
 # packages; runtime needs only the shared-library packages (added
@@ -44,9 +53,10 @@ COPY crates/ crates/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target,id=ogre-backend-target-${TARGETARCH} \
-    cargo build --profile release-fast --bin ogrenotes-api \
+    cargo build --profile release-fast --bin ogrenotes-api --bin setup_dev \
+        ${CARGO_FEATURES:+--no-default-features --features "$CARGO_FEATURES"} \
  && mkdir -p /out \
- && cp target/release-fast/ogrenotes-api /out/ogrenotes-api
+ && cp target/release-fast/ogrenotes-api target/release-fast/setup_dev /out/
 
 # ─── Stage 2: Frontend Build ───────────────────────────────────
 FROM rust:slim-bookworm AS frontend-builder
@@ -128,6 +138,8 @@ RUN apt-get update && apt-get install -y \
 
 # Backend binary
 COPY --from=backend-builder /out/ogrenotes-api /usr/local/bin/ogrenotes-api
+# One-time table/bucket creation (deploy/selfhost/setup.sh runs it).
+COPY --from=backend-builder /out/setup_dev /usr/local/bin/setup_dev
 
 # Frontend static files
 COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist

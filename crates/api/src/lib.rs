@@ -16,6 +16,8 @@ pub mod observability;
 pub mod redis_session;
 pub mod routes;
 pub mod scim;
+pub mod secrets;
+pub mod search_backup;
 pub mod search_reindex;
 pub mod seed;
 pub mod state;

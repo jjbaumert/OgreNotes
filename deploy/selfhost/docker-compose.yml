@@ -1,0 +1,70 @@
+# OgreNotes on a single home server, with DynamoDB + S3 in AWS.
+# See README.md in this directory — run setup.sh once before `up`.
+#
+#   docker compose --env-file .env up -d --build
+#
+# Everything restarts on its own after a crash or reboot
+# (`restart: unless-stopped`). Only Caddy publishes ports.
+
+name: ogrenotes
+
+x-app: &app
+  build:
+    context: ../..
+    args:
+      # Compile the dev-login endpoint out entirely (DEV_MODE=false alone
+      # only switches it off).
+      CARGO_FEATURES: "xlsx,docx,pdf"
+  image: ogrenotes:selfhost
+  env_file: ogrenotes.env
+  environment:
+    REDIS_URL: redis://redis:6379
+    DEV_MODE: "false"
+    FRONTEND_ORIGIN: https://${OGRENOTES_DOMAIN}
+    OAUTH_REDIRECT_URI: https://${OGRENOTES_DOMAIN}/api/v1/auth/callback
+    SEARCH_INDEX_PATH: /data/search-index
+  restart: unless-stopped
+  depends_on:
+    - redis
+
+services:
+  api:
+    <<: *app
+    volumes:
+      - search-index:/data/search-index
+
+  worker:
+    <<: *app
+    command: ["ogrenotes-api", "--mode=worker"]
+
+  redis:
+    image: redis:7-alpine
+    # Append-only file so queued jobs survive a restart.
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  caddy:
+    build: ./caddy
+    image: ogrenotes-caddy:selfhost
+    env_file: caddy.env
+    environment:
+      OGRENOTES_DOMAIN: ${OGRENOTES_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+    depends_on:
+      - api
+
+volumes:
+  search-index:
+  redis-data:
+  caddy-data:
+  caddy-config:

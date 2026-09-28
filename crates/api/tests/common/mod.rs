@@ -400,6 +400,7 @@ impl TestApp {
             // #166 sweep: off; its tests call `sweep` directly.
             blob_reconcile_enabled: false,
             blob_reconcile_dry_run: true,
+            search_backup_interval_mins: 0,
             // Worker subsystem defaults — integration tests that
             // exercise the queue use a per-test stream suffix so
             // concurrent runs don't collide on this shared name.
