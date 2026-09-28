@@ -51,7 +51,9 @@ impl FromRequestParts<AppState> for AuthUser {
             .user_repo
             .get_by_id(&claims.sub)
             .await
-            .map_err(|_| ApiError::Unauthorized)?
+            // A failed lookup is not a verdict on the token: 401 here would
+            // log the user out over a dropped storage connection.
+            .map_err(|_| ApiError::StorageUnavailable)?
             .ok_or(ApiError::Unauthorized)?;
 
         if user.is_disabled {

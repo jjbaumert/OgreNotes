@@ -4412,13 +4412,35 @@ tr:hover .folder-row-actions,
   background: var(--color-warning);
   animation: sync-indicator-pulse 1.2s ease-in-out infinite;
 }
-.sync-indicator.is-offline {
+.sync-indicator.is-offline,
+.sync-indicator.is-not-saved {
   color: var(--color-error-fg);
   background: var(--color-error-bg);
   border-color: var(--color-error-border);
 }
-.sync-indicator.is-offline .sync-indicator-dot {
+.sync-indicator.is-offline .sync-indicator-dot,
+.sync-indicator.is-not-saved .sync-indicator-dot {
   background: var(--color-error);
+}
+/* Server can't reach its storage (storage_banner.rs). Sits above the page
+   content across the app; clears itself when storage returns. */
+.storage-banner {
+  /* Bottom of the viewport: the header holds the save badge this
+     banner explains, so it must not cover it. */
+  position: fixed;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1000;
+  max-width: min(640px, calc(100vw - 32px));
+  padding: 8px 14px;
+  border: 1px solid var(--color-error-border);
+  border-radius: var(--radius-md);
+  color: var(--color-error-fg);
+  background: var(--color-error-bg);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  font-size: 0.9rem;
+  line-height: 1.4;
 }
 @keyframes sync-indicator-pulse {
   0%, 100% { opacity: 1; }

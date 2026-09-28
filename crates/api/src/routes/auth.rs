@@ -831,7 +831,8 @@ async fn refresh(
         .user_repo
         .get_by_id(&user_id)
         .await
-        .map_err(|_| ApiError::Unauthorized)?
+        // Storage trouble, not a bad credential — see `AuthUser`.
+        .map_err(|_| ApiError::StorageUnavailable)?
         .ok_or(ApiError::Unauthorized)?;
 
     counter::inc(MetricKey::new(

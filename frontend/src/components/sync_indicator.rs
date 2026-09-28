@@ -48,6 +48,11 @@ pub enum SyncState {
     /// WebSocket is down. `pending` carries the un-sent count so
     /// the badge can warn the user how much is at risk.
     Offline { pending: usize },
+    /// The server received edits but could not save them — it lost
+    /// its connection to storage. They're safe in this tab and are
+    /// re-sent automatically once the server reconnects; closing the
+    /// tab before then risks them.
+    NotSaved,
 }
 
 impl SyncState {
@@ -88,6 +93,7 @@ fn class_for(state: SyncState) -> &'static str {
         SyncState::Saved => "is-saved",
         SyncState::Saving => "is-saving",
         SyncState::Offline { .. } => "is-offline",
+        SyncState::NotSaved => "is-not-saved",
     }
 }
 
@@ -99,6 +105,7 @@ fn label_for(state: SyncState) -> String {
         SyncState::Offline { pending } => {
             crate::t!("sync-offline-pending", count = pending as i64)
         }
+        SyncState::NotSaved => crate::t!("sync-not-saved"),
     }
 }
 
@@ -112,6 +119,7 @@ fn tooltip_for(state: SyncState) -> String {
         SyncState::Offline { pending } => {
             crate::t!("sync-offline-pending-tooltip", count = pending as i64)
         }
+        SyncState::NotSaved => crate::t!("sync-not-saved-tooltip"),
     }
 }
 
@@ -145,19 +153,83 @@ pub fn poll_sync_state(
     let active_for_cleanup = Arc::clone(&active);
     on_cleanup(move || active_for_cleanup.store(false, Ordering::Relaxed));
 
+    // Warn before the tab closes while edits haven't been saved — they
+    // are only in this tab. Removed again on unmount.
+    install_unsaved_guard(Rc::clone(&client));
+    on_cleanup(remove_unsaved_guard);
+
     leptos::task::spawn_local(async move {
         // Seed immediately so the badge doesn't briefly render
         // a stale `Saved` placeholder before the first tick.
         set_state.set(compute_state(&client));
+        let mut last_resend_ms = 0.0_f64;
         loop {
             gloo_timers::future::TimeoutFuture::new(500).await;
             if !active.load(Ordering::Relaxed) {
                 break;
             }
+            // The server's storage is back (the app banner's poll cleared
+            // the flag): re-send everything this tab holds so edits the
+            // server couldn't save get saved. Throttled, because if storage
+            // is still down the resend fails and the mark comes back.
+            let now = js_sys::Date::now();
+            if !crate::storage_status::is_offline() && now - last_resend_ms >= RESEND_INTERVAL_MS {
+                if let Some(c) = client.borrow().as_ref() {
+                    if c.is_unsaved() && c.resend_full_state() {
+                        last_resend_ms = now;
+                    }
+                }
+            }
             let next = compute_state(&client);
             set_state.set(next);
         }
     });
+}
+
+/// Least time between two automatic full-state resends.
+const RESEND_INTERVAL_MS: f64 = 10_000.0;
+
+type UnloadClosure = wasm_bindgen::closure::Closure<dyn Fn(web_sys::BeforeUnloadEvent)>;
+
+thread_local! {
+    /// The one `beforeunload` listener for the open document (a single
+    /// page at a time mounts `poll_sync_state`).
+    static UNSAVED_GUARD: RefCell<Option<UnloadClosure>> = const { RefCell::new(None) };
+}
+
+/// Ask "Leave site?" when the tab is closed while it holds edits the
+/// server hasn't saved (or hasn't received yet). Replaces any previous
+/// listener.
+fn install_unsaved_guard(client: Rc<RefCell<Option<CollabClient>>>) {
+    use wasm_bindgen::JsCast;
+    remove_unsaved_guard();
+    let closure = UnloadClosure::new(move |event: web_sys::BeforeUnloadEvent| {
+        let at_risk = client
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.is_unsaved() || c.pending_count() > 0);
+        if at_risk {
+            event.prevent_default();
+            // Older browsers need returnValue set to show the prompt.
+            event.set_return_value("unsaved");
+        }
+    });
+    let Some(window) = web_sys::window() else { return };
+    if window
+        .add_event_listener_with_callback("beforeunload", closure.as_ref().unchecked_ref())
+        .is_ok()
+    {
+        UNSAVED_GUARD.with(|g| *g.borrow_mut() = Some(closure));
+    }
+}
+
+fn remove_unsaved_guard() {
+    use wasm_bindgen::JsCast;
+    let Some(closure) = UNSAVED_GUARD.with(|g| g.borrow_mut().take()) else { return };
+    if let Some(window) = web_sys::window() {
+        let _ = window
+            .remove_event_listener_with_callback("beforeunload", closure.as_ref().unchecked_ref());
+    }
 }
 
 fn compute_state(client: &Rc<RefCell<Option<CollabClient>>>) -> SyncState {
@@ -168,8 +240,17 @@ fn compute_state(client: &Rc<RefCell<Option<CollabClient>>>) -> SyncState {
         // doesn't shout false alarms on a fresh page load.
         return SyncState::Saved;
     };
-    let conn = c.connection_state();
-    let pending = c.pending_count();
+    derive_state(c.connection_state(), c.pending_count(), c.is_unsaved())
+}
+
+/// The badge state for a connection state, an un-sent count, and whether
+/// the server failed to save something. "Not saved" wins: those edits
+/// reached the server and were lost there unless re-sent, which is the
+/// more urgent thing to tell the user.
+fn derive_state(conn: ConnectionState, pending: usize, unsaved: bool) -> SyncState {
+    if unsaved {
+        return SyncState::NotSaved;
+    }
     match conn {
         ConnectionState::Synced if pending == 0 => SyncState::Saved,
         ConnectionState::Synced
@@ -189,6 +270,26 @@ mod tests {
         assert!(!SyncState::Saving.is_offline());
         assert!(SyncState::Offline { pending: 0 }.is_offline());
         assert!(SyncState::Offline { pending: 5 }.is_offline());
+    }
+
+    #[test]
+    fn not_saved_outranks_every_connection_state() {
+        for conn in [
+            ConnectionState::Synced,
+            ConnectionState::Connected,
+            ConnectionState::Connecting,
+            ConnectionState::Disconnected,
+        ] {
+            assert_eq!(derive_state(conn, 0, true), SyncState::NotSaved, "{conn:?}");
+        }
+        assert_eq!(derive_state(ConnectionState::Synced, 0, false), SyncState::Saved);
+        assert_eq!(
+            derive_state(ConnectionState::Disconnected, 2, false),
+            SyncState::Offline { pending: 2 }
+        );
+        assert_eq!(class_for(SyncState::NotSaved), "is-not-saved");
+        // "Offline" still means the socket is down; not-saved is its own state.
+        assert!(!SyncState::NotSaved.is_offline());
     }
 
     #[test]

@@ -38,6 +38,14 @@ pub enum ApiError {
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
 
+    /// 503: the server can't reach its storage (DynamoDB/S3) right now.
+    /// Tagged with `x-ogrenotes-storage: unavailable` so the frontend can
+    /// tell it from other 503s and show its "can't save" banner rather
+    /// than, say, treating the failure as a lost login. See
+    /// `crate::storage_health`.
+    #[error("storage unavailable")]
+    StorageUnavailable,
+
     /// 429 Too Many Requests with a `Retry-After` header. Used by the
     /// per-user and load-shedding quotas in `routes/ask.rs`. The
     /// retry_after value is the number of whole seconds until the
@@ -68,6 +76,25 @@ struct ErrorBody {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let ApiError::StorageUnavailable = self {
+            counter::inc(MetricKey::new("api.errors_total", &[("code", "storage_unavailable")]));
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    (axum::http::header::RETRY_AFTER, "5"),
+                    // What the frontend keys on: other routes also answer
+                    // 503, and it never reads error bodies (#47).
+                    (axum::http::HeaderName::from_static("x-ogrenotes-storage"), "unavailable"),
+                ],
+                Json(ErrorBody {
+                    error: "storage_unavailable",
+                    message: "The server can't reach its storage right now. Your data is safe; \
+                              try again when the connection returns."
+                        .to_string(),
+                }),
+            )
+                .into_response();
+        }
         // The two retry-bearing variants need a Retry-After header, so
         // they bypass the simple status+body construction below and
         // build their own Response.
@@ -129,7 +156,9 @@ impl IntoResponse for ApiError {
                 msg.clone(),
             ),
             // Handled above.
-            ApiError::TooManyRequests { .. } | ApiError::Overloaded { .. } => unreachable!(),
+            ApiError::TooManyRequests { .. }
+            | ApiError::Overloaded { .. }
+            | ApiError::StorageUnavailable => unreachable!(),
         };
 
         // Auth rejections (401 / 403) are client-driven and dominate in
@@ -210,6 +239,13 @@ impl From<ogrenotes_auth::jwt::AuthError> for ApiError {
             ogrenotes_auth::jwt::AuthError::SessionExpired => ApiError::Unauthorized,
             ogrenotes_auth::jwt::AuthError::RefreshTokenInvalid => ApiError::Unauthorized,
             ogrenotes_auth::jwt::AuthError::RefreshTokenReused => ApiError::Unauthorized,
+            // The session store couldn't be read — not a verdict on the
+            // credentials. Answering 401 here would log the user out over
+            // a dropped connection.
+            ogrenotes_auth::jwt::AuthError::Storage(detail) => {
+                tracing::warn!(error = %detail, "auth: session storage unavailable");
+                ApiError::StorageUnavailable
+            }
             // Cross-provider / credential conflict (SAML account, dev-login
             // adopting a real account, email reassignment, etc.) — a 409, not a
             // 500 that pollutes internal-error metrics. Log the specific reason

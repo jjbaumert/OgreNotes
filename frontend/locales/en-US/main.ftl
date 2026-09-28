@@ -925,6 +925,11 @@ sync-saved-tooltip = Your changes are saved.
 sync-saving-tooltip = Sending your latest changes to the server…
 sync-offline-tooltip = You're disconnected. Reconnect to keep collaborating.
 sync-offline-pending-tooltip = You're disconnected. {$count} change(s) haven't reached the server yet.
+sync-not-saved = Not saved
+sync-not-saved-tooltip = The server received your recent changes but couldn’t save them: it has lost its connection to storage. Keep this tab open — they’re re-sent automatically when the connection returns.
+storage-offline-title = Can’t save right now.
+storage-offline-body = The server has lost its connection to storage. Documents can’t be opened or saved until it returns; this message clears on its own.
+storage-boot-body = The server has lost its connection to storage, so it can’t sign you in yet. This page keeps retrying and continues on its own when the connection returns.
 
 # Editor width toggle (S/M/L)
 editor-width-group = Editor width

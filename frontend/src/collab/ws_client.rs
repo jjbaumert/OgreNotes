@@ -695,6 +695,11 @@ pub struct CollabClient {
     _closures: Rc<RefCell<Vec<Closure<dyn Fn(web_sys::Event)>>>>,
     /// Incremental updates queued by observe_update_v1 for sending.
     pending_updates: Rc<RefCell<Vec<Vec<u8>>>>,
+    /// The server applied an update from this session but could not
+    /// save it (`MSG_ERROR "persist-failed"`: its storage was
+    /// unreachable). Drives the "Not saved" badge, and is cleared by
+    /// [`CollabClient::resend_full_state`] once storage is back.
+    unsaved: Rc<Cell<bool>>,
     /// The normalized model doc as of the last ydoc sync in either
     /// direction (#121): set from `sync_model_to_ydoc_diffed`'s return
     /// after a local send, refreshed from `read_doc_from_ydoc` after a
@@ -780,6 +785,7 @@ impl CollabClient {
             remote_cursors: Rc::new(RefCell::new(std::collections::HashMap::new())),
             _closures: Rc::new(RefCell::new(Vec::new())),
             pending_updates,
+            unsaved: Rc::new(Cell::new(false)),
             last_synced_doc,
             local_doc_provider: Rc::new(RefCell::new(None)),
             is_applying_remote,
@@ -893,6 +899,37 @@ impl CollabClient {
         self.pending_updates.borrow().len()
     }
 
+    /// Whether an edit from this session reached the server but was not
+    /// saved (see the `unsaved` field). The tab holds the only durable
+    /// copy the user can count on until [`Self::resend_full_state`] runs.
+    pub fn is_unsaved(&self) -> bool {
+        self.unsaved.get()
+    }
+
+    /// Send this session's whole document state as one update. Called once
+    /// the server can reach storage again: CRDT merging makes the resend
+    /// harmless for everything the server already has, and it restores
+    /// anything the server lost (for example if it restarted during the
+    /// outage). The unsaved mark stays set until the server answers
+    /// `persist-ok`; if saving fails again it answers `persist-failed`.
+    /// Returns `false` when there is no open socket to send on.
+    pub fn resend_full_state(&self) -> bool {
+        let Some(ws) = self.ws.borrow().clone() else { return false };
+        if ws.ready_state() != web_sys::WebSocket::OPEN {
+            return false;
+        }
+        let state = {
+            use yrs::{ReadTxn, Transact};
+            let doc = self.ydoc.borrow();
+            let txn = doc.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        let mut frame = Vec::with_capacity(state.len() + 1);
+        frame.push(MSG_UPDATE);
+        frame.extend_from_slice(&state);
+        ws.send_with_u8_array(&frame).is_ok()
+    }
+
     /// Connect to the WebSocket server.
     /// `connected_flag` is set to true when synced, and false again on
     /// disconnect — by `onclose` for a socket the browser closed, or
@@ -972,6 +1009,7 @@ impl CollabClient {
             let on_comment_event = Rc::clone(&self.on_comment_event);
             let on_foreign_doc_update = Rc::clone(&self.on_foreign_doc_update);
             let on_liveapp_error = Rc::clone(&self.on_liveapp_error);
+            let unsaved = Rc::clone(&self.unsaved);
             let remote_cursors = Rc::clone(&self.remote_cursors);
             // Pending-updates buffer is shared with `send_update`: edits
             // made before sync completes accumulate here, and the
@@ -1102,7 +1140,9 @@ impl CollabClient {
                     }
                     MSG_ERROR => {
                         if let Ok(error) = std::str::from_utf8(payload) {
-                            web_sys::console::error_1(&format!("WebSocket error: {error}").into());
+                            if error != "persist-ok" {
+                                web_sys::console::error_1(&format!("WebSocket error: {error}").into());
+                            }
                             // Phase 2a Option A: liveapp-rejected frames
                             // route to a page-level toast setter so the
                             // user sees a "not saved" signal instead of
@@ -1111,6 +1151,20 @@ impl CollabClient {
                             // by future opaque codes (persist-failed
                             // etc.) without them being mistaken for
                             // liveapp signals.
+                            // The server applied the update but its
+                            // storage was unreachable. Mark the session
+                            // unsaved (the badge reads it) and tell the
+                            // app, whose banner polls for recovery.
+                            if error == "persist-failed" {
+                                unsaved.set(true);
+                                crate::storage_status::report_unreachable();
+                            }
+                            // The server saved an update after an earlier
+                            // failure — the only signal that clears "Not
+                            // saved" (a resend alone proves nothing).
+                            if error == "persist-ok" {
+                                unsaved.set(false);
+                            }
                             if let Some(rest) = error.strip_prefix("liveapp-rejected:") {
                                 if let Some(cb) = on_liveapp_error.borrow().as_ref() {
                                     cb(rest.to_string());

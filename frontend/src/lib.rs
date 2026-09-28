@@ -25,4 +25,8 @@ pub mod observability;
 // runs their unit tests; before this they compiled only into the
 // binary target and never gated CI.
 pub mod presentation;
+// Whether the server can reach its storage (self-hosted servers can
+// lose their internet connection). Lib-visible because `collab` — which
+// both targets compile — reports into it.
+pub mod storage_status;
 pub mod touch;

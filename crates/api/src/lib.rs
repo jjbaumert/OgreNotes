@@ -19,5 +19,6 @@ pub mod scim;
 pub mod search_reindex;
 pub mod seed;
 pub mod state;
+pub mod storage_health;
 pub mod trash_cleanup;
 pub mod worker_mode;

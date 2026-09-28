@@ -124,6 +124,11 @@ pub struct Room {
     last_edit: AtomicU64,
     /// Next client ID counter.
     next_client_id: AtomicU64,
+    /// This room's in-memory document holds edits whose save to storage
+    /// failed (storage unreachable). Such a room must not be dropped
+    /// until a snapshot succeeds — its memory is the only copy of those
+    /// edits on the server.
+    unsaved: std::sync::atomic::AtomicBool,
 }
 
 impl Room {
@@ -136,7 +141,27 @@ impl Room {
             doc_id,
             last_edit: AtomicU64::new(0),
             next_client_id: AtomicU64::new(1),
+            unsaved: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Record that an edit applied here could not be saved.
+    pub fn mark_unsaved(&self) {
+        self.unsaved.store(true, Ordering::Release);
+    }
+
+    /// Whether this room holds edits that were never saved.
+    pub fn is_unsaved(&self) -> bool {
+        self.unsaved.load(Ordering::Acquire)
+    }
+
+    /// Clear the unsaved mark, returning whether it was set. A snapshot
+    /// takes the mark *before* reading the document state and restores it
+    /// with [`mark_unsaved`](Self::mark_unsaved) if the write fails, so an
+    /// edit that fails while the snapshot is in flight is never lost track
+    /// of.
+    pub fn take_unsaved(&self) -> bool {
+        self.unsaved.swap(false, Ordering::AcqRel)
     }
 
     /// Create a room with an empty document.
@@ -593,12 +618,13 @@ impl RoomRegistry {
         self.rooms.remove(doc_id).map(|(_, room)| room)
     }
 
-    /// Remove a room only if it has no connected clients.
+    /// Remove a room only if it has no connected clients and holds no
+    /// unsaved edits (see [`Room::mark_unsaved`]).
     /// Uses DashMap::remove_if to atomically check and remove.
     pub async fn remove_if_empty(&self, doc_id: &str) -> bool {
         // First check client count while holding the room reference
         let should_remove = if let Some(room) = self.rooms.get(doc_id) {
-            room.client_count().await == 0
+            room.client_count().await == 0 && !room.is_unsaved()
         } else {
             return false;
         };
@@ -610,10 +636,12 @@ impl RoomRegistry {
             let removed = self.rooms.remove_if(doc_id, |_, room| {
                 // Synchronous check: use try_read to avoid blocking.
                 // If we can't get the lock, skip removal (client is active).
-                room.clients
-                    .try_read()
-                    .map(|c| c.is_empty())
-                    .unwrap_or(false)
+                !room.is_unsaved()
+                    && room
+                        .clients
+                        .try_read()
+                        .map(|c| c.is_empty())
+                        .unwrap_or(false)
             });
             return removed.is_some();
         }
@@ -745,6 +773,15 @@ impl RoomRegistry {
         // Broadcast the original wire-framed message to every local client.
         // Client IDs start at 1, so passing 0 excludes nobody.
         room.broadcast(0, wire_bytes.to_vec()).await;
+    }
+
+    /// Every room holding edits whose save failed.
+    pub fn unsaved_rooms(&self) -> Vec<String> {
+        self.rooms
+            .iter()
+            .filter(|e| e.value().is_unsaved())
+            .map(|e| e.key().clone())
+            .collect()
     }
 
     /// List all room doc_ids that are idle (no clients, last edit > threshold).
@@ -993,6 +1030,20 @@ mod tests {
         let (msg_type, payload) = decode_message(&msg).unwrap();
         assert_eq!(msg_type, MessageType::SyncStep1);
         assert!(!payload.is_empty(), "state vector payload should not be empty");
+    }
+
+    #[tokio::test]
+    async fn an_unsaved_room_is_not_removed_when_empty() {
+        let reg = RoomRegistry::new();
+        let room = reg.get_or_insert("d1", OgreDoc::new());
+        room.mark_unsaved();
+        assert_eq!(reg.unsaved_rooms(), vec!["d1".to_string()]);
+        assert!(!reg.remove_if_empty("d1").await, "its memory is the only copy");
+        assert!(reg.get("d1").is_some());
+        assert!(room.take_unsaved());
+        assert!(!room.is_unsaved());
+        assert!(reg.unsaved_rooms().is_empty());
+        assert!(reg.remove_if_empty("d1").await);
     }
 
     #[tokio::test]
