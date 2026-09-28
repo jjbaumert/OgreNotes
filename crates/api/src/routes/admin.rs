@@ -109,6 +109,7 @@ pub fn router() -> Router<AppState> {
         .route("/metrics", get(metrics_snapshot))
         .route("/audit", get(list_audit))
         .route("/documents/{id}/compact", post(force_compact_document))
+        .route("/search/reindex", post(reindex_search))
         .route(
             "/documents/{id}/repair-liveapp-attrs",
             post(repair_liveapp_attrs),
@@ -690,6 +691,34 @@ enum ForceCompactResponse {
 /// deletes UPDATE# rows with `created_at < cutoff`. Any update
 /// that lands during the snapshot-write is strictly newer and
 /// survives.
+/// POST /admin/search/reindex — rebuild this server's search index from
+/// every document in DynamoDB, in the background (202). 409 when one is
+/// already running. For a lost or suspect index; routine recovery after a
+/// restore happens on its own at startup (see `search_backup`).
+async fn reindex_search(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    require_admin(&auth)?;
+    enforce_admin_mut_rate_limit(&state, &auth.user_id).await?;
+    if crate::search_backup::is_reindexing() {
+        return Err(ApiError::Conflict("a search re-index is already running".into()));
+    }
+    tracing::warn!(
+        event_type = "admin_action",
+        action = "reindex_search",
+        actor_id = %auth.user_id,
+        "admin started a full search re-index"
+    );
+    let state_for_task = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::search_backup::reindex(&state_for_task, None).await {
+            tracing::warn!(error = %e, "admin search re-index failed");
+        }
+    });
+    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "started": true }))))
+}
+
 async fn force_compact_document(
     State(state): State<AppState>,
     auth: AuthUser,

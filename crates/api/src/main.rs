@@ -19,8 +19,19 @@ use ogrenotes_api::observability;
 use ogrenotes_api::routes;
 use ogrenotes_api::state::AppState;
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Secrets from SSM (SECRETS_SSM_PATH) become environment variables
+    // before the runtime starts — setting the environment is only sound
+    // while this is the process's only thread. See `secrets`.
+    ogrenotes_api::secrets::load_into_env();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime")
+        .block_on(run())
+}
+
+async fn run() {
     // Initialise the metrics recorder before any logs fire, so the
     // log-event counter layer below sees a live recorder from the first event.
     ogrenotes_common::metrics::init();
@@ -149,11 +160,18 @@ async fn main() {
         None
     };
 
-    // Initialize search index
-    let search_index = ogrenotes_search::SearchIndex::open_or_create(
-        std::path::Path::new(&config.search_index_path),
-    )
-    .expect("failed to open search index");
+    // Initialize search index. An empty directory (new disk, new server)
+    // is first restored from the S3 snapshot when there is one; either
+    // way it is brought up to date once the server is running (below).
+    let search_index_path = std::path::Path::new(&config.search_index_path);
+    let search_index_was_empty = !search_index_path.join("meta.json").exists();
+    let search_restored_at = if search_index_was_empty {
+        ogrenotes_api::search_backup::restore_if_empty(&s3, search_index_path).await
+    } else {
+        None
+    };
+    let search_index = ogrenotes_search::SearchIndex::open_or_create(search_index_path)
+        .expect("failed to open search index");
 
     // Initialize embedding pipeline (optional — disabled when QDRANT_URL is not set)
     let embedding_pipeline = if let Some(ref qdrant_url) = config.qdrant_url {
@@ -295,6 +313,21 @@ async fn main() {
     // are unreachable, and write out edits whose save failed once they
     // return. (Self-hosting over a home connection makes this routine.)
     let _storage_probe_handle = ogrenotes_api::storage_health::spawn_probe(state.clone());
+
+    // Bring a new or restored search index up to date: re-index what changed
+    // since the snapshot, or everything when there was no snapshot. Then keep
+    // backing it up (SEARCH_BACKUP_INTERVAL_MINS; off by default).
+    if search_index_was_empty {
+        let state_for_index = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                ogrenotes_api::search_backup::reindex(&state_for_index, search_restored_at).await
+            {
+                tracing::warn!(error = %e, "search index: startup re-index failed");
+            }
+        });
+    }
+    let _search_backup_handle = ogrenotes_api::search_backup::spawn_scheduler(state.clone());
 
     // Start the hourly orphaned-object sweep. Safe when
     // BLOB_RECONCILE_ENABLED is false (the default); dry-run unless

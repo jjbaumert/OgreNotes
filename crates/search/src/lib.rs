@@ -1,7 +1,10 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+mod snapshot;
+pub use snapshot::{restore_snapshot, IndexSnapshot};
 
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
@@ -23,6 +26,9 @@ pub enum SearchError {
 
     #[error("on-disk index schema does not match expected schema — delete the index directory to rebuild")]
     SchemaMismatch,
+
+    #[error("index snapshot: {0}")]
+    Snapshot(String),
 }
 
 impl SearchError {
@@ -125,6 +131,9 @@ pub struct SearchIndex {
     reader: IndexReader,
     writer: Arc<Mutex<IndexWriter>>,
     schema: SearchSchema,
+    /// The on-disk directory, or `None` for an in-memory index. Needed to
+    /// take a snapshot ([`SearchIndex::snapshot`]).
+    dir: Option<PathBuf>,
 }
 
 impl SearchIndex {
@@ -158,6 +167,7 @@ impl SearchIndex {
             reader,
             writer: Arc::new(Mutex::new(writer)),
             schema: fields,
+            dir: Some(path.to_path_buf()),
         })
     }
 
@@ -178,6 +188,7 @@ impl SearchIndex {
             reader,
             writer: Arc::new(Mutex::new(writer)),
             schema: fields,
+            dir: None,
         })
     }
 
