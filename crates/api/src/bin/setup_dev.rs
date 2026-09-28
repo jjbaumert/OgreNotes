@@ -18,6 +18,7 @@ async fn main() {
     // silently broke CI for four days.
     let table_name = table_name_for_prefix(&table_prefix);
 
+    let bucket_region = region.clone();
     println!("Setting up dev resources...");
     println!("  Region:     {region}");
     println!("  Table:      {table_name}");
@@ -306,8 +307,19 @@ async fn main() {
         }
     }
 
-    // Create S3 bucket
-    match s3.create_bucket().bucket(&bucket).send().await {
+    // Create S3 bucket. Outside us-east-1, S3 requires the region as a
+    // location constraint (a bare CreateBucket fails there).
+    let mut create = s3.create_bucket().bucket(&bucket);
+    if bucket_region != "us-east-1" && std::env::var("AWS_ENDPOINT_URL_S3").is_err() {
+        create = create.create_bucket_configuration(
+            aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                .location_constraint(aws_sdk_s3::types::BucketLocationConstraint::from(
+                    bucket_region.as_str(),
+                ))
+                .build(),
+        );
+    }
+    match create.send().await {
         Ok(_) => println!("  S3 bucket created: {bucket}"),
         Err(e) => {
             let service_err = e.into_service_error();

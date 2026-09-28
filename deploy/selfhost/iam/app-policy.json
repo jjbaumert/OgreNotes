@@ -1,0 +1,56 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "TableData",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem",
+        "dynamodb:Query", "dynamodb:Scan", "dynamodb:BatchGetItem", "dynamodb:BatchWriteItem",
+        "dynamodb:ConditionCheckItem", "dynamodb:TransactWriteItems", "dynamodb:TransactGetItems",
+        "dynamodb:DescribeTable"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:__REGION__:__ACCOUNT_ID__:table/__TABLE__",
+        "arn:aws:dynamodb:__REGION__:__ACCOUNT_ID__:table/__TABLE__/index/*"
+      ]
+    },
+    {
+      "Sid": "BucketList",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::__BUCKET__"
+    },
+    {
+      "Sid": "BucketObjects",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::__BUCKET__/*"
+    },
+    {
+      "Sid": "ReadSecrets",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParametersByPath", "ssm:GetParameter"],
+      "Resource": "arn:aws:ssm:__REGION__:__ACCOUNT_ID__:parameter__SECRETS_PATH__*"
+    },
+    {
+      "Sid": "QuipImportTokens",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:PutParameter", "ssm:DeleteParameter"],
+      "Resource": "arn:aws:ssm:__REGION__:__ACCOUNT_ID__:parameter/__TABLE_PREFIX__ogrenote/*"
+    },
+    {
+      "Sid": "SecureStringsViaSsm",
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"],
+      "Resource": "*",
+      "Condition": { "StringEquals": { "kms:ViaService": "ssm.__REGION__.amazonaws.com" } }
+    },
+    {
+      "Sid": "NeverDropTheData",
+      "Effect": "Deny",
+      "Action": ["dynamodb:DeleteTable", "s3:DeleteBucket", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy"],
+      "Resource": "*"
+    }
+  ]
+}
