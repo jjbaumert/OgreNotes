@@ -59,6 +59,9 @@ pub struct AppState {
     pub workspace_scim_token_repo: Arc<WorkspaceScimTokenRepo>,
     pub template_gallery_repo: Arc<TemplateGalleryRepo>,
     pub room_registry: Arc<RoomRegistry>,
+    /// Whether DynamoDB/S3 are reachable right now — see
+    /// [`crate::storage_health`].
+    pub storage_health: Arc<crate::storage_health::StorageHealth>,
     pub redis_pubsub: Arc<RedisPubSub>,
     /// Shared Redis command client. The single source for the raw
     /// fixed-window counter operations (rate limiting, `/ask` quota,
@@ -219,6 +222,7 @@ impl AppState {
             workspace_scim_token_repo,
             template_gallery_repo,
             room_registry: Arc::new(RoomRegistry::new()),
+            storage_health: Arc::new(crate::storage_health::StorageHealth::default()),
             redis_pubsub,
             redis,
             redis_session,

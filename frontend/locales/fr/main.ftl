@@ -730,6 +730,11 @@ sync-saved-tooltip = Vos modifications sont enregistrées.
 sync-saving-tooltip = Envoi de vos dernières modifications au serveur…
 sync-offline-tooltip = Vous êtes déconnecté. Reconnectez-vous pour continuer à collaborer.
 sync-offline-pending-tooltip = Vous êtes déconnecté. {$count} modification(s) ne sont pas encore arrivées au serveur.
+sync-not-saved = Non enregistré
+sync-not-saved-tooltip = Le serveur a reçu vos dernières modifications mais n’a pas pu les enregistrer : il a perdu la connexion au stockage. Gardez cet onglet ouvert — elles seront renvoyées automatiquement dès le retour de la connexion.
+storage-offline-title = Enregistrement impossible pour le moment.
+storage-offline-body = Le serveur a perdu la connexion au stockage. Les documents ne peuvent être ni ouverts ni enregistrés avant son retour ; ce message disparaîtra de lui-même.
+storage-boot-body = Le serveur a perdu la connexion au stockage et ne peut pas encore vous connecter. Cette page réessaie et reprendra d’elle-même au retour de la connexion.
 
 # ─── Command palette (Phase 5 M-P4 piece A) ─────────────────────
 

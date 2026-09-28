@@ -96,6 +96,7 @@ features = [
     "Location",
     "Storage",
     "console",
+    "BeforeUnloadEvent",
     "Event",
     "EventTarget",
     "KeyboardEvent",

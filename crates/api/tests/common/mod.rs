@@ -495,7 +495,7 @@ impl TestApp {
         // tests can assert against the live policy (#35). dev_mode
         // is true here so Strict-Transport-Security is omitted.
         let router = routes::apply_security_headers(
-            routes::api_router().with_state(state.clone()),
+            routes::stateful_router(state.clone()),
             state.config.dev_mode,
             &routes::security_csp(),
         );
@@ -561,7 +561,7 @@ impl TestApp {
         };
         self.state.config = std::sync::Arc::new(new_config);
         self.router = ogrenotes_api::routes::apply_security_headers(
-            ogrenotes_api::routes::api_router().with_state(self.state.clone()),
+            ogrenotes_api::routes::stateful_router(self.state.clone()),
             self.state.config.dev_mode,
             &ogrenotes_api::routes::security_csp(),
         );
@@ -580,7 +580,7 @@ impl TestApp {
         };
         self.state.config = std::sync::Arc::new(new_config);
         self.router = ogrenotes_api::routes::apply_security_headers(
-            ogrenotes_api::routes::api_router().with_state(self.state.clone()),
+            ogrenotes_api::routes::stateful_router(self.state.clone()),
             self.state.config.dev_mode,
             &ogrenotes_api::routes::security_csp(),
         );

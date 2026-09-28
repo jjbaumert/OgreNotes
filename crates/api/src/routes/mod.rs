@@ -243,9 +243,23 @@ pub fn apply_security_headers<S: Clone + Send + Sync + 'static>(
 /// folders, metrics, admin) and fits comfortably inside this cap.
 const GLOBAL_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
+/// [`api_router`] with its state applied and the storage fail-fast layer
+/// on top: while storage is unreachable, API requests get an immediate
+/// 503 instead of hanging on SDK retries (see [`crate::storage_health`]).
+/// The one entry point both the server and the test harness use.
+pub fn stateful_router(state: AppState) -> Router {
+    api_router()
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::storage_health::fail_fast_while_unreachable,
+        ))
+}
+
 pub fn api_router() -> Router<AppState> {
     Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/api/v1/status", get(crate::storage_health::status))
         .nest("/api/v1/auth", auth::router())
         .nest("/api/v1/users", users::router())
         .nest("/api/v1/documents", documents::router().merge(ws::router()).merge(comments::doc_router()).merge(history::router()).merge(sharing::doc_sharing_router()).merge(activity::router()).merge(relationships::doc_relationships_router()))

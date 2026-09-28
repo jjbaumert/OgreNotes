@@ -104,8 +104,11 @@ pub async fn compact_or_remove_on_empty(
     doc_repo: &DocRepo,
     doc_id: &str,
 ) {
+    // Edits whose save failed exist only in the room's memory — no
+    // UPDATE# row records them — so they count as pending too.
+    let unsaved = registry.get(doc_id).is_some_and(|r| r.is_unsaved());
     let has_pending = match doc_repo.has_pending_updates(doc_id).await {
-        Ok(p) => p,
+        Ok(p) => p || unsaved,
         Err(e) => {
             // DynamoDB unavailable — we can't tell whether there's an op log
             // to prune. Leave the room in the registry so the periodic
@@ -182,17 +185,29 @@ pub async fn compact_room_with_outcome(
     // strictly newer than the cutoff and are not pruned.
     let cutoff = ogrenotes_common::time::now_usec();
 
+    // Take the unsaved mark before reading the state this snapshot will
+    // write, and put it back if the write doesn't happen: an edit whose
+    // save fails while this is in flight re-marks the room itself.
+    let was_unsaved = room.take_unsaved();
     let state_bytes = room.to_state_bytes().await;
 
     let new_version = match doc_repo.get(doc_id).await {
         Ok(Some(meta)) => meta.snapshot_version + 1,
-        _ => return CompactOutcome::MetadataMissing,
+        _ => {
+            if was_unsaved {
+                room.mark_unsaved();
+            }
+            return CompactOutcome::MetadataMissing;
+        }
     };
 
     if let Err(e) = doc_repo
         .save_snapshot(doc_id, &state_bytes, new_version, cutoff, "system")
         .await
     {
+        if was_unsaved {
+            room.mark_unsaved();
+        }
         counter::inc(MetricKey::new("compaction.failure_total", &[]));
         tracing::warn!(doc_id, error = %e, "compaction: snapshot save failed");
         return CompactOutcome::SnapshotFailed;

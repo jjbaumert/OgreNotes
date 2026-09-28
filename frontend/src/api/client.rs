@@ -127,6 +127,10 @@ async fn refresh_token_inner() -> Option<TokenResponse> {
         .await
         .ok()?;
     if !resp.ok() {
+        // Raises the storage banner when the refresh failed only because
+        // the server can't reach its storage (the error value itself is
+        // not needed here).
+        let _ = http_error(&resp);
         return None;
     }
     // The backend response carries `refreshToken` and `sessionId` for
@@ -623,6 +627,15 @@ fn should_redirect_to_login(pathname: &str) -> bool {
 }
 
 fn redirect_to_login() {
+    // While the server can't reach its storage, a 401 is far more likely
+    // an outage artifact than a real logout (e.g. a token refresh that
+    // couldn't reach the session store), and navigating away would throw
+    // away any edits this tab is holding that the server couldn't save.
+    // Stay put; the banner explains, and requests work again once storage
+    // is back.
+    if crate::storage_status::is_offline() {
+        return;
+    }
     if let Some(window) = web_sys::window() {
         let pathname = window.location().pathname().unwrap_or_default();
         if should_redirect_to_login(&pathname) {
@@ -669,6 +682,12 @@ impl std::fmt::Display for ApiClientError {
 /// backend's TraceLayer emits are captured, so support can still trace
 /// the failure server-side.
 pub(crate) fn http_error(resp: &Response) -> ApiClientError {
+    // The server's fail-fast answer while it can't reach storage: raise
+    // the app-wide banner (see `storage_status`).
+    let storage = resp.headers().get(crate::storage_status::STORAGE_HEADER);
+    if crate::storage_status::is_storage_unavailable(resp.status(), storage.as_deref()) {
+        crate::storage_status::report_unreachable();
+    }
     ApiClientError::Http(resp.status(), resp.headers().get("x-request-id"))
 }
 

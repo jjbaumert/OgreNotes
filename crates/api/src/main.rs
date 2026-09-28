@@ -65,10 +65,15 @@ async fn main() {
     // Build AWS clients
     let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(config.aws_region.clone()))
+        .timeout_config(ogrenotes_api::storage_health::sdk_timeouts())
         .load()
         .await;
 
-    let dynamo_client = aws_sdk_dynamodb::Client::new(&aws_config);
+    let dynamo_client = aws_sdk_dynamodb::Client::from_conf(
+        aws_sdk_dynamodb::config::Builder::from(&aws_config)
+            .timeout_config(ogrenotes_api::storage_health::dynamodb_timeouts())
+            .build(),
+    );
     let ssm_client = aws_sdk_ssm::Client::new(&aws_config);
     // Path-style addressing is required for local S3-compatible stores
     // (MinIO) reached via a custom endpoint; they don't support the
@@ -286,6 +291,11 @@ async fn main() {
     let _trash_cleanup_handle =
         ogrenotes_api::trash_cleanup::spawn_scheduler(state.clone());
 
+    // Watch storage reachability: fail API requests fast while DynamoDB/S3
+    // are unreachable, and write out edits whose save failed once they
+    // return. (Self-hosting over a home connection makes this routine.)
+    let _storage_probe_handle = ogrenotes_api::storage_health::spawn_probe(state.clone());
+
     // Start the hourly orphaned-object sweep. Safe when
     // BLOB_RECONCILE_ENABLED is false (the default); dry-run unless
     // BLOB_RECONCILE_DRY_RUN=false. (#166.)
@@ -454,8 +464,7 @@ async fn main() {
         .allow_credentials(true);
 
     // Build router — serve API routes, then fall back to static frontend files
-    let mut app = routes::api_router()
-        .with_state(state);
+    let mut app = routes::stateful_router(state);
 
     // #48: pending OAuth-flow state lives in Redis now (keyed
     // `oauth_flow:<state>` with a TTL), so there is no in-memory map to

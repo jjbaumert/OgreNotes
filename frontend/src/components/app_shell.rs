@@ -210,6 +210,9 @@ pub fn AppShell() -> impl IntoView {
                     on:click=move |_| a11y::defer(move || ctx.drawer_open.set(false))
                 ></div>
             </Show>
+            // Shown while the server can't reach its storage (self-hosted
+            // servers can lose their internet connection).
+            <crate::components::storage_banner::StorageBanner/>
             <Outlet/>
             // #142: shell-mounted template picker. One modal serves every
             // entry point (sidebar Templates row, Document menu "New from

@@ -824,6 +824,12 @@ async fn handle_ws(
     // cleanup (line ~622: `state.room_registry.remove_if_empty`) can
     // still see `state` via its own disjoint capture.
     let state_for_recv = state.clone();
+    // This session saw a failed save (`persist-failed` sent) and hasn't
+    // yet been told a save succeeded since. The first successful save
+    // after a failure sends `persist-ok`, which is the only thing that
+    // clears the client's "Not saved" badge — clearing it on send would
+    // show "Saved" for a resend that then fails.
+    let had_persist_failure = std::sync::atomic::AtomicBool::new(false);
     // #212: the recv task's `async move` block references `state.redis_pubsub`
     // directly (Update + Awareness arms), so under RFC 2229 precise closure
     // capture that field gets moved into the task. Grab a clone now so the
@@ -998,7 +1004,21 @@ async fn handle_ws(
                                         // happened and the reader will not see it on
                                         // reload — so we surface it as MSG_ERROR
                                         // instead of the historical log-and-drop.
-                                        if let Err(e) = state_for_recv.doc_repo.append_update(&update).await {
+                                        // Storage already known unreachable: don't
+                                        // make the user wait out the SDK's timeouts
+                                        // to learn the edit wasn't saved.
+                                        let saved = if !state_for_recv.storage_health.is_up() {
+                                            counter::inc(MetricKey::new(
+                                                "ws.update_persist_failures_total",
+                                                &[],
+                                            ));
+                                            tracing::warn!(
+                                                doc_id = %doc_id,
+                                                payload_len = payload.len(),
+                                                "storage unreachable; update not saved — notifying client",
+                                            );
+                                            false
+                                        } else if let Err(e) = state_for_recv.doc_repo.append_update(&update).await {
                                             counter::inc(MetricKey::new(
                                                 "ws.update_persist_failures_total",
                                                 &[],
@@ -1013,12 +1033,35 @@ async fn handle_ws(
                                                 payload_len = payload.len(),
                                                 "append_update failed — notifying client",
                                             );
+                                            false
+                                        } else {
+                                            true
+                                        };
+                                        if saved
+                                            && had_persist_failure
+                                                .swap(false, std::sync::atomic::Ordering::Relaxed)
+                                        {
+                                            room_for_recv
+                                                .send_to_client(
+                                                    client_id,
+                                                    encode_message(MessageType::Error, b"persist-ok"),
+                                                )
+                                                .await;
+                                        }
+                                        if !saved {
+                                            had_persist_failure
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
                                             // Opaque payload — the full RepoError
                                             // (which can carry AWS SDK service-error
                                             // strings, bucket names, table names) is
                                             // already logged server-side at the
                                             // tracing::error above. The client only
                                             // needs the code to react.
+                                            // The update is applied to the
+                                            // room but saved nowhere: keep the
+                                            // room until a snapshot lands
+                                            // (see `storage_health`).
+                                            room_for_recv.mark_unsaved();
                                             let err_msg = encode_message(
                                                 MessageType::Error,
                                                 b"persist-failed",

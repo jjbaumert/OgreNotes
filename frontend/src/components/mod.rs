@@ -3,6 +3,7 @@
 pub mod accessibility_settings;
 pub mod account_menu;
 pub mod app_shell;
+pub mod storage_banner;
 pub mod ask_dialog;
 pub mod at_menu;
 pub mod block_menu;

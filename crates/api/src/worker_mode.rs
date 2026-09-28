@@ -254,9 +254,17 @@ pub async fn run(config: AppConfig) {
     // both, so each builds its own clients.
     let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(config.aws_region.clone()))
+        .timeout_config(crate::storage_health::sdk_timeouts())
         .load()
         .await;
-    let dynamo = DynamoClient::new(aws_sdk_dynamodb::Client::new(&aws_config), config.table_name());
+    let dynamo = DynamoClient::new(
+        aws_sdk_dynamodb::Client::from_conf(
+            aws_sdk_dynamodb::config::Builder::from(&aws_config)
+                .timeout_config(crate::storage_health::dynamodb_timeouts())
+                .build(),
+        ),
+        config.table_name(),
+    );
     let s3 = S3Client::new(aws_sdk_s3::Client::new(&aws_config), config.s3_bucket.clone());
 
     // Quip import deps. Build `import_repo` from a clone BEFORE `FolderRepo`
@@ -572,6 +580,24 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
             }
             Err(e) => tracing::warn!(job_id, error = %e, "ack failed; entry orphaned"),
         },
+        // Storage unreachable: the failure says nothing about the job, so it
+        // must not spend the retry budget — a long outage would otherwise
+        // dead-letter every job (and fail a multi-hour Quip import outright).
+        // Leave the entry pending, exactly like `HeldByLiveRunner`; the
+        // reaper redelivers it once it has sat idle, and it runs normally
+        // when storage is back.
+        Err(reason)
+            if crate::storage_health::probe_once(ctx.doc_repo.db(), &ctx.s3)
+                .await
+                .is_err() =>
+        {
+            tracing::warn!(
+                job_id,
+                attempt,
+                error = %reason,
+                "job failed while storage is unreachable; leaving it pending without spending a retry",
+            );
+        }
         Err(reason) => {
             tracing::warn!(job_id, attempt, error = %reason, "job failed");
             match queue

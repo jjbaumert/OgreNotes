@@ -19,6 +19,7 @@ pub mod observability;
 mod pages;
 pub use ogrenotes_frontend::presentation;
 mod rum;
+pub use ogrenotes_frontend::storage_status;
 mod spreadsheet;
 mod editor_width;
 mod theme;
@@ -80,7 +81,24 @@ fn main() {
         // Hydrate auth from the refresh cookie BEFORE mount (route guards
         // need it) and pick up the user's stored ui_prefs in the same
         // round trip — no separate /users/me fetch.
-        let auth = api::client::try_hydrate_from_cookie().await;
+        let mut auth = api::client::try_hydrate_from_cookie().await;
+        // The server couldn't restore the session only because it can't
+        // reach its storage: say so and retry, rather than mounting the
+        // app logged-out and routing to a login that can't work either.
+        if auth.is_none() && storage_status::is_offline() {
+            i18n::init(&i18n::resolve_locale_with_hint(None));
+            let notice = show_boot_storage_notice();
+            while auth.is_none() && storage_status::is_offline() {
+                gloo_timers::future::TimeoutFuture::new(10_000).await;
+                // Cleared before each try, so a failure that isn't the
+                // storage outage (a real logout) ends the wait.
+                storage_status::report_reachable();
+                auth = api::client::try_hydrate_from_cookie().await;
+            }
+            if let Some(el) = notice {
+                el.remove();
+            }
+        }
         let prefs = auth.as_ref().and_then(|t| t.ui_prefs.as_ref());
 
         // Locale: the load-bearing order is refresh -> init -> mount.
@@ -187,4 +205,21 @@ fn install_panic_hook() {
             );
         }));
     }
+}
+
+/// Pre-mount notice while the server can't reach its storage: the app
+/// can't restore the session until it does. Plain DOM (Leptos isn't
+/// mounted yet), styled like the in-app storage banner.
+fn show_boot_storage_notice() -> Option<web_sys::Element> {
+    let document = web_sys::window()?.document()?;
+    let el = document.create_element("div").ok()?;
+    el.set_class_name("storage-banner");
+    el.set_attribute("role", "alert").ok()?;
+    let title = document.create_element("strong").ok()?;
+    title.set_text_content(Some(&crate::t!("storage-offline-title")));
+    el.append_child(&title).ok()?;
+    el.append_child(&document.create_text_node(&format!(" {}", crate::t!("storage-boot-body"))))
+        .ok()?;
+    document.body()?.append_child(&el).ok()?;
+    Some(el)
 }

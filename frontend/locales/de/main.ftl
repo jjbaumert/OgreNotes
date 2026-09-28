@@ -730,6 +730,11 @@ sync-saved-tooltip = Deine Änderungen sind gespeichert.
 sync-saving-tooltip = Deine letzten Änderungen werden an den Server gesendet…
 sync-offline-tooltip = Du bist offline. Verbinde dich erneut, um weiter zusammenzuarbeiten.
 sync-offline-pending-tooltip = Du bist offline. {$count} Änderung(en) haben den Server noch nicht erreicht.
+sync-not-saved = Nicht gespeichert
+sync-not-saved-tooltip = Der Server hat deine letzten Änderungen erhalten, konnte sie aber nicht speichern: Er hat die Verbindung zum Speicher verloren. Lass diesen Tab offen – sie werden automatisch erneut gesendet, sobald die Verbindung zurück ist.
+storage-offline-title = Speichern ist gerade nicht möglich.
+storage-offline-body = Der Server hat die Verbindung zum Speicher verloren. Dokumente können erst wieder geöffnet oder gespeichert werden, wenn sie zurück ist; diese Meldung verschwindet dann von selbst.
+storage-boot-body = Der Server hat die Verbindung zum Speicher verloren und kann dich noch nicht anmelden. Diese Seite versucht es weiter und macht von selbst weiter, sobald die Verbindung zurück ist.
 
 # ─── Command palette (Phase 5 M-P4 piece A) ─────────────────────
 

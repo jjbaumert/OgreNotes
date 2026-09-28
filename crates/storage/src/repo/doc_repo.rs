@@ -70,6 +70,11 @@ impl DocRepo {
         &self.s3
     }
 
+    /// Access the DynamoDB client (for the storage reachability probe).
+    pub fn db(&self) -> &DynamoClient {
+        &self.db
+    }
+
     /// Update snapshot metadata with a condition expression (for optimistic locking).
     pub async fn conditional_update_snapshot(
         &self,
