@@ -21,6 +21,9 @@ use leptos::prelude::*;
 
 use crate::a11y;
 
+/// Pause in typing before the live preview re-renders.
+const PREVIEW_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// Everything the modal needs to render + carry back to the
 /// caller. Held in a `RwSignal<Option<MermaidModalState>>` by
 /// `editor_component.rs`; `None` means the modal is closed.
@@ -92,6 +95,16 @@ fn render_modal(
 ) -> impl IntoView {
     // Working copy of the source, staged until Save.
     let (source, set_source) = signal(initial.source.clone());
+    // What the preview shows: the source once typing pauses. Rendering
+    // a large diagram per keystroke on the main thread made the
+    // textarea lag (the design spec calls for a debounced preview).
+    let (preview_source, set_preview_source) = signal(initial.source.clone());
+    let pending_preview = StoredValue::new(None::<TimeoutHandle>);
+    on_cleanup(move || {
+        if let Some(Some(h)) = pending_preview.try_get_value() {
+            h.clear();
+        }
+    });
     let block_id_for_save = initial.block_id.clone();
 
     // Every close path flips `state.set(None)`, which collapses
@@ -132,13 +145,13 @@ fn render_modal(
     });
     let blocked_reason = Signal::derive(move || save_blocked(&source.get()));
 
-    // Live preview: rendered on each keystroke through the same
+    // Live preview: rendered once typing pauses, through the same
     // `ogrenotes_mermaid::render` pipeline the block view uses.
     // SVG → `inner_html` is trusted output from our own renderer
     // (source is XML-escaped internally); the error message is a
     // plain Leptos text node, so it's escaped automatically.
     let preview = move || {
-        let src = source.get();
+        let src = preview_source.get();
         let out = ogrenotes_mermaid::render(&src);
         match out.svg {
             Some(svg) => view! { <div class="mermaid-svg" inner_html=svg></div> }.into_any(),
@@ -182,7 +195,21 @@ fn render_modal(
                         class="mermaid-source"
                         autofocus
                         prop:value=move || source.get()
-                        on:input=move |e| set_source.set(event_target_value(&e))
+                        on:input=move |e| {
+                            let value = event_target_value(&e);
+                            set_source.set(value.clone());
+                            if let Some(h) = pending_preview.get_value() {
+                                h.clear();
+                            }
+                            let h = set_timeout_with_handle(
+                                move || {
+                                    let _ = set_preview_source.try_set(value);
+                                },
+                                PREVIEW_DEBOUNCE,
+                            )
+                            .ok();
+                            pending_preview.set_value(h);
+                        }
                     ></textarea>
                     <div class="mermaid-preview">{preview}</div>
                 </div>

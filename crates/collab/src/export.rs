@@ -1308,15 +1308,13 @@ fn render_node_markdown<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String, de
                 }
                 NodeType::CodeBlock => {
                     let lang = el.get_attribute(txn, "language").unwrap_or_default();
-                    out.push_str(&format!("```{lang}\n"));
-                    render_children_markdown(txn, el, out, depth);
-                    out.push_str("\n```\n\n");
+                    let mut body = String::new();
+                    render_children_markdown(txn, el, &mut body, depth);
+                    push_md_fenced(out, &lang, &body);
                 }
                 NodeType::Mermaid => {
                     let source = el.get_attribute(txn, "source").unwrap_or_default();
-                    out.push_str("```mermaid\n");
-                    out.push_str(&source);
-                    out.push_str("\n```\n\n");
+                    push_md_fenced(out, "mermaid", &source);
                 }
                 NodeType::HorizontalRule => {
                     out.push_str("---\n\n");
@@ -1887,6 +1885,24 @@ fn escape_md_link_text(s: &str) -> String {
 /// inside `(...)` — parens and whitespace — so a crafted URL can't break
 /// out and inject trailing markup. The URL has already passed
 /// `is_safe_url`. (#7)
+/// A fenced Markdown code block around `body`. The fence is one backtick
+/// longer than the longest backtick run in `body` (CommonMark allows any
+/// fence of 3+): with a fixed ```` ``` ````, a body line of ```` ``` ````
+/// closed the block early and everything after it became live Markdown —
+/// raw HTML included — in the export. The info string can't hold a
+/// backtick or a newline either, so those are dropped from `info`.
+fn push_md_fenced(out: &mut String, info: &str, body: &str) {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in body.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    let info: String = info.chars().filter(|c| !matches!(c, '`' | '\n' | '\r')).collect();
+    out.push_str(&format!("{fence}{info}\n{body}\n{fence}\n\n"));
+}
+
 fn escape_md_url(s: &str) -> String {
     // Parens/whitespace would terminate the `(...)` target; quotes are
     // encoded as defence-in-depth so a downstream Markdown→HTML renderer
@@ -3308,6 +3324,24 @@ mod tests {
         let md = to_markdown_of_single_mermaid("pie\n\"A\" : 1");
         assert!(md.contains("```mermaid"));
         assert!(md.contains("\"A\" : 1"));
+    }
+
+    #[test]
+    fn mermaid_markdown_source_cannot_close_its_fence() {
+        let md = to_markdown_of_single_mermaid("pie\n```\n<img src=x onerror=alert(1)>\n````");
+        // The fence outlasts the longest backtick run in the source (4).
+        assert!(md.starts_with("`````mermaid\n"), "{md}");
+        assert!(md.trim_end().ends_with("\n`````"), "{md}");
+    }
+
+    #[test]
+    fn md_fence_is_three_backticks_unless_the_body_needs_more() {
+        let mut out = String::new();
+        push_md_fenced(&mut out, "rust", "let x = `a`;");
+        assert_eq!(out, "```rust\nlet x = `a`;\n```\n\n");
+        let mut out = String::new();
+        push_md_fenced(&mut out, "x`y\nz", "```");
+        assert_eq!(out, "````xyz\n```\n````\n\n");
     }
 
     // ── Comment export (#59 T-6) ───────────────────────────────────

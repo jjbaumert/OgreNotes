@@ -234,6 +234,12 @@ impl Parser {
         if id.is_empty() {
             return Err(self.err("subgraph needs an id or title"));
         }
+        if self.stack.len() >= crate::MAX_NESTING {
+            return Err(self.err(format!(
+                "subgraphs nested too deeply (more than {})",
+                crate::MAX_NESTING
+            )));
+        }
         let parent = self.stack.last().map(|&(i, _)| i);
         let idx = self.g.subgraphs.len();
         self.g.subgraphs.push(crate::flowchart::FlowSubgraph {

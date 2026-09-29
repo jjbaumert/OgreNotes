@@ -269,14 +269,10 @@ fn draw_leaf_label(node: &Node, r: Rect, out: &mut String) {
 
 /// Truncate `s` with an ellipsis to fit `max_w` pixels (approx).
 fn clip(s: &str, max_w: f64) -> String {
-    if measure::text_size(s).0 <= max_w || max_w < 8.0 {
+    if max_w < 8.0 {
         return s.to_string();
     }
-    let mut trimmed = s.to_string();
-    while !trimmed.is_empty() && measure::text_size(&format!("{trimmed}…")).0 > max_w {
-        trimmed.pop();
-    }
-    format!("{trimmed}…")
+    measure::truncate_to_width(s, max_w)
 }
 
 fn fmt_num(v: f64) -> String {

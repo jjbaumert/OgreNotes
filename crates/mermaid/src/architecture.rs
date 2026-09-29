@@ -255,11 +255,15 @@ pub(crate) fn render_svg(a: &Architecture) -> String {
                 if pos[v].is_none() {
                     let mut cand = (ux + dx, uy + dy);
                     // Nudge off collisions along the same axis.
-                    while pos.contains(&Some(cand)) {
-                        cand = (cand.0 + dx.signum().max(0).max(if dx == 0 { 1 } else { 0 }), cand.1 + dy);
-                        if dx == 0 && dy == 0 {
-                            break;
-                        }
+                    let mut step = (dx.signum().max(0).max(if dx == 0 { 1 } else { 0 }), dy);
+                    if step == (0, 0) {
+                        // Leaving from the left (dx < 0, dy == 0): the step
+                        // above is zero and would retry the same cell
+                        // forever; keep moving left instead.
+                        step = (dx.signum(), dy.signum());
+                    }
+                    while step != (0, 0) && pos.contains(&Some(cand)) {
+                        cand = (cand.0 + step.0, cand.1 + step.1);
                     }
                     pos[v] = Some(cand);
                     queue.push_back(v);
@@ -464,14 +468,7 @@ fn draw_icon(out: &mut String, icon: &str, x: f64, y: f64, s: f64) {
 }
 
 fn clip(s: &str, max_w: f64) -> String {
-    if measure::text_size(s).0 <= max_w {
-        return s.to_string();
-    }
-    let mut t = s.to_string();
-    while !t.is_empty() && measure::text_size(&format!("{t}…")).0 > max_w {
-        t.pop();
-    }
-    format!("{t}…")
+    measure::truncate_to_width(s, max_w)
 }
 
 #[cfg(test)]
@@ -551,5 +548,17 @@ mod tests {
         assert!(svg.contains(">Cloud<") && svg.contains(">DB<"));
         assert!(svg.contains("<ellipse")); // db cylinder
         assert!(svg.contains("<path") && svg.contains("stroke")); // the edge
+    }
+
+    #[test]
+    fn two_edges_leaving_the_same_left_side_terminate() {
+        // Both b and c want the cell left of a; the collision nudge used
+        // to step by (0, 0) and spin forever.
+        let a = parse(
+            "architecture-beta\n service a(server)[A]\n service b(disk)[B]\n service c(disk)[C]\n a:L -- R:b\n a:L -- R:c",
+        )
+        .unwrap();
+        let svg = render_svg(&a);
+        assert!(svg.contains(">B<") && svg.contains(">C<"));
     }
 }

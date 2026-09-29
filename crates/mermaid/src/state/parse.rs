@@ -439,6 +439,12 @@ impl Parser {
         if self.ids.contains_key(&id) {
             return Err(self.err(format!("`{id}` is already a state, not a composite")));
         }
+        if self.stack.len() >= crate::MAX_NESTING {
+            return Err(self.err(format!(
+                "composite states nested too deeply (more than {})",
+                crate::MAX_NESTING
+            )));
+        }
         let parent = self.stack.last().map(|&(i, _)| i);
         let idx = self.g.composites.len();
         self.g.composites.push(Composite { id: id.clone(), display: id.clone(), parent });

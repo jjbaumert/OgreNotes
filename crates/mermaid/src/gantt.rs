@@ -10,6 +10,9 @@ use crate::{escape_xml, ParseError};
 use std::collections::HashMap;
 
 const MAX_TASKS: usize = 200;
+/// Most date-axis ticks drawn. Ticks are weekly until the span needs more
+/// than this, then every N weeks, so the axis costs O(1) whatever the span.
+const MAX_TICKS: f64 = 20.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Status {
@@ -246,6 +249,12 @@ pub(crate) fn parse(source: &str) -> Result<Gantt, ParseError> {
         if let Some(id) = id {
             ids.insert(id.to_string(), ti);
         }
+        // Dates are four-digit years; a duration running past 9999-12-31 is
+        // a typo (or an attempt to make the axis enormous), and a non-finite
+        // one (hundreds of digits parse to infinity) can't be drawn at all.
+        if !end.is_finite() || end > days_from_civil(9999, 12, 31) as f64 {
+            return Err(err("task ends after the year 9999", line_no));
+        }
         tasks.push(Task { name, section, start, end: end.max(start), status, milestone });
     }
 
@@ -332,7 +341,9 @@ pub(crate) fn render_svg(g: &Gantt) -> String {
     }
 
     // Weekly date-axis gridlines through the chart, dates labeled BELOW it.
-    let step = 7.0; // weekly ticks, Mermaid's default cadence
+    // Weekly is Mermaid's default cadence; a longer span widens the step to
+    // whole weeks so there are never more than MAX_TICKS.
+    let step = 7.0 * ((max - min) / 7.0 / MAX_TICKS).ceil().max(1.0);
     let mut day = min;
     while day <= max + 0.5 {
         let tx = x_of(day);
@@ -520,6 +531,26 @@ mod tests {
         let svg = render_svg(&g);
         assert!(!svg.contains("<script>"));
         assert!(svg.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn long_spans_draw_a_bounded_number_of_ticks() {
+        // Years 1..9999: formerly one tick per week (~520k) — a 280 MB SVG.
+        let g = p("gantt\nsection S\nA :a1, 0001-01-01, 9999-12-31\n");
+        let svg = render_svg(&g);
+        let ticks = svg.matches("opacity=\"0.15\"").count();
+        assert!((2..=MAX_TICKS as usize + 1).contains(&ticks), "{ticks} ticks");
+        // A short chart keeps weekly ticks.
+        let g = p("gantt\nsection S\nA :a1, 2024-01-01, 21d\n");
+        assert_eq!(render_svg(&g).matches("opacity=\"0.15\"").count(), 4);
+    }
+
+    #[test]
+    fn durations_past_year_9999_are_rejected() {
+        for dur in ["9999999d", "99999999999999999999d", &"9".repeat(400)] {
+            let src = format!("gantt\nsection S\nA :a1, 2024-01-01, {dur}\n");
+            assert!(parse(&src).unwrap_err().message.contains("9999"), "{dur}");
+        }
     }
 
     #[test]
