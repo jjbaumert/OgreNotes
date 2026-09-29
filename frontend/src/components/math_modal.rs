@@ -19,6 +19,8 @@ use crate::a11y;
 pub struct MathModalState {
     pub block_id: String,
     pub source: String,
+    /// An inline (`$…$`) equation: previewed in text style.
+    pub inline: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +78,7 @@ fn render_modal(
     // Working copy of the source, staged until Save.
     let (source, set_source) = signal(initial.source.clone());
     let block_id = initial.block_id.clone();
+    let display = if initial.inline { ogrenotes_math::Display::Inline } else { ogrenotes_math::Display::Block };
 
     let close_cb = Callback::new({
         let on_outcome = on_outcome.clone();
@@ -107,7 +110,7 @@ fn render_modal(
         if src.trim().is_empty() {
             return ().into_any();
         }
-        match ogrenotes_math::to_mathml(&src, ogrenotes_math::Display::Block) {
+        match ogrenotes_math::to_mathml(&src, display) {
             Ok(mathml) => view! { <div class="math-render" inner_html=mathml></div> }.into_any(),
             Err(e) => view! { <p class="math-error">{e.to_string()}</p> }.into_any(),
         }

@@ -171,6 +171,7 @@ pub fn default_input_rules() -> Vec<InputRule> {
         italic_rule(),      // *text*
         italic_underscore_rule(), // _text_
         code_rule(),        // `text`
+        math_inline_rule(), // $latex$
     ]
 }
 
@@ -617,6 +618,46 @@ fn code_rule() -> InputRule {
     }
 }
 
+/// `$latex$` → an inline equation. Pandoc's rules keep prose with dollar
+/// amounts intact: the opening `$` must not be followed by whitespace,
+/// the closing one not preceded by it, neither may be escaped (`\$`) or
+/// doubled (`$$`), and the content must parse as math — so "costs $5
+/// and $10" stays text.
+fn math_inline_rule() -> InputRule {
+    InputRule {
+        name: "math_inline",
+        matcher: Box::new(|text| {
+            let inner = text.strip_suffix('$')?;
+            if inner.ends_with('$') || inner.ends_with('\\') || inner.ends_with(char::is_whitespace) {
+                return None;
+            }
+            let start = inner.rfind('$')?;
+            let content = &inner[start + 1..];
+            if content.is_empty() || content.starts_with(char::is_whitespace) {
+                return None;
+            }
+            if matches!(char_before(inner, start), Some('$' | '\\')) {
+                return None;
+            }
+            Some((start, text.len() - start))
+        }),
+        handler: Box::new(|state, from, to, matched| {
+            let source = strip_delimiters(matched, "$")?;
+            // Only real math becomes an equation; anything else stays as
+            // typed rather than turning into an error chip.
+            ogrenotes_math::to_mathml(source, ogrenotes_math::Display::Inline).ok()?;
+            let mut attrs = HashMap::new();
+            attrs.insert("source".to_string(), source.to_string());
+            let node = Node::element_with_attrs(NodeType::MathInline, attrs, Fragment::empty());
+            let slice = Slice::new(Fragment::from(vec![node]), 0, 0);
+            let mut txn = state.transaction().replace(from, to, slice).ok()?;
+            txn.selection = Selection::cursor(from + 1);
+            txn.stored_marks = Some(vec![]);
+            Some(txn)
+        }),
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1020,6 +1061,42 @@ mod tests {
         let first = para.child(0).unwrap();
         assert_eq!(first.text_content(), "fn main()");
         assert!(first.marks().iter().any(|m| m.mark_type == MarkType::Code));
+    }
+
+    // ── Inline math ──
+
+    fn apply_rules(text: &str) -> Option<EditorState> {
+        let rules = default_input_rules();
+        let state = make_state(text);
+        check_input_rules(&rules, &state, text, 1).map(|txn| state.apply(txn))
+    }
+
+    #[test]
+    fn dollar_pair_becomes_an_inline_equation() {
+        let new_state = apply_rules("area $\\pi r^2$").expect("rule fires");
+        let para = new_state.doc.child(0).unwrap();
+        assert_eq!(para.child(0).unwrap().text_content(), "area ");
+        let Node::Element { node_type, attrs, .. } = para.child(1).unwrap() else { panic!("element") };
+        assert_eq!(*node_type, NodeType::MathInline);
+        assert_eq!(attrs.get("source").map(String::as_str), Some("\\pi r^2"));
+        assert!(attrs.contains_key("blockId"), "needs a blockId to be editable");
+        // Cursor lands right after the atom.
+        assert_eq!(new_state.selection.from(), 1 + 5 + 1);
+    }
+
+    #[test]
+    fn dollar_rule_leaves_prose_alone() {
+        for text in [
+            "costs $5 and $",       // closing $ after a space
+            "$ x$",                 // opening $ before a space
+            "$$x$",                 // display delimiter
+            "a \\$x$",              // escaped opener
+            "x\\$",                 // escaped closer
+            "$$",                   // empty
+            "price $\\foo$",        // not valid math
+        ] {
+            assert!(apply_rules(text).is_none(), "{text:?} should stay text");
+        }
     }
 
     // ── Underscore variants ──

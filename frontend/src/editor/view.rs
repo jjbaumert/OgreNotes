@@ -1400,6 +1400,37 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                     el.set_text_content(Some(display));
                     return Some(el.into());
                 }
+                NodeType::MathInline => {
+                    // Inline equation: MathML in text style inside an
+                    // atom span. `data-atom-size` makes the DOM↔model
+                    // walkers treat it as one position instead of
+                    // counting the MathML's text; the node's own id goes
+                    // in `data-node-block-id` (as for DocMention) so
+                    // block-id readers walking up from a click never take
+                    // an inline equation for its enclosing block.
+                    let el = doc.create_element("span").ok()?;
+                    el.set_attribute("class", "math-inline").ok()?;
+                    el.set_attribute("contenteditable", "false").ok()?;
+                    el.set_attribute("data-atom-size", &node.node_size().to_string()).ok()?;
+                    el.set_attribute("data-math-action", "edit").ok()?;
+                    let source = attrs.get("source").map(String::as_str).unwrap_or("");
+                    el.set_attribute("data-source", source).ok()?;
+                    if let Some(bid) = node.block_id() {
+                        el.set_attribute("data-node-block-id", bid).ok()?;
+                    }
+                    match ogrenotes_math::to_mathml(source, ogrenotes_math::Display::Inline) {
+                        // Trusted: our renderer's MathML (escaped text,
+                        // fixed attribute tables).
+                        Ok(mathml) => el.set_inner_html(&mathml),
+                        Err(e) => {
+                            // Untrusted source — text content only.
+                            el.set_attribute("class", "math-inline math-error").ok()?;
+                            el.set_attribute("title", &e.to_string()).ok()?;
+                            el.set_text_content(Some(source));
+                        }
+                    }
+                    return Some(el.into());
+                }
                 NodeType::DocMention => {
                     // Mentions spec §3 — in-editor doc/anchor mention
                     // chip. Same atom shape as Mention above (leaf,
@@ -1773,6 +1804,7 @@ fn node_type_to_tag(nt: NodeType) -> &'static str {
         NodeType::DocMention => "span",
         NodeType::Mermaid => "div",
         NodeType::MathBlock => "div",
+        NodeType::MathInline => "span",
         // design/presentations.md — decks never render through the
         // flow editor (a separate deck-canvas view owns Slide/Frame
         // rendering), but the match must stay total. `section`/`div`

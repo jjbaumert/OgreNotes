@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
-//! Equation live-app block. `NodeType::MathBlock` is a leaf carrying
-//! LaTeX math in a `source` attribute, rendered to MathML by
+//! Equations. `NodeType::MathBlock` (display) and `NodeType::MathInline`
+//! (`$…$` in running text) are leaves carrying LaTeX math in a `source`
+//! attribute, rendered to MathML by
 //! `ogrenotes-math` on the export path and in the editor. Validation
 //! here caps length and preserves `blockId`; like Mermaid, it doesn't
 //! parse the source, so a stricter renderer later can't make a stored
@@ -22,7 +23,7 @@ pub use ogrenotes_math::MAX_SOURCE_LEN;
 
 impl LiveAppBlock for MathBlockDef {
     fn node_types(&self) -> &'static [NodeType] {
-        &[NodeType::MathBlock]
+        &[NodeType::MathBlock, NodeType::MathInline]
     }
 
     fn validate_attrs(
@@ -93,6 +94,13 @@ mod tests {
         assert!(MATH.validate_attrs(NodeType::MathBlock, &attrs(&[])).is_err());
         let big = "x".repeat(MAX_SOURCE_LEN + 1);
         assert!(MATH.validate_attrs(NodeType::MathBlock, &attrs(&[("source", &big)])).is_err());
+    }
+
+    #[test]
+    fn inline_equations_share_the_gate() {
+        let out = MATH.validate_attrs(NodeType::MathInline, &attrs(&[("source", "a^2")])).unwrap();
+        assert_eq!(out.get("source").map(String::as_str), Some("a^2"));
+        assert!(MATH.validate_attrs(NodeType::MathInline, &attrs(&[("source", "")])).is_err());
     }
 
     #[test]

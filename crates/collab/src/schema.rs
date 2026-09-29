@@ -88,6 +88,11 @@ pub enum NodeType {
     /// both the client (live view) and server (HTML export). Mirrors the
     /// same-named variant in `frontend/src/editor/model.rs`.
     MathBlock,
+    /// Inline equation (`$…$`). Leaf atom inside a text block; LaTeX
+    /// source in the `source` attribute, rendered to MathML in text
+    /// style. Mirrors the same-named variant in
+    /// `frontend/src/editor/model.rs`.
+    MathInline,
     /// design/presentations.md — one slide in a presentation deck.
     /// Container of `Frame` children. Attrs: `layout` (preset id),
     /// `background` (optional theme-relative override).
@@ -130,6 +135,7 @@ impl NodeType {
             NodeType::DocMention => "doc_mention",
             NodeType::Mermaid => "mermaid",
             NodeType::MathBlock => "math_block",
+            NodeType::MathInline => "math_inline",
             NodeType::Slide => "slide",
             NodeType::Frame => "frame",
         }
@@ -165,6 +171,7 @@ impl NodeType {
             "doc_mention" => Some(NodeType::DocMention),
             "mermaid" => Some(NodeType::Mermaid),
             "math_block" => Some(NodeType::MathBlock),
+            "math_inline" => Some(NodeType::MathInline),
             "slide" => Some(NodeType::Slide),
             "frame" => Some(NodeType::Frame),
             _ => None,
@@ -205,7 +212,10 @@ impl NodeType {
 
     /// Whether this node type is an inline/leaf node.
     pub fn is_inline(&self) -> bool {
-        matches!(self, NodeType::HardBreak | NodeType::Mention | NodeType::DocMention)
+        matches!(
+            self,
+            NodeType::HardBreak | NodeType::Mention | NodeType::DocMention | NodeType::MathInline
+        )
     }
 
     /// Whether this node is a leaf (no children).
@@ -222,6 +232,7 @@ impl NodeType {
                 | NodeType::DocMention
                 | NodeType::Mermaid
                 | NodeType::MathBlock
+                | NodeType::MathInline
         )
     }
 
@@ -326,7 +337,8 @@ impl NodeType {
             | NodeType::Mention
             | NodeType::DocMention
             | NodeType::Mermaid
-            | NodeType::MathBlock => &[],
+            | NodeType::MathBlock
+            | NodeType::MathInline => &[],
         }
     }
 }
@@ -423,6 +435,7 @@ mod tests {
             NodeType::DocMention,
             NodeType::Mermaid,
             NodeType::MathBlock,
+            NodeType::MathInline,
             NodeType::Slide,
             NodeType::Frame,
         ];
@@ -604,6 +617,7 @@ mod tests {
         NodeType::DocMention,
         NodeType::Mermaid,
         NodeType::MathBlock,
+        NodeType::MathInline,
         NodeType::Slide,
         NodeType::Frame,
     ];
@@ -639,7 +653,7 @@ mod tests {
         // If this fails, a node type was added to or removed from the collab
         // schema without updating the expected set. Update ALL_NODE_TYPES and
         // the corresponding frontend/src/editor/model.rs NodeType enum.
-        assert_eq!(ALL_NODE_TYPES.len(), 29, "expected 29 node types");
+        assert_eq!(ALL_NODE_TYPES.len(), 30, "expected 30 node types");
     }
 
     #[test]
@@ -703,6 +717,7 @@ mod tests {
             ("doc_mention", NodeType::DocMention),
             ("mermaid", NodeType::Mermaid),
             ("math_block", NodeType::MathBlock),
+            ("math_inline", NodeType::MathInline),
             ("slide", NodeType::Slide),
             ("frame", NodeType::Frame),
         ];
@@ -753,6 +768,7 @@ mod tests {
             NodeType::DocMention,
             NodeType::Mermaid,
             NodeType::MathBlock,
+            NodeType::MathInline,
         ];
         for nt in ALL_NODE_TYPES {
             let is_leaf = expected_leaves.contains(nt);
@@ -764,7 +780,8 @@ mod tests {
     fn cross_schema_inline_nodes() {
         // Must match frontend: HardBreak, Mention (#148 slice 6), and
         // DocMention are inline; everything else is block-level.
-        let expected_inline = [NodeType::HardBreak, NodeType::Mention, NodeType::DocMention];
+        let expected_inline =
+            [NodeType::HardBreak, NodeType::Mention, NodeType::DocMention, NodeType::MathInline];
         for nt in ALL_NODE_TYPES {
             let expected = expected_inline.contains(nt);
             assert_eq!(nt.is_inline(), expected, "inline mismatch for {nt:?}");

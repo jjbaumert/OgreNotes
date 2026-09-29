@@ -1331,6 +1331,12 @@ fn element_tags(
                 None,
             )
         }
+        // Inline equation: its LaTeX between dollar signs, so a paste
+        // into plain text (or back through the `$…$` rule) reads right.
+        NodeType::MathInline => {
+            let source = attrs.get("source").map(String::as_str).unwrap_or("");
+            (format!("<span class=\"math-inline\">${}$</span>", html_escape(source)), None)
+        }
         // Equation block: the LaTeX source, same minimal shape.
         NodeType::MathBlock => {
             let source = attrs.get("source").map(String::as_str).unwrap_or("");

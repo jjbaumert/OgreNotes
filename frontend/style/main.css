@@ -6098,6 +6098,22 @@ tr:hover .folder-row-actions,
 .math-render math {
   font-size: 1.15em;
 }
+/* Inline equation (`$…$`): sits on the text baseline; a light hover
+ * wash signals it's clickable to edit. An unparseable one shows its
+ * source in the danger colour, with the error as a tooltip. */
+.math-inline {
+  cursor: pointer;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+.math-inline:hover {
+  background: var(--color-hover, rgba(0, 0, 0, 0.06));
+}
+.math-inline.math-error {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.9em;
+  margin: 0;
+}
 .math-error {
   color: var(--color-danger, #c33);
   margin: 0 0 var(--space-sm);
