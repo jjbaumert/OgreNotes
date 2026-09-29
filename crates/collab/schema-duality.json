@@ -159,6 +159,11 @@
       "inline": false,
       "leaf": true
     },
+    "MathInline": {
+      "children": [],
+      "inline": true,
+      "leaf": true
+    },
     "Mention": {
       "children": [],
       "inline": true,

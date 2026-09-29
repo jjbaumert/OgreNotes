@@ -206,6 +206,10 @@ pub enum NodeType {
     /// in the `source` attribute; rendered to MathML by `ogrenotes-math`.
     /// Mirrors the same-named variant in `crates/collab/src/schema.rs`.
     MathBlock,
+    /// Inline equation (`$…$`): leaf atom in running text; LaTeX source
+    /// in the `source` attribute, rendered to MathML in text style.
+    /// Mirrors the same-named variant in `crates/collab/src/schema.rs`.
+    MathInline,
     /// design/presentations.md — one slide in a presentation deck.
     /// Container of `Frame` children. Attrs: `layout` (preset id),
     /// `background` (optional theme-relative override). Mirrors the
@@ -229,7 +233,7 @@ impl NodeType {
         NodeType::Image, NodeType::Table, NodeType::TableRow, NodeType::TableCell,
         NodeType::TableHeader, NodeType::Embed, NodeType::Calendar, NodeType::CalendarEvent,
         NodeType::Kanban, NodeType::KanbanColumn, NodeType::KanbanCard, NodeType::Mention,
-        NodeType::DocMention, NodeType::Mermaid, NodeType::MathBlock, NodeType::Slide, NodeType::Frame,
+        NodeType::DocMention, NodeType::Mermaid, NodeType::MathBlock, NodeType::MathInline, NodeType::Slide, NodeType::Frame,
     ];
 
     /// Whether this is a leaf node (no children).
@@ -246,6 +250,7 @@ impl NodeType {
                 | NodeType::DocMention
                 | NodeType::Mermaid
                 | NodeType::MathBlock
+                | NodeType::MathInline
         )
     }
 
@@ -253,7 +258,10 @@ impl NodeType {
     /// inside a Paragraph's text stream, next to characters);
     /// Image is block-level (sits between paragraphs).
     pub fn is_inline(&self) -> bool {
-        matches!(self, NodeType::HardBreak | NodeType::Mention | NodeType::DocMention)
+        matches!(
+            self,
+            NodeType::HardBreak | NodeType::Mention | NodeType::DocMention | NodeType::MathInline
+        )
     }
 
     /// Whether this is a block node.
@@ -281,6 +289,7 @@ impl NodeType {
                 | NodeType::DocMention
                 | NodeType::Mermaid
                 | NodeType::MathBlock
+                | NodeType::MathInline
         )
     }
 
@@ -328,6 +337,7 @@ impl NodeType {
             | NodeType::DocMention
             | NodeType::Mermaid
             | NodeType::MathBlock
+            | NodeType::MathInline
             | NodeType::Slide => false,
         }
     }
@@ -379,6 +389,7 @@ impl NodeType {
             | NodeType::DocMention
             | NodeType::Mermaid
             | NodeType::MathBlock
+            | NodeType::MathInline
             // Both mandatory: without a stable blockId, the
             // bridge's `find_match` can't align Slide/Frame across
             // syncs and every edit degrades to a full subtree
@@ -454,6 +465,11 @@ impl NodeType {
                 let mut m = HashMap::new();
                 m.insert("user_id".to_string(), String::new());
                 m.insert("display".to_string(), String::new());
+                m
+            }
+            NodeType::MathInline => {
+                let mut m = HashMap::new();
+                m.insert("source".to_string(), String::new());
                 m
             }
             NodeType::DocMention => {
@@ -717,6 +733,15 @@ impl Node {
                 content: _,
                 marks: _,
             } => attrs.get("display").cloned().unwrap_or_default(),
+            // An inline equation reads as its LaTeX source (search, LLM
+            // prompts, plain-text copy), matching the server's
+            // `extract_text`.
+            Node::Element {
+                node_type: NodeType::MathInline,
+                attrs,
+                content: _,
+                marks: _,
+            } => attrs.get("source").cloned().unwrap_or_default(),
             Node::Element {
                 node_type: NodeType::DocMention,
                 attrs,
@@ -1775,6 +1800,21 @@ mod tests {
         assert_eq!(NodeType::Mention.default_attrs().len(), 2);
         assert!(NodeType::Mention.default_attrs().contains_key("user_id"));
         assert!(NodeType::Mention.default_attrs().contains_key("display"));
+    }
+
+    #[test]
+    fn math_inline_is_an_inline_atom_that_reads_as_its_source() {
+        assert!(NodeType::MathInline.is_leaf());
+        assert!(NodeType::MathInline.is_atom());
+        assert!(NodeType::MathInline.is_inline());
+        assert!(!NodeType::MathInline.is_block());
+        assert!(NodeType::MathInline.needs_block_id());
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("source".to_string(), "x^2".to_string());
+        let node = Node::element_with_attrs(NodeType::MathInline, attrs, Fragment::empty());
+        assert_eq!(node.node_size(), 1);
+        assert_eq!(node.text_content(), "x^2");
+        assert!(node.block_id().is_some());
     }
 
     #[test]

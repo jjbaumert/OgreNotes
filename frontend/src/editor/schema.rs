@@ -750,6 +750,25 @@ pub fn default_schema() -> Schema {
         },
     );
 
+    // MathInline: inline equation leaf atom, the same shape as
+    // DocMention — one position in the text stream, no marks; the LaTeX
+    // lives in the `source` attribute.
+    nodes.insert(
+        NodeType::MathInline,
+        NodeSpec {
+            valid_children: vec![],
+            inline_content: false,
+            block: false,
+            leaf: true,
+            code: false,
+            atom: true,
+            defining: false,
+            isolating: false,
+            default_attrs: HashMap::new(),
+            allowed_marks: Some(vec![]),
+        },
+    );
+
     // Table: contains table rows. Isolating prevents edits from escaping.
     nodes.insert(
         NodeType::Table,

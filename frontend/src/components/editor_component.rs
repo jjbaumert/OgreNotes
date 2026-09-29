@@ -1394,16 +1394,21 @@ fn mermaid_click_outcome(ev: &web_sys::MouseEvent) -> Option<MermaidModalState> 
     Some(MermaidModalState { block_id, source })
 }
 
-/// Equation-block counterpart of `mermaid_click_outcome`: the modal
-/// state for a click on `[data-math-action="edit"]`, seeded from the
-/// `data-source` attribute `MathBlockView::render` stamps.
+/// Equation counterpart of `mermaid_click_outcome`: the modal state for
+/// a click on `[data-math-action="edit"]`, seeded from the `data-source`
+/// the view stamps. Display equations (`.math-block`) carry their id in
+/// `data-block-id`; inline ones (`.math-inline`) in `data-node-block-id`.
 fn math_click_outcome(ev: &web_sys::MouseEvent) -> Option<MathModalState> {
     let target = ev.target()?.dyn_into::<web_sys::Element>().ok()?;
     let action_el = target.closest("[data-math-action]").ok()??;
-    let block_el = action_el.closest(".math-block").ok()??;
-    let block_id = block_el.get_attribute("data-block-id")?;
-    let source = block_el.get_attribute("data-source").unwrap_or_default();
-    Some(MathModalState { block_id, source })
+    let inline = action_el.class_list().contains("math-inline");
+    let block_id = if inline {
+        action_el.get_attribute("data-node-block-id")?
+    } else {
+        action_el.closest(".math-block").ok()??.get_attribute("data-block-id")?
+    };
+    let source = action_el.get_attribute("data-source").unwrap_or_default();
+    Some(MathModalState { block_id, source, inline })
 }
 
 /// If the user is switching from month → day/week (or vice

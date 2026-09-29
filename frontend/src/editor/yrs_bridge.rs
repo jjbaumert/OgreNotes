@@ -986,6 +986,7 @@ fn node_type_to_tag(nt: NodeType) -> &'static str {
         NodeType::DocMention => "doc_mention",
         NodeType::Mermaid => "mermaid",
         NodeType::MathBlock => "math_block",
+        NodeType::MathInline => "math_inline",
         // design/presentations.md — matches
         // `crates/collab/src/schema.rs::NodeType::Slide/Frame::tag_name`.
         NodeType::Slide => "slide",
@@ -1022,6 +1023,7 @@ fn tag_to_node_type(tag: &str) -> Option<NodeType> {
         "doc_mention" => Some(NodeType::DocMention),
         "mermaid" => Some(NodeType::Mermaid),
         "math_block" => Some(NodeType::MathBlock),
+        "math_inline" => Some(NodeType::MathInline),
         "slide" => Some(NodeType::Slide),
         "frame" => Some(NodeType::Frame),
         _ => None,

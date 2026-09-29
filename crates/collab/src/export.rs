@@ -331,6 +331,11 @@ fn extract_text<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef) -> String {
     // `text_content()` contract (added in commit ceb1040). Without
     // this arm a mention-only doc is invisible to search indexing
     // and the LLM prompt embed path.
+    // An inline equation reads as its LaTeX source (search, LLM
+    // prompts, DOCX/PDF text), matching the frontend `text_content`.
+    if el.tag().as_ref() == NodeType::MathInline.tag_name() {
+        return el.get_attribute(txn, "source").unwrap_or_default();
+    }
     if el.tag().as_ref() == NodeType::DocMention.tag_name() {
         return el
             .get_attribute(txn, "title")
@@ -1227,6 +1232,18 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
                     }
                     return;
                 }
+                if matches!(node_type, NodeType::MathInline) {
+                    let source = el.get_attribute(txn, "source").unwrap_or_default();
+                    match ogrenotes_math::to_mathml(&source, ogrenotes_math::Display::Inline) {
+                        Ok(mathml) => out.push_str(&format!("<span class=\"math-inline\">{mathml}</span>")),
+                        Err(e) => out.push_str(&format!(
+                            "<code class=\"math-error\" title=\"{}\">{}</code>",
+                            html_escape_attr(&e.to_string()),
+                            html_escape(&source),
+                        )),
+                    }
+                    return;
+                }
                 if matches!(node_type, NodeType::MathBlock) {
                     let source = el.get_attribute(txn, "source").unwrap_or_default();
                     match ogrenotes_math::to_mathml(&source, ogrenotes_math::Display::Block) {
@@ -1347,6 +1364,10 @@ fn render_node_markdown<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String, de
                 NodeType::MathBlock => {
                     let source = el.get_attribute(txn, "source").unwrap_or_default();
                     push_md_fenced(out, "math", &source);
+                }
+                NodeType::MathInline => {
+                    let source = el.get_attribute(txn, "source").unwrap_or_default();
+                    out.push_str(&md_inline_math(&source));
                 }
                 NodeType::HorizontalRule => {
                     out.push_str("---\n\n");
@@ -1632,6 +1653,7 @@ fn node_type_to_html_tag(nt: NodeType) -> &'static str {
         NodeType::DocMention => "a",
         NodeType::Mermaid => "div",
         NodeType::MathBlock => "div",
+        NodeType::MathInline => "span",
         NodeType::Slide | NodeType::Frame => crate::blocks::presentation::html_tag(nt),
     }
 }
@@ -1934,6 +1956,29 @@ fn push_md_fenced(out: &mut String, info: &str, body: &str) {
     let fence = "`".repeat((longest + 1).max(3));
     let info: String = info.chars().filter(|c| !matches!(c, '`' | '\n' | '\r')).collect();
     out.push_str(&format!("{fence}{info}\n{body}\n{fence}\n\n"));
+}
+
+/// `$…$` (GitHub, GitLab, Pandoc) for an inline equation. A source the
+/// dollar form can't carry — containing `$` or a line break, or with
+/// padding a renderer would reject — falls back to a code span, which
+/// keeps the LaTeX readable instead of mangling it.
+fn md_inline_math(source: &str) -> String {
+    let plain = !source.is_empty()
+        && !source.contains(['$', '\n', '\r', '`'])
+        && !source.starts_with(char::is_whitespace)
+        && !source.ends_with(char::is_whitespace);
+    if plain {
+        format!("${source}$")
+    } else {
+        let mut longest = 0;
+        let mut run = 0;
+        for c in source.chars() {
+            run = if c == '`' { run + 1 } else { 0 };
+            longest = longest.max(run);
+        }
+        let ticks = "`".repeat(longest + 1);
+        format!("{ticks} {} {ticks}", source.replace(['\n', '\r'], " "))
+    }
 }
 
 fn escape_md_url(s: &str) -> String {
@@ -3380,6 +3425,45 @@ mod tests {
         assert!(html.contains("unknown command `\\foo`"), "{html}");
         assert!(html.contains("<pre>\\foo &lt;b&gt;</pre>"), "{html}");
         assert!(!html.contains("<math"));
+    }
+
+    fn doc_with_inline_math(source: &str) -> Doc {
+        doc_with(|txn, frag| {
+            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            p.insert(txn, 0, XmlTextPrelim::new("area "));
+            let m = p.insert(txn, 1, XmlElementPrelim::empty(NodeType::MathInline.tag_name()));
+            m.insert_attribute(txn, "source", source);
+        })
+    }
+
+    #[test]
+    fn inline_math_exports() {
+        let doc = doc_with_inline_math("\\pi r^2");
+        let html = to_html(&doc);
+        assert!(html.contains("<p>area <span class=\"math-inline\"><math "), "{html}");
+        assert!(html.contains(r#"display="inline""#), "{html}");
+        assert!(to_markdown(&doc).starts_with("area $\\pi r^2$"), "{}", to_markdown(&doc));
+        let bad = to_html(&doc_with_inline_math("\\foo<"));
+        assert!(bad.contains("<code class=\"math-error\" title=\"unknown command"), "{bad}");
+        assert!(bad.contains(">\\foo&lt;</code>"), "{bad}");
+    }
+
+    #[test]
+    fn inline_math_plain_text_is_its_source() {
+        let doc = doc_with_inline_math("x^2");
+        let txn = doc.transact();
+        let frag = txn.get_xml_fragment("content").unwrap();
+        let Some(XmlOut::Element(p)) = frag.get(&txn, 0) else { panic!() };
+        assert_eq!(extract_text(&txn, &p), "area x^2");
+    }
+
+    #[test]
+    fn md_inline_math_falls_back_to_a_code_span() {
+        assert_eq!(md_inline_math("a+b"), "$a+b$");
+        assert_eq!(md_inline_math("\\$5"), "` \\$5 `");
+        assert_eq!(md_inline_math(" x"), "`  x `");
+        assert_eq!(md_inline_math("a`b"), "`` a`b ``");
+        assert_eq!(md_inline_math("a\nb"), "` a b `");
     }
 
     #[test]
