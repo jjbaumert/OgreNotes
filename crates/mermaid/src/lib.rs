@@ -49,6 +49,12 @@ mod props;
 /// modal's client-side guard, so the two can never drift apart.
 pub const MAX_SOURCE_LEN: usize = 20_000;
 
+/// Deepest nesting of flowchart subgraphs, state composites and C4
+/// boundaries. Layout recurses once per level, and the source cap alone
+/// allows ~1300 levels — enough to overflow a 1 MB (WASM) stack, which
+/// aborts rather than unwinds. Real diagrams nest a handful deep.
+pub(crate) const MAX_NESTING: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagramKind {
     Pie,
@@ -303,7 +309,7 @@ pub fn render(source: &str) -> RenderOutput {
             return RenderOutput { kind: DiagramKind::Unknown, svg: None, error: Some(e) }
         }
     };
-    match kind {
+    let out = match kind {
         DiagramKind::Pie => match pie::parse(source) {
             Ok(p) => RenderOutput { kind, svg: Some(pie::render_svg(&p)), error: None },
             Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
@@ -402,6 +408,29 @@ pub fn render(source: &str) -> RenderOutput {
                 line: None,
             }),
         },
+    };
+    cap_output(out)
+}
+
+/// Largest SVG `render()` returns. Every kind bounds its own work, but a
+/// missed case (one was a gantt axis emitting a tick per week across
+/// millennia: hundreds of MB from 70 bytes of source) lands in every
+/// collaborator's tab and in server-side exports. This backstop turns any
+/// such output into an error instead; real at-cap diagrams are well under
+/// a megabyte.
+pub const MAX_SVG_BYTES: usize = 8 * 1024 * 1024;
+
+fn cap_output(out: RenderOutput) -> RenderOutput {
+    match &out.svg {
+        Some(svg) if svg.len() > MAX_SVG_BYTES => RenderOutput {
+            kind: out.kind,
+            svg: None,
+            error: Some(ParseError {
+                message: format!("diagram too large to draw (over {} MB of SVG)", MAX_SVG_BYTES >> 20),
+                line: None,
+            }),
+        },
+        _ => out,
     }
 }
 

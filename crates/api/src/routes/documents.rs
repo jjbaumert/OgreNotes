@@ -2059,6 +2059,16 @@ async fn rehome_blob_refs_for_copy(
     }
 }
 
+/// Converting a document is synchronous CPU work (every Mermaid diagram
+/// renders, PDFs lay out), so it runs on the blocking pool instead of
+/// stalling an async worker thread that other requests share. A panic in
+/// the conversion comes back as a 500 rather than taking the worker down.
+async fn run_export<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ApiError::Internal(format!("export conversion failed: {e}")))
+}
+
 /// GET /documents/:id/export/:format -- export as html or markdown.
 async fn export_document(
     State(state): State<AppState>,
@@ -2078,13 +2088,17 @@ async fn export_document(
             let (content_type, content) = match format.as_str() {
                 "html" => {
                     let comments = load_export_comments(&state, &id).await;
-                    ("text/html; charset=utf-8", export::to_html_with_comments(doc.inner(), &comments))
+                    let html =
+                        run_export(move || export::to_html_with_comments(doc.inner(), &comments)).await?;
+                    ("text/html; charset=utf-8", html)
                 }
                 "markdown" | "md" => {
                     let comments = load_export_comments(&state, &id).await;
-                    ("text/markdown; charset=utf-8", export::to_markdown_with_comments(doc.inner(), &comments))
+                    let md = run_export(move || export::to_markdown_with_comments(doc.inner(), &comments))
+                        .await?;
+                    ("text/markdown; charset=utf-8", md)
                 }
-                "csv" => ("text/csv; charset=utf-8", export::to_csv(doc.inner())),
+                "csv" => ("text/csv; charset=utf-8", run_export(move || export::to_csv(doc.inner())).await?),
                 _ => unreachable!(),
             };
             let mut headers = HeaderMap::new();
@@ -2093,7 +2107,7 @@ async fn export_document(
         }
         "xlsx" => {
             counter::inc(MetricKey::new("doc.export_total", &[("format", "xlsx")]));
-            let bytes = export::to_xlsx(doc.inner());
+            let bytes = run_export(move || export::to_xlsx(doc.inner())).await?;
             let mut headers = HeaderMap::new();
             headers.insert("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".parse().unwrap());
             headers.insert("Content-Disposition", "attachment; filename=\"export.xlsx\"".parse().unwrap());
@@ -2102,7 +2116,7 @@ async fn export_document(
         "docx" => {
             counter::inc(MetricKey::new("doc.export_total", &[("format", "docx")]));
             let comments = load_export_comments(&state, &id).await;
-            let bytes = export::to_docx_with_comments(doc.inner(), &comments);
+            let bytes = run_export(move || export::to_docx_with_comments(doc.inner(), &comments)).await?;
             let mut headers = HeaderMap::new();
             headers.insert("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document".parse().unwrap());
             headers.insert("Content-Disposition", "attachment; filename=\"export.docx\"".parse().unwrap());
@@ -2112,7 +2126,7 @@ async fn export_document(
         "pdf" => {
             counter::inc(MetricKey::new("doc.export_total", &[("format", "pdf")]));
             let comments = load_export_comments(&state, &id).await;
-            let bytes = export::to_pdf_with_comments(doc.inner(), &comments);
+            let bytes = run_export(move || export::to_pdf_with_comments(doc.inner(), &comments)).await?;
             let mut headers = HeaderMap::new();
             headers.insert("Content-Type", "application/pdf".parse().unwrap());
             headers.insert("Content-Disposition", "attachment; filename=\"export.pdf\"".parse().unwrap());
@@ -3150,10 +3164,12 @@ async fn try_export_one(
     resolve_blob_refs_for_export(state, &doc, doc_id).await;
     // Comment threads travel with each doc in the bulk archive too (#59 T-6).
     let comments = load_export_comments(state, doc_id).await;
-    let body = match format {
+    let body = run_export(move || match format {
         BulkFormat::Markdown => export::to_markdown_with_comments(doc.inner(), &comments),
         BulkFormat::Html => export::to_html_with_comments(doc.inner(), &comments),
-    };
+    })
+    .await
+    .map_err(|e| BulkExportError::Internal(e.to_string()))?;
     Ok((meta.title, body))
 }
 

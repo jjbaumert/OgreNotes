@@ -96,6 +96,12 @@ pub(crate) fn parse(source: &str) -> Result<C4, ParseError> {
 
         if kw.ends_with("Boundary") || kw == "Node" || kw == "Deployment_Node" {
             // Boundary opener: `Kind(alias, "Label"[, …]) {`
+            if stack.len() >= crate::MAX_NESTING {
+                return Err(err(
+                    format!("boundaries nested too deeply (more than {})", crate::MAX_NESTING),
+                    line_no,
+                ));
+            }
             let alias = args.first().cloned().unwrap_or_default();
             let label = args.get(1).cloned().unwrap_or_else(|| alias.clone());
             let bi = c4.boundaries.len();
