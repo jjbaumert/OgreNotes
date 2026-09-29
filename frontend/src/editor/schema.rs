@@ -294,6 +294,7 @@ pub fn default_schema() -> Schema {
                 NodeType::Calendar,
                 NodeType::Kanban,
                 NodeType::Mermaid,
+                NodeType::MathBlock,
                 NodeType::Slide,
             ],
             inline_content: false,
@@ -569,6 +570,24 @@ pub fn default_schema() -> Schema {
     // rendered to SVG by the MermaidView. Mirror of Embed's spec.
     nodes.insert(
         NodeType::Mermaid,
+        NodeSpec {
+            valid_children: vec![],
+            inline_content: false,
+            block: true,
+            leaf: true,
+            code: false,
+            atom: true,
+            defining: false,
+            isolating: true,
+            default_attrs: HashMap::new(),
+            allowed_marks: Some(vec![]),
+        },
+    );
+
+    // Equation block: leaf block atom like Mermaid. LaTeX source in the
+    // `source` attribute; rendered to MathML by the MathBlockView.
+    nodes.insert(
+        NodeType::MathBlock,
         NodeSpec {
             valid_children: vec![],
             inline_content: false,
@@ -862,6 +881,7 @@ pub fn default_schema() -> Schema {
                 NodeType::Calendar,
                 NodeType::Kanban,
                 NodeType::Mermaid,
+                NodeType::MathBlock,
             ],
             inline_content: false,
             block: true,

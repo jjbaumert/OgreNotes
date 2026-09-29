@@ -61,6 +61,7 @@
         "HorizontalRule",
         "Image",
         "Kanban",
+        "MathBlock",
         "Mermaid",
         "OrderedList",
         "Paragraph",
@@ -92,6 +93,7 @@
         "HorizontalRule",
         "Image",
         "Kanban",
+        "MathBlock",
         "Mermaid",
         "OrderedList",
         "Paragraph",
@@ -151,6 +153,11 @@
       ],
       "inline": false,
       "leaf": false
+    },
+    "MathBlock": {
+      "children": [],
+      "inline": false,
+      "leaf": true
     },
     "Mention": {
       "children": [],

@@ -6083,3 +6083,53 @@ tr:hover .folder-row-actions,
   overflow: auto;
   max-height: 320px;
 }
+
+/* ─── Equation block — LaTeX rendered to MathML by crates/math. The
+ * `math` font (STIX Two Math) is set in fonts.css; text colour is
+ * inherited, so dark mode needs nothing extra. Wide equations scroll
+ * rather than overflow the page. */
+.math-block {
+  display: block;
+  margin: var(--space-md) 0;
+  cursor: pointer;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.math-render math {
+  font-size: 1.15em;
+}
+.math-error {
+  color: var(--color-danger, #c33);
+  margin: 0 0 var(--space-sm);
+}
+.math-block pre {
+  white-space: pre-wrap;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.85rem;
+  color: var(--color-text-secondary);
+  margin: 0;
+}
+.math-modal-body {
+  width: min(560px, 92vw);
+}
+.math-modal .math-source {
+  min-height: 120px;
+  width: 100%;
+  resize: vertical;
+  white-space: pre-wrap;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.9rem;
+  padding: 6px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 4px);
+  color: inherit;
+  background: var(--color-bg, white);
+}
+.math-modal .math-preview {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 4px);
+  padding: var(--space-sm);
+  min-height: 3em;
+  overflow: auto;
+  max-height: 320px;
+}

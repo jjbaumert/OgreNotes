@@ -488,7 +488,7 @@ fn render_node_readonly(node: &Node) -> AnyView {
             view! { <div class="deck-embed-chip">{label}</div> }.into_any()
         }
         NodeType::Image => render_frame_image(attrs),
-        NodeType::Mermaid | NodeType::Calendar | NodeType::Kanban => {
+        NodeType::Mermaid | NodeType::MathBlock | NodeType::Calendar | NodeType::Kanban => {
             // Delegate to the live-app block views — the same DOM the
             // document editor renders (mermaid SVG included), shown
             // static here (see `.deck-frame__content` pointer-events).
@@ -559,6 +559,7 @@ fn fragment_is_visually_empty(content: &Fragment) -> bool {
                 // "vanished" behind "Click to add text").
                 NodeType::Image
                 | NodeType::Mermaid
+                | NodeType::MathBlock
                 | NodeType::Calendar
                 | NodeType::Kanban
                 | NodeType::Embed
@@ -2217,6 +2218,7 @@ mod tests {
         // the placeholder hint).
         for nt in [
             NodeType::Mermaid,
+            NodeType::MathBlock,
             NodeType::Image,
             NodeType::Calendar,
             NodeType::Kanban,

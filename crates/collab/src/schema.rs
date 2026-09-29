@@ -83,6 +83,11 @@ pub enum NodeType {
     /// Mirrors the same-named variant in
     /// `frontend/src/editor/model.rs`.
     Mermaid,
+    /// Display equation block. Leaf atom; LaTeX math source stored in
+    /// the `source` attribute. Rendered to MathML by `ogrenotes-math` on
+    /// both the client (live view) and server (HTML export). Mirrors the
+    /// same-named variant in `frontend/src/editor/model.rs`.
+    MathBlock,
     /// design/presentations.md — one slide in a presentation deck.
     /// Container of `Frame` children. Attrs: `layout` (preset id),
     /// `background` (optional theme-relative override).
@@ -124,6 +129,7 @@ impl NodeType {
             NodeType::Mention => "mention",
             NodeType::DocMention => "doc_mention",
             NodeType::Mermaid => "mermaid",
+            NodeType::MathBlock => "math_block",
             NodeType::Slide => "slide",
             NodeType::Frame => "frame",
         }
@@ -158,6 +164,7 @@ impl NodeType {
             "mention" => Some(NodeType::Mention),
             "doc_mention" => Some(NodeType::DocMention),
             "mermaid" => Some(NodeType::Mermaid),
+            "math_block" => Some(NodeType::MathBlock),
             "slide" => Some(NodeType::Slide),
             "frame" => Some(NodeType::Frame),
             _ => None,
@@ -190,6 +197,7 @@ impl NodeType {
                 | NodeType::KanbanColumn
                 | NodeType::KanbanCard
                 | NodeType::Mermaid
+                | NodeType::MathBlock
                 | NodeType::Slide
                 | NodeType::Frame
         )
@@ -213,6 +221,7 @@ impl NodeType {
                 | NodeType::Mention
                 | NodeType::DocMention
                 | NodeType::Mermaid
+                | NodeType::MathBlock
         )
     }
 
@@ -239,6 +248,7 @@ impl NodeType {
                 NodeType::Calendar,
                 NodeType::Kanban,
                 NodeType::Mermaid,
+                NodeType::MathBlock,
                 NodeType::Slide,
             ],
             NodeType::BulletList => &[NodeType::ListItem],
@@ -301,6 +311,7 @@ impl NodeType {
                 NodeType::Calendar,
                 NodeType::Kanban,
                 NodeType::Mermaid,
+                NodeType::MathBlock,
             ],
             // Leaf/inline nodes and text containers have no element children
             NodeType::Paragraph
@@ -314,7 +325,8 @@ impl NodeType {
             | NodeType::KanbanCard
             | NodeType::Mention
             | NodeType::DocMention
-            | NodeType::Mermaid => &[],
+            | NodeType::Mermaid
+            | NodeType::MathBlock => &[],
         }
     }
 }
@@ -410,6 +422,7 @@ mod tests {
             NodeType::Mention,
             NodeType::DocMention,
             NodeType::Mermaid,
+            NodeType::MathBlock,
             NodeType::Slide,
             NodeType::Frame,
         ];
@@ -590,6 +603,7 @@ mod tests {
         NodeType::Mention,
         NodeType::DocMention,
         NodeType::Mermaid,
+        NodeType::MathBlock,
         NodeType::Slide,
         NodeType::Frame,
     ];
@@ -625,7 +639,7 @@ mod tests {
         // If this fails, a node type was added to or removed from the collab
         // schema without updating the expected set. Update ALL_NODE_TYPES and
         // the corresponding frontend/src/editor/model.rs NodeType enum.
-        assert_eq!(ALL_NODE_TYPES.len(), 28, "expected 28 node types");
+        assert_eq!(ALL_NODE_TYPES.len(), 29, "expected 29 node types");
     }
 
     #[test]
@@ -688,6 +702,7 @@ mod tests {
             ("mention", NodeType::Mention),
             ("doc_mention", NodeType::DocMention),
             ("mermaid", NodeType::Mermaid),
+            ("math_block", NodeType::MathBlock),
             ("slide", NodeType::Slide),
             ("frame", NodeType::Frame),
         ];
@@ -737,6 +752,7 @@ mod tests {
             NodeType::Mention,
             NodeType::DocMention,
             NodeType::Mermaid,
+            NodeType::MathBlock,
         ];
         for nt in ALL_NODE_TYPES {
             let is_leaf = expected_leaves.contains(nt);
@@ -766,7 +782,7 @@ mod tests {
                 NodeType::OrderedList, NodeType::TaskList, NodeType::Blockquote,
                 NodeType::CodeBlock, NodeType::HorizontalRule, NodeType::Image,
                 NodeType::Table, NodeType::Embed, NodeType::Calendar,
-                NodeType::Kanban, NodeType::Mermaid, NodeType::Slide,
+                NodeType::Kanban, NodeType::Mermaid, NodeType::MathBlock, NodeType::Slide,
             ]
         );
         // List containers:
@@ -838,6 +854,7 @@ mod tests {
             NodeType::Calendar,
             NodeType::Kanban,
             NodeType::Mermaid,
+            NodeType::MathBlock,
         ];
         assert_eq!(NodeType::Frame.valid_children(), frame_children);
         // Text containers and leaves have no element children:

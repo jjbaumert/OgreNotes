@@ -37,6 +37,7 @@ pub mod locale_selector;
 pub mod menu;
 pub mod menu_bar;
 pub mod mention_overlay;
+pub mod math_modal;
 pub mod mermaid_modal;
 pub mod notification_bell;
 pub mod notification_settings;

@@ -24,6 +24,7 @@ use ogrenotes_common::metrics::{counter, MetricKey};
 
 pub mod calendar;
 pub mod kanban;
+pub mod math;
 pub mod mermaid;
 pub mod presentation;
 pub mod validate_writes;
@@ -153,7 +154,7 @@ pub trait LiveAppBlock: Sync + 'static {
 /// a new block. The compile-time list is small enough that a
 /// linear scan by NodeType is fine.
 pub const BLOCKS: &[&(dyn LiveAppBlock + 'static)] =
-    &[&calendar::CALENDAR, &kanban::KANBAN, &mermaid::MERMAID, &presentation::PRESENTATION];
+    &[&calendar::CALENDAR, &kanban::KANBAN, &mermaid::MERMAID, &math::MATH, &presentation::PRESENTATION];
 
 /// Look up the block that owns a given NodeType, or `None` if the
 /// NodeType is a core editor type (paragraph, heading, embed, etc.)
@@ -179,6 +180,12 @@ mod tests {
     fn block_for_mermaid_resolves() {
         let b = block_for(NodeType::Mermaid).expect("Mermaid has a block");
         assert!(b.node_types().contains(&NodeType::Mermaid));
+    }
+
+    #[test]
+    fn block_for_math_block_resolves() {
+        let b = block_for(NodeType::MathBlock).expect("MathBlock has a block");
+        assert!(b.node_types().contains(&NodeType::MathBlock));
     }
 
     #[test]

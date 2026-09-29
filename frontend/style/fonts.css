@@ -143,3 +143,20 @@
   font-display: swap;
   src: url("/fonts/jetbrains-mono-700.woff2") format("woff2");
 }
+
+/* STIX Two Math — equations (SIL-OFL 1.1, self-hosted under /fonts; see
+ * static/fonts/THIRD-PARTY-FONTS.md). Browsers lay out MathML natively
+ * but need a font with an OpenType MATH table to stretch delimiters,
+ * radicals and big operators; many Linux systems have none installed.
+ * Only fetched when a page renders a <math> element. */
+@font-face {
+  font-family: "STIX Two Math";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/stix-two-math-400.woff2") format("woff2");
+}
+
+math {
+  font-family: "STIX Two Math", math;
+}

@@ -24,6 +24,7 @@ use super::editor_context_menu::{DocMentionCtx, EditorContextCommand, EditorCont
 use super::kanban_card_modal::{
     KanbanCardModal, KanbanCardModalMode, KanbanCardModalState, KanbanCardOutcome,
 };
+use super::math_modal::{MathModal, MathModalOutcome, MathModalState};
 use super::mermaid_modal::{MermaidModal, MermaidModalOutcome, MermaidModalState};
 use super::toolbar::ToolbarCommand;
 
@@ -1393,6 +1394,18 @@ fn mermaid_click_outcome(ev: &web_sys::MouseEvent) -> Option<MermaidModalState> 
     Some(MermaidModalState { block_id, source })
 }
 
+/// Equation-block counterpart of `mermaid_click_outcome`: the modal
+/// state for a click on `[data-math-action="edit"]`, seeded from the
+/// `data-source` attribute `MathBlockView::render` stamps.
+fn math_click_outcome(ev: &web_sys::MouseEvent) -> Option<MathModalState> {
+    let target = ev.target()?.dyn_into::<web_sys::Element>().ok()?;
+    let action_el = target.closest("[data-math-action]").ok()??;
+    let block_el = action_el.closest(".math-block").ok()??;
+    let block_id = block_el.get_attribute("data-block-id")?;
+    let source = block_el.get_attribute("data-source").unwrap_or_default();
+    Some(MathModalState { block_id, source })
+}
+
 /// If the user is switching from month → day/week (or vice
 /// versa), the cursor's shape needs to match. Month expects
 /// `YYYY-MM`; day/week expect `YYYY-MM-DD`. Best-effort — falls
@@ -1843,6 +1856,8 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     // on clicks inside `.mermaid-block`; the modal callback
     // dispatches `commands::update_mermaid_source`.
     let mermaid_modal_state: RwSignal<Option<MermaidModalState>> = RwSignal::new(None);
+    // Equation edit modal state, same shape as Mermaid's.
+    let math_modal_state: RwSignal<Option<MathModalState>> = RwSignal::new(None);
 
     // Task 7 — language-selector chip overlay. `None` = hidden.
     // Rendered OUTSIDE `.editor-content` (a sibling inside the
@@ -2225,6 +2240,49 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
         });
     });
 
+    // Delegated click listener for `.math-block` click-to-edit, a twin
+    // of the Mermaid one above. Read-only documents (trash, view-only
+    // shares) don't open the editor.
+    let math_modal_click = math_modal_state;
+    let math_readonly = props.readonly;
+    Effect::new(move |_| {
+        let Some(container) = container_ref.get() else { return };
+        let already: web_sys::HtmlElement = container.clone().into();
+        if already.get_attribute("data-math-observer").is_some() {
+            return;
+        }
+        let el: web_sys::HtmlElement = container.into();
+        let _ = el.set_attribute("data-math-observer", "attached");
+        let listener = Closure::wrap(Box::new(move |ev: web_sys::MouseEvent| {
+            if math_readonly {
+                return;
+            }
+            let Some(modal_state) = math_click_outcome(&ev) else {
+                return;
+            };
+            // The equation owns the click — stop it before the editor's
+            // selection handler collapses onto the leaf atom.
+            ev.stop_propagation();
+            ev.prevent_default();
+            math_modal_click.set(Some(modal_state));
+        }) as Box<dyn Fn(web_sys::MouseEvent)>);
+        let _ = el.add_event_listener_with_callback(
+            "click",
+            listener.as_ref().unchecked_ref(),
+        );
+        let cleanup_el = send_wrapper::SendWrapper::new(el);
+        let cleanup_listener = send_wrapper::SendWrapper::new(listener);
+        on_cleanup(move || {
+            let el = cleanup_el.take();
+            let listener = cleanup_listener.take();
+            let _ = el.remove_event_listener_with_callback(
+                "click",
+                listener.as_ref().unchecked_ref(),
+            );
+            drop(listener);
+        });
+    });
+
     // #137 — Column-op dispatcher. Rename/Remove use
     // `window.prompt` / `window.confirm` for v1 — good enough for
     // the "type a column name" and "are you sure" moments, and it
@@ -2433,6 +2491,35 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                 );
             }
         }
+    });
+
+    // Equation modal outcome dispatcher: Save writes the block's
+    // `source`; Cancel is a noop. Same scaffolding as Mermaid's.
+    let view_ref_math_modal = send_wrapper::SendWrapper::new(Rc::clone(&view_ref));
+    let history_ref_math_modal = send_wrapper::SendWrapper::new(Rc::clone(&history_ref));
+    let on_change_math_modal = props.on_change.clone();
+    let on_state_change_math_modal = on_state_change_shared.clone();
+    let on_mapping_math_modal = props.on_mapping.clone();
+    let on_math_outcome = Callback::new(move |outcome: MathModalOutcome| {
+        let MathModalOutcome::Save { block_id, source } = outcome else { return };
+        let view = view_ref_math_modal.borrow();
+        let Some(view) = view.as_ref() else { return };
+        let state = view.state();
+        let history_ref_dispatch = Rc::clone(&*history_ref_math_modal);
+        let on_change_dispatch = on_change_math_modal.clone();
+        let on_state_change_dispatch = on_state_change_math_modal.clone();
+        let on_mapping_dispatch = on_mapping_math_modal.clone();
+        let dispatch_fn = move |txn: Transaction| {
+            apply_and_notify(
+                view,
+                txn,
+                Some(&history_ref_dispatch),
+                &on_change_dispatch,
+                &on_state_change_dispatch,
+                on_mapping_dispatch.as_ref(),
+            );
+        };
+        commands::update_math_source(&block_id, source, &state, Some(&dispatch_fn));
     });
 
     // Task 7 — code-block language-chip selection dispatcher. Same
@@ -3317,6 +3404,10 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             <MermaidModal
                 state=mermaid_modal_state
                 on_outcome=on_mermaid_outcome
+            />
+            <MathModal
+                state=math_modal_state
+                on_outcome=on_math_outcome
             />
             <CodeLangChip
                 state=code_lang_chip_state

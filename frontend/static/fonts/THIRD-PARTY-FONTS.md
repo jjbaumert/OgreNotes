@@ -19,7 +19,14 @@ Used by the document typography themes (#59 T-12; see
 | `nunito-{400,700}.woff2` | Nunito | © Vernon Adams, Cyreal, Jacques Le Bailly |
 | `merriweather-{400,700}.woff2` | Merriweather | © Sorkin Type Co |
 | `jetbrains-mono-{400,700}.woff2` | JetBrains Mono | © JetBrains s.r.o. |
+| `stix-two-math-400.woff2` | STIX Two Math | © The STIX Fonts Project Authors (Reserved Font Name "TM Math") |
+
+STIX Two Math is the complete font (not a Latin subset) — equations need
+its OpenType MATH table and the full symbol repertoire. It backs MathML
+rendering of equation blocks (`style/fonts.css`, `crates/math`) and is
+only fetched when a page shows an equation.
 
 To refresh a family, re-fetch the corresponding
 `@fontsource/<family>@5/files/<family>-latin-<weight>-normal.woff2` and
-keep this table in sync.
+keep this table in sync (STIX Two Math: `@fontsource/stix-two-math@5`,
+`stix-two-math-latin-400-normal.woff2`).

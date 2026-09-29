@@ -202,6 +202,10 @@ pub enum NodeType {
     /// the `source` attribute; rendered to SVG by `ogrenotes-mermaid`.
     /// Mirrors the same-named variant in `crates/collab/src/schema.rs`.
     Mermaid,
+    /// Display equation block. Block-level leaf atom; LaTeX math source
+    /// in the `source` attribute; rendered to MathML by `ogrenotes-math`.
+    /// Mirrors the same-named variant in `crates/collab/src/schema.rs`.
+    MathBlock,
     /// design/presentations.md — one slide in a presentation deck.
     /// Container of `Frame` children. Attrs: `layout` (preset id),
     /// `background` (optional theme-relative override). Mirrors the
@@ -225,7 +229,7 @@ impl NodeType {
         NodeType::Image, NodeType::Table, NodeType::TableRow, NodeType::TableCell,
         NodeType::TableHeader, NodeType::Embed, NodeType::Calendar, NodeType::CalendarEvent,
         NodeType::Kanban, NodeType::KanbanColumn, NodeType::KanbanCard, NodeType::Mention,
-        NodeType::DocMention, NodeType::Mermaid, NodeType::Slide, NodeType::Frame,
+        NodeType::DocMention, NodeType::Mermaid, NodeType::MathBlock, NodeType::Slide, NodeType::Frame,
     ];
 
     /// Whether this is a leaf node (no children).
@@ -241,6 +245,7 @@ impl NodeType {
                 | NodeType::Mention
                 | NodeType::DocMention
                 | NodeType::Mermaid
+                | NodeType::MathBlock
         )
     }
 
@@ -275,6 +280,7 @@ impl NodeType {
                 | NodeType::Mention
                 | NodeType::DocMention
                 | NodeType::Mermaid
+                | NodeType::MathBlock
         )
     }
 
@@ -321,6 +327,7 @@ impl NodeType {
             | NodeType::Mention
             | NodeType::DocMention
             | NodeType::Mermaid
+            | NodeType::MathBlock
             | NodeType::Slide => false,
         }
     }
@@ -371,6 +378,7 @@ impl NodeType {
             | NodeType::Mention
             | NodeType::DocMention
             | NodeType::Mermaid
+            | NodeType::MathBlock
             // Both mandatory: without a stable blockId, the
             // bridge's `find_match` can't align Slide/Frame across
             // syncs and every edit degrades to a full subtree
