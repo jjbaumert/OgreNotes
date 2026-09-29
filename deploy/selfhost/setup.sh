@@ -28,7 +28,7 @@ TABLE="${DYNAMODB_TABLE_PREFIX}ogrenote"
 BUCKET=$S3_BUCKET
 SECRETS_PATH="/${SECRETS_SSM_PATH#/}"; SECRETS_PATH="${SECRETS_PATH%/}/"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-ORIGIN="https://${OGRENOTES_DOMAIN}"
+ORIGIN="https://${OGRENOTES_DOMAIN}${OGRENOTES_PORT:+:$OGRENOTES_PORT}"
 
 say() { printf '\n== %s\n' "$*"; }
 
@@ -76,11 +76,28 @@ else
     -e AWS_REGION="$REGION" api setup_dev
   aws dynamodb wait table-exists --table-name "$TABLE" --region "$REGION"
 fi
+# A new table rejects these for a minute or two while AWS finishes setting
+# up its backups, so retry while it's still settling.
+settle() {
+  local err i
+  for i in $(seq 1 30); do
+    err=$("$@" 2>&1 >/dev/null) && return 0
+    case $err in
+      *ContinuousBackupsUnavailableException*|*ResourceInUseException*)
+        echo "table still settling, retrying in 10s ($i/30)"; sleep 10 ;;
+      *) echo "$err" >&2; return 1 ;;
+    esac
+  done
+  echo "$err" >&2; return 1
+}
 # Point-in-time recovery is the database backup (35 days of restore points).
-aws dynamodb update-continuous-backups --table-name "$TABLE" --region "$REGION" \
-  --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true >/dev/null
-aws dynamodb update-table --table-name "$TABLE" --region "$REGION" \
-  --deletion-protection-enabled >/dev/null 2>&1 || true
+settle aws dynamodb update-continuous-backups --table-name "$TABLE" --region "$REGION" \
+  --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true
+if [[ $(aws dynamodb describe-table --table-name "$TABLE" --region "$REGION" \
+          --query Table.DeletionProtectionEnabled --output text) != True ]]; then
+  settle aws dynamodb update-table --table-name "$TABLE" --region "$REGION" \
+    --deletion-protection-enabled
+fi
 echo "point-in-time recovery on, deletion protection on"
 
 # ── Secrets in SSM ───────────────────────────────────────────────────

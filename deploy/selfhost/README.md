@@ -23,10 +23,14 @@ Everything here runs from `deploy/selfhost/`.
   keeps an A record there pointed at your home IP (dynamic DNS) and gets its
   TLS certificate through Route 53 too.
 - Your router forwarding TCP **443** (and UDP 443 for HTTP/3) to the machine.
+  If 443 is taken, pick another port, set `OGRENOTES_PORT` in `.env`, and
+  forward that port (TCP and UDP) instead. The site is then
+  `https://<domain>:<port>`, and the GitHub callback URL must include it.
   Port 80 isn't needed.
 - A GitHub OAuth app for sign-in (GitHub → Settings → Developer settings →
   OAuth Apps). Set its callback URL to
-  `https://<your domain>/api/v1/auth/callback`.
+  `https://<your domain>/api/v1/auth/callback` (with `:<port>` after the
+  domain if you set `OGRENOTES_PORT`).
 
 ## First-time setup
 

@@ -20,8 +20,9 @@ x-app: &app
   environment:
     REDIS_URL: redis://redis:6379
     DEV_MODE: "false"
-    FRONTEND_ORIGIN: https://${OGRENOTES_DOMAIN}
-    OAUTH_REDIRECT_URI: https://${OGRENOTES_DOMAIN}/api/v1/auth/callback
+    # OGRENOTES_PORT (in .env) adds ":<port>"; browsers send it in Origin.
+    FRONTEND_ORIGIN: https://${OGRENOTES_DOMAIN}${OGRENOTES_PORT:+:${OGRENOTES_PORT}}
+    OAUTH_REDIRECT_URI: https://${OGRENOTES_DOMAIN}${OGRENOTES_PORT:+:${OGRENOTES_PORT}}/api/v1/auth/callback
     SEARCH_INDEX_PATH: /data/search-index
     # Keys set in ogrenotes.env win; left out, the SDK falls back to the one
     # profile aws-creds.sh copied here (none unless OGRENOTES_AWS_PROFILE).
@@ -61,8 +62,8 @@ services:
       AWS_SHARED_CREDENTIALS_FILE: /aws/credentials
     ports:
       - "80:80"
-      - "443:443"
-      - "443:443/udp"
+      - "${OGRENOTES_PORT:-443}:443"
+      - "${OGRENOTES_PORT:-443}:443/udp"
     volumes:
       - ./aws/caddy:/aws:ro
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
