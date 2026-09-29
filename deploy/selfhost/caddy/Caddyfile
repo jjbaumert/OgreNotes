@@ -5,10 +5,13 @@
 
 	# Keep {$OGRENOTES_DOMAIN}'s A record pointed at this network's public
 	# IP. `domains` is <hosted zone> <record name(s)>; "@" is the apex.
+	# The zone needs its trailing dot: the route53 provider matches it
+	# exactly against Route 53's "example.com." and otherwise reports
+	# HostedZoneNotFound.
 	dynamic_dns {
 		provider route53
 		domains {
-			{$DNS_ZONE} {$DNS_RECORD}
+			{$DNS_ZONE}. {$DNS_RECORD}
 		}
 		ip_source simple_http https://api64.ipify.org
 		ip_source simple_http https://icanhazip.com

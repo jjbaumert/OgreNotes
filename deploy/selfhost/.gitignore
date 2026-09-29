@@ -4,3 +4,5 @@ ogrenotes.env
 caddy.env
 # Per-service credentials written by aws-creds.sh.
 aws/*/credentials
+# Policies setup.sh fills in with your account, bucket and zone.
+iam/rendered/
