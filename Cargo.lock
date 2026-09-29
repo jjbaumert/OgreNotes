@@ -3804,6 +3804,7 @@ dependencies = [
  "nanoid",
  "ogrenotes-common",
  "ogrenotes-highlight",
+ "ogrenotes-math",
  "ogrenotes-mermaid",
  "ogrenotes-storage",
  "pdf-extract",
@@ -3863,6 +3864,14 @@ name = "ogrenotes-highlight"
 version = "0.1.0"
 dependencies = [
  "proptest",
+]
+
+[[package]]
+name = "ogrenotes-math"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "quick-xml 0.37.5",
 ]
 
 [[package]]

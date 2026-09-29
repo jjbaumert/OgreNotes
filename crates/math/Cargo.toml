@@ -1,0 +1,15 @@
+[package]
+name = "ogrenotes-math"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+# LaTeX math -> MathML Core. std only: it compiles to wasm32 for the
+# editor and runs natively for server-side export, like ogrenotes-mermaid.
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }
+# Well-formedness check: every rendered equation must parse as XML.
+quick-xml = { workspace = true }

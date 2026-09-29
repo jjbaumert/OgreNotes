@@ -1647,10 +1647,33 @@ pub fn update_mermaid_source(
     state: &EditorState,
     dispatch: Option<&dyn Fn(Transaction)>,
 ) -> bool {
+    update_source_attr(NodeType::Mermaid, block_id, source, state, dispatch)
+}
+
+/// Write an equation block's `source` attribute by block id (the
+/// `MathModal` Save outcome). Same contract as `update_mermaid_source`.
+pub fn update_math_source(
+    block_id: &str,
+    source: String,
+    state: &EditorState,
+    dispatch: Option<&dyn Fn(Transaction)>,
+) -> bool {
+    update_source_attr(NodeType::MathBlock, block_id, source, state, dispatch)
+}
+
+/// Set `source` on the `node_type` element with `block_id`; `false` if
+/// there is no such element (or it's a different type).
+fn update_source_attr(
+    node_type: NodeType,
+    block_id: &str,
+    source: String,
+    state: &EditorState,
+    dispatch: Option<&dyn Fn(Transaction)>,
+) -> bool {
     let Some((offset, node)) = find_element_by_block_id(&state.doc, block_id) else {
         return false;
     };
-    if !matches!(&node, Node::Element { node_type: NodeType::Mermaid, .. }) {
+    if !matches!(&node, Node::Element { node_type: nt, .. } if *nt == node_type) {
         return false;
     }
 
@@ -6037,6 +6060,23 @@ mod tests {
             attrs.get("source").map(|s| s.as_str()),
             Some("pie\n\"B\": 2"),
         );
+    }
+
+    #[test]
+    fn update_math_source_sets_attr_and_checks_type() {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("blockId".to_string(), "e1".to_string());
+        attrs.insert("source".to_string(), "x".to_string());
+        let eq = Node::element_with_attrs(NodeType::MathBlock, attrs, Fragment::empty());
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![eq]));
+        let state = EditorState::create_default(doc);
+        let txn = run_command(&state, |s, d| update_math_source("e1", "y^2".into(), s, d)).unwrap();
+        let new_state = state.apply(txn);
+        let Node::Element { attrs, .. } = new_state.doc.child(0).unwrap() else { panic!() };
+        assert_eq!(attrs.get("source").map(String::as_str), Some("y^2"));
+        // A Mermaid block with the same id isn't an equation.
+        let mermaid = state_with_mermaid("m1", "pie\n\"A\": 1");
+        assert!(!update_math_source("m1", "y".into(), &mermaid, None));
     }
 
     #[test]

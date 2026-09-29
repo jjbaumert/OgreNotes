@@ -1018,12 +1018,20 @@ kanban-modal-assignee-label = Assignee
 kanban-column-rename-prompt = Rename column
 insert-mermaid-label = Mermaid diagram
 insert-mermaid-description = Insert a diagram rendered from Mermaid text
+insert-math-label = Equation
+insert-math-description = Insert a math equation written in LaTeX
 kanban-column-delete-confirm = Delete this column and all its cards?
 kanban-column-wip-limit-prompt = WIP limit (empty to clear)
 mermaid-modal-title = Edit Diagram
 mermaid-modal-save = Save
 mermaid-modal-error-empty = Diagram source cannot be empty.
 mermaid-modal-error-too-long = Diagram source is too long ({ $max } character limit).
+
+math-modal-title = Edit Equation
+math-modal-save = Save
+math-modal-source-label = LaTeX source
+math-modal-error-empty = Equation cannot be empty.
+math-modal-error-too-long = Equation is too long ({ $max } character limit).
 
 # ─── File-browser bulk selection (Phase 5 M-P7 piece C) ─────────
 

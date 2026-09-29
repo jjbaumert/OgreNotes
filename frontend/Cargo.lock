@@ -1130,6 +1130,7 @@ dependencies = [
  "leptos_router",
  "libm",
  "ogrenotes-highlight",
+ "ogrenotes-math",
  "ogrenotes-mermaid",
  "proptest",
  "pulldown-cmark",
@@ -1148,6 +1149,10 @@ dependencies = [
 
 [[package]]
 name = "ogrenotes-highlight"
+version = "0.1.0"
+
+[[package]]
+name = "ogrenotes-math"
 version = "0.1.0"
 
 [[package]]

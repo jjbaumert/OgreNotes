@@ -487,6 +487,12 @@ pub fn to_docx_with_comments(doc: &Doc, comments: &[ExportComment]) -> Vec<u8> {
                         .add_run(Run::new().add_text(text)),
                 );
             }
+            // No equation layout in DOCX yet: keep the LaTeX source
+            // rather than an empty paragraph.
+            NodeType::MathBlock => {
+                let source = el.get_attribute(&txn, "source").unwrap_or_default();
+                docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text(source)));
+            }
             // Paragraph and every other block kind (lists, quotes,
             // code, …) flatten to a plain paragraph of their text in
             // v1 — same scope as the importer.
@@ -718,7 +724,13 @@ fn collect_block_text(doc: &Doc) -> Vec<String> {
     let len = fragment.len(&txn);
     for i in 0..len {
         if let Some(XmlOut::Element(el)) = fragment.get(&txn, i) {
-            out.push(extract_text(&txn, &el));
+            // Equations are leaves with no text: print their LaTeX
+            // source rather than nothing.
+            if NodeType::from_tag(el.tag().as_ref()) == Some(NodeType::MathBlock) {
+                out.push(el.get_attribute(&txn, "source").unwrap_or_default());
+            } else {
+                out.push(extract_text(&txn, &el));
+            }
         }
     }
     out
@@ -1215,6 +1227,20 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
                     }
                     return;
                 }
+                if matches!(node_type, NodeType::MathBlock) {
+                    let source = el.get_attribute(txn, "source").unwrap_or_default();
+                    match ogrenotes_math::to_mathml(&source, ogrenotes_math::Display::Block) {
+                        // MathML from our own renderer: source text is
+                        // XML-escaped and attributes come from fixed tables.
+                        Ok(mathml) => out.push_str(&format!("<div class=\"math-block\">{mathml}</div>")),
+                        Err(e) => out.push_str(&format!(
+                            "<div class=\"math-error\"><p>{}</p><pre>{}</pre></div>",
+                            html_escape(&e.to_string()),
+                            html_escape(&source),
+                        )),
+                    }
+                    return;
+                }
                 out.push_str(&format!("<{html_tag}{attrs} />"));
                 return;
             }
@@ -1315,6 +1341,12 @@ fn render_node_markdown<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String, de
                 NodeType::Mermaid => {
                     let source = el.get_attribute(txn, "source").unwrap_or_default();
                     push_md_fenced(out, "mermaid", &source);
+                }
+                // A ```math fence (GitHub, GitLab) rather than `$$…$$`,
+                // which a source containing `$$` could close early.
+                NodeType::MathBlock => {
+                    let source = el.get_attribute(txn, "source").unwrap_or_default();
+                    push_md_fenced(out, "math", &source);
                 }
                 NodeType::HorizontalRule => {
                     out.push_str("---\n\n");
@@ -1599,6 +1631,7 @@ fn node_type_to_html_tag(nt: NodeType) -> &'static str {
         // special-case in `render_node_html`.
         NodeType::DocMention => "a",
         NodeType::Mermaid => "div",
+        NodeType::MathBlock => "div",
         NodeType::Slide | NodeType::Frame => crate::blocks::presentation::html_tag(nt),
     }
 }
@@ -3324,6 +3357,41 @@ mod tests {
         let md = to_markdown_of_single_mermaid("pie\n\"A\" : 1");
         assert!(md.contains("```mermaid"));
         assert!(md.contains("\"A\" : 1"));
+    }
+
+    fn doc_with_math(source: &str) -> Doc {
+        doc_with(|txn, frag| {
+            let m = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::MathBlock.tag_name()));
+            m.insert_attribute(txn, "source", source);
+        })
+    }
+
+    #[test]
+    fn math_block_html_inlines_mathml() {
+        let html = to_html(&doc_with_math("\\frac{a}{b}"));
+        assert!(html.contains("<div class=\"math-block\"><math "), "{html}");
+        assert!(html.contains("<mfrac><mi>a</mi><mi>b</mi></mfrac>"), "{html}");
+    }
+
+    #[test]
+    fn math_block_html_falls_back_to_escaped_source_on_error() {
+        let html = to_html(&doc_with_math("\\foo <b>"));
+        assert!(html.contains("<div class=\"math-error\">"), "{html}");
+        assert!(html.contains("unknown command `\\foo`"), "{html}");
+        assert!(html.contains("<pre>\\foo &lt;b&gt;</pre>"), "{html}");
+        assert!(!html.contains("<math"));
+    }
+
+    #[test]
+    fn math_block_markdown_is_a_math_fence() {
+        let md = to_markdown(&doc_with_math("x^2"));
+        assert!(md.starts_with("```math\nx^2\n```"), "{md}");
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn math_block_pdf_text_is_its_source() {
+        assert_eq!(collect_block_text(&doc_with_math("E=mc^2")), vec!["E=mc^2".to_string()]);
     }
 
     #[test]

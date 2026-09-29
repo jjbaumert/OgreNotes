@@ -1331,6 +1331,14 @@ fn element_tags(
                 None,
             )
         }
+        // Equation block: the LaTeX source, same minimal shape.
+        NodeType::MathBlock => {
+            let source = attrs.get("source").map(String::as_str).unwrap_or("");
+            (
+                format!("<div class=\"math-block\">{}</div>", html_escape_attr(source)),
+                None,
+            )
+        }
         // design/presentations.md — decks have no dedicated
         // clipboard render pipeline yet (they don't render through
         // the flow editor at all); this minimal shape mirrors
