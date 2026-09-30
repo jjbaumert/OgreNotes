@@ -5598,6 +5598,41 @@ fn source_paste_keeps_supported_block_container_boundaries() {
 }
 
 #[wasm_bindgen_test]
+fn mermaid_paste_over_rule_in_quote_without_text_blocks_keeps_schema() {
+    let doc = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![Node::element_with_content(
+            NodeType::Blockquote,
+            Fragment::from(vec![Node::element(NodeType::HorizontalRule)]),
+        )]),
+    );
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), doc);
+    let state = view.state();
+    let selection = Selection::node(&state.doc, 1).unwrap();
+    view.update_state(EditorState { selection, ..state });
+    dispatch_paste(&view, &txns, "```mermaid\ngraph TD\nA --> B\n```");
+    let doc = view.state().doc;
+    assert!(
+        ogrenotes_frontend::editor::schema::default_schema()
+            .validate(&doc)
+            .is_ok(),
+        "{doc:?}"
+    );
+    assert_eq!(
+        doc.child(0).unwrap().child(0).unwrap().node_type(),
+        Some(NodeType::CodeBlock)
+    );
+    assert!(
+        view.container()
+            .query_selector(".mermaid-svg svg")
+            .unwrap()
+            .is_some()
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
 fn paste_markdown_heading_creates_h1_in_dom() {
     let container = create_container();
     let (view, txns) = create_editor(container.clone(), Node::empty_doc());

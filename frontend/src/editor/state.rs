@@ -354,9 +354,16 @@ impl Transaction {
         };
         let raw_pos = txn.selection.from();
         let Some((block, pos)) = resolve_block_for_edit(&txn.doc, raw_pos) else {
-            // No textblock anywhere to anchor on: insert the blocks where
-            // the caret is. They are Doc-fitted, so this is only reached
-            // for a doc with no textblock at all.
+            // Without a textblock, the caret can still be inside an empty
+            // container after deleting its last atom. Fit diagrams against
+            // that insertion parent before replacing the selected content.
+            if let Some(rp) = super::position::resolve(&txn.doc, raw_pos) {
+                let parent = rp
+                    .node_at(rp.depth, &txn.doc)
+                    .node_type()
+                    .unwrap_or(NodeType::Doc);
+                super::clipboard::preserve_mermaid_nesting(&mut fitted.content.children, parent);
+            }
             return txn.replace(raw_pos, raw_pos, fitted);
         };
 
