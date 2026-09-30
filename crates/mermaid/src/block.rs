@@ -535,7 +535,7 @@ fn min_sizes(d: &BlockDiagram) -> Vec<(f64, f64)> {
             }
             Item::Group { label, .. } => {
                 let (cols, cells) = flow(d, i);
-                let (cell_w, row_h) = grid_mins(d, &size, &cells);
+                let (cell_w, row_h) = grid_mins(d, &size, cols, &cells);
                 let inner_w = cols as f64 * cell_w + (cols as f64 - 1.0) * GAP;
                 let title_w = label.as_deref().map(|l| label_size(l).0).unwrap_or(0.0);
                 let rows_h: f64 = row_h.iter().sum::<f64>() + (row_h.len().max(1) as f64 - 1.0) * GAP;
@@ -547,11 +547,12 @@ fn min_sizes(d: &BlockDiagram) -> Vec<(f64, f64)> {
 }
 
 /// A group's minimum uniform cell width and per-row heights.
-fn grid_mins(d: &BlockDiagram, size: &[(f64, f64)], cells: &[(usize, usize, usize)]) -> (f64, Vec<f64>) {
+fn grid_mins(d: &BlockDiagram, size: &[(f64, f64)], cols: usize, cells: &[(usize, usize, usize)]) -> (f64, Vec<f64>) {
     let mut cell_w = MIN_CELL_W;
     let mut row_h: Vec<f64> = Vec::new();
     for &(k, _, row) in cells {
-        let span = d.nodes[k].span as f64;
+        // Spans wider than the grid are clamped to it (see `flow`).
+        let span = d.nodes[k].span.min(cols) as f64;
         cell_w = cell_w.max((size[k].0 - (span - 1.0) * GAP) / span);
         if row_h.len() <= row {
             row_h.resize(row + 1, CELL_H);
@@ -581,7 +582,7 @@ pub(crate) fn layout(d: &BlockDiagram) -> Placed {
 /// inner width `w` (cells stretch to fill it).
 fn place_children(d: &BlockDiagram, size: &[(f64, f64)], rect: &mut [Option<(f64, f64, f64, f64)>], g: usize, x: f64, y: f64, w: f64) {
     let (cols, cells) = flow(d, g);
-    let (_, row_h) = grid_mins(d, size, &cells);
+    let (_, row_h) = grid_mins(d, size, cols, &cells);
     let cell_w = (w - (cols as f64 - 1.0) * GAP) / cols as f64;
     let mut row_y = Vec::with_capacity(row_h.len());
     let mut acc = y;
@@ -865,6 +866,7 @@ mod tests {
             "block-beta\ncolumns 2\na[\"a very long label that is much wider than a cell\"]:2\nb c",
             "block-beta\ncolumns 1\nblock:g[\"A very long group title here, wider than its content\"]\nx\nend",
             "block-beta\ncolumns 2\na:5 b",
+            "block-beta\ncolumns 1\nq[\"a much longer label with spaces in it\"]:2",
             "block-beta\na[\"line one<br/>line two<br/>line three\"] b",
         ] {
             crate::extent::assert_inside(&render_svg(&parse(src).unwrap()));
