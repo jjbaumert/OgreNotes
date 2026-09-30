@@ -5347,6 +5347,58 @@ async fn invalid_pasted_mermaid_opens_modal_and_recovers_with_exact_source() {
 }
 
 #[wasm_bindgen_test]
+fn mermaid_language_on_pre_renders_diagram() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "graph TD\nA --> B",
+        "<pre class=\"language-mermaid\">graph TD\nA --&gt; B</pre>",
+    );
+    assert_eq!(
+        view.state().doc.child(0).unwrap().node_type(),
+        Some(NodeType::Mermaid)
+    );
+    assert!(
+        view.container()
+            .query_selector(".mermaid-svg svg")
+            .unwrap()
+            .is_some()
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn html_only_source_paste_preserves_sibling_text() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), code_block_doc("old", "mermaid"));
+    set_selection(&view, 1, 4);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "",
+        "<pre><code>graph TD\nA --&gt; B</code></pre>\nB --&gt; C",
+    );
+    assert!(
+        view.state()
+            .doc
+            .child(0)
+            .unwrap()
+            .text_content()
+            .contains("B --> C")
+    );
+    assert!(
+        view.container()
+            .query_selector(".mermaid-svg svg")
+            .unwrap()
+            .is_some()
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
 fn paste_markdown_heading_creates_h1_in_dom() {
     let container = create_container();
     let (view, txns) = create_editor(container.clone(), Node::empty_doc());

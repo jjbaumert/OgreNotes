@@ -579,7 +579,14 @@ pub(super) fn literal_text_from_html(html: &str) -> Option<String> {
         .parse_from_string(html, web_sys::SupportedType::TextHtml)
         .ok()?;
     let body = document.body()?;
-    if body.child_element_count() == 1 {
+    let children = body.child_nodes();
+    let has_sibling_text = (0..children.length()).any(|i| {
+        children.item(i).is_some_and(|node| {
+            node.node_type() == web_sys::Node::TEXT_NODE
+                && !node.text_content().unwrap_or_default().trim().is_empty()
+        })
+    });
+    if body.child_element_count() == 1 && !has_sibling_text {
         let element = body.first_element_child()?;
         if let Some(source) = element.get_attribute("data-source") {
             return Some(source);
@@ -680,10 +687,12 @@ fn convert_code_block(child: &web_sys::Node, el: &web_sys::Element) -> Node {
         .unwrap_or(child);
 
     let mut attrs = std::collections::HashMap::new();
-    if let Some(code) = &code_el {
-        if let Some(lang) = code_language_from_class(&code.class_name()) {
-            attrs.insert("language".to_string(), lang.to_string());
-        }
+    let language = code_el
+        .as_ref()
+        .and_then(|code| code_language_from_class(&code.class_name()).map(str::to_owned))
+        .or_else(|| code_language_from_class(&el.class_name()).map(str::to_owned));
+    if let Some(lang) = language {
+        attrs.insert("language".to_string(), lang.to_string());
     }
 
     let text = literal_dom_text(text_source);
