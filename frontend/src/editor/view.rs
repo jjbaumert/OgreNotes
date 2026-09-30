@@ -901,7 +901,7 @@ impl EditorView {
             // Source pasted within one code block is literal text. Parsing
             // it as Markdown would collapse newlines and consume HTML tags
             // such as Mermaid's <br/> labels before the renderer sees them.
-            if !text.is_empty() {
+            if !text.is_empty() || !html.is_empty() {
                 if let Some(rp) =
                     super::position::resolve(&state_with_sel.doc, state_with_sel.selection.from())
                 {
@@ -909,7 +909,15 @@ impl EditorView {
                         == Some(NodeType::CodeBlock)
                         && state_with_sel.selection.to() <= rp.end(rp.depth, &state_with_sel.doc)
                     {
-                        let literal = super::clipboard::normalize_line_endings(&text);
+                        let source = if !text.is_empty() {
+                            Some(text.clone())
+                        } else {
+                            super::clipboard::literal_text_from_html(&html)
+                        };
+                        let Some(source) = source else {
+                            return;
+                        };
+                        let literal = super::clipboard::normalize_line_endings(&source);
                         if let Ok(txn) = state_with_sel.transaction().insert_text(&literal) {
                             dispatch_paste(txn);
                         }

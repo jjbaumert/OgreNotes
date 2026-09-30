@@ -25,6 +25,9 @@ wasm_bindgen_test_configure!(run_in_browser);
 mod code_lang_chip;
 #[path = "../src/components/dom_position.rs"]
 mod dom_position;
+#[path = "../src/components/mermaid_modal.rs"]
+mod mermaid_modal;
+pub use ogrenotes_frontend::{a11y, t};
 mod editor {
     pub use ogrenotes_frontend::editor::*;
 }
@@ -5193,6 +5196,154 @@ fn mermaid_pre_horizontal_scroll_survives_following_paragraph_edit() {
     style.remove();
     cleanup(&container);
     assert_eq!(after, scroll);
+}
+
+#[wasm_bindgen_test]
+fn html_only_source_paste_keeps_editable_code_identity() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), code_block_doc("old", "mermaid"));
+    let identity = view
+        .state()
+        .doc
+        .child(0)
+        .unwrap()
+        .attrs()
+        .get("blockId")
+        .cloned();
+    set_selection(&view, 1, 4);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "",
+        "<pre><code class=\"language-mermaid\">graph TD\nA --&gt; B</code></pre>",
+    );
+    let block = view.state().doc.child(0).unwrap().clone();
+    assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+    assert_eq!(block.text_content(), "graph TD\nA --> B");
+    assert_eq!(block.attrs().get("blockId").cloned(), identity);
+    assert!(
+        view.container()
+            .query_selector("pre > code")
+            .unwrap()
+            .is_some()
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn html_mermaid_code_breaks_keep_source_newlines_and_html_labels() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    let source = "graph TD\nA[hello<br/>world] --> B";
+    dispatch_paste_html(
+        &view,
+        &txns,
+        source,
+        "<pre><code class=\"language-mermaid\">graph TD<br>A[hello&lt;br/&gt;world] --&gt; B</code></pre>",
+    );
+    assert_eq!(
+        view.state()
+            .doc
+            .child(0)
+            .unwrap()
+            .attrs()
+            .get("source")
+            .map(String::as_str),
+        Some(source)
+    );
+    assert!(
+        view.container()
+            .query_selector(".mermaid-svg svg")
+            .unwrap()
+            .is_some()
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+async fn invalid_pasted_mermaid_opens_modal_and_recovers_with_exact_source() {
+    use leptos::prelude::*;
+    use mermaid_modal::{MermaidModal, MermaidModalOutcome};
+    let editor_container = create_container();
+    let (view, txns) = create_editor(editor_container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste(&view, &txns, "```mermaid\nnot a diagram\n```");
+    assert!(
+        view.container()
+            .query_selector(".mermaid-error")
+            .unwrap()
+            .is_some()
+    );
+    let view = std::rc::Rc::new(view);
+    let owner = Owner::new();
+    let state = owner.with(|| RwSignal::new(None::<mermaid_modal::MermaidModalState>));
+    let listener =
+        wasm_bindgen::closure::Closure::wrap(Box::new(move |event: web_sys::MouseEvent| {
+            if let Some(open) = mermaid_modal::mermaid_click_outcome(&event) {
+                state.set(Some(open));
+            }
+        }) as Box<dyn Fn(web_sys::MouseEvent)>);
+    view.container()
+        .add_event_listener_with_callback("click", listener.as_ref().unchecked_ref())
+        .unwrap();
+    let modal_container = create_container();
+    let callback_view = send_wrapper::SendWrapper::new(std::rc::Rc::clone(&view));
+    let handle = owner.with(|| leptos::mount::mount_to(modal_container.clone(), move || view! {
+        <MermaidModal state=state on_outcome=Callback::new(move |outcome| {
+            if let MermaidModalOutcome::Save { block_id, source } = outcome {
+                let current = callback_view.state();
+                let dispatch = |txn| callback_view.update_state(current.apply(txn));
+                assert!(ogrenotes_frontend::editor::commands::update_mermaid_source(&block_id, source, &current, Some(&dispatch)));
+            }
+        }) />
+    }));
+    let event_init = web_sys::MouseEventInit::new();
+    event_init.set_bubbles(true);
+    let click = web_sys::MouseEvent::new_with_mouse_event_init_dict("click", &event_init).unwrap();
+    view.container()
+        .query_selector(".mermaid-error")
+        .unwrap()
+        .unwrap()
+        .dispatch_event(&click)
+        .unwrap();
+    gloo_timers::future::TimeoutFuture::new(0).await;
+    let textarea: web_sys::HtmlTextAreaElement = modal_container
+        .query_selector("textarea")
+        .unwrap()
+        .expect("click opens actual Mermaid modal")
+        .unchecked_into();
+    assert!(textarea.value().contains("not a diagram"));
+    textarea.set_value(ORBIT_MERMAID);
+    textarea
+        .dispatch_event(&web_sys::Event::new("input").unwrap())
+        .unwrap();
+    gloo_timers::future::TimeoutFuture::new(0).await;
+    let save: web_sys::HtmlElement = modal_container
+        .query_selector("button.btn-primary")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    save.click();
+    gloo_timers::future::TimeoutFuture::new(20).await;
+    assert_eq!(
+        view.state()
+            .doc
+            .child(0)
+            .unwrap()
+            .attrs()
+            .get("source")
+            .map(String::as_str),
+        Some(ORBIT_MERMAID)
+    );
+    assert_orbit_diagram(&view);
+    view.container()
+        .remove_event_listener_with_callback("click", listener.as_ref().unchecked_ref())
+        .unwrap();
+    drop(handle);
+    owner.cleanup();
+    cleanup(&modal_container);
+    cleanup(&editor_container);
 }
 
 #[wasm_bindgen_test]

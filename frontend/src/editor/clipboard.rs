@@ -570,6 +570,101 @@ fn convert_block_element(
     }
 }
 
+/// Extract literal clipboard source without interpreting it as Markdown.
+#[cfg(target_arch = "wasm32")]
+pub(super) fn literal_text_from_html(html: &str) -> Option<String> {
+    use wasm_bindgen::JsCast;
+    let parser = web_sys::DomParser::new().ok()?;
+    let document = parser
+        .parse_from_string(html, web_sys::SupportedType::TextHtml)
+        .ok()?;
+    let body = document.body()?;
+    if body.child_element_count() == 1 {
+        let element = body.first_element_child()?;
+        if let Some(source) = element.get_attribute("data-source") {
+            return Some(source);
+        }
+        if element.tag_name().eq_ignore_ascii_case("pre") {
+            let source = element
+                .query_selector("code")
+                .ok()
+                .flatten()
+                .unwrap_or(element);
+            return Some(literal_dom_text(source.unchecked_ref()));
+        }
+    }
+    Some(literal_dom_text(body.unchecked_ref()))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn literal_dom_text(root: &web_sys::Node) -> String {
+    use wasm_bindgen::JsCast;
+    let mut text = String::new();
+    let mut synthetic_end = false;
+    // Iterative traversal also handles clipboard HTML before depth truncation.
+    let mut pending = vec![Some(root.clone())];
+    while let Some(entry) = pending.pop() {
+        let Some(node) = entry else {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+                synthetic_end = true;
+            }
+            continue;
+        };
+        if node.node_type() == web_sys::Node::TEXT_NODE {
+            let value = node.text_content().unwrap_or_default();
+            if !value.is_empty() {
+                text.push_str(&value);
+                synthetic_end = false;
+            }
+            continue;
+        }
+        if let Some(element) = node.dyn_ref::<web_sys::Element>() {
+            if element.has_attribute("data-sentinel") {
+                continue;
+            }
+            let tag = element.tag_name().to_ascii_lowercase();
+            if tag == "br" {
+                text.push('\n');
+                synthetic_end = false;
+                continue;
+            }
+            if matches!(
+                tag.as_str(),
+                "div"
+                    | "p"
+                    | "pre"
+                    | "li"
+                    | "blockquote"
+                    | "tr"
+                    | "td"
+                    | "th"
+                    | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+            ) {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                pending.push(None);
+            }
+        }
+        let children = node.child_nodes();
+        for i in (0..children.length()).rev() {
+            if let Some(child) = children.item(i) {
+                pending.push(Some(child));
+            }
+        }
+    }
+    if synthetic_end {
+        text.pop();
+    }
+    text
+}
+
 /// Parse a <pre> element into a CodeBlock node, extracting language from <code> child.
 #[cfg(target_arch = "wasm32")]
 fn convert_code_block(child: &web_sys::Node, el: &web_sys::Element) -> Node {
@@ -591,7 +686,7 @@ fn convert_code_block(child: &web_sys::Node, el: &web_sys::Element) -> Node {
         }
     }
 
-    let text = text_source.text_content().unwrap_or_default();
+    let text = literal_dom_text(text_source);
     if attrs.get("language").is_some_and(|lang| lang == "mermaid") {
         if let Some(node) = source_node(NodeType::Mermaid, &text, ogrenotes_mermaid::MAX_SOURCE_LEN)
         {
