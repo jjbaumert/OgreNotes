@@ -5515,6 +5515,49 @@ fn empty_html_source_replaces_selected_source() {
 }
 
 #[wasm_bindgen_test]
+fn html_source_coalesces_wrappers_and_preserves_explicit_newline_runs() {
+    for (breaks, source_breaks) in [
+        ("\n", "\n"),
+        ("\n\n", "\n\n"),
+        ("\n\n\n", "\n\n\n"),
+        ("<br>", "\n"),
+    ] {
+        let html = format!(
+            "<pre><code class=\"language-mermaid\"><div>graph TD</div>{breaks}<div>A --&gt; B</div></code></pre>"
+        );
+        let expected = format!("graph TD{source_breaks}A --> B");
+        for editing in [false, true] {
+            let container = create_container();
+            let (view, txns) = create_editor(
+                container.clone(),
+                if editing {
+                    code_block_doc("old", "mermaid")
+                } else {
+                    Node::empty_doc()
+                },
+            );
+            if editing {
+                set_selection(&view, 1, 4);
+            } else {
+                set_cursor(&view, 1);
+            }
+            dispatch_paste_html(&view, &txns, "", &html);
+            let block = view.state().doc.child(0).unwrap().clone();
+            let source = if editing {
+                block.text_content()
+            } else {
+                block.attrs().get("source").unwrap().clone()
+            };
+            assert_eq!(
+                source, expected,
+                "explicit newline runs must replace synthetic block boundaries"
+            );
+            cleanup(&container);
+        }
+    }
+}
+
+#[wasm_bindgen_test]
 fn paste_markdown_heading_creates_h1_in_dom() {
     let container = create_container();
     let (view, txns) = create_editor(container.clone(), Node::empty_doc());

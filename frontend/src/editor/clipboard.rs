@@ -622,6 +622,9 @@ fn literal_dom_text(root: &web_sys::Node) -> String {
         if node.node_type() == web_sys::Node::TEXT_NODE {
             let value = node.text_content().unwrap_or_default();
             if !value.is_empty() {
+                if synthetic_end && value.starts_with(['\r', '\n']) {
+                    text.pop();
+                }
                 text.push_str(&value);
                 synthetic_end = false;
             }
@@ -633,6 +636,9 @@ fn literal_dom_text(root: &web_sys::Node) -> String {
             }
             let tag = element.tag_name().to_ascii_lowercase();
             if tag == "br" {
+                if synthetic_end {
+                    text.pop();
+                }
                 text.push('\n');
                 synthetic_end = false;
                 continue;
@@ -656,6 +662,7 @@ fn literal_dom_text(root: &web_sys::Node) -> String {
             ) {
                 if !text.is_empty() && !text.ends_with('\n') {
                     text.push('\n');
+                    synthetic_end = true;
                 }
                 pending.push(None);
             }
