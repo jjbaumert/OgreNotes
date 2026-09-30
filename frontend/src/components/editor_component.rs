@@ -2193,6 +2193,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     // matches. Opens `mermaid_modal_state`; the modal's Save
     // outcome is picked up by `on_mermaid_outcome` below.
     let mermaid_modal_click = mermaid_modal_state;
+    let mermaid_readonly = props.readonly;
     Effect::new(move |_| {
         let Some(container) = container_ref.get() else { return };
         let already: web_sys::HtmlElement = container.clone().into();
@@ -2202,6 +2203,9 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
         let el: web_sys::HtmlElement = container.into();
         let _ = el.set_attribute("data-mermaid-observer", "attached");
         let listener = Closure::wrap(Box::new(move |ev: web_sys::MouseEvent| {
+            if mermaid_readonly {
+                return;
+            }
             let Some(modal_state) = mermaid_click_outcome(&ev) else {
                 return;
             };
@@ -2450,9 +2454,18 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let on_change_mermaid_modal = props.on_change.clone();
     let on_state_change_mermaid_modal = on_state_change_shared.clone();
     let on_mapping_mermaid_modal = props.on_mapping.clone();
+    let mermaid_save_readonly = props.readonly;
     let on_mermaid_outcome = Callback::new(move |outcome: MermaidModalOutcome| {
+        if matches!(outcome, MermaidModalOutcome::Cancel) {
+            return Ok(());
+        }
+        if mermaid_save_readonly {
+            return Err(commands::MermaidUpdateError::Unavailable);
+        }
         let view = view_ref_mermaid_modal.borrow();
-        let Some(view) = view.as_ref() else { return };
+        let Some(view) = view.as_ref() else {
+            return Err(commands::MermaidUpdateError::Unavailable);
+        };
         let state = view.state();
         let history_ref_dispatch = Rc::clone(&*history_ref_mermaid_modal);
         let on_change_dispatch = on_change_mermaid_modal.clone();
@@ -2469,15 +2482,18 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             );
         };
         match outcome {
-            MermaidModalOutcome::Cancel => {}
-            MermaidModalOutcome::Save { block_id, source } => {
-                commands::update_mermaid_source(
-                    &block_id,
-                    source,
-                    &state,
-                    Some(&dispatch_fn),
-                );
-            }
+            MermaidModalOutcome::Cancel => Ok(()),
+            MermaidModalOutcome::Save {
+                block_id,
+                original_source,
+                source,
+            } => commands::update_mermaid_source_if_unchanged(
+                &block_id,
+                &original_source,
+                source,
+                &state,
+                Some(&dispatch_fn),
+            ),
         }
     });
 

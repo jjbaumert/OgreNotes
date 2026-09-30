@@ -20,6 +20,7 @@
 use leptos::prelude::*;
 
 use crate::a11y;
+use crate::editor::commands::MermaidUpdateError;
 
 /// Pause in typing before the live preview re-renders.
 const PREVIEW_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
@@ -56,7 +57,11 @@ pub(crate) fn mermaid_click_outcome(ev: &web_sys::MouseEvent) -> Option<MermaidM
 /// Everything the parent needs to route the modal's result.
 #[derive(Debug, Clone)]
 pub enum MermaidModalOutcome {
-    Save { block_id: String, source: String },
+    Save {
+        block_id: String,
+        original_source: String,
+        source: String,
+    },
     Cancel,
 }
 
@@ -92,7 +97,7 @@ pub fn save_blocked(source: &str) -> Option<SaveBlockedReason> {
 pub fn MermaidModal(
     /// `Some` → open; `None` → hidden. Parent writes; modal reads.
     #[prop(into)] state: RwSignal<Option<MermaidModalState>>,
-    on_outcome: Callback<MermaidModalOutcome>,
+    on_outcome: Callback<MermaidModalOutcome, Result<(), MermaidUpdateError>>,
 ) -> impl IntoView {
     let dialog_ref = NodeRef::<leptos::html::Div>::new();
     let visible = Signal::derive(move || state.get().is_some());
@@ -110,7 +115,7 @@ pub fn MermaidModal(
 fn render_modal(
     initial: MermaidModalState,
     state: RwSignal<Option<MermaidModalState>>,
-    on_outcome: Callback<MermaidModalOutcome>,
+    on_outcome: Callback<MermaidModalOutcome, Result<(), MermaidUpdateError>>,
     dialog_ref: NodeRef<leptos::html::Div>,
 ) -> impl IntoView {
     // Working copy of the source, staged until Save.
@@ -126,6 +131,8 @@ fn render_modal(
         }
     });
     let block_id_for_save = initial.block_id.clone();
+    let original_source = initial.source.clone();
+    let save_error = RwSignal::new(None::<MermaidUpdateError>);
 
     // Every close path flips `state.set(None)`, which collapses
     // the outer `<Show>` on the same reactive turn and drops the
@@ -140,7 +147,7 @@ fn render_modal(
         let on_outcome = on_outcome.clone();
         move |()| {
             state.set(None);
-            on_outcome.run(MermaidModalOutcome::Cancel);
+            let _ = on_outcome.run(MermaidModalOutcome::Cancel);
         }
     });
     let save_cb = Callback::new({
@@ -148,7 +155,7 @@ fn render_modal(
         let on_outcome = on_outcome.clone();
         let block_id = block_id_for_save.clone();
         move |()| {
-            let src = source.get();
+            let src = source.get_untracked();
             // Second guard behind the disabled Save button: mirror the
             // server's hard gate (empty / over MAX_SOURCE_LEN) so a
             // dispatched Save can never be rejected by the write gate —
@@ -156,11 +163,15 @@ fn render_modal(
             if save_blocked(&src).is_some() {
                 return;
             }
-            state.set(None);
-            on_outcome.run(MermaidModalOutcome::Save {
+            let result = on_outcome.run(MermaidModalOutcome::Save {
                 block_id: block_id.clone(),
+                original_source: original_source.clone(),
                 source: src,
             });
+            match result {
+                Ok(()) => state.set(None),
+                Err(error) => save_error.set(Some(error)),
+            }
         }
     });
     let blocked_reason = Signal::derive(move || save_blocked(&source.get()));
@@ -234,6 +245,13 @@ fn render_modal(
                     <div class="mermaid-preview">{preview}</div>
                 </div>
                 <div class="calendar-modal-actions">
+                    {move || save_error.get().map(|error| {
+                        let message = match error {
+                            MermaidUpdateError::Changed => crate::t!("mermaid-modal-error-changed"),
+                            MermaidUpdateError::Unavailable => crate::t!("mermaid-modal-error-unavailable"),
+                        };
+                        view! { <span class="mermaid-save-conflict" role="alert">{message}</span> }
+                    })}
                     {move || {
                         blocked_reason.get().map(|reason| {
                             let msg = match reason {

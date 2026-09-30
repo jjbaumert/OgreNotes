@@ -1650,6 +1650,43 @@ pub fn update_mermaid_source(
     update_source_attr(&[NodeType::Mermaid], block_id, source, state, dispatch)
 }
 
+/// A modal draft cannot replace a diagram that changed or disappeared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MermaidUpdateError {
+    Changed,
+    Unavailable,
+}
+
+/// Commit a modal draft only against the source that was opened. The caller
+/// reads the current editor state immediately before this synchronous command.
+pub fn update_mermaid_source_if_unchanged(
+    block_id: &str,
+    original_source: &str,
+    source: String,
+    state: &EditorState,
+    dispatch: Option<&dyn Fn(Transaction)>,
+) -> Result<(), MermaidUpdateError> {
+    let (_, node) =
+        find_element_by_block_id(&state.doc, block_id).ok_or(MermaidUpdateError::Unavailable)?;
+    if node.node_type() != Some(NodeType::Mermaid) {
+        return Err(MermaidUpdateError::Unavailable);
+    }
+    if node
+        .attrs()
+        .get("source")
+        .map(String::as_str)
+        .unwrap_or_default()
+        != original_source
+    {
+        return Err(MermaidUpdateError::Changed);
+    }
+    if update_mermaid_source(block_id, source, state, dispatch) {
+        Ok(())
+    } else {
+        Err(MermaidUpdateError::Unavailable)
+    }
+}
+
 /// Write an equation's `source` attribute by block id (the `MathModal`
 /// Save outcome), display or inline. Same contract as
 /// `update_mermaid_source`.

@@ -5291,11 +5291,12 @@ async fn invalid_pasted_mermaid_opens_modal_and_recovers_with_exact_source() {
     let callback_view = send_wrapper::SendWrapper::new(std::rc::Rc::clone(&view));
     let handle = owner.with(|| leptos::mount::mount_to(modal_container.clone(), move || view! {
         <MermaidModal state=state on_outcome=Callback::new(move |outcome| {
-            if let MermaidModalOutcome::Save { block_id, source } = outcome {
+            if let MermaidModalOutcome::Save { block_id, original_source, source } = outcome {
                 let current = callback_view.state();
                 let dispatch = |txn| callback_view.update_state(current.apply(txn));
-                assert!(ogrenotes_frontend::editor::commands::update_mermaid_source(&block_id, source, &current, Some(&dispatch)));
+                return ogrenotes_frontend::editor::commands::update_mermaid_source_if_unchanged(&block_id, &original_source, source, &current, Some(&dispatch));
             }
+            Ok(())
         }) />
     }));
     let event_init = web_sys::MouseEventInit::new();
@@ -5987,4 +5988,161 @@ fn paste_dollar_amounts_stay_text() {
     assert!(view.container().query_selector("span.math-inline").unwrap().is_none(), "{}", inner_html(&view));
     assert!(inner_html(&view).contains("costs $5 and $10"), "{}", inner_html(&view));
     cleanup(&container);
+}
+
+async fn check_mermaid_modal_save_against_current_document(change: &str) {
+    use leptos::prelude::*;
+    use mermaid_modal::{MermaidModal, MermaidModalOutcome, MermaidModalState};
+    use ogrenotes_frontend::editor::model::Fragment;
+    let source = "graph TD\nA --> Original";
+    let mut attrs = HashMap::new();
+    attrs.insert("blockId".into(), "modal-diagram".into());
+    attrs.insert("source".into(), source.into());
+    let model = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![Node::element_with_attrs(
+            NodeType::Mermaid,
+            attrs,
+            Fragment::empty(),
+        )]),
+    );
+    let container = create_container();
+    let (view, _) = create_editor(container.clone(), model);
+    let view = std::rc::Rc::new(view);
+    let owner = Owner::new();
+    let state = owner.with(|| {
+        RwSignal::new(Some(MermaidModalState {
+            block_id: "modal-diagram".into(),
+            source: source.into(),
+        }))
+    });
+    let modal_container = create_container();
+    let callback_view = send_wrapper::SendWrapper::new(std::rc::Rc::clone(&view));
+    let handle = owner.with(|| leptos::mount::mount_to(modal_container.clone(), move || view! {
+        <MermaidModal state=state on_outcome=Callback::new(move |outcome| {
+            match outcome {
+                MermaidModalOutcome::Cancel => Ok(()),
+                MermaidModalOutcome::Save { block_id, original_source, source } => {
+                    let current = callback_view.state();
+                    let dispatch = |txn| callback_view.update_state(current.apply(txn));
+                    ogrenotes_frontend::editor::commands::update_mermaid_source_if_unchanged(
+                        &block_id, &original_source, source, &current, Some(&dispatch),
+                    )
+                }
+            }
+        }) />
+    }));
+    gloo_timers::future::TimeoutFuture::new(0).await;
+    let textarea: web_sys::HtmlTextAreaElement = modal_container
+        .query_selector("textarea")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    textarea.set_value("graph TD\nA --> Draft");
+    textarea
+        .dispatch_event(&web_sys::Event::new("input").unwrap())
+        .unwrap();
+    match change {
+        "changed" => {
+            let current = view.state();
+            let dispatch = |txn| view.update_state(current.apply(txn));
+            assert!(ogrenotes_frontend::editor::commands::update_mermaid_source(
+                "modal-diagram",
+                "graph TD\nA --> Remote".into(),
+                &current,
+                Some(&dispatch),
+            ));
+        }
+        "removed" => view.update_state(EditorState::create_default(Node::empty_doc())),
+        "replaced" => {
+            let mut attrs = HashMap::new();
+            attrs.insert("blockId".into(), "modal-diagram".into());
+            view.update_state(EditorState::create_default(Node::element_with_content(
+                NodeType::Doc,
+                Fragment::from(vec![Node::element_with_attrs(
+                    NodeType::CodeBlock,
+                    attrs,
+                    Fragment::from(vec![Node::text("replacement")]),
+                )]),
+            )));
+        }
+        "unchanged" => {}
+        _ => panic!("unknown test case"),
+    }
+    let before_save = view.state().doc.clone();
+    let save: HtmlElement = modal_container
+        .query_selector("button.btn-primary")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    save.click();
+    gloo_timers::future::TimeoutFuture::new(20).await;
+    if change == "unchanged" {
+        assert_eq!(
+            source_of(view.state().doc.child(0).unwrap()),
+            "graph TD\nA --> Draft"
+        );
+        assert!(
+            modal_container
+                .query_selector(".mermaid-modal")
+                .unwrap()
+                .is_none()
+        );
+    } else {
+        assert_eq!(
+            view.state().doc,
+            before_save,
+            "failed Save must leave current document intact"
+        );
+        assert_eq!(
+            textarea.value(),
+            "graph TD\nA --> Draft",
+            "failed Save keeps the user's draft"
+        );
+        let alert = modal_container
+            .query_selector("[role=alert]")
+            .unwrap()
+            .expect("failure must be visible");
+        assert!(!alert.text_content().unwrap_or_default().is_empty());
+        let cancel: HtmlElement = modal_container
+            .query_selector("button.btn-secondary")
+            .unwrap()
+            .unwrap()
+            .unchecked_into();
+        cancel.click();
+        gloo_timers::future::TimeoutFuture::new(20).await;
+        assert_eq!(view.state().doc, before_save);
+        assert!(
+            modal_container
+                .query_selector(".mermaid-modal")
+                .unwrap()
+                .is_none()
+        );
+    }
+    drop(handle);
+    owner.cleanup();
+    cleanup(&modal_container);
+    cleanup(&container);
+    // Let deferred focus restoration and component cleanup finish between tests.
+    gloo_timers::future::TimeoutFuture::new(0).await;
+}
+
+#[wasm_bindgen_test]
+async fn mermaid_modal_preserves_received_collaborator_edit_and_draft() {
+    check_mermaid_modal_save_against_current_document("changed").await;
+}
+
+#[wasm_bindgen_test]
+async fn mermaid_modal_preserves_draft_after_block_is_removed() {
+    check_mermaid_modal_save_against_current_document("removed").await;
+}
+
+#[wasm_bindgen_test]
+async fn mermaid_modal_does_not_update_a_replacement_block() {
+    check_mermaid_modal_save_against_current_document("replaced").await;
+}
+
+#[wasm_bindgen_test]
+async fn mermaid_modal_saves_an_unchanged_block_and_closes() {
+    check_mermaid_modal_save_against_current_document("unchanged").await;
 }

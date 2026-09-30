@@ -6068,9 +6068,21 @@ tr:hover .folder-row-actions,
   color: var(--color-text-secondary);
   margin: 0;
 }
+.mermaid-modal {
+  min-width: 0;
+  width: min(512px, calc(100vw - 16px));
+  max-width: calc(100vw - 16px);
+}
 .mermaid-modal-body {
-  min-width: 480px;
-  max-width: 92vw;
+  min-width: 0;
+}
+.mermaid-modal .calendar-modal-actions {
+  flex-wrap: wrap;
+}
+.mermaid-save-conflict {
+  flex-basis: 100%;
+  overflow-wrap: anywhere;
+  color: var(--color-text-error);
 }
 .mermaid-modal .mermaid-source {
   min-height: 200px;
