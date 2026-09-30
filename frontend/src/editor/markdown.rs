@@ -63,6 +63,9 @@ pub fn parse_from_markdown(src: &str) -> Slice {
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_GFM);
+    // `$…$` / `$$…$$`: equations, which is also what our markdown export
+    // writes (`$…$` inline, a ```` ```math ```` fence for blocks).
+    opts.insert(Options::ENABLE_MATH);
 
     let parser = Parser::new_ext(&normalized, opts);
     let mut builder = Builder::new();
@@ -154,10 +157,9 @@ impl Builder {
             Event::Rule => self.push_hr(),
             Event::TaskListMarker(b) => self.mark_task(b),
             Event::InlineHtml(s) => self.handle_inline_html(&s),
-            Event::Html(_)
-            | Event::FootnoteReference(_)
-            | Event::InlineMath(_)
-            | Event::DisplayMath(_) => {}
+            Event::InlineMath(s) => self.push_math(&s, false),
+            Event::DisplayMath(s) => self.push_math(&s, true),
+            Event::Html(_) | Event::FootnoteReference(_) => {}
         }
     }
 
@@ -420,6 +422,35 @@ impl Builder {
             // CodeBlocks are user-intentional (e.g., `# ` with no text) and
             // are preserved.
             NodeType::Paragraph if frame.children.is_empty() => None,
+            // A paragraph that is just `$$…$$` is an equation block; display
+            // math amid text is kept as inline equations.
+            NodeType::Paragraph if frame.children.iter().any(|c| c.node_type() == Some(NodeType::MathBlock)) => {
+                if let [only] = frame.children.as_slice() {
+                    return Some(only.clone());
+                }
+                let children = frame
+                    .children
+                    .into_iter()
+                    .map(|c| match c {
+                        Node::Element { node_type: NodeType::MathBlock, attrs, .. } => {
+                            math_node(NodeType::MathInline, attrs.get("source").map(String::as_str).unwrap_or(""))
+                        }
+                        other => other,
+                    })
+                    .collect::<Vec<_>>();
+                Some(Node::element_with_attrs(frame.node_type, frame.attrs, Fragment::from(children)))
+            }
+            // A ```` ```math ```` fence (what our markdown export writes for
+            // an equation block) is an equation block.
+            NodeType::CodeBlock if frame.attrs.get("language").is_some_and(|l| l == "math") => {
+                let source: String = frame.children.iter().map(|n| n.text_content()).collect();
+                let source = source.trim();
+                if source.is_empty() || source.chars().count() > ogrenotes_math::MAX_SOURCE_LEN {
+                    Some(Node::element_with_attrs(frame.node_type, frame.attrs, Fragment::from(frame.children)))
+                } else {
+                    Some(math_node(NodeType::MathBlock, source))
+                }
+            }
             _ => Some(Node::element_with_attrs(
                 frame.node_type,
                 frame.attrs,
@@ -531,6 +562,27 @@ impl Builder {
         }
         self.ensure_textblock();
         self.push_child(Node::text_with_marks(s, vec![Mark::new(MarkType::Code)]));
+    }
+
+    /// An equation, if its source parses (else the text as written, so a
+    /// stray `$` pair doesn't turn prose into an error chip). A display
+    /// equation is provisionally a MathBlock child of its paragraph;
+    /// `finalize_frame` promotes a paragraph holding only that to the block.
+    fn push_math(&mut self, source: &str, display: bool) {
+        let delim = if display { "$$" } else { "$" };
+        if self.code_buffer.is_some() {
+            self.push_text(&format!("{delim}{source}{delim}"));
+            return;
+        }
+        let mode = if display { ogrenotes_math::Display::Block } else { ogrenotes_math::Display::Inline };
+        let source = source.trim();
+        if source.is_empty() || ogrenotes_math::to_mathml(source, mode).is_err() {
+            self.push_text(&format!("{delim}{source}{delim}"));
+            return;
+        }
+        self.ensure_textblock();
+        let node_type = if display { NodeType::MathBlock } else { NodeType::MathInline };
+        self.push_child(math_node(node_type, source));
     }
 
     fn push_hard_break(&mut self) {
@@ -796,6 +848,12 @@ fn find_bare_url(s: &str, from: usize) -> Option<(usize, usize)> {
     None
 }
 
+fn math_node(node_type: NodeType, source: &str) -> Node {
+    let mut attrs = HashMap::new();
+    attrs.insert("source".to_string(), source.to_string());
+    Node::element_with_attrs(node_type, attrs, Fragment::empty())
+}
+
 fn alignment_str(a: Alignment) -> Option<&'static str> {
     match a {
         Alignment::Left => Some("left"),
@@ -865,6 +923,46 @@ mod tests {
     }
 
     // ─── Block constructs ──────────────────────────────────────────
+
+    #[test]
+    fn md_inline_math_becomes_an_equation() {
+        let slice = parse_from_markdown("where $m(t) \\ge 0$ holds");
+        let p = &slice.content.children[0];
+        let Node::Element { content, .. } = p else { panic!() };
+        let m = content.children.iter().find(|n| n.node_type() == Some(NodeType::MathInline)).expect("equation");
+        let Node::Element { attrs, .. } = m else { panic!() };
+        assert_eq!(attrs.get("source").map(String::as_str), Some("m(t) \\ge 0"));
+    }
+
+    #[test]
+    fn md_non_math_dollars_stay_text() {
+        for src in ["costs $5 and $10", "$\\foo{$ nope"] {
+            let slice = parse_from_markdown(src);
+            assert_eq!(slice.content.children[0].text_content(), src, "{src}");
+        }
+    }
+
+    #[test]
+    fn md_display_math_and_math_fence_become_blocks() {
+        for src in ["$$\\frac{a}{b}$$", "```math\n\\frac{a}{b}\n```"] {
+            let slice = parse_from_markdown(src);
+            let b = &slice.content.children[0];
+            assert_eq!(b.node_type(), Some(NodeType::MathBlock), "{src}: {slice:?}");
+            let Node::Element { attrs, .. } = b else { panic!() };
+            assert_eq!(attrs.get("source").map(String::as_str), Some("\\frac{a}{b}"));
+        }
+        // `$$…$$` amid text stays in the paragraph as an inline equation.
+        let slice = parse_from_markdown("see $$x$$ here");
+        let Node::Element { node_type, content, .. } = &slice.content.children[0] else { panic!() };
+        assert_eq!(*node_type, NodeType::Paragraph);
+        assert!(content.children.iter().any(|n| n.node_type() == Some(NodeType::MathInline)));
+    }
+
+    #[test]
+    fn md_math_inside_code_stays_literal() {
+        let slice = parse_from_markdown("`$x$`\n\n```sh\necho $x$\n```");
+        assert!(slice.content.children.iter().all(|n| !format!("{n:?}").contains("Math")), "{slice:?}");
+    }
 
     #[test]
     fn md_plain_paragraph() {

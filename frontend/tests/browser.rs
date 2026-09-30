@@ -4793,3 +4793,33 @@ fn paste_equations_into_the_editor_renders_them() {
     assert!(eq.is_some(), "inline equation rendered: {}", inner_html(&view));
     cleanup(&container);
 }
+
+// Pasted `$…$` text becomes an equation, as it would if typed — from a
+// rich (HTML) paste and a plain-text one alike.
+#[wasm_bindgen_test]
+fn paste_dollar_math_text_becomes_an_equation() {
+    for (plain, html) in [
+        ("test\n$m(t) \\ge 0$", "<h1>test</h1><p>$m(t) \\ge 0$</p>"),
+        ("$m(t) \\ge 0$", ""),
+    ] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+        set_cursor(&view, 1);
+        dispatch_paste_html(&view, &txns, plain, html);
+        let eq = view.container().query_selector("span.math-inline math").unwrap();
+        assert!(eq.is_some(), "{html:?}: equation rendered: {}", inner_html(&view));
+        assert!(!inner_html(&view).contains("$m(t)"), "{html:?}: dollars left as text: {}", inner_html(&view));
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn paste_dollar_amounts_stay_text() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste_html(&view, &txns, "costs $5 and $10", "");
+    assert!(view.container().query_selector("span.math-inline").unwrap().is_none(), "{}", inner_html(&view));
+    assert!(inner_html(&view).contains("costs $5 and $10"), "{}", inner_html(&view));
+    cleanup(&container);
+}

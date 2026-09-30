@@ -11,6 +11,7 @@ pub mod image_bridge;
 pub mod input_rules;
 pub mod keymap;
 pub mod markdown;
+pub mod paste_math;
 pub mod mention_url;
 pub mod model;
 pub mod plugins;
