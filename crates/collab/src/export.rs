@@ -1697,7 +1697,15 @@ fn render_table_markdown<T: ReadTxn>(
             .iter()
             .any(|name| table_span(txn, cell, name).is_some())
     });
+    let irregular_headers = rows.iter().enumerate().any(|(index, row)| {
+        let headers = row
+            .iter()
+            .filter(|cell| cell.tag().as_ref() == NodeType::TableHeader.tag_name())
+            .count();
+        headers > 0 && (index > 0 || headers != row.len())
+    });
     if has_spans
+        || irregular_headers
         || rows.len().saturating_mul(columns) > stored_cells.saturating_mul(4).max(10_000)
         || rows
             .iter()
@@ -3253,6 +3261,36 @@ mod tests {
             assert!(html.contains(&format!("{attr}=\"{value}\"")), "{html}");
             assert!(html.contains("<p>C</p>"), "{html}");
         }
+    }
+
+    #[test]
+    fn markdown_table_preserves_mixed_header_layout() {
+        let doc = doc_with(|txn, f| {
+            let table = f.insert(txn, 0, XmlElementPrelim::empty("table"));
+            for (index, values) in [["Label", "Value"], ["Row label", "42"]].iter().enumerate() {
+                let row = table.insert(txn, index as u32, XmlElementPrelim::empty("table_row"));
+                for (column, value) in values.iter().enumerate() {
+                    let cell = row.insert(
+                        txn,
+                        column as u32,
+                        XmlElementPrelim::empty(if column == 0 {
+                            "table_header"
+                        } else {
+                            "table_cell"
+                        }),
+                    );
+                    insert_text(txn, &cell, value);
+                }
+            }
+        });
+        let md = to_markdown(&doc);
+        let mut html = String::new();
+        pulldown_cmark::html::push_html(
+            &mut html,
+            pulldown_cmark::Parser::new_ext(&md, pulldown_cmark::Options::ENABLE_TABLES),
+        );
+        assert!(html.contains("<th>Row label</th>"), "{html}");
+        assert!(html.contains("<td>Value</td>"), "{html}");
     }
 
     #[test]
