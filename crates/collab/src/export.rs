@@ -1610,8 +1610,15 @@ fn render_table_markdown<T: ReadTxn>(
     }
     // Very uneven tables must not expand compact input into a huge rectangle.
     // HTML is valid Markdown and preserves every stored cell without padding.
+    // Complex code and backslash-pipe combinations also use a complete HTML
+    // block so Markdown syntax cannot reinterpret literal cell content.
     let stored_cells: usize = rows.iter().map(Vec::len).sum();
-    if rows.len().saturating_mul(columns) > stored_cells.saturating_mul(4).max(10_000) {
+    if rows.len().saturating_mul(columns) > stored_cells.saturating_mul(4).max(10_000)
+        || rows
+            .iter()
+            .flatten()
+            .any(|cell| table_cell_needs_html(txn, &XmlOut::Element(cell.clone())))
+    {
         out.push_str("<table>");
         for row in &rows {
             out.push_str("<tr>");
@@ -1631,7 +1638,9 @@ fn render_table_markdown<T: ReadTxn>(
                 out.push('>');
                 for i in 0..cell.len(txn) {
                     if let Some(child) = cell.get(txn, i) {
-                        render_node_html(txn, &child, out);
+                        let mut body = String::new();
+                        render_node_html(txn, &child, &mut body);
+                        out.push_str(&body.replace("\r\n", "\n").replace(['\r', '\n'], "<br>"));
                     }
                 }
                 out.push_str(&format!("</{tag}>"));
@@ -1669,17 +1678,7 @@ fn render_table_markdown<T: ReadTxn>(
             .iter()
             .map(|cell| {
                 let mut body = String::new();
-                if contains_multiline_code(txn, &XmlOut::Element(cell.clone())) {
-                    // Code spans treat <br> literally. Inline HTML keeps the
-                    // code formatting while making breaks real elements.
-                    for i in 0..cell.len(txn) {
-                        if let Some(child) = cell.get(txn, i) {
-                            render_node_html(txn, &child, &mut body);
-                        }
-                    }
-                } else {
-                    render_children_markdown(txn, cell, &mut body, depth);
-                }
+                render_children_markdown(txn, cell, &mut body, depth);
                 // A pipe or newline inside a cell must not create another
                 // column or row. Inline marks are already rendered above.
                 body.trim()
@@ -1696,7 +1695,7 @@ fn render_table_markdown<T: ReadTxn>(
     out.push('\n');
 }
 
-fn contains_multiline_code<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
+fn table_cell_needs_html<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
     let Some(_guard) = DepthGuard::enter() else {
         return false;
     };
@@ -1705,14 +1704,12 @@ fn contains_multiline_code<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
             el.tag().as_ref() == NodeType::CodeBlock.tag_name()
                 || (0..el.len(txn))
                     .filter_map(|i| el.get(txn, i))
-                    .any(|child| contains_multiline_code(txn, &child))
+                    .any(|child| table_cell_needs_html(txn, &child))
         }
         XmlOut::Text(text) => text.diff(txn, |_| ()).iter().any(|chunk| {
-            matches!(&chunk.insert, Out::Any(Any::String(s)) if s.contains(['\r', '\n']))
-                && chunk
-                    .attributes
-                    .as_deref()
-                    .is_some_and(|attrs| has_mark(attrs, "code"))
+            matches!(&chunk.insert, Out::Any(Any::String(s)) if
+                s.contains("\\|") || (s.contains(['\r', '\n', '`', '\\'])
+                    && chunk.attributes.as_deref().is_some_and(|attrs| has_mark(attrs, "code"))))
         }),
         _ => false,
     }
@@ -2823,7 +2820,7 @@ mod tests {
         let txn = doc.transact();
         let fragment = txn.get_xml_fragment("content").unwrap();
         let node = fragment.get(&txn, 0).unwrap();
-        assert!(!contains_multiline_code(&txn, &node));
+        assert!(!table_cell_needs_html(&txn, &node));
     }
 
     #[test]
@@ -2853,6 +2850,77 @@ mod tests {
         let md = to_markdown(&doc);
         assert!(md.contains("text-align:right"), "{md}");
         assert!(!md.contains("color:red"));
+    }
+
+    #[test]
+    fn markdown_table_backslash_before_pipe_keeps_columns_and_text() {
+        let doc = markdown_table_doc(&[&["A", "B"], &["one\\|two", "other"]], true);
+        let md = to_markdown(&doc);
+        let parser = pulldown_cmark::Parser::new_ext(&md, pulldown_cmark::Options::ENABLE_TABLES);
+        let mut html = String::new();
+        pulldown_cmark::html::push_html(&mut html, parser);
+        assert!(
+            html.contains("one\\|two") || html.contains("one\\&#124;two"),
+            "{html}"
+        );
+        assert_eq!(html.matches("<td>").count(), 2, "{html}");
+    }
+
+    #[test]
+    fn markdown_table_multiline_code_does_not_parse_markdown_syntax() {
+        let doc = markdown_table_doc(&[&["Code"], &["one *two*\nnext"]], true);
+        {
+            let mut txn = doc.transact_mut();
+            let f = txn.get_or_insert_xml_fragment("content");
+            let Some(XmlOut::Element(table)) = f.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(row)) = table.get(&txn, 1) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(cell)) = row.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(p)) = cell.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Text(text)) = p.get(&txn, 0) else {
+                panic!()
+            };
+            text.format(
+                &mut txn,
+                0,
+                14,
+                Attrs::from([("code".into(), Any::Bool(true))]),
+            );
+        }
+        let md = to_markdown(&doc);
+        let mut html = String::new();
+        pulldown_cmark::html::push_html(
+            &mut html,
+            pulldown_cmark::Parser::new_ext(&md, pulldown_cmark::Options::ENABLE_TABLES),
+        );
+        assert!(html.contains("<code>one *two*<br>next</code>"), "{html}");
+    }
+
+    #[test]
+    fn markdown_sparse_table_cell_breaks_cannot_inject_table_structure() {
+        let wide = vec!["value"; 300];
+        let injected = ["first\n\n| injected | cols |\n| --- | --- |\n| a | b |\n\nlast"];
+        let mut rows: Vec<&[&str]> = vec![&wide, &injected];
+        rows.extend(std::iter::repeat_n(&["value"][..], 298));
+        let doc = markdown_table_doc(&rows, true);
+        let md = to_markdown(&doc);
+        assert!(md.lines().count() <= 2, "fallback must be one HTML block");
+        let tables = pulldown_cmark::Parser::new_ext(&md, pulldown_cmark::Options::ENABLE_TABLES)
+            .filter(|e| {
+                matches!(
+                    e,
+                    pulldown_cmark::Event::Start(pulldown_cmark::Tag::Table(_))
+                )
+            })
+            .count();
+        assert_eq!(tables, 0, "cell text must not introduce another table");
     }
 
     #[test]
@@ -3202,7 +3270,7 @@ mod tests {
         assert!(md.contains("visible"), "known content should render: {md}");
     }
 
-    // ── Markdown: table falls through to default arm ───────────────
+    // ── Markdown: table cell text ──────────────────────────────────
 
     #[test]
     fn markdown_table_renders_cell_text() {
@@ -3214,7 +3282,7 @@ mod tests {
             insert_text(txn, &p, "Cell content");
         });
         let md = to_markdown(&doc);
-        // Table/TableRow/TableCell hit the _ => default arm, which recurses into children
+        // Table serialization preserves text from its cells.
         assert!(md.contains("Cell content"), "got: {md}");
     }
 
