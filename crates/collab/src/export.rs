@@ -1581,43 +1581,66 @@ fn render_table_markdown<T: ReadTxn>(
 ) {
     let mut rows = Vec::new();
     for i in 0..table.len(txn) {
-        let Some(XmlOut::Element(row)) = table.get(txn, i) else { continue };
-        if row.tag().as_ref() != NodeType::TableRow.tag_name() { continue; }
+        let Some(XmlOut::Element(row)) = table.get(txn, i) else {
+            continue;
+        };
+        if row.tag().as_ref() != NodeType::TableRow.tag_name() {
+            continue;
+        }
         let mut cells = Vec::new();
         for j in 0..row.len(txn) {
-            let Some(XmlOut::Element(cell)) = row.get(txn, j) else { continue };
-            if matches!(NodeType::from_tag(&cell.tag()), Some(NodeType::TableCell | NodeType::TableHeader)) {
+            let Some(XmlOut::Element(cell)) = row.get(txn, j) else {
+                continue;
+            };
+            if matches!(
+                NodeType::from_tag(&cell.tag()),
+                Some(NodeType::TableCell | NodeType::TableHeader)
+            ) {
                 cells.push(cell);
             }
         }
         rows.push(cells);
     }
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-    if columns == 0 { return; }
-    let has_header = rows[0].iter().any(|cell| cell.tag().as_ref() == NodeType::TableHeader.tag_name());
-    let separators: Vec<String> = (0..columns).map(|column| {
-        let align = rows.iter().filter_map(|row| row.get(column))
-            .find_map(|cell| cell.get_attribute(txn, "align"));
-        match align.as_deref() {
-            Some("left") => ":---",
-            Some("center") => ":---:",
-            Some("right") => "---:",
-            _ => "---",
-        }.to_string()
-    }).collect();
+    if columns == 0 {
+        return;
+    }
+    let has_header = rows[0]
+        .iter()
+        .any(|cell| cell.tag().as_ref() == NodeType::TableHeader.tag_name());
+    let separators: Vec<String> = (0..columns)
+        .map(|column| {
+            let align = rows
+                .iter()
+                .filter_map(|row| row.get(column))
+                .find_map(|cell| cell.get_attribute(txn, "align"));
+            match align.as_deref() {
+                Some("left") => ":---",
+                Some("center") => ":---:",
+                Some("right") => "---:",
+                _ => "---",
+            }
+            .to_string()
+        })
+        .collect();
     if !has_header {
         push_md_table_row(out, &[], columns, depth);
         push_md_table_row(out, &separators, columns, depth);
     }
     for (index, row) in rows.iter().enumerate() {
-        let cells: Vec<String> = row.iter().map(|cell| {
-            let mut body = String::new();
-            render_children_markdown(txn, cell, &mut body, depth);
-            // A pipe or newline inside a cell must not create another
-            // column or row. Inline marks are already rendered above.
-            body.trim().replace('|', "\\|").replace("\r\n", "\n")
-                .replace(['\r', '\n'], "<br>")
-        }).collect();
+        let cells: Vec<String> = row
+            .iter()
+            .map(|cell| {
+                let mut body = String::new();
+                render_children_markdown(txn, cell, &mut body, depth);
+                // A pipe or newline inside a cell must not create another
+                // column or row. Inline marks are already rendered above.
+                body.trim()
+                    .replace('|', "\\|")
+                    .replace("\r\n", "\n")
+                    .replace(['\r', '\n'], "<br>")
+            })
+            .collect();
         push_md_table_row(out, &cells, columns, depth);
         if has_header && index == 0 {
             push_md_table_row(out, &separators, columns, depth);
@@ -2580,7 +2603,11 @@ mod tests {
             for (i, values) in rows.iter().enumerate() {
                 let row = table.insert(txn, i as u32, XmlElementPrelim::empty("table_row"));
                 for (j, value) in values.iter().enumerate() {
-                    let tag = if header && i == 0 { "table_header" } else { "table_cell" };
+                    let tag = if header && i == 0 {
+                        "table_header"
+                    } else {
+                        "table_cell"
+                    };
                     let cell = row.insert(txn, j as u32, XmlElementPrelim::empty(tag));
                     let p = cell.insert(txn, 0, XmlElementPrelim::empty("paragraph"));
                     insert_text(txn, &p, value);
@@ -2592,15 +2619,19 @@ mod tests {
     #[test]
     fn markdown_table_pads_rows_without_losing_cells() {
         let doc = markdown_table_doc(&[&["A", "B"], &["1", "2", "3"], &["4"]], true);
-        assert_eq!(to_markdown(&doc),
-            "| A | B |  |\n| --- | --- | --- |\n| 1 | 2 | 3 |\n| 4 |  |  |\n\n");
+        assert_eq!(
+            to_markdown(&doc),
+            "| A | B |  |\n| --- | --- | --- |\n| 1 | 2 | 3 |\n| 4 |  |  |\n\n"
+        );
     }
 
     #[test]
     fn markdown_table_without_headers_keeps_all_data_rows() {
         let doc = markdown_table_doc(&[&["1", "2"], &["3", "4"]], false);
-        assert_eq!(to_markdown(&doc),
-            "|  |  |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n\n");
+        assert_eq!(
+            to_markdown(&doc),
+            "|  |  |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n\n"
+        );
     }
 
     #[test]
@@ -2611,7 +2642,12 @@ mod tests {
         let mut options = pulldown_cmark::Options::empty();
         options.insert(pulldown_cmark::Options::ENABLE_TABLES);
         let cells = pulldown_cmark::Parser::new_ext(&md, options)
-            .filter(|event| matches!(event, pulldown_cmark::Event::Start(pulldown_cmark::Tag::TableCell)))
+            .filter(|event| {
+                matches!(
+                    event,
+                    pulldown_cmark::Event::Start(pulldown_cmark::Tag::TableCell)
+                )
+            })
             .count();
         assert_eq!(cells, 4, "cell pipes must not add columns");
     }
@@ -2622,10 +2658,16 @@ mod tests {
         {
             let mut txn = doc.transact_mut();
             let fragment = txn.get_or_insert_xml_fragment("content");
-            let Some(XmlOut::Element(table)) = fragment.get(&txn, 0) else { panic!() };
-            let Some(XmlOut::Element(row)) = table.get(&txn, 0) else { panic!() };
+            let Some(XmlOut::Element(table)) = fragment.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(row)) = table.get(&txn, 0) else {
+                panic!()
+            };
             for (i, align) in ["left", "center", "right"].iter().enumerate() {
-                let Some(XmlOut::Element(cell)) = row.get(&txn, i as u32) else { panic!() };
+                let Some(XmlOut::Element(cell)) = row.get(&txn, i as u32) else {
+                    panic!()
+                };
                 cell.insert_attribute(&mut txn, "align", *align);
             }
         }
