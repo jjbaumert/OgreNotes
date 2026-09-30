@@ -123,13 +123,9 @@ fn render_comments_markdown(comments: &[ExportComment], out: &mut String) {
 const MAX_EXPORT_DEPTH: usize = 256;
 
 thread_local! {
-    /// Shared recursion counter for all three export traversals
-    /// (`extract_text`, `render_node_html`, `render_node_markdown`). They
-    /// share one MAX_EXPORT_DEPTH budget, which is sound only because no
-    /// traversal calls another mid-traversal — they compose at the top
-    /// level (e.g. `to_html` then `to_markdown`), never nested. If a future
-    /// change nests one inside another, the shared budget could trip at a
-    /// lower effective depth; split this into per-traversal counters then.
+    /// Shared depth budget for export renderers and their recursive scans.
+    /// Markdown tables can invoke HTML rendering inside a cell, so nested
+    /// traversals deliberately count against the same stack-depth budget.
     /// `DepthGuard` always restores on drop (including during panic
     /// unwinding), so the counter is 0 at every top-level entry.
     static EXPORT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1616,7 +1612,33 @@ fn render_table_markdown<T: ReadTxn>(
     // HTML is valid Markdown and preserves every stored cell without padding.
     let stored_cells: usize = rows.iter().map(Vec::len).sum();
     if rows.len().saturating_mul(columns) > stored_cells.saturating_mul(4).max(10_000) {
-        render_node_html(txn, &XmlOut::Element(table.clone()), out);
+        out.push_str("<table>");
+        for row in &rows {
+            out.push_str("<tr>");
+            for cell in row {
+                let tag = if cell.tag().as_ref() == NodeType::TableHeader.tag_name() {
+                    "th"
+                } else {
+                    "td"
+                };
+                out.push_str(&format!("<{tag}"));
+                if let Some(align) = cell
+                    .get_attribute(txn, "align")
+                    .filter(|a| matches!(a.as_str(), "left" | "center" | "right"))
+                {
+                    out.push_str(&format!(" style=\"text-align:{align}\""));
+                }
+                out.push('>');
+                for i in 0..cell.len(txn) {
+                    if let Some(child) = cell.get(txn, i) {
+                        render_node_html(txn, &child, out);
+                    }
+                }
+                out.push_str(&format!("</{tag}>"));
+            }
+            out.push_str("</tr>");
+        }
+        out.push_str("</table>");
         out.push_str("\n\n");
         return;
     }
@@ -1675,6 +1697,9 @@ fn render_table_markdown<T: ReadTxn>(
 }
 
 fn contains_multiline_code<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
+    let Some(_guard) = DepthGuard::enter() else {
+        return false;
+    };
     match node {
         XmlOut::Element(el) => {
             el.tag().as_ref() == NodeType::CodeBlock.tag_name()
@@ -2784,6 +2809,50 @@ mod tests {
         let md = to_markdown(&doc);
         assert!(md.len() < 50_000, "expanded to {} bytes", md.len());
         assert_eq!(md.matches("value").count(), 599);
+    }
+
+    #[test]
+    fn markdown_table_code_scan_respects_export_depth_limit() {
+        let doc = doc_with(|txn, f| {
+            let mut node = f.insert(txn, 0, XmlElementPrelim::empty("table_cell"));
+            for _ in 0..MAX_EXPORT_DEPTH + 1 {
+                node = node.insert(txn, 0, XmlElementPrelim::empty("blockquote"));
+            }
+            node.insert(txn, 0, XmlElementPrelim::empty("code_block"));
+        });
+        let txn = doc.transact();
+        let fragment = txn.get_xml_fragment("content").unwrap();
+        let node = fragment.get(&txn, 0).unwrap();
+        assert!(!contains_multiline_code(&txn, &node));
+    }
+
+    #[test]
+    fn markdown_sparse_table_keeps_validated_cell_alignment() {
+        let wide = vec!["value"; 300];
+        let mut rows: Vec<&[&str]> = vec![&wide];
+        rows.extend(std::iter::repeat_n(&["value"][..], 299));
+        let doc = markdown_table_doc(&rows, true);
+        {
+            let mut txn = doc.transact_mut();
+            let f = txn.get_or_insert_xml_fragment("content");
+            let Some(XmlOut::Element(table)) = f.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(row)) = table.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(cell)) = row.get(&txn, 0) else {
+                panic!()
+            };
+            cell.insert_attribute(&mut txn, "align", "right");
+            let Some(XmlOut::Element(cell)) = row.get(&txn, 1) else {
+                panic!()
+            };
+            cell.insert_attribute(&mut txn, "align", "right; color:red");
+        }
+        let md = to_markdown(&doc);
+        assert!(md.contains("text-align:right"), "{md}");
+        assert!(!md.contains("color:red"));
     }
 
     #[test]
