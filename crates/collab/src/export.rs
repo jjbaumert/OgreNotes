@@ -1692,7 +1692,13 @@ fn render_table_markdown<T: ReadTxn>(
     // Complex code and backslash-pipe combinations also use a complete HTML
     // block so Markdown syntax cannot reinterpret literal cell content.
     let stored_cells: usize = rows.iter().map(Vec::len).sum();
-    if rows.len().saturating_mul(columns) > stored_cells.saturating_mul(4).max(10_000)
+    let has_spans = rows.iter().flatten().any(|cell| {
+        ["colspan", "rowspan"]
+            .iter()
+            .any(|name| table_span(txn, cell, name).is_some())
+    });
+    if has_spans
+        || rows.len().saturating_mul(columns) > stored_cells.saturating_mul(4).max(10_000)
         || rows
             .iter()
             .flatten()
@@ -1708,7 +1714,18 @@ fn render_table_markdown<T: ReadTxn>(
                     "td"
                 };
                 out.push_str(&format!("<{tag}"));
-                if let Some(align) = &column_alignments[column] {
+                for name in ["colspan", "rowspan"] {
+                    if let Some(span) = table_span(txn, cell, name) {
+                        out.push_str(&format!(" {name}=\"{span}\""));
+                    }
+                }
+                let alignment = if has_spans {
+                    cell.get_attribute(txn, "align")
+                        .filter(|a| matches!(a.as_str(), "left" | "center" | "right"))
+                } else {
+                    column_alignments[column].clone()
+                };
+                if let Some(align) = alignment {
                     out.push_str(&format!(" style=\"text-align:{align}\""));
                 }
                 out.push('>');
@@ -1766,6 +1783,17 @@ fn render_table_markdown<T: ReadTxn>(
     out.push('\n');
 }
 
+// Match HTML's span limits; only meaningful spans require the HTML fallback.
+fn table_span<T: ReadTxn>(txn: &T, cell: &yrs::XmlElementRef, name: &str) -> Option<u32> {
+    let value = cell.get_attribute(txn, name)?.trim().parse::<u32>().ok()?;
+    let value = if name == "colspan" {
+        value.clamp(1, 1000)
+    } else {
+        value.min(65534)
+    };
+    (value != 1).then_some(value)
+}
+
 fn table_cell_needs_html<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
     let Some(_guard) = DepthGuard::enter() else {
         return false;
@@ -1790,7 +1818,7 @@ fn table_cell_needs_html<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
             let attrs = chunk.attributes.as_deref();
             let code = attrs.is_some_and(|attrs| has_mark(attrs, "code"));
             let href = attrs.and_then(link_href);
-            value.contains(['\\', '<', '>'])
+            value.contains(['\\', '<', '>', '&'])
                 || (code
                     && (value.contains(['\r', '\n', '`'])
                         || value.trim() != value.as_ref()
@@ -3183,6 +3211,47 @@ mod tests {
             let md = to_markdown(&doc);
             let dom = html5ever::parse_document(RcDom::default(), Default::default()).one(md);
             assert_eq!(pre_text(&dom.document).as_deref(), Some(source));
+        }
+    }
+
+    #[test]
+    fn markdown_table_literal_entities_stay_literal() {
+        let doc = markdown_table_doc(&[&["A"], &["&copy; &amp;"]], true);
+        let md = to_markdown(&doc);
+        let mut html = String::new();
+        pulldown_cmark::html::push_html(
+            &mut html,
+            pulldown_cmark::Parser::new_ext(&md, pulldown_cmark::Options::ENABLE_TABLES),
+        );
+        assert!(html.contains("&amp;copy; &amp;amp;"), "{html}");
+    }
+
+    #[test]
+    fn markdown_table_preserves_cell_spans() {
+        for (attr, value) in [("rowspan", "2"), ("colspan", "2"), ("rowspan", "0")] {
+            let doc = markdown_table_doc(&[&["A", "B"], &["C"]], false);
+            {
+                let mut txn = doc.transact_mut();
+                let f = txn.get_or_insert_xml_fragment("content");
+                let Some(XmlOut::Element(table)) = f.get(&txn, 0) else {
+                    panic!()
+                };
+                let Some(XmlOut::Element(row)) = table.get(&txn, 0) else {
+                    panic!()
+                };
+                let Some(XmlOut::Element(cell)) = row.get(&txn, 0) else {
+                    panic!()
+                };
+                cell.insert_attribute(&mut txn, attr, value);
+            }
+            let md = to_markdown(&doc);
+            let mut html = String::new();
+            pulldown_cmark::html::push_html(
+                &mut html,
+                pulldown_cmark::Parser::new_ext(&md, pulldown_cmark::Options::ENABLE_TABLES),
+            );
+            assert!(html.contains(&format!("{attr}=\"{value}\"")), "{html}");
+            assert!(html.contains("<p>C</p>"), "{html}");
         }
     }
 
