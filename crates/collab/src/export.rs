@@ -458,7 +458,7 @@ pub fn to_docx(doc: &Doc) -> Vec<u8> {
 /// produces the same bytes as before.
 #[cfg(feature = "docx")]
 pub fn to_docx_with_comments(doc: &Doc, comments: &[ExportComment]) -> Vec<u8> {
-    use docx_rs::{Docx, Paragraph, Run};
+    use docx_rs::{BreakType, Docx, Paragraph, Run, RunFonts};
 
     let txn = doc.transact();
     // An empty content fragment is still a valid export target when there
@@ -497,6 +497,19 @@ pub fn to_docx_with_comments(doc: &Doc, comments: &[ExportComment]) -> Vec<u8> {
             NodeType::MathBlock => {
                 let source = el.get_attribute(&txn, "source").unwrap_or_default();
                 docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text(source)));
+            }
+            // No SVG embedding yet: keep the diagram source, monospace,
+            // one line per source line, rather than an empty paragraph.
+            NodeType::Mermaid => {
+                let source = el.get_attribute(&txn, "source").unwrap_or_default();
+                let mut run = Run::new().fonts(RunFonts::new().ascii("Courier New").hi_ansi("Courier New"));
+                for (i, line) in source.lines().enumerate() {
+                    if i > 0 {
+                        run = run.add_break(BreakType::TextWrapping);
+                    }
+                    run = run.add_text(line);
+                }
+                docx = docx.add_paragraph(Paragraph::new().add_run(run));
             }
             // Paragraph and every other block kind (lists, quotes,
             // code, …) flatten to a plain paragraph of their text in
@@ -729,9 +742,12 @@ fn collect_block_text(doc: &Doc) -> Vec<String> {
     let len = fragment.len(&txn);
     for i in 0..len {
         if let Some(XmlOut::Element(el)) = fragment.get(&txn, i) {
-            // Equations are leaves with no text: print their LaTeX
-            // source rather than nothing.
-            if NodeType::from_tag(el.tag().as_ref()) == Some(NodeType::MathBlock) {
+            // Equations and diagrams are leaves with no text: print
+            // their source rather than nothing.
+            if matches!(
+                NodeType::from_tag(el.tag().as_ref()),
+                Some(NodeType::MathBlock | NodeType::Mermaid)
+            ) {
                 out.push(el.get_attribute(&txn, "source").unwrap_or_default());
             } else {
                 out.push(extract_text(&txn, &el));
@@ -3476,6 +3492,35 @@ mod tests {
     #[test]
     fn math_block_pdf_text_is_its_source() {
         assert_eq!(collect_block_text(&doc_with_math("E=mc^2")), vec!["E=mc^2".to_string()]);
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn mermaid_pdf_text_is_its_source() {
+        let doc = doc_with(|txn, frag| {
+            let m = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Mermaid.tag_name()));
+            m.insert_attribute(txn, "source", "graph TD\nA-->B");
+        });
+        assert_eq!(collect_block_text(&doc), vec!["graph TD\nA-->B".to_string()]);
+        // One wrapped line per source line.
+        assert_eq!(wrap_text("graph TD\nA-->B", 90), vec!["graph TD", "A-->B"]);
+    }
+
+    #[cfg(feature = "docx")]
+    #[test]
+    fn mermaid_docx_keeps_the_source() {
+        use std::io::Read;
+        let doc = doc_with(|txn, frag| {
+            let m = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Mermaid.tag_name()));
+            m.insert_attribute(txn, "source", "graph TD\nA-->B");
+        });
+        let bytes = to_docx(&doc);
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut xml = String::new();
+        zip.by_name("word/document.xml").unwrap().read_to_string(&mut xml).unwrap();
+        assert!(xml.contains(">graph TD</w:t>"), "{xml}");
+        assert!(xml.contains(">A--&gt;B</w:t>"), "{xml}");
+        assert!(xml.contains("Courier New"), "{xml}");
     }
 
     #[test]
