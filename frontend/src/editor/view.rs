@@ -842,6 +842,22 @@ impl EditorView {
             // verbatim with the syntax characters still visible.
             let html = clipboard_data.get_data("text/html").unwrap_or_default();
             let text = clipboard_data.get_data("text/plain").unwrap_or_default();
+            // Source pasted within one code block is literal text. Parsing
+            // it as Markdown would collapse newlines and consume HTML tags
+            // such as Mermaid's <br/> labels before the renderer sees them.
+            if !text.is_empty() {
+                if let Some(rp) = super::position::resolve(&state_with_sel.doc, state_with_sel.selection.from()) {
+                    if rp.node_at(rp.depth, &state_with_sel.doc).node_type() == Some(NodeType::CodeBlock)
+                        && state_with_sel.selection.to() <= rp.end(rp.depth, &state_with_sel.doc)
+                    {
+                        let literal = super::clipboard::normalize_line_endings(&text);
+                        if let Ok(txn) = state_with_sel.transaction().insert_text(&literal) {
+                            dispatch_paste(txn);
+                        }
+                        return;
+                    }
+                }
+            }
             super::debug::log("paste", "clipboard", &[
                 ("html_len", &html.len().to_string()),
                 ("html_preview", &html.chars().take(500).collect::<String>()),
@@ -1298,6 +1314,25 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                         pre.set_attribute("data-block-id", bid).ok()?;
                     }
                     apply_block_align(&pre, attrs);
+                    // Legacy/imported Mermaid code blocks keep their editable
+                    // source and model positions, with a rendering-only preview.
+                    if attrs.get("language").is_some_and(|lang| lang == "mermaid") {
+                        let preview = doc.create_element("div").ok()?;
+                        preview.set_attribute("data-sentinel", "").ok()?;
+                        preview.set_attribute("contenteditable", "false").ok()?;
+                        match super::blocks::mermaid::render_cached(&node.text_content()) {
+                            Ok(svg) => {
+                                preview.set_attribute("class", "mermaid-svg").ok()?;
+                                preview.set_inner_html(&svg);
+                            }
+                            Err(message) => {
+                                preview.set_attribute("class", "mermaid-error").ok()?;
+                                preview.set_text_content(Some(&message));
+                            }
+                        }
+                        pre.set_attribute("class", "mermaid-code-block").ok()?;
+                        pre.append_child(&preview).ok()?;
+                    }
                     let code = doc.create_element("code").ok()?;
                     if let Some(lang) = attrs.get("language") {
                         if !lang.is_empty() {
@@ -1901,6 +1936,9 @@ fn find_in_element(
             *pos += text_len;
         } else if child.node_type() == DomNode::ELEMENT_NODE {
             let el = child.dyn_ref::<Element>()?;
+            if is_sentinel(el) {
+                continue;
+            }
             let tag = el.tag_name().to_lowercase();
             let atom_size = read_atom_size(el);
 
@@ -1939,9 +1977,6 @@ fn find_in_element(
                 }
                 *pos += atom_size;
             } else if is_leaf_tag(&tag) {
-                if is_sentinel(el) {
-                    continue; // skip rendering-only <br>
-                }
                 if target == *pos {
                     return Some((element.clone().into(), i as usize));
                 }
@@ -2015,6 +2050,12 @@ fn dom_to_model_walk(
             *pos += char_len(&text);
         } else if child.node_type() == DomNode::ELEMENT_NODE {
             let el = child.dyn_ref::<Element>()?;
+            if is_sentinel(el) {
+                if el.contains(Some(target_node)) {
+                    return Some(*pos);
+                }
+                continue;
+            }
             let tag = el.tag_name().to_lowercase();
             let atom_size = read_atom_size(el);
 
@@ -2041,9 +2082,6 @@ fn dom_to_model_walk(
                 }
                 *pos += atom_size;
             } else if is_leaf_tag(&tag) {
-                if is_sentinel(el) {
-                    continue; // skip rendering-only <br>
-                }
                 if child.is_same_node(Some(target_node)) {
                     return Some(*pos);
                 }
@@ -2067,6 +2105,9 @@ fn dom_node_model_size(node: &DomNode) -> usize {
         char_len(&node.text_content().unwrap_or_default())
     } else if node.node_type() == DomNode::ELEMENT_NODE {
         if let Some(el) = node.dyn_ref::<Element>() {
+            if is_sentinel(el) {
+                return 0;
+            }
             let tag = el.tag_name().to_lowercase();
             let atom_size = read_atom_size(el);
             if is_mark_tag(&tag) && atom_size.is_none() {
@@ -2084,7 +2125,7 @@ fn dom_node_model_size(node: &DomNode) -> usize {
             } else if let Some(atom_size) = atom_size {
                 atom_size
             } else if is_leaf_tag(&tag) {
-                if is_sentinel(el) { 0 } else { 1 }
+                1
             } else {
                 let children = el.child_nodes();
                 let mut size = 2; // open + close
@@ -2124,7 +2165,8 @@ fn is_leaf_tag(tag: &str) -> bool {
     matches!(tag, "hr" | "br" | "img")
 }
 
-/// Check if a DOM element is a sentinel `<br>` (rendering artifact, not a model node).
+/// Rendering-only elements (line-break sentinels and diagram previews)
+/// contribute no model positions, including their entire subtree.
 fn is_sentinel(el: &Element) -> bool {
     el.has_attribute("data-sentinel")
 }

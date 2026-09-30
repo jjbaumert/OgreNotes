@@ -29,7 +29,7 @@ thread_local! {
 /// change — each keystroke, local or a collaborator's — so without this
 /// every diagram in the doc re-parsed and re-laid-out per keystroke on
 /// the main thread. A diagram's output depends only on its source.
-fn render_cached(source: &str) -> Result<String, String> {
+pub(crate) fn render_cached(source: &str) -> Result<String, String> {
     RENDER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(i) = cache.iter().position(|(s, _)| s == source) {

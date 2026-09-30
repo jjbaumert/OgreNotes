@@ -21,6 +21,50 @@ use ogrenotes_frontend::editor::view::EditorView;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
+#[path = "../src/components/code_lang_chip.rs"]
+mod code_lang_chip;
+
+#[wasm_bindgen_test]
+async fn code_language_menu_can_switch_back_to_mermaid() {
+    use code_lang_chip::{CodeLangChip, CodeLangChipState};
+    use leptos::prelude::*;
+
+    let container = create_container();
+    let owner = Owner::new();
+    let state = owner.with(|| RwSignal::new(Some(CodeLangChipState {
+        top: 0.0,
+        right: 0.0,
+        current: "mermaid".into(),
+    })));
+    let handle = owner.with(|| leptos::mount::mount_to(container.clone(), move || {
+        view! {
+            <CodeLangChip state=state on_select=Callback::new(move |tag: String| {
+                state.update(|value| value.as_mut().unwrap().current = tag);
+            }) />
+        }
+    }));
+    gloo_timers::future::TimeoutFuture::new(0).await;
+
+    let select: web_sys::HtmlSelectElement = container.query_selector("select").unwrap().unwrap().unchecked_into();
+    assert_eq!(select.query_selector_all("option[value='mermaid']").unwrap().length(), 1);
+    select.set_value("");
+    select.dispatch_event(&web_sys::Event::new("change").unwrap()).unwrap();
+    gloo_timers::future::TimeoutFuture::new(0).await;
+
+    let select: web_sys::HtmlSelectElement = container.query_selector("select").unwrap().unwrap().unchecked_into();
+    assert_eq!(select.value(), "");
+    assert_eq!(select.query_selector_all("option[value='mermaid']").unwrap().length(), 1,
+        "Mermaid must remain selectable after switching to Plain text");
+    select.set_value("mermaid");
+    select.dispatch_event(&web_sys::Event::new("change").unwrap()).unwrap();
+    gloo_timers::future::TimeoutFuture::new(0).await;
+    assert_eq!(state.get().unwrap().current, "mermaid");
+
+    drop(handle);
+    owner.cleanup();
+    cleanup(&container);
+}
+
 // ─── Test Helpers ──────────────────────────────────────────────
 
 fn document() -> Document {
@@ -4508,6 +4552,91 @@ fn ctrl_click_on_non_link_does_nothing() {
 }
 
 // ─── Markdown paste integration ─────────────────────────────────
+
+const ORBIT_MERMAID: &str = include_str!("fixtures/orbit.mmd");
+
+fn assert_orbit_diagram(view: &EditorView) {
+    let holder = view.container().query_selector(".mermaid-svg svg").unwrap();
+    assert!(holder.is_some(), "expected a rendered diagram, got: {}", normalized_html(view));
+    let text = holder.unwrap().text_content().unwrap_or_default();
+    for label in [
+        "Foundation", "Data and propagation", "Plugins", "Engines", "Binaries",
+        "orbit-geo", "orbit-plugin-loader", "optional",
+    ] {
+        assert!(text.contains(label), "missing {label}: {text}");
+    }
+}
+
+#[wasm_bindgen_test]
+fn existing_mermaid_code_block_renders_orbit_diagram_and_keeps_source_editable() {
+    let container = create_container();
+    let mut attrs = HashMap::new();
+    attrs.insert("language".into(), "mermaid".into());
+    attrs.insert("blockId".into(), "orbit-diagram".into());
+    let block = Node::element_with_attrs(
+        NodeType::CodeBlock, attrs, Fragment::from(vec![Node::text(ORBIT_MERMAID)]),
+    );
+    let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![
+        block,
+        Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text("After diagram")])),
+    ]));
+    let (view, txns) = create_editor(container.clone(), doc);
+    assert_orbit_diagram(&view);
+    assert_eq!(view.container().query_selector("pre > code").unwrap().unwrap().text_content().unwrap(), ORBIT_MERMAID);
+    // SVG labels and shapes must not add cursor positions. Check both
+    // ends of the source and the following paragraph through the real DOM.
+    for pos in [1, 9, ORBIT_MERMAID.chars().count(), ORBIT_MERMAID.chars().count() + 3] {
+        set_cursor(&view, pos);
+        assert_eq!(view.read_dom_selection().unwrap().from(), pos);
+    }
+    set_cursor(&view, 1);
+    dispatch_before_input(view.container(), "insertText", Some("%% edited\n"));
+    apply_all(&view, &txns);
+    assert_eq!(view.state().doc.child(0).unwrap().text_content(), format!("%% edited\n{ORBIT_MERMAID}"));
+    assert_orbit_diagram(&view);
+    assert_eq!(view.state().doc.child(1).unwrap().text_content(), "After diagram");
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn mermaid_code_block_parse_error_keeps_source_editable() {
+    let container = create_container();
+    let mut attrs = HashMap::new();
+    attrs.insert("language".into(), "mermaid".into());
+    let block = Node::element_with_attrs(
+        NodeType::CodeBlock, attrs, Fragment::from(vec![Node::text("not a diagram")]),
+    );
+    let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![block]));
+    let (view, txns) = create_editor(container.clone(), doc);
+    assert!(view.container().query_selector(".mermaid-error").unwrap().is_some());
+    set_selection(&view, 1, "not a diagram".chars().count() + 1);
+    dispatch_paste(&view, &txns, ORBIT_MERMAID);
+    assert_eq!(view.state().doc.child(0).unwrap().text_content(), ORBIT_MERMAID);
+    assert_orbit_diagram(&view);
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn paste_mermaid_markdown_renders_orbit_diagram() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste(&view, &txns, &format!("```mermaid\n{ORBIT_MERMAID}```"));
+    assert_orbit_diagram(&view);
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn paste_mermaid_html_renders_orbit_diagram() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    let escaped = ORBIT_MERMAID.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let html = format!("<pre><code class=\"language-mermaid\">{escaped}</code></pre>");
+    dispatch_paste_html(&view, &txns, ORBIT_MERMAID, &html);
+    assert_orbit_diagram(&view);
+    cleanup(&container);
+}
 
 #[wasm_bindgen_test]
 fn paste_markdown_heading_creates_h1_in_dom() {

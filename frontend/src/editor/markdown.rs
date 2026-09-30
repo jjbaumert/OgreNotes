@@ -440,6 +440,13 @@ impl Builder {
                     .collect::<Vec<_>>();
                 Some(Node::element_with_attrs(frame.node_type, frame.attrs, Fragment::from(children)))
             }
+            NodeType::CodeBlock if frame.attrs.get("language").is_some_and(|l| l == "mermaid") => {
+                let source: String = frame.children.iter().map(|n| n.text_content()).collect();
+                super::clipboard::source_node(NodeType::Mermaid, &source, ogrenotes_mermaid::MAX_SOURCE_LEN)
+                    .or_else(|| Some(Node::element_with_attrs(
+                        frame.node_type, frame.attrs, Fragment::from(frame.children),
+                    )))
+            }
             // A ```` ```math ```` fence (what our markdown export writes for
             // an equation block) is an equation block.
             NodeType::CodeBlock if frame.attrs.get("language").is_some_and(|l| l == "math") => {
@@ -1092,6 +1099,27 @@ mod tests {
         assert_eq!(cb.node_type(), Some(NodeType::CodeBlock));
         assert_eq!(cb.attrs().get("language").map(|s| s.as_str()), Some(""));
         assert_eq!(cb.text_content(), "x\n");
+    }
+
+    #[test]
+    fn md_mermaid_fence_preserves_source_in_a_diagram() {
+        let source = "graph BT\nA[one<br/>two] --> B\n";
+        let slice = parse_from_markdown(&format!("```mermaid\n{source}```"));
+        let node = &slice.content.children[0];
+        assert_eq!(node.node_type(), Some(NodeType::Mermaid));
+        assert_eq!(node.attrs().get("source").map(String::as_str), Some(source));
+        assert_eq!(node.child_count(), 0);
+    }
+
+    #[test]
+    fn md_mermaid_empty_or_oversized_fences_stay_recoverable_code() {
+        for source in [String::new(), "a".repeat(ogrenotes_mermaid::MAX_SOURCE_LEN + 1)] {
+            let slice = parse_from_markdown(&format!("```mermaid\n{source}\n```"));
+            let node = &slice.content.children[0];
+            assert_eq!(node.node_type(), Some(NodeType::CodeBlock));
+            assert_eq!(node.attrs().get("language").map(String::as_str), Some("mermaid"));
+            assert_eq!(node.text_content().trim_end(), source);
+        }
     }
 
     #[test]

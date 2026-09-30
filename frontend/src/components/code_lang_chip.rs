@@ -15,7 +15,7 @@ use ogrenotes_highlight::Language;
 
 /// `Some` → visible at (top, right) within the editor overlay;
 /// `None` → hidden. `current` is the block's raw `language` attr
-/// ("" = plain text; may be an unsupported tag like "mermaid").
+/// ("" = plain text; "mermaid" renders a diagram preview).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeLangChipState {
     pub top: f64,
@@ -34,7 +34,7 @@ pub fn CodeLangChip(
         <Show when=move || state.get().is_some()>
             {move || state.get().map(|s| {
                 let current = s.current.clone();
-                let known = Language::from_tag(&current).is_some();
+                let known = current == "mermaid" || Language::from_tag(&current).is_some();
                 view! {
                     <div
                         class="code-lang-chip"
@@ -49,9 +49,11 @@ pub fn CodeLangChip(
                             <option value="" selected=current.is_empty()>
                                 "Plain text"
                             </option>
-                            // Unsupported tag (e.g. markdown-imported
-                            // "mermaid"): show it, unhighlighted, so the
-                            // user sees what's set rather than a lie.
+                            <option value="mermaid" selected=current == "mermaid">
+                                "Mermaid"
+                            </option>
+                            // Preserve imported tags that have no built-in
+                            // renderer or syntax highlighter.
                             <Show when={
                                 let current = current.clone();
                                 move || !current.is_empty() && !known

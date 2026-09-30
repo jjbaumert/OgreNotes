@@ -440,7 +440,7 @@ fn strip_dollars(text: &str) -> &str {
 /// accept it (non-empty, within `max_len` chars).
 // Pure helpers of the wasm-only paste walker, compiled natively for tests.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn source_node(node_type: NodeType, source: &str, max_len: usize) -> Option<Node> {
+pub(super) fn source_node(node_type: NodeType, source: &str, max_len: usize) -> Option<Node> {
     if source.trim().is_empty() || source.chars().count() > max_len {
         return None;
     }
@@ -554,6 +554,11 @@ fn convert_code_block(child: &web_sys::Node, el: &web_sys::Element) -> Node {
     }
 
     let text = text_source.text_content().unwrap_or_default();
+    if attrs.get("language").is_some_and(|lang| lang == "mermaid") {
+        if let Some(node) = source_node(NodeType::Mermaid, &text, ogrenotes_mermaid::MAX_SOURCE_LEN) {
+            return node;
+        }
+    }
     let content = if text.is_empty() {
         Fragment::empty()
     } else {
