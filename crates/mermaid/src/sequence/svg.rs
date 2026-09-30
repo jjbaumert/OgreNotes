@@ -156,12 +156,16 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
                 r.x,
                 r.x + r.w,
             ));
-            out.push_str(&format!(
-                r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">[{}]</text>"#,
-                r.x + r.w / 2.0,
-                dy - 4.0,
-                escape_xml(label)
-            ));
+            // Below the dashed line, in the section it names (Mermaid-
+            // style); above it, it crowded the previous section's arrow.
+            if !label.is_empty() {
+                out.push_str(&format!(
+                    r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">[{}]</text>"#,
+                    r.x + r.w / 2.0,
+                    dy + 15.0,
+                    escape_xml(label)
+                ));
+            }
         }
     }
 

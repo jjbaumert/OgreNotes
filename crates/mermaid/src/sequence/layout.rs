@@ -21,7 +21,8 @@ pub(crate) const SELF_STUB: f64 = 40.0;
 pub(crate) const NOTE_PAD: f64 = 8.0;
 pub(crate) const FRAME_HEAD: f64 = 26.0;
 pub(crate) const FRAME_BOTTOM_PAD: f64 = 10.0;
-pub(crate) const DIVIDER_H: f64 = 22.0;
+/// Divider line (at +4) plus its label below it.
+pub(crate) const DIVIDER_H: f64 = 26.0;
 pub(crate) const ACT_W: f64 = 10.0;
 pub(crate) const ACT_OFFSET: f64 = 6.0;
 /// Floor for a fragment frame's width. A fragment with no (or a single
@@ -743,6 +744,22 @@ mod tests {
         ] {
             crate::extent::assert_inside(&svg(src));
         }
+    }
+
+    #[test]
+    fn divider_label_sits_below_its_line_clear_of_the_arrows() {
+        let svg = svg("sequenceDiagram\nalt ok\nA->>B: y\nelse other\nNote over A: n\nB->>A: z\nend");
+        let (_, drawn) = crate::extent::scan(&svg);
+        let label = drawn.iter().find(|d| d.text == "[other]").expect("divider label").bbox;
+        let divider = drawn.iter().find(|d| d.tag == "line" && d.bbox.y0 == d.bbox.y1 && d.bbox.x0 < label.x0).unwrap().bbox;
+        assert!(label.y0 >= divider.y0, "label {label:?} above its divider {divider:?}");
+        for d in &drawn {
+            if d.text != "[other]" && d.tag != "line" && d.tag != "rect" {
+                assert!(d.bbox.overlap(&label) == 0.0, "{d:?} overlaps the divider label {label:?}");
+            }
+        }
+        let note = drawn.iter().find(|d| d.tag == "rect" && d.bbox.y0 > divider.y0 && d.bbox.x1 - d.bbox.x0 < 100.0).unwrap();
+        assert!(note.bbox.y0 >= label.y1, "note {:?} overlaps divider label {label:?}", note.bbox);
     }
 
     #[test]
