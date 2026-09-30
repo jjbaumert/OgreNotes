@@ -30,6 +30,17 @@ thread_local! {
 /// every diagram in the doc re-parsed and re-laid-out per keystroke on
 /// the main thread. A diagram's output depends only on its source.
 pub(crate) fn render_cached(source: &str) -> Result<String, String> {
+    if source
+        .chars()
+        .take(ogrenotes_mermaid::MAX_SOURCE_LEN + 1)
+        .count()
+        > ogrenotes_mermaid::MAX_SOURCE_LEN
+    {
+        return Err(format!(
+            "diagram source too large (max {} chars)",
+            ogrenotes_mermaid::MAX_SOURCE_LEN
+        ));
+    }
     RENDER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(i) = cache.iter().position(|(s, _)| s == source) {
@@ -126,6 +137,14 @@ impl LiveAppBlockInsert for MermaidInsert {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_sources_are_not_retained_in_cache() {
+        RENDER_CACHE.with(|c| c.borrow_mut().clear());
+        let source = "x".repeat(ogrenotes_mermaid::MAX_SOURCE_LEN + 1);
+        assert!(render_cached(&source).is_err());
+        RENDER_CACHE.with(|c| assert!(c.borrow().is_empty()));
+    }
 
     #[test]
     fn render_cache_returns_the_same_output_and_stays_bounded() {

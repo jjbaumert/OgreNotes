@@ -846,8 +846,11 @@ impl EditorView {
             // it as Markdown would collapse newlines and consume HTML tags
             // such as Mermaid's <br/> labels before the renderer sees them.
             if !text.is_empty() {
-                if let Some(rp) = super::position::resolve(&state_with_sel.doc, state_with_sel.selection.from()) {
-                    if rp.node_at(rp.depth, &state_with_sel.doc).node_type() == Some(NodeType::CodeBlock)
+                if let Some(rp) =
+                    super::position::resolve(&state_with_sel.doc, state_with_sel.selection.from())
+                {
+                    if rp.node_at(rp.depth, &state_with_sel.doc).node_type()
+                        == Some(NodeType::CodeBlock)
                         && state_with_sel.selection.to() <= rp.end(rp.depth, &state_with_sel.doc)
                     {
                         let literal = super::clipboard::normalize_line_endings(&text);
@@ -1033,6 +1036,7 @@ impl EditorView {
                             | Some(super::model::NodeType::HorizontalRule)
                             | Some(super::model::NodeType::Table)
                             | Some(super::model::NodeType::Image)
+                            | Some(super::model::NodeType::Mermaid)
                     )
                 });
 

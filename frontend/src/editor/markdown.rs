@@ -72,7 +72,8 @@ pub fn parse_from_markdown(src: &str) -> Slice {
     for event in parser {
         builder.handle(event);
     }
-    let children = builder.finish();
+    let mut children = builder.finish();
+    super::clipboard::preserve_mermaid_nesting(&mut children);
     if children.is_empty() {
         return Slice::empty();
     }
@@ -442,10 +443,18 @@ impl Builder {
             }
             NodeType::CodeBlock if frame.attrs.get("language").is_some_and(|l| l == "mermaid") => {
                 let source: String = frame.children.iter().map(|n| n.text_content()).collect();
-                super::clipboard::source_node(NodeType::Mermaid, &source, ogrenotes_mermaid::MAX_SOURCE_LEN)
-                    .or_else(|| Some(Node::element_with_attrs(
-                        frame.node_type, frame.attrs, Fragment::from(frame.children),
-                    )))
+                super::clipboard::source_node(
+                    NodeType::Mermaid,
+                    &source,
+                    ogrenotes_mermaid::MAX_SOURCE_LEN,
+                )
+                .or_else(|| {
+                    Some(Node::element_with_attrs(
+                        frame.node_type,
+                        frame.attrs,
+                        Fragment::from(frame.children),
+                    ))
+                })
             }
             // A ```` ```math ```` fence (what our markdown export writes for
             // an equation block) is an equation block.
@@ -1113,11 +1122,17 @@ mod tests {
 
     #[test]
     fn md_mermaid_empty_or_oversized_fences_stay_recoverable_code() {
-        for source in [String::new(), "a".repeat(ogrenotes_mermaid::MAX_SOURCE_LEN + 1)] {
+        for source in [
+            String::new(),
+            "a".repeat(ogrenotes_mermaid::MAX_SOURCE_LEN + 1),
+        ] {
             let slice = parse_from_markdown(&format!("```mermaid\n{source}\n```"));
             let node = &slice.content.children[0];
             assert_eq!(node.node_type(), Some(NodeType::CodeBlock));
-            assert_eq!(node.attrs().get("language").map(String::as_str), Some("mermaid"));
+            assert_eq!(
+                node.attrs().get("language").map(String::as_str),
+                Some("mermaid")
+            );
             assert_eq!(node.text_content().trim_end(), source);
         }
     }

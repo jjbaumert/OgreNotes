@@ -23,6 +23,11 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 #[path = "../src/components/code_lang_chip.rs"]
 mod code_lang_chip;
+#[path = "../src/components/dom_position.rs"]
+mod dom_position;
+mod editor {
+    pub use ogrenotes_frontend::editor::*;
+}
 
 #[wasm_bindgen_test]
 async fn code_language_menu_can_switch_back_to_mermaid() {
@@ -31,32 +36,60 @@ async fn code_language_menu_can_switch_back_to_mermaid() {
 
     let container = create_container();
     let owner = Owner::new();
-    let state = owner.with(|| RwSignal::new(Some(CodeLangChipState {
-        top: 0.0,
-        right: 0.0,
-        current: "mermaid".into(),
-    })));
-    let handle = owner.with(|| leptos::mount::mount_to(container.clone(), move || {
-        view! {
-            <CodeLangChip state=state on_select=Callback::new(move |tag: String| {
-                state.update(|value| value.as_mut().unwrap().current = tag);
-            }) />
-        }
-    }));
+    let state = owner.with(|| {
+        RwSignal::new(Some(CodeLangChipState {
+            top: 0.0,
+            right: 0.0,
+            current: "mermaid".into(),
+        }))
+    });
+    let handle = owner.with(|| {
+        leptos::mount::mount_to(container.clone(), move || {
+            view! {
+                <CodeLangChip state=state on_select=Callback::new(move |tag: String| {
+                    state.update(|value| value.as_mut().unwrap().current = tag);
+                }) />
+            }
+        })
+    });
     gloo_timers::future::TimeoutFuture::new(0).await;
 
-    let select: web_sys::HtmlSelectElement = container.query_selector("select").unwrap().unwrap().unchecked_into();
-    assert_eq!(select.query_selector_all("option[value='mermaid']").unwrap().length(), 1);
+    let select: web_sys::HtmlSelectElement = container
+        .query_selector("select")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    assert_eq!(
+        select
+            .query_selector_all("option[value='mermaid']")
+            .unwrap()
+            .length(),
+        1
+    );
     select.set_value("");
-    select.dispatch_event(&web_sys::Event::new("change").unwrap()).unwrap();
+    select
+        .dispatch_event(&web_sys::Event::new("change").unwrap())
+        .unwrap();
     gloo_timers::future::TimeoutFuture::new(0).await;
 
-    let select: web_sys::HtmlSelectElement = container.query_selector("select").unwrap().unwrap().unchecked_into();
+    let select: web_sys::HtmlSelectElement = container
+        .query_selector("select")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
     assert_eq!(select.value(), "");
-    assert_eq!(select.query_selector_all("option[value='mermaid']").unwrap().length(), 1,
-        "Mermaid must remain selectable after switching to Plain text");
+    assert_eq!(
+        select
+            .query_selector_all("option[value='mermaid']")
+            .unwrap()
+            .length(),
+        1,
+        "Mermaid must remain selectable after switching to Plain text"
+    );
     select.set_value("mermaid");
-    select.dispatch_event(&web_sys::Event::new("change").unwrap()).unwrap();
+    select
+        .dispatch_event(&web_sys::Event::new("change").unwrap())
+        .unwrap();
     gloo_timers::future::TimeoutFuture::new(0).await;
     assert_eq!(state.get().unwrap().current, "mermaid");
 
@@ -4557,11 +4590,21 @@ const ORBIT_MERMAID: &str = include_str!("fixtures/orbit.mmd");
 
 fn assert_orbit_diagram(view: &EditorView) {
     let holder = view.container().query_selector(".mermaid-svg svg").unwrap();
-    assert!(holder.is_some(), "expected a rendered diagram, got: {}", normalized_html(view));
+    assert!(
+        holder.is_some(),
+        "expected a rendered diagram, got: {}",
+        normalized_html(view)
+    );
     let text = holder.unwrap().text_content().unwrap_or_default();
     for label in [
-        "Foundation", "Data and propagation", "Plugins", "Engines", "Binaries",
-        "orbit-geo", "orbit-plugin-loader", "optional",
+        "Foundation",
+        "Data and propagation",
+        "Plugins",
+        "Engines",
+        "Binaries",
+        "orbit-geo",
+        "orbit-plugin-loader",
+        "optional",
     ] {
         assert!(text.contains(label), "missing {label}: {text}");
     }
@@ -4574,27 +4617,54 @@ fn existing_mermaid_code_block_renders_orbit_diagram_and_keeps_source_editable()
     attrs.insert("language".into(), "mermaid".into());
     attrs.insert("blockId".into(), "orbit-diagram".into());
     let block = Node::element_with_attrs(
-        NodeType::CodeBlock, attrs, Fragment::from(vec![Node::text(ORBIT_MERMAID)]),
+        NodeType::CodeBlock,
+        attrs,
+        Fragment::from(vec![Node::text(ORBIT_MERMAID)]),
     );
-    let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![
-        block,
-        Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text("After diagram")])),
-    ]));
+    let doc = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![
+            block,
+            Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("After diagram")]),
+            ),
+        ]),
+    );
     let (view, txns) = create_editor(container.clone(), doc);
     assert_orbit_diagram(&view);
-    assert_eq!(view.container().query_selector("pre > code").unwrap().unwrap().text_content().unwrap(), ORBIT_MERMAID);
+    assert_eq!(
+        view.container()
+            .query_selector("pre > code")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap(),
+        ORBIT_MERMAID
+    );
     // SVG labels and shapes must not add cursor positions. Check both
     // ends of the source and the following paragraph through the real DOM.
-    for pos in [1, 9, ORBIT_MERMAID.chars().count(), ORBIT_MERMAID.chars().count() + 3] {
+    for pos in [
+        1,
+        9,
+        ORBIT_MERMAID.chars().count(),
+        ORBIT_MERMAID.chars().count() + 3,
+    ] {
         set_cursor(&view, pos);
         assert_eq!(view.read_dom_selection().unwrap().from(), pos);
     }
     set_cursor(&view, 1);
     dispatch_before_input(view.container(), "insertText", Some("%% edited\n"));
     apply_all(&view, &txns);
-    assert_eq!(view.state().doc.child(0).unwrap().text_content(), format!("%% edited\n{ORBIT_MERMAID}"));
+    assert_eq!(
+        view.state().doc.child(0).unwrap().text_content(),
+        format!("%% edited\n{ORBIT_MERMAID}")
+    );
     assert_orbit_diagram(&view);
-    assert_eq!(view.state().doc.child(1).unwrap().text_content(), "After diagram");
+    assert_eq!(
+        view.state().doc.child(1).unwrap().text_content(),
+        "After diagram"
+    );
     cleanup(&container);
 }
 
@@ -4604,14 +4674,24 @@ fn mermaid_code_block_parse_error_keeps_source_editable() {
     let mut attrs = HashMap::new();
     attrs.insert("language".into(), "mermaid".into());
     let block = Node::element_with_attrs(
-        NodeType::CodeBlock, attrs, Fragment::from(vec![Node::text("not a diagram")]),
+        NodeType::CodeBlock,
+        attrs,
+        Fragment::from(vec![Node::text("not a diagram")]),
     );
     let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![block]));
     let (view, txns) = create_editor(container.clone(), doc);
-    assert!(view.container().query_selector(".mermaid-error").unwrap().is_some());
+    assert!(
+        view.container()
+            .query_selector(".mermaid-error")
+            .unwrap()
+            .is_some()
+    );
     set_selection(&view, 1, "not a diagram".chars().count() + 1);
     dispatch_paste(&view, &txns, ORBIT_MERMAID);
-    assert_eq!(view.state().doc.child(0).unwrap().text_content(), ORBIT_MERMAID);
+    assert_eq!(
+        view.state().doc.child(0).unwrap().text_content(),
+        ORBIT_MERMAID
+    );
     assert_orbit_diagram(&view);
     cleanup(&container);
 }
@@ -4623,6 +4703,17 @@ fn paste_mermaid_markdown_renders_orbit_diagram() {
     set_cursor(&view, 1);
     dispatch_paste(&view, &txns, &format!("```mermaid\n{ORBIT_MERMAID}```"));
     assert_orbit_diagram(&view);
+    assert!(view.state().selection.to() <= view.state().doc.content_size());
+    txns.borrow_mut().clear();
+    dispatch_keydown(view.container(), "z", true, false, false);
+    apply_all(&view, &txns);
+    assert_eq!(view.state().doc.text_content(), "");
+    assert!(
+        view.container()
+            .query_selector(".mermaid-svg")
+            .unwrap()
+            .is_none()
+    );
     cleanup(&container);
 }
 
@@ -4631,11 +4722,56 @@ fn paste_mermaid_html_renders_orbit_diagram() {
     let container = create_container();
     let (view, txns) = create_editor(container.clone(), Node::empty_doc());
     set_cursor(&view, 1);
-    let escaped = ORBIT_MERMAID.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let escaped = ORBIT_MERMAID
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
     let html = format!("<pre><code class=\"language-mermaid\">{escaped}</code></pre>");
     dispatch_paste_html(&view, &txns, ORBIT_MERMAID, &html);
     assert_orbit_diagram(&view);
     cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn mermaid_preview_does_not_shift_comment_source_offsets() {
+    let container = create_container();
+    let doc = code_block_doc(ORBIT_MERMAID, "mermaid");
+    let (view, _) = create_editor(container.clone(), doc);
+    let pre = view.container().query_selector("pre").unwrap().unwrap();
+    let (text, offset) = dom_position::find_text_offset_in_element(&pre, 9).unwrap();
+    assert_eq!(text.text_content().unwrap(), ORBIT_MERMAID);
+    assert_eq!(offset, 9);
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn nested_mermaid_pastes_keep_schema_valid() {
+    for html in [
+        "<blockquote><pre><code class=\"language-mermaid\">graph TD\nA --&gt; B</code></pre></blockquote>",
+        "<ul><li><pre><code class=\"language-mermaid\">graph TD\nA --&gt; B</code></pre></li></ul>",
+    ] {
+        let slice = ogrenotes_frontend::editor::clipboard::parse_from_html(html);
+        let doc = Node::element_with_content(NodeType::Doc, slice.content);
+        assert!(
+            ogrenotes_frontend::editor::schema::default_schema()
+                .validate(&doc)
+                .is_ok(),
+            "{doc:?}"
+        );
+    }
+    for md in [
+        "> ```mermaid\n> graph TD\n> A --> B\n> ```",
+        "- ```mermaid\n  graph TD\n  A --> B\n  ```",
+    ] {
+        let slice = ogrenotes_frontend::editor::markdown::parse_from_markdown(md);
+        let doc = Node::element_with_content(NodeType::Doc, slice.content);
+        assert!(
+            ogrenotes_frontend::editor::schema::default_schema()
+                .validate(&doc)
+                .is_ok(),
+            "{doc:?}"
+        );
+    }
 }
 
 #[wasm_bindgen_test]

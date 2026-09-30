@@ -75,6 +75,7 @@ fn parse_from_html_dom(html: &str) -> Slice {
 
     let mut nodes = Vec::new();
     walk_dom_children(&body, &[], &mut nodes, false);
+    preserve_mermaid_nesting(&mut nodes);
 
     if nodes.is_empty() {
         return Slice::empty();
@@ -436,6 +437,35 @@ fn strip_dollars(text: &str) -> &str {
     t.strip_prefix('$').and_then(|r| r.strip_suffix('$')).filter(|r| !r.is_empty()).unwrap_or(t)
 }
 
+/// Keep imported diagrams in the existing schema: restricted containers
+/// retain editable Mermaid CodeBlocks, which still display a preview.
+pub(super) fn preserve_mermaid_nesting(nodes: &mut [Node]) {
+    fn walk(nodes: &mut [Node], parent: NodeType, schema: &super::schema::Schema) {
+        for node in nodes {
+            if node.node_type() == Some(NodeType::Mermaid)
+                && !schema.content_matches(parent, &[node])
+            {
+                if let Node::Element { attrs, .. } = node {
+                    let source = attrs.remove("source").unwrap_or_default();
+                    attrs.insert("language".into(), "mermaid".into());
+                    *node = Node::element_with_attrs(
+                        NodeType::CodeBlock,
+                        attrs.clone(),
+                        Fragment::from(vec![Node::text(&source)]),
+                    );
+                }
+            }
+            if let Node::Element {
+                node_type, content, ..
+            } = node
+            {
+                walk(&mut content.children, *node_type, schema);
+            }
+        }
+    }
+    walk(nodes, NodeType::Doc, &super::schema::default_schema());
+}
+
 /// A leaf node of `node_type` carrying `source`, if the server would
 /// accept it (non-empty, within `max_len` chars).
 // Pure helpers of the wasm-only paste walker, compiled natively for tests.
@@ -555,7 +585,8 @@ fn convert_code_block(child: &web_sys::Node, el: &web_sys::Element) -> Node {
 
     let text = text_source.text_content().unwrap_or_default();
     if attrs.get("language").is_some_and(|lang| lang == "mermaid") {
-        if let Some(node) = source_node(NodeType::Mermaid, &text, ogrenotes_mermaid::MAX_SOURCE_LEN) {
+        if let Some(node) = source_node(NodeType::Mermaid, &text, ogrenotes_mermaid::MAX_SOURCE_LEN)
+        {
             return node;
         }
     }
