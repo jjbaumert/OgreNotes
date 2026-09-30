@@ -1016,11 +1016,6 @@ fn mention_user_id(attrs: &Attrs) -> Option<String> {
     parsed.get("user_id").cloned()
 }
 
-/// Render a formatted `XmlText` chunk-by-chunk into HTML, wrapping each
-/// run in the tags for its marks (#7). A link nests outermost, with
-/// bold / italic / underline / strike / code inside. The href is
-/// scheme-checked (`is_safe_url`) and attribute-escaped — closing the
-/// latent XSS the ticket flagged for when link export landed.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HtmlContext {
     Document,
@@ -1028,6 +1023,11 @@ enum HtmlContext {
     TableCode,
 }
 
+/// Render a formatted `XmlText` chunk-by-chunk into HTML, wrapping each
+/// run in the tags for its marks (#7). A link nests outermost, with
+/// bold / italic / underline / strike / code inside. The href is
+/// scheme-checked (`is_safe_url`) and attribute-escaped — closing the
+/// latent XSS the ticket flagged for when link export landed.
 fn render_text_html<T: ReadTxn>(
     txn: &T,
     text: &yrs::XmlTextRef,
@@ -1339,6 +1339,9 @@ fn render_node_html_with_context<T: ReadTxn>(
             } else {
                 context
             };
+            if cell_mode && node_type == NodeType::CodeBlock {
+                out.push_str("<code>");
+            }
             // Render children. A Slide's Frame children render in
             // z-then-position order rather than tree order, so
             // stacking/overlap in the degraded export matches what the
@@ -1358,6 +1361,9 @@ fn render_node_html_with_context<T: ReadTxn>(
                 }
             }
 
+            if cell_mode && node_type == NodeType::CodeBlock {
+                out.push_str("</code>");
+            }
             out.push_str(&format!("</{html_tag}>"));
         }
         XmlOut::Text(text) => {
@@ -3165,7 +3171,7 @@ mod tests {
             node.children.borrow().iter().find_map(pre_text)
         }
         for language in ["rust", "unknown"] {
-            let source = "let a = 1;\nlet b = 2;";
+            let source = "\nlet a = 1;\nlet b = 2;";
             let doc = doc_with(|txn, f| {
                 let table = f.insert(txn, 0, XmlElementPrelim::empty("table"));
                 let row = table.insert(txn, 0, XmlElementPrelim::empty("table_row"));
