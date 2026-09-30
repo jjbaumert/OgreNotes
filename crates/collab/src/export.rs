@@ -1021,12 +1021,20 @@ fn mention_user_id(attrs: &Attrs) -> Option<String> {
 /// bold / italic / underline / strike / code inside. The href is
 /// scheme-checked (`is_safe_url`) and attribute-escaped — closing the
 /// latent XSS the ticket flagged for when link export landed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HtmlContext {
+    Document,
+    TableCell,
+    TableCode,
+}
+
 fn render_text_html<T: ReadTxn>(
     txn: &T,
     text: &yrs::XmlTextRef,
     out: &mut String,
-    cell_mode: bool,
+    context: HtmlContext,
 ) {
+    let cell_mode = context != HtmlContext::Document;
     for chunk in text.diff(txn, |_| ()) {
         let Out::Any(Any::String(s)) = &chunk.insert else {
             // Non-string embedded values have no text representation; emit
@@ -1069,7 +1077,7 @@ fn render_text_html<T: ReadTxn>(
             }
         }
         out.push_str(&open);
-        out.push_str(&html_escape_text_in_context(s, cell_mode));
+        out.push_str(&html_escape_text_in_context(s, context));
         out.push_str(&close);
     }
 }
@@ -1156,15 +1164,16 @@ fn render_fragment_html<T: ReadTxn>(txn: &T, fragment: &yrs::XmlFragmentRef, out
 }
 
 fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
-    render_node_html_with_context(txn, node, out, false);
+    render_node_html_with_context(txn, node, out, HtmlContext::Document);
 }
 
 fn render_node_html_with_context<T: ReadTxn>(
     txn: &T,
     node: &XmlOut,
     out: &mut String,
-    cell_mode: bool,
+    context: HtmlContext,
 ) {
+    let cell_mode = context != HtmlContext::Document;
     // #7: stop descending past the recursion cap (stack-overflow guard).
     let Some(_depth) = DepthGuard::enter() else {
         return;
@@ -1197,7 +1206,7 @@ fn render_node_html_with_context<T: ReadTxn>(
                     if render_code_block_highlighted(txn, el, &mut code) {
                         // Highlighted markup has fixed attributes; only its
                         // escaped source text contains line breaks.
-                        out.push_str(&code.replace("\r\n", "\n").replace(['\r', '\n'], "<br>"));
+                        out.push_str(&encode_html_line_breaks(&code));
                         return;
                     }
                 } else if render_code_block_highlighted(txn, el, out) {
@@ -1216,7 +1225,7 @@ fn render_node_html_with_context<T: ReadTxn>(
                     let content = el.get_attribute(txn, "content").unwrap_or_default();
                     out.push_str(&format!(
                         "<{html_tag}{attrs}>{}</{html_tag}>",
-                        html_escape_text_in_context(&content, cell_mode),
+                        html_escape_text_in_context(&content, context),
                     ));
                     return;
                 }
@@ -1229,7 +1238,7 @@ fn render_node_html_with_context<T: ReadTxn>(
                     let display = el.get_attribute(txn, "display").unwrap_or_default();
                     out.push_str(&format!(
                         "<{html_tag}{attrs}>{}</{html_tag}>",
-                        html_escape_text_in_context(&display, cell_mode),
+                        html_escape_text_in_context(&display, context),
                     ));
                     return;
                 }
@@ -1244,7 +1253,7 @@ fn render_node_html_with_context<T: ReadTxn>(
                         .unwrap_or(url);
                     out.push_str(&format!(
                         "<{html_tag}{attrs}>{}</{html_tag}>",
-                        html_escape_text_in_context(&title, cell_mode),
+                        html_escape_text_in_context(&title, context),
                     ));
                     return;
                 }
@@ -1272,8 +1281,8 @@ fn render_node_html_with_context<T: ReadTxn>(
                                 .unwrap_or_else(|| "diagram error".to_string());
                             out.push_str(&format!(
                                 "<div class=\"mermaid-error\"><p>{}</p><pre>{}</pre></div>",
-                                html_escape_text_in_context(&msg, cell_mode),
-                                html_escape_text_in_context(&source, cell_mode),
+                                html_escape_text_in_context(&msg, context),
+                                html_escape_text_in_context(&source, context),
                             ));
                         }
                     }
@@ -1293,7 +1302,7 @@ fn render_node_html_with_context<T: ReadTxn>(
                         Err(e) => out.push_str(&format!(
                             "<code class=\"math-error\" title=\"{}\">{}</code>",
                             html_escape_attr_in_context(&e.to_string(), cell_mode),
-                            html_escape_text_in_context(&source, cell_mode),
+                            html_escape_text_in_context(&source, context),
                         )),
                     }
                     return;
@@ -1313,8 +1322,8 @@ fn render_node_html_with_context<T: ReadTxn>(
                         }
                         Err(e) => out.push_str(&format!(
                             "<div class=\"math-error\"><p>{}</p><pre>{}</pre></div>",
-                            html_escape_text_in_context(&e.to_string(), cell_mode),
-                            html_escape_text_in_context(&source, cell_mode),
+                            html_escape_text_in_context(&e.to_string(), context),
+                            html_escape_text_in_context(&source, context),
                         )),
                     }
                     return;
@@ -1325,6 +1334,11 @@ fn render_node_html_with_context<T: ReadTxn>(
 
             out.push_str(&format!("<{html_tag}{attrs}>"));
 
+            let child_context = if cell_mode && node_type == NodeType::CodeBlock {
+                HtmlContext::TableCode
+            } else {
+                context
+            };
             // Render children. A Slide's Frame children render in
             // z-then-position order rather than tree order, so
             // stacking/overlap in the degraded export matches what the
@@ -1332,14 +1346,14 @@ fn render_node_html_with_context<T: ReadTxn>(
             if node_type == NodeType::Slide {
                 for i in slide_child_order(txn, el) {
                     if let Some(child) = el.get(txn, i) {
-                        render_node_html_with_context(txn, &child, out, cell_mode);
+                        render_node_html_with_context(txn, &child, out, child_context);
                     }
                 }
             } else {
                 let len = el.len(txn);
                 for i in 0..len {
                     if let Some(child) = el.get(txn, i) {
-                        render_node_html_with_context(txn, &child, out, cell_mode);
+                        render_node_html_with_context(txn, &child, out, child_context);
                     }
                 }
             }
@@ -1347,7 +1361,7 @@ fn render_node_html_with_context<T: ReadTxn>(
             out.push_str(&format!("</{html_tag}>"));
         }
         XmlOut::Text(text) => {
-            render_text_html(txn, text, out, cell_mode);
+            render_text_html(txn, text, out, context);
         }
         _ => {}
     }
@@ -1650,6 +1664,16 @@ fn render_table_markdown<T: ReadTxn>(
     if columns == 0 {
         return;
     }
+    let mut column_alignments = vec![None; columns];
+    for row in &rows {
+        for (column, cell) in row.iter().enumerate() {
+            if column_alignments[column].is_none() {
+                column_alignments[column] = cell
+                    .get_attribute(txn, "align")
+                    .filter(|a| matches!(a.as_str(), "left" | "center" | "right"));
+            }
+        }
+    }
     // Preserve the preceding block boundary (images emit no trailing newline).
     if !out.is_empty() && !out.ends_with("\n\n") {
         if !out.ends_with('\n') {
@@ -1671,23 +1695,20 @@ fn render_table_markdown<T: ReadTxn>(
         out.push_str("<table>");
         for row in &rows {
             out.push_str("<tr>");
-            for cell in row {
+            for (column, cell) in row.iter().enumerate() {
                 let tag = if cell.tag().as_ref() == NodeType::TableHeader.tag_name() {
                     "th"
                 } else {
                     "td"
                 };
                 out.push_str(&format!("<{tag}"));
-                if let Some(align) = cell
-                    .get_attribute(txn, "align")
-                    .filter(|a| matches!(a.as_str(), "left" | "center" | "right"))
-                {
+                if let Some(align) = &column_alignments[column] {
                     out.push_str(&format!(" style=\"text-align:{align}\""));
                 }
                 out.push('>');
                 for i in 0..cell.len(txn) {
                     if let Some(child) = cell.get(txn, i) {
-                        render_node_html_with_context(txn, &child, out, true);
+                        render_node_html_with_context(txn, &child, out, HtmlContext::TableCell);
                     }
                 }
                 out.push_str(&format!("</{tag}>"));
@@ -1701,12 +1722,9 @@ fn render_table_markdown<T: ReadTxn>(
     let has_header = rows[0]
         .iter()
         .any(|cell| cell.tag().as_ref() == NodeType::TableHeader.tag_name());
-    let separators: Vec<String> = (0..columns)
-        .map(|column| {
-            let align = rows
-                .iter()
-                .filter_map(|row| row.get(column))
-                .find_map(|cell| cell.get_attribute(txn, "align"));
+    let separators: Vec<String> = column_alignments
+        .iter()
+        .map(|align| {
             match align.as_deref() {
                 Some("left") => ":---",
                 Some("center") => ":---:",
@@ -2162,12 +2180,12 @@ fn html_escape_attr_in_context(s: &str, cell_mode: bool) -> String {
     }
 }
 
-fn html_escape_text_in_context(s: &str, cell_mode: bool) -> String {
+fn html_escape_text_in_context(s: &str, context: HtmlContext) -> String {
     let escaped = html_escape(s);
-    if cell_mode {
-        escaped.replace("\r\n", "\n").replace(['\r', '\n'], "<br>")
-    } else {
-        escaped
+    match context {
+        HtmlContext::Document => escaped,
+        HtmlContext::TableCell => escaped.replace("\r\n", "\n").replace(['\r', '\n'], "<br>"),
+        HtmlContext::TableCode => encode_html_line_breaks(&escaped),
     }
 }
 
@@ -3117,6 +3135,75 @@ mod tests {
         }
         let md = to_markdown(&doc);
         assert!(md.contains("href=\"https://example.com/a&#10;b\""), "{md}");
+    }
+
+    #[test]
+    fn markdown_table_code_block_html_text_preserves_source_newlines() {
+        use html5ever::tendril::TendrilSink;
+        use markup5ever_rcdom::{Handle, NodeData, RcDom};
+        fn text(node: &Handle) -> String {
+            let mut value = match &node.data {
+                NodeData::Text { contents } => contents.borrow().to_string(),
+                _ => String::new(),
+            };
+            for child in node.children.borrow().iter() {
+                value.push_str(&text(child));
+            }
+            value
+        }
+        fn pre_text(node: &Handle) -> Option<String> {
+            if matches!(&node.data, NodeData::Element { name, .. } if name.local.as_ref() == "pre")
+            {
+                return Some(text(node));
+            }
+            node.children.borrow().iter().find_map(pre_text)
+        }
+        for language in ["rust", "unknown"] {
+            let source = "let a = 1;\nlet b = 2;";
+            let doc = doc_with(|txn, f| {
+                let table = f.insert(txn, 0, XmlElementPrelim::empty("table"));
+                let row = table.insert(txn, 0, XmlElementPrelim::empty("table_row"));
+                let cell = row.insert(txn, 0, XmlElementPrelim::empty("table_cell"));
+                let code = cell.insert(txn, 0, XmlElementPrelim::empty("code_block"));
+                code.insert_attribute(txn, "language", language);
+                insert_text(txn, &code, source);
+            });
+            let md = to_markdown(&doc);
+            let dom = html5ever::parse_document(RcDom::default(), Default::default()).one(md);
+            assert_eq!(pre_text(&dom.document).as_deref(), Some(source));
+        }
+    }
+
+    #[test]
+    fn markdown_table_html_fallback_uses_same_column_alignment() {
+        for value in ["one", "one\\literal"] {
+            let doc = markdown_table_doc(&[&["A"], &[value]], true);
+            {
+                let mut txn = doc.transact_mut();
+                let f = txn.get_or_insert_xml_fragment("content");
+                let Some(XmlOut::Element(table)) = f.get(&txn, 0) else {
+                    panic!()
+                };
+                let Some(XmlOut::Element(row)) = table.get(&txn, 0) else {
+                    panic!()
+                };
+                let Some(XmlOut::Element(cell)) = row.get(&txn, 0) else {
+                    panic!()
+                };
+                cell.insert_attribute(&mut txn, "align", "right");
+            }
+            let md = to_markdown(&doc);
+            let mut html = String::new();
+            pulldown_cmark::html::push_html(
+                &mut html,
+                pulldown_cmark::Parser::new_ext(&md, pulldown_cmark::Options::ENABLE_TABLES),
+            );
+            assert_eq!(
+                html.replace(' ', "").matches("text-align:right").count(),
+                2,
+                "{html}"
+            );
+        }
     }
 
     #[test]
