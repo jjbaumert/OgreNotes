@@ -901,33 +901,30 @@ impl EditorView {
             // Source pasted within one code block is literal text. Parsing
             // it as Markdown would collapse newlines and consume HTML tags
             // such as Mermaid's <br/> labels before the renderer sees them.
-            if !text.is_empty() || !html.is_empty() {
-                if let Some(rp) =
+            if (!text.is_empty() || !html.is_empty())
+                && let Some(rp) =
                     super::position::resolve(&state_with_sel.doc, state_with_sel.selection.from())
+                && rp.node_at(rp.depth, &state_with_sel.doc).node_type()
+                    == Some(NodeType::CodeBlock)
+                && state_with_sel.selection.to() <= rp.end(rp.depth, &state_with_sel.doc)
+            {
+                let source = if !text.is_empty() {
+                    Some(text.clone())
+                } else {
+                    super::clipboard::literal_text_from_html(&html)
+                };
+                let Some(source) = source else {
+                    return;
+                };
+                let literal = super::clipboard::normalize_line_endings(&source);
+                if let Ok(txn) = state_with_sel
+                    .transaction()
+                    .set_stored_marks(Some(Vec::new()))
+                    .insert_text(&literal)
                 {
-                    if rp.node_at(rp.depth, &state_with_sel.doc).node_type()
-                        == Some(NodeType::CodeBlock)
-                        && state_with_sel.selection.to() <= rp.end(rp.depth, &state_with_sel.doc)
-                    {
-                        let source = if !text.is_empty() {
-                            Some(text.clone())
-                        } else {
-                            super::clipboard::literal_text_from_html(&html)
-                        };
-                        let Some(source) = source else {
-                            return;
-                        };
-                        let literal = super::clipboard::normalize_line_endings(&source);
-                        if let Ok(txn) = state_with_sel
-                            .transaction()
-                            .set_stored_marks(Some(Vec::new()))
-                            .insert_text(&literal)
-                        {
-                            dispatch_paste(txn);
-                        }
-                        return;
-                    }
+                    dispatch_paste(txn);
                 }
+                return;
             }
             super::debug::log("paste", "clipboard", &[
                 ("html_len", &html.len().to_string()),
@@ -994,10 +991,10 @@ impl EditorView {
                 let plain_pre_wrapper = html_slice.content.children.len() == 1
                     && html_slice.content.children[0].node_type()
                         == Some(super::model::NodeType::CodeBlock)
-                    && !html_slice.content.children[0]
+                    && html_slice.content.children[0]
                         .attrs()
                         .get("language")
-                        .is_some_and(|language| !language.is_empty())
+                        .is_none_or(|language| language.is_empty())
                     && !has_code_element;
                 let trivial = super::markdown::is_trivial_slice(&html_slice);
                 if !text.is_empty() && (trivial || plain_pre_wrapper) {
