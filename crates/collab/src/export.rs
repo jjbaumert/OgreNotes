@@ -1701,14 +1701,19 @@ fn table_cell_needs_html<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
     };
     match node {
         XmlOut::Element(el) => {
-            el.tag().as_ref() == NodeType::CodeBlock.tag_name()
-                || (0..el.len(txn))
-                    .filter_map(|i| el.get(txn, i))
-                    .any(|child| table_cell_needs_html(txn, &child))
+            NodeType::from_tag(&el.tag()).is_some_and(|kind| {
+                kind.is_block()
+                    && !matches!(
+                        kind,
+                        NodeType::TableCell | NodeType::TableHeader | NodeType::Paragraph
+                    )
+            }) || (0..el.len(txn))
+                .filter_map(|i| el.get(txn, i))
+                .any(|child| table_cell_needs_html(txn, &child))
         }
         XmlOut::Text(text) => text.diff(txn, |_| ()).iter().any(|chunk| {
             matches!(&chunk.insert, Out::Any(Any::String(s)) if
-                s.contains("\\|") || (s.contains(['\r', '\n', '`', '\\'])
+                s.contains('\\') || (s.contains(['\r', '\n', '`', '\\'])
                     && chunk.attributes.as_deref().is_some_and(|attrs| has_mark(attrs, "code"))))
         }),
         _ => false,
@@ -2813,7 +2818,7 @@ mod tests {
         let doc = doc_with(|txn, f| {
             let mut node = f.insert(txn, 0, XmlElementPrelim::empty("table_cell"));
             for _ in 0..MAX_EXPORT_DEPTH + 1 {
-                node = node.insert(txn, 0, XmlElementPrelim::empty("blockquote"));
+                node = node.insert(txn, 0, XmlElementPrelim::empty("paragraph"));
             }
             node.insert(txn, 0, XmlElementPrelim::empty("code_block"));
         });
@@ -2921,6 +2926,59 @@ mod tests {
             })
             .count();
         assert_eq!(tables, 0, "cell text must not introduce another table");
+    }
+
+    #[test]
+    fn markdown_table_backslash_before_break_remains_literal() {
+        let doc = markdown_table_doc(&[&["A"], &["one\\\nnext"]], true);
+        let md = to_markdown(&doc);
+        let mut html = String::new();
+        pulldown_cmark::html::push_html(
+            &mut html,
+            pulldown_cmark::Parser::new_ext(&md, pulldown_cmark::Options::ENABLE_TABLES),
+        );
+        assert!(html.contains("one\\<br>next"), "{html}");
+    }
+
+    #[test]
+    fn markdown_table_preserves_supported_cell_blocks() {
+        for block in [
+            NodeType::Heading,
+            NodeType::BulletList,
+            NodeType::OrderedList,
+            NodeType::Blockquote,
+        ] {
+            let doc = doc_with(|txn, f| {
+                let table = f.insert(txn, 0, XmlElementPrelim::empty("table"));
+                let row = table.insert(txn, 0, XmlElementPrelim::empty("table_row"));
+                let cell = row.insert(txn, 0, XmlElementPrelim::empty("table_cell"));
+                let node = cell.insert(txn, 0, XmlElementPrelim::empty(block.tag_name()));
+                if matches!(block, NodeType::BulletList | NodeType::OrderedList) {
+                    let item = node.insert(txn, 0, XmlElementPrelim::empty("list_item"));
+                    let p = item.insert(txn, 0, XmlElementPrelim::empty("paragraph"));
+                    insert_text(txn, &p, "Content");
+                } else if block == NodeType::Blockquote {
+                    let p = node.insert(txn, 0, XmlElementPrelim::empty("paragraph"));
+                    insert_text(txn, &p, "Content");
+                } else {
+                    node.insert_attribute(txn, "level", "2");
+                    insert_text(txn, &node, "Content");
+                }
+            });
+            let md = to_markdown(&doc);
+            let mut html = String::new();
+            pulldown_cmark::html::push_html(
+                &mut html,
+                pulldown_cmark::Parser::new_ext(&md, pulldown_cmark::Options::ENABLE_TABLES),
+            );
+            let tag = match block {
+                NodeType::Heading => "h2",
+                NodeType::BulletList => "ul",
+                NodeType::OrderedList => "ol",
+                _ => "blockquote",
+            };
+            assert!(html.contains(&format!("<{tag}>")), "{html}");
+        }
     }
 
     #[test]
