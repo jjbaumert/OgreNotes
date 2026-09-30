@@ -126,9 +126,9 @@ pub(crate) fn scan(svg: &str) -> (Box2, Vec<Drawn>) {
                 let b = text_box(tag, inner);
                 let text = b.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
                 i = close;
-                b.map(|(bb, _)| {
+                if let Some((bb, _)) = b {
                     out.push(Drawn { tag: "text".into(), text, bbox: bb.shift(dx, dy) });
-                });
+                }
                 None
             }
             _ => None,
