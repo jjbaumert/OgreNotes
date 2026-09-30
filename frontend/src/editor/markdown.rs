@@ -73,7 +73,7 @@ pub fn parse_from_markdown(src: &str) -> Slice {
         builder.handle(event);
     }
     let mut children = builder.finish();
-    super::clipboard::preserve_mermaid_nesting(&mut children);
+    super::clipboard::preserve_mermaid_nesting(&mut children, NodeType::Doc);
     if children.is_empty() {
         return Slice::empty();
     }

@@ -4775,6 +4775,141 @@ fn nested_mermaid_pastes_keep_schema_valid() {
 }
 
 #[wasm_bindgen_test]
+fn standalone_mermaid_paste_respects_destination_schema() {
+    for parent in [
+        NodeType::ListItem,
+        NodeType::Blockquote,
+        NodeType::TableCell,
+    ] {
+        let p = Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("before")]),
+        );
+        let child = Node::element_with_content(parent, Fragment::from(vec![p]));
+        let child = match parent {
+            NodeType::ListItem => {
+                Node::element_with_content(NodeType::BulletList, Fragment::from(vec![child]))
+            }
+            NodeType::TableCell => Node::element_with_content(
+                NodeType::Table,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::TableRow,
+                    Fragment::from(vec![child]),
+                )]),
+            ),
+            _ => child,
+        };
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![child]));
+        let pos = (0..doc.content_size())
+            .find_map(|pos| {
+                ogrenotes_frontend::editor::state::find_block_at(&doc, pos)
+                    .filter(|b| b.node_type == NodeType::Paragraph)
+                    .map(|b| b.content_start)
+            })
+            .unwrap();
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), doc);
+        set_cursor(&view, pos);
+        dispatch_paste(&view, &txns, "```mermaid\ngraph TD\nA --> B\n```");
+        assert!(
+            ogrenotes_frontend::editor::schema::default_schema()
+                .validate(&view.state().doc)
+                .is_ok(),
+            "{:?}",
+            view.state().doc
+        );
+        assert!(
+            view.container()
+                .query_selector(".mermaid-svg svg")
+                .unwrap()
+                .is_some()
+        );
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn pasted_mermaid_copy_and_cut_preserve_plain_text_source() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste(&view, &txns, &format!("```mermaid\n{ORBIT_MERMAID}```"));
+    for kind in ["copy", "cut"] {
+        set_selection(&view, 0, view.state().doc.content_size());
+        let dt = web_sys::DataTransfer::new().unwrap();
+        let init = web_sys::ClipboardEventInit::new();
+        init.set_clipboard_data(Some(&dt));
+        init.set_bubbles(true);
+        init.set_cancelable(true);
+        let event = web_sys::ClipboardEvent::new_with_event_init_dict(kind, &init).unwrap();
+        let desc = js_sys::Object::new();
+        js_sys::Reflect::set(&desc, &"value".into(), &dt).unwrap();
+        js_sys::Object::define_property(&event, &"clipboardData".into(), &desc);
+        view.container().dispatch_event(&event).unwrap();
+        assert_eq!(
+            dt.get_data("text/plain").unwrap().trim(),
+            ORBIT_MERMAID.trim()
+        );
+        apply_all(&view, &txns);
+    }
+    assert!(
+        view.container()
+            .query_selector(".mermaid-svg")
+            .unwrap()
+            .is_none()
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn mermaid_source_scroll_survives_editing_following_paragraph() {
+    let doc = web_sys::window().unwrap().document().unwrap();
+    let style = doc.create_element("style").unwrap();
+    style.set_text_content(Some(".mermaid-code-block > code {display:block;max-height:100px;overflow:auto;white-space:pre;}"));
+    doc.body().unwrap().append_child(&style).unwrap();
+    let mut attrs = HashMap::new();
+    attrs.insert("language".into(), "mermaid".into());
+    attrs.insert("blockId".into(), "scroll-diagram".into());
+    let model = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![
+            Node::element_with_attrs(
+                NodeType::CodeBlock,
+                attrs,
+                Fragment::from(vec![Node::text(ORBIT_MERMAID)]),
+            ),
+            Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("after")]),
+            ),
+        ]),
+    );
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), model);
+    let code: HtmlElement = view
+        .container()
+        .query_selector("pre > code")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    code.set_scroll_top(200);
+    let scroll = code.scroll_top();
+    assert!(scroll > 0);
+    set_cursor(&view, ORBIT_MERMAID.chars().count() + 3);
+    dispatch_before_input(view.container(), "insertText", Some("x"));
+    apply_all(&view, &txns);
+    let code: HtmlElement = view
+        .container()
+        .query_selector("pre > code")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    assert_eq!(code.scroll_top(), scroll);
+    style.remove();
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
 fn paste_markdown_heading_creates_h1_in_dom() {
     let container = create_container();
     let (view, txns) = create_editor(container.clone(), Node::empty_doc());

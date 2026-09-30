@@ -75,7 +75,7 @@ fn parse_from_html_dom(html: &str) -> Slice {
 
     let mut nodes = Vec::new();
     walk_dom_children(&body, &[], &mut nodes, false);
-    preserve_mermaid_nesting(&mut nodes);
+    preserve_mermaid_nesting(&mut nodes, NodeType::Doc);
 
     if nodes.is_empty() {
         return Slice::empty();
@@ -439,7 +439,7 @@ fn strip_dollars(text: &str) -> &str {
 
 /// Keep imported diagrams in the existing schema: restricted containers
 /// retain editable Mermaid CodeBlocks, which still display a preview.
-pub(super) fn preserve_mermaid_nesting(nodes: &mut [Node]) {
+pub(super) fn preserve_mermaid_nesting(nodes: &mut [Node], parent: NodeType) {
     fn walk(nodes: &mut [Node], parent: NodeType, schema: &super::schema::Schema) {
         for node in nodes {
             if node.node_type() == Some(NodeType::Mermaid)
@@ -463,7 +463,7 @@ pub(super) fn preserve_mermaid_nesting(nodes: &mut [Node]) {
             }
         }
     }
-    walk(nodes, NodeType::Doc, &super::schema::default_schema());
+    walk(nodes, parent, &super::schema::default_schema());
 }
 
 /// A leaf node of `node_type` carrying `source`, if the server would
@@ -1539,7 +1539,19 @@ fn element_tags(
 fn collect_text(node: &Node, out: &mut String) {
     match node {
         Node::Text { text, .. } => out.push_str(text),
-        Node::Element { content, node_type, .. } => {
+        Node::Element {
+            content,
+            node_type,
+            attrs,
+            ..
+        } => {
+            if *node_type == NodeType::Mermaid {
+                if let Some(source) = attrs.get("source") {
+                    out.push_str(source);
+                    out.push('\n');
+                }
+                return;
+            }
             if *node_type == NodeType::HardBreak {
                 out.push('\n');
                 return;

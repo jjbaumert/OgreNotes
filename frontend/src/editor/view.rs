@@ -10,6 +10,19 @@ use super::model::{char_len, Mark, MarkType, Node, NodeType};
 use super::selection::Selection;
 use super::state::{EditorState, Transaction};
 
+fn mermaid_source_panes(container: &HtmlElement) -> Vec<(String, HtmlElement)> {
+    let Ok(nodes) = container.query_selector_all("pre.mermaid-code-block > code") else {
+        return Vec::new();
+    };
+    (0..nodes.length())
+        .filter_map(|i| {
+            let code = nodes.item(i)?.dyn_into::<HtmlElement>().ok()?;
+            let id = code.parent_element()?.get_attribute("data-block-id")?;
+            Some((id, code))
+        })
+        .collect()
+}
+
 /// The editor view: bridges the document model and the browser DOM.
 /// Owns the contenteditable element, renders the model, handles input.
 pub struct EditorView {
@@ -155,6 +168,11 @@ impl EditorView {
 
         let state = self.state.borrow();
 
+        let scroll_positions: std::collections::HashMap<_, _> =
+            mermaid_source_panes(&self.container)
+                .into_iter()
+                .map(|(id, code)| (id, (code.scroll_top(), code.scroll_left())))
+                .collect();
         self.container.set_inner_html("");
 
         if let Node::Element { content, .. } = &state.doc {
@@ -167,6 +185,12 @@ impl EditorView {
             }
         }
 
+        for (id, code) in mermaid_source_panes(&self.container) {
+            if let Some((top, left)) = scroll_positions.get(&id) {
+                code.set_scroll_top(*top);
+                code.set_scroll_left(*left);
+            }
+        }
         self.sync_selection_to_dom(&state.selection);
     }
 
