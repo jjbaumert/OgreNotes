@@ -42,6 +42,8 @@ pub(crate) mod class;
 pub(crate) mod er;
 #[cfg(test)]
 mod props;
+#[cfg(test)]
+mod extent;
 
 /// Max diagram source length (chars). Shared cap: the single source of
 /// truth for both the `crates/collab` write-gate validator
@@ -822,10 +824,13 @@ mod prop_tests {
             let out = render(&src);
             prop_assert!(out.error.is_none(), "unexpected error: {:?}", out.error);
             let svg = out.svg.expect("well-formed pie must render");
+            // A repeated label keeps its first value (mermaid.js parity).
+            let distinct: std::collections::HashSet<&str> =
+                slices.iter().map(|(l, _)| l.as_str()).collect();
             prop_assert_eq!(
                 svg.matches("<text x=\"463\"").count(),
-                slices.len(),
-                "one legend row per slice"
+                distinct.len(),
+                "one legend row per distinct label"
             );
             // Every `<` in the output must open a tag the renderer itself
             // emits; any other `<` is an unescaped label character.

@@ -65,17 +65,17 @@ pub(crate) fn parse(source: &str) -> Result<Pie, ParseError> {
             });
         };
         let label = label_part.trim().trim_matches('"').to_string();
-        let value: f64 = value_part.trim().parse().map_err(|_| ParseError {
-            message: format!("`{}` is not a number", value_part.trim()),
+        let value = parse_value(value_part.trim()).ok_or_else(|| ParseError {
+            message: format!(
+                "`{}` is not a non-negative decimal number (like 42 or 4.2)",
+                value_part.trim()
+            ),
             line: Some(line_no),
         })?;
-        if value < 0.0 || !value.is_finite() {
-            return Err(ParseError {
-                message: format!("value must be a non-negative number, got {value}"),
-                line: Some(line_no),
-            });
+        // mermaid.js keeps the first value for a repeated label.
+        if !slices.iter().any(|(l, _)| *l == label) {
+            slices.push((label, value));
         }
-        slices.push((label, value));
     }
 
     if !seen_header {
@@ -91,6 +91,19 @@ pub(crate) fn parse(source: &str) -> Result<Pie, ParseError> {
         });
     }
     Ok(Pie { title, show_data, slices })
+}
+
+/// mermaid.js's pie number grammar: digits with an optional fraction
+/// (`42`, `4.2`, `.5`). No sign, exponent, `inf` or `NaN`.
+fn parse_value(s: &str) -> Option<f64> {
+    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+    let digits = |p: &str| p.bytes().all(|b| b.is_ascii_digit());
+    let well_formed = digits(int) && digits(frac) && (!int.is_empty() || !frac.is_empty())
+        && !(s.contains('.') && frac.is_empty());
+    if !well_formed {
+        return None;
+    }
+    s.parse::<f64>().ok().filter(|v| v.is_finite())
 }
 
 /// Mermaid's default-theme pie section palette (`pie1`..`pie12`), in order.
@@ -117,6 +130,7 @@ const R: f64 = SIZE / 2.0 - MARGIN; // 185
 const TEXT_POS: f64 = 0.75; // pie.textPosition: label radius = R * 0.75
 const LEGEND_H: f64 = 22.0; // legendRectSize(18) + legendSpacing(4)
 const LEGEND_X: f64 = CX + 12.0 * 18.0; // horizontal = 12 * legendRectSize = 216
+const LEGEND_FONT_PX: f64 = 17.0;
 
 /// Render the pie as a self-contained SVG string, matching mermaid.js@11's
 /// `pieRenderer` constants: 450×450 viewport, radius 185, 2px black slice +
@@ -128,8 +142,24 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
     let shown = |v: f64| total > 0.0 && v >= total * 0.01;
     let shown_total: f64 = pie.slices.iter().map(|&(_, v)| v).filter(|&v| shown(v)).sum();
     let n = pie.slices.len();
+    let legend_texts: Vec<String> = pie
+        .slices
+        .iter()
+        .map(|(label, value)| if pie.show_data { format!("{label} ({})", trim_num(*value)) } else { label.clone() })
+        .collect();
+    // mermaid.js widens the viewport by the longest legend entry:
+    // pieWidth + MARGIN + legendRectSize + legendSpacing + longest.
+    let longest = legend_texts
+        .iter()
+        .map(|t| crate::measure::text_size(t).0 * LEGEND_FONT_PX / crate::measure::FONT_PX)
+        .fold(0.0, f64::max);
+    let width = (SIZE + MARGIN + LEGEND_H + longest).ceil();
+    // A legend taller than the pie grows the viewport both ways around
+    // the pie center (the legend is centered on it).
+    let spill = (LEGEND_H * n as f64 / 2.0 + 10.0 - CY).max(0.0).ceil();
+    let (top, height) = (0.0 - spill, SIZE + 2.0 * spill); // never `-0`
     let mut svg = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {SIZE:.0} {SIZE:.0}" width="{SIZE:.0}" height="{SIZE:.0}" style="max-width:{SIZE:.0}px;width:100%;font-family:sans-serif">"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 {top:.0} {width:.0} {height:.0}" width="{width:.0}" height="{height:.0}" style="max-width:{width:.0}px;width:100%;font-family:sans-serif">"#
     );
 
     // Title: centered over the pie, 25px, normal weight; y = -(height-50)/2.
@@ -197,20 +227,15 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
     // Legend, source order, anchored to the pie center: swatch 18×18 at
     // (CX+216, CY + i·22 - 11n); text offset by (22, 14).
     let offset = LEGEND_H * n as f64 / 2.0;
-    for (i, (label, value)) in pie.slices.iter().enumerate() {
+    for (i, legend) in legend_texts.iter().enumerate() {
         let fill = PALETTE[i % PALETTE.len()];
         let sy = CY + i as f64 * LEGEND_H - offset;
         svg.push_str(&format!(
             r#"<rect x="{LEGEND_X}" y="{sy:.1}" width="18" height="18" fill="{fill}"/>"#
         ));
-        let legend = if pie.show_data {
-            format!("{label} ({})", trim_num(*value))
-        } else {
-            label.clone()
-        };
         svg.push_str(&format!(
             r#"<text x="{lx}" y="{ly:.1}" fill="currentColor" style="font-size:17px">{}</text>"#,
-            escape_xml(&legend),
+            escape_xml(legend),
             lx = LEGEND_X + 22.0,
             ly = sy + 14.0,
         ));
@@ -444,14 +469,46 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_labels_are_kept_as_separate_slices() {
-        let p = parse("pie\n\"A\" : 1\n\"A\" : 2").unwrap();
-        assert_eq!(
-            p.slices,
-            vec![("A".to_string(), 1.0), ("A".to_string(), 2.0)]
-        );
+    fn duplicate_labels_keep_the_first_value() {
+        // mermaid.js parity (#280): a repeated label doesn't add a slice.
+        let p = parse("pie\n\"A\" : 1\n\"B\" : 3\n\"A\" : 2").unwrap();
+        assert_eq!(p.slices, vec![("A".to_string(), 1.0), ("B".to_string(), 3.0)]);
         let svg = render_svg(&p);
-        assert_eq!(svg.matches("<text x=\"463\"").count(), 2, "both duplicates get a legend row");
+        assert_eq!(svg.matches("<text x=\"463\"").count(), 2, "one legend row per distinct label");
+    }
+
+    #[test]
+    fn values_follow_the_mermaid_number_grammar() {
+        for ok in ["42", "4.2", ".5", "0", "007"] {
+            assert!(parse(&format!("pie\n\"A\" : {ok}")).is_ok(), "{ok}");
+        }
+        for bad in ["1e3", "+5", "5.", ".", "1.2.3", "0x10", "inf", "NaN", "-3", "1_000", "٣"] {
+            let err = parse(&format!("pie\n\"A\" : {bad}")).unwrap_err();
+            assert_eq!(err.line, Some(2), "{bad}");
+        }
+    }
+
+    #[test]
+    fn legend_fits_the_viewbox() {
+        // #280: the fixed 450×450 viewBox cut every legend off.
+        for src in [
+            "pie title Pets\n\"Dogs\" : 386\n\"Cats\" : 85\n\"Rats\" : 15",
+            "pie showData\n\"A rather long legend label for a small slice\" : 3\n\"B\" : 1000",
+            "pie\n\"猫猫猫猫猫猫猫猫猫猫猫猫\" : 1",
+        ] {
+            crate::extent::assert_inside(&render_svg(&parse(src).unwrap()));
+        }
+    }
+
+    #[test]
+    fn tall_legend_fits_the_viewbox() {
+        let src = std::iter::once("pie".to_string())
+            .chain((0..40).map(|i| format!("\"Slice {i}\" : {}", i + 1)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let svg = render_svg(&parse(&src).unwrap());
+        crate::extent::assert_inside(&svg);
+        assert!(svg.contains(r#"viewBox="0 -"#), "grown both ways around the pie: {}", &svg[..120]);
     }
 
     #[test]
