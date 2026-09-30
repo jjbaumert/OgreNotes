@@ -58,6 +58,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && mkdir -p /out \
  && cp target/release-fast/ogrenotes-api target/release-fast/setup_dev /out/
 
+# ─── Git metadata (optional) ───────────────────────────────────
+# Empty by default. The self-host compose file replaces it with the repo's
+# `.git/` (`additional_contexts: gitmeta: …`), so frontend/build.rs can
+# read the commit for the sidebar version stamp without a build arg.
+FROM scratch AS gitmeta
+
 # ─── Stage 2: Frontend Build ───────────────────────────────────
 FROM rust:slim-bookworm AS frontend-builder
 
@@ -65,7 +71,8 @@ ARG TRUNK_VERSION=0.21.14
 # Build-time stamp baked into the WASM by frontend/build.rs. Deploy
 # scripts pass this as `--build-arg GIT_HASH=<short-sha[-dirty]>` so the
 # sidebar version row reflects the actual source state — `.dockerignore`
-# excludes `.git/`, so build.rs can't compute it itself inside the image.
+# excludes `.git/`. Left at "unknown", build.rs reads the `gitmeta`
+# context mounted below instead (self-host compose supplies it).
 ARG GIT_HASH=unknown
 ENV GIT_HASH=${GIT_HASH}
 
@@ -116,6 +123,7 @@ COPY frontend/ .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/frontend/target,id=ogre-frontend-target-${TARGETARCH} \
+    --mount=type=bind,from=gitmeta,target=/app/.git \
     CARGO_PROFILE_RELEASE_OPT_LEVEL=z \
     CARGO_PROFILE_RELEASE_LTO=fat \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \

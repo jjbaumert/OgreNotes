@@ -1,10 +1,7 @@
 # OgreNotes on a single home server, with DynamoDB + S3 in AWS.
 # See README.md in this directory — run setup.sh once before `up`.
 #
-#   GIT_HASH=$(git rev-parse --short HEAD) docker compose --env-file .env up -d --build
-#
-# GIT_HASH stamps the build into the sidebar version line (`v0.2.0 <hash>`);
-# the image can't read it itself because `.dockerignore` leaves out `.git/`.
+#   docker compose --env-file .env up -d --build
 #
 # Everything restarts on its own after a crash or reboot
 # (`restart: unless-stopped`). Only Caddy publishes ports.
@@ -18,8 +15,11 @@ x-app: &app
       # The Dockerfile's default; explicit so a future default change can't
       # quietly compile the dev-login endpoint back in.
       CARGO_FEATURES: "xlsx,docx,pdf"
-      # Shown as "unknown" when unset; see the header for how to pass it.
-      GIT_HASH: ${GIT_HASH:-unknown}
+    # The repo's git metadata, so the build stamps the commit into the
+    # sidebar version line (`v0.2.0 <commit>`); `.dockerignore` keeps
+    # `.git/` out of the main context.
+    additional_contexts:
+      gitmeta: ../../.git
   image: ogrenotes:selfhost
   env_file: ogrenotes.env
   environment:

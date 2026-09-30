@@ -70,7 +70,7 @@ else
   # setup_dev (in the app image) owns the table + index definitions; run it
   # with these admin credentials rather than the app's.
   eval "$(aws configure export-credentials --format env)"
-  GIT_HASH=$(git rev-parse --short HEAD 2>/dev/null || echo unknown) docker compose build api
+  docker compose build api
   docker compose run --rm --no-deps \
     -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
     -e AWS_REGION="$REGION" api setup_dev
@@ -140,5 +140,5 @@ If you haven't created the two IAM users yet:
       --policy-document file://iam/rendered/dns-policy.json
   aws iam create-access-key --user-name ogrenotes-dns     # -> caddy.env
 
-Then: GIT_HASH=\$(git rev-parse --short HEAD) docker compose up -d --build
+Then: docker compose up -d --build
 EOF

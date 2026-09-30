@@ -77,11 +77,9 @@ Everything here runs from `deploy/selfhost/`.
 
 4. Start everything:
    ```sh
-   GIT_HASH=$(git rev-parse --short HEAD) docker compose up -d --build
+   docker compose up -d --build
    docker compose logs -f api caddy
    ```
-   `GIT_HASH` stamps the commit into the version line at the bottom of the
-   sidebar (`v0.2.0 <commit>`). Without it that line reads `unknown`.
    The first start creates a search index from scratch and does nothing else
    interesting. Caddy updates the DNS record and gets a certificate. Then
    open `https://<your domain>` and sign in with GitHub.
@@ -123,7 +121,7 @@ until the connection returns.
 
 ```sh
 git pull
-GIT_HASH=$(git rev-parse --short HEAD) docker compose up -d --build
+docker compose up -d --build
 ```
 
 ## Backups and restore
