@@ -315,6 +315,14 @@ fn convert_element_node(
         }
     }
 
+    // Equations and Mermaid diagrams: our own copy-out shapes, the
+    // rendered editor DOM, and MathML from other sites all come back as
+    // the node they were rather than as their source text.
+    if let Some(node) = rich_block_from_html(&tag, el, inline_context) {
+        out.push(node);
+        return;
+    }
+
     // Inline formatting element → push mark and recurse
     if let Some(mark) = tag_to_mark(&tag, el) {
         let mut new_marks = active_marks.to_vec();
@@ -337,6 +345,108 @@ fn convert_element_node(
 
     // Unknown inline element (span, font, etc.): transparent, preserve marks
     walk_dom_children(child, active_marks, out, inline_context);
+}
+
+/// Whether a pasted node can sit inside a paragraph. Leaf *blocks*
+/// (equation blocks, Mermaid diagrams) are leaves but not inline, and a
+/// paragraph wrapped around one would break the schema.
+// Pure helpers of the wasm-only paste walker, compiled natively for tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn is_inline_content(n: &Node) -> bool {
+    match n {
+        Node::Text { .. } => true,
+        Node::Element { node_type, .. } => {
+            n.is_leaf() && !matches!(node_type, NodeType::MathBlock | NodeType::Mermaid)
+        }
+    }
+}
+
+/// An equation or Mermaid diagram from pasted HTML, or `None` to let
+/// the element take the ordinary path. Recognizes:
+/// - our copy-out shapes (`div.math-block`, `span.math-inline`,
+///   `div.mermaid`) and the rendered editor DOM, via `data-source`;
+/// - MathML with a TeX annotation (`<math>…<annotation
+///   encoding="application/x-tex">`), which math-rendering sites and
+///   our own HTML export emit — including Wikipedia's
+///   `span.mwe-math-element` wrapper, whose fallback `<img>` is dropped.
+///
+/// A source that is empty or over the length cap isn't restored, so a
+/// paste can never produce a node the server's write gate rejects.
+#[cfg(target_arch = "wasm32")]
+fn rich_block_from_html(tag: &str, el: &web_sys::Element, inline_context: bool) -> Option<Node> {
+    let classes = el.class_list();
+    if tag == "div" && classes.contains("mermaid") {
+        let source = el.get_attribute("data-source").or_else(|| el.text_content())?;
+        return source_node(NodeType::Mermaid, &source, ogrenotes_mermaid::MAX_SOURCE_LEN);
+    }
+    let math_kind = |display_block: bool| {
+        if display_block && !inline_context { NodeType::MathBlock } else { NodeType::MathInline }
+    };
+    if (tag == "div" && classes.contains("math-block")) || (tag == "span" && classes.contains("math-inline")) {
+        let block = tag == "div";
+        let source = el
+            .get_attribute("data-source")
+            .or_else(|| tex_annotation(el))
+            .or_else(|| {
+                let text = el.text_content()?;
+                // Inline copy-out carries `$…$` as its text.
+                Some(if block { text } else { strip_dollars(&text).to_string() })
+            })?;
+        return source_node(math_kind(block), &source, ogrenotes_math::MAX_SOURCE_LEN);
+    }
+    let math_el = if tag == "math" {
+        Some(el.clone())
+    } else if classes.contains("mwe-math-element") {
+        el.query_selector("math").ok().flatten()
+    } else {
+        None
+    };
+    let math_el = math_el?;
+    let source = tex_annotation(&math_el)?;
+    let block = math_el.get_attribute("display").as_deref() == Some("block");
+    source_node(math_kind(block), &source, ogrenotes_math::MAX_SOURCE_LEN)
+}
+
+/// The TeX source of a MathML element, from its
+/// `annotation[encoding="application/x-tex"]` child.
+#[cfg(target_arch = "wasm32")]
+fn tex_annotation(el: &web_sys::Element) -> Option<String> {
+    let annotation = el.query_selector(r#"annotation[encoding="application/x-tex"]"#).ok()??;
+    Some(unwrap_displaystyle(annotation.text_content()?.trim()).to_string())
+}
+
+/// Wikipedia wraps every formula as `{\displaystyle …}`; the wrapper is
+/// noise when editing, since display equations are display style anyway.
+// Pure helpers of the wasm-only paste walker, compiled natively for tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn unwrap_displaystyle(source: &str) -> &str {
+    source
+        .strip_prefix("{\\displaystyle")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .map(str::trim)
+        .filter(|inner| !inner.is_empty())
+        .unwrap_or(source)
+}
+
+/// `$x$` → `x`; anything else unchanged.
+// Pure helpers of the wasm-only paste walker, compiled natively for tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn strip_dollars(text: &str) -> &str {
+    let t = text.trim();
+    t.strip_prefix('$').and_then(|r| r.strip_suffix('$')).filter(|r| !r.is_empty()).unwrap_or(t)
+}
+
+/// A leaf node of `node_type` carrying `source`, if the server would
+/// accept it (non-empty, within `max_len` chars).
+// Pure helpers of the wasm-only paste walker, compiled natively for tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn source_node(node_type: NodeType, source: &str, max_len: usize) -> Option<Node> {
+    if source.trim().is_empty() || source.chars().count() > max_len {
+        return None;
+    }
+    let mut attrs = std::collections::HashMap::new();
+    attrs.insert("source".to_string(), source.to_string());
+    Some(Node::element_with_attrs(node_type, attrs, Fragment::empty()))
 }
 
 /// Walk a DOM node's children into a fresh Vec of model nodes.
@@ -397,7 +507,7 @@ fn convert_block_element(
         NodeType::TableCell | NodeType::TableHeader => {
             let children = walk_block_children(child, false);
             // If all children are inline, wrap in Paragraph (same as list items)
-            let children = if children.iter().all(|n| matches!(n, Node::Text { .. }) || n.is_leaf()) {
+            let children = if children.iter().all(is_inline_content) {
                 vec![Node::element_with_content(NodeType::Paragraph, Fragment::from(children))]
             } else {
                 children
@@ -499,7 +609,7 @@ fn convert_image(el: &web_sys::Element) -> Option<Node> {
 /// If all children are inline, wraps them in a Paragraph first.
 #[cfg(target_arch = "wasm32")]
 fn convert_list_item(children: Vec<Node>) -> Node {
-    let all_inline = children.iter().all(|n| matches!(n, Node::Text { .. }) || n.is_leaf());
+    let all_inline = children.iter().all(is_inline_content);
     if all_inline {
         let para = Node::element_with_content(NodeType::Paragraph, Fragment::from(children));
         Node::element_with_content(NodeType::ListItem, Fragment::from(vec![para]))
@@ -518,7 +628,7 @@ fn convert_unknown_block(child: &web_sys::Node, out: &mut Vec<Node>) {
         return;
     }
 
-    let all_inline = children.iter().all(|n| matches!(n, Node::Text { .. }) || n.is_leaf());
+    let all_inline = children.iter().all(is_inline_content);
     if all_inline {
         out.push(Node::element_with_content(
             NodeType::Paragraph, Fragment::from(children),
@@ -1335,13 +1445,24 @@ fn element_tags(
         // into plain text (or back through the `$…$` rule) reads right.
         NodeType::MathInline => {
             let source = attrs.get("source").map(String::as_str).unwrap_or("");
-            (format!("<span class=\"math-inline\">${}$</span>", html_escape(source)), None)
+            (
+                format!(
+                    "<span class=\"math-inline\" data-source=\"{}\">${}$</span>",
+                    html_escape_attr(source),
+                    html_escape(source)
+                ),
+                None,
+            )
         }
         // Equation block: the LaTeX source, same minimal shape.
         NodeType::MathBlock => {
             let source = attrs.get("source").map(String::as_str).unwrap_or("");
             (
-                format!("<div class=\"math-block\">{}</div>", html_escape_attr(source)),
+                format!(
+                    "<div class=\"math-block\" data-source=\"{}\">{}</div>",
+                    html_escape_attr(source),
+                    html_escape(source)
+                ),
                 None,
             )
         }
@@ -1612,6 +1733,51 @@ mod tests {
         let slice = Slice::new(Fragment::from(vec![Node::text("Hello")]), 0, 0);
         assert_eq!(serialize_to_html(&slice), "Hello");
         assert_eq!(serialize_to_text(&slice), "Hello");
+    }
+
+    // ─── Equations and Mermaid (copy-out; paste is in tests/browser.rs) ──
+
+    fn source_leaf(node_type: NodeType, source: &str) -> Node {
+        let mut attrs = HashMap::new();
+        attrs.insert("source".to_string(), source.to_string());
+        Node::element_with_attrs(node_type, attrs, Fragment::empty())
+    }
+
+    #[test]
+    fn equations_serialize_with_their_exact_source() {
+        let block = serialize_to_html(&Slice::new(
+            Fragment::from(vec![source_leaf(NodeType::MathBlock, "a < \\frac{b}{c} & \"d\"")]),
+            0,
+            0,
+        ));
+        assert!(
+            block.starts_with(r#"<div class="math-block" data-source="a &lt; \frac{b}{c} &amp; &quot;d&quot;">"#),
+            "{block}"
+        );
+        let inline = serialize_to_html(&Slice::new(
+            Fragment::from(vec![source_leaf(NodeType::MathInline, "x^2")]),
+            0,
+            0,
+        ));
+        assert_eq!(inline, r#"<span class="math-inline" data-source="x^2">$x^2$</span>"#);
+    }
+
+    #[test]
+    fn paste_helpers() {
+        assert_eq!(unwrap_displaystyle("{\\displaystyle E=mc^{2}}"), "E=mc^{2}");
+        assert_eq!(unwrap_displaystyle("x+y"), "x+y");
+        assert_eq!(unwrap_displaystyle("{\\displaystyle }"), "{\\displaystyle }");
+        assert_eq!(strip_dollars(" $x^2$ "), "x^2");
+        assert_eq!(strip_dollars("$"), "$");
+        assert_eq!(strip_dollars("x"), "x");
+        assert!(source_node(NodeType::MathInline, "  ", 10).is_none());
+        assert!(source_node(NodeType::MathInline, "abc", 2).is_none());
+        assert!(source_node(NodeType::MathInline, "ab", 2).is_some());
+        // Block atoms never count as paragraph content.
+        assert!(!is_inline_content(&source_leaf(NodeType::MathBlock, "x")));
+        assert!(!is_inline_content(&source_leaf(NodeType::Mermaid, "pie")));
+        assert!(is_inline_content(&source_leaf(NodeType::MathInline, "x")));
+        assert!(is_inline_content(&Node::text("t")));
     }
 
     // ─── DocMention clipboard round-trip (mentions spec §7) ────────
