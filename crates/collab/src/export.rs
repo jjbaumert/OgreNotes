@@ -1778,14 +1778,20 @@ fn table_cell_needs_html<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
                 .any(|child| table_cell_needs_html(txn, &child))
         }
         XmlOut::Text(text) => text.diff(txn, |_| ()).iter().any(|chunk| {
-            chunk
-                .attributes
-                .as_deref()
-                .and_then(link_href)
-                .is_some_and(|href| href.contains(['\\', '\r', '\n']))
-                || matches!(&chunk.insert, Out::Any(Any::String(s)) if
-                s.contains('\\') || (s.contains(['\r', '\n', '`', '\\'])
-                    && chunk.attributes.as_deref().is_some_and(|attrs| has_mark(attrs, "code"))))
+            let Out::Any(Any::String(value)) = &chunk.insert else {
+                return false;
+            };
+            let attrs = chunk.attributes.as_deref();
+            let code = attrs.is_some_and(|attrs| has_mark(attrs, "code"));
+            let href = attrs.and_then(link_href);
+            value.contains(['\\', '<', '>'])
+                || (code
+                    && (value.contains(['\r', '\n', '`'])
+                        || value.trim() != value.as_ref()
+                        || escape_markdown_text(value) != value.as_ref()))
+                || (!code && value.contains(['*', '_', '~', '`', '[', ']']))
+                || (href.is_some() && value.contains(['\r', '\n']))
+                || href.is_some_and(|href| href.contains(['\\', '\r', '\n']))
         }),
         _ => false,
     }
@@ -3204,6 +3210,102 @@ mod tests {
                 "{html}"
             );
         }
+    }
+
+    #[test]
+    fn markdown_table_literal_html_cannot_create_extra_cells() {
+        let doc = markdown_table_doc(&[&["A", "B"], &["<td>injected</td>", "other"]], true);
+        let md = to_markdown(&doc);
+        let mut html = String::new();
+        pulldown_cmark::html::push_html(
+            &mut html,
+            pulldown_cmark::Parser::new_ext(&md, pulldown_cmark::Options::ENABLE_TABLES),
+        );
+        assert!(html.contains("&lt;td&gt;injected&lt;/td&gt;"), "{html}");
+        assert_eq!(html.matches("<td>").count(), 2);
+    }
+
+    #[test]
+    fn markdown_table_code_keeps_structural_prefixes_and_edge_spaces() {
+        for value in ["# hi", " foo "] {
+            let doc = markdown_table_doc(&[&["Code"], &[value]], true);
+            {
+                let mut txn = doc.transact_mut();
+                let f = txn.get_or_insert_xml_fragment("content");
+                let Some(XmlOut::Element(table)) = f.get(&txn, 0) else {
+                    panic!()
+                };
+                let Some(XmlOut::Element(row)) = table.get(&txn, 1) else {
+                    panic!()
+                };
+                let Some(XmlOut::Element(cell)) = row.get(&txn, 0) else {
+                    panic!()
+                };
+                let Some(XmlOut::Element(p)) = cell.get(&txn, 0) else {
+                    panic!()
+                };
+                let Some(XmlOut::Text(text)) = p.get(&txn, 0) else {
+                    panic!()
+                };
+                text.format(
+                    &mut txn,
+                    0,
+                    value.len() as u32,
+                    Attrs::from([("code".into(), Any::Bool(true))]),
+                );
+            }
+            let md = to_markdown(&doc);
+            let mut html = String::new();
+            pulldown_cmark::html::push_html(
+                &mut html,
+                pulldown_cmark::Parser::new_ext(&md, pulldown_cmark::Options::ENABLE_TABLES),
+            );
+            assert!(html.contains(&format!("<code>{value}</code>")), "{html}");
+        }
+    }
+
+    #[test]
+    fn markdown_table_linked_label_keeps_line_breaks() {
+        let doc = markdown_table_doc(&[&["Link"], &["one\ntwo"]], true);
+        {
+            let mut txn = doc.transact_mut();
+            let f = txn.get_or_insert_xml_fragment("content");
+            let Some(XmlOut::Element(table)) = f.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(row)) = table.get(&txn, 1) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(cell)) = row.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(p)) = cell.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Text(text)) = p.get(&txn, 0) else {
+                panic!()
+            };
+            text.format(
+                &mut txn,
+                0,
+                7,
+                Attrs::from([(
+                    "link".into(),
+                    Any::String(
+                        serde_json::json!({"href":"https://example.com"})
+                            .to_string()
+                            .into(),
+                    ),
+                )]),
+            );
+        }
+        let md = to_markdown(&doc);
+        let mut html = String::new();
+        pulldown_cmark::html::push_html(
+            &mut html,
+            pulldown_cmark::Parser::new_ext(&md, pulldown_cmark::Options::ENABLE_TABLES),
+        );
+        assert!(html.contains("one<br>two"), "{html}");
     }
 
     #[test]
