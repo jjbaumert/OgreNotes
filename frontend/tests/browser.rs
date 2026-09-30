@@ -5344,6 +5344,7 @@ async fn invalid_pasted_mermaid_opens_modal_and_recovers_with_exact_source() {
     owner.cleanup();
     cleanup(&modal_container);
     cleanup(&editor_container);
+    gloo_timers::future::TimeoutFuture::new(0).await;
 }
 
 #[wasm_bindgen_test]
