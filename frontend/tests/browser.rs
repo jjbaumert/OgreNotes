@@ -35,6 +35,26 @@ async fn code_language_menu_can_switch_back_to_mermaid() {
     use leptos::prelude::*;
 
     let container = create_container();
+    let editor_container = create_container();
+    let mut model = code_block_doc(ORBIT_MERMAID, "mermaid");
+    if let Node::Element { content, .. } = &mut model {
+        if let Node::Element { attrs, .. } = &mut content.children[0] {
+            attrs.insert("blockId".into(), "language-diagram".into());
+        }
+    }
+    let (view, _) = create_editor(editor_container.clone(), model);
+    let initial = view.state();
+    view.update_state(initial.apply(initial.transaction().set_selection(Selection::cursor(9))));
+    let identity = view
+        .state()
+        .doc
+        .child(0)
+        .unwrap()
+        .attrs()
+        .get("blockId")
+        .cloned();
+    let view = std::rc::Rc::new(view);
+    let callback_view = send_wrapper::SendWrapper::new(std::rc::Rc::clone(&view));
     let owner = Owner::new();
     let state = owner.with(|| {
         RwSignal::new(Some(CodeLangChipState {
@@ -47,6 +67,9 @@ async fn code_language_menu_can_switch_back_to_mermaid() {
         leptos::mount::mount_to(container.clone(), move || {
             view! {
                 <CodeLangChip state=state on_select=Callback::new(move |tag: String| {
+                    let current = callback_view.state();
+                    let dispatch = |txn| callback_view.update_state(current.apply(txn));
+                    assert!(ogrenotes_frontend::editor::commands::set_code_block_language(&tag, &current, Some(&dispatch)));
                     state.update(|value| value.as_mut().unwrap().current = tag);
                 }) />
             }
@@ -78,6 +101,27 @@ async fn code_language_menu_can_switch_back_to_mermaid() {
         .unwrap()
         .unchecked_into();
     assert_eq!(select.value(), "");
+    assert!(
+        view.container()
+            .query_selector(".mermaid-svg")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        view.state().doc.child(0).unwrap().text_content(),
+        ORBIT_MERMAID
+    );
+    assert_eq!(
+        view.state()
+            .doc
+            .child(0)
+            .unwrap()
+            .attrs()
+            .get("blockId")
+            .cloned(),
+        identity
+    );
+    assert_eq!(view.read_dom_selection().unwrap().from(), 9);
     assert_eq!(
         select
             .query_selector_all("option[value='mermaid']")
@@ -92,10 +136,27 @@ async fn code_language_menu_can_switch_back_to_mermaid() {
         .unwrap();
     gloo_timers::future::TimeoutFuture::new(0).await;
     assert_eq!(state.get().unwrap().current, "mermaid");
+    assert_orbit_diagram(&view);
+    assert_eq!(
+        view.state().doc.child(0).unwrap().text_content(),
+        ORBIT_MERMAID
+    );
+    assert_eq!(
+        view.state()
+            .doc
+            .child(0)
+            .unwrap()
+            .attrs()
+            .get("blockId")
+            .cloned(),
+        identity
+    );
+    assert_eq!(view.read_dom_selection().unwrap().from(), 9);
 
     drop(handle);
     owner.cleanup();
     cleanup(&container);
+    cleanup(&editor_container);
 }
 
 // ─── Test Helpers ──────────────────────────────────────────────
@@ -4944,6 +5005,78 @@ fn mixed_mermaid_and_list_paste_keeps_diagram_inside_existing_list() {
         );
         cleanup(&container);
     }
+}
+
+#[wasm_bindgen_test]
+fn empty_and_oversized_mermaid_pastes_recover_through_source_editing() {
+    for source in [
+        String::new(),
+        "x".repeat(ogrenotes_mermaid::MAX_SOURCE_LEN + 1),
+    ] {
+        for html in [false, true] {
+            let container = create_container();
+            let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+            set_cursor(&view, 1);
+            let markdown = format!("```mermaid\n{source}\n```");
+            if html {
+                let code = format!("<pre><code class=\"language-mermaid\">{source}</code></pre>");
+                dispatch_paste_html(&view, &txns, &markdown, &code);
+            } else {
+                dispatch_paste(&view, &txns, &markdown);
+            }
+            let block = view.state().doc.child(0).unwrap().clone();
+            assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+            assert!(
+                view.container()
+                    .query_selector(".mermaid-error")
+                    .unwrap()
+                    .is_some()
+            );
+            let identity = block.attrs().get("blockId").cloned();
+            set_selection(&view, 1, 1 + block.text_content().chars().count());
+            dispatch_paste(&view, &txns, ORBIT_MERMAID);
+            assert_eq!(
+                view.state().doc.child(0).unwrap().text_content(),
+                ORBIT_MERMAID
+            );
+            assert_eq!(
+                view.state()
+                    .doc
+                    .child(0)
+                    .unwrap()
+                    .attrs()
+                    .get("blockId")
+                    .cloned(),
+                identity
+            );
+            assert_orbit_diagram(&view);
+            cleanup(&container);
+        }
+    }
+}
+
+#[wasm_bindgen_test]
+fn mermaid_source_is_not_clipped_by_a_separate_vertical_scroller() {
+    let doc = document();
+    let style = doc.create_element("style").unwrap();
+    style.set_text_content(Some(include_str!("../style/main.css")));
+    doc.body().unwrap().append_child(&style).unwrap();
+    let container = create_container();
+    let (view, _) = create_editor(container.clone(), code_block_doc(ORBIT_MERMAID, "mermaid"));
+    let code: HtmlElement = view
+        .container()
+        .query_selector("pre > code")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    let height = code.client_height();
+    let scroll_height = code.scroll_height();
+    style.remove();
+    cleanup(&container);
+    assert!(
+        height >= scroll_height,
+        "source must stay in the normal document flow: {height} vs {scroll_height}"
+    );
 }
 
 #[wasm_bindgen_test]
