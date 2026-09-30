@@ -241,7 +241,8 @@ fn expand_level(
                     h,
                 };
                 let title_h = input.clusters[c].title.1;
-                let content_translate = (rect.x, rect.y + title_h + CLUSTER_PAD);
+                let slack_x = (w - child.layout.size.0).max(0.0) / 2.0;
+                let content_translate = (rect.x + slack_x, rect.y + title_h + CLUSTER_PAD);
                 cluster_rects[c] = Some(rect);
                 expand_level(
                     input,
@@ -306,8 +307,13 @@ pub(crate) fn run_clustered(input: &LayoutInput) -> Result<Layout, String> {
     for c in order {
         let level_dir = effective_dir(&input.clusters, c, input.direction);
         let build = build_level(input, Some(c), level_dir, &sub_builds)?;
-        let title_h = input.clusters[c].title.1;
-        let placeholder_size = (build.layout.size.0, build.layout.size.1 + title_h + CLUSTER_PAD);
+        let (title_w, title_h) = input.clusters[c].title;
+        // At least as wide as its title (#274); `expand_level` centers the
+        // content in any extra width.
+        let placeholder_size = (
+            build.layout.size.0.max(title_w + 2.0 * CLUSTER_PAD),
+            build.layout.size.1 + title_h + CLUSTER_PAD,
+        );
         sub_builds[c] = Some(SubBuild { placeholder_size, ..build });
     }
 

@@ -7,6 +7,30 @@ use super::order::{OrderGraph, SlotKind};
 use super::position::Coords;
 use super::{EdgePath, LayoutInput};
 
+/// How far a self-loop sticks out right of its node.
+pub(crate) const SELF_LOOP_STUB: f64 = 18.0;
+/// Gap between a self-loop and its label.
+pub(crate) const SELF_LOOP_LABEL_GAP: f64 = 4.0;
+
+/// Per node with self-loops: the (widest, total stacked height) of its
+/// loop labels, in node order. Labels stack vertically beside the shared
+/// loop, `SELF_LOOP_LABEL_GAP` apart.
+pub(crate) fn self_loop_label_extents(input: &LayoutInput, self_loops: &[usize]) -> Vec<(usize, (f64, f64))> {
+    let mut per: std::collections::BTreeMap<usize, (f64, f64, usize)> = Default::default();
+    for &o in self_loops {
+        let v = input.edges[o].from;
+        let e = per.entry(v).or_insert((0.0, 0.0, 0));
+        if let Some((w, h)) = input.edges[o].label {
+            e.0 = e.0.max(w);
+            e.1 += h;
+            e.2 += 1;
+        }
+    }
+    per.into_iter()
+        .map(|(v, (w, h, n))| (v, (w, h + SELF_LOOP_LABEL_GAP * n.saturating_sub(1) as f64)))
+        .collect()
+}
+
 /// Clip point `toward` -> `center` at the bounding box of a node with
 /// the given half-extents, returning the border intersection.
 pub(crate) fn clip_to_box(center: (f64, f64), half: (f64, f64), toward: (f64, f64)) -> (f64, f64) {
@@ -97,23 +121,32 @@ pub(crate) fn route_edges(
         out.push(EdgePath { edge: orig, points: pts, label_at, reversed });
     }
 
-    // Self-loops: small rectangle stub off the node's right edge.
+    // Self-loops: small rectangle stub off the node's right edge. A node's
+    // loops share it; their labels stack top to bottom beside it.
+    let stacks: std::collections::HashMap<usize, f64> =
+        self_loop_label_extents(input, &ac.self_loops).into_iter().map(|(v, (_, h))| (v, h)).collect();
+    let mut stacked: std::collections::HashMap<usize, f64> = Default::default();
     for &orig in &ac.self_loops {
         let v = input.edges[orig].from;
         // Node centers for real slots come from coords.
         let c = coords.centers[&SlotKind::Real(v)];
         let hw = input.nodes[v].width / 2.0;
         let hh = input.nodes[v].height / 2.0;
-        let stub = 18.0;
+        let stub = SELF_LOOP_STUB;
         let pts = vec![
             (c.0 + hw, c.1 - hh * 0.5),
             (c.0 + hw + stub, c.1 - hh * 0.5),
             (c.0 + hw + stub, c.1 + hh * 0.5),
             (c.0 + hw, c.1 + hh * 0.5),
         ];
-        let label_at = input.edges[orig]
-            .label
-            .map(|_| (c.0 + hw + stub + 4.0, c.1));
+        // Label centered just right of the loop, in the room `layout_tb`
+        // reserved in the node's slot.
+        let label_at = input.edges[orig].label.map(|(lw, lh)| {
+            let used = stacked.entry(v).or_insert(0.0);
+            let top = c.1 - stacks.get(&v).copied().unwrap_or(lh) / 2.0 + *used;
+            *used += lh + SELF_LOOP_LABEL_GAP;
+            (c.0 + hw + stub + SELF_LOOP_LABEL_GAP + lw / 2.0, top + lh / 2.0)
+        });
         out.push(EdgePath { edge: orig, points: pts, label_at, reversed: false });
     }
 
@@ -264,7 +297,8 @@ mod tests {
     #[test]
     fn multi_rank_label_sits_at_the_dummy_waypoint() {
         // A->B, B->C put C two ranks below A; the labeled A->C edge then
-        // routes through one dummy waypoint, which hosts the label.
+        // routes through dummy waypoints (ranks are doubled once any edge
+        // is labeled, #274), one of which hosts the label.
         let input = LayoutInput {
             nodes: vec![node(), node(), node()],
             edges: vec![e(0, 1), e(1, 2), labeled(0, 2)],
@@ -273,10 +307,12 @@ mod tests {
         };
         let l = run(&input).unwrap();
         let long = l.edge_paths.iter().find(|p| p.edge == 2).unwrap();
-        assert_eq!(long.points.len(), 3, "one dummy waypoint between the endpoints");
+        let n = long.points.len();
+        assert!(n >= 3, "dummy waypoints between the endpoints");
+        let at = long.label_at.expect("label placed");
         assert!(
-            close(long.label_at.expect("label placed"), long.points[1]),
-            "label rides the dummy waypoint, not an endpoint"
+            long.points[1..n - 1].iter().any(|&p| close(at, p)),
+            "label rides a dummy waypoint, not an endpoint"
         );
     }
 

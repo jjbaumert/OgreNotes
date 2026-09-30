@@ -3,7 +3,9 @@
 //! than Brandes-Köpf; replaceable behind this API.
 
 use super::order::{OrderGraph, SlotKind};
-use super::{NODE_GAP_X, RANK_GAP_Y};
+use super::NODE_GAP_X;
+#[cfg(test)]
+use super::RANK_GAP_Y;
 
 #[cfg(test)]
 mod tests {
@@ -218,7 +220,15 @@ const MAX_COORD_SWEEPS: usize = 30;
 const CONVERGE_EPS: f64 = 0.25;
 const CANVAS_PAD: f64 = 20.0;
 
+/// The default rank gap (the tests' entry point).
+#[cfg(test)]
 pub(crate) fn assign_coords(g: &OrderGraph) -> Coords {
+    assign_coords_with_gap(g, RANK_GAP_Y)
+}
+
+/// `assign_coords` with an explicit gap between ranks (halved when edge
+/// labels double the ranks; see `layout_tb`).
+pub(crate) fn assign_coords_with_gap(g: &OrderGraph, rank_gap: f64) -> Coords {
     // y: rank tops from cumulative max heights.
     let rank_h: Vec<f64> = g
         .ranks
@@ -229,7 +239,7 @@ pub(crate) fn assign_coords(g: &OrderGraph) -> Coords {
     let mut y = CANVAS_PAD;
     for h in &rank_h {
         rank_y.push(y + h / 2.0);
-        y += h + RANK_GAP_Y;
+        y += h + rank_gap;
     }
 
     // x: initial packing left-to-right per rank.
@@ -322,7 +332,7 @@ pub(crate) fn assign_coords(g: &OrderGraph) -> Coords {
             centers.insert(s.kind, (xs[r][i] + shift, rank_y[r]));
         }
     }
-    let total_h = y - RANK_GAP_Y + CANVAS_PAD; // y overshoots by one gap
+    let total_h = y - rank_gap + CANVAS_PAD; // y overshoots by one gap
     let size = (max_right + shift + CANVAS_PAD, total_h.max(2.0 * CANVAS_PAD));
     Coords { centers, size }
 }
