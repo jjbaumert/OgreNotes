@@ -361,6 +361,11 @@ impl Parser {
                 i
             }
         };
+        // mermaid.js: the first subgraph that mentions a node claims it,
+        // even when the node was first used outside any subgraph.
+        if self.g.nodes[idx].subgraph.is_none() {
+            self.g.nodes[idx].subgraph = self.stack.last().map(|&(i, _)| i);
+        }
         if let Some((shape, label)) = shape_label {
             self.g.nodes[idx].shape = shape;
             self.g.nodes[idx].label = label;
@@ -951,10 +956,22 @@ mod tests {
     }
 
     #[test]
-    fn existing_node_does_not_move_into_subgraph() {
+    fn existing_node_moves_into_the_first_subgraph_that_lists_it() {
+        // mermaid.js parity (#275): a node used at the top level and then
+        // listed in a subgraph belongs to that subgraph.
         let g = p("graph TD\nA\nsubgraph s\nA --> B\nend");
-        assert_eq!(g.nodes[0].subgraph, None);
+        assert_eq!(g.nodes[0].subgraph, Some(0));
         assert_eq!(g.nodes[1].subgraph, Some(0));
+        let g = p("flowchart TB\nA --> B\nsubgraph S[Group]\nA\nend");
+        assert_eq!(g.nodes[0].subgraph, Some(0), "A moves into S");
+        assert_eq!(g.nodes[1].subgraph, None);
+        // …but a node already in a subgraph stays in the first one.
+        let g = p("graph TD\nsubgraph one\nA\nend\nsubgraph two\nA --> B\nend");
+        assert_eq!(g.nodes[0].subgraph, Some(0));
+        assert_eq!(g.nodes[1].subgraph, Some(1));
+        // A top-level mention after the subgraph doesn't move it out.
+        let g = p("graph TD\nsubgraph s\nA\nend\nA --> C");
+        assert_eq!(g.nodes[0].subgraph, Some(0));
     }
 
     #[test]

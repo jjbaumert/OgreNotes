@@ -272,3 +272,63 @@ proptest! {
         }
     }
 }
+
+/// Edge segments passing through a node box other than the edge's own
+/// endpoints (boxes shrunk by `inset` so grazing a corner doesn't count).
+fn segment_node_hits(input: &LayoutInput, l: &Layout, inset: f64) -> Vec<String> {
+    fn hits(a: (f64, f64), b: (f64, f64), c: (f64, f64), hx: f64, hy: f64) -> bool {
+        if hx <= 0.0 || hy <= 0.0 {
+            return false;
+        }
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+        for (p, q) in [(-dx, a.0 - (c.0 - hx)), (dx, (c.0 + hx) - a.0), (-dy, a.1 - (c.1 - hy)), (dy, (c.1 + hy) - a.1)] {
+            if p.abs() < 1e-12 {
+                if q < 0.0 {
+                    return false;
+                }
+            } else {
+                let r = q / p;
+                if p < 0.0 { t0 = t0.max(r) } else { t1 = t1.min(r) }
+                if t0 > t1 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    let mut out = Vec::new();
+    for ep in &l.edge_paths {
+        let e = &input.edges[ep.edge];
+        for w in ep.points.windows(2) {
+            for (v, n) in input.nodes.iter().enumerate() {
+                if v == e.from || v == e.to {
+                    continue;
+                }
+                if hits(w[0], w[1], l.node_centers[v], n.width / 2.0 - inset, n.height / 2.0 - inset) {
+                    out.push(format!("edge {} segment {:?} crosses node {v}", ep.edge, w));
+                }
+            }
+        }
+    }
+    out
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// #275: no edge segment passes through a node other than its own
+    /// endpoints — flat or clustered, any nesting and direction.
+    #[test]
+    fn edges_never_cross_other_nodes(input in arb_nested_input()) {
+        let mut flat = input.clone();
+        for n in &mut flat.nodes { n.cluster = None; }
+        flat.clusters.clear();
+        for g in [&flat, &input] {
+            if let Ok(l) = run(g) {
+                let hits = segment_node_hits(g, &l, 2.0);
+                prop_assert!(hits.is_empty(), "{hits:?}");
+            }
+        }
+    }
+}

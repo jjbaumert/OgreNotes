@@ -68,6 +68,26 @@ pub(crate) fn route_edges(
         }
     }
 
+    // Each rank's vertical band (top, bottom): its tallest slot. Edges cross
+    // a band vertically — through a dummy's column, or straight off/onto
+    // an endpoint shorter than its rank — so the diagonal part of every
+    // segment lies in the empty gap between ranks, never across a taller
+    // neighbour (a cluster placeholder, a multi-line node) on the same rank.
+    let mut rank_of: std::collections::HashMap<SlotKind, usize> = std::collections::HashMap::new();
+    let bands: Vec<(f64, f64)> = g
+        .ranks
+        .iter()
+        .enumerate()
+        .map(|(r, row)| {
+            let h = row.iter().map(|s| s.size.1).fold(0.0, f64::max);
+            let y = row.first().map(|s| coords.centers[&s.kind].1).unwrap_or(0.0);
+            for s in row {
+                rank_of.insert(s.kind, r);
+            }
+            (y - h / 2.0, y + h / 2.0)
+        })
+        .collect();
+
     // Surviving (non-self-loop) edges, chain index == acyclic edge index.
     for (ai, chain) in g.chains.iter().enumerate() {
         let orig = ac.orig[ai];
@@ -108,6 +128,30 @@ pub(crate) fn route_edges(
                 clip_to_box(b_c, (nb.width / 2.0, nb.height / 2.0), b_prev)
             };
         }
+        // Vertical runs through tall bands (see `bands`). Endpoints first,
+        // so their clipping above aims at the true next waypoint.
+        let mut routed: Vec<(f64, f64)> = Vec::with_capacity(pts.len() + 4);
+        let last = pts.len() - 1;
+        for (i, (&p, kind)) in pts.iter().zip(chain).enumerate() {
+            let (top, bottom) = rank_of.get(kind).map(|&r| bands[r]).unwrap_or((p.1, p.1));
+            if i == 0 {
+                routed.push(p);
+                if p.1 < bottom - 0.5 {
+                    routed.push((p.0, bottom));
+                }
+            } else if i == last {
+                if p.1 > top + 0.5 {
+                    routed.push((p.0, top));
+                }
+                routed.push(p);
+            } else if bottom - top > 1.0 {
+                routed.push((p.0, top));
+                routed.push((p.0, bottom));
+            } else {
+                routed.push(p);
+            }
+        }
+        let pts = &mut routed;
         // Single-span labeled edge: label at segment midpoint.
         if label_at.is_none() && input.edges[orig].label.is_some() {
             let a = pts[0];
@@ -118,7 +162,7 @@ pub(crate) fn route_edges(
         if reversed {
             pts.reverse(); // restore true direction
         }
-        out.push(EdgePath { edge: orig, points: pts, label_at, reversed });
+        out.push(EdgePath { edge: orig, points: std::mem::take(pts), label_at, reversed });
     }
 
     // Self-loops: small rectangle stub off the node's right edge. A node's
@@ -309,11 +353,14 @@ mod tests {
         let long = l.edge_paths.iter().find(|p| p.edge == 2).unwrap();
         let n = long.points.len();
         assert!(n >= 3, "dummy waypoints between the endpoints");
+        // A dummy is a vertical run through its rank's band; the label
+        // sits on one, not at an endpoint.
         let at = long.label_at.expect("label placed");
-        assert!(
-            long.points[1..n - 1].iter().any(|&p| close(at, p)),
-            "label rides a dummy waypoint, not an endpoint"
-        );
+        let on_run = long.points[1..n - 1].windows(2).any(|w| {
+            (w[0].0 - at.0).abs() < 1e-6 && (w[1].0 - at.0).abs() < 1e-6
+                && at.1 >= w[0].1.min(w[1].1) - 1e-6 && at.1 <= w[0].1.max(w[1].1) + 1e-6
+        });
+        assert!(on_run || long.points[1..n - 1].iter().any(|&p| close(at, p)), "label rides a dummy waypoint, not an endpoint");
     }
 
     #[test]

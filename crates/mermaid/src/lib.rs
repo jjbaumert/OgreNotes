@@ -959,3 +959,45 @@ mod label_space_tests {
         assert!(!s.contains("&lt;br"), "{s}");
     }
 }
+
+/// #275: subgraph membership, cluster-exit routing and direction.
+#[cfg(test)]
+mod subgraph_tests {
+    /// Center of the drawn text `t`, and every drawn box.
+    fn scan(src: &str) -> (std::collections::HashMap<String, (f64, f64)>, Vec<crate::extent::Drawn>) {
+        let svg = crate::render(src).svg.expect("renders");
+        crate::extent::assert_inside(&svg);
+        let (_, drawn) = crate::extent::scan(&svg);
+        let centers = drawn
+            .iter()
+            .filter(|d| d.tag == "text")
+            .map(|d| (d.text.clone(), ((d.bbox.x0 + d.bbox.x1) / 2.0, (d.bbox.y0 + d.bbox.y1) / 2.0)))
+            .collect();
+        (centers, drawn)
+    }
+
+    #[test]
+    fn a_node_used_before_its_subgraph_is_drawn_inside_it() {
+        let (c, drawn) = scan("flowchart TB\nA --> B\nsubgraph S[Group]\nA\nend");
+        let title = drawn.iter().find(|d| d.text == "Group").unwrap().bbox;
+        let cluster = drawn
+            .iter()
+            .find(|d| d.tag == "rect" && d.bbox.x0 <= title.x0 && d.bbox.y0 <= title.y0 && d.bbox.x1 >= title.x1)
+            .expect("cluster box")
+            .bbox;
+        let inside = |p: (f64, f64)| p.0 > cluster.x0 && p.0 < cluster.x1 && p.1 > cluster.y0 && p.1 < cluster.y1;
+        assert!(inside(c["A"]), "A {:?} outside {cluster:?}", c["A"]);
+        assert!(!inside(c["B"]), "B {:?} inside {cluster:?}", c["B"]);
+    }
+
+    #[test]
+    fn subgraph_direction_is_ignored_when_a_member_links_outside() {
+        // mermaid.js: the parent direction (LR) applies, so A and B sit
+        // side by side rather than stacked.
+        let (c, _) = scan("flowchart LR\nsubgraph S\ndirection TB\nA-->B\nend\nC-->A");
+        assert!(c["B"].0 > c["A"].0 + 20.0 && (c["B"].1 - c["A"].1).abs() < 5.0, "A {:?} B {:?}", c["A"], c["B"]);
+        // Without the outside link the subgraph's own TB applies.
+        let (c, _) = scan("flowchart LR\nsubgraph S\ndirection TB\nA-->B\nend\nC");
+        assert!(c["B"].1 > c["A"].1 + 20.0, "A {:?} B {:?}", c["A"], c["B"]);
+    }
+}
