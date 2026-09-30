@@ -453,16 +453,17 @@ pub(super) fn preserve_mermaid_nesting(nodes: &mut [Node], parent: NodeType) {
     let schema = super::schema::default_schema();
     let mut pending: Vec<_> = nodes.iter_mut().map(|node| (parent, node)).collect();
     while let Some((parent, node)) = pending.pop() {
-        if node.node_type() == Some(NodeType::Mermaid) && !schema.content_matches(parent, &[node]) {
-            if let Node::Element { attrs, .. } = node {
-                let source = attrs.remove("source").unwrap_or_default();
-                attrs.insert("language".into(), "mermaid".into());
-                *node = Node::element_with_attrs(
-                    NodeType::CodeBlock,
-                    attrs.clone(),
-                    Fragment::from(vec![Node::text(&source)]),
-                );
-            }
+        if node.node_type() == Some(NodeType::Mermaid)
+            && !schema.content_matches(parent, &[node])
+            && let Node::Element { attrs, .. } = node
+        {
+            let source = attrs.remove("source").unwrap_or_default();
+            attrs.insert("language".into(), "mermaid".into());
+            *node = Node::element_with_attrs(
+                NodeType::CodeBlock,
+                attrs.clone(),
+                Fragment::from(vec![Node::text(&source)]),
+            );
         }
         if let Node::Element {
             node_type, content, ..
