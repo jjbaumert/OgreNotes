@@ -346,7 +346,7 @@ impl Transaction {
     /// typing and inline paste take over a range, #195/#220), and the
     /// caret is resolved with `resolve_block_for_edit`, which snaps a
     /// caret on a structural seam into the adjacent block.
-    pub fn paste_blocks(self, fitted: Slice) -> Result<Self, StepError> {
+    pub fn paste_blocks(self, mut fitted: Slice) -> Result<Self, StepError> {
         let txn = if self.selection.from() != self.selection.to() {
             self.delete_selection()?
         } else {
@@ -354,11 +354,26 @@ impl Transaction {
         };
         let raw_pos = txn.selection.from();
         let Some((block, pos)) = resolve_block_for_edit(&txn.doc, raw_pos) else {
-            // No textblock anywhere to anchor on: insert the blocks where
-            // the caret is. They are Doc-fitted, so this is only reached
-            // for a doc with no textblock at all.
+            // Without a textblock, the caret can still be inside an empty
+            // container after deleting its last atom. Fit diagrams against
+            // that insertion parent before replacing the selected content.
+            if let Some(rp) = super::position::resolve(&txn.doc, raw_pos) {
+                let parent = rp
+                    .node_at(rp.depth, &txn.doc)
+                    .node_type()
+                    .unwrap_or(NodeType::Doc);
+                super::clipboard::preserve_mermaid_nesting(&mut fitted.content.children, parent);
+            }
             return txn.replace(raw_pos, raw_pos, fitted);
         };
+
+        if let Some(rp) = super::position::resolve(&txn.doc, block.content_start) {
+            let parent = rp
+                .node_at(rp.depth.saturating_sub(1), &txn.doc)
+                .node_type()
+                .unwrap_or(NodeType::Doc);
+            super::clipboard::preserve_mermaid_nesting(&mut fitted.content.children, parent);
+        }
 
         let offset = pos.saturating_sub(block.content_start).min(block.content.size());
         let before_content = block.content.cut(0, offset);

@@ -13,6 +13,16 @@ pub fn serialize_to_html(slice: &Slice) -> String {
 
 /// Serialize a document slice to plain text for clipboard copy.
 pub fn serialize_to_text(slice: &Slice) -> String {
+    if let [
+        Node::Element {
+            node_type: NodeType::Mermaid,
+            attrs,
+            ..
+        },
+    ] = slice.content.children.as_slice()
+    {
+        return attrs.get("source").cloned().unwrap_or_default();
+    }
     let mut text = String::new();
     for child in &slice.content.children {
         collect_text(child, &mut text);
@@ -75,6 +85,7 @@ fn parse_from_html_dom(html: &str) -> Slice {
 
     let mut nodes = Vec::new();
     walk_dom_children(&body, &[], &mut nodes, false);
+    preserve_mermaid_nesting(&mut nodes, NodeType::Doc);
 
     if nodes.is_empty() {
         return Slice::empty();
@@ -436,11 +447,39 @@ fn strip_dollars(text: &str) -> &str {
     t.strip_prefix('$').and_then(|r| r.strip_suffix('$')).filter(|r| !r.is_empty()).unwrap_or(t)
 }
 
+/// Keep imported diagrams in the existing schema: restricted containers
+/// retain editable Mermaid CodeBlocks, which still display a preview.
+pub(super) fn preserve_mermaid_nesting(nodes: &mut [Node], parent: NodeType) {
+    let schema = super::schema::default_schema();
+    let mut pending: Vec<_> = nodes.iter_mut().map(|node| (parent, node)).collect();
+    while let Some((parent, node)) = pending.pop() {
+        if node.node_type() == Some(NodeType::Mermaid)
+            && !schema.content_matches(parent, &[node])
+            && let Node::Element { attrs, .. } = node
+        {
+            let source = attrs.remove("source").unwrap_or_default();
+            attrs.insert("language".into(), "mermaid".into());
+            *node = Node::element_with_attrs(
+                NodeType::CodeBlock,
+                attrs.clone(),
+                Fragment::from(vec![Node::text(&source)]),
+            );
+        }
+        if let Node::Element {
+            node_type, content, ..
+        } = node
+        {
+            let parent = *node_type;
+            pending.extend(content.children.iter_mut().map(|child| (parent, child)));
+        }
+    }
+}
+
 /// A leaf node of `node_type` carrying `source`, if the server would
 /// accept it (non-empty, within `max_len` chars).
 // Pure helpers of the wasm-only paste walker, compiled natively for tests.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn source_node(node_type: NodeType, source: &str, max_len: usize) -> Option<Node> {
+pub(super) fn source_node(node_type: NodeType, source: &str, max_len: usize) -> Option<Node> {
     if source.trim().is_empty() || source.chars().count() > max_len {
         return None;
     }
@@ -532,28 +571,131 @@ fn convert_block_element(
     }
 }
 
-/// Parse a <pre> element into a CodeBlock node, extracting language from <code> child.
+/// Extract literal clipboard source without interpreting it as Markdown.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn literal_text_from_html(_html: &str) -> Option<String> {
+    None
+}
+
 #[cfg(target_arch = "wasm32")]
-fn convert_code_block(child: &web_sys::Node, el: &web_sys::Element) -> Node {
+pub(super) fn literal_text_from_html(html: &str) -> Option<String> {
     use wasm_bindgen::JsCast;
-
-    let code_el = el.query_selector("code").ok().flatten();
-    // #2: `Element` is a `Node` today so this never fails, but use a
-    // fallible cast rather than `.unwrap()` — a refactor that changed the
-    // source type would otherwise panic the whole page in wasm. Fall back
-    // to the original `child` node if the cast ever doesn't hold.
-    let text_source = code_el.as_ref()
-        .and_then(|c| c.dyn_ref::<web_sys::Node>())
-        .unwrap_or(child);
-
-    let mut attrs = std::collections::HashMap::new();
-    if let Some(code) = &code_el {
-        if let Some(lang) = code_language_from_class(&code.class_name()) {
-            attrs.insert("language".to_string(), lang.to_string());
+    let parser = web_sys::DomParser::new().ok()?;
+    let document = parser
+        .parse_from_string(html, web_sys::SupportedType::TextHtml)
+        .ok()?;
+    let body = document.body()?;
+    let children = body.child_nodes();
+    let has_sibling_text = (0..children.length()).any(|i| {
+        children.item(i).is_some_and(|node| {
+            node.node_type() == web_sys::Node::TEXT_NODE
+                && !node.text_content().unwrap_or_default().trim().is_empty()
+        })
+    });
+    if body.child_element_count() == 1 && !has_sibling_text {
+        let element = body.first_element_child()?;
+        if let Some(source) = element.get_attribute("data-source") {
+            return Some(source);
+        }
+        if element.tag_name().eq_ignore_ascii_case("pre") {
+            return Some(literal_dom_text(element.unchecked_ref()));
         }
     }
+    Some(literal_dom_text(body.unchecked_ref()))
+}
 
-    let text = text_source.text_content().unwrap_or_default();
+#[cfg(target_arch = "wasm32")]
+fn literal_dom_text(root: &web_sys::Node) -> String {
+    use wasm_bindgen::JsCast;
+    let mut text = String::new();
+    let mut synthetic_end = false;
+    let mut synthetic_parent = None;
+    // Carry the enclosing block through inline wrappers in this iterative walk.
+    // End markers transfer the separator to their parent block when wrappers
+    // close, without consuming explicit newlines inside the next code line.
+    let mut pending = vec![(root.clone(), false, None)];
+    while let Some((node, leaving_block, block_context)) = pending.pop() {
+        if leaving_block {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+                synthetic_end = true;
+            }
+            if synthetic_end {
+                synthetic_parent = block_context;
+            }
+            continue;
+        }
+        if node.node_type() == web_sys::Node::TEXT_NODE {
+            let value = node.text_content().unwrap_or_default();
+            if !value.is_empty() {
+                if synthetic_end
+                    && value.starts_with(['\r', '\n'])
+                    && synthetic_parent == block_context
+                {
+                    text.pop();
+                }
+                text.push_str(&value);
+                synthetic_end = false;
+            }
+            continue;
+        }
+        let mut child_context = block_context.clone();
+        if let Some(element) = node.dyn_ref::<web_sys::Element>() {
+            if element.has_attribute("data-sentinel") {
+                continue;
+            }
+            let tag = element.tag_name().to_ascii_lowercase();
+            if tag == "br" {
+                text.push('\n');
+                synthetic_end = false;
+                continue;
+            }
+            if is_block_level_tag(&tag)
+                || tag_to_block_type(&tag).is_some_and(|kind| kind.is_block())
+            {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                    synthetic_end = true;
+                    synthetic_parent = block_context.clone();
+                }
+                pending.push((node.clone(), true, block_context));
+                child_context = Some(node.clone());
+            }
+        }
+        let children = node.child_nodes();
+        for i in (0..children.length()).rev() {
+            if let Some(child) = children.item(i) {
+                pending.push((child, false, child_context.clone()));
+            }
+        }
+    }
+    if synthetic_end {
+        text.pop();
+    }
+    text
+}
+
+/// Parse a <pre> element into a CodeBlock node, extracting language from <code> or <pre>.
+#[cfg(target_arch = "wasm32")]
+fn convert_code_block(child: &web_sys::Node, el: &web_sys::Element) -> Node {
+    let code_el = el.query_selector("code").ok().flatten();
+
+    let mut attrs = std::collections::HashMap::new();
+    let language = code_el
+        .as_ref()
+        .and_then(|code| code_language_from_class(&code.class_name()).map(str::to_owned))
+        .or_else(|| code_language_from_class(&el.class_name()).map(str::to_owned));
+    if let Some(lang) = language {
+        attrs.insert("language".to_string(), lang.to_string());
+    }
+
+    let text = literal_dom_text(child);
+    if attrs.get("language").is_some_and(|lang| lang == "mermaid") {
+        if let Some(node) = source_node(NodeType::Mermaid, &text, ogrenotes_mermaid::MAX_SOURCE_LEN)
+        {
+            return node;
+        }
+    }
     let content = if text.is_empty() {
         Fragment::empty()
     } else {
@@ -876,6 +1018,11 @@ pub fn fit_pasted_list_items(slice: &Slice, item_type: NodeType) -> Vec<Node> {
 
 fn collect_as_list_items(node: &Node, item_type: NodeType, out: &mut Vec<Node>) {
     match node.node_type() {
+        Some(NodeType::Mermaid) => {
+            let mut nodes = vec![node.clone()];
+            preserve_mermaid_nesting(&mut nodes, item_type);
+            collect_as_list_items(&nodes[0], item_type, out);
+        }
         // A pasted list: extract its children so they become siblings in
         // the target list rather than a nested sub-list.
         Some(NodeType::BulletList | NodeType::OrderedList | NodeType::TaskList) => {
@@ -932,7 +1079,12 @@ fn collect_as_list_items(node: &Node, item_type: NodeType, out: &mut Vec<Node>) 
         // fits-to-nothing content is dropped (parity with the pre-fitter
         // paste loop) instead of becoming an empty-looking bullet.
         _ => {
-            if node.text_content().trim().is_empty() {
+            let recoverable_mermaid = node.node_type() == Some(NodeType::CodeBlock)
+                && node
+                    .attrs()
+                    .get("language")
+                    .is_some_and(|language| language == "mermaid");
+            if node.text_content().trim().is_empty() && !recoverable_mermaid {
                 return;
             }
             let fitted = fit_slice_to_context(
@@ -1503,7 +1655,19 @@ fn element_tags(
 fn collect_text(node: &Node, out: &mut String) {
     match node {
         Node::Text { text, .. } => out.push_str(text),
-        Node::Element { content, node_type, .. } => {
+        Node::Element {
+            content,
+            node_type,
+            attrs,
+            ..
+        } => {
+            if *node_type == NodeType::Mermaid {
+                if let Some(source) = attrs.get("source") {
+                    out.push_str(source);
+                    out.push('\n');
+                }
+                return;
+            }
             if *node_type == NodeType::HardBreak {
                 out.push('\n');
                 return;

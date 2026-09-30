@@ -21,6 +21,147 @@ use ogrenotes_frontend::editor::view::EditorView;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
+#[path = "../src/components/code_lang_chip.rs"]
+mod code_lang_chip;
+#[path = "../src/components/dom_position.rs"]
+mod dom_position;
+#[path = "../src/components/mermaid_modal.rs"]
+mod mermaid_modal;
+pub use ogrenotes_frontend::{a11y, t};
+mod editor {
+    pub use ogrenotes_frontend::editor::*;
+}
+
+#[wasm_bindgen_test]
+async fn code_language_menu_can_switch_back_to_mermaid() {
+    use code_lang_chip::{CodeLangChip, CodeLangChipState};
+    use leptos::prelude::*;
+
+    let container = create_container();
+    let editor_container = create_container();
+    let mut model = code_block_doc(ORBIT_MERMAID, "mermaid");
+    if let Node::Element { content, .. } = &mut model {
+        if let Node::Element { attrs, .. } = &mut content.children[0] {
+            attrs.insert("blockId".into(), "language-diagram".into());
+        }
+    }
+    let (view, _) = create_editor(editor_container.clone(), model);
+    let initial = view.state();
+    view.update_state(initial.apply(initial.transaction().set_selection(Selection::cursor(9))));
+    let identity = view
+        .state()
+        .doc
+        .child(0)
+        .unwrap()
+        .attrs()
+        .get("blockId")
+        .cloned();
+    let view = std::rc::Rc::new(view);
+    let callback_view = send_wrapper::SendWrapper::new(std::rc::Rc::clone(&view));
+    let owner = Owner::new();
+    let state = owner.with(|| {
+        RwSignal::new(Some(CodeLangChipState {
+            top: 0.0,
+            right: 0.0,
+            current: "mermaid".into(),
+        }))
+    });
+    let handle = owner.with(|| {
+        leptos::mount::mount_to(container.clone(), move || {
+            view! {
+                <CodeLangChip state=state on_select=Callback::new(move |tag: String| {
+                    let current = callback_view.state();
+                    let dispatch = |txn| callback_view.update_state(current.apply(txn));
+                    assert!(ogrenotes_frontend::editor::commands::set_code_block_language(&tag, &current, Some(&dispatch)));
+                    state.update(|value| value.as_mut().unwrap().current = tag);
+                }) />
+            }
+        })
+    });
+    gloo_timers::future::TimeoutFuture::new(0).await;
+
+    let select: web_sys::HtmlSelectElement = container
+        .query_selector("select")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    assert_eq!(
+        select
+            .query_selector_all("option[value='mermaid']")
+            .unwrap()
+            .length(),
+        1
+    );
+    select.set_value("");
+    select
+        .dispatch_event(&web_sys::Event::new("change").unwrap())
+        .unwrap();
+    gloo_timers::future::TimeoutFuture::new(0).await;
+
+    let select: web_sys::HtmlSelectElement = container
+        .query_selector("select")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    assert_eq!(select.value(), "");
+    assert!(
+        view.container()
+            .query_selector(".mermaid-svg")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        view.state().doc.child(0).unwrap().text_content(),
+        ORBIT_MERMAID
+    );
+    assert_eq!(
+        view.state()
+            .doc
+            .child(0)
+            .unwrap()
+            .attrs()
+            .get("blockId")
+            .cloned(),
+        identity
+    );
+    assert_eq!(view.read_dom_selection().unwrap().from(), 9);
+    assert_eq!(
+        select
+            .query_selector_all("option[value='mermaid']")
+            .unwrap()
+            .length(),
+        1,
+        "Mermaid must remain selectable after switching to Plain text"
+    );
+    select.set_value("mermaid");
+    select
+        .dispatch_event(&web_sys::Event::new("change").unwrap())
+        .unwrap();
+    gloo_timers::future::TimeoutFuture::new(0).await;
+    assert_eq!(state.get().unwrap().current, "mermaid");
+    assert_orbit_diagram(&view);
+    assert_eq!(
+        view.state().doc.child(0).unwrap().text_content(),
+        ORBIT_MERMAID
+    );
+    assert_eq!(
+        view.state()
+            .doc
+            .child(0)
+            .unwrap()
+            .attrs()
+            .get("blockId")
+            .cloned(),
+        identity
+    );
+    assert_eq!(view.read_dom_selection().unwrap().from(), 9);
+
+    drop(handle);
+    owner.cleanup();
+    cleanup(&container);
+    cleanup(&editor_container);
+}
+
 // ─── Test Helpers ──────────────────────────────────────────────
 
 fn document() -> Document {
@@ -4508,6 +4649,1030 @@ fn ctrl_click_on_non_link_does_nothing() {
 }
 
 // ─── Markdown paste integration ─────────────────────────────────
+
+const ORBIT_MERMAID: &str = include_str!("fixtures/orbit.mmd");
+
+fn assert_orbit_diagram(view: &EditorView) {
+    let holder = view.container().query_selector(".mermaid-svg svg").unwrap();
+    assert!(
+        holder.is_some(),
+        "expected a rendered diagram, got: {}",
+        normalized_html(view)
+    );
+    let text = holder.unwrap().text_content().unwrap_or_default();
+    for label in [
+        "Foundation",
+        "Data and propagation",
+        "Plugins",
+        "Engines",
+        "Binaries",
+        "orbit-geo",
+        "orbit-plugin-loader",
+        "optional",
+    ] {
+        assert!(text.contains(label), "missing {label}: {text}");
+    }
+}
+
+#[wasm_bindgen_test]
+fn existing_mermaid_code_block_renders_orbit_diagram_and_keeps_source_editable() {
+    let container = create_container();
+    let mut attrs = HashMap::new();
+    attrs.insert("language".into(), "mermaid".into());
+    attrs.insert("blockId".into(), "orbit-diagram".into());
+    let block = Node::element_with_attrs(
+        NodeType::CodeBlock,
+        attrs,
+        Fragment::from(vec![Node::text(ORBIT_MERMAID)]),
+    );
+    let doc = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![
+            block,
+            Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("After diagram")]),
+            ),
+        ]),
+    );
+    let (view, txns) = create_editor(container.clone(), doc);
+    assert_orbit_diagram(&view);
+    assert_eq!(
+        view.container()
+            .query_selector("pre > code")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap(),
+        ORBIT_MERMAID
+    );
+    // SVG labels and shapes must not add cursor positions. Check both
+    // ends of the source and the following paragraph through the real DOM.
+    for pos in [
+        1,
+        9,
+        ORBIT_MERMAID.chars().count(),
+        ORBIT_MERMAID.chars().count() + 3,
+    ] {
+        set_cursor(&view, pos);
+        assert_eq!(view.read_dom_selection().unwrap().from(), pos);
+    }
+    set_cursor(&view, 1);
+    dispatch_before_input(view.container(), "insertText", Some("%% edited\n"));
+    apply_all(&view, &txns);
+    assert_eq!(
+        view.state().doc.child(0).unwrap().text_content(),
+        format!("%% edited\n{ORBIT_MERMAID}")
+    );
+    assert_orbit_diagram(&view);
+    assert_eq!(
+        view.state().doc.child(1).unwrap().text_content(),
+        "After diagram"
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn mermaid_code_block_parse_error_keeps_source_editable() {
+    let container = create_container();
+    let mut attrs = HashMap::new();
+    attrs.insert("language".into(), "mermaid".into());
+    let block = Node::element_with_attrs(
+        NodeType::CodeBlock,
+        attrs,
+        Fragment::from(vec![Node::text("not a diagram")]),
+    );
+    let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![block]));
+    let (view, txns) = create_editor(container.clone(), doc);
+    assert!(
+        view.container()
+            .query_selector(".mermaid-error")
+            .unwrap()
+            .is_some()
+    );
+    set_selection(&view, 1, "not a diagram".chars().count() + 1);
+    dispatch_paste(&view, &txns, ORBIT_MERMAID);
+    assert_eq!(
+        view.state().doc.child(0).unwrap().text_content(),
+        ORBIT_MERMAID
+    );
+    assert_orbit_diagram(&view);
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn paste_mermaid_markdown_renders_orbit_diagram() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste(&view, &txns, &format!("```mermaid\n{ORBIT_MERMAID}```"));
+    assert_orbit_diagram(&view);
+    assert!(view.state().selection.to() <= view.state().doc.content_size());
+    txns.borrow_mut().clear();
+    dispatch_keydown(view.container(), "z", true, false, false);
+    apply_all(&view, &txns);
+    assert_eq!(view.state().doc.text_content(), "");
+    assert!(
+        view.container()
+            .query_selector(".mermaid-svg")
+            .unwrap()
+            .is_none()
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn paste_mermaid_html_renders_orbit_diagram() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    let escaped = ORBIT_MERMAID
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let html = format!("<pre><code class=\"language-mermaid\">{escaped}</code></pre>");
+    dispatch_paste_html(&view, &txns, ORBIT_MERMAID, &html);
+    assert_orbit_diagram(&view);
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn mermaid_preview_does_not_shift_comment_source_offsets() {
+    let container = create_container();
+    let doc = code_block_doc(ORBIT_MERMAID, "mermaid");
+    let (view, _) = create_editor(container.clone(), doc);
+    let pre = view.container().query_selector("pre").unwrap().unwrap();
+    let (text, offset) = dom_position::find_text_offset_in_element(&pre, 9).unwrap();
+    assert_eq!(text.text_content().unwrap(), ORBIT_MERMAID);
+    assert_eq!(offset, 9);
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn nested_mermaid_pastes_keep_schema_valid() {
+    for html in [
+        "<blockquote><pre><code class=\"language-mermaid\">graph TD\nA --&gt; B</code></pre></blockquote>",
+        "<ul><li><pre><code class=\"language-mermaid\">graph TD\nA --&gt; B</code></pre></li></ul>",
+    ] {
+        let slice = ogrenotes_frontend::editor::clipboard::parse_from_html(html);
+        let doc = Node::element_with_content(NodeType::Doc, slice.content);
+        assert!(
+            ogrenotes_frontend::editor::schema::default_schema()
+                .validate(&doc)
+                .is_ok(),
+            "{doc:?}"
+        );
+    }
+    for md in [
+        "> ```mermaid\n> graph TD\n> A --> B\n> ```",
+        "- ```mermaid\n  graph TD\n  A --> B\n  ```",
+    ] {
+        let slice = ogrenotes_frontend::editor::markdown::parse_from_markdown(md);
+        let doc = Node::element_with_content(NodeType::Doc, slice.content);
+        assert!(
+            ogrenotes_frontend::editor::schema::default_schema()
+                .validate(&doc)
+                .is_ok(),
+            "{doc:?}"
+        );
+    }
+}
+
+#[wasm_bindgen_test]
+fn standalone_mermaid_paste_respects_destination_schema() {
+    for parent in [
+        NodeType::ListItem,
+        NodeType::Blockquote,
+        NodeType::TableCell,
+    ] {
+        let p = Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("before")]),
+        );
+        let child = Node::element_with_content(parent, Fragment::from(vec![p]));
+        let child = match parent {
+            NodeType::ListItem => {
+                Node::element_with_content(NodeType::BulletList, Fragment::from(vec![child]))
+            }
+            NodeType::TableCell => Node::element_with_content(
+                NodeType::Table,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::TableRow,
+                    Fragment::from(vec![child]),
+                )]),
+            ),
+            _ => child,
+        };
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![child]));
+        let pos = (0..doc.content_size())
+            .find_map(|pos| {
+                ogrenotes_frontend::editor::state::find_block_at(&doc, pos)
+                    .filter(|b| b.node_type == NodeType::Paragraph)
+                    .map(|b| b.content_start)
+            })
+            .unwrap();
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), doc);
+        set_cursor(&view, pos);
+        dispatch_paste(&view, &txns, "```mermaid\ngraph TD\nA --> B\n```");
+        assert!(
+            ogrenotes_frontend::editor::schema::default_schema()
+                .validate(&view.state().doc)
+                .is_ok(),
+            "{:?}",
+            view.state().doc
+        );
+        assert!(
+            view.container()
+                .query_selector(".mermaid-svg svg")
+                .unwrap()
+                .is_some()
+        );
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn pasted_mermaid_copy_and_cut_preserve_plain_text_source() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste(&view, &txns, &format!("```mermaid\n{ORBIT_MERMAID}```"));
+    for kind in ["copy", "cut"] {
+        set_selection(&view, 0, view.state().doc.content_size());
+        let dt = web_sys::DataTransfer::new().unwrap();
+        let init = web_sys::ClipboardEventInit::new();
+        init.set_clipboard_data(Some(&dt));
+        init.set_bubbles(true);
+        init.set_cancelable(true);
+        let event = web_sys::ClipboardEvent::new_with_event_init_dict(kind, &init).unwrap();
+        let desc = js_sys::Object::new();
+        js_sys::Reflect::set(&desc, &"value".into(), &dt).unwrap();
+        js_sys::Object::define_property(&event, &"clipboardData".into(), &desc);
+        view.container().dispatch_event(&event).unwrap();
+        assert_eq!(dt.get_data("text/plain").unwrap(), ORBIT_MERMAID);
+        apply_all(&view, &txns);
+    }
+    assert!(
+        view.container()
+            .query_selector(".mermaid-svg")
+            .unwrap()
+            .is_none()
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn mermaid_source_scroll_survives_editing_following_paragraph() {
+    let doc = web_sys::window().unwrap().document().unwrap();
+    let style = doc.create_element("style").unwrap();
+    style.set_text_content(Some(".mermaid-code-block > code {display:block;max-height:100px;overflow:auto;white-space:pre;}"));
+    doc.body().unwrap().append_child(&style).unwrap();
+    let mut attrs = HashMap::new();
+    attrs.insert("language".into(), "mermaid".into());
+    attrs.insert("blockId".into(), "scroll-diagram".into());
+    let model = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![
+            Node::element_with_attrs(
+                NodeType::CodeBlock,
+                attrs,
+                Fragment::from(vec![Node::text(ORBIT_MERMAID)]),
+            ),
+            Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("after")]),
+            ),
+        ]),
+    );
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), model);
+    let code: HtmlElement = view
+        .container()
+        .query_selector("pre > code")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    code.set_scroll_top(200);
+    let scroll = code.scroll_top();
+    assert!(scroll > 0);
+    set_cursor(&view, ORBIT_MERMAID.chars().count() + 3);
+    dispatch_before_input(view.container(), "insertText", Some("x"));
+    apply_all(&view, &txns);
+    let code: HtmlElement = view
+        .container()
+        .query_selector("pre > code")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    assert_eq!(code.scroll_top(), scroll);
+    style.remove();
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn mixed_mermaid_and_list_paste_keeps_diagram_inside_existing_list() {
+    for html in [false, true] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), bullet_list_doc("existing"));
+        set_cursor(&view, 3);
+        let plain = "```mermaid\ngraph TD\nA --> B\n```\n\n- item";
+        if html {
+            dispatch_paste_html(
+                &view,
+                &txns,
+                plain,
+                "<pre><code class=\"language-mermaid\">graph TD\nA --&gt; B</code></pre><ul><li>item</li></ul>",
+            );
+        } else {
+            dispatch_paste(&view, &txns, plain);
+        }
+        assert!(
+            view.state().doc.text_content().contains("graph TD"),
+            "{:?}",
+            view.state().doc
+        );
+        assert!(
+            view.container()
+                .query_selector(".mermaid-svg svg")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ogrenotes_frontend::editor::schema::default_schema()
+                .validate(&view.state().doc)
+                .is_ok()
+        );
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn empty_and_oversized_mermaid_pastes_recover_through_source_editing() {
+    for source in [
+        String::new(),
+        "x".repeat(ogrenotes_mermaid::MAX_SOURCE_LEN + 1),
+    ] {
+        for html in [false, true] {
+            let container = create_container();
+            let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+            set_cursor(&view, 1);
+            let markdown = format!("```mermaid\n{source}\n```");
+            if html {
+                let code = format!("<pre><code class=\"language-mermaid\">{source}</code></pre>");
+                dispatch_paste_html(&view, &txns, &markdown, &code);
+            } else {
+                dispatch_paste(&view, &txns, &markdown);
+            }
+            let block = view.state().doc.child(0).unwrap().clone();
+            assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+            assert!(
+                view.container()
+                    .query_selector(".mermaid-error")
+                    .unwrap()
+                    .is_some()
+            );
+            let identity = block.attrs().get("blockId").cloned();
+            set_selection(&view, 1, 1 + block.text_content().chars().count());
+            dispatch_paste(&view, &txns, ORBIT_MERMAID);
+            assert_eq!(
+                view.state().doc.child(0).unwrap().text_content(),
+                ORBIT_MERMAID
+            );
+            assert_eq!(
+                view.state()
+                    .doc
+                    .child(0)
+                    .unwrap()
+                    .attrs()
+                    .get("blockId")
+                    .cloned(),
+                identity
+            );
+            assert_orbit_diagram(&view);
+            cleanup(&container);
+        }
+    }
+}
+
+#[wasm_bindgen_test]
+fn mermaid_source_is_not_clipped_by_a_separate_vertical_scroller() {
+    let doc = document();
+    let style = doc.create_element("style").unwrap();
+    style.set_text_content(Some(include_str!("../style/main.css")));
+    doc.body().unwrap().append_child(&style).unwrap();
+    let container = create_container();
+    let (view, _) = create_editor(container.clone(), code_block_doc(ORBIT_MERMAID, "mermaid"));
+    let code: HtmlElement = view
+        .container()
+        .query_selector("pre > code")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    let height = code.client_height();
+    let scroll_height = code.scroll_height();
+    style.remove();
+    cleanup(&container);
+    assert!(
+        height >= scroll_height,
+        "source must stay in the normal document flow: {height} vs {scroll_height}"
+    );
+}
+
+fn dispatch_clipboard_copy(view: &EditorView) -> web_sys::DataTransfer {
+    let dt = web_sys::DataTransfer::new().unwrap();
+    let init = web_sys::ClipboardEventInit::new();
+    init.set_clipboard_data(Some(&dt));
+    init.set_bubbles(true);
+    init.set_cancelable(true);
+    let event = web_sys::ClipboardEvent::new_with_event_init_dict("copy", &init).unwrap();
+    let desc = js_sys::Object::new();
+    js_sys::Reflect::set(&desc, &"value".into(), &dt).unwrap();
+    js_sys::Object::define_property(&event, &"clipboardData".into(), &desc);
+    view.container().dispatch_event(&event).unwrap();
+    dt
+}
+
+#[wasm_bindgen_test]
+fn source_selection_copy_paste_preserves_exact_text() {
+    let container = create_container();
+    let source = "graph TD\nA[identifier] --> B\n";
+    let (view, txns) = create_editor(container.clone(), code_block_doc(source, "mermaid"));
+    let start = 1 + source.find("identifier").unwrap();
+    set_selection(&view, start, start + "identifier".len());
+    let dt = dispatch_clipboard_copy(&view);
+    assert_eq!(dt.get_data("text/plain").unwrap(), "identifier");
+    dispatch_paste_html(
+        &view,
+        &txns,
+        &dt.get_data("text/plain").unwrap(),
+        &dt.get_data("text/html").unwrap(),
+    );
+    assert_eq!(view.state().doc.child(0).unwrap().text_content(), source);
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn empty_mermaid_alongside_list_remains_recoverable_in_existing_list() {
+    for html in [false, true] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), bullet_list_doc("existing"));
+        set_cursor(&view, 3);
+        let plain = "```mermaid\n\n```\n\n- item";
+        if html {
+            dispatch_paste_html(
+                &view,
+                &txns,
+                plain,
+                "<pre><code class=\"language-mermaid\"></code></pre><ul><li>item</li></ul>",
+            );
+        } else {
+            dispatch_paste(&view, &txns, plain);
+        }
+        let model = view.state().doc;
+        let code = (0..model.content_size())
+            .find_map(|pos| {
+                ogrenotes_frontend::editor::state::find_block_at(&model, pos)
+                    .filter(|b| b.node_type == NodeType::CodeBlock)
+            })
+            .expect("empty source must remain editable");
+        set_selection(
+            &view,
+            code.content_start,
+            code.content_start + code.content.size(),
+        );
+        dispatch_paste(&view, &txns, ORBIT_MERMAID);
+        assert_orbit_diagram(&view);
+        assert!(view.state().doc.text_content().contains("existing"));
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn mermaid_pre_horizontal_scroll_survives_following_paragraph_edit() {
+    let doc = document();
+    let style = doc.create_element("style").unwrap();
+    style.set_text_content(Some(include_str!("../style/main.css")));
+    doc.body().unwrap().append_child(&style).unwrap();
+    let source = format!("%% {}\n{ORBIT_MERMAID}", "x".repeat(1000));
+    let mut attrs = HashMap::new();
+    attrs.insert("language".into(), "mermaid".into());
+    attrs.insert("blockId".into(), "horizontal-scroll".into());
+    let model = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![
+            Node::element_with_attrs(
+                NodeType::CodeBlock,
+                attrs,
+                Fragment::from(vec![Node::text(&source)]),
+            ),
+            Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("after")]),
+            ),
+        ]),
+    );
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), model);
+    let pre: HtmlElement = view
+        .container()
+        .query_selector("pre")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    pre.set_scroll_left(200);
+    let scroll = pre.scroll_left();
+    assert!(scroll > 0);
+    set_cursor(&view, source.chars().count() + 3);
+    dispatch_before_input(view.container(), "insertText", Some("x"));
+    apply_all(&view, &txns);
+    let pre: HtmlElement = view
+        .container()
+        .query_selector("pre")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    let after = pre.scroll_left();
+    style.remove();
+    cleanup(&container);
+    assert_eq!(after, scroll);
+}
+
+#[wasm_bindgen_test]
+fn html_only_source_paste_keeps_editable_code_identity() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), code_block_doc("old", "mermaid"));
+    let identity = view
+        .state()
+        .doc
+        .child(0)
+        .unwrap()
+        .attrs()
+        .get("blockId")
+        .cloned();
+    set_selection(&view, 1, 4);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "",
+        "<pre><code class=\"language-mermaid\">graph TD\nA --&gt; B</code></pre>",
+    );
+    let block = view.state().doc.child(0).unwrap().clone();
+    assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+    assert_eq!(block.text_content(), "graph TD\nA --> B");
+    assert_eq!(block.attrs().get("blockId").cloned(), identity);
+    assert!(
+        view.container()
+            .query_selector("pre > code")
+            .unwrap()
+            .is_some()
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn html_mermaid_code_breaks_keep_source_newlines_and_html_labels() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    let source = "graph TD\nA[hello<br/>world] --> B";
+    dispatch_paste_html(
+        &view,
+        &txns,
+        source,
+        "<pre><code class=\"language-mermaid\">graph TD<br>A[hello&lt;br/&gt;world] --&gt; B</code></pre>",
+    );
+    assert_eq!(
+        view.state()
+            .doc
+            .child(0)
+            .unwrap()
+            .attrs()
+            .get("source")
+            .map(String::as_str),
+        Some(source)
+    );
+    assert!(
+        view.container()
+            .query_selector(".mermaid-svg svg")
+            .unwrap()
+            .is_some()
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+async fn invalid_pasted_mermaid_opens_modal_and_recovers_with_exact_source() {
+    use leptos::prelude::*;
+    use mermaid_modal::{MermaidModal, MermaidModalOutcome};
+    let editor_container = create_container();
+    let (view, txns) = create_editor(editor_container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste(&view, &txns, "```mermaid\nnot a diagram\n```");
+    assert!(
+        view.container()
+            .query_selector(".mermaid-error")
+            .unwrap()
+            .is_some()
+    );
+    let view = std::rc::Rc::new(view);
+    let owner = Owner::new();
+    let state = owner.with(|| RwSignal::new(None::<mermaid_modal::MermaidModalState>));
+    let listener =
+        wasm_bindgen::closure::Closure::wrap(Box::new(move |event: web_sys::MouseEvent| {
+            if let Some(open) = mermaid_modal::mermaid_click_outcome(&event) {
+                state.set(Some(open));
+            }
+        }) as Box<dyn Fn(web_sys::MouseEvent)>);
+    view.container()
+        .add_event_listener_with_callback("click", listener.as_ref().unchecked_ref())
+        .unwrap();
+    let modal_container = create_container();
+    let callback_view = send_wrapper::SendWrapper::new(std::rc::Rc::clone(&view));
+    let handle = owner.with(|| leptos::mount::mount_to(modal_container.clone(), move || view! {
+        <MermaidModal state=state on_outcome=Callback::new(move |outcome| {
+            if let MermaidModalOutcome::Save { block_id, source } = outcome {
+                let current = callback_view.state();
+                let dispatch = |txn| callback_view.update_state(current.apply(txn));
+                assert!(ogrenotes_frontend::editor::commands::update_mermaid_source(&block_id, source, &current, Some(&dispatch)));
+            }
+        }) />
+    }));
+    let event_init = web_sys::MouseEventInit::new();
+    event_init.set_bubbles(true);
+    let click = web_sys::MouseEvent::new_with_mouse_event_init_dict("click", &event_init).unwrap();
+    view.container()
+        .query_selector(".mermaid-error")
+        .unwrap()
+        .unwrap()
+        .dispatch_event(&click)
+        .unwrap();
+    gloo_timers::future::TimeoutFuture::new(0).await;
+    let textarea: web_sys::HtmlTextAreaElement = modal_container
+        .query_selector("textarea")
+        .unwrap()
+        .expect("click opens actual Mermaid modal")
+        .unchecked_into();
+    assert!(textarea.value().contains("not a diagram"));
+    textarea.set_value(ORBIT_MERMAID);
+    textarea
+        .dispatch_event(&web_sys::Event::new("input").unwrap())
+        .unwrap();
+    gloo_timers::future::TimeoutFuture::new(0).await;
+    let save: web_sys::HtmlElement = modal_container
+        .query_selector("button.btn-primary")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    save.click();
+    gloo_timers::future::TimeoutFuture::new(20).await;
+    assert_eq!(
+        view.state()
+            .doc
+            .child(0)
+            .unwrap()
+            .attrs()
+            .get("source")
+            .map(String::as_str),
+        Some(ORBIT_MERMAID)
+    );
+    assert_orbit_diagram(&view);
+    view.container()
+        .remove_event_listener_with_callback("click", listener.as_ref().unchecked_ref())
+        .unwrap();
+    drop(handle);
+    owner.cleanup();
+    cleanup(&modal_container);
+    cleanup(&editor_container);
+    gloo_timers::future::TimeoutFuture::new(0).await;
+}
+
+#[wasm_bindgen_test]
+fn mermaid_language_on_pre_renders_diagram() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "graph TD\nA --> B",
+        "<pre class=\"language-mermaid\">graph TD\nA --&gt; B</pre>",
+    );
+    assert_eq!(
+        view.state().doc.child(0).unwrap().node_type(),
+        Some(NodeType::Mermaid)
+    );
+    assert!(
+        view.container()
+            .query_selector(".mermaid-svg svg")
+            .unwrap()
+            .is_some()
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn html_only_source_paste_preserves_sibling_text() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), code_block_doc("old", "mermaid"));
+    set_selection(&view, 1, 4);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "",
+        "<pre><code>graph TD\nA --&gt; B</code></pre>\nB --&gt; C",
+    );
+    assert!(
+        view.state()
+            .doc
+            .child(0)
+            .unwrap()
+            .text_content()
+            .contains("B --> C")
+    );
+    assert!(
+        view.container()
+            .query_selector(".mermaid-svg svg")
+            .unwrap()
+            .is_some()
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn tagged_pre_boundary_sources_remain_editable_code() {
+    for source in [
+        String::new(),
+        "x".repeat(ogrenotes_mermaid::MAX_SOURCE_LEN + 1),
+    ] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+        set_cursor(&view, 1);
+        dispatch_paste_html(
+            &view,
+            &txns,
+            "",
+            &format!("<pre class=\"language-mermaid\">{source}</pre>"),
+        );
+        let block = view.state().doc.child(0).unwrap().clone();
+        assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+        assert_eq!(
+            block.attrs().get("language").map(String::as_str),
+            Some("mermaid")
+        );
+        assert_eq!(block.text_content(), source);
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn source_paste_ignores_active_stored_marks() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), code_block_doc("old", "mermaid"));
+    let state = view.state();
+    view.update_state(EditorState {
+        selection: Selection::cursor(1),
+        stored_marks: Some(vec![Mark::new(MarkType::Bold)]),
+        ..state
+    });
+    dispatch_paste(&view, &txns, "graph TD\nA --> B");
+    let block = view.state().doc.child(0).unwrap().clone();
+    assert!((0..block.child_count()).all(|i| block.child(i).unwrap().marks().is_empty()));
+    assert!(
+        view.container()
+            .query_selector("pre > code strong")
+            .unwrap()
+            .is_none()
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn source_paste_keeps_text_outside_code_within_pre() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), code_block_doc("old", "mermaid"));
+    set_selection(&view, 1, 4);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "",
+        "<pre><code>graph TD\nA --&gt; B</code>\nB --&gt; C</pre>",
+    );
+    assert_eq!(
+        view.state().doc.child(0).unwrap().text_content(),
+        "graph TD\nA --> B\nB --> C"
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn diagram_html_import_keeps_text_outside_code_within_pre() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "",
+        "<pre><code class=\"language-mermaid\">graph TD\nA --&gt; B</code>\nB --&gt; C</pre>",
+    );
+    assert_eq!(
+        view.state()
+            .doc
+            .child(0)
+            .unwrap()
+            .attrs()
+            .get("source")
+            .map(String::as_str),
+        Some("graph TD\nA --> B\nB --> C")
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn empty_html_source_replaces_selected_source() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), code_block_doc("old", "mermaid"));
+    let identity = view
+        .state()
+        .doc
+        .child(0)
+        .unwrap()
+        .attrs()
+        .get("blockId")
+        .cloned();
+    set_selection(&view, 1, 4);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "",
+        "<pre><code class=\"language-mermaid\"></code></pre>",
+    );
+    let block = view.state().doc.child(0).unwrap().clone();
+    assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+    assert_eq!(block.text_content(), "");
+    assert_eq!(block.attrs().get("blockId").cloned(), identity);
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn html_source_coalesces_wrappers_and_preserves_explicit_newline_runs() {
+    for (breaks, source_breaks) in [
+        ("\n", "\n"),
+        ("<span>\n</span>", "\n"),
+        ("<span><em>\n</em></span>", "\n"),
+        ("<div><span>\n</span></div>", "\n\n"),
+        ("\n\n", "\n\n"),
+        ("\n\n\n", "\n\n\n"),
+        ("<br>", "\n\n"),
+        ("<div><br></div>", "\n\n"),
+        ("<div>\n</div>", "\n\n"),
+    ] {
+        let html = format!(
+            "<pre><code class=\"language-mermaid\"><div>graph TD</div>{breaks}<div>A --&gt; B</div></code></pre>"
+        );
+        let expected = format!("graph TD{source_breaks}A --> B");
+        for editing in [false, true] {
+            let container = create_container();
+            let (view, txns) = create_editor(
+                container.clone(),
+                if editing {
+                    code_block_doc("old", "mermaid")
+                } else {
+                    Node::empty_doc()
+                },
+            );
+            if editing {
+                set_selection(&view, 1, 4);
+            } else {
+                set_cursor(&view, 1);
+            }
+            dispatch_paste_html(&view, &txns, "", &html);
+            let block = view.state().doc.child(0).unwrap().clone();
+            let source = if editing {
+                block.text_content()
+            } else {
+                block.attrs().get("source").unwrap().clone()
+            };
+            assert_eq!(
+                source, expected,
+                "explicit newline runs must replace synthetic block boundaries"
+            );
+            cleanup(&container);
+        }
+    }
+}
+
+#[wasm_bindgen_test]
+fn source_paste_keeps_supported_block_container_boundaries() {
+    for tag in [
+        "section",
+        "article",
+        "header",
+        "footer",
+        "main",
+        "nav",
+        "aside",
+        "figure",
+        "figcaption",
+        "details",
+        "summary",
+        "address",
+        "center",
+    ] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), code_block_doc("old", "mermaid"));
+        set_selection(&view, 1, 4);
+        dispatch_paste_html(
+            &view,
+            &txns,
+            "",
+            &format!("<{tag}>graph TD</{tag}><{tag}>A --&gt; B</{tag}>"),
+        );
+        assert_eq!(
+            view.state().doc.child(0).unwrap().text_content(),
+            "graph TD\nA --> B",
+            "{tag}"
+        );
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn mermaid_paste_over_rule_in_quote_without_text_blocks_keeps_schema() {
+    let doc = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![Node::element_with_content(
+            NodeType::Blockquote,
+            Fragment::from(vec![Node::element(NodeType::HorizontalRule)]),
+        )]),
+    );
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), doc);
+    let state = view.state();
+    let selection = Selection::node(&state.doc, 1).unwrap();
+    view.update_state(EditorState { selection, ..state });
+    dispatch_paste(&view, &txns, "```mermaid\ngraph TD\nA --> B\n```");
+    let doc = view.state().doc;
+    assert!(
+        ogrenotes_frontend::editor::schema::default_schema()
+            .validate(&doc)
+            .is_ok(),
+        "{doc:?}"
+    );
+    assert_eq!(
+        doc.child(0).unwrap().child(0).unwrap().node_type(),
+        Some(NodeType::CodeBlock)
+    );
+    assert!(
+        view.container()
+            .query_selector(".mermaid-svg svg")
+            .unwrap()
+            .is_some()
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn whole_mermaid_code_copy_paste_round_trip_preserves_exact_source() {
+    let source = "graph TD\nA --> B";
+    for quoted in [false, true] {
+        let mut doc = code_block_doc(source, "mermaid");
+        if quoted {
+            doc = Node::element_with_content(
+                NodeType::Doc,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::Blockquote,
+                    Fragment::from(vec![doc.child(0).unwrap().clone()]),
+                )]),
+            );
+        }
+        let start = if quoted { 2 } else { 1 };
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), doc);
+        set_cursor(&view, start);
+        dispatch_keydown(view.container(), "a", true, false, false);
+        apply_all(&view, &txns);
+        let clipboard = dispatch_clipboard_copy(&view);
+        let text = clipboard.get_data("text/plain").unwrap();
+        assert_eq!(text, source, "quoted={quoted}");
+        set_selection(&view, start, start + source.chars().count());
+        dispatch_paste_html(
+            &view,
+            &txns,
+            &text,
+            &clipboard.get_data("text/html").unwrap(),
+        );
+        let doc = view.state().doc;
+        let block = if quoted {
+            doc.child(0).unwrap().child(0).unwrap()
+        } else {
+            doc.child(0).unwrap()
+        };
+        assert_eq!(block.text_content(), source);
+        cleanup(&container);
+    }
+}
 
 #[wasm_bindgen_test]
 fn paste_markdown_heading_creates_h1_in_dom() {

@@ -33,6 +33,26 @@ pub struct MermaidModalState {
     pub source: String,
 }
 
+/// Parse a click on the editor container for a Mermaid
+/// click-to-edit hit. Returns the modal state to open, or `None`
+/// for clicks that don't hit `[data-mermaid-action="edit"]` (so the
+/// click falls through to normal editor handling).
+///
+/// The block's current `source` is read off the `data-source`
+/// attribute `MermaidView::render` stamps on the `.mermaid-block`
+/// wrapper (see `editor/blocks/mermaid.rs`) — there's no separate
+/// model lookup here, mirroring how `calendar_click_outcome` reads
+/// event fields straight off the DOM.
+pub(crate) fn mermaid_click_outcome(ev: &web_sys::MouseEvent) -> Option<MermaidModalState> {
+    use wasm_bindgen::JsCast;
+    let target = ev.target()?.dyn_into::<web_sys::Element>().ok()?;
+    let action_el = target.closest("[data-mermaid-action]").ok()??;
+    let block_el = action_el.closest(".mermaid-block").ok()??;
+    let block_id = block_el.get_attribute("data-block-id")?;
+    let source = block_el.get_attribute("data-source").unwrap_or_default();
+    Some(MermaidModalState { block_id, source })
+}
+
 /// Everything the parent needs to route the modal's result.
 #[derive(Debug, Clone)]
 pub enum MermaidModalOutcome {

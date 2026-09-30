@@ -6048,6 +6048,15 @@ tr:hover .folder-row-actions,
   max-width: 100%;
   height: auto;
 }
+.editor-content pre.mermaid-code-block > .mermaid-svg {
+  white-space: normal;
+  margin-bottom: var(--space-md);
+  color: var(--color-text);
+}
+.editor-content pre.mermaid-code-block > code {
+  display: block;
+  white-space: pre;
+}
 .mermaid-error {
   color: var(--color-danger, #c33);
   margin: 0 0 var(--space-sm);

@@ -284,6 +284,9 @@ fn walk_text_nodes(
             *pos += len;
         } else if child.node_type() == web_sys::Node::ELEMENT_NODE {
             if let Some(el) = child.dyn_ref::<web_sys::Element>() {
+                if el.has_attribute("data-sentinel") {
+                    continue;
+                }
                 // Leaf inline elements (e.g. <br> for HardBreak) count as 1
                 // position in the editor model but have no text content.
                 if el.tag_name().eq_ignore_ascii_case("br") {

@@ -1,0 +1,53 @@
+graph BT
+  subgraph Foundation
+    geo[orbit-geo<br/>time, frames, geodesy, LOS]
+    link[orbit-link<br/>RF budget, ITU-R models]
+    api[orbit-plugin-api<br/>contract, FFI shims]
+  end
+  subgraph Data_and_propagation[Data and propagation]
+    catalog[orbit-catalog<br/>TLE, OMM, OEM, SP3]
+    prop[orbit-prop<br/>SGP4, Kepler+J2, Walker]
+  end
+  subgraph Plugins
+    host[orbit-plugin-host<br/>registry, dispatch]
+    loader[orbit-plugin-loader<br/>cdylib loading]
+    builtins[orbit-builtins<br/>built-in constraints]
+    dylib[orbit-builtins-dylib]
+    testkit[orbit-plugin-testkit]
+  end
+  subgraph Engines
+    net[orbit-net<br/>windows, topology, routing]
+    sched[orbit-sched<br/>antenna scheduling]
+    emp[orbit-empirical<br/>SatNOGS, DSN Now]
+  end
+  subgraph Binaries
+    cli[orbit-cli<br/>the orbit command]
+    bench[orbit-bench]
+  end
+  catalog --> geo
+  prop --> geo
+  prop --> catalog
+  host --> api
+  loader --> api
+  loader --> host
+  builtins --> api
+  builtins --> geo
+  builtins --> link
+  dylib --> builtins
+  net --> prop
+  net --> catalog
+  net --> host
+  net --> builtins
+  net --> link
+  sched --> net
+  sched --> host
+  emp --> net
+  emp --> sched
+  cli --> net
+  cli --> sched
+  cli --> emp
+  cli -. optional .-> loader
+  bench --> cli
+  bench --> loader
+  testkit --> net
+  testkit --> loader

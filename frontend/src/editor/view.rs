@@ -10,6 +10,72 @@ use super::model::{char_len, Mark, MarkType, Node, NodeType};
 use super::selection::Selection;
 use super::state::{EditorState, Transaction};
 
+fn mermaid_scroll_panes(container: &HtmlElement) -> Vec<(String, HtmlElement)> {
+    let Ok(nodes) =
+        container.query_selector_all("pre.mermaid-code-block, pre.mermaid-code-block > code")
+    else {
+        return Vec::new();
+    };
+    (0..nodes.length())
+        .filter_map(|i| {
+            let element = nodes.item(i)?.dyn_into::<HtmlElement>().ok()?;
+            let key = if element.tag_name().eq_ignore_ascii_case("pre") {
+                format!("block:{}", element.get_attribute("data-block-id")?)
+            } else {
+                format!(
+                    "source:{}",
+                    element.parent_element()?.get_attribute("data-block-id")?
+                )
+            };
+            Some((key, element))
+        })
+        .collect()
+}
+
+fn clipboard_text_for_selection(state: &EditorState, slice: &super::model::Slice) -> String {
+    // A sole code block can be selected together with structural wrappers.
+    // Those wrappers contribute no source characters to its plain-text copy.
+    let mut selected = slice.content.children.as_slice();
+    while let [node] = selected {
+        match node {
+            Node::Element {
+                node_type: NodeType::CodeBlock,
+                ..
+            } => return node.text_content(),
+            Node::Element {
+                node_type, content, ..
+            } if node_type.is_block() && !node_type.is_textblock() && !node_type.is_atom() => {
+                selected = content.children.as_slice();
+            }
+            _ => break,
+        }
+    }
+    let from = state.selection.from();
+    let block = super::state::find_block_at(&state.doc, from).or_else(|| {
+        from.checked_add(1)
+            .and_then(|pos| super::state::find_block_at(&state.doc, pos))
+    });
+    if let Some(block) = block.filter(|block| {
+        block.node_type == NodeType::CodeBlock
+            && state.selection.to() <= block.offset + block.node_size
+    }) {
+        let from = from.saturating_sub(block.content_start);
+        let to = state
+            .selection
+            .to()
+            .saturating_sub(block.content_start)
+            .min(block.content.size());
+        return block
+            .content
+            .cut(from, to)
+            .children
+            .iter()
+            .map(Node::text_content)
+            .collect();
+    }
+    super::clipboard::serialize_to_text(slice)
+}
+
 /// The editor view: bridges the document model and the browser DOM.
 /// Owns the contenteditable element, renders the model, handles input.
 pub struct EditorView {
@@ -155,6 +221,11 @@ impl EditorView {
 
         let state = self.state.borrow();
 
+        let scroll_positions: std::collections::HashMap<_, _> =
+            mermaid_scroll_panes(&self.container)
+                .into_iter()
+                .map(|(id, code)| (id, (code.scroll_top(), code.scroll_left())))
+                .collect();
         self.container.set_inner_html("");
 
         if let Node::Element { content, .. } = &state.doc {
@@ -167,6 +238,12 @@ impl EditorView {
             }
         }
 
+        for (id, code) in mermaid_scroll_panes(&self.container) {
+            if let Some((top, left)) = scroll_positions.get(&id) {
+                code.set_scroll_top(*top);
+                code.set_scroll_left(*left);
+            }
+        }
         self.sync_selection_to_dom(&state.selection);
     }
 
@@ -774,7 +851,7 @@ impl EditorView {
             }
 
             let html = super::clipboard::serialize_to_html(&slice);
-            let text = super::clipboard::serialize_to_text(&slice);
+            let text = clipboard_text_for_selection(&state_with_sel, &slice);
             clipboard_data.set_data("text/html", &html).ok();
             clipboard_data.set_data("text/plain", &text).ok();
         }) as Box<dyn Fn(web_sys::Event)>);
@@ -801,7 +878,7 @@ impl EditorView {
             }
 
             let html = super::clipboard::serialize_to_html(&slice);
-            let text = super::clipboard::serialize_to_text(&slice);
+            let text = clipboard_text_for_selection(&state_with_sel, &slice);
             clipboard_data.set_data("text/html", &html).ok();
             clipboard_data.set_data("text/plain", &text).ok();
 
@@ -842,6 +919,38 @@ impl EditorView {
             // verbatim with the syntax characters still visible.
             let html = clipboard_data.get_data("text/html").unwrap_or_default();
             let text = clipboard_data.get_data("text/plain").unwrap_or_default();
+            // Source pasted within one code block is literal text. Parsing
+            // it as Markdown would collapse newlines and consume HTML tags
+            // such as Mermaid's <br/> labels before the renderer sees them.
+            if (!text.is_empty() || !html.is_empty())
+                && let Some(rp) =
+                    super::position::resolve(&state_with_sel.doc, state_with_sel.selection.from())
+                && rp.node_at(rp.depth, &state_with_sel.doc).node_type()
+                    == Some(NodeType::CodeBlock)
+                && state_with_sel.selection.to() <= rp.end(rp.depth, &state_with_sel.doc)
+            {
+                let source = if !text.is_empty() {
+                    Some(text.clone())
+                } else {
+                    super::clipboard::literal_text_from_html(&html)
+                };
+                let Some(source) = source else {
+                    return;
+                };
+                let literal = super::clipboard::normalize_line_endings(&source);
+                let txn = state_with_sel
+                    .transaction()
+                    .set_stored_marks(Some(Vec::new()));
+                let replacement = if literal.is_empty() {
+                    txn.delete_selection()
+                } else {
+                    txn.insert_text(&literal)
+                };
+                if let Ok(txn) = replacement {
+                    dispatch_paste(txn);
+                }
+                return;
+            }
             super::debug::log("paste", "clipboard", &[
                 ("html_len", &html.len().to_string()),
                 ("html_preview", &html.chars().take(500).collect::<String>()),
@@ -907,6 +1016,10 @@ impl EditorView {
                 let plain_pre_wrapper = html_slice.content.children.len() == 1
                     && html_slice.content.children[0].node_type()
                         == Some(super::model::NodeType::CodeBlock)
+                    && html_slice.content.children[0]
+                        .attrs()
+                        .get("language")
+                        .is_none_or(|language| language.is_empty())
                     && !has_code_element;
                 let trivial = super::markdown::is_trivial_slice(&html_slice);
                 if !text.is_empty() && (trivial || plain_pre_wrapper) {
@@ -1017,6 +1130,7 @@ impl EditorView {
                             | Some(super::model::NodeType::HorizontalRule)
                             | Some(super::model::NodeType::Table)
                             | Some(super::model::NodeType::Image)
+                            | Some(super::model::NodeType::Mermaid)
                     )
                 });
 
@@ -1298,6 +1412,25 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                         pre.set_attribute("data-block-id", bid).ok()?;
                     }
                     apply_block_align(&pre, attrs);
+                    // Legacy/imported Mermaid code blocks keep their editable
+                    // source and model positions, with a rendering-only preview.
+                    if attrs.get("language").is_some_and(|lang| lang == "mermaid") {
+                        let preview = doc.create_element("div").ok()?;
+                        preview.set_attribute("data-sentinel", "").ok()?;
+                        preview.set_attribute("contenteditable", "false").ok()?;
+                        match super::blocks::mermaid::render_cached(&node.text_content()) {
+                            Ok(svg) => {
+                                preview.set_attribute("class", "mermaid-svg").ok()?;
+                                preview.set_inner_html(&svg);
+                            }
+                            Err(message) => {
+                                preview.set_attribute("class", "mermaid-error").ok()?;
+                                preview.set_text_content(Some(&message));
+                            }
+                        }
+                        pre.set_attribute("class", "mermaid-code-block").ok()?;
+                        pre.append_child(&preview).ok()?;
+                    }
                     let code = doc.create_element("code").ok()?;
                     if let Some(lang) = attrs.get("language") {
                         if !lang.is_empty() {
@@ -1901,6 +2034,9 @@ fn find_in_element(
             *pos += text_len;
         } else if child.node_type() == DomNode::ELEMENT_NODE {
             let el = child.dyn_ref::<Element>()?;
+            if is_sentinel(el) {
+                continue;
+            }
             let tag = el.tag_name().to_lowercase();
             let atom_size = read_atom_size(el);
 
@@ -1939,9 +2075,6 @@ fn find_in_element(
                 }
                 *pos += atom_size;
             } else if is_leaf_tag(&tag) {
-                if is_sentinel(el) {
-                    continue; // skip rendering-only <br>
-                }
                 if target == *pos {
                     return Some((element.clone().into(), i as usize));
                 }
@@ -2015,6 +2148,12 @@ fn dom_to_model_walk(
             *pos += char_len(&text);
         } else if child.node_type() == DomNode::ELEMENT_NODE {
             let el = child.dyn_ref::<Element>()?;
+            if is_sentinel(el) {
+                if el.contains(Some(target_node)) {
+                    return Some(*pos);
+                }
+                continue;
+            }
             let tag = el.tag_name().to_lowercase();
             let atom_size = read_atom_size(el);
 
@@ -2041,9 +2180,6 @@ fn dom_to_model_walk(
                 }
                 *pos += atom_size;
             } else if is_leaf_tag(&tag) {
-                if is_sentinel(el) {
-                    continue; // skip rendering-only <br>
-                }
                 if child.is_same_node(Some(target_node)) {
                     return Some(*pos);
                 }
@@ -2067,6 +2203,9 @@ fn dom_node_model_size(node: &DomNode) -> usize {
         char_len(&node.text_content().unwrap_or_default())
     } else if node.node_type() == DomNode::ELEMENT_NODE {
         if let Some(el) = node.dyn_ref::<Element>() {
+            if is_sentinel(el) {
+                return 0;
+            }
             let tag = el.tag_name().to_lowercase();
             let atom_size = read_atom_size(el);
             if is_mark_tag(&tag) && atom_size.is_none() {
@@ -2084,7 +2223,7 @@ fn dom_node_model_size(node: &DomNode) -> usize {
             } else if let Some(atom_size) = atom_size {
                 atom_size
             } else if is_leaf_tag(&tag) {
-                if is_sentinel(el) { 0 } else { 1 }
+                1
             } else {
                 let children = el.child_nodes();
                 let mut size = 2; // open + close
@@ -2124,7 +2263,8 @@ fn is_leaf_tag(tag: &str) -> bool {
     matches!(tag, "hr" | "br" | "img")
 }
 
-/// Check if a DOM element is a sentinel `<br>` (rendering artifact, not a model node).
+/// Rendering-only elements (line-break sentinels and diagram previews)
+/// contribute no model positions, including their entire subtree.
 fn is_sentinel(el: &Element) -> bool {
     el.has_attribute("data-sentinel")
 }
