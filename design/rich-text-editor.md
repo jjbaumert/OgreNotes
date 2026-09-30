@@ -668,7 +668,7 @@ Default 100. Higher values load first, affecting plugin order and schema precede
 | **DetailsSummary** | `<summary>` | `inline*` | Summary text |
 | **DetailsContent** | `<div>` | `block+` | Collapsible body |
 | **Emoji** | inline atom | leaf | Unicode emoji; suggestion integration |
-| **Mathematics** | inline/block | leaf | KaTeX rendering; `$...$` input rule |
+| **Mathematics** | inline/block | leaf | Shipped as `MathInline` / `MathBlock`: LaTeX in a `source` attr, rendered to MathML Core by the in-house `crates/math` (no KaTeX/JS), STIX Two Math font; `$...$` input rule (inline), "Equation" insert entry (block) |
 | **YouTube** | `<iframe>` | leaf | YouTube embed with video options |
 | **Audio** | `<audio>` | leaf | Audio player with controls |
 

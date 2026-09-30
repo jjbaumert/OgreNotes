@@ -638,9 +638,17 @@ echo "Build context: $(pwd)"
 # `RUN --mount=type=cache,…` cache mounts in Dockerfile to take effect.
 # Without it the cache mounts silently degrade to no-op bind dirs and
 # every build re-fetches all crates.
+# The image compiles dev-login out unless this stack runs DEV_MODE=true,
+# the one case that needs it (see the Dockerfile's CARGO_FEATURES).
+DEV_LOGIN_FEATURES=""
+if [ "${DEV_MODE:-false}" = "true" ]; then
+    DEV_LOGIN_FEATURES="dev-login,xlsx,docx,pdf"
+    echo "DEV_MODE=true: building the image WITH the dev-login endpoint."
+fi
 echo "Building Docker image..."
 DOCKER_BUILDKIT=1 docker build \
     --build-arg "GIT_HASH=${GIT_STAMP}" \
+    ${DEV_LOGIN_FEATURES:+--build-arg "CARGO_FEATURES=${DEV_LOGIN_FEATURES}"} \
     --tag "${ECR_REPO}:latest" \
     --tag "${ECR_REPO}:${GIT_STAMP}" \
     -f Dockerfile .
