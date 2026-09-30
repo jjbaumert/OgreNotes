@@ -943,6 +943,9 @@ impl EditorView {
                 super::debug::warn("paste", "parsed slice is empty");
                 return;
             }
+            // `$…$` in pasted text (rich or plain) becomes an equation,
+            // as it would have if typed.
+            let slice = super::paste_math::convert_inline_math(slice);
 
             // Determine paste context and strategy
             let pos = state_with_sel.selection.from();
