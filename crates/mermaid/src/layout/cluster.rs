@@ -8,13 +8,15 @@
 //! to the top. Expansion walks back down top-first, rigidly translating
 //! each sub-layout into its placeholder's rect. Edges that cross a cluster
 //! boundary are routed at the level of their lowest common container
-//! (using representative placeholders for whichever side collapsed), then
-//! have their cluster-side endpoint re-clipped to the true inner node's
-//! absolute box so arrows terminate on the real node, not the cluster
-//! border. `apply_direction` runs exactly once, on the fully assembled
-//! whole.
+//! (using representative placeholders for whichever side collapsed). Inside
+//! each cluster they cross, the edge has a leg of its own: every cluster
+//! with outgoing (incoming) crossing edges gets an exit (entry) port pinned
+//! below (above) all its members, and the leg member→port (port→member) is
+//! laid out with the cluster, so it detours around sibling nodes instead of
+//! cutting straight through them. The legs and the main path are stitched
+//! into one polyline. `apply_direction` runs exactly once, on the fully
+//! assembled whole.
 
-use super::route;
 use super::{
     apply_direction, layout_tb, validate, Direction, EdgePath, LEdge, LNode, Layout, LayoutInput,
     Rect,
@@ -29,7 +31,24 @@ const CLUSTER_PAD: f64 = 12.0;
 enum Entity {
     Node(usize),
     Cluster(usize),
+    /// A cluster's exit (`true`) or entry port for boundary-crossing edges.
+    Port(bool),
 }
+
+/// What a level-local edge stands for.
+#[derive(Debug, Clone, Copy)]
+enum LocalRole {
+    /// An original edge routed at this level (its lowest common container).
+    Real(usize),
+    /// The inside leg of original edge `.0` in this cluster: member → exit
+    /// port, or entry port → member.
+    Leg(usize),
+    /// Invisible: pins a port below every sink / above every source.
+    Pin,
+}
+
+/// Port footprint: a waypoint, not a box.
+const PORT_SIZE: f64 = 2.0;
 
 /// One level of the collapse hierarchy: either a single cluster's induced
 /// subgraph, or the top-level graph (real top-level nodes + top-level
@@ -37,10 +56,8 @@ enum Entity {
 struct SubBuild {
     /// Direct members of this level, in the same order as `layout`'s nodes.
     entities: Vec<Entity>,
-    /// This level's induced edges, `from`/`to` indexing into `entities`.
-    local_edges: Vec<LEdge>,
-    /// Parallel to `local_edges`: the ORIGINAL `LayoutInput::edges` index.
-    local_edge_orig: Vec<usize>,
+    /// Parallel to `local_edges`: what each one stands for.
+    local_edge_orig: Vec<LocalRole>,
     /// This level's flat TB layout (local coordinates, no direction applied).
     layout: Layout,
     /// Size of the placeholder node this level collapses to in its parent:
@@ -75,12 +92,15 @@ fn representative_of(input: &LayoutInput, v: usize, target: Option<usize>) -> Op
 }
 
 /// The direction cluster `c` lays out in: its own `direction` if set,
-/// else the nearest ancestor's, falling back to `graph_dir`.
-fn effective_dir(clusters: &[super::LCluster], c: usize, graph_dir: Direction) -> Direction {
+/// else the nearest ancestor's, falling back to `graph_dir`. A cluster with
+/// a member linked outside it ignores its own `direction` and inherits
+/// (mermaid.js: "if any of a subgraph's nodes are linked to the outside,
+/// subgraph direction will be ignored").
+fn effective_dir(clusters: &[super::LCluster], links_out: &[bool], c: usize, graph_dir: Direction) -> Direction {
     let mut cur = Some(c);
     let mut guard = 0usize;
     while let Some(ci) = cur {
-        if let Some(d) = clusters[ci].direction {
+        if let Some(d) = clusters[ci].direction.filter(|_| !links_out[ci]) {
             return d;
         }
         cur = clusters[ci].parent;
@@ -90,6 +110,37 @@ fn effective_dir(clusters: &[super::LCluster], c: usize, graph_dir: Direction) -
         }
     }
     graph_dir
+}
+
+/// Whether node `v` sits in cluster `c` (directly or nested).
+fn under(input: &LayoutInput, v: usize, c: usize) -> bool {
+    let mut cur = input.nodes[v].cluster;
+    let mut guard = 0usize;
+    while let Some(x) = cur {
+        if x == c {
+            return true;
+        }
+        cur = input.clusters[x].parent;
+        guard += 1;
+        if guard > input.clusters.len() {
+            break; // defensive only; validate() rules out cycles
+        }
+    }
+    false
+}
+
+/// The clusters containing `v` but not `other`, innermost first.
+fn exclusive_chain(input: &LayoutInput, v: usize, other: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut cur = input.nodes[v].cluster;
+    while let Some(c) = cur {
+        if under(input, other, c) || out.len() > input.clusters.len() {
+            break;
+        }
+        out.push(c);
+        cur = input.clusters[c].parent;
+    }
+    out
 }
 
 /// Depth of cluster `c` in the parent forest (root clusters are depth 0).
@@ -157,7 +208,59 @@ fn build_level(
                     to: entity_index[&rt],
                     label: edge.label,
                 });
-                local_edge_orig.push(ei);
+                local_edge_orig.push(LocalRole::Real(ei));
+            }
+        }
+    }
+
+    // Boundary-crossing edges: a leg from the inside member to this
+    // cluster's exit port (or from its entry port to the member).
+    if let Some(c) = target {
+        let port_of = |exit: bool, entities: &mut Vec<Entity>, idx: &mut std::collections::HashMap<Entity, usize>| {
+            *idx.entry(Entity::Port(exit)).or_insert_with(|| {
+                entities.push(Entity::Port(exit));
+                entities.len() - 1
+            })
+        };
+        for (ei, edge) in input.edges.iter().enumerate() {
+            let (from_in, to_in) = (under(input, edge.from, c), under(input, edge.to, c));
+            if from_in == to_in {
+                continue;
+            }
+            let inner = if from_in { edge.from } else { edge.to };
+            let Some(rep) = representative_of(input, inner, target) else { continue };
+            let member = entity_index[&rep];
+            let port = port_of(from_in, &mut entities, &mut entity_index);
+            let (from, to) = if from_in { (member, port) } else { (port, member) };
+            local_edges.push(LEdge { from, to, label: None });
+            local_edge_orig.push(LocalRole::Leg(ei));
+        }
+        // Pin the exit port below every sink and the entry port above every
+        // source, so legs leave through the cluster's far side rather than
+        // ending beside a sibling mid-cluster.
+        let n = entities.len();
+        let (mut has_out, mut has_in) = (vec![false; n], vec![false; n]);
+        for e in &local_edges {
+            if e.from != e.to {
+                has_out[e.from] = true;
+                has_in[e.to] = true;
+            }
+        }
+        for (i, ent) in entities.clone().iter().enumerate() {
+            if matches!(ent, Entity::Port(_)) {
+                continue;
+            }
+            if let Some(&p) = entity_index.get(&Entity::Port(true)) {
+                if !has_out[i] {
+                    local_edges.push(LEdge { from: i, to: p, label: None });
+                    local_edge_orig.push(LocalRole::Pin);
+                }
+            }
+            if let Some(&p) = entity_index.get(&Entity::Port(false)) {
+                if !has_in[i] {
+                    local_edges.push(LEdge { from: p, to: i, label: None });
+                    local_edge_orig.push(LocalRole::Pin);
+                }
             }
         }
     }
@@ -187,12 +290,15 @@ fn build_level(
                     .placeholder_size;
                 local_nodes.push(LNode { width: w, height: h, cluster: None });
             }
+            Entity::Port(_) => {
+                local_nodes.push(LNode { width: PORT_SIZE, height: PORT_SIZE, cluster: None });
+            }
         }
     }
 
     let local_input = LayoutInput {
         nodes: local_nodes,
-        edges: local_edges.clone(),
+        edges: local_edges,
         clusters: vec![],
         direction: level_dir,
     };
@@ -201,7 +307,6 @@ fn build_level(
 
     Ok(SubBuild {
         entities,
-        local_edges,
         local_edge_orig,
         layout,
         placeholder_size: (0.0, 0.0),
@@ -212,14 +317,17 @@ fn build_level(
 /// by `translate`, writing real node centers and cluster rects into the
 /// shared output buffers, and appending this level's edges (with
 /// cluster-side endpoints re-clipped to the true inner node once known).
+#[allow(clippy::too_many_arguments)]
 fn expand_level(
     input: &LayoutInput,
     build: &SubBuild,
+    level: Option<usize>,
     translate: (f64, f64),
     sub_builds: &[Option<SubBuild>],
     node_centers: &mut [(f64, f64)],
     cluster_rects: &mut [Option<Rect>],
     edges_out: &mut Vec<EdgePath>,
+    legs: &mut std::collections::HashMap<(usize, usize), Vec<(f64, f64)>>,
 ) {
     for (local_idx, entity) in build.entities.iter().enumerate() {
         match *entity {
@@ -241,54 +349,191 @@ fn expand_level(
                     h,
                 };
                 let title_h = input.clusters[c].title.1;
-                let content_translate = (rect.x, rect.y + title_h + CLUSTER_PAD);
+                let slack_x = (w - child.layout.size.0).max(0.0) / 2.0;
+                let content_translate = (rect.x + slack_x, rect.y + title_h + CLUSTER_PAD);
                 cluster_rects[c] = Some(rect);
                 expand_level(
                     input,
                     child,
+                    Some(c),
                     content_translate,
                     sub_builds,
                     node_centers,
                     cluster_rects,
                     edges_out,
+                    legs,
                 );
             }
+            Entity::Port(_) => {}
         }
     }
 
     for ep in &build.layout.edge_paths {
-        let orig = build.local_edge_orig[ep.edge];
-        let local_edge = &build.local_edges[ep.edge];
-        let mut pts: Vec<(f64, f64)> = ep
+        let pts: Vec<(f64, f64)> = ep
             .points
             .iter()
             .map(|p| (p.0 + translate.0, p.1 + translate.1))
             .collect();
-        let label_at = ep.label_at.map(|p| (p.0 + translate.0, p.1 + translate.1));
-
-        // Re-clip cluster-side endpoints to the true inner node's box: the
-        // top-level route clipped against the PLACEHOLDER's box, not the
-        // real node buried inside it. By now every real node under this
-        // level's entities has an absolute center (set by the recursion
-        // just above), regardless of nesting depth.
-        if let Entity::Cluster(_) = build.entities[local_edge.from] {
-            let true_v = input.edges[orig].from;
-            let center = node_centers[true_v];
-            let half = (input.nodes[true_v].width / 2.0, input.nodes[true_v].height / 2.0);
-            let toward = pts.get(1).copied().unwrap_or(center);
-            pts[0] = route::clip_to_box(center, half, toward);
+        match build.local_edge_orig[ep.edge] {
+            LocalRole::Pin => {}
+            LocalRole::Leg(orig) => {
+                if let Some(c) = level {
+                    legs.insert((orig, c), pts);
+                }
+            }
+            LocalRole::Real(orig) => {
+                let label_at = ep.label_at.map(|p| (p.0 + translate.0, p.1 + translate.1));
+                edges_out.push(EdgePath { edge: orig, points: pts, label_at, reversed: ep.reversed });
+            }
         }
-        if let Entity::Cluster(_) = build.entities[local_edge.to] {
-            let true_v = input.edges[orig].to;
-            let center = node_centers[true_v];
-            let half = (input.nodes[true_v].width / 2.0, input.nodes[true_v].height / 2.0);
-            let n = pts.len();
-            let toward = if n >= 2 { pts[n - 2] } else { center };
-            pts[n - 1] = route::clip_to_box(center, half, toward);
-        }
-
-        edges_out.push(EdgePath { edge: orig, points: pts, label_at, reversed: ep.reversed });
     }
+}
+
+/// Splice each crossing edge's legs onto its main path: source-side legs
+/// innermost first, then the main path (which starts and ends on the
+/// outermost crossed clusters' borders), then target-side legs outermost
+/// first — one polyline from the true source to the true target. Each
+/// junction joins a port to the point where the next piece meets that
+/// cluster's border; when the straight join would cut through a node it
+/// runs along the cluster's inner margin instead (`ring_route`).
+fn stitch_legs(
+    input: &LayoutInput,
+    edges: &mut [EdgePath],
+    legs: &mut std::collections::HashMap<(usize, usize), Vec<(f64, f64)>>,
+    cluster_rects: &[Option<Rect>],
+    node_centers: &[(f64, f64)],
+) {
+    for ep in edges.iter_mut() {
+        let e = &input.edges[ep.edge];
+        if e.from == e.to {
+            continue;
+        }
+        let src = exclusive_chain(input, e.from, e.to);
+        let dst = exclusive_chain(input, e.to, e.from);
+        if src.is_empty() && dst.is_empty() {
+            continue;
+        }
+        // Nodes a join must not cross: everything but this edge's ends.
+        let blocked = |a: (f64, f64), b: (f64, f64)| {
+            input.nodes.iter().enumerate().any(|(v, n)| {
+                v != e.from
+                    && v != e.to
+                    && segment_hits_box(a, b, node_centers[v], (n.width / 2.0 - 1.0, n.height / 2.0 - 1.0))
+            })
+        };
+        let mut pts: Vec<(f64, f64)> = Vec::new();
+        let join = |pts: &mut Vec<(f64, f64)>, next: (f64, f64), ring: Option<&Rect>| {
+            if let (Some(&last), Some(r)) = (pts.last(), ring) {
+                if blocked(last, next) {
+                    pts.extend(ring_route(r, last, next));
+                }
+            }
+        };
+        let push_all = |pts: &mut Vec<(f64, f64)>, seg: &[(f64, f64)]| {
+            for &p in seg {
+                if pts.last().is_none_or(|q: &(f64, f64)| (q.0 - p.0).abs() > 1e-6 || (q.1 - p.1).abs() > 1e-6) {
+                    pts.push(p);
+                }
+            }
+        };
+        let mut ring: Option<&Rect> = None;
+        for c in &src {
+            if let Some(seg) = legs.remove(&(ep.edge, *c)) {
+                if let Some(&first) = seg.first() {
+                    join(&mut pts, first, ring);
+                }
+                push_all(&mut pts, &seg);
+                ring = cluster_rects[*c].as_ref();
+            }
+        }
+        if let Some(&first) = ep.points.first() {
+            join(&mut pts, first, ring);
+        }
+        push_all(&mut pts, &ep.points);
+        for c in dst.iter().rev() {
+            if let Some(seg) = legs.remove(&(ep.edge, *c)) {
+                if let Some(&first) = seg.first() {
+                    join(&mut pts, first, cluster_rects[*c].as_ref());
+                }
+                push_all(&mut pts, &seg);
+            }
+        }
+        if pts.len() >= 2 {
+            ep.points = pts;
+        }
+    }
+}
+
+/// Does segment a→b pass through the box centered at `c` with half-extents
+/// `half` (Liang–Barsky clip)?
+fn segment_hits_box(a: (f64, f64), b: (f64, f64), c: (f64, f64), half: (f64, f64)) -> bool {
+    let (hx, hy) = half;
+    if hx <= 0.0 || hy <= 0.0 {
+        return false;
+    }
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+    for (p, q) in [(-dx, a.0 - (c.0 - hx)), (dx, (c.0 + hx) - a.0), (-dy, a.1 - (c.1 - hy)), (dy, (c.1 + hy) - a.1)] {
+        if p.abs() < 1e-12 {
+            if q < 0.0 {
+                return false;
+            }
+        } else {
+            let r = q / p;
+            if p < 0.0 {
+                t0 = t0.max(r);
+            } else {
+                t1 = t1.min(r);
+            }
+            if t0 > t1 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Waypoints from `from` (inside `r`) to `to` (on `r`'s border) along a
+/// track just inside the border — the cluster's padding, which holds no
+/// nodes — taking the shorter way round.
+fn ring_route(r: &Rect, from: (f64, f64), to: (f64, f64)) -> Vec<(f64, f64)> {
+    let d = (CLUSTER_PAD / 2.0).min(r.w / 4.0).min(r.h / 4.0);
+    let (x0, y0, x1, y1) = (r.x + d, r.y + d, r.x + r.w - d, r.y + r.h - d);
+    // Perimeter coordinate of the nearest track point, clockwise from the
+    // top-left corner.
+    let (w, h) = (x1 - x0, y1 - y0);
+    let perim = 2.0 * (w + h);
+    let project = |p: (f64, f64)| -> ((f64, f64), f64) {
+        let (px, py) = (p.0.clamp(x0, x1), p.1.clamp(y0, y1));
+        let dists = [(py - y0).abs(), (x1 - px).abs(), (y1 - py).abs(), (px - x0).abs()];
+        let side = (0..4).min_by(|&a, &b| dists[a].partial_cmp(&dists[b]).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(0);
+        match side {
+            0 => ((px, y0), px - x0),
+            1 => ((x1, py), w + (py - y0)),
+            2 => ((px, y1), w + h + (x1 - px)),
+            _ => ((x0, py), 2.0 * w + h + (y1 - py)),
+        }
+    };
+    let (pa, sa) = project(from);
+    let (pb, sb) = project(to);
+    let corners = [(0.0, (x0, y0)), (w, (x1, y0)), (w + h, (x1, y1)), (2.0 * w + h, (x0, y1))];
+    let cw = (sb - sa).rem_euclid(perim);
+    let mut out = vec![pa];
+    if cw <= perim - cw {
+        // Clockwise: corners with coordinate in (sa, sa + cw).
+        let mut cs: Vec<(f64, (f64, f64))> =
+            corners.iter().map(|&(t, c)| ((t - sa).rem_euclid(perim), c)).filter(|&(t, _)| t > 1e-9 && t < cw).collect();
+        cs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        out.extend(cs.into_iter().map(|(_, c)| c));
+    } else {
+        let ccw = perim - cw;
+        let mut cs: Vec<(f64, (f64, f64))> =
+            corners.iter().map(|&(t, c)| ((sa - t).rem_euclid(perim), c)).filter(|&(t, _)| t > 1e-9 && t < ccw).collect();
+        cs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        out.extend(cs.into_iter().map(|(_, c)| c));
+    }
+    out.push(pb);
+    out
 }
 
 /// Lays out a graph whose `clusters` are non-empty via recursive
@@ -302,12 +547,20 @@ pub(crate) fn run_clustered(input: &LayoutInput) -> Result<Layout, String> {
     // Stable sort: deepest first, ties broken by ascending cluster index.
     order.sort_by_key(|&c| std::cmp::Reverse(depths[c]));
 
+    let links_out: Vec<bool> = (0..input.clusters.len())
+        .map(|c| input.edges.iter().any(|e| under(input, e.from, c) != under(input, e.to, c)))
+        .collect();
     let mut sub_builds: Vec<Option<SubBuild>> = (0..input.clusters.len()).map(|_| None).collect();
     for c in order {
-        let level_dir = effective_dir(&input.clusters, c, input.direction);
+        let level_dir = effective_dir(&input.clusters, &links_out, c, input.direction);
         let build = build_level(input, Some(c), level_dir, &sub_builds)?;
-        let title_h = input.clusters[c].title.1;
-        let placeholder_size = (build.layout.size.0, build.layout.size.1 + title_h + CLUSTER_PAD);
+        let (title_w, title_h) = input.clusters[c].title;
+        // At least as wide as its title (#274); `expand_level` centers the
+        // content in any extra width.
+        let placeholder_size = (
+            build.layout.size.0.max(title_w + 2.0 * CLUSTER_PAD),
+            build.layout.size.1 + title_h + CLUSTER_PAD,
+        );
         sub_builds[c] = Some(SubBuild { placeholder_size, ..build });
     }
 
@@ -316,15 +569,19 @@ pub(crate) fn run_clustered(input: &LayoutInput) -> Result<Layout, String> {
     let mut node_centers = vec![(0.0, 0.0); input.nodes.len()];
     let mut cluster_rects: Vec<Option<Rect>> = (0..input.clusters.len()).map(|_| None).collect();
     let mut edges_out: Vec<EdgePath> = Vec::new();
+    let mut legs = std::collections::HashMap::new();
     expand_level(
         input,
         &top,
+        None,
         (0.0, 0.0),
         &sub_builds,
         &mut node_centers,
         &mut cluster_rects,
         &mut edges_out,
+        &mut legs,
     );
+    stitch_legs(input, &mut edges_out, &mut legs, &cluster_rects, &node_centers);
     edges_out.sort_by_key(|p| p.edge);
 
     let cluster_rects: Vec<Rect> = cluster_rects
@@ -433,9 +690,11 @@ mod tests {
         // Parent graph is TB, but the subgraph declares `direction LR`: its
         // two members must flow left-to-right (node 2 right of node 1, same
         // row) instead of top-to-bottom, while still nesting in the cluster.
+        // Node 0 stays unlinked: a member linked outside would make the
+        // subgraph ignore its direction (#275, see the next test).
         let input = LayoutInput {
             nodes: vec![node_in(None), node_in(Some(0)), node_in(Some(0))],
-            edges: vec![e(0, 1), e(1, 2)],
+            edges: vec![e(1, 2)],
             clusters: vec![LCluster {
                 parent: None,
                 title: (50.0, 16.0),
@@ -460,6 +719,79 @@ mod tests {
         assert!(inside(l.node_centers[1], r));
         assert!(inside(l.node_centers[2], r));
         assert!(!inside(l.node_centers[0], r));
+    }
+
+    #[test]
+    fn subgraph_direction_is_ignored_when_a_member_links_outside() {
+        // mermaid.js: a subgraph with a member linked to the outside
+        // inherits the parent direction instead of its own (#275).
+        let input = LayoutInput {
+            nodes: vec![node_in(None), node_in(Some(0)), node_in(Some(0))],
+            edges: vec![e(0, 1), e(1, 2)],
+            clusters: vec![LCluster {
+                parent: None,
+                title: (50.0, 16.0),
+                direction: Some(Direction::LR),
+            }],
+            direction: Direction::TB,
+        };
+        let l = run_clustered(&input).unwrap();
+        assert!(
+            l.node_centers[2].1 > l.node_centers[1].1 + 10.0,
+            "parent TB applies: node 2 {:?} below node 1 {:?}",
+            l.node_centers[2],
+            l.node_centers[1]
+        );
+    }
+
+    /// Does the segment a→b pass through the box (shrunk by `inset` so
+    /// grazing a corner doesn't count)?
+    fn segment_hits_box(a: (f64, f64), b: (f64, f64), c: (f64, f64), half: (f64, f64), inset: f64) -> bool {
+        let (hx, hy) = (half.0 - inset, half.1 - inset);
+        if hx <= 0.0 || hy <= 0.0 {
+            return false;
+        }
+        // Liang–Barsky clip against the box.
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+        for (p, q) in [(-dx, a.0 - (c.0 - hx)), (dx, (c.0 + hx) - a.0), (-dy, a.1 - (c.1 - hy)), (dy, (c.1 + hy) - a.1)] {
+            if p.abs() < 1e-12 {
+                if q < 0.0 {
+                    return false;
+                }
+            } else {
+                let r = q / p;
+                if p < 0.0 { t0 = t0.max(r) } else { t1 = t1.min(r) }
+                if t0 > t1 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn edge_leaving_a_cluster_does_not_cross_a_sibling() {
+        // #275: `subgraph S: A-->B end; A-->C` drew A→C straight through B.
+        let input = LayoutInput {
+            nodes: vec![node_in(Some(0)), node_in(Some(0)), node_in(None)],
+            edges: vec![e(0, 1), e(0, 2)],
+            clusters: vec![LCluster { parent: None, title: (30.0, 16.0), direction: None }],
+            direction: Direction::TB,
+        };
+        let l = run_clustered(&input).unwrap();
+        let p = &l.edge_paths.iter().find(|p| p.edge == 1).unwrap().points;
+        for w in p.windows(2) {
+            assert!(
+                !segment_hits_box(w[0], w[1], l.node_centers[1], (30.0, 12.0), 1.0),
+                "A→C segment {w:?} crosses B at {:?}",
+                l.node_centers[1]
+            );
+        }
+        // Still runs from A's border to C's border.
+        let (start, end) = (p[0], *p.last().unwrap());
+        assert!((start.0 - l.node_centers[0].0).abs() <= 30.0 + 1e-6 && (start.1 - l.node_centers[0].1).abs() <= 12.0 + 1e-6);
+        assert!((end.0 - l.node_centers[2].0).abs() <= 30.0 + 1e-6 && (end.1 - l.node_centers[2].1).abs() <= 12.0 + 1e-6);
     }
 
     #[test]

@@ -156,12 +156,16 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
                 r.x,
                 r.x + r.w,
             ));
-            out.push_str(&format!(
-                r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">[{}]</text>"#,
-                r.x + r.w / 2.0,
-                dy - 4.0,
-                escape_xml(label)
-            ));
+            // Below the dashed line, in the section it names (Mermaid-
+            // style); above it, it crowded the previous section's arrow.
+            if !label.is_empty() {
+                out.push_str(&format!(
+                    r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">[{}]</text>"#,
+                    r.x + r.w / 2.0,
+                    dy + 15.0,
+                    escape_xml(label)
+                ));
+            }
         }
     }
 
@@ -222,7 +226,7 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
         }
 
         // Self-message labels are centered on the lifeline (layout anchors
-        // them at `fx`), same as regular messages.
+        // them at `fx`, above the loop), same as regular messages.
         let anchor = "middle";
         let lines = measure::lines(text);
         let n_lines = lines.len();
@@ -231,7 +235,9 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
             m.text_anchor.0, m.text_anchor.1
         ));
         for (idx, line_text) in lines.iter().enumerate() {
-            let dy = if idx == 0 { -((n_lines as f64 - 1.0) / 2.0) * measure::LINE_H } else { measure::LINE_H };
+            // The anchor is the LAST line's baseline (layout keeps the
+            // whole label above the arrow / self-message loop).
+            let dy = if idx == 0 { -(n_lines as f64 - 1.0) * measure::LINE_H } else { measure::LINE_H };
             let escaped = escape_xml(line_text);
             let content = if idx == 0 {
                 match m.number {

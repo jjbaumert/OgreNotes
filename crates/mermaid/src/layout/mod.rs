@@ -234,7 +234,12 @@ pub(crate) fn layout_tb(input: &LayoutInput) -> Result<Layout, String> {
                 .iter()
                 .map(|n| LNode { width: n.height, height: n.width, cluster: n.cluster })
                 .collect(),
-            edges: input.edges.clone(),
+            // Label boxes turn with the layout like node boxes do.
+            edges: input
+                .edges
+                .iter()
+                .map(|e| LEdge { label: e.label.map(|(w, h)| (h, w)), ..e.clone() })
+                .collect(),
             clusters: input.clusters.clone(),
             direction: input.direction,
         };
@@ -244,6 +249,17 @@ pub(crate) fn layout_tb(input: &LayoutInput) -> Result<Layout, String> {
     };
     let ac = acyclic::make_acyclic(input.nodes.len(), &input.edges);
     let ranks = rank::assign_ranks(input.nodes.len(), &ac.edges);
+    // Edge labels get a rank of their own (dagre-style): with any labeled
+    // edge in play, every rank is doubled so each edge spans at least two,
+    // and a labeled edge's midpoint dummy — sized to its label — sits on a
+    // rank no node occupies. Ordering then keeps labels clear of nodes and
+    // of each other. The rank gap halves so spacing stays about the same.
+    let labeled = ac.edges.iter().zip(&ac.orig).any(|(_, &o)| input.edges[o].label.is_some());
+    let (ranks, rank_gap) = if labeled {
+        (ranks.iter().map(|r| r * 2).collect::<Vec<_>>(), RANK_GAP_Y / 2.0)
+    } else {
+        (ranks, RANK_GAP_Y)
+    };
     // Order-graph nodes are the ORIGINAL nodes; edges are the surviving
     // acyclic edges (labels travel with them).
     let surviving: Vec<LEdge> = ac
@@ -273,9 +289,20 @@ pub(crate) fn layout_tb(input: &LayoutInput) -> Result<Layout, String> {
             order::MAX_DUMMY_SLOTS
         ));
     }
-    let mut g = order::build_order_graph(&input.nodes, &surviving, &ranks);
+    // A node with a self-loop reserves room beside it for the loop and its
+    // label (drawn on the right; the slot grows both ways so the node stays
+    // centered in it).
+    // Several loops on one node share the loop and stack their labels.
+    let mut slot_nodes = input.nodes.clone();
+    for (v, (lw, lh)) in route::self_loop_label_extents(input, &ac.self_loops) {
+        let n = &input.nodes[v];
+        let reach = route::SELF_LOOP_STUB + route::SELF_LOOP_LABEL_GAP * 2.0 + lw;
+        slot_nodes[v].width = slot_nodes[v].width.max(n.width + 2.0 * reach);
+        slot_nodes[v].height = slot_nodes[v].height.max(lh);
+    }
+    let mut g = order::build_order_graph(&slot_nodes, &surviving, &ranks);
     order::minimize_crossings(&mut g, &surviving);
-    let coords = position::assign_coords(&g);
+    let coords = position::assign_coords_with_gap(&g, rank_gap);
     let mut node_centers = vec![(0.0, 0.0); input.nodes.len()];
     for (kind, c) in &coords.centers {
         if let order::SlotKind::Real(i) = kind {

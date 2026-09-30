@@ -181,22 +181,8 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
         }
         out.push_str(&format!(r#"<path d="{d}" {attrs}/>"#));
 
-        if let (Some(label), Some((lx, ly))) = (&e.label, ep.label_at) {
-            let (tw, th) = measure::text_size(label);
-            let (mw, mh) = (tw + 4.0, th + 4.0);
-            out.push_str(&format!(
-                r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="var(--surface, #fff)"/>"#,
-                lx - mw / 2.0,
-                ly - mh / 2.0,
-                mw,
-                mh
-            ));
-            out.push_str(&format!(
-                r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
-                lx,
-                ly + 4.0,
-                escape_xml(label)
-            ));
+        if let (Some(label), Some(at)) = (&e.label, ep.label_at) {
+            out.push_str(&crate::edge_label_svg(label, at));
         }
     }
 

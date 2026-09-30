@@ -177,3 +177,158 @@ proptest! {
         }
     }
 }
+
+/// Like `arb_input`, but roughly half the edges carry a label of random
+/// size (wide or tall — a multi-line label is ~20px per line).
+fn arb_labeled_input() -> impl Strategy<Value = LayoutInput> {
+    arb_input().prop_flat_map(|input| {
+        let n = input.edges.len();
+        let labels = proptest::collection::vec(
+            proptest::option::of(((10.0f64..200.0), (14.0f64..90.0))),
+            n,
+        );
+        (Just(input), labels).prop_map(|(mut input, labels)| {
+            for (e, l) in input.edges.iter_mut().zip(labels) {
+                e.label = l;
+            }
+            input
+        })
+    })
+}
+
+/// Axis-aligned overlap area of two centered boxes (0 when they merely touch).
+fn overlap(a: ((f64, f64), (f64, f64)), b: ((f64, f64), (f64, f64))) -> f64 {
+    let ((ax, ay), (aw, ah)) = a;
+    let ((bx, by), (bw, bh)) = b;
+    let w = (ax + aw / 2.0).min(bx + bw / 2.0) - (ax - aw / 2.0).max(bx - bw / 2.0);
+    let h = (ay + ah / 2.0).min(by + bh / 2.0) - (ay - ah / 2.0).max(by - bh / 2.0);
+    if w > 1e-6 && h > 1e-6 { w * h } else { 0.0 }
+}
+
+/// Edge-label boxes in final (post-direction) coordinates.
+fn label_boxes(input: &LayoutInput, l: &Layout) -> Vec<((f64, f64), (f64, f64))> {
+    l.edge_paths
+        .iter()
+        .filter_map(|ep| Some((ep.label_at?, input.edges[ep.edge].label?)))
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// #274: an edge label never overlaps a node or another label, and
+    /// stays on the canvas.
+    #[test]
+    fn flat_labels_clear_nodes_and_each_other(input in arb_labeled_input()) {
+        let mut input = input;
+        for n in &mut input.nodes { n.cluster = None; }
+        input.clusters.clear();
+        if let Ok(l) = run(&input) {
+            let labels = label_boxes(&input, &l);
+            for (i, lb) in labels.iter().enumerate() {
+                for (v, n) in input.nodes.iter().enumerate() {
+                    let nb = (l.node_centers[v], (n.width, n.height));
+                    prop_assert!(overlap(*lb, nb) == 0.0, "label {lb:?} overlaps node {v} {nb:?}");
+                }
+                for other in &labels[i + 1..] {
+                    prop_assert!(overlap(*lb, *other) == 0.0, "labels overlap: {lb:?} {other:?}");
+                }
+                let ((x, y), (w, h)) = *lb;
+                prop_assert!(
+                    x - w / 2.0 >= -1e-6 && y - h / 2.0 >= -1e-6
+                        && x + w / 2.0 <= l.size.0 + 1e-6 && y + h / 2.0 <= l.size.1 + 1e-6,
+                    "label {lb:?} off the {:?} canvas", l.size
+                );
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// #274 with (nested) clusters: labels still clear every node and
+    /// each other.
+    #[test]
+    fn clustered_labels_clear_nodes_and_each_other(
+        input in arb_nested_input(),
+        labels in proptest::collection::vec(proptest::option::of(((10.0f64..200.0), (14.0f64..90.0))), 20),
+    ) {
+        let mut input = input;
+        for (e, l) in input.edges.iter_mut().zip(labels) {
+            e.label = l;
+        }
+        if let Ok(l) = run(&input) {
+            let boxes = label_boxes(&input, &l);
+            for (i, lb) in boxes.iter().enumerate() {
+                for (v, n) in input.nodes.iter().enumerate() {
+                    let nb = (l.node_centers[v], (n.width, n.height));
+                    prop_assert!(overlap(*lb, nb) == 0.0, "label {lb:?} overlaps node {v} {nb:?}");
+                }
+                for other in &boxes[i + 1..] {
+                    prop_assert!(overlap(*lb, *other) == 0.0, "labels overlap: {lb:?} {other:?}");
+                }
+            }
+        }
+    }
+}
+
+/// Edge segments passing through a node box other than the edge's own
+/// endpoints (boxes shrunk by `inset` so grazing a corner doesn't count).
+fn segment_node_hits(input: &LayoutInput, l: &Layout, inset: f64) -> Vec<String> {
+    fn hits(a: (f64, f64), b: (f64, f64), c: (f64, f64), hx: f64, hy: f64) -> bool {
+        if hx <= 0.0 || hy <= 0.0 {
+            return false;
+        }
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+        for (p, q) in [(-dx, a.0 - (c.0 - hx)), (dx, (c.0 + hx) - a.0), (-dy, a.1 - (c.1 - hy)), (dy, (c.1 + hy) - a.1)] {
+            if p.abs() < 1e-12 {
+                if q < 0.0 {
+                    return false;
+                }
+            } else {
+                let r = q / p;
+                if p < 0.0 { t0 = t0.max(r) } else { t1 = t1.min(r) }
+                if t0 > t1 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    let mut out = Vec::new();
+    for ep in &l.edge_paths {
+        let e = &input.edges[ep.edge];
+        for w in ep.points.windows(2) {
+            for (v, n) in input.nodes.iter().enumerate() {
+                if v == e.from || v == e.to {
+                    continue;
+                }
+                if hits(w[0], w[1], l.node_centers[v], n.width / 2.0 - inset, n.height / 2.0 - inset) {
+                    out.push(format!("edge {} segment {:?} crosses node {v}", ep.edge, w));
+                }
+            }
+        }
+    }
+    out
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// #275: no edge segment passes through a node other than its own
+    /// endpoints — flat or clustered, any nesting and direction.
+    #[test]
+    fn edges_never_cross_other_nodes(input in arb_nested_input()) {
+        let mut flat = input.clone();
+        for n in &mut flat.nodes { n.cluster = None; }
+        flat.clusters.clear();
+        for g in [&flat, &input] {
+            if let Ok(l) = run(g) {
+                let hits = segment_node_hits(g, &l, 2.0);
+                prop_assert!(hits.is_empty(), "{hits:?}");
+            }
+        }
+    }
+}

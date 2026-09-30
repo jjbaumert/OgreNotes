@@ -21,7 +21,8 @@ pub(crate) const SELF_STUB: f64 = 40.0;
 pub(crate) const NOTE_PAD: f64 = 8.0;
 pub(crate) const FRAME_HEAD: f64 = 26.0;
 pub(crate) const FRAME_BOTTOM_PAD: f64 = 10.0;
-pub(crate) const DIVIDER_H: f64 = 22.0;
+/// Divider line (at +4) plus its label below it.
+pub(crate) const DIVIDER_H: f64 = 26.0;
 pub(crate) const ACT_W: f64 = 10.0;
 pub(crate) const ACT_OFFSET: f64 = 6.0;
 /// Floor for a fragment frame's width. A fragment with no (or a single
@@ -110,7 +111,7 @@ fn widen_gap(col_x: &mut [f64], i: usize, j: usize, need: f64) {
 
 /// Pass 1: participant column x-positions and box widths, widened in
 /// event order to fit message text, notes, and self-message stubs.
-fn pass1_columns(d: &SeqDiagram) -> (Vec<f64>, Vec<f64>, f64, f64) {
+fn pass1_columns(d: &SeqDiagram) -> (Vec<f64>, Vec<f64>, f64) {
     let n = d.participants.len();
     let box_w: Vec<f64> = d
         .participants
@@ -134,8 +135,6 @@ fn pass1_columns(d: &SeqDiagram) -> (Vec<f64>, Vec<f64>, f64, f64) {
         }
     }
 
-    let mut overhang_right = 0.0_f64;
-
     for ev in &d.events {
         match ev {
             Event::Message { from, to, text, .. } => {
@@ -149,9 +148,7 @@ fn pass1_columns(d: &SeqDiagram) -> (Vec<f64>, Vec<f64>, f64, f64) {
                     let p = *from;
                     if p < col_x.len() {
                         let half = (text_size(text).0 / 2.0 + 6.0).max(SELF_STUB + ACT_W);
-                        if p + 1 >= col_x.len() {
-                            overhang_right = overhang_right.max(half);
-                        } else if let Some(&next_w) = box_w.get(p + 1) {
+                        if let Some(&next_w) = box_w.get(p + 1) {
                             widen_gap(&mut col_x, p, p + 1, half + next_w / 2.0);
                         }
                         if p > 0 {
@@ -167,7 +164,17 @@ fn pass1_columns(d: &SeqDiagram) -> (Vec<f64>, Vec<f64>, f64, f64) {
                     NotePlacement::Over(a, Some(b)) => {
                         widen_gap(&mut col_x, *a, *b, note_w + 12.0);
                     }
-                    NotePlacement::Over(_, None) => {}
+                    NotePlacement::Over(p, None) => {
+                        // Centered on the lifeline: half the note each side.
+                        let (p, half) = (*p, note_w / 2.0 + 6.0);
+                        if let Some(&next_w) = box_w.get(p + 1) {
+                            widen_gap(&mut col_x, p, p + 1, half + next_w / 2.0);
+                        }
+                        if p > 0 && p < col_x.len() {
+                            let prev_w = box_w.get(p - 1).copied().unwrap_or(0.0);
+                            widen_gap(&mut col_x, p - 1, p, half + prev_w / 2.0);
+                        }
+                    }
                     NotePlacement::LeftOf(p) => {
                         if *p == 0 {
                             if let Some(&x0) = col_x.first() {
@@ -182,13 +189,9 @@ fn pass1_columns(d: &SeqDiagram) -> (Vec<f64>, Vec<f64>, f64, f64) {
                         }
                     }
                     NotePlacement::RightOf(p) => {
-                        if *p + 1 >= col_x.len() {
-                            if *p < col_x.len() {
-                                overhang_right = overhang_right.max(note_w + 12.0);
-                            }
-                        } else {
-                            widen_gap(&mut col_x, *p, *p + 1, note_w + 12.0);
-                        }
+                        // The last column's right-hand note is covered by
+                        // `run`'s content extent.
+                        widen_gap(&mut col_x, *p, *p + 1, note_w + 12.0);
                     }
                 }
             }
@@ -196,7 +199,7 @@ fn pass1_columns(d: &SeqDiagram) -> (Vec<f64>, Vec<f64>, f64, f64) {
         }
     }
 
-    (col_x, box_w, head_h, overhang_right)
+    (col_x, box_w, head_h)
 }
 
 /// An open fragment on the stack while pass 2 walks the events. `x_min`/
@@ -223,6 +226,18 @@ fn extend_frame(stack: &mut [OpenFrame], lo: f64, hi: f64) {
 
 /// Horizontal padding between a fragment's content and its frame border.
 const FRAME_PAD: f64 = 10.0;
+
+/// Minimum frame width for its header and divider labels, as svg.rs
+/// draws them: a `keyword` tab (text + 16), then `[label]` 8px past the
+/// tab; each `[divider]` label centered on the frame.
+fn frame_label_w(keyword: &str, label: &str, dividers: &[(f64, String)]) -> f64 {
+    let tab_w = text_size(keyword).0 + 16.0;
+    let header = if label.is_empty() { tab_w } else { tab_w + 8.0 + text_size(&format!("[{label}]")).0 + 8.0 };
+    dividers
+        .iter()
+        .map(|(_, l)| text_size(&format!("[{l}]")).0 + 16.0)
+        .fold(header, f64::max)
+}
 
 /// Pass 2: a single top-to-bottom cursor walk placing messages, notes,
 /// activation spans, and fragment frames.
@@ -268,19 +283,22 @@ fn pass2_rows(
                 // shift by the same amount) — see
                 // `self_message_taller_than_normal` in the test module and
                 // task-5-report.md for the derivation.
-                let base_row_h = MSG_MIN_H.max(text_h + 14.0);
-                let row_h = base_row_h + if self_msg { SELF_EXTRA } else { 0.0 };
-                let line_y = cursor + base_row_h - 6.0;
-                let text_anchor = if self_msg {
-                    // Center the label on the lifeline, above the loop-back
-                    // stub (Mermaid-style) rather than trailing off to the
-                    // right of it.
+                // `text_anchor.1` is the baseline of the label's LAST line;
+                // svg.rs stacks earlier lines upward from it, so a
+                // multi-line label never crosses its own arrow.
+                let (row_h, line_y, text_anchor) = if self_msg {
+                    // Label centered on the lifeline, entirely above the
+                    // loop (Mermaid-style), so the loop never runs through it.
                     let fx = col_x.get(*from).copied().unwrap_or(0.0);
-                    (fx, cursor + text_h / 2.0 + 6.0)
+                    let loop_top = cursor + if text.is_empty() { 0.0 } else { text_h + 4.0 };
+                    let line_y = loop_top + SELF_EXTRA / 2.0;
+                    (line_y + SELF_EXTRA / 2.0 + 6.0 - cursor, line_y, (fx, loop_top - 6.0))
                 } else {
+                    let base_row_h = MSG_MIN_H.max(text_h + 14.0);
+                    let line_y = cursor + base_row_h - 6.0;
                     let fx = col_x.get(*from).copied().unwrap_or(0.0);
                     let tx = col_x.get(*to).copied().unwrap_or(fx);
-                    ((fx + tx) / 2.0, line_y - 6.0)
+                    (base_row_h, line_y, ((fx + tx) / 2.0, line_y - 6.0))
                 };
                 let number = autonum;
                 if let Some(n) = autonum {
@@ -384,7 +402,7 @@ fn pass2_rows(
                         xmin = PAD;
                         xmax = PAD + FRAME_MIN_W;
                     }
-                    let label_w = text_size(fr.kind.keyword()).0 + text_size(&fr.label).0 + 28.0;
+                    let label_w = frame_label_w(fr.kind.keyword(), &fr.label, &fr.dividers);
                     let left = xmin - FRAME_PAD;
                     let right = (xmax + FRAME_PAD).max(left + label_w);
                     let rect = crate::layout::Rect {
@@ -436,17 +454,64 @@ fn pass2_rows(
     (messages, notes, activations, frames, body_bottom)
 }
 
-pub(crate) fn run(d: &SeqDiagram) -> SeqLayout {
-    let (col_x, box_w, head_h, overhang_right) = pass1_columns(d);
-    let width = match (col_x.last(), box_w.last()) {
-        (Some(&last_x), Some(&last_w)) => last_x + last_w / 2.0 + overhang_right + PAD,
-        _ => PAD * 2.0,
+/// Horizontal extent `(min_x, max_x)` of everything drawn: participant
+/// boxes, message labels (with their autonumber prefix), self-message
+/// loops, notes, activation bars and frames.
+fn content_x_extent(d: &SeqDiagram, l: &SeqLayout) -> (f64, f64) {
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut take = |a: f64, b: f64| {
+        lo = lo.min(a);
+        hi = hi.max(b);
     };
+    for (x, w) in l.col_x.iter().zip(&l.box_w) {
+        take(x - w / 2.0, x + w / 2.0);
+    }
+    for m in &l.messages {
+        let Some(Event::Message { from, to, text, .. }) = d.events.get(m.event) else { continue };
+        let prefix = m.number.map(|n| text_size(&format!("{n}. ")).0).unwrap_or(0.0);
+        let half = (text_size(text).0 + prefix) / 2.0;
+        take(m.text_anchor.0 - half, m.text_anchor.0 + half);
+        if from == to {
+            let fx = l.col_x.get(*from).copied().unwrap_or(0.0);
+            take(fx, fx + SELF_STUB);
+        }
+    }
+    for n in &l.notes {
+        take(n.rect.x, n.rect.x + n.rect.w);
+    }
+    for f in &l.frames {
+        take(f.rect.x, f.rect.x + f.rect.w);
+    }
+    for a in &l.activations {
+        let x = l.col_x.get(a.p).copied().unwrap_or(0.0) + a.depth as f64 * ACT_OFFSET;
+        take(x - ACT_W / 2.0, x + ACT_W / 2.0);
+    }
+    if lo > hi { (PAD, PAD) } else { (lo, hi) }
+}
+
+/// Move everything right by `dx`.
+fn shift_x(l: &mut SeqLayout, dx: f64) {
+    for x in &mut l.col_x {
+        *x += dx;
+    }
+    for m in &mut l.messages {
+        m.text_anchor.0 += dx;
+    }
+    for n in &mut l.notes {
+        n.rect.x += dx;
+    }
+    for f in &mut l.frames {
+        f.rect.x += dx;
+    }
+}
+
+pub(crate) fn run(d: &SeqDiagram) -> SeqLayout {
+    let (col_x, box_w, head_h) = pass1_columns(d);
     let body_top = PAD + head_h + 14.0;
     let (messages, notes, activations, frames, body_bottom) =
         pass2_rows(d, &col_x, &box_w, body_top);
 
-    SeqLayout {
+    let mut l = SeqLayout {
         col_x,
         box_w,
         head_h,
@@ -456,8 +521,16 @@ pub(crate) fn run(d: &SeqDiagram) -> SeqLayout {
         notes,
         activations,
         frames,
-        size: (width, body_bottom + head_h + PAD),
-    }
+        size: (0.0, body_bottom + head_h + PAD),
+    };
+    // Content can reach left of the first column (a wide self-message,
+    // note or frame on it, nested frame padding) or right of the last:
+    // shift it all clear of the left margin and size the canvas to fit.
+    let (lo, hi) = content_x_extent(d, &l);
+    let dx = (PAD - lo).max(0.0);
+    shift_x(&mut l, dx);
+    l.size.0 = hi + dx + PAD;
+    l
 }
 
 #[cfg(test)]
@@ -648,6 +721,82 @@ mod tests {
             assert!(f.rect.w.is_finite() && f.rect.h.is_finite());
         }
         assert!(l.size.0.is_finite() && l.size.1.is_finite());
+    }
+
+    fn svg(src: &str) -> String {
+        crate::sequence::render_sequence(src).expect("renders")
+    }
+
+    #[test]
+    fn issue_277_repros_stay_inside_the_canvas() {
+        let nested_opt = format!("sequenceDiagram\n{}A->>B: deep\n{}", "opt o\n".repeat(8), "end\n".repeat(8));
+        for src in [
+            "sequenceDiagram\nA->>A: this is a quite long self message label that is wide\nA->>B: hi",
+            "sequenceDiagram\nNote over A: a very long note over a single participant here yes\nA->>B: x",
+            "sequenceDiagram\nNote over B: a very long note over the last participant here yes\nA->>B: x",
+            "sequenceDiagram\nA->>B: x\nloop a very long loop label that is much wider than the diagram itself\nA->>B: y\nend",
+            "sequenceDiagram\nalt ok\nA->>B: y\nelse a very long else label that is much wider than the diagram itself\nB->>A: z\nend",
+            "sequenceDiagram\npar p\nA->>B: y\nand a very long and label that is much wider than the diagram itself\nB->>A: z\nend",
+            "sequenceDiagram\ncritical c\nA->>B: y\noption a very long option label that is much wider than the diagram\nB->>A: z\nend",
+            &nested_opt,
+            "sequenceDiagram\nautonumber 1000000 1\nA->>A: numbered self message label\nB->>B: another numbered self message",
+            "sequenceDiagram\nNote left of A: a long note on the left of the first participant\nNote right of B: and a long note on the right of the last one\nA->>B: x",
+        ] {
+            crate::extent::assert_inside(&svg(src));
+        }
+    }
+
+    #[test]
+    fn divider_label_sits_below_its_line_clear_of_the_arrows() {
+        let svg = svg("sequenceDiagram\nalt ok\nA->>B: y\nelse other\nNote over A: n\nB->>A: z\nend");
+        let (_, drawn) = crate::extent::scan(&svg);
+        let label = drawn.iter().find(|d| d.text == "[other]").expect("divider label").bbox;
+        let divider = drawn.iter().find(|d| d.tag == "line" && d.bbox.y0 == d.bbox.y1 && d.bbox.x0 < label.x0).unwrap().bbox;
+        assert!(label.y0 >= divider.y0, "label {label:?} above its divider {divider:?}");
+        for d in &drawn {
+            if d.text != "[other]" && d.tag != "line" && d.tag != "rect" {
+                assert!(d.bbox.overlap(&label) == 0.0, "{d:?} overlaps the divider label {label:?}");
+            }
+        }
+        let note = drawn.iter().find(|d| d.tag == "rect" && d.bbox.y0 > divider.y0 && d.bbox.x1 - d.bbox.x0 < 100.0).unwrap();
+        assert!(note.bbox.y0 >= label.y1, "note {:?} overlaps divider label {label:?}", note.bbox);
+    }
+
+    #[test]
+    fn divider_labels_fit_their_frame() {
+        let l = lay("sequenceDiagram\nalt ok\nA->>B: y\nelse a very long else label that is much wider than the rest\nB->>A: z\nend");
+        let f = &l.frames[0];
+        let need = text_size("[a very long else label that is much wider than the rest]").0;
+        assert!(f.rect.w >= need + 16.0, "frame {} narrower than its divider label {need}", f.rect.w);
+    }
+
+    /// Text boxes (from the rendered SVG) of a message label vs its arrow.
+    fn label_and_arrow(src: &str) -> (crate::extent::Box2, f64) {
+        let svg = svg(src);
+        let (_, drawn) = crate::extent::scan(&svg);
+        let label = drawn.iter().find(|d| d.tag == "text" && d.text.starts_with("one")).expect("label").bbox;
+        let arrow = drawn.iter().find(|d| d.tag == "line" && d.bbox.y0 == d.bbox.y1 && d.bbox.x1 > d.bbox.x0 + 1.0).expect("arrow");
+        (label, arrow.bbox.y0)
+    }
+
+    #[test]
+    fn multi_line_labels_sit_above_their_arrow() {
+        for src in ["sequenceDiagram\nA->>B: one<br/>two<br/>three", "sequenceDiagram\nA->>B: one"] {
+            let (label, arrow_y) = label_and_arrow(src);
+            assert!(label.y1 <= arrow_y, "{src}: label bottom {} crosses arrow at {arrow_y}", label.y1);
+            crate::extent::assert_inside(&svg(src));
+        }
+    }
+
+    #[test]
+    fn self_message_label_clears_its_loop() {
+        for src in ["sequenceDiagram\nA->>A: thinking hard", "sequenceDiagram\nA->>A: one<br/>two", "sequenceDiagram\nA->>A: one\nA->>B: x"] {
+            let svg = svg(src);
+            let (_, drawn) = crate::extent::scan(&svg);
+            let label = drawn.iter().find(|d| d.tag == "text" && d.text.starts_with("one") || d.text.starts_with("thinking")).unwrap();
+            let lp = drawn.iter().find(|d| d.tag == "path" && d.bbox.x1 > d.bbox.x0 + 20.0 && d.bbox.y1 - d.bbox.y0 > 20.0).expect("loop");
+            assert!(label.bbox.y1 <= lp.bbox.y0, "{src}: label {:?} touches loop {:?}", label.bbox, lp.bbox);
+        }
     }
 
     #[test]

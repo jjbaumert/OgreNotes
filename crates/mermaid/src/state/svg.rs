@@ -198,17 +198,8 @@ pub(crate) fn emit(g: &StateGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
         }
         out.push_str(&format!(r#"<path d="{d}" {attrs}/>"#));
 
-        if let (Some(label), Some((lx, ly))) = (&t.label, ep.label_at) {
-            let (rx, ry, mw, mh) = edge_label_rect(label, (lx, ly));
-            out.push_str(&format!(
-                r#"<rect x="{rx:.1}" y="{ry:.1}" width="{mw:.1}" height="{mh:.1}" fill="var(--surface, #fff)"/>"#
-            ));
-            out.push_str(&format!(
-                r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
-                lx,
-                ly + 4.0,
-                escape_xml(label)
-            ));
+        if let (Some(label), Some(at)) = (&t.label, ep.label_at) {
+            out.push_str(&crate::edge_label_svg(label, at));
         }
     }
 

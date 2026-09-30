@@ -76,4 +76,13 @@ proptest! {
     fn render_output_satisfies_crate_invariants(src in arb_source()) {
         crate::props::assert_render_invariants(&src)?;
     }
+
+    /// #277: nothing is drawn outside the viewBox.
+    #[test]
+    fn everything_drawn_inside_the_viewbox(src in arb_source()) {
+        if let Some(svg) = crate::render(&src).svg {
+            let bad = crate::extent::outside(&svg);
+            prop_assert!(bad.is_empty(), "outside the viewBox: {:?}\n{}", bad, svg);
+        }
+    }
 }

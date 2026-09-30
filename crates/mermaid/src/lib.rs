@@ -42,6 +42,8 @@ pub(crate) mod class;
 pub(crate) mod er;
 #[cfg(test)]
 mod props;
+#[cfg(test)]
+mod extent;
 
 /// Max diagram source length (chars). Shared cap: the single source of
 /// truth for both the `crates/collab` write-gate validator
@@ -111,6 +113,37 @@ impl DiagramKind {
             DiagramKind::Unknown => "unknown",
         }
     }
+}
+
+/// An edge label centered on `at`: a background mask sized to the
+/// text, then the text — one `<tspan>` per `<br/>` line (a single line
+/// stays a bare `<text>`). Shared by the layered-layout renderers.
+pub(crate) fn edge_label_svg(label: &str, at: (f64, f64)) -> String {
+    let (tw, th) = measure::text_size(label);
+    let (mw, mh) = (tw + 4.0, th + 4.0);
+    let (lx, ly) = at;
+    let mut out = format!(
+        r#"<rect x="{:.1}" y="{:.1}" width="{mw:.1}" height="{mh:.1}" fill="var(--surface, #fff)"/>"#,
+        lx - mw / 2.0,
+        ly - mh / 2.0,
+    );
+    let lines = measure::lines(label);
+    if lines.len() == 1 {
+        out.push_str(&format!(
+            r#"<text x="{lx:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
+            ly + 4.0,
+            escape_xml(label)
+        ));
+        return out;
+    }
+    out.push_str(&format!(r#"<text x="{lx:.1}" y="{ly:.1}" text-anchor="middle" fill="currentColor">"#));
+    let n = lines.len() as f64;
+    for (i, line) in lines.iter().enumerate() {
+        let dy = if i == 0 { -(n - 1.0) / 2.0 * measure::LINE_H + 4.0 } else { measure::LINE_H };
+        out.push_str(&format!(r#"<tspan x="{lx:.1}" dy="{dy:.1}">{}</tspan>"#, escape_xml(line)));
+    }
+    out.push_str("</text>");
+    out
 }
 
 /// XML-escape a user-supplied string before interpolating into SVG.
@@ -822,10 +855,13 @@ mod prop_tests {
             let out = render(&src);
             prop_assert!(out.error.is_none(), "unexpected error: {:?}", out.error);
             let svg = out.svg.expect("well-formed pie must render");
+            // A repeated label keeps its first value (mermaid.js parity).
+            let distinct: std::collections::HashSet<&str> =
+                slices.iter().map(|(l, _)| l.as_str()).collect();
             prop_assert_eq!(
                 svg.matches("<text x=\"463\"").count(),
-                slices.len(),
-                "one legend row per slice"
+                distinct.len(),
+                "one legend row per distinct label"
             );
             // Every `<` in the output must open a tag the renderer itself
             // emits; any other `<` is an unescaped label character.
@@ -840,5 +876,128 @@ mod prop_tests {
                 svg
             );
         }
+    }
+}
+
+/// #274: edge labels get layout space in every layered-layout diagram.
+#[cfg(test)]
+mod label_space_tests {
+    fn svg(src: &str) -> String {
+        let out = crate::render(src);
+        out.svg.unwrap_or_else(|| panic!("{src}: {:?}", out.error))
+    }
+
+    #[test]
+    fn issue_274_repros_stay_on_the_canvas() {
+        for src in [
+            "graph LR\nA-->|a fairly long edge label| B",
+            "graph TD\nA-->|a fairly long edge label| B\nA-->|another long edge label| C",
+            "graph TD\nA-->|line1<br/>line2<br/>line3<br/>line4| B",
+            "graph LR\nA-->B-->C\nA-->|a fairly long edge label here| C",
+            "flowchart LR\nsubgraph S[A very long subgraph title here ok]\nA\nend",
+            "stateDiagram-v2\nA --> A: a longer loop label\nA --> B",
+            "erDiagram\nA ||--o{ A : manages",
+            "classDiagram\nclass Node\nNode --> Node : next",
+            "graph TD\nA-->|one| A\nA-->|two| A\nA-->B",
+        ] {
+            crate::extent::assert_inside(&svg(src));
+        }
+    }
+
+    /// Text boxes of every `<text>` that isn't a node label, i.e. the edge
+    /// labels, against every node shape.
+    #[test]
+    fn labels_clear_nodes_and_each_other() {
+        let src = "graph TD\nA-->|a fairly long edge label| B\nA-->|another long edge label| C\nB-->|xx| D\nC-->|line1<br/>line2| D";
+        let (_, drawn) = crate::extent::scan(&svg(src));
+        // Node labels are single letters; edge labels are longer.
+        let labels: Vec<_> = drawn.iter().filter(|d| d.tag == "text" && d.text.len() > 1).collect();
+        let node_texts: Vec<_> = drawn.iter().filter(|d| d.tag == "text" && d.text.len() == 1).collect();
+        // A node's shape is the rect around a node label (edge labels
+        // sit on their own mask rects).
+        let nodes: Vec<_> = drawn
+            .iter()
+            .filter(|d| d.tag == "rect" && node_texts.iter().any(|t| d.bbox.overlap(&t.bbox) > 0.0))
+            .filter(|d| !labels.iter().any(|l| d.bbox.overlap(&l.bbox) > 0.0 && d.bbox.x1 - d.bbox.x0 >= l.bbox.x1 - l.bbox.x0))
+            .collect();
+        assert!(labels.len() == 4 && nodes.len() == 4, "{labels:?} {nodes:?}");
+        for (i, l) in labels.iter().enumerate() {
+            for n in &nodes {
+                assert_eq!(l.bbox.overlap(&n.bbox), 0.0, "{l:?} overlaps node {n:?}");
+            }
+            for m in &labels[i + 1..] {
+                assert_eq!(l.bbox.overlap(&m.bbox), 0.0, "{l:?} overlaps {m:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn lr_height_follows_the_nodes_not_the_label_width() {
+        let h = |src: &str| -> f64 {
+            let s = svg(src);
+            let (v, _) = crate::extent::scan(&s);
+            v.y1 - v.y0
+        };
+        let plain = h("graph LR\nA-->B-->C\nA-->C");
+        let labeled = h("graph LR\nA-->B-->C\nA-->|a fairly long edge label here| C");
+        assert!(labeled < plain + 60.0, "LR canvas grew {plain} -> {labeled} from a label's width");
+    }
+
+    #[test]
+    fn cluster_is_at_least_as_wide_as_its_title() {
+        let s = svg("flowchart LR\nsubgraph S[A very long subgraph title here ok]\nA\nend");
+        let (_, drawn) = crate::extent::scan(&s);
+        let title = drawn.iter().find(|d| d.text.starts_with("A very long")).unwrap();
+        let cluster = drawn.iter().find(|d| d.tag == "rect" && d.bbox.x0 <= title.bbox.x0).expect("cluster rect");
+        assert!(cluster.bbox.x1 >= title.bbox.x1, "title {:?} wider than cluster {:?}", title.bbox, cluster.bbox);
+    }
+
+    #[test]
+    fn br_in_edge_labels_renders_separate_lines() {
+        let s = svg("graph TD\nA-->|one<br/>two| B");
+        assert!(s.contains(">one</tspan>") && s.contains(">two</tspan>"), "{s}");
+        assert!(!s.contains("&lt;br"), "{s}");
+    }
+}
+
+/// #275: subgraph membership, cluster-exit routing and direction.
+#[cfg(test)]
+mod subgraph_tests {
+    /// Center of the drawn text `t`, and every drawn box.
+    fn scan(src: &str) -> (std::collections::HashMap<String, (f64, f64)>, Vec<crate::extent::Drawn>) {
+        let svg = crate::render(src).svg.expect("renders");
+        crate::extent::assert_inside(&svg);
+        let (_, drawn) = crate::extent::scan(&svg);
+        let centers = drawn
+            .iter()
+            .filter(|d| d.tag == "text")
+            .map(|d| (d.text.clone(), ((d.bbox.x0 + d.bbox.x1) / 2.0, (d.bbox.y0 + d.bbox.y1) / 2.0)))
+            .collect();
+        (centers, drawn)
+    }
+
+    #[test]
+    fn a_node_used_before_its_subgraph_is_drawn_inside_it() {
+        let (c, drawn) = scan("flowchart TB\nA --> B\nsubgraph S[Group]\nA\nend");
+        let title = drawn.iter().find(|d| d.text == "Group").unwrap().bbox;
+        let cluster = drawn
+            .iter()
+            .find(|d| d.tag == "rect" && d.bbox.x0 <= title.x0 && d.bbox.y0 <= title.y0 && d.bbox.x1 >= title.x1)
+            .expect("cluster box")
+            .bbox;
+        let inside = |p: (f64, f64)| p.0 > cluster.x0 && p.0 < cluster.x1 && p.1 > cluster.y0 && p.1 < cluster.y1;
+        assert!(inside(c["A"]), "A {:?} outside {cluster:?}", c["A"]);
+        assert!(!inside(c["B"]), "B {:?} inside {cluster:?}", c["B"]);
+    }
+
+    #[test]
+    fn subgraph_direction_is_ignored_when_a_member_links_outside() {
+        // mermaid.js: the parent direction (LR) applies, so A and B sit
+        // side by side rather than stacked.
+        let (c, _) = scan("flowchart LR\nsubgraph S\ndirection TB\nA-->B\nend\nC-->A");
+        assert!(c["B"].0 > c["A"].0 + 20.0 && (c["B"].1 - c["A"].1).abs() < 5.0, "A {:?} B {:?}", c["A"], c["B"]);
+        // Without the outside link the subgraph's own TB applies.
+        let (c, _) = scan("flowchart LR\nsubgraph S\ndirection TB\nA-->B\nend\nC");
+        assert!(c["B"].1 > c["A"].1 + 20.0, "A {:?} B {:?}", c["A"], c["B"]);
     }
 }
