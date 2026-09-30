@@ -1605,6 +1605,21 @@ fn render_table_markdown<T: ReadTxn>(
     if columns == 0 {
         return;
     }
+    // Preserve the preceding block boundary (images emit no trailing newline).
+    if !out.is_empty() && !out.ends_with("\n\n") {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    // Very uneven tables must not expand compact input into a huge rectangle.
+    // HTML is valid Markdown and preserves every stored cell without padding.
+    let stored_cells: usize = rows.iter().map(Vec::len).sum();
+    if rows.len().saturating_mul(columns) > stored_cells.saturating_mul(4).max(10_000) {
+        render_node_html(txn, &XmlOut::Element(table.clone()), out);
+        out.push_str("\n\n");
+        return;
+    }
     let has_header = rows[0]
         .iter()
         .any(|cell| cell.tag().as_ref() == NodeType::TableHeader.tag_name());
@@ -1632,7 +1647,17 @@ fn render_table_markdown<T: ReadTxn>(
             .iter()
             .map(|cell| {
                 let mut body = String::new();
-                render_children_markdown(txn, cell, &mut body, depth);
+                if contains_multiline_code(txn, &XmlOut::Element(cell.clone())) {
+                    // Code spans treat <br> literally. Inline HTML keeps the
+                    // code formatting while making breaks real elements.
+                    for i in 0..cell.len(txn) {
+                        if let Some(child) = cell.get(txn, i) {
+                            render_node_html(txn, &child, &mut body);
+                        }
+                    }
+                } else {
+                    render_children_markdown(txn, cell, &mut body, depth);
+                }
                 // A pipe or newline inside a cell must not create another
                 // column or row. Inline marks are already rendered above.
                 body.trim()
@@ -1647,6 +1672,25 @@ fn render_table_markdown<T: ReadTxn>(
         }
     }
     out.push('\n');
+}
+
+fn contains_multiline_code<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
+    match node {
+        XmlOut::Element(el) => {
+            el.tag().as_ref() == NodeType::CodeBlock.tag_name()
+                || (0..el.len(txn))
+                    .filter_map(|i| el.get(txn, i))
+                    .any(|child| contains_multiline_code(txn, &child))
+        }
+        XmlOut::Text(text) => text.diff(txn, |_| ()).iter().any(|chunk| {
+            matches!(&chunk.insert, Out::Any(Any::String(s)) if s.contains(['\r', '\n']))
+                && chunk
+                    .attributes
+                    .as_deref()
+                    .is_some_and(|attrs| has_mark(attrs, "code"))
+        }),
+        _ => false,
+    }
 }
 
 fn push_md_table_row(out: &mut String, cells: &[String], columns: usize, depth: usize) {
@@ -2672,6 +2716,74 @@ mod tests {
             }
         }
         assert!(to_markdown(&doc).contains("| :--- | :---: | ---: |"));
+    }
+
+    #[test]
+    fn markdown_table_starts_after_image() {
+        let doc = markdown_table_doc(&[&["A", "B"], &["1", "2"]], true);
+        {
+            let mut txn = doc.transact_mut();
+            let fragment = txn.get_or_insert_xml_fragment("content");
+            let image = fragment.insert(&mut txn, 0, XmlElementPrelim::empty("image"));
+            image.insert_attribute(&mut txn, "src", "https://example.com/image.png");
+        }
+        let md = to_markdown(&doc);
+        let parser = pulldown_cmark::Parser::new_ext(&md, pulldown_cmark::Options::ENABLE_TABLES);
+        assert!(
+            parser.into_iter().any(|e| matches!(
+                e,
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::Table(_))
+            )),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn markdown_table_multiline_code_uses_real_breaks() {
+        let doc = markdown_table_doc(&[&["Code"], &["one\ntwo"]], true);
+        {
+            let mut txn = doc.transact_mut();
+            let f = txn.get_or_insert_xml_fragment("content");
+            let Some(XmlOut::Element(table)) = f.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(row)) = table.get(&txn, 1) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(cell)) = row.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(p)) = cell.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Text(text)) = p.get(&txn, 0) else {
+                panic!()
+            };
+            text.format(
+                &mut txn,
+                0,
+                7,
+                Attrs::from([("code".into(), Any::Bool(true))]),
+            );
+        }
+        let md = to_markdown(&doc);
+        let mut html = String::new();
+        pulldown_cmark::html::push_html(
+            &mut html,
+            pulldown_cmark::Parser::new_ext(&md, pulldown_cmark::Options::ENABLE_TABLES),
+        );
+        assert!(html.contains("<code>one<br>two</code>"), "{html}");
+    }
+
+    #[test]
+    fn markdown_table_sparse_shape_does_not_expand_quadratically() {
+        let wide = vec!["value"; 300];
+        let mut rows: Vec<&[&str]> = vec![&wide];
+        rows.extend(std::iter::repeat_n(&["value"][..], 299));
+        let doc = markdown_table_doc(&rows, true);
+        let md = to_markdown(&doc);
+        assert!(md.len() < 50_000, "expanded to {} bytes", md.len());
+        assert_eq!(md.matches("value").count(), 599);
     }
 
     #[test]
