@@ -5520,7 +5520,9 @@ fn html_source_coalesces_wrappers_and_preserves_explicit_newline_runs() {
         ("\n", "\n"),
         ("\n\n", "\n\n"),
         ("\n\n\n", "\n\n\n"),
-        ("<br>", "\n"),
+        ("<br>", "\n\n"),
+        ("<div><br></div>", "\n\n"),
+        ("<div>\n</div>", "\n\n"),
     ] {
         let html = format!(
             "<pre><code class=\"language-mermaid\"><div>graph TD</div>{breaks}<div>A --&gt; B</div></code></pre>"

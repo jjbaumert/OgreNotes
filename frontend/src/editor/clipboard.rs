@@ -609,20 +609,27 @@ fn literal_dom_text(root: &web_sys::Node) -> String {
     use wasm_bindgen::JsCast;
     let mut text = String::new();
     let mut synthetic_end = false;
+    let mut synthetic_parent = None;
     // Iterative traversal also handles clipboard HTML before depth truncation.
-    let mut pending = vec![Some(root.clone())];
-    while let Some(entry) = pending.pop() {
-        let Some(node) = entry else {
+    // End markers retain their block so only sibling newline text can replace
+    // a synthetic separator. A newline inside the next block is a blank line.
+    let mut pending = vec![(root.clone(), false)];
+    while let Some((node, leaving_block)) = pending.pop() {
+        if leaving_block {
             if !text.is_empty() && !text.ends_with('\n') {
                 text.push('\n');
                 synthetic_end = true;
+                synthetic_parent = node.parent_node();
             }
             continue;
-        };
+        }
         if node.node_type() == web_sys::Node::TEXT_NODE {
             let value = node.text_content().unwrap_or_default();
             if !value.is_empty() {
-                if synthetic_end && value.starts_with(['\r', '\n']) {
+                if synthetic_end
+                    && value.starts_with(['\r', '\n'])
+                    && synthetic_parent == node.parent_node()
+                {
                     text.pop();
                 }
                 text.push_str(&value);
@@ -636,9 +643,6 @@ fn literal_dom_text(root: &web_sys::Node) -> String {
             }
             let tag = element.tag_name().to_ascii_lowercase();
             if tag == "br" {
-                if synthetic_end {
-                    text.pop();
-                }
                 text.push('\n');
                 synthetic_end = false;
                 continue;
@@ -663,14 +667,15 @@ fn literal_dom_text(root: &web_sys::Node) -> String {
                 if !text.is_empty() && !text.ends_with('\n') {
                     text.push('\n');
                     synthetic_end = true;
+                    synthetic_parent = node.parent_node();
                 }
-                pending.push(None);
+                pending.push((node.clone(), true));
             }
         }
         let children = node.child_nodes();
         for i in (0..children.length()).rev() {
             if let Some(child) = children.item(i) {
-                pending.push(Some(child));
+                pending.push((child, false));
             }
         }
     }
