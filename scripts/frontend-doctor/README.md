@@ -300,3 +300,10 @@ Output directory contains:
 
 Final stdout line is `FRONTEND_DOCTOR_REPORT <json>` with the report inline
 for quick piping to `jq`.
+
+### Mermaid modal regression (#288)
+
+`node test-mermaid-modal.cjs --base-url http://127.0.0.1:3000 --out /tmp/mermaid-modal`
+creates an owner, editor and viewer, then checks collaborator conflict handling,
+Save/Undo delivery, read-only documents, and 320px/375px normal and error layouts.
+It purges its test document and runs in the Playwright CI workflow.
