@@ -4681,3 +4681,115 @@ fn paste_real_code_block_preserves_codeblock() {
 
     cleanup(&container);
 }
+
+// ─── Equations and Mermaid: copy/paste round trip ─────────────
+//
+// Copy writes `div.math-block` / `span.math-inline` / `div.mermaid`
+// (clipboard.rs `element_tags`); paste must turn them — and MathML with
+// a TeX annotation from other sites — back into nodes, not text.
+
+fn source_leaf(node_type: NodeType, source: &str) -> Node {
+    let mut attrs = HashMap::new();
+    attrs.insert("source".to_string(), source.to_string());
+    Node::element_with_attrs(node_type, attrs, Fragment::empty())
+}
+
+fn source_of(node: &Node) -> String {
+    node.attrs().get("source").cloned().unwrap_or_default()
+}
+
+fn round_trip(nodes: Vec<Node>) -> Slice {
+    let html = clipboard::serialize_to_html(&Slice::new(Fragment::from(nodes), 0, 0));
+    clipboard::parse_from_html(&html)
+}
+
+#[wasm_bindgen_test]
+fn copy_paste_round_trips_equation_block_and_mermaid() {
+    let tricky = "a < \\frac{b}{c} & \"d\"\n\\\\ e";
+    let slice = round_trip(vec![
+        source_leaf(NodeType::MathBlock, tricky),
+        source_leaf(NodeType::Mermaid, "pie\n\"A\" : 1"),
+    ]);
+    let nodes = &slice.content.children;
+    assert_eq!(nodes.len(), 2, "{nodes:?}");
+    assert_eq!(nodes[0].node_type(), Some(NodeType::MathBlock));
+    assert_eq!(source_of(&nodes[0]), tricky);
+    assert_eq!(nodes[1].node_type(), Some(NodeType::Mermaid));
+    assert_eq!(source_of(&nodes[1]), "pie\n\"A\" : 1");
+}
+
+#[wasm_bindgen_test]
+fn copy_paste_round_trips_inline_equation_in_a_paragraph() {
+    let para = Node::element_with_content(
+        NodeType::Paragraph,
+        Fragment::from(vec![Node::text("area "), source_leaf(NodeType::MathInline, "\\pi r^2")]),
+    );
+    let slice = round_trip(vec![para]);
+    let p = &slice.content.children[0];
+    assert_eq!(p.node_type(), Some(NodeType::Paragraph));
+    assert_eq!(p.child(0).unwrap().text_content(), "area ");
+    let eq = p.child(1).unwrap();
+    assert_eq!(eq.node_type(), Some(NodeType::MathInline));
+    assert_eq!(source_of(eq), "\\pi r^2");
+}
+
+#[wasm_bindgen_test]
+fn paste_mathml_with_tex_annotation_becomes_equations() {
+    let html = r#"<p>Energy <math><semantics><mi>E</mi><annotation encoding="application/x-tex">E=mc^2</annotation></semantics></math> here</p>
+<math display="block"><semantics><mi>x</mi><annotation encoding="application/x-tex">\sum_i x_i</annotation></semantics></math>"#;
+    let slice = clipboard::parse_from_html(html);
+    let nodes = &slice.content.children;
+    let p = &nodes[0];
+    let inline = p.child(1).unwrap();
+    assert_eq!(inline.node_type(), Some(NodeType::MathInline));
+    assert_eq!(source_of(inline), "E=mc^2");
+    assert_eq!(p.child(2).unwrap().text_content(), " here");
+    let block = nodes.last().unwrap();
+    assert_eq!(block.node_type(), Some(NodeType::MathBlock));
+    assert_eq!(source_of(block), "\\sum_i x_i");
+}
+
+#[wasm_bindgen_test]
+fn paste_wikipedia_formula_keeps_the_math_and_drops_the_fallback_image() {
+    let html = r#"<p>Euler: <span class="mwe-math-element"><span class="mwe-math-mathml-inline" style="display: none;"><math><semantics><mrow><mi>e</mi></mrow><annotation encoding="application/x-tex">{\displaystyle e^{i\pi }+1=0}</annotation></semantics></math></span><img src="https://wikimedia.org/api/rest_v1/media/math/render/svg/x" class="mwe-math-fallback-image-inline" alt="{\displaystyle e^{i\pi }+1=0}"></span></p>"#;
+    let slice = clipboard::parse_from_html(html);
+    let p = &slice.content.children[0];
+    assert_eq!(p.child_count(), 2, "text + equation only, no image: {p:?}");
+    let eq = p.child(1).unwrap();
+    assert_eq!(eq.node_type(), Some(NodeType::MathInline));
+    assert_eq!(source_of(eq), "e^{i\\pi }+1=0");
+}
+
+#[wasm_bindgen_test]
+fn paste_leaves_unrecoverable_math_as_text() {
+    // MathML without a TeX annotation: nothing to restore from.
+    let slice = clipboard::parse_from_html("<p>x <math><mi>y</mi></math></p>");
+    let p = &slice.content.children[0];
+    assert!((0..p.child_count()).all(|i| p.child(i).unwrap().node_type() != Some(NodeType::MathInline)));
+    // An empty source isn't a node the server would accept.
+    let slice = clipboard::parse_from_html(r#"<div class="math-block" data-source="  "></div>"#);
+    assert!(slice.content.children.iter().all(|n| n.node_type() != Some(NodeType::MathBlock)));
+}
+
+#[wasm_bindgen_test]
+fn pasted_equation_block_inside_a_wrapper_is_not_put_in_a_paragraph() {
+    let slice = clipboard::parse_from_html(
+        r#"<div><div class="math-block" data-source="x^2">x^2</div></div>"#,
+    );
+    let nodes = &slice.content.children;
+    assert_eq!(nodes.len(), 1, "{nodes:?}");
+    assert_eq!(nodes[0].node_type(), Some(NodeType::MathBlock));
+}
+
+#[wasm_bindgen_test]
+fn paste_equations_into_the_editor_renders_them() {
+    // Full glue: paste → parse → transaction → render.
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    let html = r#"<span class="math-inline" data-source="x^2">$x^2$</span>"#;
+    dispatch_paste_html(&view, &txns, "$x^2$", html);
+    let eq = view.container().query_selector("span.math-inline math msup").unwrap();
+    assert!(eq.is_some(), "inline equation rendered: {}", inner_html(&view));
+    cleanup(&container);
+}
