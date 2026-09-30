@@ -598,12 +598,7 @@ pub(super) fn literal_text_from_html(html: &str) -> Option<String> {
             return Some(source);
         }
         if element.tag_name().eq_ignore_ascii_case("pre") {
-            let source = element
-                .query_selector("code")
-                .ok()
-                .flatten()
-                .unwrap_or(element);
-            return Some(literal_dom_text(source.unchecked_ref()));
+            return Some(literal_dom_text(element.unchecked_ref()));
         }
     }
     Some(literal_dom_text(body.unchecked_ref()))
@@ -681,16 +676,7 @@ fn literal_dom_text(root: &web_sys::Node) -> String {
 /// Parse a <pre> element into a CodeBlock node, extracting language from <code> or <pre>.
 #[cfg(target_arch = "wasm32")]
 fn convert_code_block(child: &web_sys::Node, el: &web_sys::Element) -> Node {
-    use wasm_bindgen::JsCast;
-
     let code_el = el.query_selector("code").ok().flatten();
-    // #2: `Element` is a `Node` today so this never fails, but use a
-    // fallible cast rather than `.unwrap()` — a refactor that changed the
-    // source type would otherwise panic the whole page in wasm. Fall back
-    // to the original `child` node if the cast ever doesn't hold.
-    let text_source = code_el.as_ref()
-        .and_then(|c| c.dyn_ref::<web_sys::Node>())
-        .unwrap_or(child);
 
     let mut attrs = std::collections::HashMap::new();
     let language = code_el
@@ -701,7 +687,7 @@ fn convert_code_block(child: &web_sys::Node, el: &web_sys::Element) -> Node {
         attrs.insert("language".to_string(), lang.to_string());
     }
 
-    let text = literal_dom_text(text_source);
+    let text = literal_dom_text(child);
     if attrs.get("language").is_some_and(|lang| lang == "mermaid") {
         if let Some(node) = source_node(NodeType::Mermaid, &text, ogrenotes_mermaid::MAX_SOURCE_LEN)
         {

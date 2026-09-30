@@ -917,11 +917,15 @@ impl EditorView {
                     return;
                 };
                 let literal = super::clipboard::normalize_line_endings(&source);
-                if let Ok(txn) = state_with_sel
+                let txn = state_with_sel
                     .transaction()
-                    .set_stored_marks(Some(Vec::new()))
-                    .insert_text(&literal)
-                {
+                    .set_stored_marks(Some(Vec::new()));
+                let replacement = if literal.is_empty() {
+                    txn.delete_selection()
+                } else {
+                    txn.insert_text(&literal)
+                };
+                if let Ok(txn) = replacement {
                     dispatch_paste(txn);
                 }
                 return;

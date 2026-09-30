@@ -5447,6 +5447,74 @@ fn source_paste_ignores_active_stored_marks() {
 }
 
 #[wasm_bindgen_test]
+fn source_paste_keeps_text_outside_code_within_pre() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), code_block_doc("old", "mermaid"));
+    set_selection(&view, 1, 4);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "",
+        "<pre><code>graph TD\nA --&gt; B</code>\nB --&gt; C</pre>",
+    );
+    assert_eq!(
+        view.state().doc.child(0).unwrap().text_content(),
+        "graph TD\nA --> B\nB --> C"
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn diagram_html_import_keeps_text_outside_code_within_pre() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "",
+        "<pre><code class=\"language-mermaid\">graph TD\nA --&gt; B</code>\nB --&gt; C</pre>",
+    );
+    assert_eq!(
+        view.state()
+            .doc
+            .child(0)
+            .unwrap()
+            .attrs()
+            .get("source")
+            .map(String::as_str),
+        Some("graph TD\nA --> B\nB --> C")
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn empty_html_source_replaces_selected_source() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), code_block_doc("old", "mermaid"));
+    let identity = view
+        .state()
+        .doc
+        .child(0)
+        .unwrap()
+        .attrs()
+        .get("blockId")
+        .cloned();
+    set_selection(&view, 1, 4);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "",
+        "<pre><code class=\"language-mermaid\"></code></pre>",
+    );
+    let block = view.state().doc.child(0).unwrap().clone();
+    assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+    assert_eq!(block.text_content(), "");
+    assert_eq!(block.attrs().get("blockId").cloned(), identity);
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
 fn paste_markdown_heading_creates_h1_in_dom() {
     let container = create_container();
     let (view, txns) = create_editor(container.clone(), Node::empty_doc());
