@@ -113,7 +113,9 @@ pub struct ParseError { pub message: String, pub line: Option<usize> }
   missing `pie` header is an error.
 - **Pie SVG:** self-contained `<svg>` with slices, a legend, and optional raw
   values when `showData` is set. Slice fills use a ported 8-hue palette; text
-  uses `currentColor` so it tracks the light/dark theme.
+  uses `currentColor` on the canvas so it tracks the light/dark theme.
+  Labels on fixed light data fills use matching dark foreground tokens in
+  both themes; C4 retains light text on its darker person/system fills.
 
 ### B. Block model (both schemas, mirrored)
 

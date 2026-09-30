@@ -5,7 +5,8 @@
 //! squarified treemap — each node a rectangle whose area is proportional to
 //! its value, packed to keep cell aspect ratios near 1.
 
-use crate::{escape_xml, measure, ParseError};
+use crate::theme::{DATA_MUTED_TEXT, DATA_TEXT};
+use crate::{ParseError, escape_xml, measure};
 
 const PAD: f64 = 4.0;
 const WIDTH: f64 = 720.0;
@@ -238,7 +239,7 @@ fn draw_header_label(node: &Node, r: Rect, out: &mut String) {
         return;
     }
     out.push_str(&format!(
-        r#"<text x="{:.1}" y="{:.1}" font-weight="600" font-size="12" fill="currentColor">{}</text>"#,
+        r#"<text x="{:.1}" y="{:.1}" font-weight="600" font-size="12" fill="{DATA_TEXT}">{}</text>"#,
         r.x + 5.0,
         r.y + 13.0,
         escape_xml(&clip(&node.name, r.w - 10.0))
@@ -252,14 +253,14 @@ fn draw_leaf_label(node: &Node, r: Rect, out: &mut String) {
     let cx = r.x + r.w / 2.0;
     let cy = r.y + r.h / 2.0;
     out.push_str(&format!(
-        r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
+        r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="{DATA_TEXT}">{}</text>"#,
         cy - 2.0,
         escape_xml(&clip(&node.name, r.w - 8.0))
     ));
     if let Some(v) = node.value {
         if r.h > 34.0 {
             out.push_str(&format!(
-                r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-size="11" fill="var(--color-text-secondary, #666)">{}</text>"#,
+                r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-size="11" fill="{DATA_MUTED_TEXT}">{}</text>"#,
                 cy + 14.0,
                 fmt_num(v)
             ));

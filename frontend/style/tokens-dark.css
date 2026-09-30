@@ -17,6 +17,11 @@
  */
 
 :root[data-theme="dark"] {
+  /* Fixed light chart fills need dark foregrounds in both themes. */
+  --mermaid-data-text: #1a1a1a;
+  --mermaid-data-text-muted: #444;
+  --mermaid-data-stroke: #444;
+
   /* Opt the UA stylesheet into dark mode. Without this, native
    * form controls (`<input>`, `<textarea>`, `<select>`) keep
    * their light-mode defaults — most visibly white-on-white

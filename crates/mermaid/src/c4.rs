@@ -9,6 +9,7 @@
 //! out with the shared boxgraph adapter. Styling directives (`Update*`) are
 //! accepted and ignored.
 
+use crate::theme::DATA_TEXT;
 use crate::{escape_xml, measure, ParseError};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -364,22 +365,28 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
         let (bx, by) = (cx - bw / 2.0, cy - bh / 2.0);
         let fill = fill_for(e);
         draw_shape(&mut out, e.shape, bx, by, bw, bh, fill);
-        // text (white on the colored fill). Person boxes leave room for a head.
+        // Pair the fixed element fill with a readable foreground in either theme.
+        let (name_text, tag_text, desc_text) = if e.external || e.tier >= 2 {
+            (DATA_TEXT, DATA_TEXT, DATA_TEXT)
+        } else {
+            (TXT_NAME, TXT_TAG, TXT_DESC)
+        };
+        // Person boxes leave room for a head.
         let mut ty = by + 16.0 + if e.shape == Shape::Person { 14.0 } else { 0.0 };
         out.push_str(&format!(
-            r#"<text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" font-weight="700" fill="{TXT_NAME}">{}</text>"#,
+            r#"<text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" font-weight="700" fill="{name_text}">{}</text>"#,
             escape_xml(&e.name)
         ));
         ty += LINE_H;
         let tag = if e.external { format!("[{}]", e.kind.replace('_', " ")) } else { format!("[{}]", e.kind) };
         out.push_str(&format!(
-            r#"<text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" font-size="11" font-style="italic" fill="{TXT_TAG}">{}</text>"#,
+            r#"<text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" font-size="11" font-style="italic" fill="{tag_text}">{}</text>"#,
             escape_xml(&tag)
         ));
         for d in &e.descr {
             ty += LINE_H;
             out.push_str(&format!(
-                r#"<text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" font-size="11" fill="{TXT_DESC}">{}</text>"#,
+                r#"<text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" font-size="11" fill="{desc_text}">{}</text>"#,
                 escape_xml(d)
             ));
         }

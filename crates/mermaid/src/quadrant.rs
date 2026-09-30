@@ -6,7 +6,8 @@
 //! split by a center cross, quadrant labels in each cell, axis labels on the
 //! edges, and a labeled dot per point.
 
-use crate::{escape_xml, ParseError};
+use crate::theme::{DATA_STROKE, DATA_TEXT};
+use crate::{ParseError, escape_xml};
 
 const PAD: f64 = 20.0;
 const PLOT: f64 = 380.0; // square plot side
@@ -146,10 +147,10 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
     }
     // plot border + center cross.
     body.push_str(&format!(
-        r#"<rect x="{l:.1}" y="{top:.1}" width="{side:.1}" height="{side:.1}" fill="none" stroke="currentColor"/>"#
+        r#"<rect x="{l:.1}" y="{top:.1}" width="{side:.1}" height="{side:.1}" fill="none" stroke="{DATA_STROKE}"/>"#
     ));
     body.push_str(&format!(
-        r#"<line x1="{cx0:.1}" y1="{top:.1}" x2="{cx0:.1}" y2="{:.1}" stroke="currentColor"/><line x1="{l:.1}" y1="{cy0:.1}" x2="{:.1}" y2="{cy0:.1}" stroke="currentColor"/>"#,
+        r#"<line x1="{cx0:.1}" y1="{top:.1}" x2="{cx0:.1}" y2="{:.1}" stroke="{DATA_STROKE}"/><line x1="{l:.1}" y1="{cy0:.1}" x2="{:.1}" y2="{cy0:.1}" stroke="{DATA_STROKE}"/>"#,
         top + side,
         l + side
     ));
@@ -166,7 +167,7 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
             if !text.is_empty() {
                 let (qx, qy) = quad_centers[i];
                 body.push_str(&format!(
-                    r#"<text x="{qx:.1}" y="{qy:.1}" text-anchor="middle" fill="currentColor" opacity="0.75">{}</text>"#,
+                    r#"<text x="{qx:.1}" y="{qy:.1}" text-anchor="middle" fill="{DATA_TEXT}" opacity="0.75">{}</text>"#,
                     escape_xml(text)
                 ));
             }
@@ -211,7 +212,7 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
             r#"<circle cx="{dx:.1}" cy="{dy:.1}" r="{DOT_R}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1"/>"#
         ));
         body.push_str(&format!(
-            r#"<text x="{:.1}" y="{:.1}" font-size="12" fill="currentColor">{}</text>"#,
+            r#"<text x="{:.1}" y="{:.1}" font-size="12" fill="{DATA_TEXT}">{}</text>"#,
             dx + DOT_R + 3.0,
             dy + 4.0,
             escape_xml(name)

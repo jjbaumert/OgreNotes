@@ -19,6 +19,11 @@
  */
 
 :root {
+  /* Fixed light chart fills need dark foregrounds in both themes. */
+  --mermaid-data-text: #1a1a1a;
+  --mermaid-data-text-muted: #444;
+  --mermaid-data-stroke: #444;
+
   /* Tells the browser the page is in light mode, so the UA
    * stylesheet picks light-mode defaults for native form
    * controls, scrollbars, and any `system-ui`-derived colors.

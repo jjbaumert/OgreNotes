@@ -1,0 +1,10 @@
+C4Component
+Person(p, "Person", "Description")
+System(s, "System", "Description")
+Container(c, "Container", "Rust", "Description")
+Component(x, "Component", "Rust", "Description")
+System_Ext(e, "External", "Description")
+Rel(p, s, "uses")
+Rel(s, c, "contains")
+Rel(c, x, "contains")
+Rel(x, e, "calls")

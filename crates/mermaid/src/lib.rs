@@ -14,6 +14,7 @@
 //! and docs/superpowers/specs/2026-07-10-mermaid-slice4-state-class-er-design.md
 //! (state/class/ER).
 
+mod theme;
 mod pie;
 mod gantt;
 mod gitgraph;

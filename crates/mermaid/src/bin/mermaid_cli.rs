@@ -27,6 +27,9 @@ use std::process::{Command, Stdio};
 /// fallbacks the renderer already bakes in; dark values mirror
 /// `frontend/style/tokens-dark.css`. Keep in sync with both.
 const VARS: &[(&str, &str, &str)] = &[
+    ("var(--mermaid-data-text, #1a1a1a)", "#1a1a1a", "#1a1a1a"),
+    ("var(--mermaid-data-text-muted, #444)", "#444", "#444"),
+    ("var(--mermaid-data-stroke, #444)", "#444", "#444"),
     ("var(--mermaid-node-fill, #ececff)", "#ececff", "#2F2F45"),
     ("var(--mermaid-cluster-fill, #7773)", "#7773", "#ffffff14"),
     ("var(--mermaid-note-fill, #fff5ad)", "#fff5ad", "#4A4636"),

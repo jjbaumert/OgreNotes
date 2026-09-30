@@ -307,3 +307,10 @@ for quick piping to `jq`.
 creates an owner, editor and viewer, then checks collaborator conflict handling,
 Save/Undo delivery, read-only documents, and 320px/375px normal and error layouts.
 It purges its test document and runs in the Playwright CI workflow.
+
+### Mermaid rendered contrast regression (#287)
+
+`node test-mermaid-contrast.cjs --out /tmp/mermaid-contrast` measures browser
+foreground/background contrast for six diagram kinds in both themes, using
+renderer fixtures and the production CSS. No server is needed. The native
+renderer tests verify fixture freshness; Playwright CI runs the browser checks.

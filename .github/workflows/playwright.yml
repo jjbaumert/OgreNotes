@@ -884,6 +884,12 @@ jobs:
             --base-url http://127.0.0.1:3000 \
             --out ../../artifacts/doctor/mermaid-modal
 
+      - name: Run Mermaid rendered contrast regression
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node test-mermaid-contrast.cjs --out ../../artifacts/doctor/mermaid-contrast
+
       # ─── Teardown / artifacts ─────────────────────────────────
       - name: Stop axum server
         if: always()
