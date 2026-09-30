@@ -4910,6 +4910,43 @@ fn mermaid_source_scroll_survives_editing_following_paragraph() {
 }
 
 #[wasm_bindgen_test]
+fn mixed_mermaid_and_list_paste_keeps_diagram_inside_existing_list() {
+    for html in [false, true] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), bullet_list_doc("existing"));
+        set_cursor(&view, 3);
+        let plain = "```mermaid\ngraph TD\nA --> B\n```\n\n- item";
+        if html {
+            dispatch_paste_html(
+                &view,
+                &txns,
+                plain,
+                "<pre><code class=\"language-mermaid\">graph TD\nA --&gt; B</code></pre><ul><li>item</li></ul>",
+            );
+        } else {
+            dispatch_paste(&view, &txns, plain);
+        }
+        assert!(
+            view.state().doc.text_content().contains("graph TD"),
+            "{:?}",
+            view.state().doc
+        );
+        assert!(
+            view.container()
+                .query_selector(".mermaid-svg svg")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ogrenotes_frontend::editor::schema::default_schema()
+                .validate(&view.state().doc)
+                .is_ok()
+        );
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
 fn paste_markdown_heading_creates_h1_in_dom() {
     let container = create_container();
     let (view, txns) = create_editor(container.clone(), Node::empty_doc());

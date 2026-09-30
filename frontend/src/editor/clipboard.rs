@@ -440,30 +440,28 @@ fn strip_dollars(text: &str) -> &str {
 /// Keep imported diagrams in the existing schema: restricted containers
 /// retain editable Mermaid CodeBlocks, which still display a preview.
 pub(super) fn preserve_mermaid_nesting(nodes: &mut [Node], parent: NodeType) {
-    fn walk(nodes: &mut [Node], parent: NodeType, schema: &super::schema::Schema) {
-        for node in nodes {
-            if node.node_type() == Some(NodeType::Mermaid)
-                && !schema.content_matches(parent, &[node])
-            {
-                if let Node::Element { attrs, .. } = node {
-                    let source = attrs.remove("source").unwrap_or_default();
-                    attrs.insert("language".into(), "mermaid".into());
-                    *node = Node::element_with_attrs(
-                        NodeType::CodeBlock,
-                        attrs.clone(),
-                        Fragment::from(vec![Node::text(&source)]),
-                    );
-                }
-            }
-            if let Node::Element {
-                node_type, content, ..
-            } = node
-            {
-                walk(&mut content.children, *node_type, schema);
+    let schema = super::schema::default_schema();
+    let mut pending: Vec<_> = nodes.iter_mut().map(|node| (parent, node)).collect();
+    while let Some((parent, node)) = pending.pop() {
+        if node.node_type() == Some(NodeType::Mermaid) && !schema.content_matches(parent, &[node]) {
+            if let Node::Element { attrs, .. } = node {
+                let source = attrs.remove("source").unwrap_or_default();
+                attrs.insert("language".into(), "mermaid".into());
+                *node = Node::element_with_attrs(
+                    NodeType::CodeBlock,
+                    attrs.clone(),
+                    Fragment::from(vec![Node::text(&source)]),
+                );
             }
         }
+        if let Node::Element {
+            node_type, content, ..
+        } = node
+        {
+            let parent = *node_type;
+            pending.extend(content.children.iter_mut().map(|child| (parent, child)));
+        }
     }
-    walk(nodes, parent, &super::schema::default_schema());
 }
 
 /// A leaf node of `node_type` carrying `source`, if the server would
@@ -912,6 +910,11 @@ pub fn fit_pasted_list_items(slice: &Slice, item_type: NodeType) -> Vec<Node> {
 
 fn collect_as_list_items(node: &Node, item_type: NodeType, out: &mut Vec<Node>) {
     match node.node_type() {
+        Some(NodeType::Mermaid) => {
+            let mut nodes = vec![node.clone()];
+            preserve_mermaid_nesting(&mut nodes, item_type);
+            collect_as_list_items(&nodes[0], item_type, out);
+        }
         // A pasted list: extract its children so they become siblings in
         // the target list rather than a nested sub-list.
         Some(NodeType::BulletList | NodeType::OrderedList | NodeType::TaskList) => {
