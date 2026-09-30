@@ -5633,6 +5633,47 @@ fn mermaid_paste_over_rule_in_quote_without_text_blocks_keeps_schema() {
 }
 
 #[wasm_bindgen_test]
+fn whole_mermaid_code_copy_paste_round_trip_preserves_exact_source() {
+    let source = "graph TD\nA --> B";
+    for quoted in [false, true] {
+        let mut doc = code_block_doc(source, "mermaid");
+        if quoted {
+            doc = Node::element_with_content(
+                NodeType::Doc,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::Blockquote,
+                    Fragment::from(vec![doc.child(0).unwrap().clone()]),
+                )]),
+            );
+        }
+        let start = if quoted { 2 } else { 1 };
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), doc);
+        set_cursor(&view, start);
+        dispatch_keydown(view.container(), "a", true, false, false);
+        apply_all(&view, &txns);
+        let clipboard = dispatch_clipboard_copy(&view);
+        let text = clipboard.get_data("text/plain").unwrap();
+        assert_eq!(text, source, "quoted={quoted}");
+        set_selection(&view, start, start + source.chars().count());
+        dispatch_paste_html(
+            &view,
+            &txns,
+            &text,
+            &clipboard.get_data("text/html").unwrap(),
+        );
+        let doc = view.state().doc;
+        let block = if quoted {
+            doc.child(0).unwrap().child(0).unwrap()
+        } else {
+            doc.child(0).unwrap()
+        };
+        assert_eq!(block.text_content(), source);
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
 fn paste_markdown_heading_creates_h1_in_dom() {
     let container = create_container();
     let (view, txns) = create_editor(container.clone(), Node::empty_doc());

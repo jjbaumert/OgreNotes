@@ -33,24 +33,45 @@ fn mermaid_scroll_panes(container: &HtmlElement) -> Vec<(String, HtmlElement)> {
 }
 
 fn clipboard_text_for_selection(state: &EditorState, slice: &super::model::Slice) -> String {
-    if let Some(block) = super::state::find_block_at(&state.doc, state.selection.from()) {
-        if block.node_type == NodeType::CodeBlock
-            && state.selection.to() <= block.offset + block.node_size
-        {
-            let from = state.selection.from().saturating_sub(block.content_start);
-            let to = state
-                .selection
-                .to()
-                .saturating_sub(block.content_start)
-                .min(block.content.size());
-            return block
-                .content
-                .cut(from, to)
-                .children
-                .iter()
-                .map(Node::text_content)
-                .collect();
+    // A sole code block can be selected together with structural wrappers.
+    // Those wrappers contribute no source characters to its plain-text copy.
+    let mut selected = slice.content.children.as_slice();
+    while let [node] = selected {
+        match node {
+            Node::Element {
+                node_type: NodeType::CodeBlock,
+                ..
+            } => return node.text_content(),
+            Node::Element {
+                node_type, content, ..
+            } if node_type.is_block() && !node_type.is_textblock() && !node_type.is_atom() => {
+                selected = content.children.as_slice();
+            }
+            _ => break,
         }
+    }
+    let from = state.selection.from();
+    let block = super::state::find_block_at(&state.doc, from).or_else(|| {
+        from.checked_add(1)
+            .and_then(|pos| super::state::find_block_at(&state.doc, pos))
+    });
+    if let Some(block) = block.filter(|block| {
+        block.node_type == NodeType::CodeBlock
+            && state.selection.to() <= block.offset + block.node_size
+    }) {
+        let from = from.saturating_sub(block.content_start);
+        let to = state
+            .selection
+            .to()
+            .saturating_sub(block.content_start)
+            .min(block.content.size());
+        return block
+            .content
+            .cut(from, to)
+            .children
+            .iter()
+            .map(Node::text_content)
+            .collect();
     }
     super::clipboard::serialize_to_text(slice)
 }
