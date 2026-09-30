@@ -610,16 +610,18 @@ fn literal_dom_text(root: &web_sys::Node) -> String {
     let mut text = String::new();
     let mut synthetic_end = false;
     let mut synthetic_parent = None;
-    // Iterative traversal also handles clipboard HTML before depth truncation.
-    // End markers retain their block so only sibling newline text can replace
-    // a synthetic separator. A newline inside the next block is a blank line.
-    let mut pending = vec![(root.clone(), false)];
-    while let Some((node, leaving_block)) = pending.pop() {
+    // Carry the enclosing block through inline wrappers in this iterative walk.
+    // End markers transfer the separator to their parent block when wrappers
+    // close, without consuming explicit newlines inside the next code line.
+    let mut pending = vec![(root.clone(), false, None)];
+    while let Some((node, leaving_block, block_context)) = pending.pop() {
         if leaving_block {
             if !text.is_empty() && !text.ends_with('\n') {
                 text.push('\n');
                 synthetic_end = true;
-                synthetic_parent = node.parent_node();
+            }
+            if synthetic_end {
+                synthetic_parent = block_context;
             }
             continue;
         }
@@ -628,7 +630,7 @@ fn literal_dom_text(root: &web_sys::Node) -> String {
             if !value.is_empty() {
                 if synthetic_end
                     && value.starts_with(['\r', '\n'])
-                    && synthetic_parent == node.parent_node()
+                    && synthetic_parent == block_context
                 {
                     text.pop();
                 }
@@ -637,6 +639,7 @@ fn literal_dom_text(root: &web_sys::Node) -> String {
             }
             continue;
         }
+        let mut child_context = block_context.clone();
         if let Some(element) = node.dyn_ref::<web_sys::Element>() {
             if element.has_attribute("data-sentinel") {
                 continue;
@@ -647,35 +650,22 @@ fn literal_dom_text(root: &web_sys::Node) -> String {
                 synthetic_end = false;
                 continue;
             }
-            if matches!(
-                tag.as_str(),
-                "div"
-                    | "p"
-                    | "pre"
-                    | "li"
-                    | "blockquote"
-                    | "tr"
-                    | "td"
-                    | "th"
-                    | "h1"
-                    | "h2"
-                    | "h3"
-                    | "h4"
-                    | "h5"
-                    | "h6"
-            ) {
+            if is_block_level_tag(&tag)
+                || tag_to_block_type(&tag).is_some_and(|kind| kind.is_block())
+            {
                 if !text.is_empty() && !text.ends_with('\n') {
                     text.push('\n');
                     synthetic_end = true;
-                    synthetic_parent = node.parent_node();
+                    synthetic_parent = block_context.clone();
                 }
-                pending.push((node.clone(), true));
+                pending.push((node.clone(), true, block_context));
+                child_context = Some(node.clone());
             }
         }
         let children = node.child_nodes();
         for i in (0..children.length()).rev() {
             if let Some(child) = children.item(i) {
-                pending.push((child, false));
+                pending.push((child, false, child_context.clone()));
             }
         }
     }

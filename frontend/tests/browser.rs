@@ -5518,6 +5518,9 @@ fn empty_html_source_replaces_selected_source() {
 fn html_source_coalesces_wrappers_and_preserves_explicit_newline_runs() {
     for (breaks, source_breaks) in [
         ("\n", "\n"),
+        ("<span>\n</span>", "\n"),
+        ("<span><em>\n</em></span>", "\n"),
+        ("<div><span>\n</span></div>", "\n\n"),
         ("\n\n", "\n\n"),
         ("\n\n\n", "\n\n\n"),
         ("<br>", "\n\n"),
@@ -5556,6 +5559,41 @@ fn html_source_coalesces_wrappers_and_preserves_explicit_newline_runs() {
             );
             cleanup(&container);
         }
+    }
+}
+
+#[wasm_bindgen_test]
+fn source_paste_keeps_supported_block_container_boundaries() {
+    for tag in [
+        "section",
+        "article",
+        "header",
+        "footer",
+        "main",
+        "nav",
+        "aside",
+        "figure",
+        "figcaption",
+        "details",
+        "summary",
+        "address",
+        "center",
+    ] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), code_block_doc("old", "mermaid"));
+        set_selection(&view, 1, 4);
+        dispatch_paste_html(
+            &view,
+            &txns,
+            "",
+            &format!("<{tag}>graph TD</{tag}><{tag}>A --&gt; B</{tag}>"),
+        );
+        assert_eq!(
+            view.state().doc.child(0).unwrap().text_content(),
+            "graph TD\nA --> B",
+            "{tag}"
+        );
+        cleanup(&container);
     }
 }
 
