@@ -258,7 +258,40 @@ panic_safety!(block_render_safe, "block-beta", [
     " a --> b",
     " a --> ghost",
     " blockArrowId<[\"x\"]>(right)",
+    " block:g:2",
+    " block",
+    " end",
+    " z((\"circle\")) y{\"rhombus\"} w[(db)]",
+    " q[\"a much longer label with spaces in it\"]:2",
+    " a -- \"go\" --> b",
+    " b -->|back| a",
+    " a --- c",
+    " style a fill:#f9f",
+    " classDef hot fill:#f00",
+    " class b hot",
+    " columns auto",
 ]);
+
+/// Vocabulary for the block extent property below.
+const BLOCK_STMTS: &[&str] = &[
+    " columns 3", " columns 1", " a b c", " d", " e:2 x", " e:99", " space", " space:3",
+    " q[\"a much longer label with spaces in it\"]:2", " z((\"circle\")) y{\"rhombus\"}",
+    " block:g:2", " block", " end", " columns 2", " a --> b", " b -- \"a label\" --> c",
+];
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// #279: whatever the grouping, spans and shapes, a block diagram
+    /// draws nothing outside its viewBox.
+    #[test]
+    fn block_draws_inside_the_viewbox(src in source_strategy("block-beta", BLOCK_STMTS)) {
+        if let Some(svg) = crate::render(&src).svg {
+            let bad = crate::extent::outside(&svg);
+            prop_assert!(bad.is_empty(), "outside the viewBox: {:?}\n{}", bad, src);
+        }
+    }
+}
 
 panic_safety!(radar_render_safe, "radar-beta", [
     " title T",
