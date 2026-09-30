@@ -10,17 +10,49 @@ use super::model::{char_len, Mark, MarkType, Node, NodeType};
 use super::selection::Selection;
 use super::state::{EditorState, Transaction};
 
-fn mermaid_source_panes(container: &HtmlElement) -> Vec<(String, HtmlElement)> {
-    let Ok(nodes) = container.query_selector_all("pre.mermaid-code-block > code") else {
+fn mermaid_scroll_panes(container: &HtmlElement) -> Vec<(String, HtmlElement)> {
+    let Ok(nodes) =
+        container.query_selector_all("pre.mermaid-code-block, pre.mermaid-code-block > code")
+    else {
         return Vec::new();
     };
     (0..nodes.length())
         .filter_map(|i| {
-            let code = nodes.item(i)?.dyn_into::<HtmlElement>().ok()?;
-            let id = code.parent_element()?.get_attribute("data-block-id")?;
-            Some((id, code))
+            let element = nodes.item(i)?.dyn_into::<HtmlElement>().ok()?;
+            let key = if element.tag_name().eq_ignore_ascii_case("pre") {
+                format!("block:{}", element.get_attribute("data-block-id")?)
+            } else {
+                format!(
+                    "source:{}",
+                    element.parent_element()?.get_attribute("data-block-id")?
+                )
+            };
+            Some((key, element))
         })
         .collect()
+}
+
+fn clipboard_text_for_selection(state: &EditorState, slice: &super::model::Slice) -> String {
+    if let Some(block) = super::state::find_block_at(&state.doc, state.selection.from()) {
+        if block.node_type == NodeType::CodeBlock
+            && state.selection.to() <= block.offset + block.node_size
+        {
+            let from = state.selection.from().saturating_sub(block.content_start);
+            let to = state
+                .selection
+                .to()
+                .saturating_sub(block.content_start)
+                .min(block.content.size());
+            return block
+                .content
+                .cut(from, to)
+                .children
+                .iter()
+                .map(Node::text_content)
+                .collect();
+        }
+    }
+    super::clipboard::serialize_to_text(slice)
 }
 
 /// The editor view: bridges the document model and the browser DOM.
@@ -169,7 +201,7 @@ impl EditorView {
         let state = self.state.borrow();
 
         let scroll_positions: std::collections::HashMap<_, _> =
-            mermaid_source_panes(&self.container)
+            mermaid_scroll_panes(&self.container)
                 .into_iter()
                 .map(|(id, code)| (id, (code.scroll_top(), code.scroll_left())))
                 .collect();
@@ -185,7 +217,7 @@ impl EditorView {
             }
         }
 
-        for (id, code) in mermaid_source_panes(&self.container) {
+        for (id, code) in mermaid_scroll_panes(&self.container) {
             if let Some((top, left)) = scroll_positions.get(&id) {
                 code.set_scroll_top(*top);
                 code.set_scroll_left(*left);
@@ -798,7 +830,7 @@ impl EditorView {
             }
 
             let html = super::clipboard::serialize_to_html(&slice);
-            let text = super::clipboard::serialize_to_text(&slice);
+            let text = clipboard_text_for_selection(&state_with_sel, &slice);
             clipboard_data.set_data("text/html", &html).ok();
             clipboard_data.set_data("text/plain", &text).ok();
         }) as Box<dyn Fn(web_sys::Event)>);
@@ -825,7 +857,7 @@ impl EditorView {
             }
 
             let html = super::clipboard::serialize_to_html(&slice);
-            let text = super::clipboard::serialize_to_text(&slice);
+            let text = clipboard_text_for_selection(&state_with_sel, &slice);
             clipboard_data.set_data("text/html", &html).ok();
             clipboard_data.set_data("text/plain", &text).ok();
 

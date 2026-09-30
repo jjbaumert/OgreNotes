@@ -13,6 +13,16 @@ pub fn serialize_to_html(slice: &Slice) -> String {
 
 /// Serialize a document slice to plain text for clipboard copy.
 pub fn serialize_to_text(slice: &Slice) -> String {
+    if let [
+        Node::Element {
+            node_type: NodeType::Mermaid,
+            attrs,
+            ..
+        },
+    ] = slice.content.children.as_slice()
+    {
+        return attrs.get("source").cloned().unwrap_or_default();
+    }
     let mut text = String::new();
     for child in &slice.content.children {
         collect_text(child, &mut text);
@@ -971,7 +981,12 @@ fn collect_as_list_items(node: &Node, item_type: NodeType, out: &mut Vec<Node>) 
         // fits-to-nothing content is dropped (parity with the pre-fitter
         // paste loop) instead of becoming an empty-looking bullet.
         _ => {
-            if node.text_content().trim().is_empty() {
+            let recoverable_mermaid = node.node_type() == Some(NodeType::CodeBlock)
+                && node
+                    .attrs()
+                    .get("language")
+                    .is_some_and(|language| language == "mermaid");
+            if node.text_content().trim().is_empty() && !recoverable_mermaid {
                 return;
             }
             let fitted = fit_slice_to_context(

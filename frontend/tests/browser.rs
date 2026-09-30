@@ -4907,10 +4907,7 @@ fn pasted_mermaid_copy_and_cut_preserve_plain_text_source() {
         js_sys::Reflect::set(&desc, &"value".into(), &dt).unwrap();
         js_sys::Object::define_property(&event, &"clipboardData".into(), &desc);
         view.container().dispatch_event(&event).unwrap();
-        assert_eq!(
-            dt.get_data("text/plain").unwrap().trim(),
-            ORBIT_MERMAID.trim()
-        );
+        assert_eq!(dt.get_data("text/plain").unwrap(), ORBIT_MERMAID);
         apply_all(&view, &txns);
     }
     assert!(
@@ -5077,6 +5074,125 @@ fn mermaid_source_is_not_clipped_by_a_separate_vertical_scroller() {
         height >= scroll_height,
         "source must stay in the normal document flow: {height} vs {scroll_height}"
     );
+}
+
+fn dispatch_clipboard_copy(view: &EditorView) -> web_sys::DataTransfer {
+    let dt = web_sys::DataTransfer::new().unwrap();
+    let init = web_sys::ClipboardEventInit::new();
+    init.set_clipboard_data(Some(&dt));
+    init.set_bubbles(true);
+    init.set_cancelable(true);
+    let event = web_sys::ClipboardEvent::new_with_event_init_dict("copy", &init).unwrap();
+    let desc = js_sys::Object::new();
+    js_sys::Reflect::set(&desc, &"value".into(), &dt).unwrap();
+    js_sys::Object::define_property(&event, &"clipboardData".into(), &desc);
+    view.container().dispatch_event(&event).unwrap();
+    dt
+}
+
+#[wasm_bindgen_test]
+fn source_selection_copy_paste_preserves_exact_text() {
+    let container = create_container();
+    let source = "graph TD\nA[identifier] --> B\n";
+    let (view, txns) = create_editor(container.clone(), code_block_doc(source, "mermaid"));
+    let start = 1 + source.find("identifier").unwrap();
+    set_selection(&view, start, start + "identifier".len());
+    let dt = dispatch_clipboard_copy(&view);
+    assert_eq!(dt.get_data("text/plain").unwrap(), "identifier");
+    dispatch_paste_html(
+        &view,
+        &txns,
+        &dt.get_data("text/plain").unwrap(),
+        &dt.get_data("text/html").unwrap(),
+    );
+    assert_eq!(view.state().doc.child(0).unwrap().text_content(), source);
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn empty_mermaid_alongside_list_remains_recoverable_in_existing_list() {
+    for html in [false, true] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), bullet_list_doc("existing"));
+        set_cursor(&view, 3);
+        let plain = "```mermaid\n\n```\n\n- item";
+        if html {
+            dispatch_paste_html(
+                &view,
+                &txns,
+                plain,
+                "<pre><code class=\"language-mermaid\"></code></pre><ul><li>item</li></ul>",
+            );
+        } else {
+            dispatch_paste(&view, &txns, plain);
+        }
+        let model = view.state().doc;
+        let code = (0..model.content_size())
+            .find_map(|pos| {
+                ogrenotes_frontend::editor::state::find_block_at(&model, pos)
+                    .filter(|b| b.node_type == NodeType::CodeBlock)
+            })
+            .expect("empty source must remain editable");
+        set_selection(
+            &view,
+            code.content_start,
+            code.content_start + code.content.size(),
+        );
+        dispatch_paste(&view, &txns, ORBIT_MERMAID);
+        assert_orbit_diagram(&view);
+        assert!(view.state().doc.text_content().contains("existing"));
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn mermaid_pre_horizontal_scroll_survives_following_paragraph_edit() {
+    let doc = document();
+    let style = doc.create_element("style").unwrap();
+    style.set_text_content(Some(include_str!("../style/main.css")));
+    doc.body().unwrap().append_child(&style).unwrap();
+    let source = format!("%% {}\n{ORBIT_MERMAID}", "x".repeat(1000));
+    let mut attrs = HashMap::new();
+    attrs.insert("language".into(), "mermaid".into());
+    attrs.insert("blockId".into(), "horizontal-scroll".into());
+    let model = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![
+            Node::element_with_attrs(
+                NodeType::CodeBlock,
+                attrs,
+                Fragment::from(vec![Node::text(&source)]),
+            ),
+            Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("after")]),
+            ),
+        ]),
+    );
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), model);
+    let pre: HtmlElement = view
+        .container()
+        .query_selector("pre")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    pre.set_scroll_left(200);
+    let scroll = pre.scroll_left();
+    assert!(scroll > 0);
+    set_cursor(&view, source.chars().count() + 3);
+    dispatch_before_input(view.container(), "insertText", Some("x"));
+    apply_all(&view, &txns);
+    let pre: HtmlElement = view
+        .container()
+        .query_selector("pre")
+        .unwrap()
+        .unwrap()
+        .unchecked_into();
+    let after = pre.scroll_left();
+    style.remove();
+    cleanup(&container);
+    assert_eq!(after, scroll);
 }
 
 #[wasm_bindgen_test]
