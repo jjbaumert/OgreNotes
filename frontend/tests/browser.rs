@@ -5399,6 +5399,54 @@ fn html_only_source_paste_preserves_sibling_text() {
 }
 
 #[wasm_bindgen_test]
+fn tagged_pre_boundary_sources_remain_editable_code() {
+    for source in [
+        String::new(),
+        "x".repeat(ogrenotes_mermaid::MAX_SOURCE_LEN + 1),
+    ] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+        set_cursor(&view, 1);
+        dispatch_paste_html(
+            &view,
+            &txns,
+            "",
+            &format!("<pre class=\"language-mermaid\">{source}</pre>"),
+        );
+        let block = view.state().doc.child(0).unwrap().clone();
+        assert_eq!(block.node_type(), Some(NodeType::CodeBlock));
+        assert_eq!(
+            block.attrs().get("language").map(String::as_str),
+            Some("mermaid")
+        );
+        assert_eq!(block.text_content(), source);
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn source_paste_ignores_active_stored_marks() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), code_block_doc("old", "mermaid"));
+    let state = view.state();
+    view.update_state(EditorState {
+        selection: Selection::cursor(1),
+        stored_marks: Some(vec![Mark::new(MarkType::Bold)]),
+        ..state
+    });
+    dispatch_paste(&view, &txns, "graph TD\nA --> B");
+    let block = view.state().doc.child(0).unwrap().clone();
+    assert!((0..block.child_count()).all(|i| block.child(i).unwrap().marks().is_empty()));
+    assert!(
+        view.container()
+            .query_selector("pre > code strong")
+            .unwrap()
+            .is_none()
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
 fn paste_markdown_heading_creates_h1_in_dom() {
     let container = create_container();
     let (view, txns) = create_editor(container.clone(), Node::empty_doc());

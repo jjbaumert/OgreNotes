@@ -678,7 +678,7 @@ fn literal_dom_text(root: &web_sys::Node) -> String {
     text
 }
 
-/// Parse a <pre> element into a CodeBlock node, extracting language from <code> child.
+/// Parse a <pre> element into a CodeBlock node, extracting language from <code> or <pre>.
 #[cfg(target_arch = "wasm32")]
 fn convert_code_block(child: &web_sys::Node, el: &web_sys::Element) -> Node {
     use wasm_bindgen::JsCast;

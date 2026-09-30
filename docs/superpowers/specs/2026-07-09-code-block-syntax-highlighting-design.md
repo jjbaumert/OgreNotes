@@ -213,9 +213,9 @@ export.rs:82,183) is therefore unaffected.
 - Language auto-detection.
 - Highlighting in other surfaces (chat messages, spreadsheet cells).
 - Line numbers, line highlighting, copy-button chrome.
-- Mermaid markdown-import mapping was outside this slice. Mermaid fences
-  now import as dedicated diagram blocks, and existing CodeBlocks tagged
-  `mermaid` render a preview above their editable source. Nested imports
+- Mermaid markdown-import mapping was outside this slice. Frontend Markdown paste now converts Mermaid fences
+  to dedicated diagram blocks, and existing CodeBlocks tagged
+  `mermaid` render a preview above their editable source. Nested frontend pastes
   keep CodeBlocks where the container schema does not permit diagram atoms.
 
 ## Design-doc drift note (report, don't edit)

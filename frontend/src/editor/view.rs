@@ -918,7 +918,11 @@ impl EditorView {
                             return;
                         };
                         let literal = super::clipboard::normalize_line_endings(&source);
-                        if let Ok(txn) = state_with_sel.transaction().insert_text(&literal) {
+                        if let Ok(txn) = state_with_sel
+                            .transaction()
+                            .set_stored_marks(Some(Vec::new()))
+                            .insert_text(&literal)
+                        {
                             dispatch_paste(txn);
                         }
                         return;
@@ -990,6 +994,10 @@ impl EditorView {
                 let plain_pre_wrapper = html_slice.content.children.len() == 1
                     && html_slice.content.children[0].node_type()
                         == Some(super::model::NodeType::CodeBlock)
+                    && !html_slice.content.children[0]
+                        .attrs()
+                        .get("language")
+                        .is_some_and(|language| !language.is_empty())
                     && !has_code_element;
                 let trivial = super::markdown::is_trivial_slice(&html_slice);
                 if !text.is_empty() && (trivial || plain_pre_wrapper) {
