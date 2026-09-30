@@ -28,3 +28,6 @@ OGRENOTES-*.md
 # private local notes not for the repo
 private_local/
 scratchpad-artifacts/
+
+# Local PR review artifacts
+.ship/
