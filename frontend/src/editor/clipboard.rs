@@ -571,6 +571,11 @@ fn convert_block_element(
 }
 
 /// Extract literal clipboard source without interpreting it as Markdown.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn literal_text_from_html(_html: &str) -> Option<String> {
+    None
+}
+
 #[cfg(target_arch = "wasm32")]
 pub(super) fn literal_text_from_html(html: &str) -> Option<String> {
     use wasm_bindgen::JsCast;
