@@ -1021,7 +1021,12 @@ fn mention_user_id(attrs: &Attrs) -> Option<String> {
 /// bold / italic / underline / strike / code inside. The href is
 /// scheme-checked (`is_safe_url`) and attribute-escaped — closing the
 /// latent XSS the ticket flagged for when link export landed.
-fn render_text_html<T: ReadTxn>(txn: &T, text: &yrs::XmlTextRef, out: &mut String) {
+fn render_text_html<T: ReadTxn>(
+    txn: &T,
+    text: &yrs::XmlTextRef,
+    out: &mut String,
+    cell_mode: bool,
+) {
     for chunk in text.diff(txn, |_| ()) {
         let Out::Any(Any::String(s)) = &chunk.insert else {
             // Non-string embedded values have no text representation; emit
@@ -1032,7 +1037,10 @@ fn render_text_html<T: ReadTxn>(txn: &T, text: &yrs::XmlTextRef, out: &mut Strin
         let mut close = String::new();
         if let Some(attrs) = chunk.attributes.as_deref() {
             if let Some(href) = link_href(attrs).filter(|h| is_safe_url(h)) {
-                open.push_str(&format!("<a href=\"{}\">", html_escape_attr(&href)));
+                open.push_str(&format!(
+                    "<a href=\"{}\">",
+                    html_escape_attr_in_context(&href, cell_mode)
+                ));
                 close.insert_str(0, "</a>");
             }
             // #148: mention chip preserves the user_id and the
@@ -1041,7 +1049,7 @@ fn render_text_html<T: ReadTxn>(txn: &T, text: &yrs::XmlTextRef, out: &mut Strin
             if let Some(uid) = mention_user_id(attrs) {
                 open.push_str(&format!(
                     "<span class=\"mention\" data-user-id=\"{}\">",
-                    html_escape_attr(&uid),
+                    html_escape_attr_in_context(&uid, cell_mode),
                 ));
                 close.insert_str(0, "</span>");
             }
@@ -1061,7 +1069,7 @@ fn render_text_html<T: ReadTxn>(txn: &T, text: &yrs::XmlTextRef, out: &mut Strin
             }
         }
         out.push_str(&open);
-        out.push_str(&html_escape(s));
+        out.push_str(&html_escape_text_in_context(s, cell_mode));
         out.push_str(&close);
     }
 }
@@ -1148,6 +1156,15 @@ fn render_fragment_html<T: ReadTxn>(txn: &T, fragment: &yrs::XmlFragmentRef, out
 }
 
 fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
+    render_node_html_with_context(txn, node, out, false);
+}
+
+fn render_node_html_with_context<T: ReadTxn>(
+    txn: &T,
+    node: &XmlOut,
+    out: &mut String,
+    cell_mode: bool,
+) {
     // #7: stop descending past the recursion cap (stack-overflow guard).
     let Some(_depth) = DepthGuard::enter() else {
         return;
@@ -1162,6 +1179,11 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
             // Compute the correct HTML tag (headings need dynamic tags)
             let html_tag = resolve_html_tag(txn, el, node_type);
             let attrs = render_html_attrs(txn, el, node_type);
+            let attrs = if cell_mode {
+                encode_html_line_breaks(&attrs)
+            } else {
+                attrs
+            };
 
             // Syntax-highlighted code blocks take a dedicated path so
             // the export matches the live editor DOM
@@ -1170,7 +1192,15 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
             // to the generic path — byte-identical to the pre-highlight
             // output.
             if node_type == NodeType::CodeBlock {
-                if render_code_block_highlighted(txn, el, out) {
+                if cell_mode {
+                    let mut code = String::new();
+                    if render_code_block_highlighted(txn, el, &mut code) {
+                        // Highlighted markup has fixed attributes; only its
+                        // escaped source text contains line breaks.
+                        out.push_str(&code.replace("\r\n", "\n").replace(['\r', '\n'], "<br>"));
+                        return;
+                    }
+                } else if render_code_block_highlighted(txn, el, out) {
                     return;
                 }
             }
@@ -1186,7 +1216,7 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
                     let content = el.get_attribute(txn, "content").unwrap_or_default();
                     out.push_str(&format!(
                         "<{html_tag}{attrs}>{}</{html_tag}>",
-                        html_escape(&content),
+                        html_escape_text_in_context(&content, cell_mode),
                     ));
                     return;
                 }
@@ -1199,7 +1229,7 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
                     let display = el.get_attribute(txn, "display").unwrap_or_default();
                     out.push_str(&format!(
                         "<{html_tag}{attrs}>{}</{html_tag}>",
-                        html_escape(&display),
+                        html_escape_text_in_context(&display, cell_mode),
                     ));
                     return;
                 }
@@ -1214,7 +1244,7 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
                         .unwrap_or(url);
                     out.push_str(&format!(
                         "<{html_tag}{attrs}>{}</{html_tag}>",
-                        html_escape(&title),
+                        html_escape_text_in_context(&title, cell_mode),
                     ));
                     return;
                 }
@@ -1223,6 +1253,11 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
                     let out_render = ogrenotes_mermaid::render(&source);
                     match out_render.svg {
                         Some(svg) => {
+                            let svg = if cell_mode {
+                                encode_html_line_breaks(&svg)
+                            } else {
+                                svg
+                            };
                             // SVG is generated by our own renderer (no
                             // user HTML passes through); the source is
                             // XML-escaped inside the renderer.
@@ -1237,8 +1272,8 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
                                 .unwrap_or_else(|| "diagram error".to_string());
                             out.push_str(&format!(
                                 "<div class=\"mermaid-error\"><p>{}</p><pre>{}</pre></div>",
-                                html_escape(&msg),
-                                html_escape(&source),
+                                html_escape_text_in_context(&msg, cell_mode),
+                                html_escape_text_in_context(&source, cell_mode),
                             ));
                         }
                     }
@@ -1247,11 +1282,18 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
                 if matches!(node_type, NodeType::MathInline) {
                     let source = el.get_attribute(txn, "source").unwrap_or_default();
                     match ogrenotes_math::to_mathml(&source, ogrenotes_math::Display::Inline) {
-                        Ok(mathml) => out.push_str(&format!("<span class=\"math-inline\">{mathml}</span>")),
+                        Ok(mathml) => {
+                            let mathml = if cell_mode {
+                                encode_html_line_breaks(&mathml)
+                            } else {
+                                mathml
+                            };
+                            out.push_str(&format!("<span class=\"math-inline\">{mathml}</span>"));
+                        }
                         Err(e) => out.push_str(&format!(
                             "<code class=\"math-error\" title=\"{}\">{}</code>",
-                            html_escape_attr(&e.to_string()),
-                            html_escape(&source),
+                            html_escape_attr_in_context(&e.to_string(), cell_mode),
+                            html_escape_text_in_context(&source, cell_mode),
                         )),
                     }
                     return;
@@ -1261,11 +1303,18 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
                     match ogrenotes_math::to_mathml(&source, ogrenotes_math::Display::Block) {
                         // MathML from our own renderer: source text is
                         // XML-escaped and attributes come from fixed tables.
-                        Ok(mathml) => out.push_str(&format!("<div class=\"math-block\">{mathml}</div>")),
+                        Ok(mathml) => {
+                            let mathml = if cell_mode {
+                                encode_html_line_breaks(&mathml)
+                            } else {
+                                mathml
+                            };
+                            out.push_str(&format!("<div class=\"math-block\">{mathml}</div>"));
+                        }
                         Err(e) => out.push_str(&format!(
                             "<div class=\"math-error\"><p>{}</p><pre>{}</pre></div>",
-                            html_escape(&e.to_string()),
-                            html_escape(&source),
+                            html_escape_text_in_context(&e.to_string(), cell_mode),
+                            html_escape_text_in_context(&source, cell_mode),
                         )),
                     }
                     return;
@@ -1283,14 +1332,14 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
             if node_type == NodeType::Slide {
                 for i in slide_child_order(txn, el) {
                     if let Some(child) = el.get(txn, i) {
-                        render_node_html(txn, &child, out);
+                        render_node_html_with_context(txn, &child, out, cell_mode);
                     }
                 }
             } else {
                 let len = el.len(txn);
                 for i in 0..len {
                     if let Some(child) = el.get(txn, i) {
-                        render_node_html(txn, &child, out);
+                        render_node_html_with_context(txn, &child, out, cell_mode);
                     }
                 }
             }
@@ -1298,7 +1347,7 @@ fn render_node_html<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String) {
             out.push_str(&format!("</{html_tag}>"));
         }
         XmlOut::Text(text) => {
-            render_text_html(txn, text, out);
+            render_text_html(txn, text, out, cell_mode);
         }
         _ => {}
     }
@@ -1638,9 +1687,7 @@ fn render_table_markdown<T: ReadTxn>(
                 out.push('>');
                 for i in 0..cell.len(txn) {
                     if let Some(child) = cell.get(txn, i) {
-                        let mut body = String::new();
-                        render_node_html(txn, &child, &mut body);
-                        out.push_str(&body.replace("\r\n", "\n").replace(['\r', '\n'], "<br>"));
+                        render_node_html_with_context(txn, &child, out, true);
                     }
                 }
                 out.push_str(&format!("</{tag}>"));
@@ -1702,17 +1749,23 @@ fn table_cell_needs_html<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
     match node {
         XmlOut::Element(el) => {
             NodeType::from_tag(&el.tag()).is_some_and(|kind| {
-                kind.is_block()
-                    && !matches!(
-                        kind,
-                        NodeType::TableCell | NodeType::TableHeader | NodeType::Paragraph
-                    )
+                (kind.is_inline() && kind != NodeType::HardBreak)
+                    || kind.is_block()
+                        && !matches!(
+                            kind,
+                            NodeType::TableCell | NodeType::TableHeader | NodeType::Paragraph
+                        )
             }) || (0..el.len(txn))
                 .filter_map(|i| el.get(txn, i))
                 .any(|child| table_cell_needs_html(txn, &child))
         }
         XmlOut::Text(text) => text.diff(txn, |_| ()).iter().any(|chunk| {
-            matches!(&chunk.insert, Out::Any(Any::String(s)) if
+            chunk
+                .attributes
+                .as_deref()
+                .and_then(link_href)
+                .is_some_and(|href| href.contains(['\\', '\r', '\n']))
+                || matches!(&chunk.insert, Out::Any(Any::String(s)) if
                 s.contains('\\') || (s.contains(['\r', '\n', '`', '\\'])
                     && chunk.attributes.as_deref().is_some_and(|attrs| has_mark(attrs, "code"))))
         }),
@@ -2094,6 +2147,28 @@ pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn encode_html_line_breaks(escaped: &str) -> String {
+    escaped.replace('\r', "&#13;").replace('\n', "&#10;")
+}
+
+fn html_escape_attr_in_context(s: &str, cell_mode: bool) -> String {
+    let escaped = html_escape_attr(s);
+    if cell_mode {
+        encode_html_line_breaks(&escaped)
+    } else {
+        escaped
+    }
+}
+
+fn html_escape_text_in_context(s: &str, cell_mode: bool) -> String {
+    let escaped = html_escape(s);
+    if cell_mode {
+        escaped.replace("\r\n", "\n").replace(['\r', '\n'], "<br>")
+    } else {
+        escaped
+    }
 }
 
 fn html_escape_attr(s: &str) -> String {
@@ -2979,6 +3054,69 @@ mod tests {
             };
             assert!(html.contains(&format!("<{tag}>")), "{html}");
         }
+    }
+
+    #[test]
+    fn markdown_table_mention_preserves_backslash_before_pipe() {
+        let doc = markdown_table_doc(&[&["A", "B"], &["", "other"]], true);
+        {
+            let mut txn = doc.transact_mut();
+            let f = txn.get_or_insert_xml_fragment("content");
+            let Some(XmlOut::Element(table)) = f.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(row)) = table.get(&txn, 1) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(cell)) = row.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(p)) = cell.get(&txn, 0) else {
+                panic!()
+            };
+            let mention = p.insert(&mut txn, 0, XmlElementPrelim::empty("mention"));
+            mention.insert_attribute(&mut txn, "display", "one\\|two");
+        }
+        let md = to_markdown(&doc);
+        let mut html = String::new();
+        pulldown_cmark::html::push_html(
+            &mut html,
+            pulldown_cmark::Parser::new_ext(&md, pulldown_cmark::Options::ENABLE_TABLES),
+        );
+        assert!(html.contains("one\\|two"), "{html}");
+    }
+
+    #[test]
+    fn markdown_table_html_breaks_do_not_rewrite_link_attributes() {
+        let doc = markdown_table_doc(&[&["A", "B"], &["has\\backslash", "link"]], true);
+        {
+            let mut txn = doc.transact_mut();
+            let f = txn.get_or_insert_xml_fragment("content");
+            let Some(XmlOut::Element(table)) = f.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(row)) = table.get(&txn, 1) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(cell)) = row.get(&txn, 1) else {
+                panic!()
+            };
+            let Some(XmlOut::Element(p)) = cell.get(&txn, 0) else {
+                panic!()
+            };
+            let Some(XmlOut::Text(text)) = p.get(&txn, 0) else {
+                panic!()
+            };
+            let link = serde_json::json!({"href": "https://example.com/a\nb"}).to_string();
+            text.format(
+                &mut txn,
+                0,
+                4,
+                Attrs::from([("link".into(), Any::String(link.into()))]),
+            );
+        }
+        let md = to_markdown(&doc);
+        assert!(md.contains("href=\"https://example.com/a&#10;b\""), "{md}");
     }
 
     #[test]
