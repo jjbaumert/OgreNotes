@@ -119,6 +119,8 @@ pub struct ParseError { pub message: String, pub line: Option<usize> }
   C4 element text and treemap values use ellipses to fit their painted bounds;
   source editing and Markdown export retain the complete labels. Paint is
   bounded to the label area so font differences cannot spill onto the canvas.
+  Fitting preserves grapheme clusters and measures accented letters by their
+  base glyph, so short Unicode labels remain complete.
 
 ### B. Block model (both schemas, mirrored)
 

@@ -12,6 +12,7 @@ fn contrast_edge_fixtures_match_the_renderer() {
         "contrast-pie-empty",
         "contrast-treemap-short",
         "contrast-c4-long",
+        "contrast-c4-unicode",
         "contrast-treemap-numbers",
         "contrast-treemap-wide",
         "contrast-pie-palette",
@@ -52,7 +53,7 @@ fn fixed_palette_foregrounds_agree_between_renderer_frontend_and_cli() {
             )
             .unwrap();
             let cli = Command::new(env!("CARGO_BIN_EXE_mermaid_cli"))
-                .args(["--theme", theme])
+                .args(["--theme", theme, "--bg", "none"])
                 .arg(&path)
                 .output()
                 .unwrap();
@@ -62,13 +63,41 @@ fn fixed_palette_foregrounds_agree_between_renderer_frontend_and_cli() {
                 !resolved.contains("var(--mermaid-"),
                 "CLI must resolve every data foreground"
             );
-            for property in svg.split("var(--mermaid-").skip(1) {
+            // Compare paint attributes at corresponding XML elements. A set of
+            // colors cannot detect two CLI token mappings being swapped.
+            let paints = |xml: &str| {
+                let mut reader = quick_xml::Reader::from_str(xml);
+                let mut output = Vec::new();
+                loop {
+                    match reader.read_event().unwrap() {
+                        quick_xml::events::Event::Start(tag)
+                        | quick_xml::events::Event::Empty(tag) => {
+                            for attr in tag.attributes() {
+                                let attr = attr.unwrap();
+                                if matches!(attr.key.as_ref(), b"fill" | b"stroke") {
+                                    output.push(String::from_utf8(attr.value.to_vec()).unwrap());
+                                }
+                            }
+                        }
+                        quick_xml::events::Event::Eof => break,
+                        _ => {}
+                    }
+                }
+                output
+            };
+            let raw_paints = paints(&svg);
+            let cli_paints = paints(&resolved);
+            assert_eq!(raw_paints.len(), cli_paints.len());
+            for (raw, actual) in raw_paints.iter().zip(&cli_paints) {
+                let Some(property) = raw.strip_prefix("var(--mermaid-") else {
+                    continue;
+                };
                 let (name, fallback) = property.split_once(')').unwrap().0.split_once(',').unwrap();
                 if !name.starts_with("data-") && !name.starts_with("quadrant-") {
                     continue;
                 }
                 let declaration = format!("--mermaid-{name}:");
-                let actual = css
+                let expected = css
                     .lines()
                     .map(str::trim)
                     .find_map(|line| line.strip_prefix(&declaration))
@@ -78,11 +107,12 @@ fn fixed_palette_foregrounds_agree_between_renderer_frontend_and_cli() {
                     .unwrap()
                     .trim();
                 if theme == "light" {
-                    assert_eq!(actual, fallback.trim(), "{theme} {name}");
+                    assert_eq!(expected, fallback.trim(), "{theme} {name}");
                 }
-                assert!(
-                    resolved.contains(&format!("\"{}\"", actual)),
-                    "CLI uses the same foreground"
+                assert_eq!(
+                    actual.to_ascii_lowercase(),
+                    expected.to_ascii_lowercase(),
+                    "CLI paint must match the frontend token on the same element: {theme} {name}"
                 );
             }
         }

@@ -1,6 +1,9 @@
 //! Heuristic text measurement — there is no DOM/canvas in pure Rust, so
 //! widths come from a char-class table with generous padding downstream.
 
+use unicode_normalization::char::{decompose_canonical, is_combining_mark};
+use unicode_segmentation::UnicodeSegmentation;
+
 pub(crate) const FONT_PX: f64 = 14.0;
 pub(crate) const LINE_H: f64 = 19.0;
 
@@ -72,8 +75,10 @@ pub(crate) fn truncate_to_width(s: &str, max_w: f64) -> String {
     format!("{}…", &s[..bounds[lo]])
 }
 
-/// Fit literal SVG text at its rendered font size. Wide non-ASCII glyphs get
-/// a conservative advance; unlike text_size, <br> is measured as literal text.
+/// Fit literal SVG text at its rendered font size, preserving grapheme clusters.
+/// Accents use their base glyph's advance; wide letters and scripts get wider
+/// estimates. Unlike text_size, <br> is literal text. Callers clip label paint
+/// to its background because these advances cannot cover every browser font.
 pub(crate) fn truncate_literal_to_width(
     text: &str,
     max_width: f64,
@@ -84,25 +89,40 @@ pub(crate) fn truncate_literal_to_width(
         return String::new();
     }
     let weight = if bold { 14.0 / 13.0 } else { 1.0 };
-    let advance = |ch: char| {
-        let em = if ch.is_ascii() { char_w(ch) } else { 1.2 };
+    let advance = |grapheme: &str| {
+        let mut em: f64 = 0.0;
+        for ch in grapheme.chars() {
+            decompose_canonical(ch, |base| {
+                if is_combining_mark(base)
+                    || matches!(base, '\u{200c}' | '\u{200d}' | '\u{fe0e}' | '\u{fe0f}')
+                {
+                    return;
+                }
+                let width = match base {
+                    'Ш' | 'Щ' | 'Ж' | 'Ю' | 'Ы' | 'Ф' | 'ш' | 'щ' | 'ж' | 'ю' | 'ы' | 'ф' | 'Æ'
+                    | 'æ' | 'Œ' | 'œ' | '…' => 1.05,
+                    _ => char_w(base),
+                };
+                em = em.max(width);
+            });
+        }
         em * font_size * weight
     };
-    if text.chars().map(&advance).sum::<f64>() <= max_width + 1e-6 {
+    if text.graphemes(true).map(&advance).sum::<f64>() <= max_width + 1e-6 {
         return text.to_string();
     }
-    let budget = max_width - advance('…');
+    let budget = max_width - advance("…");
     if budget < 0.0 {
         return String::new();
     }
     let (mut used, mut end) = (0.0, 0);
-    for (offset, ch) in text.char_indices() {
-        let next = used + advance(ch);
+    for (offset, grapheme) in text.grapheme_indices(true) {
+        let next = used + advance(grapheme);
         if next > budget {
             break;
         }
         used = next;
-        end = offset + ch.len_utf8();
+        end = offset + grapheme.len();
     }
     format!("{}…", &text[..end])
 }

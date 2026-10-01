@@ -21,6 +21,7 @@ const kinds = [
   "pie-empty",
   "treemap-short",
   "c4-long",
+  "c4-unicode",
   "treemap-numbers",
   "pie-palette",
   "treemap-palette",
@@ -46,6 +47,7 @@ const kinds = [
           "pie-empty",
           "treemap-short",
           "c4-long",
+          "c4-unicode",
           "treemap-numbers",
           "pie-palette",
           "treemap-wide",
@@ -229,20 +231,27 @@ const kinds = [
               (e) => {
                 const s = getComputedStyle(e);
                 const stroke = rgb(s.stroke);
-                const adjacent =
+                // Every rim segment must contrast with its own wedge or the
+                // canvas. One bright wedge cannot make the whole rim pass.
+                const contrast =
                   s.fill === "none"
-                    ? [bg, ...fills]
-                    : [
+                    ? fills.length
+                      ? Math.min(
+                          ...fills.map((fill) =>
+                            Math.max(ratio(stroke, bg), ratio(stroke, fill)),
+                          ),
+                        )
+                      : ratio(stroke, bg)
+                    : ratio(
+                        stroke,
                         rgb(s.fill).map(
                           (v, i) =>
                             v * +s.fillOpacity + bg[i] * (1 - +s.fillOpacity),
                         ),
-                      ];
+                      );
                 return {
                   element: e.tagName,
-                  contrast: Math.max(
-                    ...adjacent.map((fill) => ratio(stroke, fill)),
-                  ),
+                  contrast,
                   width: parseFloat(s.strokeWidth),
                   opacity: +s.strokeOpacity * +s.opacity,
                 };
@@ -304,6 +313,15 @@ const kinds = [
               labels.includes("[ContainerQueue]"),
             "Database and queue tags that fit must remain complete",
           );
+        }
+        if (kind === "c4-unicode") {
+          const labels = await page.locator("svg text").allTextContents();
+          for (const label of ["éééééé", "éééééé", "👩‍👩‍👧‍👦 Family"]) {
+            assert(
+              labels.includes(label),
+              "Fitting Unicode labels must remain complete",
+            );
+          }
         }
         assert(samples.length > 0, `${kind} must contain labels`);
         failed ||= samples.some((s) => s.contrast < 4.5);

@@ -6,6 +6,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+unicode-normalization = "0.1"
+unicode-segmentation = "1.13"
 
 [dev-dependencies]
 proptest = { workspace = true }
