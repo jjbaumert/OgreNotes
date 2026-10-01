@@ -324,7 +324,7 @@ backings covering adjacent percentages; architecture arrow tips stay visible.
 Both C4 fixtures cover SystemDb cap strokes. Literal quadrant labels cross plot
 strokes without losing contrast. A separate marker regression covers existing
 dense label/point overlap without changing their positions. Expected glyph
-masks disable label clipping, so cropped text cannot pass as fully visible.
+masks disable label clipping, so text cropped by these label viewports cannot pass as fully visible.
 Short leaf cells retain the complete glyph band; overflowing Cyrillic names
 receive ellipses.
 No server is needed. The native
@@ -334,13 +334,20 @@ renderer tests verify fixture freshness; Playwright CI runs the browser checks.
 
 Build `cargo build -p ogrenotes-mermaid --bin mermaid_cli --locked`, then run
 `node test-mermaid-png.cjs --out /tmp/mermaid-png`. Set `MERMAID_CLI` if the
-binary is in a separate Cargo target directory. PNG export requires
-`rsvg-convert` (Debian/Ubuntu: `apt install librsvg2-bin`). It preserves SVG
-clipping, masks and glyph halos; ImageMagick's built-in SVG decoder drops
-labels from these diagrams. Output retains the previous 2x pixel dimensions.
+binary is in a separate Cargo target directory. PNG export prefers
+`rsvg-convert` (Debian/Ubuntu: `apt install librsvg2-bin`) and preserves
+ImageMagick fallback when its SVG delegate supports clipping, masks and paint
+order. The CLI verifies these features with a pixel probe before export.
+ImageMagick's built-in SVG decoder drops labels from these diagrams. Output retains the previous 2x pixel dimensions.
 
 The test invokes the actual CLI for SVG and PNG in both themes, then checks
 rasterized glyph visibility and contrast across all six diagram kinds and
 long, Unicode and border fixtures. Glyph and background masks use the same
 PNG renderer, with label clipping disabled in expected masks, so differences
 in browser font selection and clipped glyphs cannot hide failures.
+
+For the ImageMagick fallback, run `python3 configure-mermaid-imagemagick.py
+/tmp/mermaid-imagemagick`, then set `MAGICK_CONFIGURE_PATH` to its `config`
+directory, `MERMAID_CLI_PATH` to its `bin` directory, and `REFERENCE_MAGICK`
+to the absolute ImageMagick executable before running the PNG regression.
+This configures a real librsvg delegate while the CLI sees only ImageMagick.

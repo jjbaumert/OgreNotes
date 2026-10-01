@@ -9,6 +9,10 @@ publish = false
 unicode-normalization = "0.1"
 unicode-segmentation = "1.13"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+quick-xml = { workspace = true }
+tempfile = "3"
+
 [dev-dependencies]
 proptest = { workspace = true }
 # Well-formedness check in the fuzz net: every rendered SVG must parse.

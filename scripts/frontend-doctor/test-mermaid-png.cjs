@@ -20,6 +20,7 @@ const cases = [
   ...[
     "c4",
     "c4-long",
+    "c4-narrow",
     "c4-unicode",
     "treemap-wide",
     "treemap-numbers",
@@ -30,12 +31,26 @@ const cases = [
     "quadrant-literal",
   ].map((x) => `fixtures/contrast-${x}`),
 ];
+const cliEnv = {
+  ...process.env,
+  ...(process.env.MERMAID_CLI_PATH
+    ? { PATH: process.env.MERMAID_CLI_PATH }
+    : {}),
+};
 function raster(svg, filename) {
-  execFileSync(
-    "rsvg-convert",
-    ["--dpi-x", "192", "--dpi-y", "192", "--zoom", "2", "--output", filename],
-    { input: svg },
-  );
+  if (process.env.REFERENCE_MAGICK) {
+    fs.writeFileSync(filename + ".svg", svg);
+    execFileSync(
+      process.env.REFERENCE_MAGICK,
+      ["-density", "192", filename + ".svg", filename],
+      { env: cliEnv },
+    );
+  } else
+    execFileSync(
+      "rsvg-convert",
+      ["--dpi-x", "192", "--dpi-y", "192", "--zoom", "2", "--output", filename],
+      { input: svg },
+    );
   return (
     "data:image/png;base64," + fs.readFileSync(filename).toString("base64")
   );
@@ -56,8 +71,11 @@ function raster(svg, filename) {
         const source = path.join(root, "crates/mermaid/tests", input + ".mmd");
         const svg = execFileSync(cli, ["--theme", theme, source], {
           encoding: "utf8",
+          env: cliEnv,
         });
-        execFileSync(cli, ["--theme", theme, source, "--out", base + ".png"]);
+        execFileSync(cli, ["--theme", theme, source, "--out", base + ".png"], {
+          env: cliEnv,
+        });
         await page.setContent(svg);
         const variants = await page.evaluate(() => {
           const root = document.querySelector("svg");

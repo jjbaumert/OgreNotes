@@ -92,16 +92,18 @@ fn literal_advance(grapheme: &str, font_size: f64, bold: bool) -> f64 {
                 // generously padded char_w table is unsuitable for fitting:
                 // it needlessly drops suffixes from ordinary uppercase names.
                 'i' | 'l' | 'j' | 'I' | ' ' => 0.28,
-                'f' | 't' | '.' | ',' | ':' | ';' | '!' | '\'' | '`' => 0.30,
-                'r' | '(' | ')' | '[' | ']' => 0.36,
-                'J' | 'c' | 's' | 'v' | 'x' | 'y' | 'z' => 0.50,
+                'f' => 0.45,
+                't' => 0.40,
+                '.' | ',' | ':' | ';' | '!' | '\'' | '`' => 0.35,
+                'r' | '(' | ')' | '[' | ']' => 0.43,
+                'J' | 'c' | 's' | 'v' | 'x' | 'y' | 'z' => 0.61,
                 'E' => 0.67,
                 'F' | 'L' | 'T' | 'Z' => 0.61,
-                'M' | 'm' => 0.84,
-                'W' | '@' | '%' => 0.95,
-                'w' => 0.74,
+                'M' | 'm' => 1.00,
+                'W' | '@' | '%' => 1.00,
+                'w' => 0.85,
                 'A'..='Z' => 0.72,
-                'a'..='z' | '0'..='9' => 0.56,
+                'a'..='z' | '0'..='9' => 0.65,
                 _ => char_w(base),
             };
             em = em.max(width);

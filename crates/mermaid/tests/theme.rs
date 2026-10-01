@@ -8,6 +8,8 @@ fn contrast_edge_fixtures_match_the_renderer() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let mut names = vec![
         "contrast-c4",
+        "contrast-c4-narrow",
+        "contrast-cli-literal",
         "contrast-quadrant-edges",
         "contrast-quadrant-literal",
         "contrast-quadrant-wide",
@@ -125,5 +127,41 @@ fn fixed_palette_foregrounds_agree_between_renderer_frontend_and_cli() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn cli_theme_preserves_literal_labels() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source = root.join("tests/fixtures/contrast-cli-literal.mmd");
+    let svg = ogrenotes_mermaid::render(&std::fs::read_to_string(&source).unwrap())
+        .svg
+        .unwrap();
+    let labels = |svg: &str| {
+        let mut reader = quick_xml::Reader::from_str(svg);
+        let mut labels = Vec::new();
+        loop {
+            match reader.read_event().unwrap() {
+                quick_xml::events::Event::Text(text) => {
+                    labels.push(text.unescape().unwrap().into_owned())
+                }
+                quick_xml::events::Event::Eof => break,
+                _ => {}
+            }
+        }
+        labels
+    };
+    for theme in ["light", "dark"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_mermaid_cli"))
+            .args(["--theme", theme])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            labels(&svg),
+            labels(&String::from_utf8(output.stdout).unwrap()),
+            "CLI themes must preserve literal text: {theme}"
+        );
     }
 }
