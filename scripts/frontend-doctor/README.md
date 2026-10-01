@@ -319,6 +319,7 @@ pie colors and all treemap palette depths are renderer-backed fixtures.
 Wide Cyrillic labels, complete tags at their rendered font size, and paint
 bounds under different font metrics are also checked. Fitting ASCII and
 accented names remain complete. Thin pie labels are checked against rasterized
-background pixels, including wedge borders.
+background pixels, including wedge borders. Rendered foreground checks catch
+backings covering adjacent percentages; architecture arrow tips stay visible.
 No server is needed. The native
 renderer tests verify fixture freshness; Playwright CI runs the browser checks.

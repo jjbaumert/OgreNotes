@@ -187,6 +187,7 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
         pie.slices[b].1.partial_cmp(&pie.slices[a].1).unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    let mut backings = String::new();
     let mut labels = String::new();
     let mut angle = -std::f64::consts::FRAC_PI_2; // 12 o'clock
     for &i in &order {
@@ -201,7 +202,9 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
             svg.push_str(&format!(
                 r#"<circle cx="{CX}" cy="{CY}" r="{R}" {slice_attrs}/>"#
             ));
-            labels.push_str(&slice_label(CX, CY, pct, fill));
+            let (backing, label) = slice_label(CX, CY, pct, fill);
+            backings.push_str(&backing);
+            labels.push_str(&label);
         } else {
             let sweep = frac * std::f64::consts::TAU;
             let (x0, y0) = (CX + R * angle.cos(), CY + R * angle.sin());
@@ -215,7 +218,9 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
             // equal), so labels sit further out and thin wedges overflow.
             let mid = angle + sweep / 2.0;
             let (lx, ly) = (CX + TEXT_POS * R * mid.cos(), CY + TEXT_POS * R * mid.sin());
-            labels.push_str(&slice_label(lx, ly, pct, fill));
+            let (backing, label) = slice_label(lx, ly, pct, fill);
+            backings.push_str(&backing);
+            labels.push_str(&label);
             angle = end;
         }
     }
@@ -229,6 +234,8 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
 
     // Paint labels after every slice/border so thin neighboring wedges cannot
     // overwrite a label's backing with a dark boundary.
+    // Backings must all precede text, including neighboring thin wedges.
+    svg.push_str(&backings);
     svg.push_str(&labels);
 
     // Legend, source order, anchored to the pie center: swatch 18×18 at
@@ -254,13 +261,18 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
 
 /// A centered percentage label with an opaque palette-matched backing.
 /// Thin wedges are narrower than the text; their borders must not show through.
-fn slice_label(x: f64, y: f64, pct: i64, fill: &str) -> String {
+fn slice_label(x: f64, y: f64, pct: i64, fill: &str) -> (String, String) {
     let label = format!("{pct}%");
     let width = crate::measure::text_size(&label).0 * 17.0 / crate::measure::FONT_PX + 8.0;
-    format!(
-        r#"<rect class="pie-percentage-background" x="{left:.1}" y="{top:.1}" width="{width:.1}" height="26" rx="2" fill="{fill}"/><text x="{x:.1}" y="{y:.1}" text-anchor="middle" dominant-baseline="middle" fill="{DATA_TEXT}" style="font-size:17px">{label}</text>"#,
-        left = x - width / 2.0,
-        top = y - 13.0,
+    (
+        format!(
+            r#"<rect class="pie-percentage-background" x="{left:.1}" y="{top:.1}" width="{width:.1}" height="26" rx="2" fill="{fill}"/>"#,
+            left = x - width / 2.0,
+            top = y - 13.0,
+        ),
+        format!(
+            r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" dominant-baseline="middle" fill="{DATA_TEXT}" style="font-size:17px">{label}</text>"#
+        ),
     )
 }
 

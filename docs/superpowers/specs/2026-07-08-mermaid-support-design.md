@@ -120,8 +120,10 @@ pub struct ParseError { pub message: String, pub line: Option<usize> }
   source editing and Markdown export retain the complete labels. Paint is
   bounded to the label area so font differences cannot spill onto the canvas.
   Pie percentages have opaque palette-matched backings so thin wedge borders
-  cannot reduce text contrast. Architecture service names and quadrant point
-  names have surface-matched backings against edges and plot borders.
+  cannot reduce text contrast. Architecture service names use surface-matched
+  glyph halos against edges while preserving arrow tips. Quadrant point names
+  have surface-matched backings against plot borders. Percentage backings paint
+  before all percentage text, including adjacent thin wedges.
   Fitting preserves grapheme clusters and measures accented letters by their
   base glyph, so short Unicode labels remain complete.
 

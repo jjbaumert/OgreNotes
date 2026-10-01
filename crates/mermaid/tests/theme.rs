@@ -17,6 +17,7 @@ fn contrast_edge_fixtures_match_the_renderer() {
         "contrast-treemap-wide",
         "contrast-pie-palette",
         "contrast-pie-thin",
+        "contrast-pie-adjacent",
     ]
     .into_iter()
     .map(String::from)

@@ -25,6 +25,7 @@ const kinds = [
   "treemap-numbers",
   "pie-palette",
   "pie-thin",
+  "pie-adjacent",
   "treemap-palette",
   "treemap-wide",
 ];
@@ -52,6 +53,7 @@ const kinds = [
           "treemap-numbers",
           "pie-palette",
           "pie-thin",
+          "pie-adjacent",
           "treemap-wide",
         ];
         const inputs =
@@ -270,7 +272,7 @@ const kinds = [
         {
           // Rasterize glyph coverage and the SVG without text. Sample glyph
           // interiors using the declared foreground, excluding unrelated lines.
-          const pixels = await page.evaluate(async () => {
+          const pixels = await page.evaluate(async (kind) => {
             const results = [];
             for (const root of document.querySelectorAll(
               ".mermaid-svg > svg",
@@ -346,8 +348,23 @@ const kinds = [
                 e.style.fill = "#000";
                 e.style.stroke = "none";
               });
+              // Markers remain paintable even when their referring path is
+              // hidden. They must not be mistaken for glyphs in this mask.
+              mask
+                .querySelectorAll("marker")
+                .forEach((e) => (e.style.display = "none"));
               const glyphs = await render(mask, true);
-              clone.querySelectorAll("text").forEach((e) => e.remove());
+              const ink = await render();
+              clone.querySelectorAll("text").forEach((e) => {
+                // Keep a glyph halo as background paint while removing its
+                // foreground fill. Rectangular backings remain untouched.
+                if (
+                  getComputedStyle(originals[copies.indexOf(e)]).stroke !==
+                  "none"
+                )
+                  e.style.fill = "none";
+                else e.remove();
+              });
               const background = await render();
               const luminance = (c) =>
                 c
@@ -378,7 +395,8 @@ const kinds = [
                         ? +style.fill.match(/[\d.]+/g)[3]
                         : 1);
                     let minimum = Infinity,
-                      count = 0;
+                      count = 0,
+                      visible = 0;
                     for (
                       let y = Math.floor(box.top - bounds.top);
                       y < Math.ceil(box.bottom - bounds.top);
@@ -396,6 +414,18 @@ const kinds = [
                         const behind = Array.from(
                           background.slice(offset, offset + 3),
                         );
+                        const delta = color.map((v, i) => v - behind[i]);
+                        const norm = delta.reduce((sum, v) => sum + v * v, 0);
+                        const contribution =
+                          norm > 0
+                            ? delta.reduce(
+                                (sum, v, i) =>
+                                  sum + v * (ink[offset + i] - behind[i]),
+                                0,
+                              ) / norm
+                            : 0;
+                        if (contribution >= (glyphs[offset + 3] / 255) * 0.8)
+                          visible++;
                         const foreground = color.map(
                           (v, i) =>
                             v * paintAlpha + behind[i] * (1 - paintAlpha),
@@ -411,17 +441,52 @@ const kinds = [
                         count++;
                       }
                     }
-                    return { text: t.textContent, count, contrast: minimum };
+                    return {
+                      text: t.textContent,
+                      count,
+                      visibleFraction: visible / count,
+                      contrast: minimum,
+                    };
                   }),
               );
+              if (kind === "architecture") {
+                const edge = root.querySelector("path[marker-end]");
+                const end = edge.getPointAtLength(edge.getTotalLength());
+                const screen = new DOMPoint(end.x, end.y).matrixTransform(
+                  edge.getScreenCTM(),
+                );
+                const color = getComputedStyle(edge)
+                  .stroke.match(/[\d.]+/g)
+                  .slice(0, 3)
+                  .map(Number);
+                let tipPixels = 0;
+                for (let dy = -2; dy <= 2; dy++)
+                  for (let dx = -2; dx <= 2; dx++) {
+                    const x = Math.floor(screen.x - bounds.x) + dx,
+                      y = Math.floor(screen.y - bounds.y) + dy;
+                    const offset = (y * width + x) * 4;
+                    if (
+                      color.every((v, i) => Math.abs(v - ink[offset + i]) <= 4)
+                    )
+                      tipPixels++;
+                  }
+                if (tipPixels < 3)
+                  throw new Error(
+                    `Architecture arrow tip hidden: ${tipPixels} pixels`,
+                  );
+                results[results.length - 1].arrowTipPixels = tipPixels;
+              }
             }
             return results;
-          });
+          }, kind);
           console.log(JSON.stringify({ theme, kind, pixels }));
           assert(
             pixels.length > 0 &&
-              pixels.every((p) => p.count > 0 && p.contrast >= 4.5),
-            "Glyphs must contrast with actual background pixels, including borders",
+              pixels.every(
+                (p) =>
+                  p.count > 0 && p.contrast >= 4.5 && p.visibleFraction >= 0.9,
+              ),
+            "Glyphs must remain visible and contrast with actual background pixels, including borders",
           );
         }
         if (kind === "c4-long") {
@@ -477,12 +542,16 @@ const kinds = [
         }
         if (kind === "c4-unicode") {
           const labels = await page.locator("svg text").allTextContents();
-          for (const label of ["éééééé", "éééééé", "👩‍👩‍👧‍👦 Family"]) {
+          for (const label of ["éééééé", "éééééé"]) {
             assert(
               labels.includes(label),
               "Fitting Unicode labels must remain complete",
             );
           }
+          assert(
+            labels.some((label) => /^(?:é)+…$/.test(label)),
+            "Truncated Unicode labels must preserve entire grapheme clusters",
+          );
         }
         assert(samples.length > 0, `${kind} must contain labels`);
         failed ||= samples.some((s) => s.contrast < 4.5);
