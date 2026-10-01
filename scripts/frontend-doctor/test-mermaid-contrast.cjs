@@ -35,6 +35,7 @@ const kinds = [
   "treemap-fallback-header",
   "architecture-accent",
   "c4-unicode",
+  "c4-arabic",
   "treemap-numbers",
   "pie-palette",
   "pie-thin",
@@ -76,6 +77,7 @@ const kinds = [
           "treemap-fallback-header",
           "architecture-accent",
           "c4-unicode",
+          "c4-arabic",
           "treemap-numbers",
           "pie-palette",
           "pie-thin",
@@ -706,6 +708,19 @@ const kinds = [
             "Tall queues retain their identifying name",
           );
           assert.equal(labels.filter((label) => label === "line").length, 30);
+        }
+        if (kind === "c4-arabic") {
+          const labels = await page.locator("svg text").allTextContents();
+          assert(
+            labels.includes("السلام عليكم"),
+            "Short Arabic names that fit remain complete",
+          );
+          assert(
+            labels.some(
+              (label) => label.startsWith("س") && label.endsWith("…"),
+            ),
+            "Overflowing wide Arabic names receive an ellipsis",
+          );
         }
         if (kind.startsWith("treemap-fallback")) {
           const labels = await page.locator("svg text").allTextContents();

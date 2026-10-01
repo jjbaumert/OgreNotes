@@ -41,12 +41,12 @@ fn main() {
         if bases == [ch] || (bases.is_empty() && is_combining_mark(ch)) {
             continue;
         }
-        // All other non-ASCII bases have a full-em advance, except emoji.
+        // Other non-ASCII bases have a full-em advance, except Arabic and emoji.
         // Changing one to another therefore needs no runtime mapping.
         let full_em = |c: char| {
             !c.is_ascii()
                 && !is_combining_mark(c)
-                && !matches!(c, '\u{200c}' | '\u{200d}' | '\u{1f000}'..='\u{1faff}')
+                && !matches!(c, '\u{200c}' | '\u{200d}' | '\u{0600}'..='\u{06ff}' | '\u{0750}'..='\u{077f}' | '\u{08a0}'..='\u{08ff}' | '\u{1f000}'..='\u{1faff}')
         };
         if bases.len() == 1 && full_em(ch) && full_em(bases[0]) {
             continue;

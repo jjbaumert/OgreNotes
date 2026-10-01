@@ -30,6 +30,7 @@ const cases = [
     "treemap-fallback-header",
     "architecture-accent",
     "c4-unicode",
+    "c4-arabic",
     "treemap-wide",
     "treemap-numbers",
     "treemap-leaf-short",

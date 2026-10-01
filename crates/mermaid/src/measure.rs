@@ -124,6 +124,14 @@ fn base_advance(base: char) -> f64 {
         'w' => 0.85,
         'A'..='Z' => 0.72,
         'a'..='z' | '0'..='9' => 0.65,
+        // Joined Arabic letters have narrower advances than the full-em
+        // fallback. Keep narrow stems distinct from wide seen/sad families.
+        'ا' | 'ل' => 0.35,
+        'د' | 'ذ' | 'ر' | 'ز' | 'و' => 0.55,
+        'س' | 'ش' | 'ص' | 'ض' => 1.05,
+        'ط' | 'ظ' | 'ك' => 0.90,
+        'ب' | 'ت' | 'ث' | 'ة' | 'ع' | 'غ' | 'م' | 'ن' | 'ه' | 'ي' => 0.65,
+        '\u{0600}'..='\u{06ff}' | '\u{0750}'..='\u{077f}' | '\u{08a0}'..='\u{08ff}' => 0.75,
         '\u{1f000}'..='\u{1faff}' => 1.35,
         // Fallback fonts need a conservative full-em estimate. The
         // layout table's Latin average undercounts Cyrillic/Greek.
@@ -200,6 +208,18 @@ pub(crate) fn truncate_literal_to_width(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arabic_names_that_fit_remain_complete() {
+        assert_eq!(
+            truncate_literal_to_width("السلام عليكم", 95.6, 13.0, true),
+            "السلام عليكم"
+        );
+        let wide = "س".repeat(40);
+        let fitted = truncate_literal_to_width(&wide, 95.6, 13.0, true);
+        assert!(fitted.ends_with('…'));
+        assert!(fitted.len() < wide.len());
+    }
 
     #[test]
     fn compact_fitting_data_matches_full_unicode_normalization() {

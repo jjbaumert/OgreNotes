@@ -316,7 +316,7 @@ renderer fixtures and the production CSS. It also checks quadrant edge labels,
 all C4 external tiers and shapes, small treemap cells, and pie rim/wedge
 contrast, including an empty pie. Long labels, narrow numeric cells, all
 pie colors and all treemap palette depths are renderer-backed fixtures.
-Wide Cyrillic, Greek, Hangul and Indic names, complete tags and fallback-font
+Wide Cyrillic, Greek, Hangul and Indic names, complete Arabic names, tags and fallback-font
 captions are also checked. Tall C4 queues retain their identifying names.
 Palette-matched glyph halos protect captions without clipping differing font
 metrics. Treemap captions paint after all cells, preserving parent descenders.

@@ -27,6 +27,7 @@ fn contrast_edge_fixtures_match_the_renderer() {
         "contrast-treemap-wide-m",
         "contrast-c4-long",
         "contrast-c4-unicode",
+        "contrast-c4-arabic",
         "contrast-treemap-numbers",
         "contrast-treemap-wide",
         "contrast-pie-palette",
