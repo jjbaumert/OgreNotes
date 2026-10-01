@@ -263,7 +263,7 @@ fn draw_leaf_label(node: &Node, r: Rect, out: &mut String) {
             out.push_str(&format!(
                 r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-size="11" fill="{DATA_MUTED_TEXT}">{}</text>"#,
                 cy + 14.0,
-                fmt_num(v)
+                escape_xml(&clip(&fmt_num(v), r.w - 8.0))
             ));
         }
     }

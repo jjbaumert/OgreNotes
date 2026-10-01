@@ -375,25 +375,56 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
         let mut ty = by + 16.0 + if e.shape == Shape::Person { 14.0 } else { 0.0 };
         out.push_str(&format!(
             r#"<text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" font-weight="700" fill="{name_text}">{}</text>"#,
-            escape_xml(&e.name)
+            escape_xml(&fit_element_label(&e.name, e.shape, bw, bh, ty - by, 13.0))
         ));
         ty += LINE_H;
         let tag = if e.external { format!("[{}]", e.kind.replace('_', " ")) } else { format!("[{}]", e.kind) };
         out.push_str(&format!(
             r#"<text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" font-size="11" font-style="italic" fill="{tag_text}">{}</text>"#,
-            escape_xml(&tag)
+            escape_xml(&fit_element_label(&tag, e.shape, bw, bh, ty - by, 11.0))
         ));
         for d in &e.descr {
             ty += LINE_H;
             out.push_str(&format!(
                 r#"<text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" font-size="11" fill="{desc_text}">{}</text>"#,
-                escape_xml(d)
+                escape_xml(&fit_element_label(d, e.shape, bw, bh, ty - by, 11.0))
             ));
         }
     }
 
     out.push_str("</svg>");
     Ok(out)
+}
+
+/// Fit visible labels to the existing painted bounds, using the same ellipsis
+/// policy as architecture and treemap. The diagram source remains complete.
+fn fit_element_label(
+    text: &str,
+    shape: Shape,
+    width: f64,
+    height: f64,
+    baseline: f64,
+    font_size: f64,
+) -> String {
+    // Reserve the full glyph band, including descenders. Curved shapes narrow
+    // near their top and bottom, so use the narrowest cross-section in the band.
+    let edge_y = (baseline - font_size * 1.1).min(height - baseline - font_size * 0.3);
+    let (rx, ry) = match shape {
+        Shape::Queue => (width.min(height) / 2.0, height / 2.0),
+        Shape::Db => (width / 2.0, 7.0),
+        _ => (0.0, 0.0),
+    };
+    let inset = if ry > 0.0 {
+        let offset = 1.0 - edge_y.clamp(0.0, ry) / ry;
+        rx * (1.0 - (1.0 - offset * offset).sqrt())
+    } else {
+        0.0
+    };
+    let available = (width - 2.0 * (inset + 4.0).max(14.0)).max(0.0);
+    if available < measure::text_size("…").0 {
+        return String::new();
+    }
+    measure::truncate_to_width(text, available)
 }
 
 fn draw_shape(out: &mut String, shape: Shape, x: f64, y: f64, w: f64, h: f64, fill: &str) {

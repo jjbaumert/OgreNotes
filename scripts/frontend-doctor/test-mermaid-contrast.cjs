@@ -8,16 +8,19 @@ const args=process.argv.slice(2);
 const out=args.includes('--out')?args[args.indexOf('--out')+1]:'/tmp/ogrenotes-mermaid-contrast';
 fs.mkdirSync(out,{recursive:true});
 const {chromium}=require('playwright');
-const kinds=['treemap','pie','xy-chart','quadrant-chart','architecture','c4','quadrant-edges','pie-empty','treemap-short'];
+const kinds=['treemap','pie','xy-chart','quadrant-chart','architecture','c4','quadrant-edges','pie-empty','treemap-short','c4-long','treemap-numbers','pie-palette','treemap-palette'];
 (async()=>{
  const browser=await chromium.launch({headless:true,...(process.env.CHROME_BIN?{executablePath:process.env.CHROME_BIN}:{})});
  const page=await browser.newPage({viewport:{width:1800,height:2400}});
  let failed=false;
  try {
  for(const theme of ['light','dark']) for(const kind of kinds){
- const svg=fs.readFileSync(path.join(root,kind==='treemap-short'?'crates/mermaid/tests/fixtures/contrast-treemap-short.svg':kind==='pie-empty'?'crates/mermaid/tests/fixtures/contrast-pie-empty.svg':kind==='quadrant-edges'?'crates/mermaid/tests/fixtures/contrast-quadrant-edges.svg':kind==='c4'?'crates/mermaid/tests/fixtures/contrast-c4.svg':`crates/mermaid/tests/golden/${kind}.svg`),'utf8');
+ const fixtures=['c4','quadrant-edges','pie-empty','treemap-short','c4-long','treemap-numbers','pie-palette'];
+ const inputs=kind==='treemap-palette'?Array.from({length:8},(_,depth)=>`crates/mermaid/tests/fixtures/contrast-treemap-depth-${depth}.svg`):[fixtures.includes(kind)?`crates/mermaid/tests/fixtures/contrast-${kind}.svg`:`crates/mermaid/tests/golden/${kind}.svg`];
+ const svg=inputs.map(input=>fs.readFileSync(path.join(root,input),'utf8')).join('');
+
  const css=['frontend/style/tokens-light.css','frontend/style/tokens-dark.css'].map(p=>fs.readFileSync(path.join(root,p),'utf8')).join('\n');
- await page.setContent(`<html data-theme="${theme}"><style>${css}\nbody{color:var(--color-text);background:var(--color-surface);margin:20px}svg{display:block}</style>${svg}</html>`);
+ await page.setContent(`<html data-theme="${theme}"><style>${css}\nbody{color:var(--color-text);background:var(--color-surface);margin:20px;${kind==='treemap-palette'?'display:grid;grid-template-columns:repeat(2,1fr)':''}}svg{display:block}</style>${svg}</html>`);
  const tokens=await page.evaluate(()=>{
   const root=getComputedStyle(document.documentElement);
   const body=getComputedStyle(document.body);
@@ -32,7 +35,7 @@ const kinds=['treemap','pie','xy-chart','quadrant-chart','architecture','c4','qu
   const composite=(a,b,alpha)=>a.map((v,i)=>v*alpha+b[i]*(1-alpha));
   const luminance=c=>c.map(x=>{x/=255;return x<=.04045?x/12.92:((x+.055)/1.055)**2.4}).reduce((s,x,i)=>s+x*[.2126,.7152,.0722][i],0);
   const bg=rgb(getComputedStyle(document.body).backgroundColor);
-  return [...document.querySelectorAll('svg text')].flatMap(t=>{
+  return [...document.querySelectorAll('svg text')].filter(t=>t.textContent.trim()).flatMap(t=>{
    const box=t.getBoundingClientRect();
    return [0.1,0.5,0.9].flatMap(fx=>[0.1,0.5,0.9].map(fy=>{
    const x=box.x+box.width*fx,y=box.y+box.height*fy;
@@ -45,7 +48,7 @@ const kinds=['treemap','pie','xy-chart','quadrant-chart','architecture','c4','qu
   }));
   });
  });
- if(kind==='pie'||kind==='pie-empty'){
+ if(kind.startsWith('pie')){
   const strokes=await page.evaluate(()=>{
    const rgb=s=>s.match(/[\d.]+/g).slice(0,3).map(Number);
    const lum=c=>c.map(x=>{x/=255;return x<=.04045?x/12.92:((x+.055)/1.055)**2.4}).reduce((s,x,i)=>s+x*[.2126,.7152,.0722][i],0);

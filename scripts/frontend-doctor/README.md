@@ -314,6 +314,7 @@ It purges its test document and runs in the Playwright CI workflow.
 foreground/background contrast for six diagram kinds in both themes, using
 renderer fixtures and the production CSS. It also checks quadrant edge labels,
 all C4 external tiers and shapes, small treemap cells, and pie rim/wedge
-contrast, including an empty pie.
+contrast, including an empty pie. Long labels, narrow numeric cells, all
+pie colors and all treemap palette depths are renderer-backed fixtures.
 No server is needed. The native
 renderer tests verify fixture freshness; Playwright CI runs the browser checks.
