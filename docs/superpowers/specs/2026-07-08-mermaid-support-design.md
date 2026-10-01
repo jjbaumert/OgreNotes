@@ -116,25 +116,20 @@ pub struct ParseError { pub message: String, pub line: Option<usize> }
   uses `currentColor` on the canvas so it tracks the light/dark theme.
   Labels on fixed light data fills use matching dark foreground tokens in
   both themes; C4 retains light text on its darker person/system fills.
-  C4 element text and treemap values use ellipses to fit their painted bounds;
-  source editing and Markdown export retain the complete labels. Paint is
-  bounded to the label area so font differences cannot spill onto the canvas.
-  Pie percentages have opaque palette-matched backings so thin wedge borders
-  cannot reduce text contrast. Architecture service names use surface-matched
-  glyph halos against edges. Arrowheads paint again through a glyph mask, so
-  accented names retain contrast without erasing neighboring tips. Quadrant
-  plot strokes are masked beneath actual
-  label glyphs, including literal break markup and font fallback. Point
-  positions remain unchanged; labels paint above markers through a glyph
-  mask, clearing marker paint only where labels overlap. Percentage backings paint
-  before all percentage text, including adjacent thin wedges.
-  Fitting preserves grapheme clusters and measures accented letters by their
-  base glyph, retaining full Hangul syllable width after decomposition, so
-  short Unicode labels remain complete. Fallback scripts use conservative
-  width estimates and additional descent allowance; conjuncts count their
-  advancing letters while Hangul and joined emoji remain single glyphs. Fitted C4 and treemap
-  text uses an explicit Arial/Helvetica font family for consistent viewer metrics. Single-line leaf names
-  are vertically centered in short cells to keep the complete glyph band visible.
+  C4 element text and treemap values use grapheme-safe ellipses for long
+  labels; source editing and Markdown export retain the complete labels.
+  Palette-matched glyph halos keep fallback fonts and narrow queue caps
+  readable without clipping names or descenders. Treemap cells paint before
+  all captions so child fills cannot cover parent descenders. Pie percentages
+  have opaque palette-matched backings, painted before all percentage text.
+  Architecture service names use surface-matched glyph halos against edges.
+  Arrowheads paint again through a glyph mask, preserving accented names
+  and neighboring tips. Quadrant strokes and marker paint are masked beneath
+  actual label glyphs; point positions remain unchanged and labels paint last.
+  Fitting accounts for advancing letters in Indic conjuncts; Hangul and emoji
+  retain a single glyph advance. C4 and treemap use an explicit Arial/Helvetica
+  font family for consistent browser and standalone metrics. Short leaf names
+  are centered vertically while retaining the complete glyph band.
 
 ### B. Block model (both schemas, mirrored)
 

@@ -17,14 +17,3 @@ pub(crate) fn paint_mask_id(prefix: &str, geometry: &str) -> String {
     });
     format!("mmd-{prefix}-{hash:016x}")
 }
-
-/// Bound label paint without global SVG IDs. Inline dimensions keep nested
-/// viewports stable under the editor's responsive rules for SVG elements.
-pub(crate) fn clip_label_to_rect(x: f64, y: f64, width: f64, height: f64, text: &str) -> String {
-    if width <= 0.0 || height <= 0.0 || text.is_empty() {
-        return String::new();
-    }
-    format!(
-        r#"<svg x="{x:.3}" y="{y:.3}" width="{width:.3}" height="{height:.3}" viewBox="{x:.3} {y:.3} {width:.3} {height:.3}" overflow="hidden" style="overflow:hidden;max-width:none;width:{width:.3}px;height:{height:.3}px">{text}</svg>"#
-    )
-}

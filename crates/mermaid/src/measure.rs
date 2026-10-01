@@ -136,8 +136,8 @@ pub(crate) fn literal_text_width(text: &str, font_size: f64, bold: bool) -> f64 
 
 /// Fit literal SVG text at its rendered font size, preserving grapheme clusters.
 /// Accents use their base glyph's advance; wide letters and scripts get wider
-/// estimates. Unlike text_size, <br> is literal text. Callers clip label paint
-/// to its background because these advances cannot cover every browser font.
+/// estimates. Unlike text_size, <br> is literal text. Callers back label glyphs with palette halos
+/// because these advances cannot cover every browser font.
 pub(crate) fn truncate_literal_to_width(
     text: &str,
     max_width: f64,

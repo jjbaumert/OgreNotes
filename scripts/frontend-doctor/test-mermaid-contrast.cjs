@@ -30,6 +30,9 @@ const kinds = [
   "c4-hangul",
   "c4-fallback",
   "c4-indic",
+  "c4-tall-queue",
+  "treemap-fallback-leaf",
+  "treemap-fallback-header",
   "architecture-accent",
   "c4-unicode",
   "treemap-numbers",
@@ -68,6 +71,9 @@ const kinds = [
           "c4-hangul",
           "c4-fallback",
           "c4-indic",
+          "c4-tall-queue",
+          "treemap-fallback-leaf",
+          "treemap-fallback-header",
           "architecture-accent",
           "c4-unicode",
           "treemap-numbers",
@@ -288,6 +294,17 @@ const kinds = [
                     }
                   }
                   const style = getComputedStyle(t);
+                  // A palette halo backs glyphs even where their bounding
+                  // box extends beyond the original element geometry.
+                  if (
+                    style.stroke !== "none" &&
+                    parseFloat(style.strokeWidth) > 0
+                  )
+                    background = composite(
+                      rgb(style.stroke),
+                      background,
+                      +style.strokeOpacity,
+                    );
                   const foreground = composite(
                     rgb(style.fill),
                     background,
@@ -602,48 +619,6 @@ const kinds = [
             "Glyphs must remain visible and contrast with actual background pixels, including borders",
           );
         }
-        if (kind === "c4-long") {
-          const clipping = await page.evaluate(() => {
-            const text = [...document.querySelectorAll("svg text")].find((t) =>
-              t.textContent.includes("WWW"),
-            );
-            const frame = text.closest("svg");
-            text.style.fontSize = "36px";
-            const box = text.getBoundingClientRect();
-            const vb = frame.viewBox.baseVal,
-              matrix = frame.getScreenCTM();
-            const start = new DOMPoint(vb.x, vb.y).matrixTransform(matrix);
-            const end = new DOMPoint(
-              vb.x + vb.width,
-              vb.y + vb.height,
-            ).matrixTransform(matrix);
-            const bounds = {
-              right: end.x,
-              top: start.y,
-              width: end.x - start.x,
-              height: end.y - start.y,
-            };
-            const point = [bounds.right + 2, bounds.top + bounds.height / 2];
-            frame.style.overflow = "visible";
-            const escaped = document.elementsFromPoint(...point).includes(text);
-            frame.style.overflow = "hidden";
-            const kept = document.elementsFromPoint(...point).includes(text);
-            text.style.fontSize = "";
-            return {
-              width: box.width,
-              frameWidth: bounds.width,
-              escaped,
-              kept,
-            };
-          });
-          console.log(JSON.stringify({ theme, kind, clipping }));
-          assert(
-            clipping.width > clipping.frameWidth &&
-              clipping.escaped &&
-              !clipping.kept,
-            "Different font metrics must remain inside their painted bounds",
-          );
-        }
         if (kind === "treemap-wide-m") {
           const labels = await page.locator("svg text").allTextContents();
           assert(
@@ -658,6 +633,21 @@ const kinds = [
               labels.includes("[ContainerQueue]") &&
               labels.includes("EXTERNAL DB"),
             "Database and queue tags that fit must remain complete",
+          );
+        }
+        if (kind === "c4-tall-queue") {
+          const labels = await page.locator("svg text").allTextContents();
+          assert(
+            labels.includes("Queue"),
+            "Tall queues retain their identifying name",
+          );
+          assert.equal(labels.filter((label) => label === "line").length, 30);
+        }
+        if (kind.startsWith("treemap-fallback")) {
+          const labels = await page.locator("svg text").allTextContents();
+          assert(
+            labels.includes("မြန်မာ"),
+            "Short fallback captions remain complete",
           );
         }
         if (kind === "c4-indic") {

@@ -9,7 +9,7 @@
 //! out with the shared boxgraph adapter. Styling directives (`Update*`) are
 //! accepted and ignored.
 
-use crate::theme::{DATA_TEXT, LABEL_FONT, clip_label_to_rect};
+use crate::theme::{DATA_TEXT, LABEL_FONT};
 use crate::{ParseError, escape_xml, measure};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -374,18 +374,7 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
         // Person boxes leave room for a head.
         let mut ty = by + 16.0 + if e.shape == Shape::Person { 14.0 } else { 0.0 };
         out.push_str(
-            &fit_element_label(&e.name, e.shape, bw, bh, ty - by, 13.0, true).render(
-                cx,
-                by,
-                ty,
-                name_text,
-                false,
-                if e.shape == Shape::Db {
-                    Some(fill)
-                } else {
-                    None
-                },
-            ),
+            &fit_element_label(&e.name, bw, 13.0, true).render(cx, ty, name_text, false, fill),
         );
         ty += LINE_H;
         let tag = if e.external {
@@ -394,14 +383,12 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
             format!("[{}]", e.kind)
         };
         out.push_str(
-            &fit_element_label(&tag, e.shape, bw, bh, ty - by, 11.0, false)
-                .render(cx, by, ty, tag_text, true, None),
+            &fit_element_label(&tag, bw, 11.0, false).render(cx, ty, tag_text, true, fill),
         );
         for d in &e.descr {
             ty += LINE_H;
             out.push_str(
-                &fit_element_label(d, e.shape, bw, bh, ty - by, 11.0, false)
-                    .render(cx, by, ty, desc_text, false, None),
+                &fit_element_label(d, bw, 11.0, false).render(cx, ty, desc_text, false, fill),
             );
         }
     }
@@ -412,9 +399,6 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
 
 struct FittedLabel {
     text: String,
-    width: f64,
-    top: f64,
-    bottom: f64,
     font_size: f64,
     bold: bool,
 }
@@ -423,69 +407,35 @@ impl FittedLabel {
     fn render(
         &self,
         cx: f64,
-        by: f64,
         baseline: f64,
         color: &str,
         italic: bool,
-        background: Option<&str>,
+        background: &str,
     ) -> String {
         if self.text.is_empty() {
             return String::new();
         }
-        // Database cap strokes must not lighten the fill beneath name glyphs.
-        let halo = background.map(|fill| format!(
-            r#" stroke="{fill}" stroke-width="3" stroke-linejoin="round" paint-order="stroke""#
-        )).unwrap_or_default();
-        let text = format!(
+        // Back actual glyphs rather than clipping heuristic font bands.
+        // This also protects names over narrow queue/database caps.
+        let halo = format!(
+            r#" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke""#
+        );
+        format!(
             r#"<text x="{cx:.1}" y="{baseline:.1}" text-anchor="middle" font-size="{}" font-weight="{}" font-style="{}" fill="{color}"{halo}>{}</text>"#,
             self.font_size,
             if self.bold { 700 } else { 400 },
             if italic { "italic" } else { "normal" },
             escape_xml(&self.text),
-        );
-        clip_label_to_rect(
-            cx - self.width / 2.0,
-            by + self.top,
-            self.width,
-            self.bottom - self.top,
-            &text,
         )
     }
 }
 
-/// Fit visible labels to the existing painted bounds, using the same ellipsis
+/// Fit visible labels to the element width, using the same ellipsis
 /// policy as architecture and treemap. The diagram source remains complete.
-fn fit_element_label(
-    text: &str,
-    shape: Shape,
-    width: f64,
-    height: f64,
-    baseline: f64,
-    font_size: f64,
-    bold: bool,
-) -> FittedLabel {
-    // Reserve extra descent for fallback scripts, including Burmese. Curved shapes narrow
-    // near their top and bottom, so use the narrowest cross-section in the band.
-    let top = (baseline - font_size * 1.1).max(if shape == Shape::Person { 16.0 } else { 0.0 });
-    let bottom = (baseline + font_size * 0.65).min(height);
-    let edge_y = top.min(height - bottom);
-    let (rx, ry) = match shape {
-        Shape::Queue => (width.min(height) / 2.0, height / 2.0),
-        Shape::Db => (width / 2.0, 7.0),
-        _ => (0.0, 0.0),
-    };
-    let inset = if ry > 0.0 {
-        let offset = 1.0 - edge_y.clamp(0.0, ry) / ry;
-        rx * (1.0 - (1.0 - offset * offset).sqrt())
-    } else {
-        0.0
-    };
-    let available = (width - 2.0 * (inset + 4.0).max(14.0)).max(0.0);
+fn fit_element_label(text: &str, width: f64, font_size: f64, bold: bool) -> FittedLabel {
+    let available = (width - 28.0).max(0.0);
     FittedLabel {
         text: measure::truncate_literal_to_width(text, available, font_size, bold),
-        width: available,
-        top,
-        bottom,
         font_size,
         bold,
     }

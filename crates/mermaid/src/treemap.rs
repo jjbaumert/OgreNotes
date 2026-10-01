@@ -5,7 +5,7 @@
 //! squarified treemap — each node a rectangle whose area is proportional to
 //! its value, packed to keep cell aspect ratios near 1.
 
-use crate::theme::{DATA_MUTED_TEXT, DATA_TEXT, LABEL_FONT, clip_label_to_rect};
+use crate::theme::{DATA_MUTED_TEXT, DATA_TEXT, LABEL_FONT};
 use crate::{ParseError, escape_xml, measure};
 
 const PAD: f64 = 4.0;
@@ -202,14 +202,18 @@ pub(crate) fn render_svg(t: &Treemap) -> String {
     }
     // Lay the roots out as one virtual level filling the canvas.
     let area = Rect { x: PAD, y: PAD + title_h, w: WIDTH, h: HEIGHT };
-    layout_level(&t.roots, area, 0, &mut out);
+    // Paint every cell before captions, so child fills cannot cover a
+    // parent caption whose fallback-font descenders cross the header edge.
+    let mut labels = String::new();
+    layout_level(&t.roots, area, 0, &mut out, &mut labels);
+    out.push_str(&labels);
     out.push_str("</svg>");
     out
 }
 
 /// Squarify `nodes` into `rect`, then recurse into each branch (reserving a
 /// header strip for its label).
-fn layout_level(nodes: &[Node], rect: Rect, depth: usize, out: &mut String) {
+fn layout_level(nodes: &[Node], rect: Rect, depth: usize, out: &mut String, labels: &mut String) {
     if nodes.is_empty() || rect.w < 2.0 || rect.h < 2.0 {
         return;
     }
@@ -222,39 +226,33 @@ fn layout_level(nodes: &[Node], rect: Rect, depth: usize, out: &mut String) {
             r.x, r.y, r.w.max(0.0), r.h.max(0.0)
         ));
         if node.children.is_empty() {
-            draw_leaf_label(node, r, out);
+            draw_leaf_label(node, r, fill, labels);
         } else {
             // Branch: header strip with the name, children in the remainder.
-            draw_header_label(node, r, out);
+            draw_header_label(node, r, fill, labels);
             if r.h > HEADER_H + 4.0 {
                 let inner = Rect { x: r.x, y: r.y + HEADER_H, w: r.w, h: r.h - HEADER_H };
-                layout_level(&node.children, inner, depth + 1, out);
+                layout_level(&node.children, inner, depth + 1, out, labels);
             }
         }
     }
 }
 
-fn draw_header_label(node: &Node, r: Rect, out: &mut String) {
+fn draw_header_label(node: &Node, r: Rect, background: &str, out: &mut String) {
     // Match leaf labels: omit text when its cell cannot contain it.
     if r.w < 24.0 || r.h < HEADER_H {
         return;
     }
     let text = format!(
-        r#"<text x="{:.1}" y="{:.1}" font-weight="600" font-size="12" fill="{DATA_TEXT}">{}</text>"#,
+        r#"<text x="{:.1}" y="{:.1}" font-weight="600" font-size="12" fill="{DATA_TEXT}" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke">{}</text>"#,
         r.x + 5.0,
         r.y + 13.0,
         escape_xml(&clip(&node.name, r.w - 10.0, 12.0, true))
     );
-    out.push_str(&clip_label_to_rect(
-        r.x + 1.0,
-        r.y + 1.0,
-        r.w - 2.0,
-        r.h - 2.0,
-        &text,
-    ));
+    out.push_str(&text);
 }
 
-fn draw_leaf_label(node: &Node, r: Rect, out: &mut String) {
+fn draw_leaf_label(node: &Node, r: Rect, background: &str, out: &mut String) {
     if r.w < 24.0 || r.h < 18.0 {
         return;
     }
@@ -264,26 +262,20 @@ fn draw_leaf_label(node: &Node, r: Rect, out: &mut String) {
     let two_lines = node.value.is_some() && r.h > 34.0;
     let name_baseline = if two_lines { cy - 2.0 } else { cy + 4.0 };
     let mut text = format!(
-        r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="{DATA_TEXT}">{}</text>"#,
+        r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="{DATA_TEXT}" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke">{}</text>"#,
         name_baseline,
         escape_xml(&clip(&node.name, r.w - 8.0, 13.0, false))
     );
     if let Some(v) = node.value {
         if r.h > 34.0 {
             text.push_str(&format!(
-                r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-size="11" fill="{DATA_MUTED_TEXT}">{}</text>"#,
+                r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-size="11" fill="{DATA_MUTED_TEXT}" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke">{}</text>"#,
                 cy + 14.0,
                 escape_xml(&clip(&fmt_num(v), r.w - 8.0, 11.0, false))
             ));
         }
     }
-    out.push_str(&clip_label_to_rect(
-        r.x + 1.0,
-        r.y + 1.0,
-        r.w - 2.0,
-        r.h - 2.0,
-        &text,
-    ));
+    out.push_str(&text);
 }
 
 /// Truncate `s` with an ellipsis to fit `max_w` pixels (approx).
