@@ -5,7 +5,7 @@
 //! squarified treemap — each node a rectangle whose area is proportional to
 //! its value, packed to keep cell aspect ratios near 1.
 
-use crate::theme::{DATA_MUTED_TEXT, DATA_TEXT};
+use crate::theme::{DATA_MUTED_TEXT, DATA_TEXT, clip_label_to_rect};
 use crate::{ParseError, escape_xml, measure};
 
 const PAD: f64 = 4.0;
@@ -239,11 +239,18 @@ fn draw_header_label(node: &Node, r: Rect, out: &mut String) {
     if r.w < 24.0 || r.h < HEADER_H {
         return;
     }
-    out.push_str(&format!(
+    let text = format!(
         r#"<text x="{:.1}" y="{:.1}" font-weight="600" font-size="12" fill="{DATA_TEXT}">{}</text>"#,
         r.x + 5.0,
         r.y + 13.0,
-        escape_xml(&clip(&node.name, r.w - 10.0))
+        escape_xml(&clip(&node.name, r.w - 10.0, 12.0, true))
+    );
+    out.push_str(&clip_label_to_rect(
+        r.x + 1.0,
+        r.y + 1.0,
+        r.w - 2.0,
+        r.h - 2.0,
+        &text,
     ));
 }
 
@@ -253,28 +260,32 @@ fn draw_leaf_label(node: &Node, r: Rect, out: &mut String) {
     }
     let cx = r.x + r.w / 2.0;
     let cy = r.y + r.h / 2.0;
-    out.push_str(&format!(
+    let mut text = format!(
         r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="{DATA_TEXT}">{}</text>"#,
         cy - 2.0,
-        escape_xml(&clip(&node.name, r.w - 8.0))
-    ));
+        escape_xml(&clip(&node.name, r.w - 8.0, 13.0, false))
+    );
     if let Some(v) = node.value {
         if r.h > 34.0 {
-            out.push_str(&format!(
+            text.push_str(&format!(
                 r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-size="11" fill="{DATA_MUTED_TEXT}">{}</text>"#,
                 cy + 14.0,
-                escape_xml(&clip(&fmt_num(v), r.w - 8.0))
+                escape_xml(&clip(&fmt_num(v), r.w - 8.0, 11.0, false))
             ));
         }
     }
+    out.push_str(&clip_label_to_rect(
+        r.x + 1.0,
+        r.y + 1.0,
+        r.w - 2.0,
+        r.h - 2.0,
+        &text,
+    ));
 }
 
 /// Truncate `s` with an ellipsis to fit `max_w` pixels (approx).
-fn clip(s: &str, max_w: f64) -> String {
-    if max_w < 8.0 {
-        return s.to_string();
-    }
-    measure::truncate_to_width(s, max_w)
+fn clip(s: &str, max_w: f64, font_size: f64, bold: bool) -> String {
+    measure::truncate_literal_to_width(s, max_w, font_size, bold)
 }
 
 fn fmt_num(v: f64) -> String {

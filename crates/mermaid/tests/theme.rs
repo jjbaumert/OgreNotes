@@ -13,6 +13,7 @@ fn contrast_edge_fixtures_match_the_renderer() {
         "contrast-treemap-short",
         "contrast-c4-long",
         "contrast-treemap-numbers",
+        "contrast-treemap-wide",
         "contrast-pie-palette",
     ]
     .into_iter()

@@ -316,5 +316,7 @@ renderer fixtures and the production CSS. It also checks quadrant edge labels,
 all C4 external tiers and shapes, small treemap cells, and pie rim/wedge
 contrast, including an empty pie. Long labels, narrow numeric cells, all
 pie colors and all treemap palette depths are renderer-backed fixtures.
+Wide Cyrillic labels, complete tags at their rendered font size, and paint
+bounds under different font metrics are also checked.
 No server is needed. The native
 renderer tests verify fixture freshness; Playwright CI runs the browser checks.

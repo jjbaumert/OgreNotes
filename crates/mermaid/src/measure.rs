@@ -72,6 +72,41 @@ pub(crate) fn truncate_to_width(s: &str, max_w: f64) -> String {
     format!("{}…", &s[..bounds[lo]])
 }
 
+/// Fit literal SVG text at its rendered font size. Wide non-ASCII glyphs get
+/// a conservative advance; unlike text_size, <br> is measured as literal text.
+pub(crate) fn truncate_literal_to_width(
+    text: &str,
+    max_width: f64,
+    font_size: f64,
+    bold: bool,
+) -> String {
+    if text.is_empty() || max_width <= 0.0 {
+        return String::new();
+    }
+    let weight = if bold { 14.0 / 13.0 } else { 1.0 };
+    let advance = |ch: char| {
+        let em = if ch.is_ascii() { char_w(ch) } else { 1.2 };
+        em * font_size * weight
+    };
+    if text.chars().map(&advance).sum::<f64>() <= max_width + 1e-6 {
+        return text.to_string();
+    }
+    let budget = max_width - advance('…');
+    if budget < 0.0 {
+        return String::new();
+    }
+    let (mut used, mut end) = (0.0, 0);
+    for (offset, ch) in text.char_indices() {
+        let next = used + advance(ch);
+        if next > budget {
+            break;
+        }
+        used = next;
+        end = offset + ch.len_utf8();
+    }
+    format!("{}…", &text[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,7 +9,7 @@
 //! out with the shared boxgraph adapter. Styling directives (`Update*`) are
 //! accepted and ignored.
 
-use crate::theme::DATA_TEXT;
+use crate::theme::{DATA_TEXT, clip_label_to_rect};
 use crate::{escape_xml, measure, ParseError};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -373,27 +373,62 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
         };
         // Person boxes leave room for a head.
         let mut ty = by + 16.0 + if e.shape == Shape::Person { 14.0 } else { 0.0 };
-        out.push_str(&format!(
-            r#"<text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" font-weight="700" fill="{name_text}">{}</text>"#,
-            escape_xml(&fit_element_label(&e.name, e.shape, bw, bh, ty - by, 13.0))
-        ));
+        out.push_str(
+            &fit_element_label(&e.name, e.shape, bw, bh, ty - by, 13.0, true)
+                .render(cx, by, ty, name_text, false),
+        );
         ty += LINE_H;
-        let tag = if e.external { format!("[{}]", e.kind.replace('_', " ")) } else { format!("[{}]", e.kind) };
-        out.push_str(&format!(
-            r#"<text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" font-size="11" font-style="italic" fill="{tag_text}">{}</text>"#,
-            escape_xml(&fit_element_label(&tag, e.shape, bw, bh, ty - by, 11.0))
-        ));
+        let tag = if e.external {
+            format!("[{}]", e.kind.replace('_', " "))
+        } else {
+            format!("[{}]", e.kind)
+        };
+        out.push_str(
+            &fit_element_label(&tag, e.shape, bw, bh, ty - by, 11.0, false)
+                .render(cx, by, ty, tag_text, true),
+        );
         for d in &e.descr {
             ty += LINE_H;
-            out.push_str(&format!(
-                r#"<text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" font-size="11" fill="{desc_text}">{}</text>"#,
-                escape_xml(&fit_element_label(d, e.shape, bw, bh, ty - by, 11.0))
-            ));
+            out.push_str(
+                &fit_element_label(d, e.shape, bw, bh, ty - by, 11.0, false)
+                    .render(cx, by, ty, desc_text, false),
+            );
         }
     }
 
     out.push_str("</svg>");
     Ok(out)
+}
+
+struct FittedLabel {
+    text: String,
+    width: f64,
+    top: f64,
+    bottom: f64,
+    font_size: f64,
+    bold: bool,
+}
+
+impl FittedLabel {
+    fn render(&self, cx: f64, by: f64, baseline: f64, color: &str, italic: bool) -> String {
+        if self.text.is_empty() {
+            return String::new();
+        }
+        let text = format!(
+            r#"<text x="{cx:.1}" y="{baseline:.1}" text-anchor="middle" font-size="{}" font-weight="{}" font-style="{}" fill="{color}">{}</text>"#,
+            self.font_size,
+            if self.bold { 700 } else { 400 },
+            if italic { "italic" } else { "normal" },
+            escape_xml(&self.text),
+        );
+        clip_label_to_rect(
+            cx - self.width / 2.0,
+            by + self.top,
+            self.width,
+            self.bottom - self.top,
+            &text,
+        )
+    }
 }
 
 /// Fit visible labels to the existing painted bounds, using the same ellipsis
@@ -405,10 +440,13 @@ fn fit_element_label(
     height: f64,
     baseline: f64,
     font_size: f64,
-) -> String {
+    bold: bool,
+) -> FittedLabel {
     // Reserve the full glyph band, including descenders. Curved shapes narrow
     // near their top and bottom, so use the narrowest cross-section in the band.
-    let edge_y = (baseline - font_size * 1.1).min(height - baseline - font_size * 0.3);
+    let top = (baseline - font_size * 1.1).max(if shape == Shape::Person { 16.0 } else { 0.0 });
+    let bottom = (baseline + font_size * 0.3).min(height);
+    let edge_y = top.min(height - bottom);
     let (rx, ry) = match shape {
         Shape::Queue => (width.min(height) / 2.0, height / 2.0),
         Shape::Db => (width / 2.0, 7.0),
@@ -421,10 +459,14 @@ fn fit_element_label(
         0.0
     };
     let available = (width - 2.0 * (inset + 4.0).max(14.0)).max(0.0);
-    if available < measure::text_size("…").0 {
-        return String::new();
+    FittedLabel {
+        text: measure::truncate_literal_to_width(text, available, font_size, bold),
+        width: available,
+        top,
+        bottom,
+        font_size,
+        bold,
     }
-    measure::truncate_to_width(text, available)
 }
 
 fn draw_shape(out: &mut String, shape: Shape, x: f64, y: f64, w: f64, h: f64, fill: &str) {
