@@ -325,11 +325,13 @@ Decorative underlays are excluded from selection and accessibility text.
 Treemap captions paint after all cells, preserving parent descenders.
 Thin pie labels are checked against rasterized background pixels, including
 wedge borders. Foreground checks catch backings covering adjacent percentages;
-architecture arrow tips stay visible. C4 fixtures cover SystemDb cap strokes.
+architecture arrow tips stay visible. Original architecture edges clear complete
+label glyphs, including wide interiors. C4 fixtures cover SystemDb cap strokes.
 Dense quadrant overlap runs text contrast and glyph-visibility checks along
 with checks for surviving marker color. Point positions stay unchanged; glyphs
 can obscure part of an overlapping marker. Caption overlaps receive a masked
 palette-colored ring so a fully covered dot retains a visible indicator.
+Point and ring masks also protect axis labels.
 Long names receive ellipses; C4 and
 treemap use an explicit Arial/Helvetica family for consistent viewer metrics.
 

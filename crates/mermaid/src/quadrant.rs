@@ -211,6 +211,7 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
         }
     }
 
+    let axis_start = body.len();
     // axis labels: x below (left/right ends), y on the left (bottom/top ends).
     if let Some((left, right)) = &c.x_axis {
         let ty = top + side + 16.0;
@@ -239,6 +240,14 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
             escape_xml(top_lbl)
         ));
     }
+
+    // Reuse the exact generated axis geometry, including rotated y labels.
+    // Label text is XML-escaped, so this paint-attribute substitution cannot
+    // change literal source text. Rings must clear axis glyphs as well.
+    holes.push_str(&body[axis_start..].replace(
+        "fill=\"currentColor\"",
+        "fill=\"#000\" stroke=\"#000\" stroke-width=\"3\"",
+    ));
 
     // Clear marker paint only at label glyphs, retaining the rest of each
     // marker. A thin expansion also clears antialiased glyph interiors.
