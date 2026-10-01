@@ -8,14 +8,14 @@ const args=process.argv.slice(2);
 const out=args.includes('--out')?args[args.indexOf('--out')+1]:'/tmp/ogrenotes-mermaid-contrast';
 fs.mkdirSync(out,{recursive:true});
 const {chromium}=require('playwright');
-const kinds=['treemap','pie','xy-chart','quadrant-chart','architecture','c4','quadrant-edges','pie-empty'];
+const kinds=['treemap','pie','xy-chart','quadrant-chart','architecture','c4','quadrant-edges','pie-empty','treemap-short'];
 (async()=>{
  const browser=await chromium.launch({headless:true,...(process.env.CHROME_BIN?{executablePath:process.env.CHROME_BIN}:{})});
- const page=await browser.newPage({viewport:{width:1800,height:1400}});
+ const page=await browser.newPage({viewport:{width:1800,height:2400}});
  let failed=false;
  try {
  for(const theme of ['light','dark']) for(const kind of kinds){
- const svg=fs.readFileSync(path.join(root,kind==='pie-empty'?'crates/mermaid/tests/fixtures/contrast-pie-empty.svg':kind==='quadrant-edges'?'crates/mermaid/tests/fixtures/contrast-quadrant-edges.svg':kind==='c4'?'crates/mermaid/tests/fixtures/contrast-c4.svg':`crates/mermaid/tests/golden/${kind}.svg`),'utf8');
+ const svg=fs.readFileSync(path.join(root,kind==='treemap-short'?'crates/mermaid/tests/fixtures/contrast-treemap-short.svg':kind==='pie-empty'?'crates/mermaid/tests/fixtures/contrast-pie-empty.svg':kind==='quadrant-edges'?'crates/mermaid/tests/fixtures/contrast-quadrant-edges.svg':kind==='c4'?'crates/mermaid/tests/fixtures/contrast-c4.svg':`crates/mermaid/tests/golden/${kind}.svg`),'utf8');
  const css=['frontend/style/tokens-light.css','frontend/style/tokens-dark.css'].map(p=>fs.readFileSync(path.join(root,p),'utf8')).join('\n');
  await page.setContent(`<html data-theme="${theme}"><style>${css}\nbody{color:var(--color-text);background:var(--color-surface);margin:20px}svg{display:block}</style>${svg}</html>`);
  const tokens=await page.evaluate(()=>{

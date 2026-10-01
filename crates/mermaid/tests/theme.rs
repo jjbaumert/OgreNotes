@@ -10,6 +10,7 @@ fn contrast_edge_fixtures_match_the_renderer() {
         "contrast-c4",
         "contrast-quadrant-edges",
         "contrast-pie-empty",
+        "contrast-treemap-short",
     ] {
         let source = std::fs::read_to_string(root.join(format!("{name}.mmd"))).unwrap();
         let svg = ogrenotes_mermaid::render(&source)

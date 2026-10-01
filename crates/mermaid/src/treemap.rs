@@ -235,7 +235,8 @@ fn layout_level(nodes: &[Node], rect: Rect, depth: usize, out: &mut String) {
 }
 
 fn draw_header_label(node: &Node, r: Rect, out: &mut String) {
-    if r.w < 24.0 {
+    // Match leaf labels: omit text when its cell cannot contain it.
+    if r.w < 24.0 || r.h < HEADER_H {
         return;
     }
     out.push_str(&format!(

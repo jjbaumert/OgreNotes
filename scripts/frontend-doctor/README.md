@@ -313,6 +313,7 @@ It purges its test document and runs in the Playwright CI workflow.
 `node test-mermaid-contrast.cjs --out /tmp/mermaid-contrast` measures browser
 foreground/background contrast for six diagram kinds in both themes, using
 renderer fixtures and the production CSS. It also checks quadrant edge labels,
-external-person names, and pie rim/wedge contrast, including an empty pie.
+all C4 external tiers and shapes, small treemap cells, and pie rim/wedge
+contrast, including an empty pie.
 No server is needed. The native
 renderer tests verify fixture freshness; Playwright CI runs the browser checks.
