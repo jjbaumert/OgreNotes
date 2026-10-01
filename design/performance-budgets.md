@@ -83,7 +83,7 @@ Measured by the M-P9 piece B CI job: `trunk build --release`,
 
 | Asset | Aspirational budget | Current baseline (2026-06-04) | CI gate threshold |
 |---|---|---|---|
-| `ogrenotes-frontend_bg.wasm` (gzipped) | **800 KB** | **~1.80 MB** (last measured PR #182, 2026-08-01; was ~1.66 MB on 2026-07-10) | Fail PR if > **~1.91 MiB** (2,005,000 B) |
+| `ogrenotes-frontend_bg.wasm` (gzipped) | **800 KB** | **~1.80 MB** (last measured PR #182, 2026-08-01; was ~1.66 MB on 2026-07-10) | Fail PR if > **~2.29 MiB** (2,406,000 B) |
 | `ogrenotes-frontend.js` glue (gzipped) | 100 KB | 12 KB | Tracked, no gate |
 | Total app shell (HTML + CSS + WASM + glue, gzipped) | 1 MB | ~1.20 MB | Tracked, no gate |
 
@@ -102,6 +102,12 @@ gate is what we have. Two independent disciplines come out of this:
   regex compiles, evaluate `wasm-snip` for unreachable panics,
   lazy-load the spreadsheet engine out of the document bundle)
   closes the gap between baseline and aspirational budget.
+
+> **2026-10-01 budget increase.** At the owner's request, the CI gate
+> increased exactly 20%, from 2,005,000 B to **2,406,000 B**. The
+> Mermaid contrast branch measured 2,005,992 B with Rust 1.98.1 and
+> the production build profile before this increase. The release
+> profile and aspirational budget remain unchanged.
 
 > **2026-08-01 re-baseline (doc-noted bump).** The gate was raised
 > from ~1.76 MiB (1,850,000 B) to **~1.91 MiB (2,005,000 B)**. The
