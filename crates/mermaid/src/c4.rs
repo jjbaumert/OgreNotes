@@ -399,7 +399,8 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
 fn draw_shape(out: &mut String, shape: Shape, x: f64, y: f64, w: f64, h: f64, fill: &str) {
     match shape {
         Shape::Person => {
-            // head circle + rounded body box.
+            // Head circle + rounded body box. Back the full name ascent,
+            // including glyphs extending above the old y + 22 body edge.
             let hr = 11.0;
             out.push_str(&format!(
                 r#"<circle cx="{:.1}" cy="{:.1}" r="{hr}" fill="{fill}"/>"#,
@@ -408,8 +409,8 @@ fn draw_shape(out: &mut String, shape: Shape, x: f64, y: f64, w: f64, h: f64, fi
             ));
             out.push_str(&format!(
                 r#"<rect x="{x:.1}" y="{:.1}" width="{w:.1}" height="{:.1}" fill="{fill}" rx="8"/>"#,
-                y + 2.0 * hr,
-                h - 2.0 * hr
+                y + 2.0 * hr - 6.0,
+                h - 2.0 * hr + 6.0
             ));
         }
         Shape::Db => {

@@ -175,7 +175,7 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
     // All-zero (or all-sub-1%): an empty outlined circle so the area isn't blank.
     if shown_total == 0.0 {
         svg.push_str(&format!(
-            r#"<circle cx="{CX}" cy="{CY}" r="{R}" fill="none" stroke="{DATA_STROKE}" stroke-width="2"/>"#
+            r#"<circle cx="{CX}" cy="{CY}" r="{R}" fill="none" stroke="currentColor" stroke-width="2"/>"#
         ));
     }
 

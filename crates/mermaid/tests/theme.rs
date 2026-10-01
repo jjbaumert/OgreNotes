@@ -6,7 +6,11 @@ use std::process::Command;
 #[test]
 fn contrast_edge_fixtures_match_the_renderer() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    for name in ["contrast-c4", "contrast-quadrant-edges"] {
+    for name in [
+        "contrast-c4",
+        "contrast-quadrant-edges",
+        "contrast-pie-empty",
+    ] {
         let source = std::fs::read_to_string(root.join(format!("{name}.mmd"))).unwrap();
         let svg = ogrenotes_mermaid::render(&source)
             .svg
