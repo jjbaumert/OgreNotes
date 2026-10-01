@@ -362,6 +362,8 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
     }
 
     // element boxes.
+    let mut label_backings = String::new();
+    let mut label_foregrounds = String::new();
     for (i, e) in c4.els.iter().enumerate() {
         let (cx, cy) = l.node_centers[i];
         let cy = cy + dy;
@@ -378,7 +380,7 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
         // Person boxes leave room for a head.
         let mut ty = by + 16.0 + if e.shape == Shape::Person { 14.0 } else { 0.0 };
         fit_element_label(&e.name, bw, 13.0, true).render(
-            &mut out,
+            (&mut label_backings, &mut label_foregrounds),
             (cx, ty),
             name_text,
             false,
@@ -390,11 +392,17 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
         } else {
             format!("[{}]", e.kind)
         };
-        fit_element_label(&tag, bw, 11.0, false).render(&mut out, (cx, ty), tag_text, true, fill);
+        fit_element_label(&tag, bw, 11.0, false).render(
+            (&mut label_backings, &mut label_foregrounds),
+            (cx, ty),
+            tag_text,
+            true,
+            fill,
+        );
         for d in &e.descr {
             ty += LINE_H;
             fit_element_label(d, bw, 11.0, false).render(
-                &mut out,
+                (&mut label_backings, &mut label_foregrounds),
                 (cx, ty),
                 desc_text,
                 false,
@@ -403,6 +411,9 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
         }
     }
 
+    // Back every glyph before painting any foreground caption.
+    out.push_str(&label_backings);
+    out.push_str(&label_foregrounds);
     out.push_str("</svg>");
     Ok(out)
 }
@@ -416,7 +427,7 @@ struct FittedLabel {
 impl FittedLabel {
     fn render(
         &self,
-        out: &mut String,
+        out: (&mut String, &mut String),
         position: (f64, f64),
         color: &str,
         italic: bool,
@@ -426,15 +437,25 @@ impl FittedLabel {
             return;
         }
         let (cx, baseline) = position;
-        // Back actual glyphs rather than clipping heuristic font bands.
-        // This also protects names over narrow queue/database caps.
-        write!(out,
-            r#"<text x="{cx:.1}" y="{baseline:.1}" text-anchor="middle" font-size="{}" font-weight="{}" font-style="{}" fill="{color}" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke">{}</text>"#,
+        // A filled underlay protects wide glyph interiors outside narrow
+        // queue/database caps. An outline alone leaves those interiors bare.
+        let (backing, foreground) = out;
+        for (out, color, extra) in [
+            (
+                backing,
+                background,
+                r#" data-label-underlay="true" aria-hidden="true" pointer-events="none" style="user-select:none""#,
+            ),
+            (foreground, color, ""),
+        ] {
+            write!(out,
+            r#"<text x="{cx:.1}" y="{baseline:.1}" text-anchor="middle" font-size="{}" font-weight="{}" font-style="{}" fill="{color}" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke"{extra}>{}</text>"#,
             self.font_size,
             if self.bold { 700 } else { 400 },
             if italic { "italic" } else { "normal" },
             escape_xml(&self.text),
         ).unwrap();
+        }
     }
 }
 

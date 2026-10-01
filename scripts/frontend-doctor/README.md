@@ -319,7 +319,10 @@ pie colors and all treemap palette depths are renderer-backed fixtures.
 Wide Cyrillic, Greek, Hangul and Indic names, complete Arabic and fitting Latin
 names, tags and fallback-font captions are also checked. Tall C4 queues retain their identifying names.
 Palette-matched glyph halos protect captions without clipping differing font
-metrics. Treemap captions paint after all cells, preserving parent descenders.
+metrics. C4 captions also receive filled glyph underlays, painted before all
+foreground labels, to protect wide interiors outside rounded queue caps.
+Decorative underlays are excluded from selection and accessibility text.
+Treemap captions paint after all cells, preserving parent descenders.
 Thin pie labels are checked against rasterized background pixels, including
 wedge borders. Foreground checks catch backings covering adjacent percentages;
 architecture arrow tips stay visible. C4 fixtures cover SystemDb cap strokes.

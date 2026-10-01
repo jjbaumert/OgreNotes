@@ -26,6 +26,7 @@ const cases = [
     "c4-fallback",
     "c4-indic",
     "c4-tall-queue",
+    "c4-tall-wide",
     "treemap-fallback-leaf",
     "treemap-fallback-header",
     "architecture-accent",
@@ -92,12 +93,16 @@ function raster(svg, filename) {
         const variants = await page.evaluate(() => {
           const root = document.querySelector("svg");
           const texts = [...root.querySelectorAll("text")].filter(
-            (t) => t.textContent.trim() && !t.closest("defs"),
+            (t) =>
+              t.textContent.trim() &&
+              !t.closest("defs") &&
+              !t.hasAttribute("data-label-underlay"),
           );
           const xml = (e) => new XMLSerializer().serializeToString(e);
           const bg = root.cloneNode(true);
           bg.querySelectorAll("text").forEach((t) => {
-            if (t.closest("defs")) return;
+            if (t.closest("defs") || t.hasAttribute("data-label-underlay"))
+              return;
             if (t.getAttribute("stroke") && t.getAttribute("stroke") !== "none")
               t.setAttribute("fill", "none");
             else t.remove();
@@ -144,8 +149,16 @@ function raster(svg, filename) {
               mask
                 .querySelectorAll("marker")
                 .forEach((e) => e.setAttribute("display", "none"));
+              mask
+                .querySelectorAll("text[data-label-underlay]")
+                .forEach((t) => t.setAttribute("visibility", "hidden"));
               [...mask.querySelectorAll("text")]
-                .filter((t) => t.textContent.trim() && !t.closest("defs"))
+                .filter(
+                  (t) =>
+                    t.textContent.trim() &&
+                    !t.closest("defs") &&
+                    !t.hasAttribute("data-label-underlay"),
+                )
                 .forEach((t, i) => {
                   if (i !== index) t.setAttribute("visibility", "hidden");
                   else {

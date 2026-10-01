@@ -32,6 +32,7 @@ const kinds = [
   "c4-fallback",
   "c4-indic",
   "c4-tall-queue",
+  "c4-tall-wide",
   "treemap-fallback-leaf",
   "treemap-fallback-header",
   "architecture-accent",
@@ -76,6 +77,7 @@ const kinds = [
           "c4-fallback",
           "c4-indic",
           "c4-tall-queue",
+          "c4-tall-wide",
           "treemap-fallback-leaf",
           "treemap-fallback-header",
           "architecture-accent",
@@ -258,7 +260,12 @@ const kinds = [
               .reduce((s, x, i) => s + x * [0.2126, 0.7152, 0.0722][i], 0);
           const bg = rgb(getComputedStyle(document.body).backgroundColor);
           return [...document.querySelectorAll("svg text")]
-            .filter((t) => t.textContent.trim() && !t.closest("defs"))
+            .filter(
+              (t) =>
+                t.textContent.trim() &&
+                !t.closest("defs") &&
+                !t.hasAttribute("data-label-underlay"),
+            )
             .flatMap((t) => {
               const box = t.getBoundingClientRect();
               return [0.1, 0.5, 0.9].flatMap((fx) =>
@@ -512,7 +519,11 @@ const kinds = [
                   .forEach((e) => (e.style.display = "none"));
                 const ink = await render();
                 clone.querySelectorAll("text").forEach((e) => {
-                  if (e.closest("defs")) return;
+                  if (
+                    e.closest("defs") ||
+                    e.hasAttribute("data-label-underlay")
+                  )
+                    return;
                   // Keep a glyph halo as background paint while removing its
                   // foreground fill. Rectangular backings remain untouched.
                   if (
@@ -538,7 +549,12 @@ const kinds = [
                 results.push(
                   ...(await Promise.all(
                     [...root.querySelectorAll("text")]
-                      .filter((t) => t.textContent.trim() && !t.closest("defs"))
+                      .filter(
+                        (t) =>
+                          t.textContent.trim() &&
+                          !t.closest("defs") &&
+                          !t.hasAttribute("data-label-underlay"),
+                      )
                       .map(async (t) => {
                         // Isolate this label. A combined mask can mistake a
                         // neighboring label's ink for an invisible label's glyphs.
@@ -683,6 +699,26 @@ const kinds = [
               ),
             "Glyphs must remain visible and contrast with actual background pixels, including borders",
           );
+          if (kind === "c4-tall-wide") {
+            await page
+              .locator("svg text:not([data-label-underlay])")
+              .first()
+              .evaluate((e) => (e.style.visibility = "hidden"));
+            const missing = await measure();
+            assert(
+              missing.some(
+                (p) => p.text === "████████" && p.visibleFraction < 0.99,
+              ),
+              "A decorative underlay must not pass for a visible foreground caption",
+            );
+            console.log(
+              JSON.stringify({ theme, kind, hiddenCaptionDetected: true }),
+            );
+            await page
+              .locator("svg text:not([data-label-underlay])")
+              .first()
+              .evaluate((e) => (e.style.visibility = ""));
+          }
           if (kind === "pie-adjacent") {
             await page.evaluate(() => {
               [...document.querySelectorAll("svg text")]
@@ -705,14 +741,18 @@ const kinds = [
           }
         }
         if (kind === "treemap-wide-m") {
-          const labels = await page.locator("svg text").allTextContents();
+          const labels = await page
+            .locator("svg text:not([data-label-underlay])")
+            .allTextContents();
           assert(
             labels.filter((t) => t.includes("М")).every((t) => t.endsWith("…")),
             "Overflowing wide Cyrillic names must have an ellipsis",
           );
         }
         if (kind === "c4") {
-          const labels = await page.locator("svg text").allTextContents();
+          const labels = await page
+            .locator("svg text:not([data-label-underlay])")
+            .allTextContents();
           assert(
             labels.includes("[ContainerDb]") &&
               labels.includes("[ContainerQueue]") &&
@@ -720,24 +760,30 @@ const kinds = [
             "Database and queue tags that fit must remain complete",
           );
         }
-        if (kind === "c4-tall-queue") {
-          const labels = await page.locator("svg text").allTextContents();
+        if (kind === "c4-tall-queue" || kind === "c4-tall-wide") {
+          const labels = await page
+            .locator("svg text:not([data-label-underlay])")
+            .allTextContents();
           assert(
-            labels.includes("Queue"),
+            labels.includes(kind === "c4-tall-wide" ? "████████" : "Queue"),
             "Tall queues retain their identifying name",
           );
           assert.equal(labels.filter((label) => label === "line").length, 30);
         }
         if (kind === "c4-fitting") {
           assert(
-            (await page.locator("svg text").allTextContents()).includes(
-              "Message broker",
-            ),
+            (
+              await page
+                .locator("svg text:not([data-label-underlay])")
+                .allTextContents()
+            ).includes("Message broker"),
             "Names that fit retain their identifying text",
           );
         }
         if (kind === "c4-arabic") {
-          const labels = await page.locator("svg text").allTextContents();
+          const labels = await page
+            .locator("svg text:not([data-label-underlay])")
+            .allTextContents();
           assert(
             labels.includes("السلام عليكم"),
             "Short Arabic names that fit remain complete",
@@ -750,14 +796,18 @@ const kinds = [
           );
         }
         if (kind.startsWith("treemap-fallback")) {
-          const labels = await page.locator("svg text").allTextContents();
+          const labels = await page
+            .locator("svg text:not([data-label-underlay])")
+            .allTextContents();
           assert(
             labels.includes("မြန်မာ"),
             "Short fallback captions remain complete",
           );
         }
         if (kind === "c4-indic") {
-          const labels = await page.locator("svg text").allTextContents();
+          const labels = await page
+            .locator("svg text:not([data-label-underlay])")
+            .allTextContents();
           assert(labels.includes("क्‍ष"));
           assert(
             labels.some(
@@ -766,7 +816,9 @@ const kinds = [
           );
         }
         if (kind === "c4-fallback") {
-          const labels = await page.locator("svg text").allTextContents();
+          const labels = await page
+            .locator("svg text:not([data-label-underlay])")
+            .allTextContents();
           assert(labels.includes("မြန်မာ") && labels.includes("ДΩ"));
           assert(
             labels.some(
@@ -780,7 +832,9 @@ const kinds = [
           );
         }
         if (kind === "c4-hangul") {
-          const labels = await page.locator("svg text").allTextContents();
+          const labels = await page
+            .locator("svg text:not([data-label-underlay])")
+            .allTextContents();
           assert(
             labels.includes("가가") && labels.includes("가가"),
             "Short composed and decomposed Hangul names must remain complete",
@@ -791,7 +845,9 @@ const kinds = [
           );
         }
         if (kind === "c4-unicode") {
-          const labels = await page.locator("svg text").allTextContents();
+          const labels = await page
+            .locator("svg text:not([data-label-underlay])")
+            .allTextContents();
           for (const label of ["éééééé", "éééééé"]) {
             assert(
               labels.includes(label),

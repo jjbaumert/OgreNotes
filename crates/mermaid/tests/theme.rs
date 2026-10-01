@@ -12,6 +12,7 @@ fn contrast_edge_fixtures_match_the_renderer() {
         "contrast-c4-fallback",
         "contrast-c4-indic",
         "contrast-c4-tall-queue",
+        "contrast-c4-tall-wide",
         "contrast-treemap-fallback-leaf",
         "contrast-treemap-fallback-header",
         "contrast-architecture-accent",
