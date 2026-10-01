@@ -347,8 +347,9 @@ ImageMagick's built-in SVG decoder drops labels from these diagrams. Output reta
 The test invokes the actual CLI for SVG and PNG in both themes, then checks
 rasterized glyph visibility and contrast across all six diagram kinds and
 long, Unicode and border fixtures. Glyph and background masks use the same
-PNG renderer, so differences
-in browser font selection and clipped glyphs cannot hide failures.
+PNG renderer to detect obscured text independently of browser font selection.
+Coverage is measured inside the export viewport. Existing diagram layout
+and outer-viewport clipping are unchanged.
 
 For the ImageMagick fallback, run `python3 configure-mermaid-imagemagick.py
 /tmp/mermaid-imagemagick`, then set `MAGICK_CONFIGURE_PATH` to its `config`

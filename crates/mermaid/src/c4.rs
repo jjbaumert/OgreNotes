@@ -417,11 +417,8 @@ impl FittedLabel {
         }
         // Back actual glyphs rather than clipping heuristic font bands.
         // This also protects names over narrow queue/database caps.
-        let halo = format!(
-            r#" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke""#
-        );
         format!(
-            r#"<text x="{cx:.1}" y="{baseline:.1}" text-anchor="middle" font-size="{}" font-weight="{}" font-style="{}" fill="{color}"{halo}>{}</text>"#,
+            r#"<text x="{cx:.1}" y="{baseline:.1}" text-anchor="middle" font-size="{}" font-weight="{}" font-style="{}" fill="{color}" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke">{}</text>"#,
             self.font_size,
             if self.bold { 700 } else { 400 },
             if italic { "italic" } else { "normal" },

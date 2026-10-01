@@ -132,6 +132,8 @@ fn base_advance(base: char) -> f64 {
     }
 }
 
+// Share the Unicode lookup path instead of duplicating it at fitting sites.
+#[inline(never)]
 fn literal_advance(grapheme: &str, font_size: f64, bold: bool) -> f64 {
     let weight = if bold { 1.04 } else { 1.0 };
     // Ordinary grapheme clusters can contain multiple advancing letters
@@ -159,13 +161,6 @@ fn literal_advance(grapheme: &str, font_size: f64, bold: bool) -> f64 {
     em * font_size * weight
 }
 
-/// Width of literal text, without interpreting break markup.
-pub(crate) fn literal_text_width(text: &str, font_size: f64, bold: bool) -> f64 {
-    text.graphemes(true)
-        .map(|g| literal_advance(g, font_size, bold))
-        .sum()
-}
-
 /// Fit literal SVG text at its rendered font size, preserving grapheme clusters.
 /// Accents use their base glyph's advance; wide letters and scripts get wider
 /// estimates. Unlike text_size, <br> is literal text. Callers back label glyphs with palette halos
@@ -180,21 +175,24 @@ pub(crate) fn truncate_literal_to_width(
         return String::new();
     }
     let advance = |grapheme: &str| literal_advance(grapheme, font_size, bold);
-    if literal_text_width(text, font_size, bold) <= max_width + 1e-6 {
+    let budget = max_width - advance("…");
+    let (mut total, mut end, mut fitting) = (0.0, 0, true);
+    // Measure the full label and its fitting prefix together. Keep checking
+    // the full width after the prefix fills: an untruncated label may fit
+    // even when there is no room for the additional ellipsis.
+    for grapheme in text.graphemes(true) {
+        total += advance(grapheme);
+        if fitting && total <= budget {
+            end += grapheme.len();
+        } else {
+            fitting = false;
+        }
+    }
+    if total <= max_width + 1e-6 {
         return text.to_string();
     }
-    let budget = max_width - advance("…");
     if budget < 0.0 {
         return String::new();
-    }
-    let (mut used, mut end) = (0.0, 0);
-    for (offset, grapheme) in text.grapheme_indices(true) {
-        let next = used + advance(grapheme);
-        if next > budget {
-            break;
-        }
-        used = next;
-        end = offset + grapheme.len();
     }
     format!("{}…", &text[..end])
 }
