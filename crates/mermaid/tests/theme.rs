@@ -14,6 +14,8 @@ fn contrast_edge_fixtures_match_the_renderer() {
         "contrast-quadrant-marker-overlap",
         "contrast-pie-empty",
         "contrast-treemap-short",
+        "contrast-treemap-leaf-short",
+        "contrast-treemap-wide-m",
         "contrast-c4-long",
         "contrast-c4-unicode",
         "contrast-treemap-numbers",

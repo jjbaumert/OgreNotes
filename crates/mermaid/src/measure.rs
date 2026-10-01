@@ -86,8 +86,8 @@ fn literal_advance(grapheme: &str, font_size: f64, bold: bool) -> f64 {
                 return;
             }
             let width = match base {
-                'Ш' | 'Щ' | 'Ж' | 'Ю' | 'Ы' | 'Ф' | 'ш' | 'щ' | 'ж' | 'ю' | 'ы' | 'ф' | 'Æ'
-                | 'æ' | 'Œ' | 'œ' | '…' => 1.05,
+                'М' | 'Ш' | 'Щ' | 'Ж' | 'Ю' | 'Ы' | 'Ф' | 'ш' | 'щ' | 'ж' | 'ю' | 'ы' | 'ф'
+                | 'Æ' | 'æ' | 'Œ' | 'œ' | '…' => 1.05,
                 // Advances for the renderer's sans-serif labels. Layout's
                 // generously padded char_w table is unsuitable for fitting:
                 // it needlessly drops suffixes from ordinary uppercase names.

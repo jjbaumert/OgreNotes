@@ -260,9 +260,12 @@ fn draw_leaf_label(node: &Node, r: Rect, out: &mut String) {
     }
     let cx = r.x + r.w / 2.0;
     let cy = r.y + r.h / 2.0;
+    // With no numeric line, center the complete glyph band in short cells.
+    let two_lines = node.value.is_some() && r.h > 34.0;
+    let name_baseline = if two_lines { cy - 2.0 } else { cy + 4.0 };
     let mut text = format!(
         r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="{DATA_TEXT}">{}</text>"#,
-        cy - 2.0,
+        name_baseline,
         escape_xml(&clip(&node.name, r.w - 8.0, 13.0, false))
     );
     if let Some(v) = node.value {

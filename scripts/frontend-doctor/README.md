@@ -323,7 +323,10 @@ background pixels, including wedge borders. Rendered foreground checks catch
 backings covering adjacent percentages; architecture arrow tips stay visible.
 Both C4 fixtures cover SystemDb cap strokes. Literal quadrant labels cross plot
 strokes without losing contrast. A separate marker regression covers existing
-dense label/point overlap without changing their positions.
+dense label/point overlap without changing their positions. Expected glyph
+masks disable label clipping, so cropped text cannot pass as fully visible.
+Short leaf cells retain the complete glyph band; overflowing Cyrillic names
+receive ellipses.
 No server is needed. The native
 renderer tests verify fixture freshness; Playwright CI runs the browser checks.
 
@@ -339,4 +342,5 @@ labels from these diagrams. Output retains the previous 2x pixel dimensions.
 The test invokes the actual CLI for SVG and PNG in both themes, then checks
 rasterized glyph visibility and contrast across all six diagram kinds and
 long, Unicode and border fixtures. Glyph and background masks use the same
-PNG renderer, so differences in browser font selection cannot hide failures.
+PNG renderer, with label clipping disabled in expected masks, so differences
+in browser font selection and clipped glyphs cannot hide failures.

@@ -23,6 +23,8 @@ const cases = [
     "c4-unicode",
     "treemap-wide",
     "treemap-numbers",
+    "treemap-leaf-short",
+    "treemap-wide-m",
     "pie-thin",
     "quadrant-wide",
     "quadrant-literal",
@@ -74,6 +76,12 @@ function raster(svg, filename) {
             background: xml(bg),
             labels: texts.map((text, index) => {
               const mask = root.cloneNode(true);
+              // Do not let the expected mask repeat a clipping defect.
+              mask
+                .querySelectorAll("svg")
+                .forEach((e) =>
+                  e.style.setProperty("overflow", "visible", "important"),
+                );
               mask
                 .querySelectorAll(
                   "rect,path,circle,ellipse,line,polyline,polygon,use,image",
@@ -195,7 +203,7 @@ function raster(svg, filename) {
         for (const result of results) {
           assert(result.count > 0, `${name}: no glyphs for ${result.text}`);
           assert(
-            result.visibleFraction >= 0.9,
+            result.visibleFraction >= 0.99,
             `${name}: missing label ${JSON.stringify(result)}`,
           );
           assert(

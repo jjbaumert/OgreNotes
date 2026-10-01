@@ -23,6 +23,8 @@ const kinds = [
   "quadrant-marker-overlap",
   "pie-empty",
   "treemap-short",
+  "treemap-leaf-short",
+  "treemap-wide-m",
   "c4-long",
   "c4-unicode",
   "treemap-numbers",
@@ -54,6 +56,8 @@ const kinds = [
           "quadrant-marker-overlap",
           "pie-empty",
           "treemap-short",
+          "treemap-leaf-short",
+          "treemap-wide-m",
           "c4-long",
           "c4-unicode",
           "treemap-numbers",
@@ -429,6 +433,12 @@ const kinds = [
               // A glyph-only mask excludes strokes that happen to have the
               // same color as text within its bounding box.
               const mask = clone.cloneNode(true);
+              // Expected glyphs must include paint outside clipping viewports.
+              mask
+                .querySelectorAll("svg")
+                .forEach((e) =>
+                  e.style.setProperty("overflow", "visible", "important"),
+                );
               mask
                 .querySelectorAll(
                   "rect,path,circle,ellipse,line,polyline,polygon,use,image",
@@ -577,7 +587,7 @@ const kinds = [
             pixels.length > 0 &&
               pixels.every(
                 (p) =>
-                  p.count > 0 && p.contrast >= 4.5 && p.visibleFraction >= 0.9,
+                  p.count > 0 && p.contrast >= 4.5 && p.visibleFraction >= 0.99,
               ),
             "Glyphs must remain visible and contrast with actual background pixels, including borders",
           );
@@ -622,6 +632,13 @@ const kinds = [
               clipping.escaped &&
               !clipping.kept,
             "Different font metrics must remain inside their painted bounds",
+          );
+        }
+        if (kind === "treemap-wide-m") {
+          const labels = await page.locator("svg text").allTextContents();
+          assert(
+            labels.filter((t) => t.includes("М")).every((t) => t.endsWith("…")),
+            "Overflowing wide Cyrillic names must have an ellipsis",
           );
         }
         if (kind === "c4") {
