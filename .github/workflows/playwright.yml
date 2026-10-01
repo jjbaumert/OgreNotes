@@ -107,7 +107,7 @@ jobs:
           sudo apt-get install -y \
             pkg-config libssl-dev \
             libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
-            clang libclang-dev
+            clang libclang-dev librsvg2-bin
 
       # ─── Toolchain ────────────────────────────────────────────
       - name: Install Rust (stable + wasm32)
@@ -886,6 +886,11 @@ jobs:
 
       - name: Verify Mermaid rendered fixture freshness
         run: cargo test -p ogrenotes-mermaid --test golden --test theme --locked
+
+      - name: Run Mermaid CLI PNG regression
+        working-directory: scripts/frontend-doctor
+        run: |
+          node test-mermaid-png.cjs --out ../../artifacts/doctor/mermaid-png
 
       - name: Run Mermaid rendered contrast regression
         if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')

@@ -1,0 +1,213 @@
+// Copyright (c) 2026 Joel Baumert. All Rights Reserved.
+// Exercise the actual CLI PNG path, with renderer-matched glyph/background masks.
+const fs = require("node:fs");
+const path = require("node:path");
+const assert = require("node:assert/strict");
+const { execFileSync } = require("node:child_process");
+const { chromium } = require("playwright");
+const root = path.resolve(__dirname, "../..");
+const outputIndex = process.argv.indexOf("--out");
+const out = path.resolve(
+  outputIndex >= 0 ? process.argv[outputIndex + 1] : "/tmp/mermaid-png",
+);
+fs.mkdirSync(out, { recursive: true });
+const cli =
+  process.env.MERMAID_CLI || path.join(root, "target/debug/mermaid_cli");
+const cases = [
+  ...["treemap", "pie", "xy-chart", "quadrant-chart", "architecture", "c4"].map(
+    (x) => `golden/${x}`,
+  ),
+  ...[
+    "c4",
+    "c4-long",
+    "c4-unicode",
+    "treemap-wide",
+    "treemap-numbers",
+    "pie-thin",
+    "quadrant-wide",
+    "quadrant-literal",
+  ].map((x) => `fixtures/contrast-${x}`),
+];
+function raster(svg, filename) {
+  execFileSync(
+    "rsvg-convert",
+    ["--dpi-x", "192", "--dpi-y", "192", "--zoom", "2", "--output", filename],
+    { input: svg },
+  );
+  return (
+    "data:image/png;base64," + fs.readFileSync(filename).toString("base64")
+  );
+}
+(async () => {
+  const browser = await chromium.launch({
+    headless: true,
+    ...(process.env.CHROME_BIN
+      ? { executablePath: process.env.CHROME_BIN }
+      : {}),
+  });
+  const page = await browser.newPage();
+  try {
+    for (const theme of ["light", "dark"])
+      for (const input of cases) {
+        const name = theme + "-" + path.basename(input),
+          base = path.join(out, name);
+        const source = path.join(root, "crates/mermaid/tests", input + ".mmd");
+        const svg = execFileSync(cli, ["--theme", theme, source], {
+          encoding: "utf8",
+        });
+        execFileSync(cli, ["--theme", theme, source, "--out", base + ".png"]);
+        await page.setContent(svg);
+        const variants = await page.evaluate(() => {
+          const root = document.querySelector("svg");
+          const texts = [...root.querySelectorAll("text")].filter(
+            (t) => t.textContent.trim() && !t.closest("defs"),
+          );
+          const xml = (e) => new XMLSerializer().serializeToString(e);
+          const bg = root.cloneNode(true);
+          bg.querySelectorAll("text").forEach((t) => {
+            if (t.closest("defs")) return;
+            if (t.getAttribute("stroke") && t.getAttribute("stroke") !== "none")
+              t.setAttribute("fill", "none");
+            else t.remove();
+          });
+          return {
+            background: xml(bg),
+            labels: texts.map((text, index) => {
+              const mask = root.cloneNode(true);
+              mask
+                .querySelectorAll(
+                  "rect,path,circle,ellipse,line,polyline,polygon,use,image",
+                )
+                .forEach((e) => {
+                  if (!e.closest("defs"))
+                    e.setAttribute("visibility", "hidden");
+                });
+              mask
+                .querySelectorAll("marker")
+                .forEach((e) => e.setAttribute("display", "none"));
+              [...mask.querySelectorAll("text")]
+                .filter((t) => t.textContent.trim() && !t.closest("defs"))
+                .forEach((t, i) => {
+                  if (i !== index) t.setAttribute("visibility", "hidden");
+                  else {
+                    t.setAttribute("fill", "#000");
+                    t.setAttribute("stroke", "none");
+                    t.removeAttribute("opacity");
+                    t.removeAttribute("fill-opacity");
+                  }
+                });
+              return {
+                text: text.textContent,
+                fill: getComputedStyle(text).fill,
+                opacity: +getComputedStyle(text).opacity,
+                svg: xml(mask),
+              };
+            }),
+          };
+        });
+        const ink =
+          "data:image/png;base64," +
+          fs.readFileSync(base + ".png").toString("base64");
+        const background = raster(
+          variants.background,
+          base + "-background.png",
+        );
+        const labels = variants.labels.map((label, i) => ({
+          ...label,
+          mask: raster(label.svg, base + `-mask-${i}.png`),
+        }));
+        const results = await page.evaluate(
+          async ({ ink, background, labels }) => {
+            async function decode(src) {
+              const image = new Image();
+              image.src = src;
+              await image.decode();
+              const canvas = document.createElement("canvas");
+              canvas.width = image.width;
+              canvas.height = image.height;
+              const ctx = canvas.getContext("2d");
+              ctx.drawImage(image, 0, 0);
+              return {
+                width: image.width,
+                height: image.height,
+                pixels: ctx.getImageData(0, 0, image.width, image.height).data,
+              };
+            }
+            const actual = await decode(ink),
+              bg = await decode(background);
+            const lum = (c) =>
+              c
+                .map((v) => {
+                  v /= 255;
+                  return v <= 0.04045
+                    ? v / 12.92
+                    : ((v + 0.055) / 1.055) ** 2.4;
+                })
+                .reduce((s, v, i) => s + v * [0.2126, 0.7152, 0.0722][i], 0);
+            const results = [];
+            for (const label of labels) {
+              const mask = await decode(label.mask);
+              if (
+                mask.width !== actual.width ||
+                mask.height !== actual.height ||
+                bg.width !== actual.width ||
+                bg.height !== actual.height
+              )
+                throw new Error("Raster dimensions disagree");
+              const color = label.fill
+                .match(/[\d.]+/g)
+                .slice(0, 3)
+                .map(Number);
+              let count = 0,
+                visible = 0,
+                contrast = Infinity;
+              for (let o = 0; o < mask.pixels.length; o += 4) {
+                if (mask.pixels[o + 3] < 200) continue;
+                count++;
+                const behind = [...bg.pixels.slice(o, o + 3)];
+                const delta = color.map(
+                  (v, i) => (v - behind[i]) * label.opacity,
+                );
+                const norm = delta.reduce((s, v) => s + v * v, 0);
+                const contribution = norm
+                  ? delta.reduce(
+                      (s, v, i) => s + v * (actual.pixels[o + i] - behind[i]),
+                      0,
+                    ) / norm
+                  : 0;
+                if (contribution >= 0.65) visible++;
+                const foreground = behind.map((v, i) => v + delta[i]);
+                const l = [lum(foreground), lum(behind)].sort((a, b) => a - b);
+                contrast = Math.min(contrast, (l[1] + 0.05) / (l[0] + 0.05));
+              }
+              results.push({
+                text: label.text,
+                count,
+                visibleFraction: visible / count,
+                contrast,
+              });
+            }
+            return results;
+          },
+          { ink, background, labels },
+        );
+        console.log(JSON.stringify({ theme, input, results }));
+        for (const result of results) {
+          assert(result.count > 0, `${name}: no glyphs for ${result.text}`);
+          assert(
+            result.visibleFraction >= 0.9,
+            `${name}: missing label ${JSON.stringify(result)}`,
+          );
+          assert(
+            result.contrast >= 4.5,
+            `${name}: contrast ${JSON.stringify(result)}`,
+          );
+        }
+      }
+  } finally {
+    await browser.close();
+  }
+})().catch((e) => {
+  console.error(e);
+  process.exitCode = 1;
+});

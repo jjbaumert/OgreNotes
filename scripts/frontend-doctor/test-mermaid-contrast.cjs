@@ -19,6 +19,7 @@ const kinds = [
   "c4",
   "quadrant-edges",
   "quadrant-literal",
+  "quadrant-wide",
   "quadrant-marker-overlap",
   "pie-empty",
   "treemap-short",
@@ -49,6 +50,7 @@ const kinds = [
           "c4",
           "quadrant-edges",
           "quadrant-literal",
+          "quadrant-wide",
           "quadrant-marker-overlap",
           "pie-empty",
           "treemap-short",
@@ -216,7 +218,7 @@ const kinds = [
               .reduce((s, x, i) => s + x * [0.2126, 0.7152, 0.0722][i], 0);
           const bg = rgb(getComputedStyle(document.body).backgroundColor);
           return [...document.querySelectorAll("svg text")]
-            .filter((t) => t.textContent.trim())
+            .filter((t) => t.textContent.trim() && !t.closest("defs"))
             .flatMap((t) => {
               const box = t.getBoundingClientRect();
               return [0.1, 0.5, 0.9].flatMap((fx) =>
@@ -446,6 +448,7 @@ const kinds = [
               const glyphs = await render(mask, true);
               const ink = await render();
               clone.querySelectorAll("text").forEach((e) => {
+                if (e.closest("defs")) return;
                 // Keep a glyph halo as background paint while removing its
                 // foreground fill. Rectangular backings remain untouched.
                 if (
@@ -470,7 +473,7 @@ const kinds = [
                   );
               results.push(
                 ...[...root.querySelectorAll("text")]
-                  .filter((t) => t.textContent.trim())
+                  .filter((t) => t.textContent.trim() && !t.closest("defs"))
                   .map((t) => {
                     const box = t.getBoundingClientRect();
                     const style = getComputedStyle(t);

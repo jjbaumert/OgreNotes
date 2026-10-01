@@ -10,6 +10,7 @@ fn contrast_edge_fixtures_match_the_renderer() {
         "contrast-c4",
         "contrast-quadrant-edges",
         "contrast-quadrant-literal",
+        "contrast-quadrant-wide",
         "contrast-quadrant-marker-overlap",
         "contrast-pie-empty",
         "contrast-treemap-short",
@@ -78,7 +79,9 @@ fn fixed_palette_foregrounds_agree_between_renderer_frontend_and_cli() {
                         | quick_xml::events::Event::Empty(tag) => {
                             for attr in tag.attributes() {
                                 let attr = attr.unwrap();
-                                if matches!(attr.key.as_ref(), b"fill" | b"stroke") {
+                                if tag.name().as_ref() != b"svg"
+                                    && matches!(attr.key.as_ref(), b"fill" | b"stroke")
+                                {
                                     output.push(String::from_utf8(attr.value.to_vec()).unwrap());
                                 }
                             }

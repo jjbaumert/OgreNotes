@@ -326,3 +326,17 @@ strokes without losing contrast. A separate marker regression covers existing
 dense label/point overlap without changing their positions.
 No server is needed. The native
 renderer tests verify fixture freshness; Playwright CI runs the browser checks.
+
+### Mermaid CLI PNG regression
+
+Build `cargo build -p ogrenotes-mermaid --bin mermaid_cli --locked`, then run
+`node test-mermaid-png.cjs --out /tmp/mermaid-png`. Set `MERMAID_CLI` if the
+binary is in a separate Cargo target directory. PNG export requires
+`rsvg-convert` (Debian/Ubuntu: `apt install librsvg2-bin`). It preserves SVG
+clipping, masks and glyph halos; ImageMagick's built-in SVG decoder drops
+labels from these diagrams. Output retains the previous 2x pixel dimensions.
+
+The test invokes the actual CLI for SVG and PNG in both themes, then checks
+rasterized glyph visibility and contrast across all six diagram kinds and
+long, Unicode and border fixtures. Glyph and background masks use the same
+PNG renderer, so differences in browser font selection cannot hide failures.

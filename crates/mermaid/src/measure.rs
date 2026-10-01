@@ -131,7 +131,7 @@ pub(crate) fn truncate_literal_to_width(
         return String::new();
     }
     let advance = |grapheme: &str| literal_advance(grapheme, font_size, bold);
-    if text.graphemes(true).map(&advance).sum::<f64>() <= max_width + 1e-6 {
+    if literal_text_width(text, font_size, bold) <= max_width + 1e-6 {
         return text.to_string();
     }
     let budget = max_width - advance("…");

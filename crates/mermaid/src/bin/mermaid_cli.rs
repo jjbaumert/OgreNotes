@@ -5,14 +5,14 @@
 //! upstream mermaid.ai rendering. The `--mermaid-*` theme custom-properties and
 //! `currentColor` are resolved to concrete colors for the chosen theme, so the
 //! result is faithful in a browser *and* rasterizes correctly to PNG (via
-//! ImageMagick) without a CSS-aware SVG renderer.
+//! librsvg), including clipped labels, masks and glyph halos.
 //!
 //!   cargo run -p ogrenotes-mermaid --bin mermaid_cli -- [OPTIONS] [INPUT]
 //!
 //! INPUT   Path to a .mmd/.mermaid file, or `-` / omitted to read stdin.
 //!
 //! OPTIONS
-//!   -o, --out <PATH>   Write here. `.png` rasterizes via ImageMagick;
+//!   -o, --out <PATH>   Write here. `.png` rasterizes via librsvg;
 //!                      any other extension (or none) writes SVG. Omit for
 //!                      SVG on stdout.
 //!   -t, --theme <T>    `light` (default) or `dark`.
@@ -148,7 +148,14 @@ fn main() {
 /// stamp a background rect (unless transparent) so any SVG viewer or
 /// rasterizer reproduces the app's appearance.
 fn theme(svg: &str, dark: bool, bg: &str) -> String {
-    let mut out = svg.to_string();
+    let mut out = svg.replacen(
+        "<svg ",
+        &format!(
+            "<svg fill=\"{}\" ",
+            if dark { TEXT_DARK } else { TEXT_LIGHT }
+        ),
+        1,
+    );
     for (needle, light, darkv) in VARS {
         out = out.replace(needle, if dark { darkv } else { light });
     }
@@ -216,30 +223,31 @@ fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-/// Pipe the SVG to ImageMagick (`magick`, falling back to `convert`) to write a
-/// PNG. The SVG already carries a real background rect and concrete colors, so
-/// no CSS-aware delegate is required.
+/// librsvg supports the clipping, masks and text paint order used by the
+/// renderer. ImageMagick's built-in SVG decoder silently drops this paint.
 fn rasterize(svg: &str, out_path: &str) {
-    for tool in ["magick", "convert"] {
-        let mut child = match Command::new(tool)
-            .args(["-density", "192", "svg:-", out_path])
-            .stdin(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(_) => continue, // tool not installed — try the next
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(svg.as_bytes());
-        }
-        match child.wait() {
-            Ok(status) if status.success() => return,
-            Ok(status) => die(&format!("{tool} exited with {status}")),
-            Err(e) => die(&format!("{tool} failed: {e}")),
-        }
+    let mut child = Command::new("rsvg-convert")
+        .args([
+            "--dpi-x", "192", "--dpi-y", "192", "--zoom", "2", "--output", out_path,
+        ])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap_or_else(|e| {
+            die(&format!(
+                "PNG export requires rsvg-convert (install librsvg2-bin): {e}"
+            ))
+        });
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(svg.as_bytes())
+            .unwrap_or_else(|e| die(&format!("failed to send SVG: {e}")));
     }
-    die("no PNG rasterizer found (install ImageMagick, or output .svg instead)");
+    match child.wait() {
+        Ok(status) if status.success() => {}
+        Ok(status) => die(&format!("rsvg-convert exited with {status}")),
+        Err(e) => die(&format!("rsvg-convert failed: {e}")),
+    }
 }
 
 fn die(msg: &str) -> ! {
@@ -256,10 +264,12 @@ USAGE:
     INPUT   .mmd/.mermaid file, or `-`/omitted to read stdin.
 
 OPTIONS:
-    -o, --out <PATH>   Output file. `.png` rasterizes via ImageMagick; any
+    -o, --out <PATH>   Output file. `.png` rasterizes via librsvg; any
                        other extension writes SVG. Omit for SVG on stdout.
     -t, --theme <T>    light (default) | dark.
         --bg <COLOR>   Background (`none` = transparent). Default #ffffff
                        (light) / #1e1e1e (dark).
-    -h, --help         Show this help.
+    -h, --help         Show this help.\n\
+\n\
+    PNG requires rsvg-convert (Debian/Ubuntu: librsvg2-bin).
 ";

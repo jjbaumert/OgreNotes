@@ -149,35 +149,50 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
             r#"<rect x="{qx:.1}" y="{qy:.1}" width="{half:.1}" height="{half:.1}" fill="{tint}"/>"#
         ));
     }
-    // Knock out plot strokes beneath labels instead of painting rectangles
-    // over the whole scene, which can erase neighboring point markers.
-    let label_bounds: Vec<_> = c
-        .points
-        .iter()
-        .map(|(name, x, y)| {
-            let (lx, ly) = (px(*x) + DOT_R + 3.0, py(*y) + 4.0);
-            let width = crate::measure::literal_text_width(name, 12.0, false) * 1.1 + 8.0;
-            (lx - 3.0, ly - 14.0, width, 19.0)
-        })
-        .collect();
-    for (horizontal, fixed, start, end) in [
-        (true, top, l, l + side),
-        (true, top + side, l, l + side),
-        (false, l, top, top + side),
-        (false, l + side, top, top + side),
-        (false, cx0, top, top + side),
-        (true, cy0, l, l + side),
-    ] {
-        draw_plot_line(&mut body, horizontal, fixed, start, end, &label_bounds);
-    }
-
-    // quadrant labels: 1=top-right, 2=top-left, 3=bottom-left, 4=bottom-right.
     let quad_centers = [
-        (l + side * 0.75, top + side * 0.25), // 1
-        (l + side * 0.25, top + side * 0.25), // 2
-        (l + side * 0.25, top + side * 0.75), // 3
-        (l + side * 0.75, top + side * 0.75), // 4
+        (l + side * 0.75, top + side * 0.25),
+        (l + side * 0.25, top + side * 0.25),
+        (l + side * 0.25, top + side * 0.75),
+        (l + side * 0.75, top + side * 0.75),
     ];
+    // Mask only plot strokes using actual glyph geometry. Font fallback can
+    // exceed heuristic widths; masking glyphs also preserves every marker.
+    let mut holes = String::new();
+    for (name, x, y) in &c.points {
+        holes.push_str(&format!(
+            r##"<text x="{:.1}" y="{:.1}" font-size="12" fill="#000" stroke="#000" stroke-width="3">{}</text>"##,
+            px(*x)+DOT_R+3.0,py(*y)+4.0,escape_xml(name)
+        ));
+    }
+    for (i, label) in c.quadrants.iter().enumerate() {
+        if let Some(text) = label {
+            let (x, y) = quad_centers[i];
+            holes.push_str(&format!(
+                r##"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" font-size="14" fill="#000" stroke="#000" stroke-width="3">{}</text>"##,
+                escape_xml(text)
+            ));
+        }
+    }
+    let mask_body = format!(
+        r##"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="#fff"/>{holes}"##,
+        l - 1.0,
+        top - 1.0,
+        side + 2.0,
+        side + 2.0
+    );
+    // Identical IDs imply identical mask geometry, even across multiple SVGs.
+    // FNV-1a is stable across platforms and compiler versions for goldens.
+    let hash = mask_body
+        .bytes()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+    let mask_id = format!("mmd-quad-strokes-{hash:016x}");
+    body.push_str(&format!(
+        r#"<defs><mask id="{mask_id}" maskUnits="userSpaceOnUse" maskContentUnits="userSpaceOnUse" x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}">{mask_body}</mask></defs><g mask="url(#{mask_id})"><rect x="{l:.1}" y="{top:.1}" width="{side:.1}" height="{side:.1}" fill="none" stroke="currentColor"/><line x1="{cx0:.1}" y1="{top:.1}" x2="{cx0:.1}" y2="{:.1}" stroke="currentColor"/><line x1="{l:.1}" y1="{cy0:.1}" x2="{:.1}" y2="{cy0:.1}" stroke="currentColor"/></g>"#,
+        l-1.0,top-1.0,side+2.0,side+2.0,top+side,l+side
+    ));
+
     for (i, label) in c.quadrants.iter().enumerate() {
         if let Some(text) = label {
             if !text.is_empty() {
@@ -242,46 +257,6 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
     out.push_str(&body);
     out.push_str("</svg>");
     out
-}
-
-/// Draw a horizontal/vertical stroke with gaps through label bounds. Sorting
-/// and merging intervals keeps output linear and avoids global SVG mask IDs.
-fn draw_plot_line(
-    out: &mut String,
-    horizontal: bool,
-    fixed: f64,
-    start: f64,
-    end: f64,
-    labels: &[(f64, f64, f64, f64)],
-) {
-    let mut gaps: Vec<_> = labels
-        .iter()
-        .filter_map(|&(x, y, w, h)| {
-            let (across, length, along, span) = if horizontal {
-                (y, h, x, w)
-            } else {
-                (x, w, y, h)
-            };
-            if fixed < across || fixed > across + length {
-                return None;
-            }
-            let (a, b) = (along.max(start), (along + span).min(end));
-            (b > a).then_some((a, b))
-        })
-        .collect();
-    gaps.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut cursor = start;
-    for (a, b) in gaps.into_iter().chain(std::iter::once((end, end))) {
-        if a > cursor {
-            let (x1, y1, x2, y2) = if horizontal {
-                (cursor, fixed, a, fixed)
-            } else {
-                (fixed, cursor, fixed, a)
-            };
-            out.push_str(&format!(r#"<line x1="{x1:.1}" y1="{y1:.1}" x2="{x2:.1}" y2="{y2:.1}" stroke="currentColor"/>"#));
-        }
-        cursor = cursor.max(b);
-    }
 }
 
 #[cfg(test)]
