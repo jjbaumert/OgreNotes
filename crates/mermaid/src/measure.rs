@@ -1,7 +1,6 @@
 //! Heuristic text measurement — there is no DOM/canvas in pure Rust, so
 //! widths come from a char-class table with generous padding downstream.
 
-use unicode_normalization::char::{decompose_canonical, is_combining_mark};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) const FONT_PX: f64 = 14.0;
@@ -75,6 +74,61 @@ pub(crate) fn truncate_to_width(s: &str, max_w: f64) -> String {
     format!("{}…", &s[..bounds[lo]])
 }
 
+include!(concat!(env!("OUT_DIR"), "/compact_unicode.rs"));
+
+fn is_combining_mark(ch: char) -> bool {
+    let value = ch as u32;
+    let index = COMBINING_RANGES.partition_point(|&(_, end)| end < value);
+    COMBINING_RANGES
+        .get(index)
+        .is_some_and(|&(start, _)| start <= value)
+}
+
+fn fitting_bases(ch: char, mut visit: impl FnMut(char)) {
+    if ('\u{ac00}'..='\u{d7a3}').contains(&ch) {
+        let index = ch as u32 - 0xac00;
+        visit(char::from_u32(0x1100 + index / 588).unwrap());
+        visit(char::from_u32(0x1161 + (index % 588) / 28).unwrap());
+        let trailing = index % 28;
+        if trailing != 0 {
+            visit(char::from_u32(0x11a7 + trailing).unwrap());
+        }
+    } else if let Ok(index) = CANONICAL_BASES.binary_search_by_key(&ch, |&(base, _)| base) {
+        CANONICAL_BASES[index].1.chars().for_each(visit);
+    } else {
+        visit(ch);
+    }
+}
+
+fn base_advance(base: char) -> f64 {
+    match base {
+        '\u{1100}'..='\u{11ff}' | '\u{a960}'..='\u{a97f}' | '\u{d7b0}'..='\u{d7ff}' => 1.05,
+        'М' | 'Ш' | 'Щ' | 'Ж' | 'Ю' | 'Ы' | 'Ф' | 'ш' | 'щ' | 'ж' | 'ю' | 'ы' | 'ф' | 'Æ' | 'æ'
+        | 'Œ' | 'œ' | '…' => 1.05,
+        // Advances for the renderer's sans-serif labels. Layout's
+        // generously padded char_w table is unsuitable for fitting:
+        // it needlessly drops suffixes from ordinary uppercase names.
+        'i' | 'l' | 'j' | 'I' | ' ' => 0.28,
+        'f' => 0.45,
+        't' => 0.40,
+        '.' | ',' | ':' | ';' | '!' | '\'' | '`' => 0.35,
+        'r' | '(' | ')' | '[' | ']' => 0.43,
+        'J' | 'c' | 's' | 'v' | 'x' | 'y' | 'z' => 0.61,
+        'E' => 0.67,
+        'F' | 'L' | 'T' | 'Z' => 0.61,
+        'M' | 'm' => 1.00,
+        'W' | '@' | '%' => 1.00,
+        'w' => 0.85,
+        'A'..='Z' => 0.72,
+        'a'..='z' | '0'..='9' => 0.65,
+        '\u{1f000}'..='\u{1faff}' => 1.35,
+        // Fallback fonts need a conservative full-em estimate. The
+        // layout table's Latin average undercounts Cyrillic/Greek.
+        c if !c.is_ascii() => 1.05,
+        _ => char_w(base),
+    }
+}
+
 fn literal_advance(grapheme: &str, font_size: f64, bold: bool) -> f64 {
     let weight = if bold { 1.04 } else { 1.0 };
     // Ordinary grapheme clusters can contain multiple advancing letters
@@ -85,38 +139,13 @@ fn literal_advance(grapheme: &str, font_size: f64, bold: bool) -> f64 {
         });
     let mut em: f64 = 0.0;
     for ch in grapheme.chars() {
-        decompose_canonical(ch, |base| {
+        fitting_bases(ch, |base| {
             if is_combining_mark(base)
                 || matches!(base, '\u{200c}' | '\u{200d}' | '\u{fe0e}' | '\u{fe0f}')
             {
                 return;
             }
-            let width = match base {
-                '\u{1100}'..='\u{11ff}' | '\u{a960}'..='\u{a97f}' | '\u{d7b0}'..='\u{d7ff}' => 1.05,
-                'М' | 'Ш' | 'Щ' | 'Ж' | 'Ю' | 'Ы' | 'Ф' | 'ш' | 'щ' | 'ж' | 'ю' | 'ы' | 'ф'
-                | 'Æ' | 'æ' | 'Œ' | 'œ' | '…' => 1.05,
-                // Advances for the renderer's sans-serif labels. Layout's
-                // generously padded char_w table is unsuitable for fitting:
-                // it needlessly drops suffixes from ordinary uppercase names.
-                'i' | 'l' | 'j' | 'I' | ' ' => 0.28,
-                'f' => 0.45,
-                't' => 0.40,
-                '.' | ',' | ':' | ';' | '!' | '\'' | '`' => 0.35,
-                'r' | '(' | ')' | '[' | ']' => 0.43,
-                'J' | 'c' | 's' | 'v' | 'x' | 'y' | 'z' => 0.61,
-                'E' => 0.67,
-                'F' | 'L' | 'T' | 'Z' => 0.61,
-                'M' | 'm' => 1.00,
-                'W' | '@' | '%' => 1.00,
-                'w' => 0.85,
-                'A'..='Z' => 0.72,
-                'a'..='z' | '0'..='9' => 0.65,
-                '\u{1f000}'..='\u{1faff}' => 1.35,
-                // Fallback fonts need a conservative full-em estimate. The
-                // layout table's Latin average undercounts Cyrillic/Greek.
-                c if !c.is_ascii() => 1.05,
-                _ => char_w(base),
-            };
+            let width = base_advance(base);
             em = if single_glyph {
                 em.max(width)
             } else {
@@ -170,6 +199,49 @@ pub(crate) fn truncate_literal_to_width(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_fitting_data_matches_full_unicode_normalization() {
+        use unicode_normalization::char::{decompose_canonical, is_combining_mark as full_mark};
+
+        fn reference(text: &str) -> f64 {
+            let single = text.chars().next().is_some_and(|ch| {
+                matches!(ch, '\u{1100}'..='\u{11ff}' | '\u{ac00}'..='\u{d7a3}' | '\u{1f000}'..='\u{1faff}')
+            });
+            let mut width: f64 = 0.0;
+            for ch in text.chars() {
+                decompose_canonical(ch, |base| {
+                    if !full_mark(base)
+                        && !matches!(base, '\u{200c}' | '\u{200d}' | '\u{fe0e}' | '\u{fe0f}')
+                    {
+                        let advance = base_advance(base);
+                        width = if single {
+                            width.max(advance)
+                        } else {
+                            width + advance
+                        };
+                    }
+                });
+            }
+            width
+        }
+
+        for value in 0..=0x10ffff {
+            let Some(ch) = char::from_u32(value) else {
+                continue;
+            };
+            assert_eq!(is_combining_mark(ch), full_mark(ch), "mark U+{value:04X}");
+            // A prepended character also exercises decomposed Hangul when
+            // it is not the first character of the grapheme cluster.
+            for text in [ch.to_string(), format!("\u{0600}{ch}")] {
+                assert_eq!(
+                    literal_advance(&text, 1.0, false),
+                    reference(&text),
+                    "advance U+{value:04X}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn wider_text_measures_wider() {

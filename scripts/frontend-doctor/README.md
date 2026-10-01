@@ -328,6 +328,9 @@ with checks for surviving marker color. Point positions stay unchanged; glyphs
 can obscure part of an overlapping marker. Long names receive ellipses; C4 and
 treemap use an explicit Arial/Helvetica family for consistent viewer metrics.
 
+Unicode fitting tables are generated at build time to keep the WASM bundle
+within budget. A native reference check verifies combining-mark membership
+and fitting advances against the full normalization engine for every scalar.
 No server is needed. The native
 renderer tests verify fixture freshness; Playwright CI runs the browser checks.
 
