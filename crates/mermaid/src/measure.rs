@@ -103,7 +103,15 @@ fn fitting_bases(ch: char, mut visit: impl FnMut(char)) {
     }
 }
 
+include!("font_advances.rs");
+
 fn base_advance(base: char) -> f64 {
+    if !base.is_ascii() {
+        if let Ok(index) = FONT_ADVANCES.binary_search_by_key(&(base as u32), |packed| packed >> 11)
+        {
+            return (FONT_ADVANCES[index] & 0x7ff) as f64 / 1024.0;
+        }
+    }
     match base {
         '\u{1100}'..='\u{11ff}' | '\u{a960}'..='\u{a97f}' | '\u{d7b0}'..='\u{d7ff}' => 1.05,
         'М' | 'Ш' | 'Щ' | 'Ж' | 'Ю' | 'Ы' | 'Ф' | 'ш' | 'щ' | 'ж' | 'ю' | 'ы' | 'ф' | 'Æ' | 'æ'
@@ -167,6 +175,15 @@ fn literal_advance(grapheme: &str, font_size: f64, bold: bool) -> f64 {
         });
     }
     em * font_size * weight
+}
+
+/// Conservative literal glyph bounds for overlap detection, without HTML breaks.
+/// The allowance covers fallback fonts; it changes marker presentation, not layout.
+pub(crate) fn literal_overlap_width(text: &str, font_size: f64) -> f64 {
+    text.graphemes(true)
+        .map(|g| literal_advance(g, font_size, false))
+        .sum::<f64>()
+        * 1.3
 }
 
 /// Fit literal SVG text at its rendered font size, preserving grapheme clusters.

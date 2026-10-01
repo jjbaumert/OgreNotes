@@ -164,7 +164,7 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
             caption_bounds.push((
                 px(*x) + DOT_R + 3.0,
                 py(*y) - 12.0,
-                crate::measure::text_size(name).0 * 12.0 / 14.0,
+                crate::measure::literal_overlap_width(name, 12.0),
                 18.0,
             ));
         }
@@ -177,7 +177,7 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
         if let Some(text) = label {
             let (x, y) = quad_centers[i];
             if !text.is_empty() {
-                let width = crate::measure::text_size(text).0;
+                let width = crate::measure::literal_overlap_width(text, 14.0);
                 caption_bounds.push((x - width / 2.0, y - 16.0, width, 21.0));
             }
             holes.push_str(&format!(

@@ -5,6 +5,8 @@ use unicode_normalization::char::{decompose_canonical, is_combining_mark};
 
 // Fitting needs combining-mark membership and canonical bases with differing
 // advances, rather than the complete Unicode normalization engine in WASM.
+include!("src/font_advances.rs");
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let mut mappings = String::from("const CANONICAL_BASES: &[(char, &str)] = &[\n");
@@ -41,10 +43,13 @@ fn main() {
         if bases == [ch] || (bases.is_empty() && is_combining_mark(ch)) {
             continue;
         }
-        // Other non-ASCII bases have a full-em advance, except Arabic and emoji.
+        // Unmeasured non-ASCII bases have a full-em advance, except Arabic and emoji.
         // Changing one to another therefore needs no runtime mapping.
         let full_em = |c: char| {
             !c.is_ascii()
+                && FONT_ADVANCES
+                    .binary_search_by_key(&(c as u32), |packed| packed >> 11)
+                    .is_err()
                 && !is_combining_mark(c)
                 && !matches!(c, '\u{200c}' | '\u{200d}' | '\u{0600}'..='\u{06ff}' | '\u{0750}'..='\u{077f}' | '\u{08a0}'..='\u{08ff}' | '\u{1f000}'..='\u{1faff}')
         };

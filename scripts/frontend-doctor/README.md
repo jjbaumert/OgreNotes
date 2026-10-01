@@ -317,7 +317,7 @@ all C4 external tiers and shapes, small treemap cells, and pie rim/wedge
 contrast, including an empty pie. Long labels, narrow numeric cells, all
 pie colors and all treemap palette depths are renderer-backed fixtures.
 Wide Cyrillic, Greek, Hangul and Indic names, complete Arabic and fitting Latin
-names, tags and fallback-font captions are also checked. Tall C4 queues retain their identifying names.
+names, including narrow Greek names, tags and fallback-font captions are also checked. Tall C4 queues retain their identifying names.
 Palette-matched glyph halos protect captions without clipping differing font
 metrics. C4 captions also receive filled glyph underlays, painted before all
 foreground labels, to protect wide interiors outside rounded queue caps.
@@ -331,9 +331,15 @@ Dense quadrant overlap runs text contrast and glyph-visibility checks along
 with checks for surviving marker color. Point positions stay unchanged; glyphs
 can obscure part of an overlapping marker. Caption overlaps receive a masked
 palette-colored ring so a fully covered dot retains a visible indicator.
-Point and ring masks also protect axis labels.
+Point and ring masks also protect axis labels. Overlap bounds measure literal
+text, so a displayed `<br>` cannot hide an overlapping point.
 Long names receive ellipses; C4 and
 treemap use an explicit Arial/Helvetica family for consistent viewer metrics.
+
+Supported non-ASCII advances use measurements of the Arial-compatible
+Liberation Sans regular, bold and italic faces. Regenerate the checked-in bounds
+with `python3 scripts/measure-mermaid-fonts.py` (Pillow and fontconfig required).
+The renderer does not bundle fonts and retains estimates for unsupported glyphs.
 
 Unicode fitting tables are generated at build time to keep the WASM bundle
 within budget. A native reference check verifies combining-mark membership

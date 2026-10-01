@@ -21,6 +21,7 @@ const kinds = [
   "quadrant-literal",
   "quadrant-wide",
   "quadrant-marker-overlap",
+  "quadrant-marker-literal-overlap",
   "quadrant-ring-axis",
   "quadrant-marker-covered",
   "pie-empty",
@@ -40,6 +41,7 @@ const kinds = [
   "architecture-wide",
   "c4-unicode",
   "c4-arabic",
+  "c4-greek-narrow",
   "c4-fitting",
   "treemap-numbers",
   "pie-palette",
@@ -68,6 +70,7 @@ const kinds = [
           "quadrant-literal",
           "quadrant-wide",
           "quadrant-marker-overlap",
+          "quadrant-marker-literal-overlap",
           "quadrant-ring-axis",
           "quadrant-marker-covered",
           "pie-empty",
@@ -87,6 +90,7 @@ const kinds = [
           "architecture-wide",
           "c4-unicode",
           "c4-arabic",
+          "c4-greek-narrow",
           "c4-fitting",
           "treemap-numbers",
           "pie-palette",
@@ -782,6 +786,18 @@ const kinds = [
                 .allTextContents()
             ).includes("Message broker"),
             "Names that fit retain their identifying text",
+          );
+        }
+        if (kind === "c4-greek-narrow") {
+          const labels = await page
+            .locator("svg text:not([data-label-underlay])")
+            .allTextContents();
+          assert(labels.includes("μμμμμμμμμμμμ"));
+          assert(labels.includes("ι".repeat(24)));
+          assert(
+            labels.some(
+              (label) => label.startsWith("Ω") && label.endsWith("…"),
+            ),
           );
         }
         if (kind === "c4-arabic") {
