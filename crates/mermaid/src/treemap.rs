@@ -5,6 +5,8 @@
 //! squarified treemap — each node a rectangle whose area is proportional to
 //! its value, packed to keep cell aspect ratios near 1.
 
+use std::fmt::Write;
+
 use crate::theme::{DATA_MUTED_TEXT, DATA_TEXT, LABEL_FONT};
 use crate::{ParseError, escape_xml, measure};
 
@@ -193,12 +195,12 @@ pub(crate) fn render_svg(t: &Treemap) -> String {
         h = HEIGHT + title_h + 2.0 * PAD,
     );
     if let Some(title) = &t.title {
-        out.push_str(&format!(
+        write!(out,
             r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" font-weight="bold" font-size="18" fill="currentColor">{}</text>"#,
             WIDTH / 2.0 + PAD,
             PAD + 20.0,
             escape_xml(title)
-        ));
+        ).unwrap();
     }
     // Lay the roots out as one virtual level filling the canvas.
     let area = Rect { x: PAD, y: PAD + title_h, w: WIDTH, h: HEIGHT };
@@ -221,10 +223,10 @@ fn layout_level(nodes: &[Node], rect: Rect, depth: usize, out: &mut String, labe
     let rects = squarify(&weights, rect);
     for (node, r) in nodes.iter().zip(rects) {
         let fill = PALETTE[depth % PALETTE.len()];
-        out.push_str(&format!(
+        write!(out,
             r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1.5"/>"#,
             r.x, r.y, r.w.max(0.0), r.h.max(0.0)
-        ));
+        ).unwrap();
         if node.children.is_empty() {
             draw_leaf_label(node, r, fill, labels);
         } else {
@@ -243,13 +245,12 @@ fn draw_header_label(node: &Node, r: Rect, background: &str, out: &mut String) {
     if r.w < 24.0 || r.h < HEADER_H {
         return;
     }
-    let text = format!(
+    write!(out,
         r#"<text x="{:.1}" y="{:.1}" font-weight="600" font-size="12" fill="{DATA_TEXT}" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke">{}</text>"#,
         r.x + 5.0,
         r.y + 13.0,
         escape_xml(&clip(&node.name, r.w - 10.0, 12.0, true))
-    );
-    out.push_str(&text);
+    ).unwrap();
 }
 
 fn draw_leaf_label(node: &Node, r: Rect, background: &str, out: &mut String) {
@@ -261,21 +262,20 @@ fn draw_leaf_label(node: &Node, r: Rect, background: &str, out: &mut String) {
     // With no numeric line, center the complete glyph band in short cells.
     let two_lines = node.value.is_some() && r.h > 34.0;
     let name_baseline = if two_lines { cy - 2.0 } else { cy + 4.0 };
-    let mut text = format!(
+    write!(out,
         r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="{DATA_TEXT}" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke">{}</text>"#,
         name_baseline,
         escape_xml(&clip(&node.name, r.w - 8.0, 13.0, false))
-    );
+    ).unwrap();
     if let Some(v) = node.value {
         if r.h > 34.0 {
-            text.push_str(&format!(
+            write!(out,
                 r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-size="11" fill="{DATA_MUTED_TEXT}" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke">{}</text>"#,
                 cy + 14.0,
                 escape_xml(&clip(&fmt_num(v), r.w - 8.0, 11.0, false))
-            ));
+            ).unwrap();
         }
     }
-    out.push_str(&text);
 }
 
 /// Truncate `s` with an ellipsis to fit `max_w` pixels (approx).
