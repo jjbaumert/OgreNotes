@@ -1026,6 +1026,8 @@ mermaid-modal-title = Edit Diagram
 mermaid-modal-save = Save
 mermaid-modal-error-empty = Diagram source cannot be empty.
 mermaid-modal-error-too-long = Diagram source is too long ({ $max } character limit).
+mermaid-modal-error-changed = This diagram changed while you were editing. Copy your draft, then reopen the diagram to edit the latest version.
+mermaid-modal-error-unavailable = This diagram is no longer editable. Copy your draft before closing.
 
 math-modal-title = Edit Equation
 math-modal-save = Save

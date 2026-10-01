@@ -138,7 +138,9 @@ pub struct ParseError { pub message: String, pub line: Option<usize> }
 - `frontend/src/components/mermaid_modal.rs`: a code textarea + **live preview**
   (debounced `render()` on each edit), mirroring `calendar_modal` /
   `kanban_card_modal`. Save writes the `source` attribute via the transform
-  pipeline.
+  pipeline, provided the current source still matches the source opened in the
+  modal. A received collaborator edit or removed block keeps the draft open
+  with an error; read-only documents do not open this editor.
 - Fluent keys `insert-mermaid-label` / `insert-mermaid-description` added to
   `frontend/locales/en-US/main.ftl`.
 - `frontend/Cargo.toml`: `ogrenotes-mermaid = { path = "../crates/mermaid" }`
