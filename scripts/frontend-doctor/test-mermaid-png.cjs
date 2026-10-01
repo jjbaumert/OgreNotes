@@ -23,6 +23,7 @@ const cases = [
     "c4-long",
     "c4-narrow",
     "c4-hangul",
+    "c4-fallback",
     "architecture-accent",
     "c4-unicode",
     "treemap-wide",

@@ -28,6 +28,7 @@ const kinds = [
   "c4-long",
   "c4-narrow",
   "c4-hangul",
+  "c4-fallback",
   "architecture-accent",
   "c4-unicode",
   "treemap-numbers",
@@ -64,6 +65,7 @@ const kinds = [
           "c4-long",
           "c4-narrow",
           "c4-hangul",
+          "c4-fallback",
           "architecture-accent",
           "c4-unicode",
           "treemap-numbers",
@@ -654,6 +656,20 @@ const kinds = [
               labels.includes("[ContainerQueue]") &&
               labels.includes("EXTERNAL DB"),
             "Database and queue tags that fit must remain complete",
+          );
+        }
+        if (kind === "c4-fallback") {
+          const labels = await page.locator("svg text").allTextContents();
+          assert(labels.includes("မြန်မာ") && labels.includes("ДΩ"));
+          assert(
+            labels.some(
+              (label) => label.startsWith("Д") && label.endsWith("…"),
+            ),
+          );
+          assert(
+            labels.some(
+              (label) => label.startsWith("Ω") && label.endsWith("…"),
+            ),
           );
         }
         if (kind === "c4-hangul") {

@@ -77,6 +77,13 @@ pub(crate) fn truncate_to_width(s: &str, max_w: f64) -> String {
 
 fn literal_advance(grapheme: &str, font_size: f64, bold: bool) -> f64 {
     let weight = if bold { 1.04 } else { 1.0 };
+    // Ordinary grapheme clusters can contain multiple advancing letters
+    // (for example Indic conjuncts). Hangul jamo and joined emoji shape
+    // into a single glyph instead of adding each component's advance.
+    let single_glyph = grapheme.contains('\u{200d}')
+        || grapheme.chars().next().is_some_and(|ch| {
+            matches!(ch, '\u{1100}'..='\u{11ff}' | '\u{ac00}'..='\u{d7a3}' | '\u{1f000}'..='\u{1faff}')
+        });
     let mut em: f64 = 0.0;
     for ch in grapheme.chars() {
         decompose_canonical(ch, |base| {
@@ -105,9 +112,17 @@ fn literal_advance(grapheme: &str, font_size: f64, bold: bool) -> f64 {
                 'w' => 0.85,
                 'A'..='Z' => 0.72,
                 'a'..='z' | '0'..='9' => 0.65,
+                '\u{1f000}'..='\u{1faff}' => 1.35,
+                // Fallback fonts need a conservative full-em estimate. The
+                // layout table's Latin average undercounts Cyrillic/Greek.
+                c if !c.is_ascii() => 1.05,
                 _ => char_w(base),
             };
-            em = em.max(width);
+            em = if single_glyph {
+                em.max(width)
+            } else {
+                em + width
+            };
         });
     }
     em * font_size * weight

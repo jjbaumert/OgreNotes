@@ -464,10 +464,10 @@ fn fit_element_label(
     font_size: f64,
     bold: bool,
 ) -> FittedLabel {
-    // Reserve the full glyph band, including descenders. Curved shapes narrow
+    // Reserve extra descent for fallback scripts, including Burmese. Curved shapes narrow
     // near their top and bottom, so use the narrowest cross-section in the band.
     let top = (baseline - font_size * 1.1).max(if shape == Shape::Person { 16.0 } else { 0.0 });
-    let bottom = (baseline + font_size * 0.3).min(height);
+    let bottom = (baseline + font_size * 0.65).min(height);
     let edge_y = top.min(height - bottom);
     let (rx, ry) = match shape {
         Shape::Queue => (width.min(height) / 2.0, height / 2.0),

@@ -9,6 +9,7 @@ fn contrast_edge_fixtures_match_the_renderer() {
     let mut names = vec![
         "contrast-c4",
         "contrast-c4-hangul",
+        "contrast-c4-fallback",
         "contrast-architecture-accent",
         "contrast-c4-narrow",
         "contrast-cli-literal",

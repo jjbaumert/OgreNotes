@@ -129,7 +129,9 @@ pub struct ParseError { pub message: String, pub line: Option<usize> }
   before all percentage text, including adjacent thin wedges.
   Fitting preserves grapheme clusters and measures accented letters by their
   base glyph, retaining full Hangul syllable width after decomposition, so
-  short Unicode labels remain complete. Fitted C4 and treemap
+  short Unicode labels remain complete. Fallback scripts use conservative
+  width estimates and additional descent allowance; conjuncts count their
+  advancing letters while Hangul and joined emoji remain single glyphs. Fitted C4 and treemap
   text uses an explicit Arial/Helvetica font family for consistent viewer metrics. Single-line leaf names
   are vertically centered in short cells to keep the complete glyph band visible.
 
