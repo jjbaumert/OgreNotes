@@ -119,6 +119,9 @@ pub struct ParseError { pub message: String, pub line: Option<usize> }
   C4 element text and treemap values use ellipses to fit their painted bounds;
   source editing and Markdown export retain the complete labels. Paint is
   bounded to the label area so font differences cannot spill onto the canvas.
+  Pie percentages have opaque palette-matched backings so thin wedge borders
+  cannot reduce text contrast. Architecture service names and quadrant point
+  names have surface-matched backings against edges and plot borders.
   Fitting preserves grapheme clusters and measures accented letters by their
   base glyph, so short Unicode labels remain complete.
 

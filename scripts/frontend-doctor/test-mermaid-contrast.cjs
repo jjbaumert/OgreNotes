@@ -24,6 +24,7 @@ const kinds = [
   "c4-unicode",
   "treemap-numbers",
   "pie-palette",
+  "pie-thin",
   "treemap-palette",
   "treemap-wide",
 ];
@@ -50,6 +51,7 @@ const kinds = [
           "c4-unicode",
           "treemap-numbers",
           "pie-palette",
+          "pie-thin",
           "treemap-wide",
         ];
         const inputs =
@@ -164,17 +166,18 @@ const kinds = [
                           "polygon",
                           "ellipse",
                         ].includes(e.tagName) &&
-                        !e.closest("defs") &&
-                        getComputedStyle(e).fill !== "none",
+                        !e.closest("defs"),
                     );
                   let background = bg;
                   for (const e of layers.reverse()) {
                     const style = getComputedStyle(e);
-                    background = composite(
-                      rgb(style.fill),
-                      background,
-                      +style.fillOpacity * +style.opacity * alpha(style.fill),
-                    );
+                    if (style.fill !== "none") {
+                      background = composite(
+                        rgb(style.fill),
+                        background,
+                        +style.fillOpacity * +style.opacity * alpha(style.fill),
+                      );
+                    }
                   }
                   const style = getComputedStyle(t);
                   const foreground = composite(
@@ -264,6 +267,163 @@ const kinds = [
           );
           console.log(JSON.stringify({ theme, kind, strokes }));
         }
+        {
+          // Rasterize glyph coverage and the SVG without text. Sample glyph
+          // interiors using the declared foreground, excluding unrelated lines.
+          const pixels = await page.evaluate(async () => {
+            const results = [];
+            for (const root of document.querySelectorAll(
+              ".mermaid-svg > svg",
+            )) {
+              const bounds = root.getBoundingClientRect();
+              const clone = root.cloneNode(true);
+              const originals = [root, ...root.querySelectorAll("*")];
+              const copies = [clone, ...clone.querySelectorAll("*")];
+              const properties = [
+                "fill",
+                "stroke",
+                "fill-opacity",
+                "stroke-opacity",
+                "opacity",
+                "font-family",
+                "font-size",
+                "font-weight",
+                "text-anchor",
+                "dominant-baseline",
+                "paint-order",
+              ];
+              originals.forEach((e, i) => {
+                const computed = getComputedStyle(e);
+                for (const property of properties) {
+                  copies[i].style.setProperty(
+                    property,
+                    computed.getPropertyValue(property),
+                  );
+                }
+              });
+              const width = Math.ceil(bounds.width),
+                height = Math.ceil(bounds.height);
+              clone.setAttribute("width", width);
+              clone.setAttribute("height", height);
+              clone.style.cssText += `;width:${width}px;height:${height}px;max-width:none`;
+              const render = async (imageSvg = clone, transparent = false) => {
+                const url = URL.createObjectURL(
+                  new Blob([new XMLSerializer().serializeToString(imageSvg)], {
+                    type: "image/svg+xml",
+                  }),
+                );
+                try {
+                  const image = new Image();
+                  image.src = url;
+                  await image.decode();
+                  const canvas = document.createElement("canvas");
+                  canvas.width = width;
+                  canvas.height = height;
+                  const ctx = canvas.getContext("2d");
+                  if (!transparent) {
+                    ctx.fillStyle = getComputedStyle(
+                      document.body,
+                    ).backgroundColor;
+                    ctx.fillRect(0, 0, width, height);
+                  }
+                  ctx.drawImage(image, 0, 0);
+                  return ctx.getImageData(0, 0, width, height).data;
+                } finally {
+                  URL.revokeObjectURL(url);
+                }
+              };
+              // A glyph-only mask excludes strokes that happen to have the
+              // same color as text within its bounding box.
+              const mask = clone.cloneNode(true);
+              mask
+                .querySelectorAll(
+                  "rect,path,circle,ellipse,line,polyline,polygon,use,image",
+                )
+                .forEach((e) => {
+                  if (!e.closest("defs")) e.style.visibility = "hidden";
+                });
+              mask.querySelectorAll("text").forEach((e) => {
+                e.style.fill = "#000";
+                e.style.stroke = "none";
+              });
+              const glyphs = await render(mask, true);
+              clone.querySelectorAll("text").forEach((e) => e.remove());
+              const background = await render();
+              const luminance = (c) =>
+                c
+                  .map((v) => {
+                    v /= 255;
+                    return v <= 0.04045
+                      ? v / 12.92
+                      : ((v + 0.055) / 1.055) ** 2.4;
+                  })
+                  .reduce(
+                    (sum, v, i) => sum + v * [0.2126, 0.7152, 0.0722][i],
+                    0,
+                  );
+              results.push(
+                ...[...root.querySelectorAll("text")]
+                  .filter((t) => t.textContent.trim())
+                  .map((t) => {
+                    const box = t.getBoundingClientRect();
+                    const style = getComputedStyle(t);
+                    const color = style.fill
+                      .match(/[\d.]+/g)
+                      .slice(0, 3)
+                      .map(Number);
+                    const paintAlpha =
+                      +style.opacity *
+                      +style.fillOpacity *
+                      (style.fill.startsWith("rgba")
+                        ? +style.fill.match(/[\d.]+/g)[3]
+                        : 1);
+                    let minimum = Infinity,
+                      count = 0;
+                    for (
+                      let y = Math.floor(box.top - bounds.top);
+                      y < Math.ceil(box.bottom - bounds.top);
+                      y++
+                    ) {
+                      for (
+                        let x = Math.floor(box.left - bounds.left);
+                        x < Math.ceil(box.right - bounds.left);
+                        x++
+                      ) {
+                        if (x < 0 || y < 0 || x >= width || y >= height)
+                          continue;
+                        const offset = (y * width + x) * 4;
+                        if (glyphs[offset + 3] < 128) continue;
+                        const behind = Array.from(
+                          background.slice(offset, offset + 3),
+                        );
+                        const foreground = color.map(
+                          (v, i) =>
+                            v * paintAlpha + behind[i] * (1 - paintAlpha),
+                        );
+                        const l = [
+                          luminance(foreground),
+                          luminance(behind),
+                        ].sort((a, b) => a - b);
+                        minimum = Math.min(
+                          minimum,
+                          (l[1] + 0.05) / (l[0] + 0.05),
+                        );
+                        count++;
+                      }
+                    }
+                    return { text: t.textContent, count, contrast: minimum };
+                  }),
+              );
+            }
+            return results;
+          });
+          console.log(JSON.stringify({ theme, kind, pixels }));
+          assert(
+            pixels.length > 0 &&
+              pixels.every((p) => p.count > 0 && p.contrast >= 4.5),
+            "Glyphs must contrast with actual background pixels, including borders",
+          );
+        }
         if (kind === "c4-long") {
           const clipping = await page.evaluate(() => {
             const text = [...document.querySelectorAll("svg text")].find((t) =>
@@ -310,7 +470,8 @@ const kinds = [
           const labels = await page.locator("svg text").allTextContents();
           assert(
             labels.includes("[ContainerDb]") &&
-              labels.includes("[ContainerQueue]"),
+              labels.includes("[ContainerQueue]") &&
+              labels.includes("EXTERNAL DB"),
             "Database and queue tags that fit must remain complete",
           );
         }

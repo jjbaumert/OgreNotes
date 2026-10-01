@@ -349,10 +349,16 @@ pub(crate) fn render_svg(a: &Architecture) -> String {
         let ix = cx - ICON / 2.0;
         let iy = cy - ICON / 2.0 - 6.0;
         draw_icon(&mut out, &node.icon, ix, iy, ICON);
+        let label = clip(&node.title, CELL_W - 10.0);
+        let label_y = iy + ICON + 16.0;
+        let width = crate::measure::text_size(&label).0 + 6.0;
+        // Edges may run beneath service names. Back the complete label without
+        // moving nodes or changing its inherited foreground.
         out.push_str(&format!(
-            r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
-            iy + ICON + 16.0,
-            escape_xml(&clip(&node.title, CELL_W - 10.0))
+            r#"<rect x="{:.1}" y="{:.1}" width="{width:.1}" height="22" fill="var(--surface, #fff)"/><text x="{cx:.1}" y="{label_y:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
+            cx - width / 2.0,
+            label_y - 16.0,
+            escape_xml(&label)
         ));
     }
 

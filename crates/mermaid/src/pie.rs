@@ -187,6 +187,7 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
         pie.slices[b].1.partial_cmp(&pie.slices[a].1).unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    let mut labels = String::new();
     let mut angle = -std::f64::consts::FRAC_PI_2; // 12 o'clock
     for &i in &order {
         let value = pie.slices[i].1;
@@ -200,7 +201,7 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
             svg.push_str(&format!(
                 r#"<circle cx="{CX}" cy="{CY}" r="{R}" {slice_attrs}/>"#
             ));
-            svg.push_str(&slice_label(CX, CY, pct));
+            labels.push_str(&slice_label(CX, CY, pct, fill));
         } else {
             let sweep = frac * std::f64::consts::TAU;
             let (x0, y0) = (CX + R * angle.cos(), CY + R * angle.sin());
@@ -214,7 +215,7 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
             // equal), so labels sit further out and thin wedges overflow.
             let mid = angle + sweep / 2.0;
             let (lx, ly) = (CX + TEXT_POS * R * mid.cos(), CY + TEXT_POS * R * mid.sin());
-            svg.push_str(&slice_label(lx, ly, pct));
+            labels.push_str(&slice_label(lx, ly, pct, fill));
             angle = end;
         }
     }
@@ -225,6 +226,10 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
             r#"<circle cx="{CX}" cy="{CY}" r="{R}" fill="none" stroke="{DATA_STROKE}" stroke-width="2"/>"#
         ));
     }
+
+    // Paint labels after every slice/border so thin neighboring wedges cannot
+    // overwrite a label's backing with a dark boundary.
+    svg.push_str(&labels);
 
     // Legend, source order, anchored to the pie center: swatch 18×18 at
     // (CX+216, CY + i·22 - 11n); text offset by (22, 14).
@@ -247,10 +252,15 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
     svg
 }
 
-/// A centered percentage label for a wedge (17px, theme text color).
-fn slice_label(x: f64, y: f64, pct: i64) -> String {
+/// A centered percentage label with an opaque palette-matched backing.
+/// Thin wedges are narrower than the text; their borders must not show through.
+fn slice_label(x: f64, y: f64, pct: i64, fill: &str) -> String {
+    let label = format!("{pct}%");
+    let width = crate::measure::text_size(&label).0 * 17.0 / crate::measure::FONT_PX + 8.0;
     format!(
-        r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" dominant-baseline="middle" fill="{DATA_TEXT}" style="font-size:17px">{pct}%</text>"#
+        r#"<rect class="pie-percentage-background" x="{left:.1}" y="{top:.1}" width="{width:.1}" height="26" rx="2" fill="{fill}"/><text x="{x:.1}" y="{y:.1}" text-anchor="middle" dominant-baseline="middle" fill="{DATA_TEXT}" style="font-size:17px">{label}</text>"#,
+        left = x - width / 2.0,
+        top = y - 13.0,
     )
 }
 
@@ -607,11 +617,11 @@ mod tests {
         let svg = render_svg(&p);
         assert_eq!(svg.matches("<text x=\"463\"").count(), n, "one legend row per slice");
         // Slice `PALETTE.len()` wraps around to the first palette color, so
-        // palette[0] is used by two slices (wedge fill + legend swatch each).
+        // palette[0] is used by two slices (wedge, label backing, and legend).
         assert_eq!(
             svg.matches(PALETTE[0]).count(),
-            4,
-            "slices 0 and PALETTE.len() each use palette[0] for wedge fill + legend swatch"
+            6,
+            "slices 0 and PALETTE.len() each use palette[0] for wedge, backing, and swatch"
         );
     }
 }

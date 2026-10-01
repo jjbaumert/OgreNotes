@@ -209,19 +209,24 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
 
     // data points: filled, cycled through a categorical palette (Mermaid
     // colors each point) with a thin light outline for contrast on the tints.
+    let mut point_labels = String::new();
     for (i, (name, x, y)) in c.points.iter().enumerate() {
         let (dx, dy) = (px(*x), py(*y));
         let fill = POINT_PALETTE[i % POINT_PALETTE.len()];
         body.push_str(&format!(
             r#"<circle cx="{dx:.1}" cy="{dy:.1}" r="{DOT_R}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1"/>"#
         ));
-        body.push_str(&format!(
-            r#"<text x="{:.1}" y="{:.1}" font-size="12" fill="currentColor">{}</text>"#,
-            dx + DOT_R + 3.0,
-            dy + 4.0,
+        let (lx, ly) = (dx + DOT_R + 3.0, dy + 4.0);
+        let width = crate::measure::text_size(name).0 * 12.0 / crate::measure::FONT_PX + 6.0;
+        // Edge and center-cross strokes must not show through point names.
+        point_labels.push_str(&format!(
+            r#"<rect x="{:.1}" y="{:.1}" width="{width:.1}" height="19" fill="var(--surface, #fff)"/><text x="{lx:.1}" y="{ly:.1}" font-size="12" fill="currentColor">{}</text>"#,
+            lx - 3.0,
+            ly - 14.0,
             escape_xml(name)
         ));
     }
+    body.push_str(&point_labels);
 
     let total_h = top + side + AXIS_GAP + PAD;
     let mut out = format!(

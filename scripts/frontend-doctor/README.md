@@ -317,6 +317,8 @@ all C4 external tiers and shapes, small treemap cells, and pie rim/wedge
 contrast, including an empty pie. Long labels, narrow numeric cells, all
 pie colors and all treemap palette depths are renderer-backed fixtures.
 Wide Cyrillic labels, complete tags at their rendered font size, and paint
-bounds under different font metrics are also checked.
+bounds under different font metrics are also checked. Fitting ASCII and
+accented names remain complete. Thin pie labels are checked against rasterized
+background pixels, including wedge borders.
 No server is needed. The native
 renderer tests verify fixture freshness; Playwright CI runs the browser checks.

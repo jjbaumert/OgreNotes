@@ -88,7 +88,7 @@ pub(crate) fn truncate_literal_to_width(
     if text.is_empty() || max_width <= 0.0 {
         return String::new();
     }
-    let weight = if bold { 14.0 / 13.0 } else { 1.0 };
+    let weight = if bold { 1.04 } else { 1.0 };
     let advance = |grapheme: &str| {
         let mut em: f64 = 0.0;
         for ch in grapheme.chars() {
@@ -101,6 +101,20 @@ pub(crate) fn truncate_literal_to_width(
                 let width = match base {
                     'Ш' | 'Щ' | 'Ж' | 'Ю' | 'Ы' | 'Ф' | 'ш' | 'щ' | 'ж' | 'ю' | 'ы' | 'ф' | 'Æ'
                     | 'æ' | 'Œ' | 'œ' | '…' => 1.05,
+                    // Advances for the renderer's sans-serif labels. Layout's
+                    // generously padded char_w table is unsuitable for fitting:
+                    // it needlessly drops suffixes from ordinary uppercase names.
+                    'i' | 'l' | 'j' | 'I' | ' ' => 0.28,
+                    'f' | 't' | '.' | ',' | ':' | ';' | '!' | '\'' | '`' => 0.30,
+                    'r' | '(' | ')' | '[' | ']' => 0.36,
+                    'J' | 'c' | 's' | 'v' | 'x' | 'y' | 'z' => 0.50,
+                    'E' => 0.67,
+                    'F' | 'L' | 'T' | 'Z' => 0.61,
+                    'M' | 'm' => 0.84,
+                    'W' | '@' | '%' => 0.95,
+                    'w' => 0.74,
+                    'A'..='Z' => 0.72,
+                    'a'..='z' | '0'..='9' => 0.56,
                     _ => char_w(base),
                 };
                 em = em.max(width);
