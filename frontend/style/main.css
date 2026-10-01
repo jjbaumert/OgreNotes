@@ -6073,6 +6073,10 @@ tr:hover .folder-row-actions,
   width: min(512px, calc(100vw - 16px));
   max-width: calc(100vw - 16px);
 }
+.mermaid-modal .mermaid-error {
+  overflow-wrap: anywhere;
+}
+
 .mermaid-modal-body {
   min-width: 0;
 }

@@ -12,9 +12,9 @@ fs.mkdirSync(out, { recursive: true });
 const original = 'graph TD\nA --> Original\n';
 const remote = 'graph TD\nA --> Remote';
 const draft = 'graph TD\nA --> Draft';
-const source = page => page.locator('.mermaid-block').getAttribute('data-source');
+const source = page => page.locator('.editor-content > .mermaid-block').getAttribute('data-source');
 const waitSource = (page, expected) => page.waitForFunction(
-  value => document.querySelector('.mermaid-block')?.dataset.source === value, expected,
+  value => document.querySelector('.editor-content > .mermaid-block')?.dataset.source === value, expected,
 );
 const save = page => page.locator('.mermaid-modal button.btn-primary').click();
 const cancel = page => page.locator('.mermaid-modal button.btn-secondary').click();
@@ -27,16 +27,16 @@ async function api(context, method, route, data, token) {
   return response.headers()['content-type']?.includes('application/json') ? response.json() : null;
 }
 async function checkLayout(page, label) {
-  const results = await page.locator('.mermaid-modal').evaluate(modal => {
+  const results = await page.locator('.mermaid-modal').evaluate((modal, label) => {
     const elements = [modal, ...modal.querySelectorAll(
       '.mermaid-modal-body, textarea, .calendar-modal-actions, button, [role=alert]',
-    )];
+    ), ...(label.startsWith('parser-') ? modal.querySelectorAll('.mermaid-preview, .mermaid-error') : [])];
     return elements.map(el => {
       const rect = el.getBoundingClientRect();
       return { element: el.className, left: rect.left, right: rect.right,
         client: el.clientWidth, scroll: el.scrollWidth, viewport: innerWidth };
     });
-  });
+  }, label);
   for (const result of results) {
     assert(result.left >= -1 && result.right <= result.viewport + 1, `${label}: ${JSON.stringify(result)}`);
     assert(result.scroll <= result.client + 1, `${label}: horizontal overflow: ${JSON.stringify(result)}`);
@@ -55,7 +55,7 @@ async function checkLayout(page, label) {
   try {
     const users = [];
     for (const name of ['owner', 'editor', 'viewer']) {
-      const context = await browser.newContext();
+      const context = await browser.newContext({ bypassCSP: true });
       contexts.push(context);
       const auth = await api(context, 'POST', '/auth/dev-login', {
         email: `mermaid-${name}-${Date.now()}@ogrenotes.example.com`, name: 'Mermaid test ' + name,
@@ -73,10 +73,15 @@ async function checkLayout(page, label) {
     }
     const url = `${base}/d/${documentId}/probe`;
     const pages = [];
-    const a = await owner.newPage();
-    a.on('pageerror', e => errors.push(e.message));
-    await a.goto(url);
-    await a.locator('[contenteditable=true]').waitFor();
+    for (const [index, user] of users.entries()) {
+      const page = await user.context.newPage();
+      page.on('pageerror', e => errors.push(e.message));
+      await page.goto(url);
+      await page.locator(index === 2 ? '.editor-content-readonly' : '.editor-content[contenteditable=true]').waitFor();
+      await page.locator('.sync-indicator.is-saved').waitFor();
+      pages.push(page);
+    }
+    const [a] = pages;
     await a.locator('[contenteditable=true]').focus();
     await a.evaluate(text => {
       const dt = new DataTransfer();
@@ -85,25 +90,17 @@ async function checkLayout(page, label) {
         new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }),
       );
     }, original);
-    await waitSource(a, original);
-    pages.push(a);
-    for (const user of users.slice(1)) {
-      const page = await user.context.newPage();
-      page.on('pageerror', e => errors.push(e.message));
-      await page.goto(url);
-      await waitSource(page, original);
-      pages.push(page);
-    }
+    for (const page of pages) await waitSource(page, original);
     const [, b, viewer] = pages;
-    await viewer.locator('.mermaid-block').click();
+    await viewer.locator('.editor-content > .mermaid-block').click();
     assert.equal(await viewer.locator('.mermaid-modal').count(), 0);
     assert.equal(await viewer.locator('.mermaid-modal button.btn-primary').count(), 0);
     assert.equal(await source(viewer), original);
     console.log('PASS view-only diagram cannot open or save');
 
-    await a.locator('.mermaid-block').click();
+    await a.locator('.editor-content > .mermaid-block').click();
     await a.locator('.mermaid-source').fill(draft);
-    await b.locator('.mermaid-block').click();
+    await b.locator('.editor-content > .mermaid-block').click();
     await b.locator('.mermaid-source').fill(remote);
     await save(b);
     await waitSource(a, remote);
@@ -122,17 +119,20 @@ async function checkLayout(page, label) {
 
     for (const width of [320, 375]) {
       await a.setViewportSize({ width, height: 800 });
-      await a.locator('.mermaid-block').click();
+      await a.locator('.editor-content > .mermaid-block').click();
       await a.locator('.mermaid-source').waitFor();
       await checkLayout(a, `normal-${width}`);
       await a.locator('.mermaid-source').fill('');
       await a.locator('.mermaid-modal [role=alert]').waitFor();
       assert(await a.locator('.mermaid-modal button.btn-primary').isDisabled());
       await checkLayout(a, `validation-${width}`);
+      await a.locator('.mermaid-source').fill('pie\n' + 'x'.repeat(200));
+      await a.waitForFunction(() => document.querySelector('.mermaid-modal .mermaid-error')?.textContent.includes('x'.repeat(200)));
+      await checkLayout(a, `parser-${width}`);
       await cancel(a);
       await a.locator('.mermaid-modal').waitFor({ state: 'detached' });
     }
-    await a.locator('.mermaid-block').click();
+    await a.locator('.editor-content > .mermaid-block').click();
     await a.locator('.mermaid-source').fill(draft);
     await save(a);
     await a.locator('.mermaid-modal').waitFor({ state: 'detached' });
@@ -146,7 +146,7 @@ async function checkLayout(page, label) {
     trashed = true;
     await a.reload();
     await a.locator('.trash-banner').waitFor();
-    await a.locator('.mermaid-block').click();
+    await a.locator('.editor-content > .mermaid-block').click();
     assert.equal(await a.locator('.mermaid-modal').count(), 0);
     assert.equal(await a.locator('[contenteditable=true]').count(), 0);
     assert.equal(await a.locator('.mermaid-modal button.btn-primary').count(), 0);
