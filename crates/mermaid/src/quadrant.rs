@@ -6,7 +6,6 @@
 //! split by a center cross, quadrant labels in each cell, axis labels on the
 //! edges, and a labeled dot per point.
 
-use crate::theme::{DATA_STROKE, DATA_TEXT};
 use crate::{ParseError, escape_xml};
 
 const PAD: f64 = 20.0;
@@ -16,7 +15,12 @@ const DOT_R: f64 = 5.0;
 const MAX_POINTS: usize = 400;
 
 /// Subtle per-quadrant background tints (TR, TL, BL, BR), Mermaid-style.
-const QUAD_TINT: [&str; 4] = ["#eef4ff", "#fff7e8", "#fdeef6", "#eefaf1"];
+const QUAD_TINT: [&str; 4] = [
+    "var(--mermaid-quadrant-1, #eef4ff)",
+    "var(--mermaid-quadrant-2, #fff7e8)",
+    "var(--mermaid-quadrant-3, #fdeef6)",
+    "var(--mermaid-quadrant-4, #eefaf1)",
+];
 /// Categorical fill palette for the plotted points, cycled.
 const POINT_PALETTE: &[&str] =
     &["#3b82f6", "#ef4444", "#22c55e", "#a855f7", "#f59e0b", "#14b8a6", "#ec4899", "#64748b"];
@@ -147,10 +151,10 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
     }
     // plot border + center cross.
     body.push_str(&format!(
-        r#"<rect x="{l:.1}" y="{top:.1}" width="{side:.1}" height="{side:.1}" fill="none" stroke="{DATA_STROKE}"/>"#
+        r#"<rect x="{l:.1}" y="{top:.1}" width="{side:.1}" height="{side:.1}" fill="none" stroke="currentColor"/>"#
     ));
     body.push_str(&format!(
-        r#"<line x1="{cx0:.1}" y1="{top:.1}" x2="{cx0:.1}" y2="{:.1}" stroke="{DATA_STROKE}"/><line x1="{l:.1}" y1="{cy0:.1}" x2="{:.1}" y2="{cy0:.1}" stroke="{DATA_STROKE}"/>"#,
+        r#"<line x1="{cx0:.1}" y1="{top:.1}" x2="{cx0:.1}" y2="{:.1}" stroke="currentColor"/><line x1="{l:.1}" y1="{cy0:.1}" x2="{:.1}" y2="{cy0:.1}" stroke="currentColor"/>"#,
         top + side,
         l + side
     ));
@@ -167,7 +171,7 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
             if !text.is_empty() {
                 let (qx, qy) = quad_centers[i];
                 body.push_str(&format!(
-                    r#"<text x="{qx:.1}" y="{qy:.1}" text-anchor="middle" fill="{DATA_TEXT}" opacity="0.75">{}</text>"#,
+                    r#"<text x="{qx:.1}" y="{qy:.1}" text-anchor="middle" fill="currentColor" opacity="0.75">{}</text>"#,
                     escape_xml(text)
                 ));
             }
@@ -212,7 +216,7 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
             r#"<circle cx="{dx:.1}" cy="{dy:.1}" r="{DOT_R}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1"/>"#
         ));
         body.push_str(&format!(
-            r#"<text x="{:.1}" y="{:.1}" font-size="12" fill="{DATA_TEXT}">{}</text>"#,
+            r#"<text x="{:.1}" y="{:.1}" font-size="12" fill="currentColor">{}</text>"#,
             dx + DOT_R + 3.0,
             dy + 4.0,
             escape_xml(name)

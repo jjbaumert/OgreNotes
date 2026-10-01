@@ -4,14 +4,19 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[test]
-fn c4_all_tiers_have_a_stable_contrast_fixture() {
-    let output = ogrenotes_mermaid::render(include_str!("fixtures/contrast-c4.mmd"));
-    let svg = output.svg.expect("C4 contrast fixture renders");
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/contrast-c4.svg");
-    if std::env::var("UPDATE_GOLDEN").is_ok() {
-        std::fs::write(path, svg).unwrap();
-    } else {
-        assert_eq!(svg, std::fs::read_to_string(path).unwrap());
+fn contrast_edge_fixtures_match_the_renderer() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for name in ["contrast-c4", "contrast-quadrant-edges"] {
+        let source = std::fs::read_to_string(root.join(format!("{name}.mmd"))).unwrap();
+        let svg = ogrenotes_mermaid::render(&source)
+            .svg
+            .expect("contrast fixture renders");
+        let path = root.join(format!("{name}.svg"));
+        if std::env::var("UPDATE_GOLDEN").is_ok() {
+            std::fs::write(path, svg).unwrap();
+        } else {
+            assert_eq!(svg, std::fs::read_to_string(path).unwrap());
+        }
     }
 }
 
@@ -40,12 +45,15 @@ fn fixed_palette_foregrounds_agree_between_renderer_frontend_and_cli() {
             assert!(cli.status.success());
             let resolved = String::from_utf8(cli.stdout).unwrap();
             assert!(
-                !resolved.contains("var(--mermaid-data-"),
+                !resolved.contains("var(--mermaid-"),
                 "CLI must resolve every data foreground"
             );
-            for property in svg.split("var(--mermaid-data-").skip(1) {
+            for property in svg.split("var(--mermaid-").skip(1) {
                 let (name, fallback) = property.split_once(')').unwrap().0.split_once(',').unwrap();
-                let declaration = format!("--mermaid-data-{name}:");
+                if !name.starts_with("data-") && !name.starts_with("quadrant-") {
+                    continue;
+                }
+                let declaration = format!("--mermaid-{name}:");
                 let actual = css
                     .lines()
                     .map(str::trim)
@@ -55,9 +63,11 @@ fn fixed_palette_foregrounds_agree_between_renderer_frontend_and_cli() {
                     .next()
                     .unwrap()
                     .trim();
-                assert_eq!(actual, fallback.trim(), "{theme} {name}");
+                if theme == "light" {
+                    assert_eq!(actual, fallback.trim(), "{theme} {name}");
+                }
                 assert!(
-                    resolved.contains(&format!("\"{}\"", fallback.trim())),
+                    resolved.contains(&format!("\"{}\"", actual)),
                     "CLI uses the same foreground"
                 );
             }

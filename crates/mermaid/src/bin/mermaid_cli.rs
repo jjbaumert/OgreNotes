@@ -27,6 +27,10 @@ use std::process::{Command, Stdio};
 /// fallbacks the renderer already bakes in; dark values mirror
 /// `frontend/style/tokens-dark.css`. Keep in sync with both.
 const VARS: &[(&str, &str, &str)] = &[
+    ("var(--mermaid-quadrant-1, #eef4ff)", "#eef4ff", "#253348"),
+    ("var(--mermaid-quadrant-2, #fff7e8)", "#fff7e8", "#3d3325"),
+    ("var(--mermaid-quadrant-3, #fdeef6)", "#fdeef6", "#402838"),
+    ("var(--mermaid-quadrant-4, #eefaf1)", "#eefaf1", "#25382d"),
     ("var(--mermaid-data-text, #1a1a1a)", "#1a1a1a", "#1a1a1a"),
     ("var(--mermaid-data-text-muted, #444)", "#444", "#444"),
     ("var(--mermaid-data-stroke, #444)", "#444", "#444"),

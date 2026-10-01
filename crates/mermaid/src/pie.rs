@@ -364,12 +364,14 @@ mod tests {
         // Keep 2px contrasting slice strokes and a distinct fill:none outer rim.
         let svg = render_svg(&parse("pie\n\"A\" : 3\n\"B\" : 1").unwrap());
         assert!(
-            svg.contains(r#"stroke="{DATA_STROKE}" stroke-width="2""#),
+            svg.contains(&format!(r#"stroke="{DATA_STROKE}" stroke-width="2""#)),
             "slice stroke: {svg}"
         );
         assert!(svg.contains(r#"fill-opacity="0.7""#), "pie opacity: {svg}");
         assert!(
-            svg.contains(r#"r="185" fill="none" stroke="{DATA_STROKE}" stroke-width="2""#),
+            svg.contains(&format!(
+                r#"r="185" fill="none" stroke="{DATA_STROKE}" stroke-width="2""#
+            )),
             "outer rim circle: {svg}"
         );
     }

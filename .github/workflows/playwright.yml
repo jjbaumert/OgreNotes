@@ -884,6 +884,9 @@ jobs:
             --base-url http://127.0.0.1:3000 \
             --out ../../artifacts/doctor/mermaid-modal
 
+      - name: Verify Mermaid rendered fixture freshness
+        run: cargo test -p ogrenotes-mermaid --test golden --test theme --locked
+
       - name: Run Mermaid rendered contrast regression
         if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
         working-directory: scripts/frontend-doctor

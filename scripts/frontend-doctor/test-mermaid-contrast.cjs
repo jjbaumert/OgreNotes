@@ -8,16 +8,24 @@ const args=process.argv.slice(2);
 const out=args.includes('--out')?args[args.indexOf('--out')+1]:'/tmp/ogrenotes-mermaid-contrast';
 fs.mkdirSync(out,{recursive:true});
 const {chromium}=require('playwright');
-const kinds=['treemap','pie','xy-chart','quadrant-chart','architecture','c4'];
+const kinds=['treemap','pie','xy-chart','quadrant-chart','architecture','c4','quadrant-edges'];
 (async()=>{
  const browser=await chromium.launch({headless:true,...(process.env.CHROME_BIN?{executablePath:process.env.CHROME_BIN}:{})});
  const page=await browser.newPage({viewport:{width:1800,height:1400}});
  let failed=false;
  try {
  for(const theme of ['light','dark']) for(const kind of kinds){
- const svg=fs.readFileSync(path.join(root,kind==='c4'?'crates/mermaid/tests/fixtures/contrast-c4.svg':`crates/mermaid/tests/golden/${kind}.svg`),'utf8');
+ const svg=fs.readFileSync(path.join(root,kind==='quadrant-edges'?'crates/mermaid/tests/fixtures/contrast-quadrant-edges.svg':kind==='c4'?'crates/mermaid/tests/fixtures/contrast-c4.svg':`crates/mermaid/tests/golden/${kind}.svg`),'utf8');
  const css=['frontend/style/tokens-light.css','frontend/style/tokens-dark.css'].map(p=>fs.readFileSync(path.join(root,p),'utf8')).join('\n');
- await page.setContent(`<html data-theme="${theme}"><style>${css}\nbody{color:var(--color-text-primary);background:var(--color-bg);margin:20px}svg{display:block}</style>${svg}</html>`);
+ await page.setContent(`<html data-theme="${theme}"><style>${css}\nbody{color:var(--color-text);background:var(--color-surface);margin:20px}svg{display:block}</style>${svg}</html>`);
+ const tokens=await page.evaluate(()=>{
+  const root=getComputedStyle(document.documentElement);
+  const body=getComputedStyle(document.body);
+  return {text:root.getPropertyValue('--color-text').trim(),surface:root.getPropertyValue('--color-surface').trim(),foreground:body.color,background:body.backgroundColor};
+ });
+ assert(tokens.text&&tokens.surface, 'Production document colors must be defined');
+ assert.equal(tokens.foreground, theme==='dark'?'rgb(232, 232, 232)':'rgb(26, 26, 26)');
+ assert.equal(tokens.background, theme==='dark'?'rgb(42, 42, 42)':'rgb(255, 255, 255)');
  const samples=await page.evaluate(()=>{
   const rgb=s=>s.match(/[\d.]+/g).slice(0,3).map(Number);
   const alpha=s=>s.startsWith('rgba')?+s.match(/[\d.]+/g)[3]:1;
