@@ -395,220 +395,264 @@ const kinds = [
         {
           // Rasterize glyph coverage and the SVG without text. Sample glyph
           // interiors using the declared foreground, excluding unrelated lines.
-          const pixels = await page.evaluate(async (kind) => {
-            const results = [];
-            for (const root of document.querySelectorAll(
-              ".mermaid-svg > svg",
-            )) {
-              const bounds = root.getBoundingClientRect();
-              const clone = root.cloneNode(true);
-              const originals = [root, ...root.querySelectorAll("*")];
-              const copies = [clone, ...clone.querySelectorAll("*")];
-              const properties = [
-                "fill",
-                "stroke",
-                "fill-opacity",
-                "stroke-opacity",
-                "opacity",
-                "font-family",
-                "font-size",
-                "font-weight",
-                "text-anchor",
-                "dominant-baseline",
-                "paint-order",
-              ];
-              originals.forEach((e, i) => {
-                const computed = getComputedStyle(e);
-                for (const property of properties) {
-                  copies[i].style.setProperty(
-                    property,
-                    computed.getPropertyValue(property),
-                  );
-                }
-              });
-              const width = Math.ceil(bounds.width),
-                height = Math.ceil(bounds.height);
-              clone.setAttribute("width", width);
-              clone.setAttribute("height", height);
-              clone.style.cssText += `;width:${width}px;height:${height}px;max-width:none`;
-              const render = async (imageSvg = clone, transparent = false) => {
-                const url = URL.createObjectURL(
-                  new Blob([new XMLSerializer().serializeToString(imageSvg)], {
-                    type: "image/svg+xml",
-                  }),
-                );
-                try {
-                  const image = new Image();
-                  image.src = url;
-                  await image.decode();
-                  const canvas = document.createElement("canvas");
-                  canvas.width = width;
-                  canvas.height = height;
-                  const ctx = canvas.getContext("2d");
-                  if (!transparent) {
-                    ctx.fillStyle = getComputedStyle(
-                      document.body,
-                    ).backgroundColor;
-                    ctx.fillRect(0, 0, width, height);
+          const measure = () =>
+            page.evaluate(async (kind) => {
+              const results = [];
+              for (const root of document.querySelectorAll(
+                ".mermaid-svg > svg",
+              )) {
+                const bounds = root.getBoundingClientRect();
+                const clone = root.cloneNode(true);
+                const originals = [root, ...root.querySelectorAll("*")];
+                const copies = [clone, ...clone.querySelectorAll("*")];
+                const properties = [
+                  "fill",
+                  "stroke",
+                  "fill-opacity",
+                  "stroke-opacity",
+                  "opacity",
+                  "font-family",
+                  "font-size",
+                  "font-weight",
+                  "text-anchor",
+                  "dominant-baseline",
+                  "paint-order",
+                ];
+                originals.forEach((e, i) => {
+                  const computed = getComputedStyle(e);
+                  for (const property of properties) {
+                    copies[i].style.setProperty(
+                      property,
+                      computed.getPropertyValue(property),
+                    );
                   }
-                  ctx.drawImage(image, 0, 0);
-                  return ctx.getImageData(0, 0, width, height).data;
-                } finally {
-                  URL.revokeObjectURL(url);
-                }
-              };
-              // A glyph-only mask excludes strokes that happen to have the
-              // same color as text within its bounding box.
-              const mask = clone.cloneNode(true);
-              // Expected glyphs must include paint outside clipping viewports.
-              mask
-                .querySelectorAll("svg")
-                .forEach((e) =>
-                  e.style.setProperty("overflow", "visible", "important"),
-                );
-              mask
-                .querySelectorAll(
-                  "rect,path,circle,ellipse,line,polyline,polygon,use,image",
-                )
-                .forEach((e) => {
-                  if (!e.closest("defs")) e.style.visibility = "hidden";
                 });
-              mask.querySelectorAll("text").forEach((e) => {
-                e.style.fill = "#000";
-                e.style.stroke = "none";
-              });
-              // Markers remain paintable even when their referring path is
-              // hidden. They must not be mistaken for glyphs in this mask.
-              mask
-                .querySelectorAll("marker")
-                .forEach((e) => (e.style.display = "none"));
-              const glyphs = await render(mask, true);
-              const ink = await render();
-              clone.querySelectorAll("text").forEach((e) => {
-                if (e.closest("defs")) return;
-                // Keep a glyph halo as background paint while removing its
-                // foreground fill. Rectangular backings remain untouched.
-                if (
-                  getComputedStyle(originals[copies.indexOf(e)]).stroke !==
-                  "none"
-                )
-                  e.style.fill = "none";
-                else e.remove();
-              });
-              const background = await render();
-              const luminance = (c) =>
-                c
-                  .map((v) => {
-                    v /= 255;
-                    return v <= 0.04045
-                      ? v / 12.92
-                      : ((v + 0.055) / 1.055) ** 2.4;
-                  })
-                  .reduce(
-                    (sum, v, i) => sum + v * [0.2126, 0.7152, 0.0722][i],
-                    0,
+                const width = Math.ceil(bounds.width),
+                  height = Math.ceil(bounds.height);
+                clone.setAttribute("width", width);
+                clone.setAttribute("height", height);
+                clone.style.cssText += `;width:${width}px;height:${height}px;max-width:none`;
+                const render = async (
+                  imageSvg = clone,
+                  transparent = false,
+                ) => {
+                  const url = URL.createObjectURL(
+                    new Blob(
+                      [new XMLSerializer().serializeToString(imageSvg)],
+                      {
+                        type: "image/svg+xml",
+                      },
+                    ),
                   );
-              results.push(
-                ...[...root.querySelectorAll("text")]
-                  .filter((t) => t.textContent.trim() && !t.closest("defs"))
-                  .map((t) => {
-                    const box = t.getBoundingClientRect();
-                    const style = getComputedStyle(t);
-                    const color = style.fill
-                      .match(/[\d.]+/g)
-                      .slice(0, 3)
-                      .map(Number);
-                    const paintAlpha =
-                      +style.opacity *
-                      +style.fillOpacity *
-                      (style.fill.startsWith("rgba")
-                        ? +style.fill.match(/[\d.]+/g)[3]
-                        : 1);
-                    let minimum = Infinity,
-                      count = 0,
-                      visible = 0;
-                    for (
-                      let y = Math.floor(box.top - bounds.top);
-                      y < Math.ceil(box.bottom - bounds.top);
-                      y++
-                    ) {
-                      for (
-                        let x = Math.floor(box.left - bounds.left);
-                        x < Math.ceil(box.right - bounds.left);
-                        x++
-                      ) {
-                        if (x < 0 || y < 0 || x >= width || y >= height)
-                          continue;
-                        const offset = (y * width + x) * 4;
-                        if (glyphs[offset + 3] < 128) continue;
-                        const behind = Array.from(
-                          background.slice(offset, offset + 3),
-                        );
-                        const delta = color.map((v, i) => v - behind[i]);
-                        const norm = delta.reduce((sum, v) => sum + v * v, 0);
-                        const contribution =
-                          norm > 0
-                            ? delta.reduce(
-                                (sum, v, i) =>
-                                  sum + v * (ink[offset + i] - behind[i]),
-                                0,
-                              ) / norm
-                            : 0;
-                        if (contribution >= (glyphs[offset + 3] / 255) * 0.8)
-                          visible++;
-                        const foreground = color.map(
-                          (v, i) =>
-                            v * paintAlpha + behind[i] * (1 - paintAlpha),
-                        );
-                        const l = [
-                          luminance(foreground),
-                          luminance(behind),
-                        ].sort((a, b) => a - b);
-                        minimum = Math.min(
-                          minimum,
-                          (l[1] + 0.05) / (l[0] + 0.05),
-                        );
-                        count++;
-                      }
+                  try {
+                    const image = new Image();
+                    image.src = url;
+                    await image.decode();
+                    const canvas = document.createElement("canvas");
+                    canvas.width = width;
+                    canvas.height = height;
+                    const ctx = canvas.getContext("2d");
+                    if (!transparent) {
+                      ctx.fillStyle = getComputedStyle(
+                        document.body,
+                      ).backgroundColor;
+                      ctx.fillRect(0, 0, width, height);
                     }
-                    return {
-                      text: t.textContent,
-                      count,
-                      visibleFraction: visible / count,
-                      contrast: minimum,
-                    };
-                  }),
-              );
-              if (kind.startsWith("architecture")) {
-                const edge = root.querySelector("path[marker-end]");
-                const end = edge.getPointAtLength(edge.getTotalLength());
-                const screen = new DOMPoint(end.x, end.y).matrixTransform(
-                  edge.getScreenCTM(),
-                );
-                const color = getComputedStyle(edge)
-                  .stroke.match(/[\d.]+/g)
-                  .slice(0, 3)
-                  .map(Number);
-                let tipPixels = 0;
-                for (let dy = -2; dy <= 2; dy++)
-                  for (let dx = -2; dx <= 2; dx++) {
-                    const x = Math.floor(screen.x - bounds.x) + dx,
-                      y = Math.floor(screen.y - bounds.y) + dy;
-                    const offset = (y * width + x) * 4;
-                    if (
-                      color.every((v, i) => Math.abs(v - ink[offset + i]) <= 4)
-                    )
-                      tipPixels++;
+                    ctx.drawImage(image, 0, 0);
+                    return ctx.getImageData(0, 0, width, height).data;
+                  } finally {
+                    URL.revokeObjectURL(url);
                   }
-                if (tipPixels === 0)
-                  throw new Error(
-                    `Architecture arrow tip hidden: ${tipPixels} pixels`,
+                };
+                // A glyph-only mask excludes strokes that happen to have the
+                // same color as text within its bounding box.
+                const mask = clone.cloneNode(true);
+                // Expected glyphs must include paint outside clipping viewports.
+                mask
+                  .querySelectorAll("svg")
+                  .forEach((e) =>
+                    e.style.setProperty("overflow", "visible", "important"),
                   );
-                results[results.length - 1].arrowTipPixels = tipPixels;
+                mask
+                  .querySelectorAll(
+                    "rect,path,circle,ellipse,line,polyline,polygon,use,image",
+                  )
+                  .forEach((e) => {
+                    if (!e.closest("defs")) e.style.visibility = "hidden";
+                  });
+                mask.querySelectorAll("text").forEach((e) => {
+                  e.style.fill = "#000";
+                  e.style.stroke = "none";
+                });
+                // Markers remain paintable even when their referring path is
+                // hidden. They must not be mistaken for glyphs in this mask.
+                mask
+                  .querySelectorAll("marker")
+                  .forEach((e) => (e.style.display = "none"));
+                const ink = await render();
+                clone.querySelectorAll("text").forEach((e) => {
+                  if (e.closest("defs")) return;
+                  // Keep a glyph halo as background paint while removing its
+                  // foreground fill. Rectangular backings remain untouched.
+                  if (
+                    getComputedStyle(originals[copies.indexOf(e)]).stroke !==
+                    "none"
+                  )
+                    e.style.fill = "none";
+                  else e.remove();
+                });
+                const background = await render();
+                const luminance = (c) =>
+                  c
+                    .map((v) => {
+                      v /= 255;
+                      return v <= 0.04045
+                        ? v / 12.92
+                        : ((v + 0.055) / 1.055) ** 2.4;
+                    })
+                    .reduce(
+                      (sum, v, i) => sum + v * [0.2126, 0.7152, 0.0722][i],
+                      0,
+                    );
+                results.push(
+                  ...(await Promise.all(
+                    [...root.querySelectorAll("text")]
+                      .filter((t) => t.textContent.trim() && !t.closest("defs"))
+                      .map(async (t) => {
+                        // Isolate this label. A combined mask can mistake a
+                        // neighboring label's ink for an invisible label's glyphs.
+                        const expected = mask.cloneNode(true);
+                        const index = [
+                          ...root.querySelectorAll("text"),
+                        ].indexOf(t);
+                        expected.querySelectorAll("text").forEach((e, i) => {
+                          e.style.setProperty(
+                            "visibility",
+                            i === index ? "visible" : "hidden",
+                            "important",
+                          );
+                          if (i === index) {
+                            e.style.setProperty(
+                              "display",
+                              "inline",
+                              "important",
+                            );
+                            e.style.setProperty("opacity", "1", "important");
+                            e.style.setProperty(
+                              "fill-opacity",
+                              "1",
+                              "important",
+                            );
+                          }
+                        });
+                        const glyphs = await render(expected, true);
+                        const box = t.getBoundingClientRect();
+                        const style = getComputedStyle(t);
+                        const color = style.fill
+                          .match(/[\d.]+/g)
+                          .slice(0, 3)
+                          .map(Number);
+                        const paintAlpha =
+                          +style.opacity *
+                          +style.fillOpacity *
+                          (style.fill.startsWith("rgba")
+                            ? +style.fill.match(/[\d.]+/g)[3]
+                            : 1);
+                        let minimum = Infinity,
+                          count = 0,
+                          visible = 0;
+                        for (
+                          let y = Math.floor(box.top - bounds.top);
+                          y < Math.ceil(box.bottom - bounds.top);
+                          y++
+                        ) {
+                          for (
+                            let x = Math.floor(box.left - bounds.left);
+                            x < Math.ceil(box.right - bounds.left);
+                            x++
+                          ) {
+                            if (x < 0 || y < 0 || x >= width || y >= height)
+                              continue;
+                            const offset = (y * width + x) * 4;
+                            if (glyphs[offset + 3] < 128) continue;
+                            const behind = Array.from(
+                              background.slice(offset, offset + 3),
+                            );
+                            const delta = color.map((v, i) => v - behind[i]);
+                            const norm = delta.reduce(
+                              (sum, v) => sum + v * v,
+                              0,
+                            );
+                            const contribution =
+                              norm > 0
+                                ? delta.reduce(
+                                    (sum, v, i) =>
+                                      sum + v * (ink[offset + i] - behind[i]),
+                                    0,
+                                  ) / norm
+                                : 0;
+                            if (
+                              contribution >=
+                              (glyphs[offset + 3] / 255) * paintAlpha * 0.8
+                            )
+                              visible++;
+                            const foreground = color.map(
+                              (v, i) =>
+                                v * paintAlpha + behind[i] * (1 - paintAlpha),
+                            );
+                            const l = [
+                              luminance(foreground),
+                              luminance(behind),
+                            ].sort((a, b) => a - b);
+                            minimum = Math.min(
+                              minimum,
+                              (l[1] + 0.05) / (l[0] + 0.05),
+                            );
+                            count++;
+                          }
+                        }
+                        return {
+                          text: t.textContent,
+                          count,
+                          visibleFraction: visible / count,
+                          contrast: minimum,
+                        };
+                      }),
+                  )),
+                );
+                if (kind.startsWith("architecture")) {
+                  const edge = root.querySelector("path[marker-end]");
+                  const end = edge.getPointAtLength(edge.getTotalLength());
+                  const screen = new DOMPoint(end.x, end.y).matrixTransform(
+                    edge.getScreenCTM(),
+                  );
+                  const color = getComputedStyle(edge)
+                    .stroke.match(/[\d.]+/g)
+                    .slice(0, 3)
+                    .map(Number);
+                  let tipPixels = 0;
+                  for (let dy = -2; dy <= 2; dy++)
+                    for (let dx = -2; dx <= 2; dx++) {
+                      const x = Math.floor(screen.x - bounds.x) + dx,
+                        y = Math.floor(screen.y - bounds.y) + dy;
+                      const offset = (y * width + x) * 4;
+                      if (
+                        color.every(
+                          (v, i) => Math.abs(v - ink[offset + i]) <= 4,
+                        )
+                      )
+                        tipPixels++;
+                    }
+                  if (tipPixels === 0)
+                    throw new Error(
+                      `Architecture arrow tip hidden: ${tipPixels} pixels`,
+                    );
+                  results[results.length - 1].arrowTipPixels = tipPixels;
+                }
               }
-            }
-            return results;
-          }, kind);
+              return results;
+            }, kind);
+          const pixels = await measure();
           console.log(JSON.stringify({ theme, kind, pixels }));
           assert(
             pixels.length > 0 &&
@@ -618,6 +662,26 @@ const kinds = [
               ),
             "Glyphs must remain visible and contrast with actual background pixels, including borders",
           );
+          if (kind === "pie-adjacent") {
+            await page.evaluate(() => {
+              [...document.querySelectorAll("svg text")]
+                .find((t) => t.textContent === "1%")
+                .style.setProperty("visibility", "hidden", "important");
+            });
+            const hidden = await measure();
+            assert(
+              hidden.some((p) => p.text === "1%" && p.visibleFraction < 0.99),
+              "An adjacent percentage label must not hide a missing label",
+            );
+            console.log(
+              JSON.stringify({ theme, kind, hiddenLabelRejected: true }),
+            );
+            await page.evaluate(() => {
+              [...document.querySelectorAll("svg text")]
+                .find((t) => t.textContent === "1%")
+                .style.removeProperty("visibility");
+            });
+          }
         }
         if (kind === "treemap-wide-m") {
           const labels = await page.locator("svg text").allTextContents();

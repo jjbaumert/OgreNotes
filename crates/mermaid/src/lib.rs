@@ -148,20 +148,26 @@ pub(crate) fn edge_label_svg(label: &str, at: (f64, f64)) -> String {
 }
 
 /// XML-escape a user-supplied string before interpolating into SVG.
-/// Order matters: `&` first so earlier escapes aren't double-escaped.
+/// Each input scalar is escaped once so generated entities are not re-escaped.
 ///
 /// Control characters other than tab / newline / carriage return are
 /// illegal in XML 1.0 even as entities, and a document carrying one is
 /// unparseable (the browser renders nothing for `set_inner_html`). They
 /// carry no meaning in a label, so they are dropped rather than escaped.
 pub(crate) fn escape_xml(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
-        .collect::<String>()
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\t' | '\n' | '\r' => out.push(ch),
+            ch if ch.is_control() => {}
+            ch => out.push(ch),
+        }
+    }
+    out
 }
 
 /// The `accTitle`/`accDescr` accessibility keyword a statement invokes,
@@ -471,6 +477,21 @@ fn cap_output(out: RenderOutput) -> RenderOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xml_escape_matches_reference_for_all_scalars() {
+        let mut text: String = (0..=0x10ffff).filter_map(char::from_u32).collect();
+        text.push_str("&< >\"&amp;&lt;\t\n\r");
+        let reference = text
+            .chars()
+            .filter(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+            .collect::<String>()
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+        assert_eq!(escape_xml(&text), reference);
+    }
 
     #[test]
     fn curved_path_smooths_edges_and_degenerates() {
