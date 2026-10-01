@@ -29,6 +29,7 @@ const kinds = [
   "c4-narrow",
   "c4-hangul",
   "c4-fallback",
+  "c4-indic",
   "architecture-accent",
   "c4-unicode",
   "treemap-numbers",
@@ -66,6 +67,7 @@ const kinds = [
           "c4-narrow",
           "c4-hangul",
           "c4-fallback",
+          "c4-indic",
           "architecture-accent",
           "c4-unicode",
           "treemap-numbers",
@@ -203,13 +205,12 @@ const kinds = [
           });
           console.log(JSON.stringify({ theme, kind, marker }));
           assert(
-            marker.visible >= 40,
-            "Neighboring point marker must remain visible",
+            marker.visible > 0,
+            "Overlapping marker must retain visible palette pixels",
           );
           await page.screenshot({
             path: path.join(out, `${kind}-${theme}.png`),
           });
-          continue;
         }
         const samples = await page.evaluate(() => {
           const rgb = (s) =>
@@ -272,7 +273,8 @@ const kinds = [
                           "polygon",
                           "ellipse",
                         ].includes(e.tagName) &&
-                        !e.closest("defs"),
+                        !e.closest("defs") &&
+                        !e.hasAttribute("mask"),
                     );
                   let background = bg;
                   for (const e of layers.reverse()) {
@@ -656,6 +658,15 @@ const kinds = [
               labels.includes("[ContainerQueue]") &&
               labels.includes("EXTERNAL DB"),
             "Database and queue tags that fit must remain complete",
+          );
+        }
+        if (kind === "c4-indic") {
+          const labels = await page.locator("svg text").allTextContents();
+          assert(labels.includes("क्‍ष"));
+          assert(
+            labels.some(
+              (label) => label.startsWith("क्‍ष") && label.endsWith("…"),
+            ),
           );
         }
         if (kind === "c4-fallback") {

@@ -10,6 +10,7 @@ fn contrast_edge_fixtures_match_the_renderer() {
         "contrast-c4",
         "contrast-c4-hangul",
         "contrast-c4-fallback",
+        "contrast-c4-indic",
         "contrast-architecture-accent",
         "contrast-c4-narrow",
         "contrast-cli-literal",

@@ -80,8 +80,7 @@ fn literal_advance(grapheme: &str, font_size: f64, bold: bool) -> f64 {
     // Ordinary grapheme clusters can contain multiple advancing letters
     // (for example Indic conjuncts). Hangul jamo and joined emoji shape
     // into a single glyph instead of adding each component's advance.
-    let single_glyph = grapheme.contains('\u{200d}')
-        || grapheme.chars().next().is_some_and(|ch| {
+    let single_glyph = grapheme.chars().next().is_some_and(|ch| {
             matches!(ch, '\u{1100}'..='\u{11ff}' | '\u{ac00}'..='\u{d7a3}' | '\u{1f000}'..='\u{1faff}')
         });
     let mut em: f64 = 0.0;

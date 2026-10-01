@@ -24,6 +24,7 @@ const cases = [
     "c4-narrow",
     "c4-hangul",
     "c4-fallback",
+    "c4-indic",
     "architecture-accent",
     "c4-unicode",
     "treemap-wide",
@@ -32,6 +33,7 @@ const cases = [
     "treemap-wide-m",
     "pie-thin",
     "quadrant-wide",
+    "quadrant-marker-overlap",
     "quadrant-literal",
   ].map((x) => `fixtures/contrast-${x}`),
 ];
@@ -95,6 +97,12 @@ function raster(svg, filename) {
             else t.remove();
           });
           return {
+            markers: [...root.querySelectorAll("circle")].map((circle) => ({
+              x: +circle.getAttribute("cx"),
+              y: +circle.getAttribute("cy"),
+              radius: +circle.getAttribute("r"),
+              color: getComputedStyle(circle).fill,
+            })),
             arrows: [...root.querySelectorAll("path[marker-end]")]
               .filter((e) => getComputedStyle(e).stroke !== "none")
               .map((e) => {
@@ -157,7 +165,7 @@ function raster(svg, filename) {
           mask: raster(label.svg, base + `-mask-${i}.png`),
         }));
         const results = await page.evaluate(
-          async ({ ink, background, labels, arrows }) => {
+          async ({ ink, background, labels, arrows, markers }) => {
             async function decode(src) {
               const image = new Image();
               image.src = src;
@@ -227,6 +235,29 @@ function raster(svg, filename) {
                 contrast,
               });
             }
+            for (const marker of markers) {
+              const color = marker.color
+                .match(/[\d.]+/g)
+                .slice(0, 3)
+                .map(Number);
+              let visible = 0;
+              const radius = Math.ceil(marker.radius * 2);
+              for (let dy = -radius; dy <= radius; dy++)
+                for (let dx = -radius; dx <= radius; dx++) {
+                  const x = Math.floor(marker.x * 2) + dx,
+                    y = Math.floor(marker.y * 2) + dy;
+                  if (x < 0 || y < 0 || x >= actual.width || y >= actual.height)
+                    continue;
+                  const offset = (y * actual.width + x) * 4;
+                  if (
+                    color.every(
+                      (v, i) => Math.abs(v - actual.pixels[offset + i]) <= 4,
+                    )
+                  )
+                    visible++;
+                }
+              if (!visible) throw new Error("PNG point marker hidden");
+            }
             for (const arrow of arrows) {
               const color = arrow.color
                 .match(/[\d.]+/g)
@@ -258,6 +289,7 @@ function raster(svg, filename) {
             background,
             labels,
             arrows: input.includes("architecture") ? variants.arrows : [],
+            markers: input.includes("quadrant") ? variants.markers : [],
           },
         );
         console.log(JSON.stringify({ theme, input, results }));

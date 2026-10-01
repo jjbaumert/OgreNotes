@@ -322,8 +322,9 @@ accented names remain complete. Thin pie labels are checked against rasterized
 background pixels, including wedge borders. Rendered foreground checks catch
 backings covering adjacent percentages; architecture arrow tips stay visible.
 Both C4 fixtures cover SystemDb cap strokes. Literal quadrant labels cross plot
-strokes without losing contrast. A separate marker regression covers existing
-dense label/point overlap without changing their positions. Expected glyph
+strokes without losing contrast. Dense label/point overlap is checked for
+text contrast, complete glyphs and surviving marker color. Point positions
+stay unchanged; glyphs can obscure part of an overlapping marker. Expected glyph
 masks disable label clipping, so text cropped by these label viewports cannot pass as fully visible.
 Short leaf cells retain the complete glyph band; overflowing Cyrillic names
 receive ellipses. Fitted C4 and treemap labels use an explicit Arial/Helvetica

@@ -124,8 +124,9 @@ pub struct ParseError { pub message: String, pub line: Option<usize> }
   glyph halos against edges. Arrowheads paint again through a glyph mask, so
   accented names retain contrast without erasing neighboring tips. Quadrant
   plot strokes are masked beneath actual
-  label glyphs, including literal break markup and font fallback, without
-  covering neighboring markers. Percentage backings paint
+  label glyphs, including literal break markup and font fallback. Point
+  positions remain unchanged; labels paint above markers through a glyph
+  mask, clearing marker paint only where labels overlap. Percentage backings paint
   before all percentage text, including adjacent thin wedges.
   Fitting preserves grapheme clusters and measures accented letters by their
   base glyph, retaining full Hangul syllable width after decomposition, so

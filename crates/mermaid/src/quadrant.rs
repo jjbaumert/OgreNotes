@@ -155,8 +155,8 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
         (l + side * 0.25, top + side * 0.75),
         (l + side * 0.75, top + side * 0.75),
     ];
-    // Mask only plot strokes using actual glyph geometry. Font fallback can
-    // exceed heuristic widths; masking glyphs also preserves every marker.
+    // Mask plot strokes using actual glyph geometry. Font fallback can
+    // exceed heuristic widths, so rectangular gaps cannot protect labels.
     let mut holes = String::new();
     for (name, x, y) in &c.points {
         holes.push_str(&format!(
@@ -227,14 +227,31 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
         ));
     }
 
+    // Clear marker paint only at label glyphs, retaining the rest of each
+    // marker. A thin expansion also clears antialiased glyph interiors.
+    let point_mask_body = format!(
+        r##"<rect width="{total_w:.1}" height="{:.1}" fill="#fff"/>{}"##,
+        top + side + AXIS_GAP + PAD,
+        holes.replace("stroke-width=\"3\"", "stroke-width=\"0.3\"")
+    );
+    let point_mask_id = crate::theme::paint_mask_id("quad-points", &point_mask_body);
+    body.push_str(&format!(
+        r#"<defs><mask id="{point_mask_id}" maskUnits="userSpaceOnUse" maskContentUnits="userSpaceOnUse" x="0" y="0" width="{total_w:.1}" height="{:.1}">{point_mask_body}</mask></defs>"#,
+        top + side + AXIS_GAP + PAD
+    ));
+
     // data points: filled, cycled through a categorical palette (Mermaid
     // colors each point) with a thin light outline for contrast on the tints.
-    for (i, (name, x, y)) in c.points.iter().enumerate() {
+    for (i, (_, x, y)) in c.points.iter().enumerate() {
         let (dx, dy) = (px(*x), py(*y));
         let fill = POINT_PALETTE[i % POINT_PALETTE.len()];
         body.push_str(&format!(
-            r#"<circle cx="{dx:.1}" cy="{dy:.1}" r="{DOT_R}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1"/>"#
+            r#"<circle cx="{dx:.1}" cy="{dy:.1}" r="{DOT_R}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1" mask="url(#{point_mask_id})"/>"#
         ));
+    }
+    // Paint names after every marker, so later points cannot cover them.
+    for (name, x, y) in &c.points {
+        let (dx, dy) = (px(*x), py(*y));
         body.push_str(&format!(
             r#"<text x="{:.1}" y="{:.1}" font-size="12" fill="currentColor">{}</text>"#,
             dx + DOT_R + 3.0,
