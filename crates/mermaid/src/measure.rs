@@ -78,10 +78,10 @@ include!(concat!(env!("OUT_DIR"), "/compact_unicode.rs"));
 
 fn is_combining_mark(ch: char) -> bool {
     let value = ch as u32;
-    let index = COMBINING_RANGES.partition_point(|&(_, end)| end < value);
+    let index = COMBINING_RANGES.partition_point(|&range| (range >> 8) + (range & 255) < value);
     COMBINING_RANGES
         .get(index)
-        .is_some_and(|&(start, _)| start <= value)
+        .is_some_and(|&range| (range >> 8) <= value)
 }
 
 fn fitting_bases(ch: char, mut visit: impl FnMut(char)) {
@@ -93,6 +93,9 @@ fn fitting_bases(ch: char, mut visit: impl FnMut(char)) {
         if trailing != 0 {
             visit(char::from_u32(0x11a7 + trailing).unwrap());
         }
+    } else if let Ok(index) = CANONICAL_ASCII.binary_search_by_key(&(ch as u32), |&base| base >> 7)
+    {
+        visit(char::from_u32(CANONICAL_ASCII[index] & 127).unwrap());
     } else if let Ok(index) = CANONICAL_BASES.binary_search_by_key(&ch, |&(base, _)| base) {
         CANONICAL_BASES[index].1.chars().for_each(visit);
     } else {
