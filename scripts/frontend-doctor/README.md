@@ -321,5 +321,8 @@ bounds under different font metrics are also checked. Fitting ASCII and
 accented names remain complete. Thin pie labels are checked against rasterized
 background pixels, including wedge borders. Rendered foreground checks catch
 backings covering adjacent percentages; architecture arrow tips stay visible.
+Both C4 fixtures cover SystemDb cap strokes. Literal quadrant labels cross plot
+strokes without losing contrast. A separate marker regression covers existing
+dense label/point overlap without changing their positions.
 No server is needed. The native
 renderer tests verify fixture freshness; Playwright CI runs the browser checks.

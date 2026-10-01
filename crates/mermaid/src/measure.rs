@@ -75,6 +75,48 @@ pub(crate) fn truncate_to_width(s: &str, max_w: f64) -> String {
     format!("{}…", &s[..bounds[lo]])
 }
 
+fn literal_advance(grapheme: &str, font_size: f64, bold: bool) -> f64 {
+    let weight = if bold { 1.04 } else { 1.0 };
+    let mut em: f64 = 0.0;
+    for ch in grapheme.chars() {
+        decompose_canonical(ch, |base| {
+            if is_combining_mark(base)
+                || matches!(base, '\u{200c}' | '\u{200d}' | '\u{fe0e}' | '\u{fe0f}')
+            {
+                return;
+            }
+            let width = match base {
+                'Ш' | 'Щ' | 'Ж' | 'Ю' | 'Ы' | 'Ф' | 'ш' | 'щ' | 'ж' | 'ю' | 'ы' | 'ф' | 'Æ'
+                | 'æ' | 'Œ' | 'œ' | '…' => 1.05,
+                // Advances for the renderer's sans-serif labels. Layout's
+                // generously padded char_w table is unsuitable for fitting:
+                // it needlessly drops suffixes from ordinary uppercase names.
+                'i' | 'l' | 'j' | 'I' | ' ' => 0.28,
+                'f' | 't' | '.' | ',' | ':' | ';' | '!' | '\'' | '`' => 0.30,
+                'r' | '(' | ')' | '[' | ']' => 0.36,
+                'J' | 'c' | 's' | 'v' | 'x' | 'y' | 'z' => 0.50,
+                'E' => 0.67,
+                'F' | 'L' | 'T' | 'Z' => 0.61,
+                'M' | 'm' => 0.84,
+                'W' | '@' | '%' => 0.95,
+                'w' => 0.74,
+                'A'..='Z' => 0.72,
+                'a'..='z' | '0'..='9' => 0.56,
+                _ => char_w(base),
+            };
+            em = em.max(width);
+        });
+    }
+    em * font_size * weight
+}
+
+/// Width of literal text, without interpreting break markup.
+pub(crate) fn literal_text_width(text: &str, font_size: f64, bold: bool) -> f64 {
+    text.graphemes(true)
+        .map(|g| literal_advance(g, font_size, bold))
+        .sum()
+}
+
 /// Fit literal SVG text at its rendered font size, preserving grapheme clusters.
 /// Accents use their base glyph's advance; wide letters and scripts get wider
 /// estimates. Unlike text_size, <br> is literal text. Callers clip label paint
@@ -88,40 +130,7 @@ pub(crate) fn truncate_literal_to_width(
     if text.is_empty() || max_width <= 0.0 {
         return String::new();
     }
-    let weight = if bold { 1.04 } else { 1.0 };
-    let advance = |grapheme: &str| {
-        let mut em: f64 = 0.0;
-        for ch in grapheme.chars() {
-            decompose_canonical(ch, |base| {
-                if is_combining_mark(base)
-                    || matches!(base, '\u{200c}' | '\u{200d}' | '\u{fe0e}' | '\u{fe0f}')
-                {
-                    return;
-                }
-                let width = match base {
-                    'Ш' | 'Щ' | 'Ж' | 'Ю' | 'Ы' | 'Ф' | 'ш' | 'щ' | 'ж' | 'ю' | 'ы' | 'ф' | 'Æ'
-                    | 'æ' | 'Œ' | 'œ' | '…' => 1.05,
-                    // Advances for the renderer's sans-serif labels. Layout's
-                    // generously padded char_w table is unsuitable for fitting:
-                    // it needlessly drops suffixes from ordinary uppercase names.
-                    'i' | 'l' | 'j' | 'I' | ' ' => 0.28,
-                    'f' | 't' | '.' | ',' | ':' | ';' | '!' | '\'' | '`' => 0.30,
-                    'r' | '(' | ')' | '[' | ']' => 0.36,
-                    'J' | 'c' | 's' | 'v' | 'x' | 'y' | 'z' => 0.50,
-                    'E' => 0.67,
-                    'F' | 'L' | 'T' | 'Z' => 0.61,
-                    'M' | 'm' => 0.84,
-                    'W' | '@' | '%' => 0.95,
-                    'w' => 0.74,
-                    'A'..='Z' => 0.72,
-                    'a'..='z' | '0'..='9' => 0.56,
-                    _ => char_w(base),
-                };
-                em = em.max(width);
-            });
-        }
-        em * font_size * weight
-    };
+    let advance = |grapheme: &str| literal_advance(grapheme, font_size, bold);
     if text.graphemes(true).map(&advance).sum::<f64>() <= max_width + 1e-6 {
         return text.to_string();
     }

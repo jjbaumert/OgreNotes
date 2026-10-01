@@ -9,6 +9,8 @@ fn contrast_edge_fixtures_match_the_renderer() {
     let mut names = vec![
         "contrast-c4",
         "contrast-quadrant-edges",
+        "contrast-quadrant-literal",
+        "contrast-quadrant-marker-overlap",
         "contrast-pie-empty",
         "contrast-treemap-short",
         "contrast-c4-long",

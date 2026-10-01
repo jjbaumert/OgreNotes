@@ -18,6 +18,8 @@ const kinds = [
   "architecture",
   "c4",
   "quadrant-edges",
+  "quadrant-literal",
+  "quadrant-marker-overlap",
   "pie-empty",
   "treemap-short",
   "c4-long",
@@ -46,6 +48,8 @@ const kinds = [
         const fixtures = [
           "c4",
           "quadrant-edges",
+          "quadrant-literal",
+          "quadrant-marker-overlap",
           "pie-empty",
           "treemap-short",
           "c4-long",
@@ -57,17 +61,22 @@ const kinds = [
           "treemap-wide",
         ];
         const inputs =
-          kind === "treemap-palette"
-            ? Array.from(
-                { length: 8 },
-                (_, depth) =>
-                  `crates/mermaid/tests/fixtures/contrast-treemap-depth-${depth}.svg`,
-              )
-            : [
-                fixtures.includes(kind)
-                  ? `crates/mermaid/tests/fixtures/contrast-${kind}.svg`
-                  : `crates/mermaid/tests/golden/${kind}.svg`,
-              ];
+          kind === "c4"
+            ? [
+                "crates/mermaid/tests/fixtures/contrast-c4.svg",
+                "crates/mermaid/tests/golden/c4.svg",
+              ]
+            : kind === "treemap-palette"
+              ? Array.from(
+                  { length: 8 },
+                  (_, depth) =>
+                    `crates/mermaid/tests/fixtures/contrast-treemap-depth-${depth}.svg`,
+                )
+              : [
+                  fixtures.includes(kind)
+                    ? `crates/mermaid/tests/fixtures/contrast-${kind}.svg`
+                    : `crates/mermaid/tests/golden/${kind}.svg`,
+                ];
         const svg = inputs
           .map((input) => fs.readFileSync(path.join(root, input), "utf8"))
           .join("");
@@ -107,6 +116,87 @@ const kinds = [
           tokens.background,
           theme === "dark" ? "rgb(42, 42, 42)" : "rgb(255, 255, 255)",
         );
+        if (kind === "quadrant-marker-overlap") {
+          // Label/point overlap predates this contrast fix and its positions
+          // remain outside scope. This case checks the introduced regression:
+          // plot-stroke treatment must not erase a neighboring point marker.
+          const marker = await page.evaluate(async () => {
+            const root = document.querySelector("svg"),
+              clone = root.cloneNode(true);
+            const originals = [root, ...root.querySelectorAll("*")],
+              copies = [clone, ...clone.querySelectorAll("*")];
+            originals.forEach((e, i) => {
+              const computed = getComputedStyle(e);
+              for (const property of [
+                "fill",
+                "stroke",
+                "font-family",
+                "font-size",
+                "fill-opacity",
+                "stroke-opacity",
+                "opacity",
+              ])
+                copies[i].style.setProperty(
+                  property,
+                  computed.getPropertyValue(property),
+                );
+            });
+            const circle = root.querySelectorAll("circle")[1],
+              point = new DOMPoint(
+                +circle.getAttribute("cx"),
+                +circle.getAttribute("cy"),
+              ).matrixTransform(circle.getScreenCTM());
+            const bounds = root.getBoundingClientRect(),
+              width = Math.ceil(bounds.width),
+              height = Math.ceil(bounds.height);
+            clone.setAttribute("width", width);
+            clone.setAttribute("height", height);
+            clone.style.cssText += `;width:${width}px;height:${height}px;max-width:none`;
+            const url = URL.createObjectURL(
+              new Blob([new XMLSerializer().serializeToString(clone)], {
+                type: "image/svg+xml",
+              }),
+            );
+            try {
+              const image = new Image();
+              image.src = url;
+              await image.decode();
+              const canvas = document.createElement("canvas");
+              canvas.width = width;
+              canvas.height = height;
+              const ctx = canvas.getContext("2d");
+              ctx.drawImage(image, 0, 0);
+              const data = ctx.getImageData(0, 0, width, height).data,
+                color = getComputedStyle(circle)
+                  .fill.match(/[\d.]+/g)
+                  .slice(0, 3)
+                  .map(Number);
+              let visible = 0;
+              for (let dy = -5; dy <= 5; dy++)
+                for (let dx = -5; dx <= 5; dx++) {
+                  const x = Math.floor(point.x - bounds.x) + dx,
+                    y = Math.floor(point.y - bounds.y) + dy,
+                    offset = (y * width + x) * 4;
+                  if (
+                    color.every((v, i) => Math.abs(v - data[offset + i]) <= 3)
+                  )
+                    visible++;
+                }
+              return { visible, color };
+            } finally {
+              URL.revokeObjectURL(url);
+            }
+          });
+          console.log(JSON.stringify({ theme, kind, marker }));
+          assert(
+            marker.visible >= 40,
+            "Neighboring point marker must remain visible",
+          );
+          await page.screenshot({
+            path: path.join(out, `${kind}-${theme}.png`),
+          });
+          continue;
+        }
         const samples = await page.evaluate(() => {
           const rgb = (s) =>
             s

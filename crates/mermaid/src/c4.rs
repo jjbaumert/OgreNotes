@@ -374,8 +374,18 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
         // Person boxes leave room for a head.
         let mut ty = by + 16.0 + if e.shape == Shape::Person { 14.0 } else { 0.0 };
         out.push_str(
-            &fit_element_label(&e.name, e.shape, bw, bh, ty - by, 13.0, true)
-                .render(cx, by, ty, name_text, false),
+            &fit_element_label(&e.name, e.shape, bw, bh, ty - by, 13.0, true).render(
+                cx,
+                by,
+                ty,
+                name_text,
+                false,
+                if e.shape == Shape::Db {
+                    Some(fill)
+                } else {
+                    None
+                },
+            ),
         );
         ty += LINE_H;
         let tag = if e.external {
@@ -385,13 +395,13 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
         };
         out.push_str(
             &fit_element_label(&tag, e.shape, bw, bh, ty - by, 11.0, false)
-                .render(cx, by, ty, tag_text, true),
+                .render(cx, by, ty, tag_text, true, None),
         );
         for d in &e.descr {
             ty += LINE_H;
             out.push_str(
                 &fit_element_label(d, e.shape, bw, bh, ty - by, 11.0, false)
-                    .render(cx, by, ty, desc_text, false),
+                    .render(cx, by, ty, desc_text, false, None),
             );
         }
     }
@@ -410,12 +420,24 @@ struct FittedLabel {
 }
 
 impl FittedLabel {
-    fn render(&self, cx: f64, by: f64, baseline: f64, color: &str, italic: bool) -> String {
+    fn render(
+        &self,
+        cx: f64,
+        by: f64,
+        baseline: f64,
+        color: &str,
+        italic: bool,
+        background: Option<&str>,
+    ) -> String {
         if self.text.is_empty() {
             return String::new();
         }
+        // Database cap strokes must not lighten the fill beneath name glyphs.
+        let halo = background.map(|fill| format!(
+            r#" stroke="{fill}" stroke-width="3" stroke-linejoin="round" paint-order="stroke""#
+        )).unwrap_or_default();
         let text = format!(
-            r#"<text x="{cx:.1}" y="{baseline:.1}" text-anchor="middle" font-size="{}" font-weight="{}" font-style="{}" fill="{color}">{}</text>"#,
+            r#"<text x="{cx:.1}" y="{baseline:.1}" text-anchor="middle" font-size="{}" font-weight="{}" font-style="{}" fill="{color}"{halo}>{}</text>"#,
             self.font_size,
             if self.bold { 700 } else { 400 },
             if italic { "italic" } else { "normal" },

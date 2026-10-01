@@ -149,15 +149,27 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
             r#"<rect x="{qx:.1}" y="{qy:.1}" width="{half:.1}" height="{half:.1}" fill="{tint}"/>"#
         ));
     }
-    // plot border + center cross.
-    body.push_str(&format!(
-        r#"<rect x="{l:.1}" y="{top:.1}" width="{side:.1}" height="{side:.1}" fill="none" stroke="currentColor"/>"#
-    ));
-    body.push_str(&format!(
-        r#"<line x1="{cx0:.1}" y1="{top:.1}" x2="{cx0:.1}" y2="{:.1}" stroke="currentColor"/><line x1="{l:.1}" y1="{cy0:.1}" x2="{:.1}" y2="{cy0:.1}" stroke="currentColor"/>"#,
-        top + side,
-        l + side
-    ));
+    // Knock out plot strokes beneath labels instead of painting rectangles
+    // over the whole scene, which can erase neighboring point markers.
+    let label_bounds: Vec<_> = c
+        .points
+        .iter()
+        .map(|(name, x, y)| {
+            let (lx, ly) = (px(*x) + DOT_R + 3.0, py(*y) + 4.0);
+            let width = crate::measure::literal_text_width(name, 12.0, false) * 1.1 + 8.0;
+            (lx - 3.0, ly - 14.0, width, 19.0)
+        })
+        .collect();
+    for (horizontal, fixed, start, end) in [
+        (true, top, l, l + side),
+        (true, top + side, l, l + side),
+        (false, l, top, top + side),
+        (false, l + side, top, top + side),
+        (false, cx0, top, top + side),
+        (true, cy0, l, l + side),
+    ] {
+        draw_plot_line(&mut body, horizontal, fixed, start, end, &label_bounds);
+    }
 
     // quadrant labels: 1=top-right, 2=top-left, 3=bottom-left, 4=bottom-right.
     let quad_centers = [
@@ -209,24 +221,19 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
 
     // data points: filled, cycled through a categorical palette (Mermaid
     // colors each point) with a thin light outline for contrast on the tints.
-    let mut point_labels = String::new();
     for (i, (name, x, y)) in c.points.iter().enumerate() {
         let (dx, dy) = (px(*x), py(*y));
         let fill = POINT_PALETTE[i % POINT_PALETTE.len()];
         body.push_str(&format!(
             r#"<circle cx="{dx:.1}" cy="{dy:.1}" r="{DOT_R}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1"/>"#
         ));
-        let (lx, ly) = (dx + DOT_R + 3.0, dy + 4.0);
-        let width = crate::measure::text_size(name).0 * 12.0 / crate::measure::FONT_PX + 6.0;
-        // Edge and center-cross strokes must not show through point names.
-        point_labels.push_str(&format!(
-            r#"<rect x="{:.1}" y="{:.1}" width="{width:.1}" height="19" fill="var(--surface, #fff)"/><text x="{lx:.1}" y="{ly:.1}" font-size="12" fill="currentColor">{}</text>"#,
-            lx - 3.0,
-            ly - 14.0,
+        body.push_str(&format!(
+            r#"<text x="{:.1}" y="{:.1}" font-size="12" fill="currentColor">{}</text>"#,
+            dx + DOT_R + 3.0,
+            dy + 4.0,
             escape_xml(name)
         ));
     }
-    body.push_str(&point_labels);
 
     let total_h = top + side + AXIS_GAP + PAD;
     let mut out = format!(
@@ -235,6 +242,46 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
     out.push_str(&body);
     out.push_str("</svg>");
     out
+}
+
+/// Draw a horizontal/vertical stroke with gaps through label bounds. Sorting
+/// and merging intervals keeps output linear and avoids global SVG mask IDs.
+fn draw_plot_line(
+    out: &mut String,
+    horizontal: bool,
+    fixed: f64,
+    start: f64,
+    end: f64,
+    labels: &[(f64, f64, f64, f64)],
+) {
+    let mut gaps: Vec<_> = labels
+        .iter()
+        .filter_map(|&(x, y, w, h)| {
+            let (across, length, along, span) = if horizontal {
+                (y, h, x, w)
+            } else {
+                (x, w, y, h)
+            };
+            if fixed < across || fixed > across + length {
+                return None;
+            }
+            let (a, b) = (along.max(start), (along + span).min(end));
+            (b > a).then_some((a, b))
+        })
+        .collect();
+    gaps.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut cursor = start;
+    for (a, b) in gaps.into_iter().chain(std::iter::once((end, end))) {
+        if a > cursor {
+            let (x1, y1, x2, y2) = if horizontal {
+                (cursor, fixed, a, fixed)
+            } else {
+                (fixed, cursor, fixed, a)
+            };
+            out.push_str(&format!(r#"<line x1="{x1:.1}" y1="{y1:.1}" x2="{x2:.1}" y2="{y2:.1}" stroke="currentColor"/>"#));
+        }
+        cursor = cursor.max(b);
+    }
 }
 
 #[cfg(test)]
