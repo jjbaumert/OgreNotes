@@ -86,6 +86,7 @@ fn literal_advance(grapheme: &str, font_size: f64, bold: bool) -> f64 {
                 return;
             }
             let width = match base {
+                '\u{1100}'..='\u{11ff}' | '\u{a960}'..='\u{a97f}' | '\u{d7b0}'..='\u{d7ff}' => 1.05,
                 'М' | 'Ш' | 'Щ' | 'Ж' | 'Ю' | 'Ы' | 'Ф' | 'ш' | 'щ' | 'ж' | 'ю' | 'ы' | 'ф'
                 | 'Æ' | 'æ' | 'Œ' | 'œ' | '…' => 1.05,
                 // Advances for the renderer's sans-serif labels. Layout's

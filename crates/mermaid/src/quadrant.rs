@@ -180,14 +180,7 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
         side + 2.0,
         side + 2.0
     );
-    // Identical IDs imply identical mask geometry, even across multiple SVGs.
-    // FNV-1a is stable across platforms and compiler versions for goldens.
-    let hash = mask_body
-        .bytes()
-        .fold(0xcbf29ce484222325_u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-        });
-    let mask_id = format!("mmd-quad-strokes-{hash:016x}");
+    let mask_id = crate::theme::paint_mask_id("quad-strokes", &mask_body);
     body.push_str(&format!(
         r#"<defs><mask id="{mask_id}" maskUnits="userSpaceOnUse" maskContentUnits="userSpaceOnUse" x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}">{mask_body}</mask></defs><g mask="url(#{mask_id})"><rect x="{l:.1}" y="{top:.1}" width="{side:.1}" height="{side:.1}" fill="none" stroke="currentColor"/><line x1="{cx0:.1}" y1="{top:.1}" x2="{cx0:.1}" y2="{:.1}" stroke="currentColor"/><line x1="{l:.1}" y1="{cy0:.1}" x2="{:.1}" y2="{cy0:.1}" stroke="currentColor"/></g>"#,
         l-1.0,top-1.0,side+2.0,side+2.0,top+side,l+side

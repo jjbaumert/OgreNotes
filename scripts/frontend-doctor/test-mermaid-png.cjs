@@ -22,6 +22,8 @@ const cases = [
     "c4",
     "c4-long",
     "c4-narrow",
+    "c4-hangul",
+    "architecture-accent",
     "c4-unicode",
     "treemap-wide",
     "treemap-numbers",
@@ -92,6 +94,16 @@ function raster(svg, filename) {
             else t.remove();
           });
           return {
+            arrows: [...root.querySelectorAll("path[marker-end]")]
+              .filter((e) => getComputedStyle(e).stroke !== "none")
+              .map((e) => {
+                const point = e.getPointAtLength(e.getTotalLength());
+                return {
+                  x: point.x,
+                  y: point.y,
+                  color: getComputedStyle(e).stroke,
+                };
+              }),
             background: xml(bg),
             labels: texts.map((text, index) => {
               const mask = root.cloneNode(true);
@@ -144,7 +156,7 @@ function raster(svg, filename) {
           mask: raster(label.svg, base + `-mask-${i}.png`),
         }));
         const results = await page.evaluate(
-          async ({ ink, background, labels }) => {
+          async ({ ink, background, labels, arrows }) => {
             async function decode(src) {
               const image = new Image();
               image.src = src;
@@ -214,9 +226,38 @@ function raster(svg, filename) {
                 contrast,
               });
             }
+            for (const arrow of arrows) {
+              const color = arrow.color
+                .match(/[\d.]+/g)
+                .slice(0, 3)
+                .map(Number);
+              let visible = 0;
+              // CLI exports preserve 2x dimensions; sample the marker core.
+              for (let dy = -4; dy <= 4; dy++)
+                for (let dx = -4; dx <= 4; dx++) {
+                  const x = Math.floor(arrow.x * 2) + dx,
+                    y = Math.floor(arrow.y * 2) + dy;
+                  if (x < 0 || y < 0 || x >= actual.width || y >= actual.height)
+                    continue;
+                  const offset = (y * actual.width + x) * 4;
+                  if (
+                    color.every(
+                      (v, i) => Math.abs(v - actual.pixels[offset + i]) <= 4,
+                    )
+                  )
+                    visible++;
+                }
+              if (visible < 3)
+                throw new Error(`PNG arrow tip hidden: ${visible} pixels`);
+            }
             return results;
           },
-          { ink, background, labels },
+          {
+            ink,
+            background,
+            labels,
+            arrows: input.includes("architecture") ? variants.arrows : [],
+          },
         );
         console.log(JSON.stringify({ theme, input, results }));
         for (const result of results) {

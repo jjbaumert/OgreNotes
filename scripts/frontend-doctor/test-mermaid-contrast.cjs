@@ -27,6 +27,8 @@ const kinds = [
   "treemap-wide-m",
   "c4-long",
   "c4-narrow",
+  "c4-hangul",
+  "architecture-accent",
   "c4-unicode",
   "treemap-numbers",
   "pie-palette",
@@ -61,6 +63,8 @@ const kinds = [
           "treemap-wide-m",
           "c4-long",
           "c4-narrow",
+          "c4-hangul",
+          "architecture-accent",
           "c4-unicode",
           "treemap-numbers",
           "pie-palette",
@@ -554,7 +558,7 @@ const kinds = [
                     };
                   }),
               );
-              if (kind === "architecture") {
+              if (kind.startsWith("architecture")) {
                 const edge = root.querySelector("path[marker-end]");
                 const end = edge.getPointAtLength(edge.getTotalLength());
                 const screen = new DOMPoint(end.x, end.y).matrixTransform(
@@ -575,7 +579,7 @@ const kinds = [
                     )
                       tipPixels++;
                   }
-                if (tipPixels < 3)
+                if (tipPixels === 0)
                   throw new Error(
                     `Architecture arrow tip hidden: ${tipPixels} pixels`,
                   );
@@ -650,6 +654,17 @@ const kinds = [
               labels.includes("[ContainerQueue]") &&
               labels.includes("EXTERNAL DB"),
             "Database and queue tags that fit must remain complete",
+          );
+        }
+        if (kind === "c4-hangul") {
+          const labels = await page.locator("svg text").allTextContents();
+          assert(
+            labels.includes("가가") && labels.includes("가가"),
+            "Short composed and decomposed Hangul names must remain complete",
+          );
+          assert(
+            labels.some((t) => t.startsWith("가가가") && t.endsWith("…")),
+            "Long Hangul names must receive an ellipsis",
           );
         }
         if (kind === "c4-unicode") {

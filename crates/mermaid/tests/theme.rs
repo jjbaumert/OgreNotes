@@ -8,6 +8,8 @@ fn contrast_edge_fixtures_match_the_renderer() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let mut names = vec![
         "contrast-c4",
+        "contrast-c4-hangul",
+        "contrast-architecture-accent",
         "contrast-c4-narrow",
         "contrast-cli-literal",
         "contrast-quadrant-edges",

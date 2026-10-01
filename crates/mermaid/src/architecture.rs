@@ -358,7 +358,56 @@ pub(crate) fn render_svg(a: &Architecture) -> String {
         ));
     }
 
-    out.push_str("</svg>");
+    // Preserve marker paint outside actual glyphs. The halo is wider than
+    // the glyph; it must not erase a neighboring arrow tip. Glyph interiors
+    // still need the surface background for readable foreground contrast.
+    let mut mask = format!(r##"<rect width="{total_w}" height="{total_h}" fill="#fff"/>"##);
+    for (i, node) in a.nodes.iter().enumerate() {
+        if node.is_group || node.junction {
+            continue;
+        }
+        let (cx, cy) = center(i);
+        // Preserve the original edges-before-icons paint order, including
+        // diagrams whose endpoint sides do not match the incoming direction.
+        mask.push_str(&format!(
+            r##"<rect x="{:.1}" y="{:.1}" width="{}" height="{}" fill="#000"/>"##,
+            cx - ICON / 2.0 - 1.0,
+            cy - ICON / 2.0 - 7.0,
+            ICON + 2.0,
+            ICON + 2.0
+        ));
+        mask.push_str(&format!(
+            r##"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="#000" stroke="#000" stroke-width="0.3">{}</text>"##,
+            cy + ICON / 2.0 + 10.0,
+            escape_xml(&clip(&node.title, CELL_W - 10.0))
+        ));
+    }
+    let mask_id = crate::theme::paint_mask_id("arch-names", &mask);
+    out.push_str(&format!(r#"<defs><mask id="{mask_id}" maskUnits="userSpaceOnUse" x="0" y="0" width="{total_w}" height="{total_h}">{mask}</mask></defs><g mask="url(#{mask_id})">"#));
+    // Repaint arrowheads above name halos, without repainting edge stems.
+    // Accented glyph halos can reach a bottom-port tip even when a plain
+    // label does not. Stroke-free paths preserve the marker geometry.
+    for e in &a.edges {
+        if !e.arrow_from && !e.arrow_to {
+            continue;
+        }
+        let (x1, y1) = port_point(center(e.from), e.from_side);
+        let (x2, y2) = port_point(center(e.to), e.to_side);
+        let ms = if e.arrow_from {
+            r#" marker-start="url(#mmd-arch-arrow)""#
+        } else {
+            ""
+        };
+        let me = if e.arrow_to {
+            r#" marker-end="url(#mmd-arch-arrow)""#
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            r#"<path d="M {x1:.1} {y1:.1} L {x2:.1} {y2:.1}" fill="none" stroke="none" stroke-width="1.5"{ms}{me}/>"#
+        ));
+    }
+    out.push_str("</g></svg>");
     out
 }
 

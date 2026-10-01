@@ -121,12 +121,15 @@ pub struct ParseError { pub message: String, pub line: Option<usize> }
   bounded to the label area so font differences cannot spill onto the canvas.
   Pie percentages have opaque palette-matched backings so thin wedge borders
   cannot reduce text contrast. Architecture service names use surface-matched
-  glyph halos against edges while preserving arrow tips. Quadrant plot strokes are masked beneath actual
+  glyph halos against edges. Arrowheads paint again through a glyph mask, so
+  accented names retain contrast without erasing neighboring tips. Quadrant
+  plot strokes are masked beneath actual
   label glyphs, including literal break markup and font fallback, without
   covering neighboring markers. Percentage backings paint
   before all percentage text, including adjacent thin wedges.
   Fitting preserves grapheme clusters and measures accented letters by their
-  base glyph, so short Unicode labels remain complete. Fitted C4 and treemap
+  base glyph, retaining full Hangul syllable width after decomposition, so
+  short Unicode labels remain complete. Fitted C4 and treemap
   text uses an explicit Arial/Helvetica font family for consistent viewer metrics. Single-line leaf names
   are vertically centered in short cells to keep the complete glyph band visible.
 
