@@ -132,7 +132,9 @@ fn main() {
 
     match out.as_deref() {
         None => print!("{image}"),
-        Some(path) if path.to_ascii_lowercase().ends_with(".png") => rasterize(&image, path),
+        Some(path) if path.to_ascii_lowercase().ends_with(".png") => {
+            rasterize(&image, path).unwrap_or_else(|message| die(&message))
+        }
         Some(path) => std::fs::write(path, &image)
             .unwrap_or_else(|e| die(&format!("failed to write {path}: {e}"))),
     }
@@ -283,7 +285,7 @@ fn escape_xml(s: &str) -> String {
 
 /// Prefer librsvg. Preserve ImageMagick installations whose SVG delegate
 /// supports the renderer's clipping, masks and text paint order.
-fn rasterize(svg: &str, out_path: &str) {
+fn rasterize(svg: &str, out_path: &str) -> Result<(), String> {
     match Command::new("rsvg-convert")
         .args([
             "--dpi-x", "192", "--dpi-y", "192", "--zoom", "2", "--output", out_path,
@@ -293,23 +295,23 @@ fn rasterize(svg: &str, out_path: &str) {
         .spawn()
     {
         Ok(child) => {
-            write_image(child, svg, "rsvg-convert");
-            return;
+            return write_image(child, svg, "rsvg-convert");
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => die(&format!("rsvg-convert failed: {e}")),
+        Err(e) => return Err(format!("rsvg-convert failed: {e}")),
     }
     let advanced = needs_advanced_svg(svg);
     for tool in ["magick", "convert"] {
         if advanced && !compatible_svg_delegate(tool) {
             continue;
         }
-        let Ok(mut input) = tempfile::Builder::new().suffix(".svg").tempfile() else {
-            die("failed to create temporary SVG")
-        };
+        let mut input = tempfile::Builder::new()
+            .suffix(".svg")
+            .tempfile()
+            .map_err(|e| format!("failed to create temporary SVG: {e}"))?;
         input
             .write_all(svg.as_bytes())
-            .unwrap_or_else(|e| die(&format!("failed to write temporary SVG: {e}")));
+            .map_err(|e| format!("failed to write temporary SVG: {e}"))?;
         match Command::new(tool)
             .args(["-density", "192"])
             .arg(input.path())
@@ -317,15 +319,13 @@ fn rasterize(svg: &str, out_path: &str) {
             .stderr(Stdio::inherit())
             .status()
         {
-            Ok(status) if status.success() => return,
-            Ok(status) => die(&format!("{tool} exited with {status}")),
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => return Err(format!("{tool} exited with {status}")),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => die(&format!("{tool} failed: {e}")),
+            Err(e) => return Err(format!("{tool} failed: {e}")),
         }
     }
-    die(
-        "PNG export needs rsvg-convert (install librsvg2-bin) or ImageMagick with a compatible SVG delegate (librsvg/Inkscape)",
-    );
+    Err("PNG export needs rsvg-convert (install librsvg2-bin) or ImageMagick with a compatible SVG delegate (librsvg/Inkscape)".into())
 }
 
 fn needs_advanced_svg(svg: &str) -> bool {
@@ -363,17 +363,18 @@ fn needs_advanced_svg(svg: &str) -> bool {
     }
 }
 
-fn write_image(mut child: std::process::Child, svg: &str, tool: &str) {
+fn write_image(mut child: std::process::Child, svg: &str, tool: &str) -> Result<(), String> {
     if let Some(mut stdin) = child.stdin.take() {
         if let Err(e) = stdin.write_all(svg.as_bytes()) {
+            drop(stdin);
             let _ = child.wait();
-            die(&format!("failed to send SVG to {tool}: {e}"));
+            return Err(format!("failed to send SVG to {tool}: {e}"));
         }
     }
     match child.wait() {
-        Ok(status) if status.success() => {}
-        Ok(status) => die(&format!("{tool} exited with {status}")),
-        Err(e) => die(&format!("{tool} failed: {e}")),
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("{tool} exited with {status}")),
+        Err(e) => Err(format!("{tool} failed: {e}")),
     }
 }
 

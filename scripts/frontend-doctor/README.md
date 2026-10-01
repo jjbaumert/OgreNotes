@@ -326,7 +326,8 @@ strokes without losing contrast. A separate marker regression covers existing
 dense label/point overlap without changing their positions. Expected glyph
 masks disable label clipping, so text cropped by these label viewports cannot pass as fully visible.
 Short leaf cells retain the complete glyph band; overflowing Cyrillic names
-receive ellipses.
+receive ellipses. Fitted C4 and treemap labels use an explicit Arial/Helvetica
+family to keep browser and standalone font metrics consistent.
 No server is needed. The native
 renderer tests verify fixture freshness; Playwright CI runs the browser checks.
 
@@ -351,3 +352,4 @@ For the ImageMagick fallback, run `python3 configure-mermaid-imagemagick.py
 directory, `MERMAID_CLI_PATH` to its `bin` directory, and `REFERENCE_MAGICK`
 to the absolute ImageMagick executable before running the PNG regression.
 This configures a real librsvg delegate while the CLI sees only ImageMagick.
+The fallback test also verifies that failed exports remove temporary SVGs.

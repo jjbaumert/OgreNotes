@@ -5,7 +5,7 @@
 //! squarified treemap — each node a rectangle whose area is proportional to
 //! its value, packed to keep cell aspect ratios near 1.
 
-use crate::theme::{DATA_MUTED_TEXT, DATA_TEXT, clip_label_to_rect};
+use crate::theme::{DATA_MUTED_TEXT, DATA_TEXT, LABEL_FONT, clip_label_to_rect};
 use crate::{ParseError, escape_xml, measure};
 
 const PAD: f64 = 4.0;
@@ -188,7 +188,7 @@ struct Rect {
 pub(crate) fn render_svg(t: &Treemap) -> String {
     let title_h = if t.title.is_some() { TITLE_H } else { 0.0 };
     let mut out = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:13px">"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:{LABEL_FONT};font-size:13px">"#,
         w = WIDTH + 2.0 * PAD,
         h = HEIGHT + title_h + 2.0 * PAD,
     );

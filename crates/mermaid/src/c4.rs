@@ -9,8 +9,8 @@
 //! out with the shared boxgraph adapter. Styling directives (`Update*`) are
 //! accepted and ignored.
 
-use crate::theme::{DATA_TEXT, clip_label_to_rect};
-use crate::{escape_xml, measure, ParseError};
+use crate::theme::{DATA_TEXT, LABEL_FONT, clip_label_to_rect};
+use crate::{ParseError, escape_xml, measure};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Shape {
@@ -304,7 +304,7 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
     w = w.max(200.0);
 
     let mut out = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:13px"><defs><marker id="mmd-c4-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker></defs>"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:{LABEL_FONT};font-size:13px"><defs><marker id="mmd-c4-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker></defs>"#
     );
     let dy = title_h;
 

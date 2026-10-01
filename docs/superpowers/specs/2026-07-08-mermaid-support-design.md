@@ -126,7 +126,8 @@ pub struct ParseError { pub message: String, pub line: Option<usize> }
   covering neighboring markers. Percentage backings paint
   before all percentage text, including adjacent thin wedges.
   Fitting preserves grapheme clusters and measures accented letters by their
-  base glyph, so short Unicode labels remain complete. Single-line leaf names
+  base glyph, so short Unicode labels remain complete. Fitted C4 and treemap
+  text uses an explicit Arial/Helvetica font family for consistent viewer metrics. Single-line leaf names
   are vertically centered in short cells to keep the complete glyph band visible.
 
 ### B. Block model (both schemas, mirrored)

@@ -3,7 +3,8 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const assert = require("node:assert/strict");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawnSync } = require("node:child_process");
+const os = require("node:os");
 const { chromium } = require("playwright");
 const root = path.resolve(__dirname, "../..");
 const outputIndex = process.argv.indexOf("--out");
@@ -230,6 +231,36 @@ function raster(svg, filename) {
           );
         }
       }
+    if (process.env.MERMAID_CLI_PATH) {
+      const temporary = fs.mkdtempSync(
+        path.join(os.tmpdir(), "mermaid-png-errors-"),
+      );
+      try {
+        const result = spawnSync(
+          cli,
+          [
+            path.join(root, "crates/mermaid/tests/fixtures/contrast-c4.mmd"),
+            "--out",
+            path.join(temporary, "missing", "diagram.png"),
+          ],
+          { env: { ...cliEnv, TMPDIR: temporary }, encoding: "utf8" },
+        );
+        assert.equal(
+          result.status,
+          1,
+          "Failed PNG export must report an error",
+        );
+        assert.equal(
+          fs.readdirSync(temporary).filter((name) => name.endsWith(".svg"))
+            .length,
+          0,
+          "Failed export must remove temporary SVGs",
+        );
+        console.log("PNG export failure cleanup: PASS");
+      } finally {
+        fs.rmSync(temporary, { recursive: true, force: true });
+      }
+    }
   } finally {
     await browser.close();
   }
