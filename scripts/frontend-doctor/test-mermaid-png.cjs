@@ -31,6 +31,7 @@ const cases = [
     "architecture-accent",
     "c4-unicode",
     "c4-arabic",
+    "c4-fitting",
     "treemap-wide",
     "treemap-numbers",
     "treemap-leaf-short",
@@ -38,6 +39,7 @@ const cases = [
     "pie-thin",
     "quadrant-wide",
     "quadrant-marker-overlap",
+    "quadrant-marker-covered",
     "quadrant-literal",
   ].map((x) => `fixtures/contrast-${x}`),
 ];
@@ -101,12 +103,17 @@ function raster(svg, filename) {
             else t.remove();
           });
           return {
-            markers: [...root.querySelectorAll("circle")].map((circle) => ({
-              x: +circle.getAttribute("cx"),
-              y: +circle.getAttribute("cy"),
-              radius: +circle.getAttribute("r"),
-              color: getComputedStyle(circle).fill,
-            })),
+            markers: [...root.querySelectorAll("circle")]
+              .filter((circle) => getComputedStyle(circle).fill !== "none")
+              .map((circle) => ({
+                x: +circle.getAttribute("cx"),
+                y: +circle.getAttribute("cy"),
+                radius: +(
+                  circle.getAttribute("data-indicator-radius") ||
+                  circle.getAttribute("r")
+                ),
+                color: getComputedStyle(circle).fill,
+              })),
             arrows: [...root.querySelectorAll("path[marker-end]")]
               .filter((e) => getComputedStyle(e).stroke !== "none")
               .map((e) => {

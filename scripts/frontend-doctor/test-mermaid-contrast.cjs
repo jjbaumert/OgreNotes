@@ -21,6 +21,7 @@ const kinds = [
   "quadrant-literal",
   "quadrant-wide",
   "quadrant-marker-overlap",
+  "quadrant-marker-covered",
   "pie-empty",
   "treemap-short",
   "treemap-leaf-short",
@@ -36,6 +37,7 @@ const kinds = [
   "architecture-accent",
   "c4-unicode",
   "c4-arabic",
+  "c4-fitting",
   "treemap-numbers",
   "pie-palette",
   "pie-thin",
@@ -63,6 +65,7 @@ const kinds = [
           "quadrant-literal",
           "quadrant-wide",
           "quadrant-marker-overlap",
+          "quadrant-marker-covered",
           "pie-empty",
           "treemap-short",
           "treemap-leaf-short",
@@ -78,6 +81,7 @@ const kinds = [
           "architecture-accent",
           "c4-unicode",
           "c4-arabic",
+          "c4-fitting",
           "treemap-numbers",
           "pie-palette",
           "pie-thin",
@@ -140,11 +144,11 @@ const kinds = [
           tokens.background,
           theme === "dark" ? "rgb(42, 42, 42)" : "rgb(255, 255, 255)",
         );
-        if (kind === "quadrant-marker-overlap") {
+        if (kind.startsWith("quadrant-marker-")) {
           // Label/point overlap predates this contrast fix and its positions
           // remain outside scope. This case checks the introduced regression:
           // plot-stroke treatment must not erase a neighboring point marker.
-          const marker = await page.evaluate(async () => {
+          const marker = await page.evaluate(async (kind) => {
             const root = document.querySelector("svg"),
               clone = root.cloneNode(true);
             const originals = [root, ...root.querySelectorAll("*")],
@@ -165,7 +169,9 @@ const kinds = [
                   computed.getPropertyValue(property),
                 );
             });
-            const circle = root.querySelectorAll("circle")[1],
+            const circle = [...root.querySelectorAll("circle")].filter(
+                (e) => getComputedStyle(e).fill !== "none",
+              )[kind === "quadrant-marker-covered" ? 0 : 1],
               point = new DOMPoint(
                 +circle.getAttribute("cx"),
                 +circle.getAttribute("cy"),
@@ -195,9 +201,13 @@ const kinds = [
                   .fill.match(/[\d.]+/g)
                   .slice(0, 3)
                   .map(Number);
+              const radius = +(
+                circle.getAttribute("data-indicator-radius") ||
+                circle.getAttribute("r")
+              );
               let visible = 0;
-              for (let dy = -5; dy <= 5; dy++)
-                for (let dx = -5; dx <= 5; dx++) {
+              for (let dy = -radius; dy <= radius; dy++)
+                for (let dx = -radius; dx <= radius; dx++) {
                   const x = Math.floor(point.x - bounds.x) + dx,
                     y = Math.floor(point.y - bounds.y) + dy,
                     offset = (y * width + x) * 4;
@@ -206,11 +216,20 @@ const kinds = [
                   )
                     visible++;
                 }
-              return { visible, color };
+              return {
+                visible,
+                color,
+                x: +circle.getAttribute("cx"),
+                y: +circle.getAttribute("cy"),
+              };
             } finally {
               URL.revokeObjectURL(url);
             }
-          });
+          }, kind);
+          if (kind === "quadrant-marker-covered") {
+            assert.equal(marker.x, 327);
+            assert.equal(marker.y, 109);
+          }
           console.log(JSON.stringify({ theme, kind, marker }));
           assert(
             marker.visible > 0,
@@ -708,6 +727,14 @@ const kinds = [
             "Tall queues retain their identifying name",
           );
           assert.equal(labels.filter((label) => label === "line").length, 30);
+        }
+        if (kind === "c4-fitting") {
+          assert(
+            (await page.locator("svg text").allTextContents()).includes(
+              "Message broker",
+            ),
+            "Names that fit retain their identifying text",
+          );
         }
         if (kind === "c4-arabic") {
           const labels = await page.locator("svg text").allTextContents();

@@ -158,7 +158,16 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
     // Mask plot strokes using actual glyph geometry. Font fallback can
     // exceed heuristic widths, so rectangular gaps cannot protect labels.
     let mut holes = String::new();
+    let mut caption_bounds = Vec::new();
     for (name, x, y) in &c.points {
+        if !name.is_empty() {
+            caption_bounds.push((
+                px(*x) + DOT_R + 3.0,
+                py(*y) - 12.0,
+                crate::measure::text_size(name).0 * 12.0 / 14.0,
+                18.0,
+            ));
+        }
         holes.push_str(&format!(
             r##"<text x="{:.1}" y="{:.1}" font-size="12" fill="#000" stroke="#000" stroke-width="3">{}</text>"##,
             px(*x)+DOT_R+3.0,py(*y)+4.0,escape_xml(name)
@@ -167,6 +176,10 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
     for (i, label) in c.quadrants.iter().enumerate() {
         if let Some(text) = label {
             let (x, y) = quad_centers[i];
+            if !text.is_empty() {
+                let width = crate::measure::text_size(text).0;
+                caption_bounds.push((x - width / 2.0, y - 16.0, width, 21.0));
+            }
             holes.push_str(&format!(
                 r##"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" font-size="14" fill="#000" stroke="#000" stroke-width="3">{}</text>"##,
                 escape_xml(text)
@@ -245,8 +258,22 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
     for (i, (_, x, y)) in c.points.iter().enumerate() {
         let (dx, dy) = (px(*x), py(*y));
         let fill = POINT_PALETTE[i % POINT_PALETTE.len()];
+        // A caption can cover the entire dot. A surrounding ring retains
+        // its palette and location while the same glyph mask protects text.
+        let overlaps_caption = caption_bounds.iter().any(|&(left, top, width, height)| {
+            dx + DOT_R >= left
+                && dx - DOT_R <= left + width
+                && dy + DOT_R >= top
+                && dy - DOT_R <= top + height
+        });
+        let indicator_radius = if overlaps_caption { 17.0 } else { DOT_R };
+        if overlaps_caption {
+            body.push_str(&format!(
+                r#"<circle cx="{dx:.1}" cy="{dy:.1}" r="16" fill="none" stroke="{fill}" stroke-width="2" mask="url(#{point_mask_id})"/>"#
+            ));
+        }
         body.push_str(&format!(
-            r#"<circle cx="{dx:.1}" cy="{dy:.1}" r="{DOT_R}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1" mask="url(#{point_mask_id})"/>"#
+            r#"<circle cx="{dx:.1}" cy="{dy:.1}" r="{DOT_R}" data-indicator-radius="{indicator_radius}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1" mask="url(#{point_mask_id})"/>"#
         ));
     }
     // Paint names after every marker, so later points cannot cover them.

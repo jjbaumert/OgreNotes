@@ -119,11 +119,11 @@ fn base_advance(base: char) -> f64 {
         'J' | 'c' | 's' | 'v' | 'x' | 'y' | 'z' => 0.61,
         'E' => 0.67,
         'F' | 'L' | 'T' | 'Z' => 0.61,
-        'M' | 'm' => 1.00,
+        'M' | 'm' => 0.95,
         'W' | '@' | '%' => 1.00,
         'w' => 0.85,
         'A'..='Z' => 0.72,
-        'a'..='z' | '0'..='9' => 0.65,
+        'a'..='z' | '0'..='9' => 0.60,
         // Joined Arabic letters have narrower advances than the full-em
         // fallback. Keep narrow stems distinct from wide seen/sad families.
         'ا' | 'ل' => 0.35,

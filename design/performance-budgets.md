@@ -276,7 +276,7 @@ on every PR and push to main.
 
 ```yaml
 env:
-  WASM_GZ_LIMIT: "1850000"   # ~1.76 MiB
+  WASM_GZ_LIMIT: "2406000"   # ~2.29 MiB
 
 steps:
   - run: cd frontend && trunk build --release

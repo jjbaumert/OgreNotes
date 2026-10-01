@@ -316,8 +316,8 @@ renderer fixtures and the production CSS. It also checks quadrant edge labels,
 all C4 external tiers and shapes, small treemap cells, and pie rim/wedge
 contrast, including an empty pie. Long labels, narrow numeric cells, all
 pie colors and all treemap palette depths are renderer-backed fixtures.
-Wide Cyrillic, Greek, Hangul and Indic names, complete Arabic names, tags and fallback-font
-captions are also checked. Tall C4 queues retain their identifying names.
+Wide Cyrillic, Greek, Hangul and Indic names, complete Arabic and fitting Latin
+names, tags and fallback-font captions are also checked. Tall C4 queues retain their identifying names.
 Palette-matched glyph halos protect captions without clipping differing font
 metrics. Treemap captions paint after all cells, preserving parent descenders.
 Thin pie labels are checked against rasterized background pixels, including
@@ -325,7 +325,9 @@ wedge borders. Foreground checks catch backings covering adjacent percentages;
 architecture arrow tips stay visible. C4 fixtures cover SystemDb cap strokes.
 Dense quadrant overlap runs text contrast and glyph-visibility checks along
 with checks for surviving marker color. Point positions stay unchanged; glyphs
-can obscure part of an overlapping marker. Long names receive ellipses; C4 and
+can obscure part of an overlapping marker. Caption overlaps receive a masked
+palette-colored ring so a fully covered dot retains a visible indicator.
+Long names receive ellipses; C4 and
 treemap use an explicit Arial/Helvetica family for consistent viewer metrics.
 
 Unicode fitting tables are generated at build time to keep the WASM bundle
