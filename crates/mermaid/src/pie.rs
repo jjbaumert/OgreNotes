@@ -1,6 +1,7 @@
 //! Mermaid `pie` diagram: parser + SVG renderer.
 
-use crate::{escape_xml, ParseError};
+use crate::theme::{DATA_STROKE, DATA_TEXT};
+use crate::{ParseError, escape_xml};
 
 #[derive(Debug)]
 pub(crate) struct Pie {
@@ -133,7 +134,7 @@ const LEGEND_X: f64 = CX + 12.0 * 18.0; // horizontal = 12 * legendRectSize = 21
 const LEGEND_FONT_PX: f64 = 17.0;
 
 /// Render the pie as a self-contained SVG string, matching mermaid.js@11's
-/// `pieRenderer` constants: 450×450 viewport, radius 185, 2px black slice +
+/// `pieRenderer` constants: 450×450 viewport, radius 185, 2px contrasting slice +
 /// outer strokes, `pieOpacity` 0.7, labels at 0.75·R, center-anchored legend.
 pub(crate) fn render_svg(pie: &Pie) -> String {
     let total: f64 = pie.slices.iter().map(|(_, v)| *v).sum();
@@ -174,7 +175,7 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
     // All-zero (or all-sub-1%): an empty outlined circle so the area isn't blank.
     if shown_total == 0.0 {
         svg.push_str(&format!(
-            r#"<circle cx="{CX}" cy="{CY}" r="{R}" fill="none" stroke="black" stroke-width="2"/>"#
+            r#"<circle cx="{CX}" cy="{CY}" r="{R}" fill="none" stroke="currentColor" stroke-width="2"/>"#
         ));
     }
 
@@ -186,19 +187,24 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
         pie.slices[b].1.partial_cmp(&pie.slices[a].1).unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    let mut backings = String::new();
+    let mut labels = String::new();
     let mut angle = -std::f64::consts::FRAC_PI_2; // 12 o'clock
     for &i in &order {
         let value = pie.slices[i].1;
         let frac = value / shown_total;
         let fill = PALETTE[i % PALETTE.len()];
         let pct = (value / total * 100.0).round() as i64;
-        let slice_attrs = format!(r#"fill="{fill}" fill-opacity="0.7" stroke="black" stroke-width="2""#);
+        let slice_attrs =
+            format!(r#"fill="{fill}" fill-opacity="0.7" stroke="{DATA_STROKE}" stroke-width="2""#);
         if frac >= 1.0 {
             // A lone full wedge: a zero-length arc is invisible, so draw a disc.
             svg.push_str(&format!(
                 r#"<circle cx="{CX}" cy="{CY}" r="{R}" {slice_attrs}/>"#
             ));
-            svg.push_str(&slice_label(CX, CY, pct));
+            let (backing, label) = slice_label(CX, CY, pct, fill);
+            backings.push_str(&backing);
+            labels.push_str(&label);
         } else {
             let sweep = frac * std::f64::consts::TAU;
             let (x0, y0) = (CX + R * angle.cos(), CY + R * angle.sin());
@@ -212,7 +218,9 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
             // equal), so labels sit further out and thin wedges overflow.
             let mid = angle + sweep / 2.0;
             let (lx, ly) = (CX + TEXT_POS * R * mid.cos(), CY + TEXT_POS * R * mid.sin());
-            svg.push_str(&slice_label(lx, ly, pct));
+            let (backing, label) = slice_label(lx, ly, pct, fill);
+            backings.push_str(&backing);
+            labels.push_str(&label);
             angle = end;
         }
     }
@@ -220,9 +228,15 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
     // Distinct outer rim on top of the slices.
     if shown_total > 0.0 {
         svg.push_str(&format!(
-            r#"<circle cx="{CX}" cy="{CY}" r="{R}" fill="none" stroke="black" stroke-width="2"/>"#
+            r#"<circle cx="{CX}" cy="{CY}" r="{R}" fill="none" stroke="{DATA_STROKE}" stroke-width="2"/>"#
         ));
     }
+
+    // Paint labels after every slice/border so thin neighboring wedges cannot
+    // overwrite a label's backing with a dark boundary.
+    // Backings must all precede text, including neighboring thin wedges.
+    svg.push_str(&backings);
+    svg.push_str(&labels);
 
     // Legend, source order, anchored to the pie center: swatch 18×18 at
     // (CX+216, CY + i·22 - 11n); text offset by (22, 14).
@@ -245,10 +259,20 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
     svg
 }
 
-/// A centered percentage label for a wedge (17px, theme text color).
-fn slice_label(x: f64, y: f64, pct: i64) -> String {
-    format!(
-        r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" dominant-baseline="middle" fill="currentColor" style="font-size:17px">{pct}%</text>"#
+/// A centered percentage label with an opaque palette-matched backing.
+/// Thin wedges are narrower than the text; their borders must not show through.
+fn slice_label(x: f64, y: f64, pct: i64, fill: &str) -> (String, String) {
+    let label = format!("{pct}%");
+    let width = crate::measure::text_size(&label).0 * 17.0 / crate::measure::FONT_PX + 8.0;
+    (
+        format!(
+            r#"<rect class="pie-percentage-background" x="{left:.1}" y="{top:.1}" width="{width:.1}" height="26" rx="2" fill="{fill}"/>"#,
+            left = x - width / 2.0,
+            top = y - 13.0,
+        ),
+        format!(
+            r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" dominant-baseline="middle" fill="{DATA_TEXT}" style="font-size:17px">{label}</text>"#
+        ),
     )
 }
 
@@ -358,13 +382,18 @@ mod tests {
     }
 
     #[test]
-    fn slice_has_black_stroke_and_outer_circle() {
-        // Defect 2: 2px black slice strokes + a distinct fill:none outer rim.
+    fn slice_has_contrasting_stroke_and_outer_circle() {
+        // Keep 2px contrasting slice strokes and a distinct fill:none outer rim.
         let svg = render_svg(&parse("pie\n\"A\" : 3\n\"B\" : 1").unwrap());
-        assert!(svg.contains(r#"stroke="black" stroke-width="2""#), "slice stroke: {svg}");
+        assert!(
+            svg.contains(&format!(r#"stroke="{DATA_STROKE}" stroke-width="2""#)),
+            "slice stroke: {svg}"
+        );
         assert!(svg.contains(r#"fill-opacity="0.7""#), "pie opacity: {svg}");
         assert!(
-            svg.contains(r#"r="185" fill="none" stroke="black" stroke-width="2""#),
+            svg.contains(&format!(
+                r#"r="185" fill="none" stroke="{DATA_STROKE}" stroke-width="2""#
+            )),
             "outer rim circle: {svg}"
         );
     }
@@ -600,11 +629,11 @@ mod tests {
         let svg = render_svg(&p);
         assert_eq!(svg.matches("<text x=\"463\"").count(), n, "one legend row per slice");
         // Slice `PALETTE.len()` wraps around to the first palette color, so
-        // palette[0] is used by two slices (wedge fill + legend swatch each).
+        // palette[0] is used by two slices (wedge, label backing, and legend).
         assert_eq!(
             svg.matches(PALETTE[0]).count(),
-            4,
-            "slices 0 and PALETTE.len() each use palette[0] for wedge fill + legend swatch"
+            6,
+            "slices 0 and PALETTE.len() each use palette[0] for wedge, backing, and swatch"
         );
     }
 }

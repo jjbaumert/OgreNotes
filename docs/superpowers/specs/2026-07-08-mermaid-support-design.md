@@ -113,7 +113,23 @@ pub struct ParseError { pub message: String, pub line: Option<usize> }
   missing `pie` header is an error.
 - **Pie SVG:** self-contained `<svg>` with slices, a legend, and optional raw
   values when `showData` is set. Slice fills use a ported 8-hue palette; text
-  uses `currentColor` so it tracks the light/dark theme.
+  uses `currentColor` on the canvas so it tracks the light/dark theme.
+  Labels on fixed light data fills use matching dark foreground tokens in
+  both themes; C4 retains light text on its darker person/system fills.
+  C4 element text and treemap values use grapheme-safe ellipses for long
+  labels; source editing and Markdown export retain the complete labels.
+  Palette-matched glyph halos keep fallback fonts and narrow queue caps
+  readable without clipping names or descenders. Treemap cells paint before
+  all captions so child fills cannot cover parent descenders. Pie percentages
+  have opaque palette-matched backings, painted before all percentage text.
+  Architecture service names use surface-matched glyph halos against edges.
+  Arrowheads paint again through a glyph mask, preserving accented names
+  and neighboring tips. Quadrant strokes and marker paint are masked beneath
+  actual label glyphs; point positions remain unchanged and labels paint last.
+  Fitting accounts for advancing letters in Indic conjuncts; Hangul and emoji
+  retain a single glyph advance. C4 and treemap use an explicit Arial/Helvetica
+  font family for consistent browser and standalone metrics. Short leaf names
+  are centered vertically while retaining the complete glyph band.
 
 ### B. Block model (both schemas, mirrored)
 

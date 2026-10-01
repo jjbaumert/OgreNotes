@@ -5,7 +5,10 @@
 //! squarified treemap — each node a rectangle whose area is proportional to
 //! its value, packed to keep cell aspect ratios near 1.
 
-use crate::{escape_xml, measure, ParseError};
+use std::fmt::Write;
+
+use crate::theme::{DATA_MUTED_TEXT, DATA_TEXT, LABEL_FONT};
+use crate::{ParseError, escape_xml, measure};
 
 const PAD: f64 = 4.0;
 const WIDTH: f64 = 720.0;
@@ -187,28 +190,32 @@ struct Rect {
 pub(crate) fn render_svg(t: &Treemap) -> String {
     let title_h = if t.title.is_some() { TITLE_H } else { 0.0 };
     let mut out = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:13px">"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:{LABEL_FONT};font-size:13px">"#,
         w = WIDTH + 2.0 * PAD,
         h = HEIGHT + title_h + 2.0 * PAD,
     );
     if let Some(title) = &t.title {
-        out.push_str(&format!(
+        write!(out,
             r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" font-weight="bold" font-size="18" fill="currentColor">{}</text>"#,
             WIDTH / 2.0 + PAD,
             PAD + 20.0,
             escape_xml(title)
-        ));
+        ).unwrap();
     }
     // Lay the roots out as one virtual level filling the canvas.
     let area = Rect { x: PAD, y: PAD + title_h, w: WIDTH, h: HEIGHT };
-    layout_level(&t.roots, area, 0, &mut out);
+    // Paint every cell before captions, so child fills cannot cover a
+    // parent caption whose fallback-font descenders cross the header edge.
+    let mut labels = String::new();
+    layout_level(&t.roots, area, 0, &mut out, &mut labels);
+    out.push_str(&labels);
     out.push_str("</svg>");
     out
 }
 
 /// Squarify `nodes` into `rect`, then recurse into each branch (reserving a
 /// header strip for its label).
-fn layout_level(nodes: &[Node], rect: Rect, depth: usize, out: &mut String) {
+fn layout_level(nodes: &[Node], rect: Rect, depth: usize, out: &mut String, labels: &mut String) {
     if nodes.is_empty() || rect.w < 2.0 || rect.h < 2.0 {
         return;
     }
@@ -216,63 +223,64 @@ fn layout_level(nodes: &[Node], rect: Rect, depth: usize, out: &mut String) {
     let rects = squarify(&weights, rect);
     for (node, r) in nodes.iter().zip(rects) {
         let fill = PALETTE[depth % PALETTE.len()];
-        out.push_str(&format!(
+        write!(out,
             r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1.5"/>"#,
             r.x, r.y, r.w.max(0.0), r.h.max(0.0)
-        ));
+        ).unwrap();
         if node.children.is_empty() {
-            draw_leaf_label(node, r, out);
+            draw_leaf_label(node, r, fill, labels);
         } else {
             // Branch: header strip with the name, children in the remainder.
-            draw_header_label(node, r, out);
+            draw_header_label(node, r, fill, labels);
             if r.h > HEADER_H + 4.0 {
                 let inner = Rect { x: r.x, y: r.y + HEADER_H, w: r.w, h: r.h - HEADER_H };
-                layout_level(&node.children, inner, depth + 1, out);
+                layout_level(&node.children, inner, depth + 1, out, labels);
             }
         }
     }
 }
 
-fn draw_header_label(node: &Node, r: Rect, out: &mut String) {
-    if r.w < 24.0 {
+fn draw_header_label(node: &Node, r: Rect, background: &str, out: &mut String) {
+    // Match leaf labels: omit text when its cell cannot contain it.
+    if r.w < 24.0 || r.h < HEADER_H {
         return;
     }
-    out.push_str(&format!(
-        r#"<text x="{:.1}" y="{:.1}" font-weight="600" font-size="12" fill="currentColor">{}</text>"#,
+    write!(out,
+        r#"<text x="{:.1}" y="{:.1}" font-weight="600" font-size="12" fill="{DATA_TEXT}" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke">{}</text>"#,
         r.x + 5.0,
         r.y + 13.0,
-        escape_xml(&clip(&node.name, r.w - 10.0))
-    ));
+        escape_xml(&clip(&node.name, r.w - 10.0, 12.0, true))
+    ).unwrap();
 }
 
-fn draw_leaf_label(node: &Node, r: Rect, out: &mut String) {
+fn draw_leaf_label(node: &Node, r: Rect, background: &str, out: &mut String) {
     if r.w < 24.0 || r.h < 18.0 {
         return;
     }
     let cx = r.x + r.w / 2.0;
     let cy = r.y + r.h / 2.0;
-    out.push_str(&format!(
-        r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="currentColor">{}</text>"#,
-        cy - 2.0,
-        escape_xml(&clip(&node.name, r.w - 8.0))
-    ));
+    // With no numeric line, center the complete glyph band in short cells.
+    let two_lines = node.value.is_some() && r.h > 34.0;
+    let name_baseline = if two_lines { cy - 2.0 } else { cy + 4.0 };
+    write!(out,
+        r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" fill="{DATA_TEXT}" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke">{}</text>"#,
+        name_baseline,
+        escape_xml(&clip(&node.name, r.w - 8.0, 13.0, false))
+    ).unwrap();
     if let Some(v) = node.value {
         if r.h > 34.0 {
-            out.push_str(&format!(
-                r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-size="11" fill="var(--color-text-secondary, #666)">{}</text>"#,
+            write!(out,
+                r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-size="11" fill="{DATA_MUTED_TEXT}" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke">{}</text>"#,
                 cy + 14.0,
-                fmt_num(v)
-            ));
+                escape_xml(&clip(&fmt_num(v), r.w - 8.0, 11.0, false))
+            ).unwrap();
         }
     }
 }
 
 /// Truncate `s` with an ellipsis to fit `max_w` pixels (approx).
-fn clip(s: &str, max_w: f64) -> String {
-    if max_w < 8.0 {
-        return s.to_string();
-    }
-    measure::truncate_to_width(s, max_w)
+fn clip(s: &str, max_w: f64, font_size: f64, bold: bool) -> String {
+    measure::truncate_literal_to_width(s, max_w, font_size, bold)
 }
 
 fn fmt_num(v: f64) -> String {

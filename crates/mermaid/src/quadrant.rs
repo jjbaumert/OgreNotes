@@ -6,7 +6,7 @@
 //! split by a center cross, quadrant labels in each cell, axis labels on the
 //! edges, and a labeled dot per point.
 
-use crate::{escape_xml, ParseError};
+use crate::{ParseError, escape_xml};
 
 const PAD: f64 = 20.0;
 const PLOT: f64 = 380.0; // square plot side
@@ -15,7 +15,12 @@ const DOT_R: f64 = 5.0;
 const MAX_POINTS: usize = 400;
 
 /// Subtle per-quadrant background tints (TR, TL, BL, BR), Mermaid-style.
-const QUAD_TINT: [&str; 4] = ["#eef4ff", "#fff7e8", "#fdeef6", "#eefaf1"];
+const QUAD_TINT: [&str; 4] = [
+    "var(--mermaid-quadrant-1, #eef4ff)",
+    "var(--mermaid-quadrant-2, #fff7e8)",
+    "var(--mermaid-quadrant-3, #fdeef6)",
+    "var(--mermaid-quadrant-4, #eefaf1)",
+];
 /// Categorical fill palette for the plotted points, cycled.
 const POINT_PALETTE: &[&str] =
     &["#3b82f6", "#ef4444", "#22c55e", "#a855f7", "#f59e0b", "#14b8a6", "#ec4899", "#64748b"];
@@ -144,23 +149,56 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
             r#"<rect x="{qx:.1}" y="{qy:.1}" width="{half:.1}" height="{half:.1}" fill="{tint}"/>"#
         ));
     }
-    // plot border + center cross.
+    let quad_centers = [
+        (l + side * 0.75, top + side * 0.25),
+        (l + side * 0.25, top + side * 0.25),
+        (l + side * 0.25, top + side * 0.75),
+        (l + side * 0.75, top + side * 0.75),
+    ];
+    // Mask plot strokes using actual glyph geometry. Font fallback can
+    // exceed heuristic widths, so rectangular gaps cannot protect labels.
+    let mut holes = String::new();
+    let mut caption_bounds = Vec::new();
+    for (name, x, y) in &c.points {
+        if !name.is_empty() {
+            caption_bounds.push((
+                px(*x) + DOT_R + 3.0,
+                py(*y) - 12.0,
+                crate::measure::literal_overlap_width(name, 12.0),
+                18.0,
+            ));
+        }
+        holes.push_str(&format!(
+            r##"<text x="{:.1}" y="{:.1}" font-size="12" fill="#000" stroke="#000" stroke-width="3">{}</text>"##,
+            px(*x)+DOT_R+3.0,py(*y)+4.0,escape_xml(name)
+        ));
+    }
+    for (i, label) in c.quadrants.iter().enumerate() {
+        if let Some(text) = label {
+            let (x, y) = quad_centers[i];
+            if !text.is_empty() {
+                let width = crate::measure::literal_overlap_width(text, 14.0);
+                caption_bounds.push((x - width / 2.0, y - 16.0, width, 21.0));
+            }
+            holes.push_str(&format!(
+                r##"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" font-size="14" fill="#000" stroke="#000" stroke-width="3">{}</text>"##,
+                escape_xml(text)
+            ));
+        }
+    }
+    let mask_body = format!(
+        r##"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="#fff"/>{holes}"##,
+        l - 1.0,
+        top - 1.0,
+        side + 2.0,
+        side + 2.0
+    );
+    let mask_id = crate::theme::paint_mask_id("quad-strokes", &mask_body);
     body.push_str(&format!(
-        r#"<rect x="{l:.1}" y="{top:.1}" width="{side:.1}" height="{side:.1}" fill="none" stroke="currentColor"/>"#
-    ));
-    body.push_str(&format!(
-        r#"<line x1="{cx0:.1}" y1="{top:.1}" x2="{cx0:.1}" y2="{:.1}" stroke="currentColor"/><line x1="{l:.1}" y1="{cy0:.1}" x2="{:.1}" y2="{cy0:.1}" stroke="currentColor"/>"#,
-        top + side,
-        l + side
+        r#"<defs><mask id="{mask_id}" maskUnits="userSpaceOnUse" maskContentUnits="userSpaceOnUse" x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}">{mask_body}</mask></defs><g mask="url(#{mask_id})"><rect x="{l:.1}" y="{top:.1}" width="{side:.1}" height="{side:.1}" fill="none" stroke="currentColor"/><line x1="{cx0:.1}" y1="{top:.1}" x2="{cx0:.1}" y2="{:.1}" stroke="currentColor"/><line x1="{l:.1}" y1="{cy0:.1}" x2="{:.1}" y2="{cy0:.1}" stroke="currentColor"/></g>"#,
+        l-1.0,top-1.0,side+2.0,side+2.0,top+side,l+side
     ));
 
-    // quadrant labels: 1=top-right, 2=top-left, 3=bottom-left, 4=bottom-right.
-    let quad_centers = [
-        (l + side * 0.75, top + side * 0.25), // 1
-        (l + side * 0.25, top + side * 0.25), // 2
-        (l + side * 0.25, top + side * 0.75), // 3
-        (l + side * 0.75, top + side * 0.75), // 4
-    ];
     for (i, label) in c.quadrants.iter().enumerate() {
         if let Some(text) = label {
             if !text.is_empty() {
@@ -173,6 +211,7 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
         }
     }
 
+    let axis_start = body.len();
     // axis labels: x below (left/right ends), y on the left (bottom/top ends).
     if let Some((left, right)) = &c.x_axis {
         let ty = top + side + 16.0;
@@ -202,14 +241,53 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
         ));
     }
 
+    // Reuse the exact generated axis geometry, including rotated y labels.
+    // Label text is XML-escaped, so this paint-attribute substitution cannot
+    // change literal source text. Rings must clear axis glyphs as well.
+    holes.push_str(&body[axis_start..].replace(
+        "fill=\"currentColor\"",
+        "fill=\"#000\" stroke=\"#000\" stroke-width=\"3\"",
+    ));
+
+    // Clear marker paint only at label glyphs, retaining the rest of each
+    // marker. A thin expansion also clears antialiased glyph interiors.
+    let point_mask_body = format!(
+        r##"<rect width="{total_w:.1}" height="{:.1}" fill="#fff"/>{}"##,
+        top + side + AXIS_GAP + PAD,
+        holes.replace("stroke-width=\"3\"", "stroke-width=\"0.3\"")
+    );
+    let point_mask_id = crate::theme::paint_mask_id("quad-points", &point_mask_body);
+    body.push_str(&format!(
+        r#"<defs><mask id="{point_mask_id}" maskUnits="userSpaceOnUse" maskContentUnits="userSpaceOnUse" x="0" y="0" width="{total_w:.1}" height="{:.1}">{point_mask_body}</mask></defs>"#,
+        top + side + AXIS_GAP + PAD
+    ));
+
     // data points: filled, cycled through a categorical palette (Mermaid
     // colors each point) with a thin light outline for contrast on the tints.
-    for (i, (name, x, y)) in c.points.iter().enumerate() {
+    for (i, (_, x, y)) in c.points.iter().enumerate() {
         let (dx, dy) = (px(*x), py(*y));
         let fill = POINT_PALETTE[i % POINT_PALETTE.len()];
+        // A caption can cover the entire dot. A surrounding ring retains
+        // its palette and location while the same glyph mask protects text.
+        let overlaps_caption = caption_bounds.iter().any(|&(left, top, width, height)| {
+            dx + DOT_R >= left
+                && dx - DOT_R <= left + width
+                && dy + DOT_R >= top
+                && dy - DOT_R <= top + height
+        });
+        let indicator_radius = if overlaps_caption { 17.0 } else { DOT_R };
+        if overlaps_caption {
+            body.push_str(&format!(
+                r#"<circle cx="{dx:.1}" cy="{dy:.1}" r="16" fill="none" stroke="{fill}" stroke-width="2" mask="url(#{point_mask_id})"/>"#
+            ));
+        }
         body.push_str(&format!(
-            r#"<circle cx="{dx:.1}" cy="{dy:.1}" r="{DOT_R}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1"/>"#
+            r#"<circle cx="{dx:.1}" cy="{dy:.1}" r="{DOT_R}" data-indicator-radius="{indicator_radius}" fill="{fill}" stroke="var(--surface, #fff)" stroke-width="1" mask="url(#{point_mask_id})"/>"#
         ));
+    }
+    // Paint names after every marker, so later points cannot cover them.
+    for (name, x, y) in &c.points {
+        let (dx, dy) = (px(*x), py(*y));
         body.push_str(&format!(
             r#"<text x="{:.1}" y="{:.1}" font-size="12" fill="currentColor">{}</text>"#,
             dx + DOT_R + 3.0,

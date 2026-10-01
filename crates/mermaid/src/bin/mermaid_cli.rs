@@ -5,14 +5,14 @@
 //! upstream mermaid.ai rendering. The `--mermaid-*` theme custom-properties and
 //! `currentColor` are resolved to concrete colors for the chosen theme, so the
 //! result is faithful in a browser *and* rasterizes correctly to PNG (via
-//! ImageMagick) without a CSS-aware SVG renderer.
+//! librsvg), including clipped labels, masks and glyph halos.
 //!
 //!   cargo run -p ogrenotes-mermaid --bin mermaid_cli -- [OPTIONS] [INPUT]
 //!
 //! INPUT   Path to a .mmd/.mermaid file, or `-` / omitted to read stdin.
 //!
 //! OPTIONS
-//!   -o, --out <PATH>   Write here. `.png` rasterizes via ImageMagick;
+//!   -o, --out <PATH>   Write here. `.png` uses librsvg or a compatible ImageMagick SVG delegate;
 //!                      any other extension (or none) writes SVG. Omit for
 //!                      SVG on stdout.
 //!   -t, --theme <T>    `light` (default) or `dark`.
@@ -27,6 +27,13 @@ use std::process::{Command, Stdio};
 /// fallbacks the renderer already bakes in; dark values mirror
 /// `frontend/style/tokens-dark.css`. Keep in sync with both.
 const VARS: &[(&str, &str, &str)] = &[
+    ("var(--mermaid-quadrant-1, #eef4ff)", "#eef4ff", "#253348"),
+    ("var(--mermaid-quadrant-2, #fff7e8)", "#fff7e8", "#3d3325"),
+    ("var(--mermaid-quadrant-3, #fdeef6)", "#fdeef6", "#402838"),
+    ("var(--mermaid-quadrant-4, #eefaf1)", "#eefaf1", "#25382d"),
+    ("var(--mermaid-data-text, #1a1a1a)", "#1a1a1a", "#1a1a1a"),
+    ("var(--mermaid-data-text-muted, #444)", "#444", "#444"),
+    ("var(--mermaid-data-stroke, #444)", "#444", "#444"),
     ("var(--mermaid-node-fill, #ececff)", "#ececff", "#2F2F45"),
     ("var(--mermaid-cluster-fill, #7773)", "#7773", "#ffffff14"),
     ("var(--mermaid-note-fill, #fff5ad)", "#fff5ad", "#4A4636"),
@@ -125,7 +132,9 @@ fn main() {
 
     match out.as_deref() {
         None => print!("{image}"),
-        Some(path) if path.to_ascii_lowercase().ends_with(".png") => rasterize(&image, path),
+        Some(path) if path.to_ascii_lowercase().ends_with(".png") => {
+            rasterize(&image, path).unwrap_or_else(|message| die(&message))
+        }
         Some(path) => std::fs::write(path, &image)
             .unwrap_or_else(|e| die(&format!("failed to write {path}: {e}"))),
     }
@@ -141,19 +150,84 @@ fn main() {
 /// stamp a background rect (unless transparent) so any SVG viewer or
 /// rasterizer reproduces the app's appearance.
 fn theme(svg: &str, dark: bool, bg: &str) -> String {
-    let mut out = svg.to_string();
-    for (needle, light, darkv) in VARS {
-        out = out.replace(needle, if dark { darkv } else { light });
-    }
-    out = out.replace("currentColor", if dark { TEXT_DARK } else { TEXT_LIGHT });
-
-    if bg != "none" {
-        if let Some(pos) = out.find('>') {
-            let rect = format!(r#"<rect x="0" y="0" width="100%" height="100%" fill="{bg}"/>"#);
-            out.insert_str(pos + 1, &rect);
+    use quick_xml::events::{BytesStart, Event};
+    let mut reader = quick_xml::Reader::from_str(svg);
+    let mut writer = quick_xml::Writer::new(Vec::new());
+    let resolve = |value: &str| {
+        let mut out = value.to_string();
+        for (needle, light, darkv) in VARS {
+            out = out.replace(needle, if dark { darkv } else { light });
+        }
+        out.replace("currentColor", if dark { TEXT_DARK } else { TEXT_LIGHT })
+    };
+    let mut root = true;
+    loop {
+        let event = reader.read_event().expect("renderer emits well-formed SVG");
+        let empty = matches!(event, Event::Empty(_));
+        match event {
+            Event::Start(tag) | Event::Empty(tag) => {
+                let name = std::str::from_utf8(tag.name().as_ref())
+                    .unwrap()
+                    .to_string();
+                let mut replacement = BytesStart::new(name);
+                for attr in tag.attributes() {
+                    let attr = attr.unwrap();
+                    let key = std::str::from_utf8(attr.key.as_ref()).unwrap();
+                    let value = attr.unescape_value().unwrap();
+                    let paint = matches!(key, "fill" | "stroke" | "color" | "stop-color");
+                    let value = if paint {
+                        resolve(&value)
+                    } else if key == "style" {
+                        value
+                            .split(';')
+                            .map(|declaration| {
+                                let Some((property, value)) = declaration.split_once(':') else {
+                                    return declaration.to_string();
+                                };
+                                if matches!(
+                                    property.trim(),
+                                    "fill" | "stroke" | "color" | "stop-color"
+                                ) {
+                                    format!("{property}:{}", resolve(value))
+                                } else {
+                                    declaration.to_string()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(";")
+                    } else {
+                        value.into_owned()
+                    };
+                    replacement.push_attribute((key, value.as_str()));
+                }
+                if root {
+                    replacement.push_attribute(("fill", if dark { TEXT_DARK } else { TEXT_LIGHT }));
+                }
+                writer
+                    .write_event(if empty {
+                        Event::Empty(replacement)
+                    } else {
+                        Event::Start(replacement)
+                    })
+                    .unwrap();
+                if root && bg != "none" {
+                    let mut rect = BytesStart::new("rect");
+                    rect.extend_attributes([
+                        ("x", "0"),
+                        ("y", "0"),
+                        ("width", "100%"),
+                        ("height", "100%"),
+                        ("fill", bg),
+                    ]);
+                    writer.write_event(Event::Empty(rect)).unwrap();
+                }
+                root = false;
+            }
+            Event::Eof => break,
+            other => writer.write_event(other).unwrap(),
         }
     }
-    out
+    String::from_utf8(writer.into_inner()).unwrap()
 }
 
 /// Render the app's parse-error state — a red banner plus the raw source —
@@ -209,30 +283,134 @@ fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-/// Pipe the SVG to ImageMagick (`magick`, falling back to `convert`) to write a
-/// PNG. The SVG already carries a real background rect and concrete colors, so
-/// no CSS-aware delegate is required.
-fn rasterize(svg: &str, out_path: &str) {
-    for tool in ["magick", "convert"] {
-        let mut child = match Command::new(tool)
-            .args(["-density", "192", "svg:-", out_path])
-            .stdin(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(_) => continue, // tool not installed — try the next
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(svg.as_bytes());
+/// Prefer librsvg. Preserve ImageMagick installations whose SVG delegate
+/// supports the renderer's clipping, masks and text paint order.
+fn rasterize(svg: &str, out_path: &str) -> Result<(), String> {
+    match Command::new("rsvg-convert")
+        .args([
+            "--dpi-x", "192", "--dpi-y", "192", "--zoom", "2", "--output", out_path,
+        ])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(child) => {
+            return write_image(child, svg, "rsvg-convert");
         }
-        match child.wait() {
-            Ok(status) if status.success() => return,
-            Ok(status) => die(&format!("{tool} exited with {status}")),
-            Err(e) => die(&format!("{tool} failed: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("rsvg-convert failed: {e}")),
+    }
+    let advanced = needs_advanced_svg(svg);
+    for tool in ["magick", "convert"] {
+        if advanced && !compatible_svg_delegate(tool) {
+            continue;
+        }
+        let mut input = tempfile::Builder::new()
+            .suffix(".svg")
+            .tempfile()
+            .map_err(|e| format!("failed to create temporary SVG: {e}"))?;
+        input
+            .write_all(svg.as_bytes())
+            .map_err(|e| format!("failed to write temporary SVG: {e}"))?;
+        match Command::new(tool)
+            .args(["-density", "192"])
+            .arg(input.path())
+            .arg(out_path)
+            .stderr(Stdio::inherit())
+            .status()
+        {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => return Err(format!("{tool} exited with {status}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{tool} failed: {e}")),
         }
     }
-    die("no PNG rasterizer found (install ImageMagick, or output .svg instead)");
+    Err("PNG export needs rsvg-convert (install librsvg2-bin) or ImageMagick with a compatible SVG delegate (librsvg/Inkscape)".into())
+}
+
+fn needs_advanced_svg(svg: &str) -> bool {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(svg);
+    let mut roots = 0;
+    loop {
+        match reader.read_event().expect("well-formed renderer SVG") {
+            Event::Start(tag) | Event::Empty(tag) => {
+                if tag.name().as_ref() == b"svg" {
+                    roots += 1;
+                }
+                if roots > 1 || matches!(tag.name().as_ref(), b"mask" | b"clipPath") {
+                    return true;
+                }
+                for attr in tag.attributes() {
+                    let attr = attr.unwrap();
+                    if matches!(attr.key.as_ref(), b"mask" | b"clip-path" | b"paint-order") {
+                        return true;
+                    }
+                    if attr.key.as_ref() == b"style"
+                        && attr.unescape_value().unwrap().split(';').any(|d| {
+                            d.split_once(':').is_some_and(|(key, _)| {
+                                matches!(key.trim(), "mask" | "clip-path" | "paint-order")
+                            })
+                        })
+                    {
+                        return true;
+                    }
+                }
+            }
+            Event::Eof => return false,
+            _ => {}
+        }
+    }
+}
+
+fn write_image(mut child: std::process::Child, svg: &str, tool: &str) -> Result<(), String> {
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(svg.as_bytes()) {
+            drop(stdin);
+            let _ = child.wait();
+            return Err(format!("failed to send SVG to {tool}: {e}"));
+        }
+    }
+    match child.wait() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("{tool} exited with {status}")),
+        Err(e) => Err(format!("{tool} failed: {e}")),
+    }
+}
+
+fn compatible_svg_delegate(tool: &str) -> bool {
+    // A real pixel probe avoids relying on executable/version names. The
+    // four samples check nested viewport clipping, masking and paint order.
+    let probe = r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="8"><rect width="24" height="8" fill="#fff"/><svg width="8" height="8" overflow="hidden"><rect width="16" height="8" fill="#0f0"/></svg><defs><mask id="probe" maskUnits="userSpaceOnUse" x="8" y="0" width="8" height="8"><rect x="8" width="8" height="8" fill="#fff"/><rect x="8" width="4" height="8" fill="#000"/></mask></defs><rect x="8" width="8" height="8" fill="#f00" mask="url(#probe)"/><svg x="16" width="8" height="8" overflow="hidden"><rect width="8" height="8" fill="#00f" stroke="#f00" stroke-width="10" paint-order="stroke"/></svg></svg>"##;
+    let Ok(mut input) = tempfile::Builder::new().suffix(".svg").tempfile() else {
+        return false;
+    };
+    if input.write_all(probe.as_bytes()).is_err() {
+        return false;
+    }
+    let Ok(output) = Command::new(tool)
+        .args(["-density", "96"])
+        .arg(input.path())
+        .args(["-depth", "8", "rgb:-"])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() || output.stdout.len() != 24 * 8 * 3 {
+        return false;
+    }
+    [
+        (4, [0, 255, 0]),
+        (9, [255, 255, 255]),
+        (14, [255, 0, 0]),
+        (20, [0, 0, 255]),
+    ]
+    .iter()
+    .all(|(x, color)| {
+        let offset = (4 * 24 + x) * 3;
+        output.stdout[offset..offset + 3] == *color
+    })
 }
 
 fn die(msg: &str) -> ! {
@@ -249,10 +427,13 @@ USAGE:
     INPUT   .mmd/.mermaid file, or `-`/omitted to read stdin.
 
 OPTIONS:
-    -o, --out <PATH>   Output file. `.png` rasterizes via ImageMagick; any
+    -o, --out <PATH>   Output file. `.png` uses librsvg or a compatible ImageMagick SVG delegate; any
                        other extension writes SVG. Omit for SVG on stdout.
     -t, --theme <T>    light (default) | dark.
         --bg <COLOR>   Background (`none` = transparent). Default #ffffff
                        (light) / #1e1e1e (dark).
-    -h, --help         Show this help.
+    -h, --help         Show this help.\n\
+\n\
+    PNG uses rsvg-convert (Debian/Ubuntu: librsvg2-bin), or ImageMagick\n\
+with an SVG delegate supporting clipping, masks and paint order.
 ";

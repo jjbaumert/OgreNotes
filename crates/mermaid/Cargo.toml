@@ -6,8 +6,17 @@ license.workspace = true
 publish = false
 
 [dependencies]
+unicode-segmentation = "1.13"
+
+[build-dependencies]
+unicode-normalization = "0.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+quick-xml = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
+unicode-normalization = "0.1"
 proptest = { workspace = true }
 # Well-formedness check in the fuzz net: every rendered SVG must parse.
 quick-xml = { workspace = true }

@@ -307,3 +307,66 @@ for quick piping to `jq`.
 creates an owner, editor and viewer, then checks collaborator conflict handling,
 Save/Undo delivery, read-only documents, and 320px/375px normal and error layouts.
 It purges its test document and runs in the Playwright CI workflow.
+
+### Mermaid rendered contrast regression (#287)
+
+`node test-mermaid-contrast.cjs --out /tmp/mermaid-contrast` measures browser
+foreground/background contrast for six diagram kinds in both themes, using
+renderer fixtures and the production CSS. It also checks quadrant edge labels,
+all C4 external tiers and shapes, small treemap cells, and pie rim/wedge
+contrast, including an empty pie. Long labels, narrow numeric cells, all
+pie colors and all treemap palette depths are renderer-backed fixtures.
+Wide Cyrillic, Greek, Hangul and Indic names, complete Arabic and fitting Latin
+names, including narrow Greek names, tags and fallback-font captions are also checked. Tall C4 queues retain their identifying names.
+Palette-matched glyph halos protect captions without clipping differing font
+metrics. C4 captions also receive filled glyph underlays, painted before all
+foreground labels, to protect wide interiors outside rounded queue caps.
+Decorative underlays are excluded from selection and accessibility text.
+Treemap captions paint after all cells, preserving parent descenders.
+Thin pie labels are checked against rasterized background pixels, including
+wedge borders. Foreground checks catch backings covering adjacent percentages;
+architecture arrow tips stay visible. Original architecture edges clear complete
+label glyphs, including wide interiors. C4 fixtures cover SystemDb cap strokes.
+Dense quadrant overlap runs text contrast and glyph-visibility checks along
+with checks for surviving marker color. Point positions stay unchanged; glyphs
+can obscure part of an overlapping marker. Caption overlaps receive a masked
+palette-colored ring so a fully covered dot retains a visible indicator.
+Point and ring masks also protect axis labels. Overlap bounds measure literal
+text, so a displayed `<br>` cannot hide an overlapping point.
+Long names receive ellipses; C4 and
+treemap use an explicit Arial/Helvetica family for consistent viewer metrics.
+
+Supported non-ASCII advances use measurements of the Arial-compatible
+Liberation Sans regular, bold and italic faces. Regenerate the checked-in bounds
+with `python3 scripts/measure-mermaid-fonts.py` (Pillow and fontconfig required).
+The renderer does not bundle fonts and retains estimates for unsupported glyphs.
+
+Unicode fitting tables are generated at build time to keep the WASM bundle
+within budget. A native reference check verifies combining-mark membership
+and fitting advances against the full normalization engine for every scalar.
+No server is needed. The native
+renderer tests verify fixture freshness; Playwright CI runs the browser checks.
+
+### Mermaid CLI PNG regression
+
+Build `cargo build -p ogrenotes-mermaid --bin mermaid_cli --locked`, then run
+`node test-mermaid-png.cjs --out /tmp/mermaid-png`. Set `MERMAID_CLI` if the
+binary is in a separate Cargo target directory. PNG export prefers
+`rsvg-convert` (Debian/Ubuntu: `apt install librsvg2-bin`) and preserves
+ImageMagick fallback when its SVG delegate supports clipping, masks and paint
+order. The CLI verifies these features with a pixel probe before export.
+ImageMagick's built-in SVG decoder drops labels from these diagrams. Output retains the previous 2x pixel dimensions.
+
+The test invokes the actual CLI for SVG and PNG in both themes, then checks
+rasterized glyph visibility and contrast across all six diagram kinds and
+long, Unicode and border fixtures. Glyph and background masks use the same
+PNG renderer to detect obscured text independently of browser font selection.
+Coverage is measured inside the export viewport. Existing diagram layout
+and outer-viewport clipping are unchanged.
+
+For the ImageMagick fallback, run `python3 configure-mermaid-imagemagick.py
+/tmp/mermaid-imagemagick`, then set `MAGICK_CONFIGURE_PATH` to its `config`
+directory, `MERMAID_CLI_PATH` to its `bin` directory, and `REFERENCE_MAGICK`
+to the absolute ImageMagick executable before running the PNG regression.
+This configures a real librsvg delegate while the CLI sees only ImageMagick.
+The fallback test also verifies that failed exports remove temporary SVGs.

@@ -107,7 +107,7 @@ jobs:
           sudo apt-get install -y \
             pkg-config libssl-dev \
             libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
-            clang libclang-dev
+            clang libclang-dev librsvg2-bin imagemagick
 
       # ─── Toolchain ────────────────────────────────────────────
       - name: Install Rust (stable + wasm32)
@@ -883,6 +883,29 @@ jobs:
           node test-mermaid-modal.cjs \
             --base-url http://127.0.0.1:3000 \
             --out ../../artifacts/doctor/mermaid-modal
+
+      - name: Verify Mermaid rendered fixture freshness
+        run: cargo test -p ogrenotes-mermaid --test golden --test theme --locked
+
+      - name: Run Mermaid CLI PNG regression
+        working-directory: scripts/frontend-doctor
+        run: |
+          node test-mermaid-png.cjs --out ../../artifacts/doctor/mermaid-png
+
+      - name: Run Mermaid ImageMagick fallback regression
+        working-directory: scripts/frontend-doctor
+        run: |
+          python3 configure-mermaid-imagemagick.py /tmp/mermaid-imagemagick
+          export MAGICK_CONFIGURE_PATH=/tmp/mermaid-imagemagick/config
+          export MERMAID_CLI_PATH=/tmp/mermaid-imagemagick/bin
+          export REFERENCE_MAGICK="$(command -v convert)"
+          node test-mermaid-png.cjs --out ../../artifacts/doctor/mermaid-png-imagemagick
+
+      - name: Run Mermaid rendered contrast regression
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node test-mermaid-contrast.cjs --out ../../artifacts/doctor/mermaid-contrast
 
       # ─── Teardown / artifacts ─────────────────────────────────
       - name: Stop axum server

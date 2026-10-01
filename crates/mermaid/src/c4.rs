@@ -9,7 +9,10 @@
 //! out with the shared boxgraph adapter. Styling directives (`Update*`) are
 //! accepted and ignored.
 
-use crate::{escape_xml, measure, ParseError};
+use std::fmt::Write;
+
+use crate::theme::{DATA_TEXT, LABEL_FONT};
+use crate::{ParseError, escape_xml, measure};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Shape {
@@ -303,31 +306,33 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
     w = w.max(200.0);
 
     let mut out = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:13px"><defs><marker id="mmd-c4-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker></defs>"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:{LABEL_FONT};font-size:13px"><defs><marker id="mmd-c4-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker></defs>"#
     );
     let dy = title_h;
 
     if let Some(title) = &c4.title {
-        out.push_str(&format!(
+        write!(out,
             r#"<text x="{:.1}" y="20" text-anchor="middle" font-weight="bold" font-size="17" fill="currentColor">{}</text>"#,
             w / 2.0,
             escape_xml(title)
-        ));
+        ).unwrap();
     }
 
     // boundaries (dashed clusters) behind everything.
     for (i, b) in c4.boundaries.iter().enumerate() {
         let r = &l.cluster_rects[i];
-        out.push_str(&format!(
+        write!(out,
             r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="none" stroke="currentColor" stroke-dasharray="6 4" rx="4" opacity="0.7"/>"#,
             r.x, r.y + dy, r.w, r.h
-        ));
-        out.push_str(&format!(
+        ).unwrap();
+        write!(
+            out,
             r#"<text x="{:.1}" y="{:.1}" font-weight="600" fill="currentColor">{}</text>"#,
             r.x + 8.0,
             r.y + dy + LINE_H,
             escape_xml(&b.label)
-        ));
+        )
+        .unwrap();
     }
 
     // relationship arrows.
@@ -336,27 +341,29 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
         let pts: Vec<(f64, f64)> = ep.points.iter().map(|(x, y)| (*x, y + dy)).collect();
         let d = crate::curved_path(&pts, true);
         let start_marker = if r.bidir { r#" marker-start="url(#mmd-c4-arrow)""# } else { "" };
-        out.push_str(&format!(
+        write!(out,
             r#"<path d="{d}" fill="none" stroke="currentColor" stroke-dasharray="3 3"{start_marker} marker-end="url(#mmd-c4-arrow)"/>"#
-        ));
+        ).unwrap();
         if let Some((lx, ly)) = ep.label_at {
             let mut txt = r.label.clone();
             if let Some(t) = &r.tech {
                 txt = format!("{txt} [{t}]");
             }
             let (tw, _) = measure::text_size(&txt);
-            out.push_str(&format!(
+            write!(out,
                 r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="16" fill="var(--surface, #fff)"/><text x="{lx:.1}" y="{:.1}" text-anchor="middle" font-size="11" fill="currentColor">{}</text>"#,
                 lx - tw / 2.0 - 3.0,
                 ly + dy - 8.0,
                 tw + 6.0,
                 ly + dy + 4.0,
                 escape_xml(&txt)
-            ));
+            ).unwrap();
         }
     }
 
     // element boxes.
+    let mut label_backings = String::new();
+    let mut label_foregrounds = String::new();
     for (i, e) in c4.els.iter().enumerate() {
         let (cx, cy) = l.node_centers[i];
         let cy = cy + dy;
@@ -364,71 +371,148 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
         let (bx, by) = (cx - bw / 2.0, cy - bh / 2.0);
         let fill = fill_for(e);
         draw_shape(&mut out, e.shape, bx, by, bw, bh, fill);
-        // text (white on the colored fill). Person boxes leave room for a head.
+        // Pair the fixed element fill with a readable foreground in either theme.
+        let (name_text, tag_text, desc_text) = if e.external || e.tier >= 2 {
+            (DATA_TEXT, DATA_TEXT, DATA_TEXT)
+        } else {
+            (TXT_NAME, TXT_TAG, TXT_DESC)
+        };
+        // Person boxes leave room for a head.
         let mut ty = by + 16.0 + if e.shape == Shape::Person { 14.0 } else { 0.0 };
-        out.push_str(&format!(
-            r#"<text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" font-weight="700" fill="{TXT_NAME}">{}</text>"#,
-            escape_xml(&e.name)
-        ));
+        fit_element_label(&e.name, bw, 13.0, true).render(
+            (&mut label_backings, &mut label_foregrounds),
+            (cx, ty),
+            name_text,
+            false,
+            fill,
+        );
         ty += LINE_H;
-        let tag = if e.external { format!("[{}]", e.kind.replace('_', " ")) } else { format!("[{}]", e.kind) };
-        out.push_str(&format!(
-            r#"<text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" font-size="11" font-style="italic" fill="{TXT_TAG}">{}</text>"#,
-            escape_xml(&tag)
-        ));
+        let tag = if e.external {
+            format!("[{}]", e.kind.replace('_', " "))
+        } else {
+            format!("[{}]", e.kind)
+        };
+        fit_element_label(&tag, bw, 11.0, false).render(
+            (&mut label_backings, &mut label_foregrounds),
+            (cx, ty),
+            tag_text,
+            true,
+            fill,
+        );
         for d in &e.descr {
             ty += LINE_H;
-            out.push_str(&format!(
-                r#"<text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" font-size="11" fill="{TXT_DESC}">{}</text>"#,
-                escape_xml(d)
-            ));
+            fit_element_label(d, bw, 11.0, false).render(
+                (&mut label_backings, &mut label_foregrounds),
+                (cx, ty),
+                desc_text,
+                false,
+                fill,
+            );
         }
     }
 
+    // Back every glyph before painting any foreground caption.
+    out.push_str(&label_backings);
+    out.push_str(&label_foregrounds);
     out.push_str("</svg>");
     Ok(out)
+}
+
+struct FittedLabel {
+    text: String,
+    font_size: f64,
+    bold: bool,
+}
+
+impl FittedLabel {
+    fn render(
+        &self,
+        out: (&mut String, &mut String),
+        position: (f64, f64),
+        color: &str,
+        italic: bool,
+        background: &str,
+    ) {
+        if self.text.is_empty() {
+            return;
+        }
+        let (cx, baseline) = position;
+        // A filled underlay protects wide glyph interiors outside narrow
+        // queue/database caps. An outline alone leaves those interiors bare.
+        let (backing, foreground) = out;
+        for (out, color, extra) in [
+            (
+                backing,
+                background,
+                r#" data-label-underlay="true" aria-hidden="true" pointer-events="none" style="user-select:none""#,
+            ),
+            (foreground, color, ""),
+        ] {
+            write!(out,
+            r#"<text x="{cx:.1}" y="{baseline:.1}" text-anchor="middle" font-size="{}" font-weight="{}" font-style="{}" fill="{color}" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke"{extra}>{}</text>"#,
+            self.font_size,
+            if self.bold { 700 } else { 400 },
+            if italic { "italic" } else { "normal" },
+            escape_xml(&self.text),
+        ).unwrap();
+        }
+    }
+}
+
+/// Fit visible labels to the element width, using the same ellipsis
+/// policy as architecture and treemap. The diagram source remains complete.
+fn fit_element_label(text: &str, width: f64, font_size: f64, bold: bool) -> FittedLabel {
+    let available = (width - 28.0).max(0.0);
+    FittedLabel {
+        text: measure::truncate_literal_to_width(text, available, font_size, bold),
+        font_size,
+        bold,
+    }
 }
 
 fn draw_shape(out: &mut String, shape: Shape, x: f64, y: f64, w: f64, h: f64, fill: &str) {
     match shape {
         Shape::Person => {
-            // head circle + rounded body box.
+            // Head circle + rounded body box. Back the full name ascent,
+            // including glyphs extending above the old y + 22 body edge.
             let hr = 11.0;
-            out.push_str(&format!(
+            write!(
+                out,
                 r#"<circle cx="{:.1}" cy="{:.1}" r="{hr}" fill="{fill}"/>"#,
                 x + w / 2.0,
                 y + hr + 1.0
-            ));
-            out.push_str(&format!(
+            )
+            .unwrap();
+            write!(out,
                 r#"<rect x="{x:.1}" y="{:.1}" width="{w:.1}" height="{:.1}" fill="{fill}" rx="8"/>"#,
-                y + 2.0 * hr,
-                h - 2.0 * hr
-            ));
+                y + 2.0 * hr - 6.0,
+                h - 2.0 * hr + 6.0
+            ).unwrap();
         }
         Shape::Db => {
             // cylinder: body rect + top/bottom ellipses.
             let ry = 7.0;
-            out.push_str(&format!(
+            write!(out,
                 r#"<path d="M {x:.1} {:.1} L {x:.1} {:.1} A {:.1} {ry} 0 0 0 {:.1} {:.1} L {:.1} {:.1} A {:.1} {ry} 0 0 0 {x:.1} {:.1} Z" fill="{fill}"/>"#,
                 y + ry, y + h - ry, w / 2.0, x + w, y + h - ry, x + w, y + ry, w / 2.0, y + ry,
-            ));
-            out.push_str(&format!(
+            ).unwrap();
+            write!(out,
                 r#"<ellipse cx="{:.1}" cy="{:.1}" rx="{:.1}" ry="{ry}" fill="{fill}" stroke="{TXT_NAME}" stroke-opacity="0.4"/>"#,
                 x + w / 2.0,
                 y + ry,
                 w / 2.0
-            ));
+            ).unwrap();
         }
         Shape::Queue => {
-            out.push_str(&format!(
+            write!(out,
                 r#"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" fill="{fill}" rx="{:.1}"/>"#,
                 h / 2.0
-            ));
+            ).unwrap();
         }
         Shape::Box => {
-            out.push_str(&format!(
+            write!(out,
                 r#"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" fill="{fill}" rx="3"/>"#
-            ));
+            ).unwrap();
         }
     }
 }
