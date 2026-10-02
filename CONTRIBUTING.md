@@ -39,14 +39,26 @@ cargo test --bin ogrenotes-frontend --target x86_64-unknown-linux-gnu \
 ### Frontend WASM browser tests
 
 The `#[wasm_bindgen_test]` suites need a real browser driven over WebDriver.
-**Firefox is the supported path** and the one CI uses
+**Firefox is the supported suite** and the one CI uses
 (`.github/workflows/wasm-tests.yml`):
+
+On Linux, the wrapper below cleans up browsers and drivers even after a failed
+or interrupted test run. It uses an invocation-specific process marker and
+preserves the test exit status. On other platforms, omit the Python wrapper.
+The Chrome helper uses the same cleanup automatically on Linux. All descendants
+started by the wrapped command are torn down; start shared build services before
+the wrapper if they should keep running. CI also interrupts both browsers to
+check process cleanup; the full Chrome suite remains a local development check. Run
+`python3 scripts/test_browser_cleanup.py chrome --complete` (or `firefox`)
+from the repo root to verify a successful run leaves no observed descendants.
+Cleanup failure returns 125 only when
+the test itself passed; otherwise the original failure status is preserved.
 
 ```bash
 cd frontend
-wasm-pack test --headless --firefox -- --test browser   # DOM suite
-wasm-pack test --headless --firefox -- --lib            # inline lib tests
-wasm-pack test --headless --firefox -- --test collab_e2e  # needs the local stack
+python3 ../scripts/with-test-cleanup.py -- wasm-pack test --headless --firefox -- --test browser   # DOM suite
+python3 ../scripts/with-test-cleanup.py -- wasm-pack test --headless --firefox -- --lib            # inline lib tests
+python3 ../scripts/with-test-cleanup.py -- wasm-pack test --headless --firefox -- --test collab_e2e  # needs the local stack
 ```
 
 #### Chrome: `Error: http status: 404` is a tooling failure, not a test failure

@@ -190,7 +190,7 @@ jobs:
       - name: Run collab_e2e under headless Firefox
         working-directory: frontend
         run: |
-          wasm-pack test --headless --firefox -- --test collab_e2e
+          python3 ../scripts/with-test-cleanup.py -- wasm-pack test --headless --firefox -- --test collab_e2e
 
       # ─── Teardown ─────────────────────────────────────────────
       - name: Stop axum server
@@ -254,6 +254,9 @@ jobs:
         with:
           version: latest
 
+      - name: Verify browser process cleanup
+        run: python3 scripts/test_test_cleanup.py
+
       # geckodriver + Firefox are preinstalled on ubuntu-latest; wasm-pack
       # uses them transparently when --firefox is passed.
       # `--lib` goes AFTER the `--` separator (a cargo passthrough arg, same
@@ -262,21 +265,26 @@ jobs:
       # `--lib` from before the separator.
       - name: Run frontend lib wasm-bindgen tests
         working-directory: frontend
-        run: wasm-pack test --headless --firefox -- --lib
+        run: python3 ../scripts/with-test-cleanup.py -- wasm-pack test --headless --firefox -- --lib
 
       # Issue #20: the browser.rs DOM suite (148 tests — rendering, input
       # rules, backspace/list handling, markdown paste) existed but was
       # never run by CI, so a DOM-observable regression could ship
       # unnoticed. Pure browser-DOM, no backend — it shares this job's
       # build cache with the --lib target.
-      - name: Run frontend browser DOM tests
-        working-directory: frontend
-        run: wasm-pack test --headless --firefox -- --test browser
+      - name: Run frontend browser DOM tests and verify cleanup
+        run: python3 scripts/test_browser_cleanup.py firefox --complete
 
       - name: Frontend binary DOM position regressions
         working-directory: frontend
-        run: wasm-pack test --headless --firefox -- --bin ogrenotes-frontend
+        run: python3 ../scripts/with-test-cleanup.py -- wasm-pack test --headless --firefox -- --bin ogrenotes-frontend
 
       - name: Collaboration content preservation
         working-directory: frontend
-        run: wasm-pack test --headless --firefox -- --test collab_semantics
+        run: python3 ../scripts/with-test-cleanup.py -- wasm-pack test --headless --firefox -- --test collab_semantics
+
+      - name: Verify Firefox cleanup after interruption
+        run: python3 scripts/test_browser_cleanup.py firefox
+
+      - name: Verify Chrome cleanup after interruption
+        run: python3 scripts/test_browser_cleanup.py chrome

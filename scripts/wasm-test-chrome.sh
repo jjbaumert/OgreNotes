@@ -194,4 +194,8 @@ fi
 echo
 echo "+ wasm-pack test --headless --chrome --chromedriver $driver -- $*"
 cd "$FRONTEND_DIR"
+if [[ "$(uname -s)" == Linux ]]; then
+  exec python3 "$REPO_ROOT/scripts/with-test-cleanup.py" -- \
+    wasm-pack test --headless --chrome --chromedriver "$driver" -- "$@"
+fi
 exec wasm-pack test --headless --chrome --chromedriver "$driver" -- "$@"
