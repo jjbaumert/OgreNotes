@@ -12,10 +12,13 @@ const args = process.argv.slice(2);
 const option = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback;
 const base = option('--base-url', 'http://localhost:3000');
 const engine = option('--browser', 'chromium');
+const viewportWidth = Number(option('--viewport-width', '1360'));
 const snapshot = option('--snapshot');
 const generatedOnly = args.includes('--generated-only');
+const expectCaretVisible = args.includes('--expect-caret-visible');
 const baselinePath = option('--baseline-report');
 const baseline = baselinePath ? JSON.parse(fs.readFileSync(baselinePath, 'utf8')) : null;
+if (baseline) assert.equal(baseline.harnessVersion, 2, 'Recapture the baseline with this harness version');
 const out = option('--out', '/tmp/ogrenotes-editor-scroll');
 assert(snapshot || generatedOnly, '--snapshot must name a document content snapshot; it stays local');
 assert(['chromium', 'firefox'].includes(engine), '--browser must be chromium or firefox');
@@ -64,7 +67,7 @@ async function firefoxPage(context) {
     session = (await command('POST', '/session', {
       capabilities: { alwaysMatch: { browserName: 'firefox', acceptInsecureCerts: true, 'moz:firefoxOptions': firefoxOptions } },
     })).sessionId;
-    await command('POST', `/session/${session}/window/rect`, { width: 1360, height: 900 });
+    await command('POST', `/session/${session}/window/rect`, { width: viewportWidth, height: 900 });
     const goto = url => command('POST', `/session/${session}/url`, { url });
     await goto(base + '/login');
     for (const { name, value, path, httpOnly, secure, sameSite } of await context.cookies()) {
@@ -80,6 +83,12 @@ async function firefoxPage(context) {
           { type: 'keyDown', value: character }, { type: 'keyUp', value: character },
         ] }],
       }),
+      press: key => {
+        const keys = key.split('+').map(value => ({ Enter: '\uE007', Control: '\uE009' }[value] || value));
+        return command('POST', `/session/${session}/actions`, { actions: [{ type: 'key', id: 'typing',
+          actions: [...keys.map(value => ({ type: 'keyDown', value })), ...keys.reverse().map(value => ({ type: 'keyUp', value }))],
+        }] });
+      },
     };
   } catch (error) { await close(); throw error; }
 }
@@ -94,10 +103,18 @@ async function waitFor(page, fn, arg) {
 const metrics = page => page.evaluate(() => {
   const container = document.querySelector('.editor-container');
   const selection = getSelection();
-  const rect = selection.rangeCount ? selection.getRangeAt(0).getBoundingClientRect() : null;
+  let rect = selection.rangeCount ? selection.getRangeAt(0).getBoundingClientRect() : null;
+  if (rect?.height < 1 && selection.focusNode?.nodeType === Node.ELEMENT_NODE) {
+    rect = selection.focusNode.getBoundingClientRect();
+  }
+  const bounds = container.getBoundingClientRect();
+  let viewportTop = Math.max(bounds.top, visualViewport?.offsetTop || 0);
+  let viewportBottom = Math.min(bounds.bottom, (visualViewport?.offsetTop || 0) + (visualViewport?.height || innerHeight));
+  const toolbar = document.querySelector('.toolbar');
+  if (toolbar && getComputedStyle(toolbar).position === 'fixed') viewportBottom = Math.min(viewportBottom, toolbar.getBoundingClientRect().top);
   return { top: container.scrollTop, height: container.scrollHeight,
     caretTop: rect?.top, caretBottom: rect?.bottom, caretLeft: rect?.left,
-    viewportTop: container.getBoundingClientRect().top, viewportBottom: container.getBoundingClientRect().bottom,
+    viewportTop, viewportBottom,
     characters: document.querySelector('.editor-content').textContent.length };
 });
 
@@ -117,7 +134,7 @@ const metrics = page => page.evaluate(() => {
     return response.headers()['content-type']?.includes('application/json') ? response.json() : null;
   }
   try {
-    context = await browser.newContext({ viewport: { width: 1360, height: 800 }, ignoreHTTPSErrors: true });
+    context = await browser.newContext({ viewport: { width: viewportWidth, height: 800 }, ignoreHTTPSErrors: true });
     token = (await api('POST', '/auth/dev-login', {
       email: `scroll-${Date.now()}@ogrenotes.example.com`, name: 'Editor scroll regression',
     })).accessToken;
@@ -127,8 +144,9 @@ const metrics = page => page.evaluate(() => {
     if (engine === 'firefox') page = await firefoxPage(context);
     else {
       const chromiumPage = await context.newPage();
+      chromiumPage.on('pageerror', error => console.error('Browser error:', error.message));
       page = { goto: url => chromiumPage.goto(url), evaluate: (fn, arg) => chromiumPage.evaluate(fn, arg),
-        type: character => chromiumPage.keyboard.type(character), close: () => chromiumPage.close() };
+        type: character => chromiumPage.keyboard.type(character), press: key => chromiumPage.keyboard.press(key), close: () => chromiumPage.close() };
     }
     await page.goto(`${base}/d/${id}/regression`);
     await waitFor(page, () => !!document.querySelector('.editor-content[data-editor-ready=true]'));
@@ -232,7 +250,7 @@ const metrics = page => page.evaluate(() => {
       getSelection().removeAllRanges(); getSelection().addRange(range);
       const data = new DataTransfer();
       data.setData('text/html', '<h1>Remote viewport fixture</h1>' + Array.from({ length: 180 }, (_, n) =>
-        `<p>SCROLL_GENERATED_${n}: keep the editor viewport steady while another person types.</p>` +
+        `<p>${n === 0 ? 'SCROLL_GENERATED_0:' : `SCROLL_GENERATED_${n}: keep the editor viewport steady while another person types.`}</p>` +
         (n === 80 ? '<pre><code class="language-rust">let value = 1;</code></pre>' : '')).join(''));
       const event = new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true });
       Object.defineProperty(event, 'clipboardData', { value: data });
@@ -266,10 +284,29 @@ const metrics = page => page.evaluate(() => {
         await page.type(character); await pause(80);
         const after = await metrics(page); steps.push(after);
         assert.equal(after.characters, before.characters + steps.length);
+        if (expectCaretVisible) {
+          assert(after.caretTop >= after.viewportTop - 1 && after.caretBottom <= after.viewportBottom + 1,
+            `Code typing left the caret outside the viewport (${position})`);
+        }
         assert(Math.abs(after.top - before.top) <= 1, 'Ordinary code typing moved viewport');
       }
       console.log(`PASS ${engine} generated code ${position}: typing preserves viewport`);
     }
+    // A code pane below the visible band must not stop the parent reveal.
+    const codeBand = await metrics(page);
+    await page.evaluate(bottom => {
+      const container = document.querySelector('.editor-container');
+      const range = getSelection().getRangeAt(0);
+      container.scrollTop += range.getBoundingClientRect().top - bottom - 8;
+    }, codeBand.viewportBottom);
+    const codeEdgeBefore = await metrics(page);
+    await page.type('x'); await pause(100);
+    const codeEdgeAfter = await metrics(page);
+    reports.push({ scenario: 'code-edge', before: codeEdgeBefore, steps: [codeEdgeAfter] });
+    assert.equal(codeEdgeAfter.characters, codeEdgeBefore.characters + 1);
+    if (expectCaretVisible) assert(codeEdgeAfter.caretTop >= codeEdgeAfter.viewportTop - 1 &&
+      codeEdgeAfter.caretBottom <= codeEdgeAfter.viewportBottom + 1, 'Code pane below the viewport hid its caret');
+
     await page.evaluate(() => {
       const editor = document.querySelector('.editor-content'); editor.focus({ preventScroll: true });
       const target = editor.querySelectorAll(':scope > p')[90];
@@ -296,11 +333,22 @@ const metrics = page => page.evaluate(() => {
     assert(Math.abs(after.top - before.top) <= 1, 'Remote layout-neutral typing moved viewport');
     assert(Math.abs(after.caretTop - before.caretTop) <= 1, 'Remote typing moved local caret');
     console.log(`PASS ${engine} remote: text delivered without moving viewport or local caret`);
+    await page.evaluate(() => { document.querySelector('.editor-container').scrollTop = 0; });
+    const passive = await metrics(page);
+    assert(passive.caretTop > passive.viewportBottom, 'Passive caret must be outside viewport');
+    await peer.keyboard.type('passiveprobe');
+    await waitFor(page, () => document.querySelector('.editor-content').textContent.includes('passiveprobe'));
+    await pause(250);
+    const passiveAfter = await metrics(page);
+    reports.push({ scenario: 'remote-passive', before: passive, steps: [passiveAfter] });
+    assert.equal(passiveAfter.characters, passive.characters + 'passiveprobe'.length);
+    assert(Math.abs(passiveAfter.top - passive.top) <= 1, 'Remote edit pulled a passive reader back to their caret');
+    console.log(`PASS ${engine} remote: offscreen passive caret does not move viewport`);
 
     // Record boundary and remote layout changes for comparison with a baseline
     // build that does not suppress anchoring during redraws.
-    // Existing caret-reveal behavior at a wrap past the viewport edge is measured
-    // rather than asserted fixed by this change to per-character anchoring.
+    // --expect-caret-visible asserts caret reveal; otherwise wrapping behavior
+    // is recorded for comparison with the baseline renderer.
     for (const anchoring of ['auto', 'none']) {
       const lineHeight = await page.evaluate(anchoring => {
         const editor = document.querySelector('.editor-content');
@@ -314,6 +362,10 @@ const metrics = page => page.evaluate(() => {
         return parseFloat(getComputedStyle(target).lineHeight);
       }, anchoring);
       await pause(250);
+      const positioned = await metrics(page);
+      await page.evaluate(delta => { document.querySelector('.editor-container').scrollTop += delta; },
+        positioned.caretBottom - positioned.viewportBottom + 2);
+      await pause(100);
       const before = await metrics(page);
       const steps = [];
       reports.push({ scenario: `wrap-edge-${anchoring}`, before, steps });
@@ -321,9 +373,38 @@ const metrics = page => page.evaluate(() => {
         await page.type(character); await pause(30);
         const after = await metrics(page); steps.push(after);
         assert.equal(after.characters, before.characters + steps.length);
+        if (expectCaretVisible) {
+          assert(after.caretTop >= after.viewportTop - 1 && after.caretBottom <= after.viewportBottom + 1,
+            `Local wrapping left the caret outside the viewport (${anchoring})`);
+        }
         if (after.height - before.height >= lineHeight * 2 - 1) break;
       }
       assert(steps.at(-1).height - before.height >= lineHeight * 2 - 1, 'Boundary case must wrap across two lines');
+      if (expectCaretVisible) {
+        assert(steps.at(-1).top > before.top, 'Boundary typing must actually scroll to reveal the caret');
+        const paragraphs = await page.evaluate(() => document.querySelectorAll('.editor-content > p').length);
+        // Start a new history group so this undo isolates the Enter edit.
+        await pause(1000);
+        await page.press('Enter'); await pause(100);
+        const entered = await metrics(page);
+        assert.equal(await page.evaluate(() => document.querySelectorAll('.editor-content > p').length), paragraphs + 1);
+        assert(entered.caretTop >= entered.viewportTop - 1 && entered.caretBottom <= entered.viewportBottom + 1, 'Enter hid the new empty paragraph caret');
+        await page.press('Control+z'); await pause(100);
+        assert.equal(await page.evaluate(() => document.querySelectorAll('.editor-content > p').length), paragraphs);
+        const undone = await metrics(page);
+        assert.equal(undone.characters, steps.at(-1).characters, 'Undo must restore the text before Enter');
+        assert(undone.caretTop >= undone.viewportTop - 1 && undone.caretBottom <= undone.viewportBottom + 1, 'Undo hid the restored caret');
+        // Toolbar history commands take a different production dispatch path.
+        await page.evaluate(() => document.querySelector('.toolbar button[title="Redo (Ctrl+Shift+Z)"]').click());
+        await pause(100);
+        assert.equal(await page.evaluate(() => document.querySelectorAll('.editor-content > p').length), paragraphs + 1);
+        await page.evaluate(() => document.querySelector('.toolbar button[title="Undo (Ctrl+Z)"]').click());
+        await pause(100);
+        const toolbarUndo = await metrics(page);
+        assert.equal(toolbarUndo.characters, undone.characters);
+        assert(toolbarUndo.caretTop >= toolbarUndo.viewportTop - 1 && toolbarUndo.caretBottom <= toolbarUndo.viewportBottom + 1,
+          'Toolbar undo hid the restored caret');
+      }
 
       // Select a caret in the middle, then insert and undo real blocks above it.
       await page.evaluate(() => {
@@ -434,14 +515,17 @@ const metrics = page => page.evaluate(() => {
         assert(before && after, `Baseline missing ${scenario}`);
         if (scenario === 'wrap-edge-auto') {
           const overflow = report => Math.max(...report.steps.map(step => Math.max(0, step.caretBottom - step.viewportBottom)));
+          if (expectCaretVisible) assert(overflow(before) > 1, 'Baseline must reproduce an invisible caret');
           assert(overflow(after) <= overflow(before) + 1, 'New boundary caret regression against unpatched baseline');
           assert.equal(after.steps.length, before.steps.length, 'Wrapping must use matching transitions');
           after.steps.forEach((step, index) => {
             const old = before.steps[index];
-            assert(Math.abs((step.top - after.before.top) - (old.top - before.before.top)) <= 1,
-              'New wrapping scroll movement against unpatched baseline');
-            assert(Math.abs((step.caretTop - after.before.caretTop) - (old.caretTop - before.before.caretTop)) <= 1,
-              'New wrapping caret movement against unpatched baseline');
+            if (!expectCaretVisible || old.caretBottom <= old.viewportBottom + 1) {
+              assert(Math.abs((step.top - after.before.top) - (old.top - before.before.top)) <= 1,
+                'New wrapping scroll movement against unpatched baseline');
+              assert(Math.abs((step.caretTop - after.before.caretTop) - (old.caretTop - before.before.caretTop)) <= 1,
+                'New wrapping caret movement against unpatched baseline');
+            }
           });
         } else {
           assert.equal(after.steps.length, before.steps.length);
@@ -459,7 +543,7 @@ const metrics = page => page.evaluate(() => {
   } finally {
     const cleanupErrors = [];
     try {
-      fs.writeFileSync(path.join(out, 'report.json'), JSON.stringify({ browser: engine, reports }, null, 2));
+      fs.writeFileSync(path.join(out, 'report.json'), JSON.stringify({ harnessVersion: 2, browser: engine, reports }, null, 2));
     } catch (error) { cleanupErrors.push(error); }
     try { if (page) await page.close(); } catch (error) { cleanupErrors.push(error); }
     const deleted = await Promise.allSettled(ids.map(async id => {

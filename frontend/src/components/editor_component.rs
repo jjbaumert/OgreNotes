@@ -78,8 +78,7 @@ fn apply_and_notify(
     }
     let step_maps = txn.maps.clone();
     let old_doc = old_state.doc.clone();
-    let new_state = old_state.apply(txn);
-    view.update_state(new_state.clone());
+    let new_state = view.apply_local_transaction(txn);
     on_state_change.run(new_state.clone());
     if new_state.doc != old_doc {
         // Phase 1 observability — fires once per doc-changing
@@ -2954,13 +2953,17 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                 commands::insert_live_app(id, &state, Some(&dispatch_fn));
             }
             ToolbarCommand::Undo => {
-                if let Some(txn) = history_ref_cmd.borrow_mut().undo(&state) {
-                    dispatch_fn(txn);
+                // Dispatch records history, so release the mutable borrow first.
+                let transaction = history_ref_cmd.borrow_mut().undo(&state);
+                if let Some(txn) = transaction {
+                    dispatch_fn(txn.scroll_into_view());
                 }
             }
             ToolbarCommand::Redo => {
-                if let Some(txn) = history_ref_cmd.borrow_mut().redo(&state) {
-                    dispatch_fn(txn);
+                // Dispatch records history, so release the mutable borrow first.
+                let transaction = history_ref_cmd.borrow_mut().redo(&state);
+                if let Some(txn) = transaction {
+                    dispatch_fn(txn.scroll_into_view());
                 }
             }
             // Spreadsheet-only: no-op in document mode.
