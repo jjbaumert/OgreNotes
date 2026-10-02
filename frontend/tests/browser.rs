@@ -4971,6 +4971,128 @@ fn mermaid_source_scroll_survives_editing_following_paragraph() {
 }
 
 #[wasm_bindgen_test]
+async fn typing_in_a_long_document_preserves_the_editor_viewport() {
+    let style = document().create_element("style").unwrap();
+    style.set_text_content(Some(&format!(
+        "{}\n{}\n{}",
+        include_str!("../style/variables.css"),
+        include_str!("../style/tokens-light.css"),
+        include_str!("../style/main.css"),
+    )));
+    document().head().unwrap().append_child(&style).unwrap();
+    let wrapper = create_container();
+    wrapper.set_class_name("editor-container");
+    wrapper
+        .set_attribute(
+            "style",
+            "position:fixed;top:100px;left:20px;width:900px;height:600px",
+        )
+        .unwrap();
+    let container = document()
+        .create_element("div")
+        .unwrap()
+        .unchecked_into::<HtmlElement>();
+    wrapper.append_child(&container).unwrap();
+    let mut blocks = Vec::new();
+    let mut positions = Vec::new();
+    let mut position = 0;
+    for index in 0..180 {
+        positions.push(position + 11);
+        let mut text = vec![Node::text(&format!(
+            "Paragraph {index}: keep this long document still while typing into its text."
+        ))];
+        if index % 6 == 0 {
+            text.push(source_leaf(NodeType::MathInline, "x^2 + y^2"));
+        }
+        let paragraph = Node::element_with_content(NodeType::Paragraph, Fragment::from(text));
+        position += paragraph.node_size();
+        blocks.push(paragraph);
+        if index == 30 {
+            let mut attrs = HashMap::new();
+            attrs.insert("language".into(), "mermaid".into());
+            attrs.insert("blockId".into(), format!("viewport-diagram-{index}"));
+            let diagram = Node::element_with_attrs(
+                NodeType::CodeBlock,
+                attrs,
+                Fragment::from(vec![Node::text(ORBIT_MERMAID)]),
+            );
+            position += diagram.node_size();
+            blocks.push(diagram);
+        }
+        if index == 40 {
+            let equation = source_leaf(NodeType::MathBlock, "\\frac{x^2}{y^2} + 1");
+            position += equation.node_size();
+            blocks.push(equation);
+        }
+    }
+    let model = Node::element_with_content(NodeType::Doc, Fragment::from(blocks));
+    let (view, txns) = create_editor(container.clone(), model);
+    container.focus().unwrap();
+    let mut inserted = 0;
+    for index in [90, 162] {
+        if index == 162 {
+            wrapper
+                .style()
+                .set_property_with_priority("overflow-anchor", "auto", "important")
+                .unwrap();
+        }
+        set_cursor(&view, positions[index] + inserted);
+        let target = container
+            .query_selector_all(":scope > p")
+            .unwrap()
+            .item(index as u32)
+            .unwrap()
+            .unchecked_into::<HtmlElement>();
+        let top = wrapper.scroll_top() as f64 + target.get_bounding_client_rect().top()
+            - wrapper.get_bounding_client_rect().top()
+            - 200.0;
+        wrapper.set_scroll_top(top as i32);
+        gloo_timers::future::TimeoutFuture::new(50).await;
+        let initial_scroll = wrapper.scroll_top();
+        assert!(initial_scroll > 0, "fixture must scroll before typing");
+        for count in 1..=8 {
+            let before = view.state().doc.text_content().len();
+            dispatch_before_input(view.container(), "insertText", Some("x"));
+            assert_eq!(txns.borrow().len(), 1);
+            let state = apply_all(&view, &txns);
+            txns.borrow_mut().clear();
+            assert_eq!(
+                wrapper
+                    .style()
+                    .get_property_value("overflow-anchor")
+                    .unwrap(),
+                if index == 162 { "auto" } else { "" }
+            );
+            assert_eq!(
+                wrapper.style().get_property_priority("overflow-anchor"),
+                if index == 162 { "important" } else { "" }
+            );
+            inserted += 1;
+            assert_eq!(state.doc.text_content().len(), before + 1);
+            let paragraph = container
+                .query_selector_all(":scope > p")
+                .unwrap()
+                .item(index as u32)
+                .unwrap();
+            assert!(
+                paragraph
+                    .text_content()
+                    .unwrap()
+                    .starts_with(&format!("Paragraph {}{index}:", "x".repeat(count)))
+            );
+            gloo_timers::future::TimeoutFuture::new(50).await;
+            assert!(
+                (wrapper.scroll_top() - initial_scroll).abs() <= 1,
+                "typing moved the viewport at paragraph {index}: {initial_scroll} -> {}",
+                wrapper.scroll_top()
+            );
+        }
+    }
+    cleanup(&wrapper);
+    style.remove();
+}
+
+#[wasm_bindgen_test]
 fn mixed_mermaid_and_list_paste_keeps_diagram_inside_existing_list() {
     for html in [false, true] {
         let container = create_container();
