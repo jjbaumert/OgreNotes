@@ -152,6 +152,7 @@ impl Parser {
     }
 
     fn parse_header(&mut self, line: &str) -> Result<(), ParseError> {
+        let line = line.split_once("%%").map_or(line, |(header, _)| header);
         let mut toks = line.split_whitespace();
         match toks.next() {
             Some("graph") | Some("flowchart") => {}
@@ -164,6 +165,11 @@ impl Parser {
             Some("RL") => Direction::RL,
             Some(other) => return Err(self.err(format!("unknown direction {other:?}"))),
         };
+        if toks.next().is_some() {
+            return Err(
+                self.err("statements after the flowchart direction need a semicolon or newline")
+            );
+        }
         Ok(())
     }
 

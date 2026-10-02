@@ -77,6 +77,15 @@ pub(crate) fn parse(source: &str) -> Result<Treemap, ParseError> {
             title = Some(t.trim().to_string());
             continue;
         }
+        if matches!(
+            trimmed.split_whitespace().next(),
+            Some("classDef" | "class" | "style" | "click")
+        ) {
+            return Err(err(
+                "styling and click directives are not supported in treemap diagrams",
+                line_no,
+            ));
+        }
         let indent = indent_of(raw);
         let (name, value) = parse_node(trimmed)
             .ok_or_else(|| err(format!("unrecognized treemap line {trimmed:?}"), line_no))?;

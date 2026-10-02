@@ -959,3 +959,5 @@ quip-import-report-truncated = In { $count } documenti il contenuto con annidame
 quip-import-report-mentions = In { $count } documenti le @menzioni sono state importate come testo semplice
 quip-import-report-live-apps = { $count } app Quip incorporate (bacheche Kanban e simili) non sono state trasferite
 quip-import-report-formulas = { $count } formule di foglio di calcolo non sono state importate — quelle celle mantengono l'ultimo valore e non verranno ricalcolate
+
+mermaid-modal-source-label = Sorgente del diagramma

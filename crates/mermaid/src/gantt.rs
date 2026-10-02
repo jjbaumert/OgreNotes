@@ -1,7 +1,7 @@
 //! Mermaid `gantt` chart: parser + SVG renderer.
 //!
-//! Dates use the default `YYYY-MM-DD` format (other `dateFormat` values are
-//! accepted but not reinterpreted), converted to integer day numbers via
+//! Dates use the default `YYYY-MM-DD` format. Unsupported date/calendar
+//! directives are rejected explicitly. Dates become integer day numbers via
 //! the civil-calendar algorithm. Task starts may be a date or `after
 //! <id>...`; ends may be a date or a `<n>d|w|h` duration. The time axis is
 //! scaled to a fixed chart width so any date range fits a bounded canvas.
@@ -149,9 +149,13 @@ pub(crate) fn parse(source: &str) -> Result<Gantt, ParseError> {
                 cur_section = Some(sections.len() - 1);
                 continue;
             }
-            // Accepted but not interpreted (single date format / no calendar).
+            "dateFormat" if line["dateFormat".len()..].trim() == "YYYY-MM-DD" => continue,
+            "axisFormat" if line["axisFormat".len()..].trim() == "%Y-%m-%d" => continue,
+            "todayMarker" if line["todayMarker".len()..].trim() == "off" => continue,
             "dateFormat" | "axisFormat" | "excludes" | "includes" | "todayMarker"
-            | "tickInterval" | "weekday" => continue,
+            | "tickInterval" | "weekday" => {
+                return Err(err(format!("unsupported Gantt directive: {line}"), line_no));
+            }
             _ => {}
         }
 

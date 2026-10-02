@@ -959,3 +959,5 @@ quip-import-report-truncated = Bei { $count } Dokumenten wurden tief verschachte
 quip-import-report-mentions = Bei { $count } Dokumenten wurden @Erwähnungen als reiner Text importiert
 quip-import-report-live-apps = { $count } eingebettete Quip-Apps (Kanban-Boards und Ähnliches) konnten nicht übernommen werden
 quip-import-report-formulas = { $count } Tabellenformeln wurden nicht importiert — diese Zellen behalten ihren letzten Wert und werden nicht neu berechnet
+
+mermaid-modal-source-label = Diagrammquelle

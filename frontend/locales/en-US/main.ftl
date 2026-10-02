@@ -1023,6 +1023,7 @@ insert-math-description = Insert a math equation written in LaTeX
 kanban-column-delete-confirm = Delete this column and all its cards?
 kanban-column-wip-limit-prompt = WIP limit (empty to clear)
 mermaid-modal-title = Edit Diagram
+mermaid-modal-source-label = Diagram source
 mermaid-modal-save = Save
 mermaid-modal-error-empty = Diagram source cannot be empty.
 mermaid-modal-error-too-long = Diagram source is too long ({ $max } character limit).
