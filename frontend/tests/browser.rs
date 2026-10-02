@@ -5093,6 +5093,111 @@ async fn typing_in_a_long_document_preserves_the_editor_viewport() {
 }
 
 #[wasm_bindgen_test]
+fn local_edit_reveals_wrapped_caret_without_scrolling_remote_updates() {
+    let wrapper = create_container();
+    wrapper.set_class_name("editor-container");
+    wrapper
+        .set_attribute(
+            "style",
+            "position:fixed;top:50px;left:10px;width:300px;height:160px;overflow:auto",
+        )
+        .unwrap();
+    let container = document()
+        .create_element("div")
+        .unwrap()
+        .unchecked_into::<HtmlElement>();
+    container
+        .set_attribute("style", "font:16px/24px Arial;padding:0")
+        .unwrap();
+    wrapper.append_child(&container).unwrap();
+    let blocks: Vec<_> = (0..40)
+        .map(|_| {
+            Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("word ".repeat(20).trim_end())]),
+            )
+        })
+        .collect();
+    let position = blocks.iter().take(20).map(Node::node_size).sum::<usize>()
+        + 1
+        + blocks[20].text_content().chars().count();
+    let (view, txns) = create_editor(
+        container.clone(),
+        Node::element_with_content(NodeType::Doc, Fragment::from(blocks)),
+    );
+    container.focus().unwrap();
+    set_cursor(&view, position);
+    let selection = document().get_selection().unwrap().unwrap();
+    let caret = selection
+        .get_range_at(0)
+        .unwrap()
+        .get_bounding_client_rect();
+    wrapper.set_scroll_top(
+        (caret.bottom() - wrapper.get_bounding_client_rect().bottom() + 2.0) as i32,
+    );
+    let initial_scroll = wrapper.scroll_top();
+    assert!(initial_scroll > 0);
+    for _ in 0..80 {
+        dispatch_before_input(&container, "insertText", Some("x"));
+        assert_eq!(txns.borrow().len(), 1);
+        let transaction = txns.borrow_mut().pop().unwrap();
+        assert!(
+            transaction.scroll_into_view,
+            "direct input must request caret reveal"
+        );
+        view.apply_local_transaction(transaction);
+        let caret = selection
+            .get_range_at(0)
+            .unwrap()
+            .get_bounding_client_rect();
+        assert!(caret.height() > 0.0);
+        assert!(caret.bottom() <= wrapper.get_bounding_client_rect().bottom() + 1.0);
+    }
+    assert!(
+        wrapper.scroll_top() > initial_scroll,
+        "typing must cross a wrapping boundary"
+    );
+    dispatch_before_input(&container, "insertParagraph", None);
+    let transaction = txns.borrow_mut().pop().unwrap();
+    assert!(transaction.scroll_into_view);
+    let entered = view.apply_local_transaction(transaction);
+    let (node, _) =
+        ogrenotes_frontend::editor::view::find_dom_position(&container, entered.selection.head())
+            .unwrap();
+    let paragraph = node.dyn_into::<HtmlElement>().unwrap();
+    assert!(
+        paragraph.get_bounding_client_rect().bottom()
+            <= wrapper.get_bounding_client_rect().bottom() + 1.0,
+        "Enter must reveal the new empty paragraph"
+    );
+    assert!(
+        paragraph.get_bounding_client_rect().top()
+            >= wrapper.get_bounding_client_rect().top() - 1.0,
+        "Enter must not overshoot the visible band"
+    );
+    // A passive observer can scroll away from their selection. A remote update
+    // must not invoke the local-edit reveal path and pull them back to it.
+    wrapper.set_scroll_top(0);
+    let state = view.state();
+    let mut remote = state
+        .transaction()
+        .insert(1, Fragment::from(vec![Node::text("remote")]))
+        .unwrap();
+    remote.selection = state.selection.clone();
+    view.update_state(state.apply(remote));
+    assert_eq!(wrapper.scroll_top(), 0);
+    // Async results are local transactions, but do not request caret reveal.
+    let state = view.state();
+    let asynchronous = state
+        .transaction()
+        .insert(1, Fragment::from(vec![Node::text("async")]))
+        .unwrap();
+    view.apply_local_transaction(asynchronous);
+    assert_eq!(wrapper.scroll_top(), 0);
+    cleanup(&wrapper);
+}
+
+#[wasm_bindgen_test]
 fn mixed_mermaid_and_list_paste_keeps_diagram_inside_existing_list() {
     for html in [false, true] {
         let container = create_container();
