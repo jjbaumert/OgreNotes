@@ -370,3 +370,48 @@ directory, `MERMAID_CLI_PATH` to its `bin` directory, and `REFERENCE_MAGICK`
 to the absolute ImageMagick executable before running the PNG regression.
 This configures a real librsvg delegate while the CLI sees only ImageMagick.
 The fallback test also verifies that failed exports remove temporary SVGs.
+
+### Editor typing viewport regression
+
+`test-editor-scroll.cjs` checks typing at rendered positions near the top,
+middle and end of a long document, at block starts and middles, in long
+paragraphs and ordinary code blocks, and through a wrapping transition.
+It also uses a separate generated document for remote typing, block insertion
+and Undo, viewport-edge wrapping across two lines, and delayed image loading.
+
+Run against a local DEV_MODE stack using a private binary snapshot from the
+authenticated `GET /api/v1/documents/{id}/content` endpoint:
+
+```bash
+node scripts/frontend-doctor/test-editor-scroll.cjs \
+  --base-url http://localhost:3000 --snapshot /tmp/document-content.bin \
+  --browser firefox --out /tmp/editor-scroll-firefox
+```
+
+For layout comparisons, first capture the same generated scenarios from an
+unpatched build, then supply that report to the fixed-build run:
+
+```bash
+node scripts/frontend-doctor/test-editor-scroll.cjs \
+  --base-url http://localhost:3001 --generated-only \
+  --browser firefox --out /tmp/editor-scroll-baseline
+node scripts/frontend-doctor/test-editor-scroll.cjs \
+  --base-url http://localhost:3000 --snapshot /tmp/document-content.bin \
+  --browser firefox --baseline-report /tmp/editor-scroll-baseline/report.json
+```
+
+Repeat with `--browser chromium` and its own baseline. Comparisons use the
+unpatched renderer, rather than changing a CSS flag in the patched renderer.
+Firefox must retain the caret position when the delayed image gains height;
+Chromium's existing delayed-image behavior is compared with its baseline.
+The existing caret-reveal limitation at the viewport edge is also measured
+against the baseline.
+
+Both modes require Playwright Chromium. Firefox also requires Firefox and
+`geckodriver` on PATH. OpenSSL generates a temporary HTTPS image fixture;
+test browsers accept its self-signed certificate, which is removed on exit.
+`CHROME_BIN`, `FIREFOX_BIN`, `GECKODRIVER` and `GECKODRIVER_PROFILE_ROOT`
+override executable/profile locations. The script creates and purges its test
+documents. Keep the input snapshot local. Reports contain geometry and character
+counts without document text. The WASM browser suite also checks long-document
+viewport stability and restoration of the host's anchoring settings.

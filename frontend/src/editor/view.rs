@@ -226,6 +226,24 @@ impl EditorView {
                 .into_iter()
                 .map(|(id, code)| (id, (code.scroll_top(), code.scroll_left())))
                 .collect();
+        // Discard native anchors before replacing their nodes. Flush the rebuilt
+        // layout while anchoring is disabled, then restore it so delayed images
+        // and other asynchronous layout changes can still keep text in view.
+        let anchoring = self
+            .container
+            .closest(".editor-container")
+            .ok()
+            .flatten()
+            .and_then(|element| element.dyn_into::<HtmlElement>().ok())
+            .map(|scroller| {
+                let style = scroller.style();
+                let value = style
+                    .get_property_value("overflow-anchor")
+                    .unwrap_or_default();
+                let priority = style.get_property_priority("overflow-anchor");
+                let _ = style.set_property_with_priority("overflow-anchor", "none", "important");
+                (scroller, value, priority)
+            });
         self.container.set_inner_html("");
 
         if let Node::Element { content, .. } = &state.doc {
@@ -245,6 +263,18 @@ impl EditorView {
             }
         }
         self.sync_selection_to_dom(&state.selection);
+        if let Some((scroller, value, priority)) = anchoring {
+            let _ = scroller.scroll_height();
+            if value.is_empty() {
+                let _ = scroller.style().remove_property("overflow-anchor");
+            } else {
+                let _ = scroller.style().set_property_with_priority(
+                    "overflow-anchor",
+                    &value,
+                    &priority,
+                );
+            }
+        }
     }
 
     /// Sync the model selection to the browser's DOM selection.
