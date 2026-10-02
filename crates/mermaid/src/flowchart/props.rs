@@ -74,3 +74,40 @@ proptest! {
         crate::props::assert_render_invariants(&src)?;
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 128,
+        rng_seed: proptest::test_runner::RngSeed::Fixed(0x0006_5245),
+        ..ProptestConfig::default()
+    })]
+
+    /// Exercise the public source-to-SVG pipeline in every flow direction.
+    /// Checking the rendered nodes also catches sizing/emission mismatches.
+    #[test]
+    fn seeded_dags_keep_nodes_separate_and_inside_the_canvas(
+        direction in prop_oneof![Just("TD"), Just("BT"), Just("LR"), Just("RL")],
+        count in 2usize..12,
+        edges in proptest::collection::vec((0usize..12, 0usize..12), 0..20),
+    ) {
+        let mut source = format!("flowchart {direction}\n");
+        for index in 0..count {
+            source.push_str(&format!("n{index}[Node {index}]\n"));
+        }
+        for (a, b) in edges {
+            if a < b && b < count {
+                source.push_str(&format!("n{a} --> n{b}\n"));
+            }
+        }
+        let svg = crate::render(&source).svg.expect("valid DAG renders");
+        crate::extent::assert_inside(&svg);
+        let (_, elements) = crate::extent::scan(&svg);
+        let nodes: Vec<_> = elements.iter().filter(|element| element.tag == "rect").collect();
+        prop_assert_eq!(nodes.len(), count);
+        for (index, node) in nodes.iter().enumerate() {
+            for other in &nodes[index + 1..] {
+                prop_assert_eq!(node.bbox.overlap(&other.bbox), 0.0);
+            }
+        }
+    }
+}

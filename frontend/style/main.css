@@ -6174,3 +6174,19 @@ tr:hover .folder-row-actions,
   overflow: auto;
   max-height: 320px;
 }
+
+/* Keyboard edit affordance for Mermaid leaf blocks. */
+.mermaid-edit-control {
+    display: block;
+    margin: 0.5rem 0 0 auto;
+    padding: 0.25rem 0.5rem;
+    color: var(--text-primary);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+}
+.mermaid-edit-control:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}

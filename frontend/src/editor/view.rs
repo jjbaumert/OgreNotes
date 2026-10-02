@@ -262,6 +262,22 @@ impl EditorView {
                 code.set_scroll_left(*left);
             }
         }
+        // Read-only diagrams retain their accessible image but have no edit control.
+        if self
+            .container
+            .class_list()
+            .contains("editor-content-readonly")
+        {
+            if let Ok(controls) = self.container.query_selector_all(".mermaid-edit-control") {
+                for index in 0..controls.length() {
+                    if let Some(control) = controls.item(index) {
+                        if let Some(parent) = control.parent_node() {
+                            let _ = parent.remove_child(&control);
+                        }
+                    }
+                }
+            }
+        }
         self.sync_selection_to_dom(&state.selection);
         if let Some((scroller, value, priority)) = anchoring {
             let _ = scroller.scroll_height();
@@ -335,6 +351,15 @@ impl EditorView {
                 return;
             };
 
+            // Native Mermaid edit buttons own Enter/Space and Tab navigation.
+            if ke
+                .target()
+                .and_then(|target| target.dyn_into::<Element>().ok())
+                .and_then(|target| target.closest(".mermaid-edit-control").ok().flatten())
+                .is_some()
+            {
+                return;
+            }
             let key = ke.key();
             let ctrl = ke.ctrl_key();
             let meta = ke.meta_key();

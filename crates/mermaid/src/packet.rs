@@ -54,13 +54,36 @@ pub(crate) fn parse(source: &str) -> Result<Packet, ParseError> {
         let Some((range, label)) = line.split_once(':') else {
             return Err(err("packet field needs `bits: \"label\"`", line_no));
         };
-        let (start, end) = parse_range(range.trim())
-            .ok_or_else(|| err("packet field range must be `start-end` or `bit`", line_no))?;
+        let range = range.trim();
+        let (start, end) = if let Some(length) = range.strip_prefix('+') {
+            let length: usize =
+                length.parse().ok().filter(|n| *n > 0).ok_or_else(|| {
+                    err("relative packet length must be a positive integer", line_no)
+                })?;
+            let start = fields.last().map_or(0, |field| field.end + 1);
+            let end = start
+                .checked_add(length - 1)
+                .ok_or_else(|| err("packet range is too large", line_no))?;
+            (start, end)
+        } else {
+            parse_range(range).ok_or_else(|| {
+                err(
+                    "packet field range must be `start-end`, `bit` or `+length`",
+                    line_no,
+                )
+            })?
+        };
         if start > end {
             return Err(err("packet field start bit must be <= end bit", line_no));
         }
         if end >= MAX_BITS {
             return Err(err(format!("packet too large: bit {end} >= {MAX_BITS}"), line_no));
+        }
+        if fields
+            .iter()
+            .any(|field| start <= field.end && field.start <= end)
+        {
+            return Err(err("packet fields must not overlap", line_no));
         }
         let label = label.trim();
         let label = label.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(label);

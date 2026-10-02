@@ -170,13 +170,9 @@ pub(crate) fn escape_xml(s: &str) -> String {
     out
 }
 
-/// The `accTitle`/`accDescr` accessibility keyword a statement invokes,
-/// or `None` when it merely starts with those letters. Mermaid treats
-/// them as directives only when the keyword is immediately followed by
-/// `:` (single-line) or `{` (block form) — `accTitleNode` is a plain id,
-/// not a directive. Shared by the flowchart and state parsers so both
-/// draw the id/directive boundary the same way. Both keywords are
-/// exactly 8 ASCII bytes.
+/// Recognize accessibility statements without reserving similarly named node
+/// IDs, class assignments or flowchart diamond shapes. Block descriptions use
+/// whitespace before `{` to distinguish them from a node named `accDescr`.
 pub(crate) fn acc_directive_keyword(stmt: &str) -> Option<&'static str> {
     let kw = if stmt.starts_with("accTitle") {
         "accTitle"
@@ -185,8 +181,11 @@ pub(crate) fn acc_directive_keyword(stmt: &str) -> Option<&'static str> {
     } else {
         return None;
     };
-    let rest = stmt[kw.len()..].trim_start();
-    (rest.is_empty() || rest.starts_with(':') || rest.starts_with('{')).then_some(kw)
+    let rest = &stmt[kw.len()..];
+    let trimmed = rest.trim_start();
+    ((trimmed.starts_with(':') && !trimmed.starts_with("::"))
+        || (kw == "accDescr" && rest.starts_with(char::is_whitespace) && trimmed.starts_with('{')))
+    .then_some(kw)
 }
 
 /// SVG path `d` drawing a smooth curve through `points` — one cubic
@@ -224,6 +223,16 @@ pub struct ParseError {
     pub message: String,
     /// 1-based source line the error points at, when known.
     pub line: Option<usize>,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(line) = self.line {
+            write!(formatter, "Line {line}: {}", self.message)
+        } else {
+            formatter.write_str(&self.message)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,7 +276,7 @@ pub fn detect_kind(source: &str) -> DiagramKind {
         "timeline" => DiagramKind::Timeline,
         "journey" => DiagramKind::Journey,
         "quadrantChart" => DiagramKind::Quadrant,
-        "xychart-beta" => DiagramKind::XyChart,
+        "xychart-beta" | "xychart" => DiagramKind::XyChart,
         "kanban" => DiagramKind::Kanban,
         "packet" | "packet-beta" => DiagramKind::Packet,
         "requirementDiagram" => DiagramKind::Requirement,
@@ -314,6 +323,157 @@ fn strip_front_matter(source: &str) -> Result<Option<String>, ParseError> {
     Ok(Some(blanked.join("\n")))
 }
 
+/// Extract shared accessibility statements while retaining original error lines.
+fn accessibility_source(
+    source: &str,
+) -> Result<(String, Option<String>, Option<String>), ParseError> {
+    let mut title = None;
+    let mut description = None;
+    let mut multiline: Option<(usize, String)> = None;
+    let mut lines = Vec::new();
+    for (index, raw) in source.lines().enumerate() {
+        let line = raw.trim();
+        if let Some((_, text)) = multiline.as_mut() {
+            if let Some((before, after)) = raw.split_once('}') {
+                text.push_str(before);
+                description = Some(text.trim().to_string());
+                multiline = None;
+                lines.push(after);
+            } else {
+                text.push_str(raw);
+                text.push('\n');
+                lines.push("");
+            }
+        } else if let Some(value) = line.strip_prefix("accTitle").and_then(|rest| {
+            rest.trim_start()
+                .strip_prefix(':')
+                .filter(|value| !value.starts_with(':'))
+        }) {
+            title = Some(value.trim().to_string());
+            lines.push("");
+        } else if let Some(value) = line.strip_prefix("accDescr").and_then(|rest| {
+            rest.trim_start()
+                .strip_prefix(':')
+                .filter(|value| !value.starts_with(':'))
+        }) {
+            description = Some(value.trim().to_string());
+            lines.push("");
+        } else if let Some(value) = line
+            .strip_prefix("accDescr")
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+            .and_then(|rest| rest.trim_start().strip_prefix('{'))
+        {
+            if let Some((value, after)) = value.split_once('}') {
+                description = Some(value.trim().to_string());
+                lines.push(after);
+            } else {
+                multiline = Some((index + 1, format!("{value}\n")));
+                lines.push("");
+            }
+        } else {
+            lines.push(raw);
+        }
+    }
+    if let Some((line, _)) = multiline {
+        return Err(ParseError {
+            message: "unterminated accDescr block".into(),
+            line: Some(line),
+        });
+    }
+    Ok((lines.join("\n"), title, description))
+}
+
+// SVG is generated by our renderers. Ignore decorative text in masks and
+// explicitly hidden underlays, while retaining repeated visible labels.
+fn visible_svg_labels(svg: &str) -> String {
+    let mut labels = Vec::new();
+    let mut hidden_stack = Vec::new();
+    let mut rest = svg;
+    while let Some(start) = rest.find('<') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('>') else { break };
+        let tag = &rest[..end];
+        rest = &rest[end + 1..];
+        if tag.starts_with('/') {
+            hidden_stack.pop();
+            continue;
+        }
+        let name = tag
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('/');
+        let hidden = hidden_stack.last().copied().unwrap_or(false)
+            || matches!(name, "defs" | "mask" | "clipPath" | "marker")
+            || tag.contains("aria-hidden=\"true\"");
+        if name == "text" && !tag.ends_with('/') {
+            let Some(close) = rest.find("</text>") else {
+                break;
+            };
+            if !hidden {
+                let mut text = String::new();
+                let mut in_tag = false;
+                for character in rest[..close].chars() {
+                    match character {
+                        '<' => {
+                            in_tag = true;
+                            text.push(' ');
+                        }
+                        '>' => in_tag = false,
+                        _ if !in_tag => text.push(character),
+                        _ => {}
+                    }
+                }
+                let text = text
+                    .trim()
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&quot;", "\"")
+                    .replace("&apos;", "'")
+                    .replace("&amp;", "&");
+                if !text.is_empty() {
+                    labels.push(text);
+                }
+            }
+            rest = &rest[close + "</text>".len()..];
+        } else if !tag.ends_with('/') {
+            hidden_stack.push(hidden);
+        }
+    }
+    let mut description = labels.join("; ");
+    if let Some((end, _)) = description.char_indices().nth(MAX_SOURCE_LEN - 1) {
+        description.truncate(end);
+        description.push('…');
+    }
+    description
+}
+
+fn accessible_svg(
+    svg: String,
+    kind: DiagramKind,
+    title: Option<String>,
+    description: Option<String>,
+) -> String {
+    let title = title
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("{} diagram", kind.label()));
+    let title = escape_xml(&title);
+    let description = escape_xml(&description.unwrap_or_else(|| visible_svg_labels(&svg)));
+    let Some(end) = svg.find('>') else { return svg };
+    let mut out = String::with_capacity(svg.len() + title.len() * 2 + 100);
+    out.push_str(&svg[..end]);
+    // Explicit name/description avoids shared ID references when cached SVGs
+    // appear more than once in a document.
+    out.push_str(&format!(" role=\"img\" aria-label=\"{title}\""));
+    out.push('>');
+    out.push_str(&format!("<title>{title}</title>"));
+    if !description.is_empty() {
+        out.push_str(&format!("<desc>{description}</desc>"));
+    }
+    out.push_str(&svg[end + 1..]);
+    out
+}
+
 /// Render mermaid `source` to an SVG string. Never panics.
 pub fn render(source: &str) -> RenderOutput {
     let kind = detect_kind(source);
@@ -349,6 +509,17 @@ pub fn render(source: &str) -> RenderOutput {
             return RenderOutput { kind: DiagramKind::Unknown, svg: None, error: Some(e) }
         }
     };
+    let (accessible_source, title, description) = match accessibility_source(source) {
+        Ok(values) => values,
+        Err(error) => {
+            return RenderOutput {
+                kind,
+                svg: None,
+                error: Some(error),
+            };
+        }
+    };
+    let source = accessible_source.as_str();
     let out = match kind {
         DiagramKind::Pie => match pie::parse(source) {
             Ok(p) => RenderOutput { kind, svg: Some(pie::render_svg(&p)), error: None },
@@ -449,6 +620,10 @@ pub fn render(source: &str) -> RenderOutput {
             }),
         },
     };
+    let mut out = out;
+    if let Some(svg) = out.svg.take() {
+        out.svg = Some(accessible_svg(svg, kind, title, description));
+    }
     cap_output(out)
 }
 
@@ -888,7 +1063,7 @@ mod prop_tests {
             // Every `<` in the output must open a tag the renderer itself
             // emits; any other `<` is an unescaped label character.
             let renderer_tags =
-                ["<svg", "</svg>", "<text", "</text>", "<rect", "<path", "<circle"];
+                ["<svg", "</svg>", "<title", "</title>", "<desc", "</desc>", "<text", "</text>", "<rect", "<path", "<circle"];
             let tag_lt: usize =
                 renderer_tags.iter().map(|t| svg.matches(t).count()).sum();
             prop_assert_eq!(

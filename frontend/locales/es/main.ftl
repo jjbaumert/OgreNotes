@@ -959,3 +959,5 @@ quip-import-report-truncated = En { $count } documentos se aplanó el contenido 
 quip-import-report-mentions = En { $count } documentos las @menciones se importaron como texto sin formato
 quip-import-report-live-apps = { $count } apps integradas de Quip (tableros Kanban y similares) no se pudieron trasladar
 quip-import-report-formulas = No se importaron { $count } fórmulas de hoja de cálculo: esas celdas conservan su último valor y no se recalcularán
+
+mermaid-modal-source-label = Código del diagrama

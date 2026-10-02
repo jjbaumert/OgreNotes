@@ -40,6 +40,8 @@ pub(crate) struct Series {
 pub(crate) struct XYChart {
     pub title: Option<String>,
     pub x_categories: Vec<String>,
+    pub x_label: Option<String>,
+    pub x_range: Option<(f64, f64)>,
     pub y_label: Option<String>,
     pub y_range: Option<(f64, f64)>,
     pub series: Vec<Series>,
@@ -49,11 +51,14 @@ pub(crate) fn parse(source: &str) -> Result<XYChart, ParseError> {
     let mut c = XYChart {
         title: None,
         x_categories: Vec::new(),
+        x_label: None,
+        x_range: None,
         y_label: None,
         y_range: None,
         series: Vec::new(),
     };
     let mut seen_header = false;
+    let mut series_lines = Vec::new();
 
     for (idx, raw) in source.lines().enumerate() {
         let line_no = idx + 1;
@@ -62,8 +67,14 @@ pub(crate) fn parse(source: &str) -> Result<XYChart, ParseError> {
             continue;
         }
         if !seen_header {
-            if line.strip_suffix(';').unwrap_or(line).trim_end() != "xychart-beta" {
-                return Err(err("xy chart must start with `xychart-beta`", line_no));
+            if !matches!(
+                line.strip_suffix(';').unwrap_or(line).trim_end(),
+                "xychart-beta" | "xychart"
+            ) {
+                return Err(err(
+                    "xy chart must start with `xychart` or `xychart-beta`",
+                    line_no,
+                ));
             }
             seen_header = true;
             continue;
@@ -71,27 +82,63 @@ pub(crate) fn parse(source: &str) -> Result<XYChart, ParseError> {
         if let Some(t) = line.strip_prefix("title ") {
             c.title = Some(unquote(t.trim()));
         } else if let Some(a) = line.strip_prefix("x-axis ") {
-            c.x_categories = parse_list_str(a);
+            let (label, rest) =
+                parse_axis_label(a).ok_or_else(|| err("invalid x-axis title", line_no))?;
+            c.x_label = label;
+            if rest.starts_with('[') {
+                c.x_categories = parse_categories(rest)
+                    .ok_or_else(|| err("x-axis needs a bracketed category list", line_no))?;
+                if c.x_categories.len() > MAX_POINTS {
+                    return Err(err("too many x-axis categories", line_no));
+                }
+                c.x_range = None;
+            } else {
+                c.x_categories.clear();
+                c.x_range = parse_axis_range(rest).ok_or_else(|| {
+                    err(
+                        "x-axis needs a finite increasing numeric range or category list",
+                        line_no,
+                    )
+                })?;
+            }
         } else if let Some(a) = line.strip_prefix("y-axis ") {
-            let (label, range) = parse_y_axis(a);
+            let (label, rest) =
+                parse_axis_label(a).ok_or_else(|| err("invalid y-axis title", line_no))?;
             c.y_label = label;
-            c.y_range = range;
+            c.y_range = parse_axis_range(rest)
+                .ok_or_else(|| err("y-axis needs a finite increasing numeric range", line_no))?;
         } else if let Some(v) = line.strip_prefix("bar ") {
             push_series(&mut c, SeriesKind::Bar, v, line_no)?;
+            series_lines.push(line_no);
         } else if let Some(v) = line.strip_prefix("line ") {
             push_series(&mut c, SeriesKind::Line, v, line_no)?;
+            series_lines.push(line_no);
         } else {
             return Err(err(format!("unrecognized xychart line {line:?}"), line_no));
         }
     }
     if !seen_header {
         return Err(ParseError {
-            message: "xy chart must start with `xychart-beta`".into(),
+            message: "xy chart must start with `xychart` or `xychart-beta`".into(),
             line: Some(1),
         });
     }
     if c.series.is_empty() {
         return Err(err("xy chart needs at least one `bar` or `line` series", 1));
+    }
+    let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+    let mut range_line = 1;
+    for (series, line) in c.series.iter().zip(series_lines) {
+        for &value in &series.values {
+            if value < lo || value > hi {
+                lo = lo.min(value);
+                hi = hi.max(value);
+                range_line = line;
+            }
+        }
+    }
+    if c.y_range.is_none() && !(hi - lo).is_finite() {
+        return Err(err("derived y-axis range is too large", range_line));
     }
     Ok(c)
 }
@@ -110,10 +157,44 @@ fn unquote(s: &str) -> String {
     s.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(s).to_string()
 }
 
-/// `[a, b, c]` → string items (quotes stripped).
-fn parse_list_str(s: &str) -> Vec<String> {
-    let inner = s.trim().trim_start_matches('[').trim_end_matches(']');
-    inner.split(',').map(|x| unquote(x.trim())).filter(|x| !x.is_empty()).collect()
+/// Categories may contain commas inside double quotes.
+fn parse_categories(s: &str) -> Option<Vec<String>> {
+    let inner = s.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let mut values = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    for (index, character) in inner.char_indices() {
+        if character == '"' {
+            quoted = !quoted;
+        }
+        if character == ',' && !quoted {
+            values.push(category(&inner[start..index])?);
+            start = index + 1;
+        }
+    }
+    if quoted {
+        return None;
+    }
+    values.push(category(&inner[start..])?);
+    Some(values)
+}
+
+fn category(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.starts_with('"') {
+        let text = value.strip_prefix('"')?.strip_suffix('"')?;
+        if text.contains('"') {
+            return None;
+        }
+        Some(text.to_string())
+    } else if value.contains(['"', '[', ']']) {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 /// `[1, 2, 3]` → floats, or `None` if any item isn't numeric.
@@ -127,24 +208,35 @@ fn parse_list_num(s: &str) -> Option<Vec<f64>> {
         .collect()
 }
 
-/// `"label" min --> max`, `"label"`, or `min --> max` — any part optional.
-fn parse_y_axis(s: &str) -> (Option<String>, Option<(f64, f64)>) {
+/// Split an optional quoted or bare title from an axis specification.
+fn parse_axis_label(s: &str) -> Option<(Option<String>, &str)> {
     let s = s.trim();
-    let (label, rest) = if let Some(r) = s.strip_prefix('"') {
-        match r.split_once('"') {
-            Some((lbl, after)) => (Some(lbl.to_string()), after.trim()),
-            None => (Some(r.to_string()), ""),
-        }
-    } else {
-        (None, s)
-    };
-    let range = rest.split_once("-->").and_then(|(a, b)| {
-        Some((
-            a.trim().parse::<f64>().ok().filter(|v| v.is_finite())?,
-            b.trim().parse::<f64>().ok().filter(|v| v.is_finite())?,
-        ))
-    });
-    (label, range)
+    if let Some(rest) = s.strip_prefix('"') {
+        let (label, rest) = rest.split_once('"')?;
+        return Some((Some(label.to_string()), rest.trim()));
+    }
+    if s.starts_with('[')
+        || s.split_whitespace().next().is_some_and(|word| {
+            word.parse::<f64>()
+                .is_ok_and(|value| value.is_finite() || s.contains("-->"))
+        })
+    {
+        return Some((None, s));
+    }
+    let split = s.find(char::is_whitespace).unwrap_or(s.len());
+    let (label, rest) = s.split_at(split);
+    (!label.is_empty()).then(|| (Some(label.to_string()), rest.trim()))
+}
+
+/// An omitted range is valid; a supplied range must be finite and increasing.
+fn parse_axis_range(s: &str) -> Option<Option<(f64, f64)>> {
+    if s.is_empty() {
+        return Some(None);
+    }
+    let (lo, hi) = s.split_once("-->")?;
+    let lo: f64 = lo.trim().parse().ok()?;
+    let hi: f64 = hi.trim().parse().ok()?;
+    (lo.is_finite() && hi.is_finite() && hi > lo && (hi - lo).is_finite()).then_some(Some((lo, hi)))
 }
 
 fn err(message: impl Into<String>, line: usize) -> ParseError {
@@ -169,10 +261,7 @@ pub(crate) fn render_svg(c: &XYChart) -> String {
         }
         (lo, hi)
     });
-    // Normalize an inverted explicit range (`10 --> -10`): sorting keeps
-    // `span` honest instead of collapsing it to the 1e-9 floor, and makes
-    // the value clamp below well-defined.
-    let (ymin, ymax) = if ymin_raw <= ymax_raw { (ymin_raw, ymax_raw) } else { (ymax_raw, ymin_raw) };
+    let (ymin, ymax) = (ymin_raw, ymax_raw);
     let span = (ymax - ymin).max(1e-9);
     // Pin data to the axis range. Values far outside an explicit range
     // (e.g. 1e308 against `0 --> 100`) would otherwise overflow the pixel
@@ -196,7 +285,17 @@ pub(crate) fn render_svg(c: &XYChart) -> String {
     }
     let (left, top) = (plot_left, plot_top);
     let bottom = top + PLOT_H;
-    let vx = |i: f64| left + (i + 0.5) / n as f64 * PLOT_W; // category center
+    let numeric_line_axis = c.x_range.is_some()
+        && c.series
+            .iter()
+            .all(|series| series.kind == SeriesKind::Line);
+    let vx = |i: f64| {
+        if numeric_line_axis && n > 1 {
+            left + i / (n - 1) as f64 * PLOT_W
+        } else {
+            left + (i + 0.5) / n as f64 * PLOT_W
+        }
+    };
     let vy = |val: f64| bottom - (val - ymin) / span * PLOT_H;
 
     // axes.
@@ -206,7 +305,7 @@ pub(crate) fn render_svg(c: &XYChart) -> String {
     ));
     // y ticks: min, mid, max.
     for frac in [0.0, 0.5, 1.0] {
-        let val = ymin + frac * span;
+        let val = axis_tick(ymin, ymax, frac);
         let gy = bottom - frac * PLOT_H;
         body.push_str(&format!(
             r#"<text x="{:.1}" y="{:.1}" text-anchor="end" font-size="11" fill="currentColor">{}</text>"#,
@@ -228,6 +327,20 @@ pub(crate) fn render_svg(c: &XYChart) -> String {
         body.push_str(&format!(
             r#"<text x="{lx:.1}" y="{ly:.1}" text-anchor="middle" font-size="12" fill="currentColor" transform="rotate(-90 {lx:.1} {ly:.1})">{}</text>"#,
             escape_xml(lbl)
+        ));
+    }
+    if let Some((lo, hi)) = c.x_range {
+        for fraction in [0.0, 0.5, 1.0] {
+            body.push_str(&format!(
+                r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="11" fill="currentColor">{}</text>"#,
+                if n == 1 { left + fraction * PLOT_W } else { vx(fraction * (n - 1) as f64) }, bottom + 16.0, fmt_num(axis_tick(lo, hi, fraction))
+            ));
+        }
+    }
+    if let Some(label) = &c.x_label {
+        body.push_str(&format!(
+            r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="12" fill="currentColor">{}</text>"#,
+            left + PLOT_W / 2.0, bottom + 36.0, escape_xml(label)
         ));
     }
     // x category labels.
@@ -274,7 +387,7 @@ pub(crate) fn render_svg(c: &XYChart) -> String {
         }
     }
 
-    let total_h = bottom + X_AXIS_H + PAD;
+    let total_h = bottom + X_AXIS_H + if c.x_label.is_some() { 24.0 } else { 0.0 } + PAD;
     let mut out = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total_w:.0} {total_h:.0}" width="{total_w:.0}" height="{total_h:.0}" style="font-family:sans-serif;font-size:14px">"#
     );
@@ -285,10 +398,32 @@ pub(crate) fn render_svg(c: &XYChart) -> String {
     out
 }
 
+/// Avoid cancellation noise near zero on the midpoint tick, without rounding
+/// away genuine tiny endpoints or their data.
+fn axis_tick(lo: f64, hi: f64, fraction: f64) -> f64 {
+    if fraction == 0.0 {
+        return lo;
+    }
+    if fraction == 1.0 {
+        return hi;
+    }
+    let middle = lo * 0.5 + hi * 0.5;
+    if middle.abs() <= (hi - lo) * 1e-12 {
+        0.0
+    } else {
+        middle
+    }
+}
+
 /// Compact number: integers without a decimal, else one decimal place.
 fn fmt_num(v: f64) -> String {
-    if (v - v.round()).abs() < 1e-6 {
-        format!("{}", v.round() as i64)
+    if v == 0.0 {
+        return "0".to_string();
+    }
+    if v.abs() >= 1e9 || (v != 0.0 && v.abs() < 0.001) {
+        format!("{v:.2e}")
+    } else if (v - v.round()).abs() < 1e-6 {
+        format!("{v:.0}")
     } else {
         format!("{v:.1}")
     }

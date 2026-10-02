@@ -52,7 +52,10 @@ pub(crate) fn render_cached(source: &str) -> Result<String, String> {
         let rendered = ogrenotes_mermaid::render(source);
         let out = match rendered.svg {
             Some(svg) => Ok(svg),
-            None => Err(rendered.error.map(|e| e.message).unwrap_or_else(|| "diagram error".into())),
+            None => Err(rendered
+                .error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "diagram error".into())),
         };
         cache.push_front((source.to_string(), out.clone()));
         cache.truncate(RENDER_CACHE_CAP);
@@ -110,6 +113,12 @@ impl LiveAppBlockView for MermaidView {
                 wrapper.append_child(&pre).ok()?;
             }
         }
+        let edit = doc.create_element("button").ok()?;
+        edit.set_attribute("type", "button").ok()?;
+        edit.set_attribute("class", "mermaid-edit-control").ok()?;
+        edit.set_attribute("data-mermaid-action", "edit").ok()?;
+        edit.set_text_content(Some(&crate::t!("mermaid-modal-title")));
+        wrapper.append_child(&edit).ok()?;
         Some(wrapper.into())
     }
 }
