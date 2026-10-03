@@ -1095,3 +1095,90 @@ async fn published_run_activates_from_its_receipt_after_api_crash() {
     assert_eq!(app.state.import_repo.current_run_id(&import_id).await.unwrap().as_deref(), Some(run.id.as_str()));
     app.cleanup().await;
 }
+
+#[tokio::test]
+async fn worker_pool_renews_live_receipts_while_other_consumers_block() {
+    common::require_infra!();
+    use std::time::Duration;
+    use ogrenotes_api::worker_mode::spawn_workers;
+    let ready = Arc::new(tokio::sync::Barrier::new(17));
+    let router = axum::Router::new().route("/1/folders/", axum::routing::get({
+        let ready = Arc::clone(&ready);
+        move |axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>| {
+            let ready = Arc::clone(&ready);
+            async move {
+                let id = query.get("ids").unwrap().clone();
+                if id == "long0" || id.starts_with("short") {
+                    // All 16 handlers enter before 15 finish and start idle
+                    // blocking reads. This exercises the real production pool.
+                    ready.wait().await;
+                }
+                let children = if let Some(level) = id.strip_prefix("long") {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    let level: u32 = level.parse().unwrap();
+                    if level < 6 { vec![serde_json::json!({"folder_id": format!("long{}", level + 1)})] }
+                    else { Vec::new() }
+                } else { Vec::new() };
+                axum::Json(std::collections::HashMap::from([(id.clone(), serde_json::json!({
+                    "folder": {"id": id, "title": "Pool fixture"}, "children": children,
+                }))]))
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let app = common::TestApp::new_with_quip_base(base.clone()).await;
+    let queue = fresh_queue("pool-heartbeat").await;
+    let monitor_client = RedisClient::new(
+        fred::types::RedisConfig::from_url("redis://127.0.0.1:6379/13").unwrap(), None, None, None);
+    monitor_client.init().await.unwrap();
+    let monitor = JobQueue::new(Arc::new(monitor_client), queue.stream_name()).await.unwrap();
+    let mut long_job = String::new();
+    let mut long_import = String::new();
+    for i in 0..16 {
+        let root = if i == 0 { "long0".into() } else { format!("short{i}") };
+        let import_id = seed_scoping_import(&app, "owner1", &[&root]).await;
+        app.state.quip_token_store.put(&import_id, &QuipToken::new("tok".into())).await.unwrap();
+        let job_id = queue.enqueue(Job::StartQuipImport {
+            import_id: import_id.clone(), owner_id: "owner1".into(), run: None,
+        }).await.unwrap();
+        if i == 0 { long_job = job_id; long_import = import_id; }
+    }
+    let ctx = Arc::new(worker_ctx_with_quip(&app, base));
+    let (shutdown, rx) = tokio::sync::watch::channel(false);
+    let handles = spawn_workers(queue, ctx, 16, rx);
+    let started = tokio::time::timeout(Duration::from_secs(20), ready.wait()).await.is_ok();
+    let mut reclaimed_long = false;
+    let mut completed = false;
+    if started {
+        tokio::time::sleep(Duration::from_secs(65)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(80);
+        loop {
+            let reclaimed = monitor.claim_stale("other-process", 60_000, 32).await.unwrap();
+            reclaimed_long = reclaimed.iter().any(|job| job.envelope.job_id == long_job);
+            if reclaimed_long {
+                eprintln!("pool fixture: original long receipt reclaimed while its finalizer was still pending");
+                break;
+            }
+            if matches!(monitor.status(&long_job).await.unwrap(), JobStatus::Succeeded { .. })
+                && app.state.import_repo.get_for_run(&long_import, None).await.unwrap().unwrap().status
+                    == ImportStatus::Succeeded
+            {
+                completed = true;
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline { break; }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    let final_status = app.state.import_repo.get(&long_import).await.unwrap().unwrap().status;
+    let _ = shutdown.send(true);
+    for handle in handles { handle.abort(); let _ = handle.await; }
+    server.abort();
+    app.cleanup().await;
+    assert!(started, "the 16 production handlers failed to enter the fixture");
+    assert!(!reclaimed_long, "idle consumers delayed renewal beyond the 60-second lease");
+    assert!(completed, "the original long handler failed to finalize");
+    assert_eq!(final_status, ImportStatus::Succeeded);
+}

@@ -350,6 +350,15 @@ pub struct JobQueue {
     client: Arc<RedisClient>,
     stream: String,
     group: String,
+    // Present only for independently connected consumers. The last handle
+    // closes its routing task, including cancellation during startup/drain.
+    _connection: Option<Arc<OwnedConnection>>,
+}
+
+struct OwnedConnection(fred::types::ConnectHandle);
+
+impl Drop for OwnedConnection {
+    fn drop(&mut self) { self.0.abort(); }
 }
 
 impl JobQueue {
@@ -385,7 +394,28 @@ impl JobQueue {
             Err(e) if e.to_string().contains("BUSYGROUP") => {}
             Err(e) => return Err(JobError::Redis(e.to_string())),
         }
-        Ok(Self { client, stream, group })
+        Ok(Self { client, stream, group, _connection: None })
+    }
+
+    /// Connect a separate sequential consumer with identical Redis settings.
+    /// Its blocking read cannot delay other consumers or the reaper. Clones
+    /// share this new connection only with the consumer's active heartbeat;
+    /// the caller must finish execution before issuing its next blocking read.
+    pub async fn dedicated_connection(&self) -> Result<Self, JobError> {
+        let client = Arc::new(self.client.clone_new());
+        let mut connection = OwnedConnection(client.connect());
+        tokio::select! {
+            ready = client.wait_for_connect() => ready?,
+            ended = &mut connection.0 => {
+                return Err(JobError::Redis(format!("consumer connection ended during startup: {ended:?}")));
+            }
+        }
+        Ok(Self {
+            client,
+            _connection: Some(Arc::new(connection)),
+            stream: self.stream.clone(),
+            group: self.group.clone(),
+        })
     }
 
     /// The main work stream key this queue reads/writes. The

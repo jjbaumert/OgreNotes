@@ -236,8 +236,7 @@ pub async fn run(config: AppConfig) {
         .await
         .expect("worker mode: queue init failed");
 
-    // Its own connection: the queue's is held by `XREADGROUP BLOCK`, which
-    // would stall a publish queued behind it.
+    // Keep reindex publishing independent of worker queue traffic.
     let reindex_client = RedisClient::new(
         fred::types::RedisConfig::from_url(&config.redis_url).expect("invalid REDIS_URL"),
         None,
@@ -364,6 +363,26 @@ async fn consume_loop(
     mut shutdown: watch::Receiver<bool>,
     ctx: Arc<WorkerCtx>,
 ) {
+    // Each loop executes one handler at a time. Its heartbeat/finalization
+    // therefore never waits behind another consumer's XREADGROUP BLOCK.
+    // The original queue remains nonblocking for producers and the reaper.
+    let queue = loop {
+        if *shutdown.borrow() { return; }
+        let connected = tokio::select! {
+            result = queue.dedicated_connection() => result,
+            _ = shutdown.changed() => continue,
+        };
+        match connected {
+            Ok(queue) => break queue,
+            Err(e) => {
+                tracing::warn!(consumer, error = %e, "consumer connection failed; retrying");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                    _ = shutdown.changed() => {},
+                }
+            }
+        }
+    };
     tracing::info!(consumer, "worker mode: consumer started");
     loop {
         if *shutdown.borrow() {
