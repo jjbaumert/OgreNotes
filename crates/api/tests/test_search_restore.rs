@@ -12,6 +12,10 @@ use wiremock::{
     matchers::{method, path},
 };
 
+// Reindex admission is process-global even when TestApp storage is isolated.
+// Give each recovery scenario exclusive ownership of that production guard.
+static REINDEX_SCENARIO: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn serve_snapshot(snapshot: &IndexSnapshot) -> (MockServer, S3Client) {
     let server = MockServer::start().await;
     for verb in ["HEAD", "GET"] {
@@ -215,6 +219,7 @@ fn query(text: &str) -> SearchQuery {
 #[tokio::test]
 async fn failed_full_startup_does_not_disable_recovery_on_restart() {
     common::require_infra!();
+    let _reindex_scenario = REINDEX_SCENARIO.lock().await;
     use ogrenotes_storage::{dynamo::DynamoClient, repo::doc_repo::DocRepo};
     use std::sync::Arc;
 
@@ -241,7 +246,8 @@ async fn failed_full_startup_does_not_disable_recovery_on_restart() {
         ),
         app.state.doc_repo.s3().clone(),
     ));
-    assert!(startup.reindex.unwrap().run(&unavailable).await.is_err());
+    let error = startup.reindex.unwrap().run(&unavailable).await.unwrap_err();
+    assert!(error.starts_with("list documents:"), "unexpected failure: {error}");
     drop(unavailable);
 
     // A document indexed after the failed startup must survive restarting
@@ -347,6 +353,7 @@ async fn startup_preserves_legacy_indexes_at_the_volume_root() {
 #[tokio::test]
 async fn incomplete_document_rebuild_keeps_marker_until_retry_succeeds() {
     common::require_infra!();
+    let _reindex_scenario = REINDEX_SCENARIO.lock().await;
     use std::sync::Arc;
     let mut app = common::TestApp::new().await;
     let (_, token) = app.create_user("partial-rebuild@test.com").await;
@@ -367,9 +374,10 @@ async fn incomplete_document_rebuild_keeps_marker_until_retry_succeeds() {
     let volume = tempfile::tempdir().unwrap();
     let startup = initialize(&s3, volume.path()).await.unwrap();
     app.state.search_index = Arc::new(startup.index);
+    let error = startup.reindex.unwrap().run(&app.state).await.unwrap_err();
     assert!(
-        startup.reindex.unwrap().run(&app.state).await.is_err(),
-        "one failed document must prevent clearing the recovery marker"
+        error.starts_with("1 document(s) failed during reindex;") && error.contains(&missing),
+        "the missing document must prevent clearing the recovery marker: {error}"
     );
     assert_eq!(
         app.state.search_index.search(&query("puffin")).unwrap()[0].doc_id,
