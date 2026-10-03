@@ -242,7 +242,7 @@ return claimed
 // delivery count. The count prevents an A -> B -> A ownership cycle from
 // reviving the first A receipt.
 const FINALIZE_DELIVERY: &str = r#"
-local source, destination, status = KEYS[1], KEYS[2], KEYS[3]
+local source, destination, status, finalizations = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
 local group, id = ARGV[1], ARGV[2]
 if #redis.call('XRANGE', source, id, id) == 0 then
     return 0
@@ -259,6 +259,12 @@ if status_type ~= 'none' and status_type ~= 'hash' then
     return redis.error_reply('WRONGTYPE job status must be a hash')
 end
 local commands = {}
+if ARGV[11] ~= '' then
+    local finalizations_type = redis.call('TYPE', finalizations).ok
+    if finalizations_type ~= 'none' and finalizations_type ~= 'hash' then
+        return redis.error_reply('WRONGTYPE pending finalizations must be a hash')
+    end
+end
 if ARGV[6] ~= '' then
     local destination_type = redis.call('TYPE', destination).ok
     if destination_type ~= 'none' and destination_type ~= 'stream' then
@@ -270,6 +276,9 @@ if ARGV[6] ~= '' then
         table.insert(append, ARGV[8])
     end
     table.insert(commands, append)
+end
+if ARGV[11] ~= '' then
+    table.insert(commands, {'HSET', finalizations, ARGV[12], ARGV[11]})
 end
 local fields = {'HSET', status, 'json', ARGV[3]}
 if ARGV[4] ~= '' then
@@ -544,9 +553,18 @@ impl JobQueue {
         } else {
             self.stream.clone()
         };
+        let finalization_json = if replacement.is_none() || dead_letter_error.is_some() {
+            serde_json::to_string(&PendingFinalization {
+                envelope: claimed.envelope.clone(),
+                status: status.clone(),
+            }).map_err(|e| JobError::Serialize(e.to_string()))?
+        } else {
+            String::new()
+        };
         let outcome: u64 = self.client.eval(
             FINALIZE_DELIVERY,
-            vec![self.stream.clone(), destination, status_key(&claimed.envelope.job_id)],
+            vec![self.stream.clone(), destination, status_key(&claimed.envelope.job_id),
+                self.finalizations_key()],
             vec![
                 self.group.clone(),
                 claimed.stream_id.clone(),
@@ -558,6 +576,8 @@ impl JobQueue {
                 dead_letter_error.unwrap_or_default().to_string(),
                 claimed.consumer.clone(),
                 claimed.delivery_count.to_string(),
+                finalization_json,
+                claimed.envelope.job_id.clone(),
             ],
         ).await?;
         match outcome {
@@ -566,6 +586,37 @@ impl JobQueue {
             2 => Ok(FinalizationOutcome::ClaimLost),
             other => Err(JobError::Redis(format!("unexpected finalization outcome: {other}"))),
         }
+    }
+
+    fn finalizations_key(&self) -> String {
+        format!("{}:finalizations", self.stream)
+    }
+
+    /// Durable terminal effects still owed by the application. Written in
+    /// the same script that retires the source, with no TTL until reconciled.
+    pub async fn pending_finalization(&self, job_id: &str) -> Result<Option<PendingFinalization>, JobError> {
+        let json: Option<String> = self.client.hget(self.finalizations_key(), job_id).await?;
+        json.map(|value| serde_json::from_str(&value)
+            .map_err(|e| JobError::Serialize(e.to_string()))).transpose()
+    }
+
+    /// Scan one batch for recovery after a worker crash or a lost script reply.
+    pub async fn pending_finalizations(&self, cursor: &str, count: usize)
+        -> Result<(String, Vec<PendingFinalization>), JobError>
+    {
+        let (next, entries): (String, std::collections::HashMap<String, String>) = self.client.eval(
+            "return redis.call('HSCAN', KEYS[1], ARGV[1], 'COUNT', ARGV[2])",
+            vec![self.finalizations_key()], vec![cursor.to_string(), count.to_string()],
+        ).await?;
+        let records = entries.into_values().map(|value| serde_json::from_str(&value)
+            .map_err(|e| JobError::Serialize(e.to_string()))).collect::<Result<_, _>>()?;
+        Ok((next, records))
+    }
+
+    /// Remove an immutable terminal outcome only after its effects succeeded.
+    pub async fn complete_finalization(&self, job_id: &str) -> Result<(), JobError> {
+        let _: u64 = self.client.hdel(self.finalizations_key(), job_id).await?;
+        Ok(())
     }
 
     /// Read the side-channel status hash for `job_id`. Returns
@@ -686,6 +737,13 @@ pub struct ClaimedJob {
     consumer: String,
     // PEL delivery count distinguishes receipts even if ownership cycles back.
     delivery_count: u64,
+}
+
+/// Durable input for idempotent application-side terminal effects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingFinalization {
+    pub envelope: JobEnvelope,
+    pub status: JobStatus,
 }
 
 /// Whether this invocation applied a delivery's finalization.

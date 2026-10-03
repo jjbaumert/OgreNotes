@@ -92,6 +92,34 @@ impl ImportRepo {
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
+    /// Apply one queue job's completion at most once. Retain applied IDs so
+    /// an outbox replay cannot regress the status of a later reconnect/run.
+    /// Returns false for an already-applied completion or a deleted import.
+    pub async fn apply_job_completion(
+        &self,
+        import_id: &str,
+        job_id: &str,
+        status: ImportStatus,
+    ) -> Result<bool, RepoError> {
+        let mut values = HashMap::from([
+            (":status".to_string(), AttributeValue::S(status_to_str(status).to_string())),
+            (":updated_at".to_string(), AttributeValue::N(ogrenotes_common::time::now_usec().to_string())),
+            (":job".to_string(), AttributeValue::S(job_id.to_string())),
+            (":jobs".to_string(), AttributeValue::Ss(vec![job_id.to_string()])),
+        ]);
+        let mut update = "SET #status = :status, updated_at = :updated_at".to_string();
+        if status == ImportStatus::Succeeded {
+            update.push_str(", phase = :phase");
+            values.insert(":phase".to_string(), AttributeValue::N("2".to_string()));
+        }
+        update.push_str(" ADD applied_job_completions :jobs");
+        self.db.update_item_conditional(
+            &format!("IMPORT#{import_id}"), ImportRecord::sk(), &update,
+            "attribute_exists(PK) AND (attribute_not_exists(applied_job_completions) OR NOT contains(applied_job_completions, :job))",
+            values, Some(HashMap::from([("#status".to_string(), "status".to_string())])),
+        ).await.map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
     /// Write a folder row discovered during inventory BFS.
     ///
     /// Upserts the fields the *inventory walk* owns — title and parentage —

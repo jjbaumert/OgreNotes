@@ -48,7 +48,7 @@ use ogrenotes_storage::repo::folder_repo::FolderRepo;
 use ogrenotes_storage::repo::import_repo::ImportRepo;
 use ogrenotes_storage::repo::user_repo::UserRepo;
 use ogrenotes_storage::s3::S3Client;
-use ogrenotes_worker::{ClaimedJob, FinalizationOutcome, Job, JobQueue, RetryOutcome};
+use ogrenotes_worker::{ClaimedJob, FinalizationOutcome, Job, JobQueue, JobStatus, PendingFinalization, RetryOutcome};
 
 use crate::search_reindex::ReindexPublisher;
 use tokio::sync::watch;
@@ -65,6 +65,7 @@ use tokio::sync::watch;
 /// `pub` constructor so integration tests can build one from a `TestApp`'s
 /// repos and drive [`execute_and_finalize`] (and the reaper's `claim_stale`
 /// path) directly, instead of reimplementing the loop.
+#[derive(Clone)]
 pub struct WorkerCtx {
     doc_repo: Arc<DocRepo>,
     folder_repo: Arc<FolderRepo>,
@@ -88,6 +89,9 @@ pub struct WorkerCtx {
     /// (#138) — the worker can't reach their local search indexes. `None`
     /// without Redis, and in tests that don't exercise search.
     reindex: Option<ReindexPublisher>,
+    // Per-delivery completion intent. Queue execution defers terminal writes
+    // until its receipt wins; direct handler callers keep their old contract.
+    deferred_import_status: Option<Arc<std::sync::Mutex<Option<ImportStatus>>>>,
 }
 
 impl WorkerCtx {
@@ -109,6 +113,7 @@ impl WorkerCtx {
             quip_token_store,
             quip_base,
             reindex: None,
+            deferred_import_status: None,
         }
     }
 
@@ -401,6 +406,7 @@ async fn reaper_loop(
 ) {
     tracing::info!(consumer, "worker mode: reaper started");
     let mut running = tokio::task::JoinSet::new();
+    let mut finalization_cursor = "0".to_string();
     let mut tick = tokio::time::interval(Duration::from_secs(REAPER_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // First tick fires immediately; skip it so the first reap waits
@@ -423,6 +429,7 @@ async fn reaper_loop(
         }
         // Collect finished tasks so the set does not grow without bound.
         while running.try_join_next().is_some() {}
+        reconcile_finalizations(&queue, &ctx, &mut finalization_cursor).await;
 
         let free = slots.free().min(REAPER_BATCH);
         if free == 0 {
@@ -540,6 +547,19 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &WorkerCtx) {
     let job_id = claimed.envelope.job_id.clone();
     let attempt = claimed.envelope.attempt;
+    match queue.pending_finalization(&job_id).await {
+        Ok(Some(record)) => {
+            reconcile_finalization(queue, ctx, record).await;
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(job_id, error = %e, "cannot check pending finalization; leaving delivery pending");
+            return;
+        }
+    }
+    let mut delivery_ctx = ctx.clone();
+    delivery_ctx.deferred_import_status = Some(Arc::new(std::sync::Mutex::new(None)));
     // Isolate the handler behind catch_unwind: a panic in any job kind
     // (e.g. a malformed-PDF panic in a parser dependency — see the
     // `catch_unwind` in import_pdf.rs for why this class is real) must
@@ -547,7 +567,7 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
     // particular disables stale-job recovery for the entire worker fleet,
     // not just the poison job. A panic is treated as an ordinary job
     // failure so the retry/dead-letter machinery still applies.
-    let result = match std::panic::AssertUnwindSafe(execute(ctx, &claimed.envelope.payload))
+    let result = match std::panic::AssertUnwindSafe(execute(&delivery_ctx, &claimed.envelope.payload))
         .catch_unwind()
         .await
     {
@@ -573,13 +593,9 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
         Ok(JobDisposition::Done(payload)) => match queue.ack(&claimed, payload).await {
             Ok(FinalizationOutcome::Applied) => {
                 tracing::info!(job_id, attempt, "job succeeded");
-                // Terminal success: the staging upload is no longer
-                // needed. Delete after the ack, never before — a
-                // pre-ack delete would strand a retry.
-                cleanup_staging_blob(ctx, &claimed.envelope.payload).await;
             }
             Ok(FinalizationOutcome::AlreadyFinalized) => {
-                tracing::info!(job_id, attempt, "delivery already finalized; skipping terminal cleanup");
+                tracing::info!(job_id, attempt, "delivery already finalized; reconciling committed outcome");
             }
             Ok(FinalizationOutcome::ClaimLost) => {
                 tracing::info!(job_id, attempt, "delivery reclaimed; skipping terminal cleanup");
@@ -615,18 +631,9 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
                 }
                 Ok(RetryOutcome::DeadLettered) => {
                     tracing::warn!(job_id, "job dead-lettered");
-                    // Terminal failure: drop the staging upload too —
-                    // no future attempt will read it.
-                    cleanup_staging_blob(ctx, &claimed.envelope.payload).await;
-                    // For a Quip import the queue's dead-letter is invisible to
-                    // the frontend, which polls the ImportRecord: without a
-                    // terminal status the record stays Running/phase 0 and the
-                    // wizard hangs on "Scanning…" forever. Flip it to Failed so
-                    // the poll loop stops. Only on DeadLettered, never on Retried.
-                    mark_import_dead_lettered(ctx, &claimed.envelope.payload).await;
                 }
                 Ok(RetryOutcome::AlreadyFinalized) => {
-                    tracing::info!(job_id, attempt, "delivery already finalized; skipping terminal cleanup");
+                    tracing::info!(job_id, attempt, "delivery already finalized; reconciling committed outcome");
                 }
                 Ok(RetryOutcome::ClaimLost) => {
                     tracing::info!(job_id, attempt, "delivery reclaimed; skipping terminal cleanup");
@@ -641,6 +648,66 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
             }
         }
     }
+    // Covers an applied transition, a duplicate invocation, and a committed
+    // script whose reply was lost. Retry handoffs have no terminal record.
+    match queue.pending_finalization(&job_id).await {
+        Ok(Some(record)) => reconcile_finalization(queue, ctx, record).await,
+        Ok(None) => {}
+        Err(e) => tracing::warn!(job_id, error = %e, "terminal effects await reaper recovery"),
+    }
+}
+
+/// Recover terminal effects after a lost reply, storage outage, or restart.
+/// The cursor keeps a failing record from starving later records.
+pub async fn reconcile_finalizations(queue: &JobQueue, ctx: &WorkerCtx, cursor: &mut String) {
+    match queue.pending_finalizations(cursor, 32).await {
+        Ok((next, records)) => {
+            *cursor = next;
+            for record in records {
+                reconcile_finalization(queue, ctx, record).await;
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "cannot scan pending terminal effects"),
+    }
+}
+
+async fn reconcile_finalization(queue: &JobQueue, ctx: &WorkerCtx, record: PendingFinalization) {
+    let job_id = &record.envelope.job_id;
+    if let Err(e) = apply_finalization(ctx, &record).await {
+        tracing::warn!(job_id, error = %e, "terminal effects retained for recovery");
+        return;
+    }
+    if let Err(e) = queue.complete_finalization(job_id).await {
+        tracing::warn!(job_id, error = %e, "terminal effects applied; outbox removal will retry");
+    }
+}
+
+async fn apply_finalization(ctx: &WorkerCtx, record: &PendingFinalization) -> Result<(), String> {
+    if let Job::StartQuipImport { import_id, .. } = &record.envelope.payload {
+        let status = match &record.status {
+            JobStatus::Failed { .. } => Some(ImportStatus::Failed),
+            JobStatus::Succeeded { result_json: Some(json), .. } => {
+                let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+                value.get("importStatus").filter(|v| !v.is_null())
+                    .map(|v| serde_json::from_value::<ImportStatus>(v.clone())).transpose()
+                    .map_err(|e| e.to_string())?
+            }
+            _ => None,
+        };
+        if let Some(status) = status {
+            let applied = ctx.import_repo.apply_job_completion(import_id, &record.envelope.job_id, status)
+                .await.map_err(|e| e.to_string())?;
+            // Never base cleanup on an eventually-consistent status read: a
+            // replay could sweep a newer run. Cleanup is advisory after the
+            // conditional write; a crash here leaves the lifecycle backstop.
+            if applied && matches!(status, ImportStatus::Succeeded | ImportStatus::Failed) {
+                cleanup_quip_staging(ctx, import_id).await;
+            }
+        }
+    } else {
+        cleanup_staging_blob(ctx, &record.envelope.payload).await;
+    }
+    Ok(())
 }
 
 /// Map a [`Job`] payload to its handler. New variants land here.
@@ -701,9 +768,13 @@ async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<JobDisposition, Strin
         Job::ImportPdf { .. } => Err("PDF import not compiled into this build".into()),
         Job::StartQuipImport { import_id, owner_id } => {
             match execute_start_quip_import(ctx, import_id, owner_id).await? {
-                ImportRunOutcome::Ran => Ok(JobDisposition::Done(Some(
-                    serde_json::json!({ "importId": import_id }).to_string(),
-                ))),
+                ImportRunOutcome::Ran => {
+                    let status = ctx.deferred_import_status.as_ref().and_then(|status|
+                        *status.lock().unwrap_or_else(|p| p.into_inner()));
+                    Ok(JobDisposition::Done(Some(serde_json::json!({
+                        "importId": import_id, "importStatus": status,
+                    }).to_string())))
+                }
                 // Not ours to ack — the lease-holder is still working. See
                 // [`JobDisposition::HeldByLiveRunner`].
                 ImportRunOutcome::HeldByLiveRunner => Ok(JobDisposition::HeldByLiveRunner),
@@ -727,7 +798,7 @@ async fn cleanup_staging_blob(ctx: &WorkerCtx, payload: &Job) {
         // *import*-terminal: an acked `StartQuipImport` is not necessarily a
         // finished import (a `TokenRejected` run acks too, and that import
         // resumes the moment the user reconnects), and a dead-lettered one
-        // is finalized by [`mark_import_dead_lettered`]. The sweep therefore
+        // is finalized from its durable queue outcome. The sweep therefore
         // hangs off the terminal-status writes themselves — see
         // [`cleanup_quip_staging`] for the full list of hooks.
         Job::StartQuipImport { .. } | Job::Noop { .. } => return,
@@ -795,31 +866,22 @@ async fn cleanup_quip_staging(ctx: &WorkerCtx, import_id: &str) {
     }
 }
 
-/// Best-effort terminal-status write for a dead-lettered import job. The
-/// job queue's dead-letter is invisible to the frontend, which polls the
-/// `ImportRecord`; a sustained-failure Quip inventory job that exhausts its
-/// retry budget would otherwise leave the record in `Running`/phase 0 and hang
-/// the wizard on "Scanning…" forever. Flipping the status to `Failed` gives the
-/// poll loop a terminal state to stop on (the frontend already treats
-/// `"failed"` as terminal). Dispatches on the payload exactly like
-/// [`cleanup_staging_blob`]; only the Quip variant has an `ImportRecord` to
-/// finalize. A write error is logged, not propagated — this runs after the job
-/// is already terminal in the queue.
-async fn mark_import_dead_lettered(ctx: &WorkerCtx, payload: &Job) {
-    match payload {
-        Job::StartQuipImport { import_id, .. } => {
-            if let Err(e) = ctx.import_repo.set_status(import_id, ImportStatus::Failed).await {
-                tracing::warn!(import_id, error = %e, "failed to mark dead-lettered import Failed");
-            }
-            // Import-terminal: the queue has exhausted the retry budget, so no
-            // future run will read this import's staging. Unconditional on the
-            // status write above — a dead-lettered job is terminal whether or
-            // not DynamoDB accepted the record of it, and the staged content
-            // must not outlive the run either way.
-            cleanup_quip_staging(ctx, import_id).await;
-        }
-        Job::ImportDocx { .. } | Job::ImportPdf { .. } | Job::Noop { .. } => {}
+/// Record a handler's completion intent. Queue execution persists it with the
+/// winning Redis finalization before applying status and cleanup effects.
+async fn finish_quip_import(ctx: &WorkerCtx, import_id: &str, status: ImportStatus) -> Result<(), String> {
+    if let Some(deferred) = &ctx.deferred_import_status {
+        *deferred.lock().unwrap_or_else(|p| p.into_inner()) = Some(status);
+        return Ok(());
     }
+    // Direct handler callers have no queue receipt or outbox.
+    if status == ImportStatus::Succeeded {
+        ctx.import_repo.set_phase(import_id, 2).await.map_err(|e| e.to_string())?;
+    }
+    ctx.import_repo.set_status(import_id, status).await.map_err(|e| e.to_string())?;
+    if matches!(status, ImportStatus::Succeeded | ImportStatus::Failed) {
+        cleanup_quip_staging(ctx, import_id).await;
+    }
+    Ok(())
 }
 
 /// Run a DOCX import to completion: fetch the staged blob from S3,
@@ -1293,10 +1355,7 @@ async fn run_inventory(
     {
         Some(t) => t,
         None => {
-            ctx.import_repo
-                .set_status(import_id, ImportStatus::TokenRejected)
-                .await
-                .ok();
+            finish_quip_import(ctx, import_id, ImportStatus::TokenRejected).await?;
             tracing::warn!(import_id, "quip inventory: no token in store; TokenRejected");
             return Ok(());
         }
@@ -2658,10 +2717,7 @@ async fn run_content_pass(
         match outcome {
             Ok(()) => consecutive_failures = 0,
             Err(ThreadImportError::TokenRejected) => {
-                ctx.import_repo
-                    .set_status(import_id, ImportStatus::TokenRejected)
-                    .await
-                    .ok();
+                finish_quip_import(ctx, import_id, ImportStatus::TokenRejected).await?;
                 tracing::warn!(
                     import_id,
                     thread = %thread.quip_thread_id,
@@ -2812,29 +2868,7 @@ async fn run_content_pass(
         return Err(format!("quip content transient error: {reason}"));
     }
 
-    ctx.import_repo
-        .set_phase(import_id, 2)
-        .await
-        .map_err(|e| format!("set phase: {e}"))?;
-    // Terminal success. Written AFTER the phase bump so the strongest claim
-    // lands last, and written at all because otherwise a finished import and
-    // a *stranded* one are the same record state (`Running`, phase 1-or-2) —
-    // which makes any recovery sweep over `Running` imports unwriteable, and
-    // leaves the wizard's "done" signal resting on `phase` alone. The wizard
-    // already terminates on `phase >= 2` and treats only
-    // `failed`/`tokenrejected`/`cancelled` as terminal *failures*, so
-    // `succeeded` is additive there.
-    ctx.import_repo
-        .set_status(import_id, ImportStatus::Succeeded)
-        .await
-        .map_err(|e| format!("set succeeded: {e}"))?;
-    // Import-terminal, and only here: every earlier exit from this pass leaves
-    // the import re-runnable (a returned `Err` is retried by the queue, a
-    // `TokenRejected` resumes after a reconnect), and the staged HTML is the
-    // in-flight run's diagnostic material until the run is over. Deliberately
-    // AFTER the `Succeeded` write, and only if that write landed: a status
-    // this pass could not record is a pass the queue will retry.
-    cleanup_quip_staging(ctx, import_id).await;
+    finish_quip_import(ctx, import_id, ImportStatus::Succeeded).await?;
     tracing::info!(import_id, threads = threads.len(), "quip content: phase 2 complete");
     Ok(())
 }
@@ -3504,10 +3538,7 @@ async fn mark_quip_failure(
 ) -> Result<(), String> {
     match err {
         QuipError::Unauthorized => {
-            ctx.import_repo
-                .set_status(import_id, ImportStatus::TokenRejected)
-                .await
-                .ok();
+            finish_quip_import(ctx, import_id, ImportStatus::TokenRejected).await?;
             tracing::warn!(import_id, "quip inventory: credential rejected (401); TokenRejected");
             Ok(())
         }
@@ -3532,14 +3563,7 @@ async fn mark_quip_failure(
                 }),
             )
             .await;
-            ctx.import_repo.set_status(import_id, ImportStatus::Failed).await.ok();
-            // Import-terminal (`Failed`, and this run returns `Ok` so the queue
-            // acks rather than retries): nothing will re-run this import, so
-            // its staged thread HTML — which an earlier run of the same import
-            // may well have written before a selected root became unreadable —
-            // has no reader left. The sibling `Unauthorized` arm above
-            // deliberately does NOT sweep: `TokenRejected` is resumable.
-            cleanup_quip_staging(ctx, import_id).await;
+            finish_quip_import(ctx, import_id, ImportStatus::Failed).await?;
             tracing::warn!(
                 import_id,
                 "quip inventory: a selected root is not readable (403); Failed (not TokenRejected \

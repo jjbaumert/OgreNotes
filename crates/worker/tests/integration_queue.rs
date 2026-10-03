@@ -685,6 +685,43 @@ async fn ownership_cycle_does_not_revive_an_old_claim() {
     assert_eq!(queue.ack(&current, None).await.unwrap(), FinalizationOutcome::Applied);
 }
 
+#[tokio::test]
+async fn terminal_outbox_failure_preserves_delivery_and_records_survive_reconnect() {
+    let url = require_redis!();
+    let client = fresh_client(&url).await;
+    for dead_letter in [false, true] {
+        let queue = fresh_queue(Arc::clone(&client), "terminal-outbox").await;
+        let job_id = queue.enqueue(owned_import("outbox-owner")).await.unwrap();
+        let claimed = queue.consume_next("worker", 1000).await.unwrap().unwrap();
+        let running = queue.status(&job_id).await.unwrap();
+        let outbox = format!("{}:finalizations", queue.stream_name());
+        let _: () = client.set(outbox.as_str(), "wrong type", None, None, false).await.unwrap();
+        if dead_letter {
+            assert!(queue.retry_or_dead_letter(&claimed, 0, "terminal error").await.is_err());
+        } else {
+            assert!(queue.ack(&claimed, None).await.is_err());
+        }
+        assert_eq!(queue.status(&job_id).await.unwrap(), running);
+        let _: u64 = client.del(outbox).await.unwrap();
+        let recovered = queue.claim_stale("recovery", 0, 1).await.unwrap().pop().unwrap();
+        if dead_letter {
+            assert_eq!(queue.retry_or_dead_letter(&recovered, 0, "terminal error").await.unwrap(),
+                RetryOutcome::DeadLettered);
+        } else {
+            assert_eq!(queue.ack(&recovered, None).await.unwrap(), FinalizationOutcome::Applied);
+        }
+        let stream = queue.stream_name().to_string();
+        drop(queue);
+        let reconnected = JobQueue::new(fresh_client(&url).await, stream).await.unwrap();
+        let record = reconnected.pending_finalization(&job_id).await.unwrap().unwrap();
+        assert_eq!(record.envelope.owner.as_deref(), Some("outbox-owner"));
+        assert_eq!(matches!(record.status, JobStatus::Failed { .. }), dead_letter);
+        assert!(reconnected.claim_stale("later", 0, 1).await.unwrap().is_empty());
+        reconnected.complete_finalization(&job_id).await.unwrap();
+        assert!(reconnected.pending_finalization(&job_id).await.unwrap().is_none());
+    }
+}
+
 /// Pause a real Redis request after XREADGROUP has succeeded. This models a
 /// delayed connection across another worker's reclaim and terminal write.
 #[tokio::test]
