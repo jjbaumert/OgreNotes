@@ -1277,7 +1277,7 @@ fn render_node_html_with_context<T: ReadTxn>(
                         None => {
                             let msg = out_render
                                 .error
-                                .map(|e| e.message)
+                                .map(|e| e.to_string())
                                 .unwrap_or_else(|| "diagram error".to_string());
                             out.push_str(&format!(
                                 "<div class=\"mermaid-error\"><p>{}</p><pre>{}</pre></div>",
@@ -4333,6 +4333,15 @@ mod tests {
         // raw source preserved and escaped
         assert!(html.contains("not a diagram at all"));
         assert!(!html.contains("<svg"));
+    }
+
+    #[test]
+    fn mermaid_html_error_keeps_original_source_line() {
+        let html = to_html_of_single_mermaid("gantt\nexcludes weekends\nt :2024-01-05, 2d");
+        assert!(
+            html.contains("Line 2: unsupported Gantt directive"),
+            "{html}"
+        );
     }
 
     #[test]

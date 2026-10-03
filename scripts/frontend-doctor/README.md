@@ -415,3 +415,25 @@ override executable/profile locations. The script creates and purges its test
 documents. Keep the input snapshot local. Reports contain geometry and character
 counts without document text. The WASM browser suite also checks long-document
 viewport stability and restoration of the host's anchoring settings.
+
+### Mermaid semantics and accessibility
+
+Run `node scripts/frontend-doctor/test-mermaid-semantics.cjs --base-url http://localhost:3000`
+against a local DEV_MODE stack. It creates and purges a generated document,
+checks the source modal and saved SVG, and opens the edit button with Enter
+and Space. It verifies browser accessibility-tree names/descriptions, focus
+restoration and the absence of edit controls for a read-only member. The
+Playwright workflow runs it. `--observe` records defects on an unpatched build.
+
+Gantt supports `YYYY-MM-DD`, its default date axis, and `todayMarker off`.
+Other date formats, calendar directives and unsupported display directives
+report an explicit source-line error. XY charts support quoted/bare axis titles, quoted categories and finite
+increasing numeric ranges. Quadrant coordinates must be finite and within
+0..1. Packet `+length` fields follow the previous field; overlaps are errors.
+Shared `accTitle:` and `accDescr:` statements (including description blocks)
+set the SVG image name and description. Without a title, the image is named
+by diagram kind and visible rendered labels become its description, bounded
+to 20,000 characters. Decorative label copies are excluded. Use `accDescr`
+for a concise authored summary. Description blocks use `accDescr { ... }`
+with whitespace before the opening brace. Native edit buttons use the
+existing modal title.

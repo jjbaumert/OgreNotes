@@ -101,13 +101,14 @@ fn split_axis(s: &str) -> (String, String) {
     }
 }
 
-/// `[x, y]` with x,y parseable floats clamped to 0..1.
+/// `[x, y]` with finite x,y within the inclusive range 0..1.
 fn parse_point(s: &str) -> Option<(f64, f64)> {
     let inner = s.trim().strip_prefix('[')?.strip_suffix(']')?;
     let (xs, ys) = inner.split_once(',')?;
     let x: f64 = xs.trim().parse().ok()?;
     let y: f64 = ys.trim().parse().ok()?;
-    Some((x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)))
+    (x.is_finite() && y.is_finite() && (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y))
+        .then_some((x, y))
 }
 
 fn err(message: impl Into<String>, line: usize) -> ParseError {
@@ -325,13 +326,11 @@ mod tests {
     }
 
     #[test]
-    fn point_coords_validated_and_clamped() {
+    fn point_coords_validated_without_clamping() {
         assert!(parse("quadrantChart\n A: [x, 0.5]").is_err());
         assert!(parse("quadrantChart\n A: 0.3, 0.5").is_err()); // no brackets
-        // out-of-range clamps rather than errors
-        let c = parse("quadrantChart\n A: [1.5, -0.2]").unwrap();
-        assert_eq!(c.points[0].1, 1.0);
-        assert_eq!(c.points[0].2, 0.0);
+        assert!(parse("quadrantChart\n A: [1.5, -0.2]").is_err());
+        assert!(parse("quadrantChart\n A: [NaN, 0.5]").is_err());
     }
 
     #[test]

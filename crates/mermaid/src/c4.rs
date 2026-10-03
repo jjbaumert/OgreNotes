@@ -131,6 +131,32 @@ pub(crate) fn parse(source: &str) -> Result<C4, ParseError> {
             c4.rels.push(Rel { from, to, label, tech, bidir: kw.starts_with("BiRel") });
             continue;
         }
+        // Unknown macros must never turn into plausible-looking elements.
+        if !matches!(
+            kw,
+            "Person"
+                | "Person_Ext"
+                | "System"
+                | "System_Ext"
+                | "SystemDb"
+                | "SystemDb_Ext"
+                | "SystemQueue"
+                | "SystemQueue_Ext"
+                | "Container"
+                | "Container_Ext"
+                | "ContainerDb"
+                | "ContainerDb_Ext"
+                | "ContainerQueue"
+                | "ContainerQueue_Ext"
+                | "Component"
+                | "Component_Ext"
+                | "ComponentDb"
+                | "ComponentDb_Ext"
+                | "ComponentQueue"
+                | "ComponentQueue_Ext"
+        ) {
+            return Err(err(format!("unsupported C4 macro `{kw}`"), line_no));
+        }
         // Otherwise an element declaration.
         let (shape, external, tier) = classify(kw);
         let alias = args.first().cloned().unwrap_or_default();

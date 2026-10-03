@@ -169,7 +169,46 @@ fn render_modal(
                 source: src,
             });
             match result {
-                Ok(()) => state.set(None),
+                Ok(()) => {
+                    state.set(None);
+                    let block_id = block_id.clone();
+                    // Saving replaces the block DOM, including the opening button.
+                    // Let teardown and the focus trap settle before finding its replacement.
+                    leptos::task::spawn_local(async move {
+                        gloo_timers::future::TimeoutFuture::new(0).await;
+                        gloo_timers::future::TimeoutFuture::new(0).await;
+                        use wasm_bindgen::JsCast;
+                        if let Some(document) =
+                            web_sys::window().and_then(|window| window.document())
+                        {
+                            if let Ok(blocks) = document.query_selector_all(".mermaid-block") {
+                                for index in 0..blocks.length() {
+                                    let Some(block) = blocks
+                                        .item(index)
+                                        .and_then(|node| node.dyn_into::<web_sys::Element>().ok())
+                                    else {
+                                        continue;
+                                    };
+                                    if block.get_attribute("data-block-id").as_deref()
+                                        == Some(block_id.as_str())
+                                    {
+                                        if let Some(button) = block
+                                            .query_selector(".mermaid-edit-control")
+                                            .ok()
+                                            .flatten()
+                                            .and_then(|element| {
+                                                element.dyn_into::<web_sys::HtmlElement>().ok()
+                                            })
+                                        {
+                                            let _ = button.focus();
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
                 Err(error) => save_error.set(Some(error)),
             }
         }
@@ -189,9 +228,9 @@ fn render_modal(
             None => {
                 let msg = out
                     .error
-                    .map(|e| e.message)
+                    .map(|e| e.to_string())
                     .unwrap_or_else(|| "diagram error".into());
-                view! { <p class="mermaid-error">{msg}</p> }.into_any()
+                view! { <p class="mermaid-error" role="status">{msg}</p> }.into_any()
             }
         }
     };
@@ -206,6 +245,7 @@ fn render_modal(
                 class="calendar-modal mermaid-modal"
                 role="dialog"
                 aria-modal="true"
+                aria-labelledby="mermaid-modal-title"
                 on:click=move |e: web_sys::MouseEvent| e.stop_propagation()
                 on:keydown=move |e: web_sys::KeyboardEvent| {
                     // Escape closes. Enter is deliberately NOT
@@ -219,12 +259,13 @@ fn render_modal(
                 }
             >
                 <div class="confirm-header">
-                    <h3>{crate::t!("mermaid-modal-title")}</h3>
+                    <h3 id="mermaid-modal-title">{crate::t!("mermaid-modal-title")}</h3>
                 </div>
                 <div class="calendar-modal-body mermaid-modal-body">
                     <textarea
                         class="mermaid-source"
-                        autofocus
+                        aria-label=crate::t!("mermaid-modal-source-label")
+                        data-autofocus="true"
                         prop:value=move || source.get()
                         on:input=move |e| {
                             let value = event_target_value(&e);

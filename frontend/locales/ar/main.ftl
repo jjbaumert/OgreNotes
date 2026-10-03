@@ -957,3 +957,5 @@ quip-import-report-truncated = في { $count } مستند تم تسطيح الم
 quip-import-report-mentions = في { $count } مستند تم استيراد الإشارات @ كنص عادي
 quip-import-report-live-apps = تعذّر نقل { $count } من تطبيقات Quip المضمّنة (لوحات كانبان وما شابهها)
 quip-import-report-formulas = لم يتم استيراد { $count } صيغة من جداول البيانات — تحتفظ تلك الخلايا بآخر قيمة ولن يُعاد حسابها
+
+mermaid-modal-source-label = مصدر المخطط
