@@ -447,3 +447,121 @@ async fn reaper_reclaims_orphaned_job_and_finalizes_it() {
         "a reclaimed-and-finalized job must reach Succeeded, got {status:?}"
     );
 }
+
+#[tokio::test]
+async fn stopped_worker_pools_close_their_dedicated_redis_connections() {
+    common::require_infra!();
+    use ogrenotes_api::worker_mode::spawn_workers;
+    use std::collections::HashSet;
+    let app = common::TestApp::new().await;
+    let client = fresh_client("redis://127.0.0.1:6379/13").await;
+    let queue = fresh_queue(Arc::clone(&client), "connection-lifetime").await;
+    let ctx = Arc::new(worker_ctx(&app));
+    for cancel in [true, false] {
+        let before: String = client
+            .custom(fred::cmd!("CLIENT"), vec!["LIST"])
+            .await
+            .unwrap();
+        let before: HashSet<String> = before
+            .lines()
+            .filter_map(|line| {
+                line.split_whitespace()
+                    .find_map(|field| field.strip_prefix("id=").map(str::to_owned))
+            })
+            .collect();
+        let (shutdown, rx) = watch::channel(false);
+        let handles = spawn_workers(queue.clone(), Arc::clone(&ctx), 4, rx);
+        let owned = timeout(Duration::from_secs(10), async {
+            loop {
+                let current: String = client
+                    .custom(fred::cmd!("CLIENT"), vec!["LIST"])
+                    .await
+                    .unwrap();
+                let ids: Vec<String> = current
+                    .lines()
+                    .filter(|line| {
+                        line.split_whitespace().any(|field| field == "db=13")
+                            && line
+                                .split_whitespace()
+                                .any(|field| field == "cmd=xreadgroup")
+                    })
+                    .filter_map(|line| {
+                        line.split_whitespace()
+                            .find_map(|field| field.strip_prefix("id=").map(str::to_owned))
+                    })
+                    .filter(|id| !before.contains(id))
+                    .collect();
+                if ids.len() == 4 {
+                    break ids;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("all four consumers must establish blocking reads");
+        if cancel {
+            for handle in handles {
+                handle.abort();
+                let _ = handle.await;
+            }
+        } else {
+            let job_id = queue
+                .enqueue(Job::Noop {
+                    label: "before-drain".into(),
+                })
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    if matches!(
+                        queue.status(&job_id).await.unwrap(),
+                        JobStatus::Succeeded { .. }
+                    ) {
+                        break;
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            shutdown.send(true).unwrap();
+            timeout(
+                Duration::from_secs(2),
+                futures_util::future::join_all(handles),
+            )
+            .await
+            .unwrap();
+        }
+        let mut remaining_count = owned.len();
+        let closed = timeout(Duration::from_secs(8), async {
+            loop {
+                let remaining: String = client
+                    .custom(
+                        fred::cmd!("CLIENT"),
+                        [vec!["LIST".to_string(), "ID".to_string()], owned.clone()].concat(),
+                    )
+                    .await
+                    .unwrap();
+                remaining_count = remaining
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .count();
+                if remaining_count == 0 {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .is_ok();
+        eprintln!("worker pool cancelled={cancel}: {} owned Redis connections, remaining={remaining_count}, closed={closed}", owned.len());
+        if !closed {
+            app.cleanup().await;
+        }
+        assert!(
+            closed,
+            "stopped pool retained dedicated Redis readers after the blocking window"
+        );
+    }
+    app.cleanup().await;
+}

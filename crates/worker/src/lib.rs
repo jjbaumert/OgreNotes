@@ -351,14 +351,46 @@ pub struct JobQueue {
     stream: String,
     group: String,
     // Present only for independently connected consumers. The last handle
-    // closes its routing task, including cancellation during startup/drain.
+    // starts graceful shutdown independently of consumer cancellation.
     _connection: Option<Arc<OwnedConnection>>,
 }
 
-struct OwnedConnection(fred::types::ConnectHandle);
+struct OwnedConnection {
+    client: Arc<RedisClient>,
+    task: Option<fred::types::ConnectHandle>,
+    runtime: tokio::runtime::Handle,
+}
 
 impl Drop for OwnedConnection {
-    fn drop(&mut self) { self.0.abort(); }
+    fn drop(&mut self) {
+        let Some(mut task) = self.task.take() else {
+            return;
+        };
+        let client = Arc::clone(&self.client);
+        // Fred's reader is a separate task. Aborting only the router detaches
+        // that reader and can retain its socket. Keep the router alive for QUIT.
+        // This task belongs to the runtime, not the consumer being cancelled.
+        self.runtime.spawn(async move {
+            let closed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                let quit = client.quit().await;
+                let joined = (&mut task).await;
+                if let Err(error) = quit {
+                    tracing::debug!(%error, "consumer Redis QUIT failed");
+                }
+                if let Err(error) = joined {
+                    tracing::debug!(%error, "consumer Redis router stopped during cleanup");
+                }
+            })
+            .await;
+            if closed.is_err() {
+                // Fred9 has no public force-close for the detached reader.
+                // Bound this cleanup task; after a network blackhole, the
+                // reader may linger until transport/runtime shutdown.
+                tracing::warn!("consumer Redis shutdown timed out; aborting router");
+                task.abort();
+            }
+        });
+    }
 }
 
 impl JobQueue {
@@ -403,10 +435,15 @@ impl JobQueue {
     /// the caller must finish execution before issuing its next blocking read.
     pub async fn dedicated_connection(&self) -> Result<Self, JobError> {
         let client = Arc::new(self.client.clone_new());
-        let mut connection = OwnedConnection(client.connect());
+        let mut connection = OwnedConnection {
+            client: Arc::clone(&client),
+            task: Some(client.connect()),
+            runtime: tokio::runtime::Handle::current(),
+        };
         tokio::select! {
             ready = client.wait_for_connect() => ready?,
-            ended = &mut connection.0 => {
+            ended = connection.task.as_mut().expect("new connection task") => {
+                connection.task.take();
                 return Err(JobError::Redis(format!("consumer connection ended during startup: {ended:?}")));
             }
         }
