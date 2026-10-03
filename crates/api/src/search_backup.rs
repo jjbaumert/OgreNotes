@@ -152,8 +152,8 @@ pub async fn restore_if_empty(s3: &S3Client, dir: &Path) -> Option<i64> {
         }
         Err(e) => {
             tracing::warn!(error = %e, "search index: snapshot restore failed; will rebuild");
-            // Don't leave a half-written directory for the index to open.
-            let _ = std::fs::remove_dir_all(dir);
+            // restore_snapshot publishes atomically and owns its staging
+            // cleanup. Never delete pre-existing or concurrently created data.
             None
         }
     }

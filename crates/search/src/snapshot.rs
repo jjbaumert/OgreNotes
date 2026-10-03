@@ -93,9 +93,13 @@ fn segment_ids(meta: &[u8]) -> Result<HashSet<String>, String> {
         .collect()
 }
 
-/// Write a snapshot's files into `dir`, which must not already hold an
-/// index. File names are checked to be plain names (no path separators),
-/// so a tampered snapshot can't write outside `dir`.
+/// Restore into a missing or empty directory, without replacing an index
+/// or unrelated files. Files are written and validated in a private sibling
+/// directory, then published with one atomic rename. A failed or interrupted
+/// restore never exposes partial metadata at the destination.
+///
+/// A process killed before publication can leave an unused staging directory.
+/// Future restores use a fresh directory and never delete unowned siblings.
 pub fn restore_snapshot(dir: &Path, snapshot: &IndexSnapshot) -> Result<(), SearchError> {
     if dir.join("meta.json").exists() {
         return Err(SearchError::Snapshot(format!(
@@ -103,21 +107,62 @@ pub fn restore_snapshot(dir: &Path, snapshot: &IndexSnapshot) -> Result<(), Sear
             dir.display()
         )));
     }
-    if !snapshot.files.iter().any(|(name, _)| name == "meta.json") {
+    let mut names = HashSet::new();
+    for (name, _) in &snapshot.files {
+        let plain = !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\']);
+        if !plain || !names.insert(name.as_str()) {
+            return Err(SearchError::Snapshot(format!(
+                "invalid or duplicate file name {name:?}"
+            )));
+        }
+    }
+    if !names.contains("meta.json") {
         return Err(SearchError::Snapshot("snapshot has no meta.json".into()));
     }
-    std::fs::create_dir_all(dir).map_err(|e| SearchError::Snapshot(e.to_string()))?;
+    let parent = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| SearchError::Snapshot(e.to_string()))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".ogrenotes-restore-")
+        .tempdir_in(parent)
+        .map_err(|e| SearchError::Snapshot(format!("create staging directory: {e}")))?;
     for (name, bytes) in &snapshot.files {
-        let plain = !name.is_empty()
-            && name != "."
-            && name != ".."
-            && !name.contains(['/', '\\']);
-        if !plain {
-            return Err(SearchError::Snapshot(format!("refusing file name {name:?}")));
-        }
-        std::fs::write(dir.join(name), bytes)
+        use std::io::Write;
+        let mut file = std::fs::File::create(staging.path().join(name))
+            .map_err(|e| SearchError::Snapshot(format!("create {name}: {e}")))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
             .map_err(|e| SearchError::Snapshot(format!("write {name}: {e}")))?;
     }
+    // Opening the reader checks the referenced segment files, not just JSON
+    // syntax. A corrupt or incompatible backup must allow startup to rebuild.
+    {
+        let index = tantivy::Index::open_in_dir(staging.path())?;
+        if index.schema() != SearchIndex::build_schema().0 {
+            return Err(SearchError::SchemaMismatch);
+        }
+        let _reader = index.reader()?;
+    }
+    sync_directory(staging.path())?;
+    // rename cannot replace a nonempty directory, including an index created
+    // by another process while this restore was being prepared. Do not remove
+    // the destination first: that would both risk data loss and break atomicity.
+    std::fs::rename(staging.path(), dir)
+        .map_err(|e| SearchError::Snapshot(format!("publish restored index: {e}")))?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+fn sync_directory(dir: &Path) -> Result<(), SearchError> {
+    // Directory fsync is available on Unix, where production is deployed.
+    #[cfg(unix)]
+    std::fs::File::open(dir)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| SearchError::Snapshot(format!("sync directory {}: {e}", dir.display())))?;
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 
@@ -194,5 +239,118 @@ mod tests {
         std::fs::write(dst.path().join("meta.json"), b"{}").unwrap();
         let ok = IndexSnapshot { files: vec![("meta.json".into(), b"{}".to_vec())] };
         assert!(restore_snapshot(dst.path(), &ok).is_err(), "never overwrite an index");
+    }
+
+    #[test]
+    fn failed_restore_does_not_publish_metadata_and_can_be_retried() {
+        let src = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(src.path()).unwrap();
+        index.index_document(&doc("recovered", "capybara")).unwrap();
+        let snapshot = index.snapshot().unwrap().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let dir = dst.path().join("restored");
+        let mut broken = snapshot.clone();
+        // A plain name that cannot be written on the filesystem. Earlier
+        // snapshot files have already been written when this write fails.
+        broken.files.push(("x".repeat(4096), vec![1]));
+        assert!(restore_snapshot(&dir, &broken).is_err());
+        assert!(
+            !dir.join("meta.json").exists(),
+            "failed restore was published"
+        );
+        assert_eq!(
+            std::fs::read_dir(dst.path()).unwrap().count(),
+            0,
+            "staging files leaked"
+        );
+        restore_snapshot(&dir, &snapshot).unwrap();
+        let restored = SearchIndex::open_or_create(&dir).unwrap();
+        assert_eq!(
+            restored.search(&q("capybara")).unwrap()[0].doc_id,
+            "recovered"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_snapshot_is_not_published() {
+        let src = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(src.path()).unwrap();
+        index.index_document(&doc("d1", "capybara")).unwrap();
+        let mut snapshot = index.snapshot().unwrap().unwrap();
+        snapshot.files.retain(|(name, _)| name == "meta.json");
+        let dst = tempfile::tempdir().unwrap();
+        let dir = dst.path().join("restored");
+        assert!(restore_snapshot(&dir, &snapshot).is_err());
+        assert!(!dir.exists());
+        // This is the same fallback the server uses when restore fails.
+        assert!(SearchIndex::open_or_create(&dir).is_ok());
+    }
+
+    #[test]
+    fn restore_preserves_unrelated_destination_files() {
+        let src = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(src.path()).unwrap();
+        let snapshot = index.snapshot().unwrap().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(dst.path().join("operator-notes"), "keep me").unwrap();
+        assert!(restore_snapshot(dst.path(), &snapshot).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("operator-notes")).unwrap(),
+            "keep me"
+        );
+        assert!(!dst.path().join("meta.json").exists());
+    }
+
+    #[test]
+    fn an_interrupted_staging_directory_does_not_block_a_new_restore() {
+        let src = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(src.path()).unwrap();
+        index.index_document(&doc("d1", "capybara")).unwrap();
+        let snapshot = index.snapshot().unwrap().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        // A killed process cannot run TempDir::drop. Its private staging
+        // directory must neither be mistaken for the index nor reused.
+        let abandoned = dst.path().join(".ogrenotes-restore-abandoned");
+        std::fs::create_dir(&abandoned).unwrap();
+        std::fs::write(abandoned.join("meta.json"), &snapshot.files[0].1).unwrap();
+        let dir = dst.path().join("restored");
+        std::fs::create_dir(&dir).unwrap();
+        restore_snapshot(&dir, &snapshot).unwrap();
+        let restored = SearchIndex::open_or_create(&dir).unwrap();
+        assert_eq!(restored.search(&q("capybara")).unwrap()[0].doc_id, "d1");
+        assert!(
+            abandoned.exists(),
+            "never delete unowned sibling directories"
+        );
+    }
+
+    #[test]
+    fn restore_never_replaces_an_existing_valid_index() {
+        let src = tempfile::tempdir().unwrap();
+        let source = SearchIndex::open_or_create(src.path()).unwrap();
+        source.index_document(&doc("new", "capybara")).unwrap();
+        let snapshot = source.snapshot().unwrap().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let existing = SearchIndex::open_or_create(dst.path()).unwrap();
+        existing.index_document(&doc("existing", "marmot")).unwrap();
+        assert!(restore_snapshot(dst.path(), &snapshot).is_err());
+        assert_eq!(existing.search(&q("marmot")).unwrap()[0].doc_id, "existing");
+        assert!(existing.search(&q("capybara")).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_does_not_follow_a_destination_symlink() {
+        let src = tempfile::tempdir().unwrap();
+        let source = SearchIndex::open_or_create(src.path()).unwrap();
+        let snapshot = source.snapshot().unwrap().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let unrelated = dst.path().join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        let link = dst.path().join("index");
+        std::os::unix::fs::symlink(&unrelated, &link).unwrap();
+        assert!(restore_snapshot(&link, &snapshot).is_err());
+        assert!(link.is_symlink());
+        assert_eq!(std::fs::read_dir(unrelated).unwrap().count(), 0);
     }
 }
