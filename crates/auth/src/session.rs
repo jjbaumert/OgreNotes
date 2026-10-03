@@ -82,8 +82,17 @@ pub async fn rotate_refresh_token(
     let new_hash = hash_token(&new_token);
     let new_expires = now_usec() + REFRESH_TOKEN_TTL_USEC;
 
-    repo.update_refresh_token(user_id, session_id, &new_hash, new_expires)
-        .await?;
+    // The read and hash comparison alone cannot consume the token: two
+    // requests can both observe the same valid value. Only the guarded
+    // write's winner may return a successor. A losing request observed a
+    // valid token before a concurrent refresh/logout, so it is rejected
+    // without treating that race as evidence of replay and revoking the
+    // winner's session. A mismatch on the initial strong read still follows
+    // the all-session reuse-revocation policy above.
+    if !repo.update_refresh_token(user_id, session_id, &presented_hash, &new_hash, new_expires)
+        .await? {
+        return Err(AuthError::RefreshTokenInvalid);
+    }
 
     Ok(new_token)
 }

@@ -39,7 +39,7 @@ impl SessionRepo {
         let sk = format!("SESSION#{session_id}");
         let item = self
             .db
-            .get_item(&pk, &sk)
+            .get_item_consistent(&pk, &sk)
             .await
             .map_err(|e| RepoError::Dynamo(e.to_string()))?;
 
@@ -64,7 +64,7 @@ impl SessionRepo {
         let pk = format!("USER#{user_id}");
         let items = self
             .db
-            .query(&pk, Some("SESSION#"))
+            .query_consistent(&pk, Some("SESSION#"))
             .await
             .map_err(|e| RepoError::Dynamo(e.to_string()))?;
 
@@ -80,14 +80,17 @@ impl SessionRepo {
         Ok(())
     }
 
-    /// Update the refresh token hash (for rotation).
+    /// Consume exactly the token hash observed by the caller. Returns
+    /// false when another refresh or revocation won the race, or the
+    /// session expired. A failed condition never recreates a deleted row.
     pub async fn update_refresh_token(
         &self,
         user_id: &str,
         session_id: &str,
+        expected_hash: &str,
         new_hash: &str,
         new_expires_at: i64,
-    ) -> Result<(), RepoError> {
+    ) -> Result<bool, RepoError> {
         let pk = format!("USER#{user_id}");
         let sk = format!("SESSION#{session_id}");
         let mut values = HashMap::new();
@@ -100,11 +103,15 @@ impl SessionRepo {
             AttributeValue::N(new_expires_at.to_string()),
         );
 
+        values.insert(":expected_hash".into(), AttributeValue::S(expected_hash.to_string()));
+        values.insert(":now".into(), AttributeValue::N(ogrenotes_common::time::now_usec().to_string()));
+
         self.db
-            .update_item(
+            .update_item_conditional(
                 &pk,
                 &sk,
                 "SET refresh_token_hash = :hash, expires_at = :expires_at",
+                "attribute_exists(PK) AND refresh_token_hash = :expected_hash AND expires_at > :now",
                 values,
                 None,
             )
@@ -214,5 +221,59 @@ mod tests {
             other => panic!("expected MissingField(expires_at), got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn session_read_requests_authoritative_state() {
+        use crate::test_support::{replaying_dynamo, request_body};
+        let (db, replay) = replaying_dynamo(vec!["{}"]);
+        assert!(SessionRepo::new(db).get("user", "session").await.unwrap().is_none());
+        let body: serde_json::Value = serde_json::from_str(&request_body(&replay, 0)).unwrap();
+        assert_eq!(body["ConsistentRead"], true);
+        assert_eq!(body["Key"]["PK"]["S"], "USER#user");
+        assert_eq!(body["Key"]["SK"]["S"], "SESSION#session");
+    }
+
+    #[tokio::test]
+    async fn rotation_guards_token_existence_and_expiry_and_reports_lost_races() {
+        use crate::test_support::{replaying_dynamo_with_status, request_body, CONDITIONAL_CHECK_FAILED};
+        let (db, replay) = replaying_dynamo_with_status(vec![(200, "{}"), (400, CONDITIONAL_CHECK_FAILED)]);
+        let repo = SessionRepo::new(db);
+        assert!(repo.update_refresh_token("u", "s", "old-hash", "new-hash", 123).await.unwrap());
+        assert!(!repo.update_refresh_token("u", "s", "old-hash", "other-hash", 456).await.unwrap());
+        for index in 0..2 {
+            let body: serde_json::Value = serde_json::from_str(&request_body(&replay, index)).unwrap();
+            let condition = body["ConditionExpression"].as_str().unwrap();
+            assert!(condition.contains("attribute_exists(PK)"));
+            assert!(condition.contains("refresh_token_hash = :expected_hash"));
+            assert!(condition.contains("expires_at > :now"));
+            assert_eq!(body["ExpressionAttributeValues"][":expected_hash"]["S"], "old-hash");
+            assert!(body["ExpressionAttributeValues"][":now"]["N"].as_str().unwrap().parse::<i64>().unwrap() > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn reuse_revocation_reads_every_session_page_consistently() {
+        use crate::test_support::{replaying_dynamo, request_body, request_target};
+        let (db, replay) = replaying_dynamo(vec![
+            r#"{"Items":[{"SK":{"S":"SESSION#a"}}],"LastEvaluatedKey":{"PK":{"S":"USER#u"},"SK":{"S":"SESSION#a"}}}"#,
+            r#"{"Items":[{"SK":{"S":"SESSION#b"}}]}"#,
+            "{}", "{}",
+        ]);
+        SessionRepo::new(db).delete_all_for_user("u").await.unwrap();
+        for index in 0..2 {
+            assert!(request_target(&replay, index).ends_with(".Query"));
+            let body: serde_json::Value = serde_json::from_str(&request_body(&replay, index)).unwrap();
+            assert_eq!(body["ConsistentRead"], true);
+            assert_eq!(body["ExpressionAttributeValues"][":sk"]["S"], "SESSION#");
+        }
+        let next: serde_json::Value = serde_json::from_str(&request_body(&replay, 1)).unwrap();
+        assert_eq!(next["ExclusiveStartKey"]["SK"]["S"], "SESSION#a");
+        for (index, session) in [(2, "SESSION#a"), (3, "SESSION#b")] {
+            assert!(request_target(&replay, index).ends_with(".DeleteItem"));
+            let body: serde_json::Value = serde_json::from_str(&request_body(&replay, index)).unwrap();
+            assert_eq!(body["Key"]["SK"]["S"], session);
+        }
+    }
+
 }
 
