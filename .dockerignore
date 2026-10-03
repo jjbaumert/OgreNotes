@@ -1,5 +1,7 @@
 target/
 frontend/target/
+vendor/yrs/target/
+vendor/yrs/Cargo.lock
 frontend/dist/
 dist/
 .git/

@@ -1154,6 +1154,7 @@ dependencies = [
  "send_wrapper",
  "serde",
  "serde_json",
+ "similar",
  "unic-langid",
  "urlencoding",
  "wasm-bindgen",
@@ -1787,6 +1788,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
+dependencies = [
+ "web-time",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2353,6 +2363,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2517,8 +2537,6 @@ dependencies = [
 [[package]]
 name = "yrs"
 version = "0.21.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81de5913bca29f43a1d12ca92a7b39a2945e9420e01602a7563917c7bfc60f70"
 dependencies = [
  "arc-swap",
  "async-lock",

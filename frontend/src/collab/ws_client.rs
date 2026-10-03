@@ -437,10 +437,11 @@ fn flush_pending_updates_to_socket(
 /// would otherwise rebuild the view from a ydoc that has never seen the
 /// keystroke — silently dropping it (the "first keystrokes after mount"
 /// bug). Folding first turns the subsequent apply into a true CRDT
-/// merge. Ordering matters: folding AFTER the apply treats remote
-/// content the stale model has never seen as local deletions — see the
-/// `fold_after_remote_apply_deletes_peer_content` tripwire test in
-/// yrs_bridge.
+/// merge. This pre-apply fold covers the gap before the callback runs.
+/// A callback can also observe keystrokes typed after remote apply; its
+/// baseline-aware fold preserves peer content that the stale model has not
+/// rendered yet. The `fold_after_remote_apply_deletes_peer_content` test
+/// shows why folding without that baseline is unsafe.
 ///
 /// No-op without a provider (page registered none) or a baseline (a
 /// full-doc fold is exactly the unsafe overwrite we're avoiding; the
@@ -527,25 +528,15 @@ fn schedule_remote_callback(
                 let Ok(mut doc) = yrs_bridge::read_doc_from_ydoc(&ydoc) else {
                     return;
                 };
-                // #92 (swap-window half): keystrokes typed between the
-                // frame's apply and THIS debounced read exist only in the
-                // editor model — the swap below would clobber them. Fold
-                // them in first, but only when the model and the
-                // post-merge ydoc agree on top-level structure: with the
-                // lists equal, reconciliation is per-block (blocks the
-                // user didn't touch are skipped by the equality check and
-                // keep their remote content). When a remote STRUCTURAL
-                // change landed, folding a model that predates it would
-                // delete the new block (the tripwire test) — skip, accept
-                // the legacy swap for that rare concurrent case.
+                // Keystrokes typed after remote apply but before this callback
+                // exist only in the editor model. The bridge reconciles against
+                // the last rendered baseline, so peer-only blocks survive even
+                // when the remote update changed the top-level structure.
                 let folded = (|| {
                     let model = provider_ref.borrow().as_ref().and_then(|p| p())?;
                     let baseline = last_synced_ref.borrow().clone()?;
                     if model == baseline {
                         return None; // nothing pending — plain swap
-                    }
-                    if !yrs_bridge::same_top_level_block_ids(&model, &doc) {
-                        return None; // remote structural change — unsafe
                     }
                     yrs_bridge::sync_model_to_ydoc_diffed(&ydoc, &model, Some(&baseline));
                     yrs_bridge::read_doc_from_ydoc(&ydoc).ok()

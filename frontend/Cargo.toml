@@ -76,6 +76,7 @@ ogrenotes-math = { path = "../crates/math" }
 # backend (crates/highlight) — server HTML export uses the same
 # tokenizer + palette, so editor and export always agree.
 ogrenotes-highlight = { path = "../crates/highlight" }
+similar = { version = "2", default-features = false, features = ["wasm32_web_time"] }
 
 [dependencies.web-sys]
 version = "0.3"
@@ -178,6 +179,9 @@ futures-util = "0.3"
 # unused fork/timeout machinery on native.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
+
+[patch.crates-io]
+yrs = { path = "../vendor/yrs" }
 
 # Tuned for build speed on the test-stack Docker image. Trunk has no
 # --profile flag, so we override release directly here. Frontend is

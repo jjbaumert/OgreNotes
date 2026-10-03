@@ -6,7 +6,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{Document, Element, HtmlElement, Node as DomNode};
 
-use super::model::{char_len, Mark, MarkType, Node, NodeType};
+use super::model::{char_len, char_to_utf16_offset, utf16_to_char_offset, Mark, MarkType, Node, NodeType};
 use super::selection::Selection;
 use super::state::{EditorState, Transaction};
 
@@ -472,6 +472,7 @@ impl EditorView {
         // beforeinput -- handle text insertion, deletion
         let state = Rc::clone(&self.state);
         let dispatch = Rc::clone(&self.dispatch);
+        let history_input = Rc::clone(&self.history);
         let composing2 = Rc::clone(&self.composing);
         let just_composed2 = Rc::clone(&self.just_composed);
         let container2 = self.container.clone();
@@ -752,7 +753,8 @@ impl EditorView {
                         );
                         let content = super::model::Fragment::from(vec![br_node]);
                         let slice = super::model::Slice::new(content, 0, 0);
-                        if let Ok(txn) = state_with_sel.transaction().replace(from, to, slice) {
+                        if let Ok(mut txn) = state_with_sel.transaction().replace(from, to, slice) {
+                            txn.selection = Selection::cursor(from + 1);
                             dispatch(txn);
                         }
                     }
@@ -781,11 +783,24 @@ impl EditorView {
                         }
                     }
                 }
+                "historyUndo" | "historyRedo" => {
+                    event.prevent_default();
+                    // Native menus and touch controls use beforeinput rather
+                    // than keydown. Release the history borrow before dispatch,
+                    // which records transactions through the same history.
+                    let txn = if input_type == "historyUndo" {
+                        history_input.borrow_mut().undo(&current_state)
+                    } else {
+                        history_input.borrow_mut().redo(&current_state)
+                    };
+                    if let Some(txn) = txn {
+                        dispatch(txn);
+                    }
+                }
                 // Prevent unhandled input types from mutating DOM without model update
                 "deleteSoftLineBackward" | "deleteSoftLineForward"
                 | "deleteHardLineBackward" | "deleteHardLineForward"
-                | "insertFromPaste" | "insertFromDrop"
-                | "historyUndo" | "historyRedo" => {
+                | "insertFromPaste" | "insertFromDrop" => {
                     event.prevent_default();
                     // These are not yet implemented; prevent DOM corruption.
                     // Paste/clipboard handling will be added in 8i.
@@ -2058,7 +2073,7 @@ fn find_in_element(
                 let ambiguous_line_end =
                     target == *pos + text_len && text.ends_with('\n');
                 if !ambiguous_line_end {
-                    return Some((child, target - *pos));
+                    return Some((child, char_to_utf16_offset(&text, target - *pos)));
                 }
             }
             *pos += text_len;
@@ -2172,7 +2187,9 @@ fn dom_to_model_walk(
 
         if child.node_type() == DomNode::TEXT_NODE {
             if child.is_same_node(Some(target_node)) {
-                return Some(*pos + target_offset);
+                return Some(*pos + utf16_to_char_offset(
+                    &child.text_content().unwrap_or_default(), target_offset,
+                ));
             }
             let text = child.text_content().unwrap_or_default();
             *pos += char_len(&text);

@@ -3021,6 +3021,36 @@ fn shift_enter_inserts_hard_break() {
 }
 
 #[wasm_bindgen_test]
+fn typing_after_hard_break_preserves_the_break() {
+    for input_type in ["insertLineBreak", "insertSoftLineBreak"] {
+        for replace_selection in [false, true] {
+            let container = create_container();
+            let text = if replace_selection { "Hello world" } else { "Hello" };
+            let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![
+                Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text(text)])),
+            ]));
+            let (view, txns) = create_editor(container.clone(), doc);
+            set_selection(&view, 6, if replace_selection { 12 } else { 6 });
+            dispatch_before_input(view.container(), input_type, None);
+            let state = apply_all(&view, &txns);
+            assert_eq!(state.selection, Selection::cursor(7));
+            txns.borrow_mut().clear();
+            dispatch_before_input(view.container(), "insertText", Some("next"));
+            let state = apply_all(&view, &txns);
+            let para = state.doc.child(0).unwrap();
+            assert_eq!(para.text_content(), "Hellonext");
+            assert_eq!(para.child_count(), 3);
+            assert_eq!(para.child(0).unwrap().text_content(), "Hello");
+            assert_eq!(para.child(1).unwrap().node_type(), Some(NodeType::HardBreak));
+            assert_eq!(para.child(2).unwrap().text_content(), "next");
+            assert_eq!(state.selection, Selection::cursor(11));
+            assert_eq!(view.container().query_selector_all("p br:not([data-sentinel])").unwrap().length(), 1);
+            cleanup(&container);
+        }
+    }
+}
+
+#[wasm_bindgen_test]
 fn ctrl_backspace_deletes_word() {
     let container = create_container();
     let (view, txns) = create_editor(container.clone(), simple_doc());
@@ -3582,6 +3612,36 @@ fn full_flow_type_bullets_delete_all_then_backspace_bullet() {
 }
 
 // ─── Undo/Redo Tests ──────────────────────────────────────────
+
+#[wasm_bindgen_test]
+fn native_history_undo_redo_restores_text_and_selection_once() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), simple_doc());
+    set_cursor(&view, 3);
+    dispatch_before_input(view.container(), "insertText", Some("😀"));
+    apply_all(&view, &txns);
+    txns.borrow_mut().clear();
+    assert_eq!(view.state().doc.text_content(), "He😀llo world");
+
+    for (input, text, expected_selection) in [
+        ("historyUndo", "Hello world", Selection::cursor(3)),
+        ("historyRedo", "He😀llo world", Selection::text(3, 4)),
+    ] {
+        dispatch_before_input(view.container(), input, None);
+        assert_eq!(txns.borrow().len(), 1, "{input} must dispatch exactly once");
+        let state = apply_all(&view, &txns);
+        txns.borrow_mut().clear();
+        assert_eq!(state.doc.text_content(), text);
+        assert_eq!(state.selection, expected_selection);
+        assert_eq!(view.container().text_content().as_deref(), Some(text));
+        let selection = document().get_selection().unwrap().unwrap();
+        assert_eq!(selection.focus_offset(), if input == "historyRedo" { 4 } else { 2 });
+    }
+    // There is only one redo entry. Repeating an unavailable operation is inert.
+    dispatch_before_input(view.container(), "historyRedo", None);
+    assert!(txns.borrow().is_empty());
+    cleanup(&container);
+}
 
 #[wasm_bindgen_test]
 fn ctrl_z_undoes_text_insertion() {
@@ -6267,4 +6327,105 @@ async fn mermaid_modal_does_not_update_a_replacement_block() {
 #[wasm_bindgen_test]
 async fn mermaid_modal_saves_an_unchanged_block_and_closes() {
     check_mermaid_modal_save_against_current_document("unchanged").await;
+}
+
+// Native DOM offsets are UTF-16 code units; model positions are Unicode scalars.
+// Assert known DOM boundaries and actual selected/inserted text, not only a pair
+// of conversions that could share the same wrong units.
+#[wasm_bindgen_test]
+fn unicode_caret_uses_native_utf16_boundaries() {
+    let container = create_container();
+    let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![
+        Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text("A😀B")]))
+    ]));
+    let (view, _) = create_editor(container.clone(), doc);
+    set_cursor(&view, 4);
+    let selection = document().get_selection().unwrap().unwrap();
+    assert_eq!(selection.focus_offset(), 4, "end of A😀B is UTF-16 offset 4");
+    set_selection(&view, 2, 3);
+    assert_eq!(selection.anchor_offset(), 1);
+    assert_eq!(selection.focus_offset(), 3);
+    assert_eq!(String::from(selection.to_string()), "😀");
+    set_selection(&view, 3, 2);
+    assert_eq!(selection.anchor_offset(), 3);
+    assert_eq!(selection.focus_offset(), 1);
+    assert_eq!(String::from(selection.to_string()), "😀");
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn typing_at_unicode_dom_caret_preserves_the_selected_boundary() {
+    // Include mixed RTL, supplementary characters, combining accents, ZWJ and
+    // a variation selector. The prefix is the intended native caret boundary.
+    for prefix in ["A😀", "مرحبا😀", "e\u{301}😀", "👩\u{200d}💻", "✈\u{fe0f}😀"] {
+        let container = create_container();
+        let text = format!("{prefix}B");
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![
+            Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text(&text)]))
+        ]));
+        let (view, txns) = create_editor(container.clone(), doc);
+        let node = view.container().query_selector("p").unwrap().unwrap().first_child().unwrap();
+        let selection = document().get_selection().unwrap().unwrap();
+        selection.collapse_with_offset(Some(&node), prefix.encode_utf16().count() as u32).unwrap();
+        dispatch_before_input(view.container(), "insertText", Some("X"));
+        let state = apply_all(&view, &txns);
+        assert_eq!(state.doc.text_content(), format!("{prefix}XB"));
+        assert_eq!(view.container().text_content().unwrap(), format!("{prefix}XB"));
+        assert_eq!(selection.focus_offset(), prefix.encode_utf16().count() as u32 + 1);
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn replacing_unicode_dom_selection_changes_only_selected_text() {
+    let container = create_container();
+    let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![
+        Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text("A😀B")]))
+    ]));
+    let (view, txns) = create_editor(container.clone(), doc);
+    let node = view.container().query_selector("p").unwrap().unwrap().first_child().unwrap();
+    let selection = document().get_selection().unwrap().unwrap();
+    selection.set_base_and_extent(&node, 1, &node, 3).unwrap();
+    dispatch_before_input(view.container(), "insertText", Some("X"));
+    assert_eq!(apply_all(&view, &txns).doc.text_content(), "AXB");
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn unicode_selection_copy_paste_preserves_text_and_marks() {
+    let container = create_container();
+    let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![
+        Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![
+            Node::text("A"),
+            Node::text_with_marks("😀", vec![Mark::new(MarkType::Bold)]),
+            Node::text("B"),
+        ])),
+    ]));
+    let (view, _) = create_editor(container.clone(), doc);
+    set_selection(&view, 2, 3);
+    let clipboard = web_sys::DataTransfer::new().unwrap();
+    let init = web_sys::ClipboardEventInit::new();
+    init.set_bubbles(true);
+    init.set_cancelable(true);
+    init.set_clipboard_data(Some(&clipboard));
+    let event = web_sys::ClipboardEvent::new_with_event_init_dict("copy", &init).unwrap();
+    // Match the paste helper: Firefox protects synthetic event clipboard data
+    // during dispatch, so expose the writable test payload directly.
+    let desc = js_sys::Object::new();
+    js_sys::Reflect::set(&desc, &"value".into(), &clipboard).unwrap();
+    js_sys::Object::define_property(&event, &"clipboardData".into(), &desc);
+    view.container().dispatch_event(&event).unwrap();
+    assert!(event.default_prevented());
+    // The selected paragraph slice retains its plain-text block separator.
+    assert_eq!(clipboard.get_data("text/plain").unwrap(), "😀\n");
+    let html = clipboard.get_data("text/html").unwrap();
+    assert!(html.contains("<strong>😀</strong>"), "{html}");
+    let target = create_container();
+    let (pasted, txns) = create_editor(target.clone(), Node::empty_doc());
+    set_cursor(&pasted, 1);
+    dispatch_paste_html(&pasted, &txns, "😀", &html);
+    assert_eq!(pasted.state().doc.text_content(), "😀");
+    assert_eq!(pasted.container().query_selector("strong").unwrap().unwrap().text_content().as_deref(), Some("😀"));
+    cleanup(&target);
+    cleanup(&container);
 }

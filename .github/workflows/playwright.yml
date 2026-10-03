@@ -254,6 +254,10 @@ jobs:
         working-directory: scripts/frontend-doctor
         run: npm run test:browser
 
+      - name: Collaboration content and native history regressions
+        working-directory: scripts/frontend-doctor
+        run: node collab-preservation.cjs http://127.0.0.1:3000
+
       - name: Run trash-flow scenario
         id: trash-flow
         working-directory: scripts/frontend-doctor

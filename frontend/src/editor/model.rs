@@ -493,6 +493,22 @@ pub fn char_len(s: &str) -> usize {
     s.chars().count()
 }
 
+/// Convert the model's Unicode-scalar offset into a DOM UTF-16 offset.
+/// Positions beyond the text clamp to its end.
+pub fn char_to_utf16_offset(text: &str, offset: usize) -> usize {
+    text.chars().take(offset).map(char::len_utf16).sum()
+}
+
+/// Convert a DOM UTF-16 offset into the model's Unicode-scalar offset.
+/// A boundary inside a surrogate pair rounds down to the character's start.
+pub fn utf16_to_char_offset(text: &str, offset: usize) -> usize {
+    let mut units = 0;
+    text.chars().take_while(|ch| {
+        units += ch.len_utf16();
+        units <= offset
+    }).count()
+}
+
 /// Slice a string by char indices (safe for all Unicode).
 pub fn char_slice(s: &str, start: usize, end: usize) -> String {
     s.chars().skip(start).take(end - start).collect()
