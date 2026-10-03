@@ -81,7 +81,7 @@ node doctor.js \
     --out "$OUT"
 ```
 
-Exit code 0 = scenario ran without crashing (pass/fail is in the report). Exit 1 = scenario error. Exit 2 = bad args. Exit 3 = fatal harness error.
+Exit code 0 = required scenario checks passed. Exit 1 = a required observation failed or a scenario error occurred. Exit 2 = bad args. Exit 3 = fatal harness error.
 
 ## Reading the report
 
@@ -89,7 +89,7 @@ The last stdout line is `FRONTEND_DOCTOR_REPORT <json>`; also `$OUT/report.json`
 
 | Path | Meaning |
 |---|---|
-| `ok` | Did the harness complete without throwing. Independent of pass/fail. |
+| `ok` | Whether the scenario completed with all required checks passing. |
 | `scenario.syncObservedInB` | **Text-sync assertion** for collab-sync. `true` = text edits propagate; `false` = they don't. |
 | `scenario.remoteCursorObservedInB` | **Presence assertion** — did tab B render a `.remote-cursor-caret` or `.remote-cursor-selection` for tab A? `false` despite `syncObservedInB=true` points at a silently-dropped awareness field (the protocol-shape bug class). |
 | `scenario.remoteCursorCountInB` | Count of matching overlay elements. Useful sanity when the assertion is true. |

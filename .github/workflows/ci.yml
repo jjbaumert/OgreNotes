@@ -100,6 +100,14 @@ jobs:
       # only in main.rs, so its ~800 unit tests live in the bin target and
       # `--lib` alone never ran them (#240). The step name is unchanged
       # because .claude/agents/test-triage-doctor.md refers to it.
+      - name: Install Node for doctor result contracts
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Frontend doctor result contracts
+        run: node --test scripts/frontend-doctor/doctor-result.test.js
+
       - name: Frontend lib tests
         working-directory: frontend
         run: cargo test --lib --bins --locked
