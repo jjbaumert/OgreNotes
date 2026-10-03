@@ -250,6 +250,8 @@ pub async fn reindex(state: &AppState, since: Option<i64>) -> Result<ReindexRepo
 async fn reindex_inner(state: &AppState, since: Option<i64>) -> Result<ReindexReport, String> {
     let cutoff = since.map(|t| t - CATCH_UP_MARGIN_USEC);
     let mut report = ReindexReport::default();
+    let mut failures = 0usize;
+    let mut first_error = None;
     let mut cursor = None;
     loop {
         let (metas, next) = state
@@ -260,8 +262,12 @@ async fn reindex_inner(state: &AppState, since: Option<i64>) -> Result<ReindexRe
         for meta in metas {
             report.scanned += 1;
             if meta.is_deleted {
-                if state.search_index.delete_document(&meta.doc_id).is_ok() {
-                    report.removed += 1;
+                match state.search_index.delete_document(&meta.doc_id) {
+                    Ok(()) => report.removed += 1,
+                    Err(e) => {
+                        failures += 1;
+                        first_error.get_or_insert_with(|| format!("remove {}: {e}", meta.doc_id));
+                    }
                 }
                 continue;
             }
@@ -271,14 +277,23 @@ async fn reindex_inner(state: &AppState, since: Option<i64>) -> Result<ReindexRe
                 Some(_) => state.doc_repo.has_pending_updates(&meta.doc_id).await.unwrap_or(true),
             };
             if changed {
-                crate::routes::documents::index_document_now(state, meta, false).await;
-                report.indexed += 1;
+                let doc_id = meta.doc_id.clone();
+                match crate::routes::documents::try_index_document_now(state, meta, false).await {
+                    Ok(()) => report.indexed += 1,
+                    Err(e) => {
+                        failures += 1;
+                        first_error.get_or_insert_with(|| format!("index {doc_id}: {e}"));
+                    }
+                }
             }
         }
         cursor = next;
         if cursor.is_none() {
             break;
         }
+    }
+    if let Some(error) = first_error {
+        return Err(format!("{failures} document(s) failed during reindex; first error: {error}"));
     }
     tracing::info!(?report, full = since.is_none(), "search re-index complete");
     Ok(report)

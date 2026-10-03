@@ -4706,65 +4706,57 @@ pub(crate) fn spawn_index_document(state: &AppState, meta: DocumentMeta) {
 /// store alone — for callers that re-index documents some other process
 /// already embedded (the #138 reindex stream's boot catch-up).
 pub(crate) async fn index_document_now(state: &AppState, meta: DocumentMeta, embed: bool) {
-    let doc_repo = &state.doc_repo;
-    let search_index = &state.search_index;
-    let max_pending_bytes = state.config.max_pending_updates_bytes;
-    {
-        let snapshot = match doc_repo.load_snapshot(&meta.doc_id).await {
-            Ok(Some(s)) => s,
-            _ => return,
-        };
+    let doc_id = meta.doc_id.clone();
+    if let Err(error) = try_index_document_now(state, meta, embed).await {
+        tracing::warn!(%doc_id, %error, "document search indexing incomplete");
+    }
+}
 
-        let mut ogre_doc = match OgreDoc::from_state_bytes(&snapshot) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+/// Report whether every required read and write succeeded. Background hooks
+/// remain best-effort; startup rebuilds use this result to keep their durable
+/// retry marker when even one document could only be partially indexed.
+pub(crate) async fn try_index_document_now(
+    state: &AppState,
+    meta: DocumentMeta,
+    embed: bool,
+) -> Result<(), String> {
+    let snapshot = state.doc_repo.load_snapshot(&meta.doc_id).await
+        .map_err(|e| format!("load document snapshot: {e}"))?
+        .ok_or_else(|| "document snapshot missing".to_string())?;
+    let mut ogre_doc = OgreDoc::from_state_bytes(&snapshot)
+        .map_err(|e| format!("decode document snapshot: {e}"))?;
 
-        // #91: search reindex is best-effort. If the pending tail
-        // exceeds the cap, log and skip — letting one giant doc
-        // poison the search index is worse than indexing slightly-
-        // stale snapshot text. Compaction will eventually catch up.
-        // The explicit `match` (rather than `if let Ok`) is the
-        // emit-log channel: an over-budget doc is the operator
-        // signal that something needs compacting before the next
-        // GET /content 503s on it.
-        match doc_repo
-            .get_pending_updates(&meta.doc_id, max_pending_bytes)
-            .await
-        {
-            Ok(updates) => {
-                for u in &updates {
-                    let _ = ogre_doc.apply_update(&u.update_bytes);
+    // Preserve #91's snapshot-only fallback for ordinary background hooks,
+    // but expose incomplete tails to callers responsible for durable recovery.
+    let mut incomplete = None;
+    match state.doc_repo.get_pending_updates(
+        &meta.doc_id, state.config.max_pending_updates_bytes,
+    ).await {
+        Ok(updates) => {
+            for update in &updates {
+                if let Err(e) = ogre_doc.apply_update(&update.update_bytes) {
+                    incomplete = Some(format!("apply pending update: {e}"));
                 }
             }
-            Err(ogrenotes_storage::repo::RepoError::TooLarge { what, actual, cap }) => {
-                tracing::warn!(
-                    doc_id = %meta.doc_id,
-                    actual,
-                    cap,
-                    "spawn_index_document: pending tail too large ({what}) — \
-                     indexing snapshot only; doc needs compaction"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    doc_id = %meta.doc_id,
-                    error = %e,
-                    "spawn_index_document: failed to load pending updates; \
-                     indexing snapshot only"
-                );
-            }
         }
+        Err(e) => {
+            tracing::warn!(doc_id = %meta.doc_id, error = %e,
+                "failed to load pending updates; indexing snapshot only");
+            incomplete = Some(format!("load pending updates: {e}"));
+        }
+    }
 
-        let plain_text = export::to_plain_text(ogre_doc.inner());
-        let search_doc = build_search_doc(&meta, &plain_text);
-        if let Err(e) = search_index.index_document(&search_doc) {
-            tracing::error!(doc_id = %meta.doc_id, error = %e, "failed to index document");
-        }
-
-        if embed {
-            spawn_embed_document(state, meta, plain_text);
-        }
+    let plain_text = export::to_plain_text(ogre_doc.inner());
+    let search_doc = build_search_doc(&meta, &plain_text);
+    let indexed = state.search_index.index_document(&search_doc)
+        .map_err(|e| format!("write search document: {e}"));
+    if embed {
+        spawn_embed_document(state, meta, plain_text);
+    }
+    indexed?;
+    match incomplete {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 

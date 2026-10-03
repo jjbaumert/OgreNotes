@@ -196,8 +196,8 @@ async fn interrupted_startup_restore_recovers_on_restart() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].doc_id, "recovered");
     assert!(
-        abandoned.exists(),
-        "restart must not delete unowned siblings"
+        !abandoned.exists(),
+        "restart must reclaim its tagged interrupted stage before copying again"
     );
 }
 
@@ -342,4 +342,67 @@ async fn startup_preserves_legacy_indexes_at_the_volume_root() {
         !volume.path().join("index").exists(),
         "legacy index must not be replaced or moved"
     );
+}
+
+#[tokio::test]
+async fn incomplete_document_rebuild_keeps_marker_until_retry_succeeds() {
+    common::require_infra!();
+    use std::sync::Arc;
+    let mut app = common::TestApp::new().await;
+    let (_, token) = app.create_user("partial-rebuild@test.com").await;
+    let missing = app
+        .create_doc(&token, "capybara temporarily unavailable", None)
+        .await;
+    let healthy = app
+        .create_doc(&token, "puffin healthy document", None)
+        .await;
+    let meta = app.state.doc_repo.get(&missing).await.unwrap().unwrap();
+    let key = meta.snapshot_s3_key.unwrap();
+    let saved = app.state.doc_repo.s3().get_object(&key).await.unwrap();
+    app.state.doc_repo.s3().delete_object(&key).await.unwrap();
+
+    let mut corrupt = populated_snapshot();
+    corrupt.files.retain(|(name, _)| name == "meta.json");
+    let (_server, s3) = serve_snapshot(&corrupt).await;
+    let volume = tempfile::tempdir().unwrap();
+    let startup = initialize(&s3, volume.path()).await.unwrap();
+    app.state.search_index = Arc::new(startup.index);
+    assert!(
+        startup.reindex.unwrap().run(&app.state).await.is_err(),
+        "one failed document must prevent clearing the recovery marker"
+    );
+    assert_eq!(
+        app.state.search_index.search(&query("puffin")).unwrap()[0].doc_id,
+        healthy,
+        "one failed document must not stop other documents making progress"
+    );
+    app.state.search_index = Arc::new(SearchIndex::open_in_memory().unwrap());
+
+    app.state
+        .doc_repo
+        .s3()
+        .put_object(&key, saved)
+        .await
+        .unwrap();
+    let startup = initialize(&s3, volume.path()).await.unwrap();
+    app.state.search_index = Arc::new(startup.index);
+    startup
+        .reindex
+        .expect("partial rebuild must retry")
+        .run(&app.state)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.state.search_index.search(&query("capybara")).unwrap()[0].doc_id,
+        missing
+    );
+    app.state.search_index = Arc::new(SearchIndex::open_in_memory().unwrap());
+    assert!(
+        initialize(&s3, volume.path())
+            .await
+            .unwrap()
+            .reindex
+            .is_none()
+    );
+    app.cleanup().await;
 }
