@@ -53,17 +53,18 @@ fn block_range_rects(
     let document = match window.document() { Some(d) => d, None => return vec![] };
     let range = match document.create_range() { Ok(r) => r, Err(_) => return vec![] };
 
-    // Range.setEnd before start throws in strict document order, so try the
-    // "natural" ordering first and fall back to the swap if it fails.
-    // (Selecting right-to-left produces anchor > head in doc order.)
-    if range.set_start(&n1, o1).is_ok() && range.set_end(&n2, o2).is_ok() {
-        // start ≤ end — ok
-    } else {
-        let range2 = match document.create_range() { Ok(r) => r, Err(_) => return vec![] };
-        if range2.set_start(&n2, o2).is_err() || range2.set_end(&n1, o1).is_err() {
+    // setEnd before start does not throw: the DOM Range silently collapses
+    // to the earlier endpoint. Detect that collapse for distinct endpoints
+    // and rebuild the range in document order for right-to-left selections.
+    if range.set_start(&n1, o1).is_err() || range.set_end(&n2, o2).is_err() {
+        return vec![];
+    }
+    if range.collapsed() && (!n1.is_same_node(Some(&n2)) || o1 != o2) {
+        let reversed = match document.create_range() { Ok(r) => r, Err(_) => return vec![] };
+        if reversed.set_start(&n2, o2).is_err() || reversed.set_end(&n1, o1).is_err() {
             return vec![];
         }
-        return collect_rects(&range2);
+        return collect_rects(&reversed);
     }
     collect_rects(&range)
 }
