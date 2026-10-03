@@ -389,7 +389,8 @@ node scripts/frontend-doctor/test-editor-scroll.cjs \
 ```
 
 For layout comparisons, first capture the same generated scenarios from an
-unpatched build, then supply that report to the fixed-build run:
+unpatched build using the current harness version, then supply that report to
+the fixed-build run. Recapture reports from older harness versions:
 
 ```bash
 node scripts/frontend-doctor/test-editor-scroll.cjs \
@@ -404,8 +405,13 @@ Repeat with `--browser chromium` and its own baseline. Comparisons use the
 unpatched renderer, rather than changing a CSS flag in the patched renderer.
 Firefox must retain the caret position when the delayed image gains height;
 Chromium's existing delayed-image behavior is compared with its baseline.
-The existing caret-reveal limitation at the viewport edge is also measured
-against the baseline.
+Add `--expect-caret-visible` to assert that local typing keeps the caret visible
+through wrapping transitions at the viewport edge. In this mode, wrapping may
+scroll to reveal the caret, while remote-edit and delayed-image comparisons
+still use the baseline. `--generated-only --expect-caret-visible` exercises this
+without a private document snapshot. It also checks Enter, undo and a code
+caret below the visible band. Use `--viewport-width 375` to cover the fixed
+mobile toolbar.
 
 Both modes require Playwright Chromium. Firefox also requires Firefox and
 `geckodriver` on PATH. OpenSSL generates a temporary HTTPS image fixture;

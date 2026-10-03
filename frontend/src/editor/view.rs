@@ -159,6 +159,13 @@ impl EditorView {
             if let Ok(state_ref) = state_for_dispatch.try_borrow() {
                 history_for_dispatch.borrow_mut().record(&txn, &state_ref.doc);
             }
+            // Direct input (including paste and undo) should reveal its caret.
+            // Async results and widget actions bypass this wrapper.
+            let txn = if txn.doc_changed {
+                txn.scroll_into_view()
+            } else {
+                txn
+            };
             external_dispatch(txn);
         });
         let composing = Rc::new(RefCell::new(false));
@@ -211,6 +218,18 @@ impl EditorView {
                 self.sync_selection_to_dom(&sel);
             }
         }
+    }
+
+    /// Apply a local transaction and honor an explicit caret reveal request.
+    /// Updates arriving from collaborators use `update_state` directly.
+    pub fn apply_local_transaction(&self, transaction: Transaction) -> EditorState {
+        let reveal = transaction.scroll_into_view;
+        let state = self.state.borrow().apply(transaction);
+        self.update_state(state.clone());
+        if reveal && !*self.composing.borrow() {
+            self.scroll_selection_into_view();
+        }
+        state
     }
 
     /// Render the document model to DOM.
@@ -325,6 +344,112 @@ impl EditorView {
                     head_offset as u32,
                 );
             }
+        }
+    }
+
+    /// Reveal the active selection after a local edit. Remote state updates
+    /// deliberately do not call this, so a passive reader keeps their viewport.
+    fn scroll_selection_into_view(&self) {
+        let Some(document) = self.container.owner_document() else {
+            return;
+        };
+        if !document
+            .active_element()
+            .is_some_and(|active| self.container.contains(Some(&active)))
+        {
+            return;
+        }
+        let head = self.state.borrow().selection.head();
+        let Some((node, offset)) = find_dom_position(&self.container, head) else {
+            return;
+        };
+        let Ok(range) = document.create_range() else {
+            return;
+        };
+        if range.set_start(&node, offset as u32).is_err() {
+            return;
+        }
+        range.collapse_with_to_start(true);
+        // Empty text blocks and trailing code newlines use a BR sentinel.
+        // Their collapsed ranges can have no rect, including a caret after BR.
+        let children = node.child_nodes();
+        let placeholder = children
+            .item(offset as u32)
+            .or_else(|| {
+                offset
+                    .checked_sub(1)
+                    .and_then(|index| children.item(index as u32))
+            })
+            .and_then(|child| child.dyn_into::<Element>().ok())
+            .filter(|element| element.tag_name().eq_ignore_ascii_case("br"));
+        let caret_bounds = || {
+            let rect = range.get_bounding_client_rect();
+            if rect.height() >= 1.0 {
+                rect
+            } else if let Some(placeholder) = &placeholder {
+                placeholder.get_bounding_client_rect()
+            } else {
+                rect
+            }
+        };
+        let mut ancestor = node.parent_element();
+        while let Some(element) = ancestor {
+            let is_editor_scroller = element.class_list().contains("editor-container");
+            if let Some(scroller) = element.dyn_ref::<HtmlElement>() {
+                let overflow = document
+                    .default_view()
+                    .and_then(|window| window.get_computed_style(&element).ok().flatten())
+                    .and_then(|style| style.get_property_value("overflow-y").ok());
+                if is_editor_scroller || matches!(overflow.as_deref(), Some("auto" | "scroll")) {
+                    let caret = caret_bounds();
+                    if caret.height() >= 1.0 && scroller.client_height() > 0 {
+                        let mut top = scroller.get_bounding_client_rect().top()
+                            + f64::from(scroller.client_top());
+                        let mut bottom = top + f64::from(scroller.client_height());
+                        if let Some(viewport) = document
+                            .default_view()
+                            .and_then(|window| window.visual_viewport())
+                        {
+                            top = top.max(viewport.offset_top());
+                            bottom = bottom.min(viewport.offset_top() + viewport.height());
+                        }
+                        if let Some(toolbar) = document.query_selector(".toolbar").ok().flatten() {
+                            let fixed = document
+                                .default_view()
+                                .and_then(|window| {
+                                    window.get_computed_style(&toolbar).ok().flatten()
+                                })
+                                .and_then(|style| style.get_property_value("position").ok())
+                                .is_some_and(|position| position == "fixed");
+                            let rect = toolbar.get_bounding_client_rect();
+                            if fixed && rect.height() > 0.0 && rect.bottom() > top {
+                                bottom = bottom.min(rect.top());
+                            }
+                        }
+                        if bottom <= top {
+                            if is_editor_scroller {
+                                break;
+                            }
+                            ancestor = element.parent_element();
+                            continue;
+                        }
+                        let delta = if caret.bottom() > bottom + 1.0 {
+                            (caret.bottom() - bottom + 4.0).ceil()
+                        } else if caret.top() < top - 1.0 {
+                            (caret.top() - top - 4.0).floor()
+                        } else {
+                            0.0
+                        };
+                        if delta != 0.0 {
+                            scroller.set_scroll_top(scroller.scroll_top() + delta as i32);
+                        }
+                    }
+                }
+            }
+            if is_editor_scroller {
+                break;
+            }
+            ancestor = element.parent_element();
         }
     }
 
