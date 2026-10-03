@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use fred::clients::RedisClient;
 use fred::prelude::*;
-use ogrenotes_worker::{Job, JobProducer, JobQueue, JobStatus, RetryOutcome};
+use ogrenotes_worker::{FinalizationOutcome, Job, JobProducer, JobQueue, JobStatus, RetryOutcome};
 use tokio::time::sleep;
 
 /// Locally, skips (with a stderr note) when `REDIS_URL` is unset. When
@@ -94,10 +94,11 @@ async fn enqueue_then_consume_then_ack() {
     );
 
     // Ack with a result body.
-    queue
+    let outcome = queue
         .ack(&claimed, Some("{\"docId\":\"abc\"}".to_string()))
         .await
         .expect("ack");
+    assert_eq!(outcome, FinalizationOutcome::Applied);
 
     // Status flipped to Succeeded with the result_json.
     let status = queue.status(&job_id).await.expect("status succeeded");
@@ -461,7 +462,7 @@ async fn status_write_failure_preserves_each_finalization_for_recovery() {
             .await
             .unwrap();
         let failed = match action {
-            "ack" => queue.ack(&claimed, Some("result".into())).await,
+            "ack" => queue.ack(&claimed, Some("result".into())).await.map(|_| ()),
             "retry" => queue
                 .retry_or_dead_letter(&claimed, 1, "failed")
                 .await
@@ -485,10 +486,10 @@ async fn status_write_failure_preserves_each_finalization_for_recovery() {
 
         let _: u64 = client.del(key.as_str()).await.unwrap();
         match action {
-            "ack" => queue
-                .ack(&recovered[0], Some("result".into()))
-                .await
-                .unwrap(),
+            "ack" => {
+                assert_eq!(queue.ack(&recovered[0], Some("result".into())).await.unwrap(),
+                    FinalizationOutcome::Applied);
+            }
             "retry" => {
                 queue
                     .retry_or_dead_letter(&recovered[0], 1, "failed")
@@ -599,8 +600,9 @@ async fn repeated_and_concurrent_finalization_only_moves_a_delivery_once() {
         queue.retry_or_dead_letter(&claimed, 1, "failed"),
         queue.retry_or_dead_letter(&claimed, 1, "failed"),
     );
-    assert_eq!(a.unwrap(), RetryOutcome::Retried { attempt: 1 });
-    assert_eq!(b.unwrap(), RetryOutcome::Retried { attempt: 1 });
+    let outcomes = [a.unwrap(), b.unwrap()];
+    assert!(outcomes.contains(&RetryOutcome::Retried { attempt: 1 }));
+    assert!(outcomes.contains(&RetryOutcome::AlreadyFinalized));
     assert_eq!(client.xlen::<u64, _>(queue.stream_name()).await.unwrap(), 1);
     let next = queue.consume_next("next", 1000).await.unwrap().unwrap();
     assert_eq!(next.envelope.job_id, job_id);
@@ -609,23 +611,24 @@ async fn repeated_and_concurrent_finalization_only_moves_a_delivery_once() {
     let running = queue.status(&job_id).await.unwrap();
     // A late success or failure from the old claim cannot retire attempt1
     // or overwrite its Running status.
-    queue.ack(&claimed, Some("late".into())).await.unwrap();
-    queue
+    assert_eq!(queue.ack(&claimed, Some("late".into())).await.unwrap(),
+        FinalizationOutcome::AlreadyFinalized);
+    assert_eq!(queue
         .retry_or_dead_letter(&claimed, 0, "late failure")
         .await
-        .unwrap();
+        .unwrap(), RetryOutcome::AlreadyFinalized);
     assert_eq!(queue.status(&job_id).await.unwrap(), running);
 
-    queue
+    assert_eq!(queue
         .retry_or_dead_letter(&next, 1, "final failure")
         .await
-        .unwrap();
+        .unwrap(), RetryOutcome::DeadLettered);
     let failed = queue.status(&job_id).await.unwrap();
-    queue
+    assert_eq!(queue
         .retry_or_dead_letter(&next, 1, "different duplicate error")
         .await
-        .unwrap();
-    queue.ack(&next, None).await.unwrap();
+        .unwrap(), RetryOutcome::AlreadyFinalized);
+    assert_eq!(queue.ack(&next, None).await.unwrap(), FinalizationOutcome::AlreadyFinalized);
     assert_eq!(queue.status(&job_id).await.unwrap(), failed);
     let dlq = format!("{}:dlq", queue.stream_name());
     assert_eq!(client.xlen::<u64, _>(dlq.as_str()).await.unwrap(), 1);

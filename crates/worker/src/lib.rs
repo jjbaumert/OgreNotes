@@ -399,7 +399,9 @@ impl JobQueue {
     }
 
     /// Atomically publish Succeeded status and retire the delivery.
-    /// Repeated finalization of the same delivery is a no-op.
+    /// Repeated finalization returns [`FinalizationOutcome::AlreadyFinalized`].
+    /// Only [`FinalizationOutcome::Applied`] permits terminal cleanup: an
+    /// earlier finalizer may have retried this job instead of completing it.
     /// `result_json` is whatever the worker
     /// wants the client to see on GET /jobs/{id}; pass None when
     /// the work has no result body.
@@ -407,7 +409,7 @@ impl JobQueue {
         &self,
         claimed: &ClaimedJob,
         result_json: Option<String>,
-    ) -> Result<(), JobError> {
+    ) -> Result<FinalizationOutcome, JobError> {
         let status = JobStatus::Succeeded {
             finished_at_ms: now_ms(),
             result_json,
@@ -440,17 +442,23 @@ impl JobQueue {
                 owner: claimed.envelope.owner.clone(),
                 payload: claimed.envelope.payload.clone(),
             };
-            self.finalize_delivery(claimed, &JobStatus::Pending, Some(&next), None)
+            let finalized = self.finalize_delivery(claimed, &JobStatus::Pending, Some(&next), None)
                 .await?;
-            Ok(RetryOutcome::Retried { attempt: next.attempt })
+            Ok(match finalized {
+                FinalizationOutcome::Applied => RetryOutcome::Retried { attempt: next.attempt },
+                FinalizationOutcome::AlreadyFinalized => RetryOutcome::AlreadyFinalized,
+            })
         } else {
             let status = JobStatus::Failed {
                 finished_at_ms: now_ms(),
                 error: error.to_string(),
             };
-            self.finalize_delivery(claimed, &status, Some(&claimed.envelope), Some(error))
+            let finalized = self.finalize_delivery(claimed, &status, Some(&claimed.envelope), Some(error))
                 .await?;
-            Ok(RetryOutcome::DeadLettered)
+            Ok(match finalized {
+                FinalizationOutcome::Applied => RetryOutcome::DeadLettered,
+                FinalizationOutcome::AlreadyFinalized => RetryOutcome::AlreadyFinalized,
+            })
         }
     }
 
@@ -462,7 +470,7 @@ impl JobQueue {
         status: &JobStatus,
         replacement: Option<&JobEnvelope>,
         dead_letter_error: Option<&str>,
-    ) -> Result<(), JobError> {
+    ) -> Result<FinalizationOutcome, JobError> {
         let status_json = serde_json::to_string(status)
             .map_err(|e| JobError::Serialize(e.to_string()))?;
         let envelope_json = replacement.map(serde_json::to_string).transpose()
@@ -473,7 +481,7 @@ impl JobQueue {
         } else {
             self.stream.clone()
         };
-        let _: u64 = self.client.eval(
+        let applied: bool = self.client.eval(
             FINALIZE_DELIVERY,
             vec![self.stream.clone(), destination, status_key(&claimed.envelope.job_id)],
             vec![
@@ -487,7 +495,11 @@ impl JobQueue {
                 dead_letter_error.unwrap_or_default().to_string(),
             ],
         ).await?;
-        Ok(())
+        Ok(if applied {
+            FinalizationOutcome::Applied
+        } else {
+            FinalizationOutcome::AlreadyFinalized
+        })
     }
 
     /// Read the side-channel status hash for `job_id`. Returns
@@ -607,11 +619,22 @@ pub struct ClaimedJob {
     pub envelope: JobEnvelope,
 }
 
+/// Whether this invocation applied a delivery's finalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizationOutcome {
+    Applied,
+    /// A different invocation already retired this delivery. Its outcome may
+    /// have been a retry, so this does not authorize terminal side effects.
+    AlreadyFinalized,
+}
+
 /// Outcome of [`JobQueue::retry_or_dead_letter`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum RetryOutcome {
     Retried { attempt: u32 },
     DeadLettered,
+    /// No change was made. Do not perform terminal cleanup or status writes.
+    AlreadyFinalized,
 }
 
 /// Trait-shaped abstraction so the producer side (the API task)

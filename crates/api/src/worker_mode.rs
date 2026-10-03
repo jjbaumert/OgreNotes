@@ -48,7 +48,7 @@ use ogrenotes_storage::repo::folder_repo::FolderRepo;
 use ogrenotes_storage::repo::import_repo::ImportRepo;
 use ogrenotes_storage::repo::user_repo::UserRepo;
 use ogrenotes_storage::s3::S3Client;
-use ogrenotes_worker::{ClaimedJob, Job, JobQueue, RetryOutcome};
+use ogrenotes_worker::{ClaimedJob, FinalizationOutcome, Job, JobQueue, RetryOutcome};
 
 use crate::search_reindex::ReindexPublisher;
 use tokio::sync::watch;
@@ -571,12 +571,15 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
             );
         }
         Ok(JobDisposition::Done(payload)) => match queue.ack(&claimed, payload).await {
-            Ok(()) => {
+            Ok(FinalizationOutcome::Applied) => {
                 tracing::info!(job_id, attempt, "job succeeded");
                 // Terminal success: the staging upload is no longer
                 // needed. Delete after the ack, never before — a
                 // pre-ack delete would strand a retry.
                 cleanup_staging_blob(ctx, &claimed.envelope.payload).await;
+            }
+            Ok(FinalizationOutcome::AlreadyFinalized) => {
+                tracing::info!(job_id, attempt, "delivery already finalized; skipping terminal cleanup");
             }
             Err(e) => tracing::warn!(job_id, error = %e, "ack failed; entry orphaned"),
         },
@@ -618,6 +621,9 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
                     // wizard hangs on "Scanning…" forever. Flip it to Failed so
                     // the poll loop stops. Only on DeadLettered, never on Retried.
                     mark_import_dead_lettered(ctx, &claimed.envelope.payload).await;
+                }
+                Ok(RetryOutcome::AlreadyFinalized) => {
+                    tracing::info!(job_id, attempt, "delivery already finalized; skipping terminal cleanup");
                 }
                 Err(e) => {
                     tracing::error!(

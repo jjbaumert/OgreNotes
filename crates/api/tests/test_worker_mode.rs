@@ -233,6 +233,57 @@ fn worker_ctx(app: &common::TestApp) -> WorkerCtx {
 }
 
 #[tokio::test]
+async fn stale_success_must_not_delete_the_live_retrys_staging_blob() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let ctx = worker_ctx(&app);
+    let (owner_id, token) = app.create_user("stale-worker@test.com").await;
+    let folder_id = app.create_folder(&token, "Imports", None).await;
+    let fixture = {
+        use yrs::{Doc, Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
+        let doc = Doc::new();
+        {
+            let root = doc.get_or_insert_xml_fragment("content");
+            let mut txn = doc.transact_mut();
+            let paragraph = root.insert(&mut txn, 0, XmlElementPrelim::empty("paragraph"));
+            paragraph.insert(&mut txn, 0, XmlTextPrelim::new("Retry payload must survive"));
+        }
+        ogrenotes_collab::export::to_docx(&doc)
+    };
+    let key = format!("imports/{owner_id}/stale-success.docx");
+    let s3 = app.state.doc_repo.s3();
+    s3.put_object(&key, fixture.clone()).await.unwrap();
+    let client = fresh_client("redis://127.0.0.1:6379/13").await;
+    let queue = fresh_queue(client, "stale-success").await;
+    let job_id = queue.enqueue(Job::ImportDocx {
+        s3_key: key.clone(), title: "Retry payload".into(),
+        folder_id: Some(folder_id.clone()), owner_id,
+    }).await.unwrap();
+    let old = queue.consume_next("slow-worker", 1000).await.unwrap().unwrap();
+
+    // A recovery worker has already finalized this delivery as a retry.
+    queue.retry_or_dead_letter(&old, 3, "recovery worker failed").await.unwrap();
+    let retry = queue.consume_next("recovery-worker", 1000).await.unwrap().unwrap();
+    assert_eq!(retry.envelope.attempt, 1);
+    let running = queue.status(&job_id).await.unwrap();
+
+    // The old worker completes real S3 parsing and document persistence late.
+    // Its obsolete ack must not delete the live retry's only input object.
+    execute_and_finalize(&queue, old, &ctx).await;
+    assert_eq!(app.state.folder_repo.list_children(&folder_id).await.unwrap().len(), 1,
+        "the stale handler must actually succeed to exercise its ack cleanup path");
+    assert_eq!(queue.status(&job_id).await.unwrap(), running);
+    assert_eq!(s3.get_object(&key).await.unwrap(), fixture,
+        "stale completion deleted the live retry's staging upload");
+
+    // Only the current delivery may perform terminal cleanup.
+    execute_and_finalize(&queue, retry, &ctx).await;
+    assert!(matches!(queue.status(&job_id).await.unwrap(), JobStatus::Succeeded { .. }));
+    assert!(!s3.object_exists(&key).await.unwrap());
+    app.cleanup().await;
+}
+
+#[tokio::test]
 async fn execute_and_finalize_retries_to_budget_then_dead_letters() {
     common::require_infra!();
     let app = common::TestApp::new().await;

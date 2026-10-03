@@ -629,6 +629,75 @@ async fn dead_lettered_quip_import_drops_its_staged_thread_html() {
     );
 }
 
+#[tokio::test]
+async fn stale_failure_must_not_fail_a_completed_import_or_sweep_its_staging() {
+    common::require_infra!();
+    // Pause an actual outbound Quip request until another finalizer wins.
+    // Notifications make this interleaving deterministic without timing sleeps.
+    let requested = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let router = axum::Router::new().route("/1/folders/", axum::routing::get({
+        let requested = Arc::clone(&requested);
+        let release = Arc::clone(&release);
+        move || {
+            let requested = Arc::clone(&requested);
+            let release = Arc::clone(&release);
+            async move {
+                requested.notify_one();
+                release.notified().await;
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let app = common::TestApp::new_with_quip_base(base.clone()).await;
+    let import_id = seed_scoping_import(&app, "owner1", &["root"]).await;
+    app.state.quip_token_store.put(&import_id, &QuipToken::new("tok".into())).await.unwrap();
+    let staged_key = format!("imports/{import_id}/threads/t1.html");
+    let staged = b"<p>retained diagnostic content</p>".to_vec();
+    app.state.doc_repo.s3().put_object(&staged_key, staged.clone()).await.unwrap();
+    let client = RedisClient::new(
+        fred::types::RedisConfig::from_url("redis://127.0.0.1:6379/13").unwrap(),
+        None, None, None,
+    );
+    client.init().await.unwrap();
+    let queue = JobQueue::new(Arc::new(client), format!("quip-stale-finalizer:{}", nanoid::nanoid!(8)))
+        .await.unwrap();
+    let job_id = queue.enqueue(Job::StartQuipImport {
+        import_id: import_id.clone(), owner_id: "owner1".into(),
+    }).await.unwrap();
+    let mut claimed = queue.consume_next("old-worker", 1000).await.unwrap().unwrap();
+    for _ in 0..3 {
+        queue.retry_or_dead_letter(&claimed, 3, "earlier failure").await.unwrap();
+        claimed = queue.consume_next("old-worker", 1000).await.unwrap().unwrap();
+    }
+    assert_eq!(claimed.envelope.attempt, 3);
+    let ctx = worker_ctx_with_quip(&app, base);
+    let old_queue = queue.clone();
+    let old_claim = claimed.clone();
+    let worker = tokio::spawn(async move {
+        execute_and_finalize(&old_queue, old_claim, &ctx).await;
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), requested.notified()).await.unwrap();
+
+    // A different worker has completed the same delivery while this handler
+    // is waiting for its failing HTTP response.
+    queue.ack(&claimed, None).await.unwrap();
+    app.state.import_repo.set_status(&import_id, ImportStatus::Succeeded).await.unwrap();
+    let succeeded = queue.status(&job_id).await.unwrap();
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(10), worker).await.unwrap().unwrap();
+    assert_eq!(queue.status(&job_id).await.unwrap(), succeeded);
+    assert_eq!(app.state.import_repo.get(&import_id).await.unwrap().unwrap().status,
+        ImportStatus::Succeeded, "obsolete dead-letter overwrote the winning import status");
+    assert_eq!(app.state.doc_repo.s3().get_object(&staged_key).await.unwrap(), staged,
+        "obsolete dead-letter performed terminal staging cleanup");
+    server.abort();
+    app.cleanup().await;
+}
+
 /// Regression (C1/C2, the critical one): the reaper must NOT ack a job whose
 /// work is still in flight on another worker.
 ///
