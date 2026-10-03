@@ -17,9 +17,14 @@ members = [
 ]
 exclude = [
     "frontend",
+    "vendor/yrs",
     "tests/load",
     "tests/rag-eval",
 ]
+
+[patch.crates-io]
+# XML prepend origin fix, backported without changing the Yrs API or wire format.
+yrs = { path = "vendor/yrs" }
 
 [workspace.package]
 # Keep in lockstep with `frontend/Cargo.toml`. The frontend is outside this

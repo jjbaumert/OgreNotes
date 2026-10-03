@@ -110,7 +110,7 @@ jobs:
 
       - name: Frontend lib tests
         working-directory: frontend
-        run: cargo test --lib --bins --locked
+        run: cargo test --lib --bins --test collab_semantics --locked
 
   # ─── Supply-chain audit: cargo-deny ─────────────────────────────
   # License policy + RUSTSEC advisories + source allow-list, driven by

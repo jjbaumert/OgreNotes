@@ -172,20 +172,12 @@ impl std::fmt::Display for BridgeError {
 }
 
 /// An action to take for each model child during sync.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum SyncAction<'a> {
     /// Reuse an existing yrs block at `yrs_idx`, updating its content.
     Reuse { yrs_idx: usize, node: &'a Node },
     /// Insert a new yrs block from this model node.
     Insert { node: &'a Node },
-}
-
-impl<'a> SyncAction<'a> {
-    fn node(&self) -> &'a Node {
-        match self {
-            SyncAction::Reuse { node, .. } | SyncAction::Insert { node } => node,
-        }
-    }
 }
 
 /// Snapshot of a yrs block's identity for matching purposes.
@@ -220,9 +212,8 @@ fn write_node<C: XmlFragment>(
             let text_ref = container.insert(txn, index, XmlTextPrelim::new(text));
             if !marks.is_empty() {
                 let attrs = marks_to_attrs(marks);
-                // yrs Doc defaults to OffsetKind::Bytes, so format() expects
-                // byte offsets into the UTF-8 content.
-                text_ref.format(txn, 0, text.len() as u32, attrs);
+                let len = text_ref.len(txn);
+                text_ref.format(txn, 0, len, attrs);
             }
         }
         Node::Element {
@@ -286,13 +277,9 @@ pub fn sync_model_to_ydoc(ydoc: &Doc, new_doc: &Node) {
 /// `last_synced` must reflect the ydoc's content as last seen by the
 /// caller: store this function's return value after a local sync, and
 /// refresh from `read_doc_from_ydoc` after applying a remote update.
-/// Old/new children are paired positionally (under that invariant, the
-/// ydoc child at index `i` is `last_synced`'s child `i`). The skip is
-/// safe even when a concurrent remote update has invalidated the
-/// invariant: equality with `last_synced` means we have no *local*
-/// change to contribute for that subtree, so skipping at worst
-/// preserves the remote content — where a full sync would have
-/// overwritten it with our identical-to-stale state.
+/// Children are paired with the baseline by blockId, independently of live
+/// positions. Equal baseline/model subtrees have no local change to contribute
+/// and are skipped, preserving remote edits and inserted blocks.
 pub fn sync_model_to_ydoc_diffed(
     ydoc: &Doc,
     new_doc: &Node,
@@ -360,7 +347,45 @@ fn sync_children<C: XmlFragment>(
     new_children: &[Node],
     old_children: Option<&[Node]>,
 ) {
-    let (actions, matched, yrs_blocks) = match_children(txn, container, new_children);
+    let (mut actions, matched, yrs_blocks) = match_children(txn, container, new_children);
+    // An old block missing from the live CRDT was deleted by a peer. A stale
+    // model must not resurrect it, even if it contains an unsent local edit.
+    if let Some(old) = old_children {
+        let old_ids: std::collections::HashSet<_> = old.iter().filter_map(Node::block_id).collect();
+        actions.retain(|action| !matches!(action, SyncAction::Insert { node }
+            if node.block_id().is_some_and(|id| old_ids.contains(id))));
+        // A stale local text edit must not undo a reorder already received
+        // from a peer. Only reorder existing blocks when the local model's
+        // order differs from its own baseline. Carry local insertions with
+        // their preceding block while sorting unchanged blocks by live order.
+        let new_ids: std::collections::HashSet<_> = new_children.iter().filter_map(Node::block_id).collect();
+        let before: Vec<_> = old.iter().filter_map(Node::block_id)
+            .filter(|id| new_ids.contains(id)).collect();
+        let after: Vec<_> = new_children.iter().filter_map(Node::block_id)
+            .filter(|id| old_ids.contains(id)).collect();
+        if before == after && actions.iter().all(|action| match action {
+            SyncAction::Reuse { node, .. } => node.block_id().is_some(),
+            SyncAction::Insert { .. } => true,
+        }) {
+            let mut prefix = Vec::new();
+            let mut groups: Vec<(usize, Vec<SyncAction<'_>>)> = Vec::new();
+            for action in actions.drain(..) {
+                match action {
+                    SyncAction::Reuse { yrs_idx, .. } => groups.push((yrs_idx, vec![action])),
+                    SyncAction::Insert { .. } => {
+                        if let Some((_, group)) = groups.last_mut() {
+                            group.push(action);
+                        } else {
+                            prefix.push(action);
+                        }
+                    }
+                }
+            }
+            groups.sort_by_key(|(index, _)| *index);
+            actions = prefix;
+            actions.extend(groups.into_iter().flat_map(|(_, group)| group));
+        }
+    }
 
     // Diagnostic counters for the "every keystroke produces a 60 KB
     // rewrite" pathology — see crate::observability docstrings on
@@ -377,8 +402,8 @@ fn sync_children<C: XmlFragment>(
         matched_count as u64,
     );
 
-    remove_unmatched(txn, container, &matched, &yrs_blocks, old_children);
-    apply_actions(txn, container, &actions, &matched, old_children);
+    let retained = remove_unmatched(txn, container, &matched, &yrs_blocks, old_children);
+    apply_actions(txn, container, &actions, &retained, old_children);
 }
 
 /// Match model children to existing yrs blocks by blockId (or tag for leaf atoms).
@@ -559,7 +584,8 @@ fn remove_unmatched<C: XmlFragment>(
     matched: &[bool],
     yrs_blocks: &[YrsBlockInfo],
     old_children: Option<&[Node]>,
-) {
+) -> Vec<bool> {
+    let mut retained = matched.to_vec();
     let old_ids: Option<std::collections::HashSet<&str>> =
         old_children.map(|old| old.iter().filter_map(|n| n.block_id()).collect());
     for i in (0..matched.len()).rev() {
@@ -568,11 +594,13 @@ fn remove_unmatched<C: XmlFragment>(
         }
         if let (Some(old_ids), Some(bid)) = (&old_ids, yrs_blocks[i].block_id.as_deref()) {
             if !old_ids.contains(bid) {
-                continue; // unknown to the caller's baseline — keep it
+                retained[i] = true;
+                continue; // unknown to the caller's baseline: keep it
             }
         }
         container.remove(txn, i as u32);
     }
+    retained
 }
 
 /// Write the matched/new actions to the yrs container.
@@ -602,14 +630,15 @@ fn remove_unmatched<C: XmlFragment>(
 /// regression test (`sustained_typing_stays_within_budget_and_fast_path`)
 /// pin that contract.
 ///
-/// The slow path is correct but heavy: it rewrites every block from
-/// scratch, producing the same ~60 KB-per-edit pattern that the d92dac4
+/// The slow path preserves already-delivered content but replaces block
+/// identities, so a truly concurrent edit of a reordered block can still be
+/// lost. It also produces the ~60 KB-per-edit pattern that the d92dac4
 /// fix arc set out to kill. The Phase-1 tripwire metric
 /// (`client.collab.sync_slow_path_total`) plus the unit tests in this
 /// file make a future regression of the fast-path predicate observable
 /// in production telemetry AND blocked in CI. Replacing the wholesale
-/// rewrite with a real `compute_minimum_moves` algorithm is the
-/// long-term proper fix — tracked separately in the issue.
+/// rewrite requires identity-preserving moves and a versioned client rollout;
+/// old XML readers do not understand the ordering of Yrs move records.
 fn apply_actions<C: XmlFragment>(
     txn: &mut yrs::TransactionMut<'_>,
     container: &C,
@@ -617,65 +646,87 @@ fn apply_actions<C: XmlFragment>(
     matched: &[bool],
     old_children: Option<&[Node]>,
 ) {
-    // Compute where each matched block ended up after deletions
+    // Include peer-only blocks retained by remove_unmatched when mapping live
+    // positions. Counting only matched blocks would overwrite a prepended peer.
     let mut old_to_new_pos: HashMap<usize, u32> = HashMap::new();
     let mut pos = 0u32;
-    for (i, was_matched) in matched.iter().enumerate() {
-        if *was_matched {
+    for (i, retained) in matched.iter().enumerate() {
+        if *retained {
             old_to_new_pos.insert(i, pos);
             pos += 1;
         }
     }
-
+    let old_by_id: HashMap<&str, &Node> = old_children.into_iter().flatten()
+        .filter_map(|node| node.block_id().map(|id| (id, node))).collect();
+    let old_node = |node: &Node, index: usize| {
+        match node.block_id() {
+            Some(id) => old_by_id.get(id).copied(),
+            None => old_children.and_then(|old| old.get(index)),
+        }
+    };
     let reused_indices: Vec<usize> = actions.iter().filter_map(|a| {
         if let SyncAction::Reuse { yrs_idx, .. } = a { Some(*yrs_idx) } else { None }
     }).collect();
-
     let already_ordered = reused_indices.windows(2).all(|w| w[0] < w[1]);
 
     if already_ordered {
-        // Fast path: matched blocks are in order. Insert new blocks and update changed ones.
         let mut insert_offset = 0u32;
-        for (target_idx, action) in actions.iter().enumerate() {
+        let mut cursor = 0;
+        for action in actions {
             match action {
                 SyncAction::Insert { node } => {
-                    write_node(txn, container, target_idx as u32, node);
+                    write_node(txn, container, cursor, node);
                     insert_offset += 1;
+                    cursor += 1;
                 }
                 SyncAction::Reuse { yrs_idx, node } => {
                     let current_pos = old_to_new_pos[yrs_idx] + insert_offset;
-                    // #121: positional old/new pairing — at last sync the
-                    // ydoc's child `yrs_idx` was written from (or read as)
-                    // `old_children[yrs_idx]`. If the model node is equal,
-                    // we have no local change to contribute for this
-                    // subtree: skip it entirely (no yrs attr/text reads,
-                    // no recursion).
-                    let old_node = old_children.and_then(|o| o.get(*yrs_idx));
-                    if old_node == Some(*node) {
-                        continue;
+                    let baseline = old_node(node, *yrs_idx);
+                    if baseline != Some(*node) {
+                        sync_block_content(txn, container, current_pos, node, baseline);
                     }
-                    sync_block_content(txn, container, current_pos, node, old_node);
+                    cursor = current_pos + 1;
                 }
             }
         }
     } else {
-        // Slow path: blocks are reordered. Clear and rewrite everything.
-        //
-        // Phase 1 of #93 — observability for the slow path so a
-        // regression of the find_match ordering invariants (or any
-        // future change that makes this branch fire on routine
-        // edits) is visible. Counter ticks per call; warn fires
-        // once per editor session so support bundles surface the
-        // first occurrence without being flooded.
         crate::observability::inc(crate::observability::SYNC_SLOW_PATH);
         warn_slow_path_first_time();
-
-        let remaining = container.len(txn);
-        if remaining > 0 {
-            container.remove_range(txn, 0, remaining);
+        // XML reordering replaces element identities. Preserve all content
+        // already delivered before the reorder by merging into the live blocks
+        // first; edits arriving concurrently with the reorder need a future
+        // versioned representation that supports identity-preserving moves.
+        let mut reordered = Vec::with_capacity(actions.len());
+        for action in actions {
+            match action {
+                SyncAction::Reuse { yrs_idx, node } => {
+                    let current_pos = old_to_new_pos[yrs_idx];
+                    let baseline = old_node(node, *yrs_idx);
+                    if baseline != Some(*node) {
+                        sync_block_content(txn, container, current_pos, node, baseline);
+                    }
+                    if let Some(out) = container.get(txn, current_pos) {
+                        reordered.extend(read_xml_out(txn, &out));
+                    }
+                }
+                SyncAction::Insert { node } => reordered.push((*node).clone()),
+            }
         }
-        for (i, action) in actions.iter().enumerate() {
-            write_node(txn, container, i as u32, action.node());
+        let reused: std::collections::HashSet<_> = reused_indices.into_iter().collect();
+        let mut peers: Vec<_> = old_to_new_pos.iter()
+            .filter(|(index, _)| !reused.contains(index))
+            .filter_map(|(_, pos)| container.get(txn, *pos)
+                .map(|out| (*pos as usize, read_xml_out(txn, &out))))
+            .collect();
+        peers.sort_by_key(|(pos, _)| *pos);
+        for (pos, nodes) in peers {
+            let at = pos.min(reordered.len());
+            reordered.splice(at..at, nodes);
+        }
+        let remaining = container.len(txn);
+        if remaining > 0 { container.remove_range(txn, 0, remaining); }
+        for (i, node) in reordered.iter().enumerate() {
+            write_node(txn, container, i as u32, node);
         }
     }
 }
@@ -704,7 +755,7 @@ fn warn_slow_path_first_time() {
 }
 
 /// Update the content of an existing yrs block to match the model node.
-/// `old_node` is the positionally-paired node from the caller's
+/// `old_node` is the identity-matched node from the caller's
 /// `last_synced` doc (see `sync_model_to_ydoc_diffed`); equal parts of
 /// it license skipping the corresponding yrs reads/writes.
 fn sync_block_content<C: XmlFragment>(
@@ -741,7 +792,7 @@ fn sync_block_content<C: XmlFragment>(
     };
 
     if old_attrs != Some(model_attrs) {
-        sync_attrs(txn, el, model_attrs);
+        sync_attrs(txn, el, model_attrs, old_attrs);
     }
 
     // Container blocks recurse into children; leaf blocks compare
@@ -780,7 +831,340 @@ fn sync_block_content<C: XmlFragment>(
     } else if old_content != Some(model_content)
         && !text_and_marks_match(txn, el, model_node, &model_content.children)
     {
-        replace_children(txn, el, &model_content.children);
+        if !sync_plain_text_edit(txn, el, model_content, old_content) {
+            replace_children(txn, el, &model_content.children);
+        }
+    }
+}
+
+/// Reconcile text and formatting as operations on the existing XmlText items.
+/// Align the baseline with both the local model and the live CRDT. Local
+/// deletions only remove surviving baseline characters, never peer insertions;
+/// formatting patches only write mark keys changed by the local editor.
+fn sync_plain_text_edit(
+    txn: &mut yrs::TransactionMut<'_>,
+    el: &yrs::XmlElementRef,
+    new_content: &Fragment,
+    old_content: Option<&Fragment>,
+) -> bool {
+    let live_nodes: Vec<Node> = (0..el.len(txn)).flat_map(|i| {
+        el.get(txn, i).map(|out| read_xml_out(txn, &out)).unwrap_or_default()
+    }).collect();
+    let live_content = Fragment::from(live_nodes);
+    let old_content = old_content.unwrap_or(&live_content);
+    if old_content.children.iter().chain(&new_content.children).chain(&live_content.children)
+        .any(|node| !matches!(node, Node::Text { .. }))
+    {
+        return sync_inline_text_edits(txn, el, new_content, old_content, &live_content);
+    }
+    // Preserve all existing XmlText identities, including separate marked runs.
+    if el.len(txn) == 0 { el.insert(txn, 0, XmlTextPrelim::new("")); }
+    let texts: Vec<_> = el.children(txn).filter_map(XmlOut::into_xml_text).collect();
+    sync_text_run(txn, &texts, new_content, old_content, &live_content);
+    true
+}
+
+/// Inline atoms delimit text runs. Formatting and typing within a run update
+/// its existing XmlText objects, leaving mentions, equations and breaks intact.
+fn sync_inline_text_edits(
+    txn: &mut yrs::TransactionMut<'_>,
+    el: &yrs::XmlElementRef,
+    new_content: &Fragment,
+    old_content: &Fragment,
+    live_content: &Fragment,
+) -> bool {
+    fn split(content: &Fragment) -> (Vec<Fragment>, Vec<&Node>) {
+        let mut runs = vec![Fragment::empty()];
+        let mut atoms = Vec::new();
+        for node in &content.children {
+            if matches!(node, Node::Text { .. }) {
+                runs.last_mut().unwrap().children.push(node.clone());
+            } else {
+                atoms.push(node);
+                runs.push(Fragment::empty());
+            }
+        }
+        (runs, atoms)
+    }
+    let (old_runs, old_atoms) = split(old_content);
+    let (new_runs, new_atoms) = split(new_content);
+    let (live_runs, live_atoms) = split(live_content);
+    let same_identity =
+        |a: &&Node, b: &&Node| a.node_type() == b.node_type() && a.block_id() == b.block_id();
+    if old_atoms.len() != new_atoms.len()
+        || old_atoms.len() != live_atoms.len()
+        || !old_atoms
+            .iter()
+            .zip(&new_atoms)
+            .all(|(a, b)| same_identity(a, b))
+        || !old_atoms
+            .iter()
+            .zip(&live_atoms)
+            .all(|(a, b)| same_identity(a, b))
+    {
+        return false;
+    }
+    let mut runs: Vec<(u32, Vec<yrs::XmlTextRef>)> = vec![(0, Vec::new())];
+    let mut atoms = Vec::new();
+    for (index, child) in el.children(txn).enumerate() {
+        match child {
+            XmlOut::Text(text) => runs.last_mut().unwrap().1.push(text),
+            XmlOut::Element(atom) => {
+                atoms.push(atom);
+                runs.push((index as u32 + 1, Vec::new()));
+            }
+            XmlOut::Fragment(_) => return false,
+        }
+    }
+    if runs.len() != new_runs.len() {
+        return false;
+    }
+    // Work backwards so adding a text object to an empty run cannot shift
+    // the insertion positions of runs still to reconcile.
+    for (index, (at, texts)) in runs.iter_mut().enumerate().rev() {
+        if new_runs[index] == old_runs[index] {
+            continue;
+        }
+        if texts.is_empty() {
+            texts.push(el.insert(txn, *at, XmlTextPrelim::new("")));
+        }
+        sync_text_run(
+            txn,
+            texts,
+            &new_runs[index],
+            &old_runs[index],
+            &live_runs[index],
+        );
+    }
+    for ((atom, old), new) in atoms.iter().zip(old_atoms).zip(new_atoms) {
+        if old.attrs() != new.attrs() {
+            sync_attrs(txn, atom, new.attrs(), Some(old.attrs()));
+        }
+    }
+    true
+}
+
+fn sync_text_run(
+    txn: &mut yrs::TransactionMut<'_>,
+    texts: &[yrs::XmlTextRef],
+    new_content: &Fragment,
+    old_content: &Fragment,
+    live_content: &Fragment,
+) {
+    let old = styled_chars(old_content).expect("text-only run");
+    let new = styled_chars(new_content).expect("text-only run");
+    let live = styled_chars(live_content).expect("text-only run");
+    let old_chars: Vec<_> = old.iter().map(|(ch, _)| *ch).collect();
+    let new_chars: Vec<_> = new.iter().map(|(ch, _)| *ch).collect();
+    let live_chars: Vec<_> = live.iter().map(|(ch, _)| *ch).collect();
+    let local_ops = text_diff(&old_chars, &new_chars);
+    let remote_ops = text_diff(&old_chars, &live_chars);
+    let mut surviving = vec![None; old.len()];
+    let mut boundaries = vec![0; old.len() + 1];
+    for op in remote_ops {
+        let (tag, before, after) = op.as_tag_tuple();
+        if tag == similar::DiffTag::Equal {
+            for offset in 0..before.len() {
+                surviving[before.start + offset] = Some(after.start + offset);
+            }
+            for offset in 0..=before.len() {
+                boundaries[before.start + offset] = after.start + offset;
+            }
+        } else {
+            // Concurrent insertions at a gap stay before our later insertion.
+            for boundary in &mut boundaries[before.start..=before.end] {
+                *boundary = after.end;
+            }
+            if !before.is_empty() {
+                boundaries[before.start] = after.start;
+            }
+        }
+    }
+    let offsets = text_offsets(&live_chars, txn.doc().offset_kind());
+    // Format before changing text so the baseline-to-live mapping remains
+    // valid. Coalesce identical patches instead of emitting one op per char.
+    let mut pending: Option<(usize, usize, Attrs)> = None;
+    for op in &local_ops {
+        if let similar::DiffOp::Equal {
+            old_index,
+            new_index,
+            len,
+        } = *op
+        {
+            for offset in 0..len {
+                let old_index = old_index + offset;
+                let Some(live_index) = surviving[old_index] else {
+                    continue;
+                };
+                if old[old_index].1 == new[new_index + offset].1 {
+                    continue;
+                }
+                let patch = mark_patch(old[old_index].1, new[new_index + offset].1);
+                if patch.is_empty() {
+                    continue;
+                }
+                let from = offsets[live_index];
+                let to = offsets[live_index + 1];
+                if let Some((_, end, attrs)) = pending.as_mut() {
+                    if *end == from && *attrs == patch {
+                        *end = to;
+                        continue;
+                    }
+                }
+                if let Some((start, end, attrs)) = pending.take() {
+                    format_text_range(txn, texts, start, end, attrs);
+                }
+                pending = Some((from, to, patch));
+            }
+        }
+    }
+    if let Some((start, end, attrs)) = pending {
+        format_text_range(txn, texts, start, end, attrs);
+    }
+    for op in local_ops.into_iter().rev() {
+        let (tag, before, after) = op.as_tag_tuple();
+        if tag == similar::DiffTag::Equal {
+            continue;
+        }
+        // Multiple disjoint deletions can fall inside a replacement span when
+        // a peer inserted text there. Keep every such insertion intact.
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for index in before.clone().filter_map(|index| surviving[index]) {
+            let start = offsets[index];
+            let end = offsets[index + 1];
+            if let Some((_, last_end)) = ranges.last_mut() {
+                if *last_end == start {
+                    *last_end = end;
+                    continue;
+                }
+            }
+            ranges.push((start, end));
+        }
+        for (start, end) in ranges.into_iter().rev() {
+            remove_text_range(txn, texts, start, end);
+        }
+        let mut at = offsets[boundaries[before.start]];
+        let mut index = after.start;
+        while index < after.end {
+            let marks = new[index].1;
+            let mut end = index + 1;
+            while end < after.end && new[end].1 == marks {
+                end += 1;
+            }
+            let inserted: String = new[index..end].iter().map(|(ch, _)| *ch).collect();
+            insert_text_at(txn, texts, at, &inserted, marks_to_attrs(marks));
+            at += text_len(&inserted, txn.doc().offset_kind());
+            index = end;
+        }
+    }
+}
+
+fn styled_chars(content: &Fragment) -> Option<Vec<(char, &[Mark])>> {
+    let mut result = Vec::new();
+    for child in &content.children {
+        let Node::Text { text, marks } = child else { return None };
+        result.extend(text.chars().map(|ch| (ch, marks.as_slice())));
+    }
+    Some(result)
+}
+
+fn text_diff(old: &[char], new: &[char]) -> Vec<similar::DiffOp> {
+    if old == new {
+        return vec![similar::DiffOp::Equal { old_index: 0, new_index: 0, len: old.len() }];
+    }
+    // The Myers implementation uses linear space. A disjoint alphabet is a
+    // common worst case (select-all replacement); detect it in linear time.
+    let old_chars: std::collections::HashSet<_> = old.iter().copied().collect();
+    if !old.is_empty() && !new.is_empty() && !new.iter().any(|ch| old_chars.contains(ch)) {
+        return vec![similar::DiffOp::Replace {
+            old_index: 0, old_len: old.len(), new_index: 0, new_len: new.len(),
+        }];
+    }
+    similar::capture_diff_slices(similar::Algorithm::Myers, old, new)
+}
+
+fn text_len(text: &str, kind: yrs::OffsetKind) -> usize {
+    match kind {
+        yrs::OffsetKind::Bytes => text.len(),
+        yrs::OffsetKind::Utf16 => text.encode_utf16().count(),
+    }
+}
+
+fn text_offsets(chars: &[char], kind: yrs::OffsetKind) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(chars.len() + 1);
+    offsets.push(0);
+    for ch in chars {
+        let len = match kind { yrs::OffsetKind::Bytes => ch.len_utf8(), yrs::OffsetKind::Utf16 => ch.len_utf16() };
+        offsets.push(offsets.last().unwrap() + len);
+    }
+    offsets
+}
+
+fn mark_patch(old: &[Mark], new: &[Mark]) -> Attrs {
+    let old = marks_to_attrs(old);
+    let new = marks_to_attrs(new);
+    let mut patch = Attrs::new();
+    for (key, value) in &new {
+        if old.get(key) != Some(value) { patch.insert(key.clone(), value.clone()); }
+    }
+    for key in old.keys() {
+        if !new.contains_key(key) { patch.insert(key.clone(), Any::Null); }
+    }
+    patch
+}
+
+fn format_text_range(
+    txn: &mut yrs::TransactionMut<'_>,
+    texts: &[yrs::XmlTextRef],
+    start: usize,
+    end: usize,
+    attrs: Attrs,
+) {
+    let mut offset = 0;
+    for text in texts {
+        let len = text.len(txn) as usize;
+        let from = start.saturating_sub(offset).min(len);
+        let to = end.saturating_sub(offset).min(len);
+        if to > from {
+            text.format(txn, from as u32, (to - from) as u32, attrs.clone());
+        }
+        offset += len;
+    }
+}
+
+fn remove_text_range(
+    txn: &mut yrs::TransactionMut<'_>,
+    texts: &[yrs::XmlTextRef],
+    start: usize,
+    end: usize,
+) {
+    let mut offset = 0;
+    for text in texts {
+        let len = text.len(txn) as usize;
+        let from = start.saturating_sub(offset).min(len);
+        let to = end.saturating_sub(offset).min(len);
+        if to > from {
+            text.remove_range(txn, from as u32, (to - from) as u32);
+        }
+        offset += len;
+    }
+}
+
+fn insert_text_at(
+    txn: &mut yrs::TransactionMut<'_>,
+    texts: &[yrs::XmlTextRef],
+    at: usize,
+    inserted: &str,
+    attrs: Attrs,
+) {
+    let mut offset = 0;
+    for text in texts {
+        let len = text.len(txn) as usize;
+        if at <= offset + len {
+            text.insert_with_attributes(txn, (at - offset) as u32, inserted, attrs);
+            return;
+        }
+        offset += len;
     }
 }
 
@@ -789,19 +1173,28 @@ fn sync_attrs(
     txn: &mut yrs::TransactionMut<'_>,
     el: &yrs::XmlElementRef,
     model_attrs: &HashMap<String, String>,
+    old_attrs: Option<&HashMap<String, String>>,
 ) {
     let mut yrs_attrs: HashMap<String, String> = el.attributes(txn)
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
     for (key, value) in model_attrs {
+        // Reconcile only keys changed since the caller's baseline. A remote
+        // peer may have edited another key on this same element meanwhile.
+        if old_attrs.is_some_and(|old| old.get(key) == Some(value)) {
+            continue;
+        }
         if yrs_attrs.get(key) != Some(value) {
             el.insert_attribute(txn, key.as_str(), value.as_str());
         }
         yrs_attrs.remove(key);
     }
-    for key in yrs_attrs.keys() {
-        el.remove_attribute(txn, key);
+    let removed = old_attrs
+        .map(|old| old.keys().filter(|key| !model_attrs.contains_key(*key)).cloned().collect::<Vec<_>>())
+        .unwrap_or_else(|| yrs_attrs.keys().filter(|key| !model_attrs.contains_key(*key)).cloned().collect());
+    for key in removed {
+        el.remove_attribute(txn, &key);
     }
 }
 
@@ -2661,24 +3054,101 @@ mod tests {
 
     #[test]
     fn concurrent_edit_same_block_text() {
-        // Both clients rewrite the same paragraph's text.
-        // sync_model_to_ydoc does a full children rewrite when text differs,
-        // so this is an XML-level conflict, not char-level merge.
+        // Both peers edit different positions of the same plain-text node.
         let initial = make_doc(vec![make_para("b1", "Hello world")]);
         let pair = make_client_pair(&initial);
 
         let model_a = make_doc(vec![make_para("b1", "Hello beautiful world")]);
-        sync_model_to_ydoc(&pair.doc_a, &model_a);
+        sync_model_to_ydoc_diffed(&pair.doc_a, &model_a, Some(&initial));
 
         let model_b = make_doc(vec![make_para("b1", "Hello world!")]);
-        sync_model_to_ydoc(&pair.doc_b, &model_b);
+        sync_model_to_ydoc_diffed(&pair.doc_b, &model_b, Some(&initial));
 
         exchange_updates(&pair);
         let (result, _) = assert_convergence(&pair);
 
-        // Primary assertion: convergence (A==B). Content depends on yrs conflict resolution.
-        let text = result.child(0).unwrap().text_content();
-        assert!(!text.is_empty(), "merged text should not be empty: got '{text}'");
+        assert_eq!(result.child(0).unwrap().text_content(), "Hello beautiful world!");
+    }
+
+    #[test]
+    fn stale_local_direction_update_preserves_remote_alignment() {
+        let initial = make_doc(vec![make_para("b1", "مرحبا Hello")]);
+        let ydoc = Doc::new();
+        let baseline = sync_model_to_ydoc_diffed(&ydoc, &initial, None);
+
+        let mut remote = initial.clone();
+        if let Node::Element { content, .. } = &mut remote {
+            if let Node::Element { attrs, .. } = &mut content.children[0] {
+                attrs.insert("align".into(), "center".into());
+            }
+        }
+        sync_model_to_ydoc_diffed(&ydoc, &remote, Some(&baseline));
+
+        let mut local = initial.clone();
+        if let Node::Element { content, .. } = &mut local {
+            if let Node::Element { attrs, .. } = &mut content.children[0] {
+                attrs.insert("dir".into(), "rtl".into());
+            }
+        }
+        sync_model_to_ydoc_diffed(&ydoc, &local, Some(&baseline));
+        let merged = read_doc_from_ydoc(&ydoc).unwrap();
+        let para = merged.child(0).unwrap();
+        assert_eq!(para.attrs().get("dir").map(String::as_str), Some("rtl"));
+        assert_eq!(para.attrs().get("align").map(String::as_str), Some("center"));
+        assert_eq!(para.text_content(), "مرحبا Hello");
+    }
+
+    #[test]
+    fn concurrent_direction_and_text_edit_merge() {
+        let initial = make_doc(vec![make_para("b1", "مرحبا Hello")]);
+        let pair = make_client_pair(&initial);
+
+        let mut directed = initial.clone();
+        if let Node::Element { content, .. } = &mut directed {
+            if let Node::Element { attrs, .. } = &mut content.children[0] {
+                attrs.insert("dir".into(), "rtl".into());
+            }
+        }
+        sync_model_to_ydoc_diffed(&pair.doc_a, &directed, Some(&initial));
+
+        let typed = make_doc(vec![make_para("b1", "مرحبا Hello!")]);
+        sync_model_to_ydoc_diffed(&pair.doc_b, &typed, Some(&initial));
+
+        exchange_updates(&pair);
+        let (merged, _) = assert_convergence(&pair);
+        let paragraph = merged.child(0).unwrap();
+        assert_eq!(paragraph.attrs().get("dir").map(String::as_str), Some("rtl"));
+        assert_eq!(paragraph.text_content(), "مرحبا Hello!");
+    }
+
+    #[test]
+    fn stale_local_text_edit_rebases_after_remote_edit() {
+        let initial = make_doc(vec![make_para("b1", "مرحبا Hello")]);
+        let ydoc = Doc::new();
+        let baseline = sync_model_to_ydoc_diffed(&ydoc, &initial, None);
+
+        let remote = make_doc(vec![make_para("b1", "مرحبا Hello!")]);
+        sync_model_to_ydoc_diffed(&ydoc, &remote, Some(&baseline));
+
+        let local = make_doc(vec![make_para("b1", "يا مرحبا Hello")]);
+        sync_model_to_ydoc_diffed(&ydoc, &local, Some(&baseline));
+        assert_eq!(read_doc_from_ydoc(&ydoc).unwrap().child(0).unwrap().text_content(),
+            "يا مرحبا Hello!");
+    }
+
+    #[test]
+    fn stale_local_text_edit_rebases_when_remote_is_before_it() {
+        let initial = make_doc(vec![make_para("b1", "مرحبا Hello")]);
+        let ydoc = Doc::new();
+        let baseline = sync_model_to_ydoc_diffed(&ydoc, &initial, None);
+
+        let remote = make_doc(vec![make_para("b1", "يا مرحبا Hello")]);
+        sync_model_to_ydoc_diffed(&ydoc, &remote, Some(&baseline));
+
+        let local = make_doc(vec![make_para("b1", "مرحبا Hello!")]);
+        sync_model_to_ydoc_diffed(&ydoc, &local, Some(&baseline));
+        assert_eq!(read_doc_from_ydoc(&ydoc).unwrap().child(0).unwrap().text_content(),
+            "يا مرحبا Hello!");
     }
 
     #[test]
@@ -2919,11 +3389,10 @@ mod tests {
         exchange_updates(&pair);
         let (result, _) = assert_convergence(&pair);
 
-        // Both clients fully rewrite children when marks differ (remove_range +
-        // write_node), so yrs sees two independent insertions → text may be
-        // duplicated. Convergence (A==B) is the key assertion.
-        let text = result.child(0).unwrap().text_content();
-        assert!(text.contains("Hello"), "original text should be present: got '{text}'");
+        let paragraph = result.child(0).unwrap();
+        assert_eq!(paragraph.text_content(), "Hello", "formatting must not duplicate text");
+        assert_eq!(paragraph.child(0).unwrap().marks(),
+            &[Mark::new(MarkType::Bold), Mark::new(MarkType::Italic)]);
     }
 
     #[test]

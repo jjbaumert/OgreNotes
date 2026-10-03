@@ -279,7 +279,9 @@ fn walk_text_nodes(
             let text = child.text_content().unwrap_or_default();
             let len = text.chars().count() as u32;
             if target >= *pos && target <= *pos + len {
-                return Some((child, target - *pos));
+                return Some((child, crate::editor::model::char_to_utf16_offset(
+                    &text, (target - *pos) as usize,
+                ) as u32));
             }
             *pos += len;
         } else if child.node_type() == web_sys::Node::ELEMENT_NODE {
@@ -591,6 +593,37 @@ mod browser_tests {
         assert!((rect.bottom() - 240.0).abs() < 1.0);
 
         cleanup(&el);
+    }
+
+    #[wasm_bindgen_test]
+    fn unicode_block_offsets_select_complete_emoji_across_marks() {
+        let doc = web_sys::window().unwrap().document().unwrap();
+        let el = doc.create_element("p").unwrap();
+        el.set_inner_html("<strong>A😀</strong>B");
+        doc.body().unwrap().append_child(&el).unwrap();
+        let (start, start_offset) = find_text_offset_in_element(&el, 1).unwrap();
+        let (end, end_offset) = find_text_offset_in_element(&el, 2).unwrap();
+        assert_eq!(start_offset, 1);
+        assert_eq!(end_offset, 3);
+        let range = doc.create_range().unwrap();
+        range.set_start(&start, start_offset).unwrap();
+        range.set_end(&end, end_offset).unwrap();
+        assert_eq!(String::from(range.to_string()), "😀");
+        let (_, offset) = find_text_offset_in_element(&el, 3).unwrap();
+        assert_eq!(offset, 1, "end of B is in the following text node");
+        el.remove();
+    }
+
+    #[wasm_bindgen_test]
+    fn unicode_block_offsets_skip_rendering_only_preview_text() {
+        let doc = web_sys::window().unwrap().document().unwrap();
+        let el = doc.create_element("pre").unwrap();
+        el.set_inner_html("<div data-sentinel><svg><text>Preview</text></svg></div><code>A😀B</code>");
+        doc.body().unwrap().append_child(&el).unwrap();
+        let (node, offset) = find_text_offset_in_element(&el, 2).unwrap();
+        assert_eq!(node.text_content().as_deref(), Some("A😀B"));
+        assert_eq!(offset, 3);
+        el.remove();
     }
 
     #[wasm_bindgen_test]

@@ -272,3 +272,11 @@ jobs:
       - name: Run frontend browser DOM tests
         working-directory: frontend
         run: wasm-pack test --headless --firefox -- --test browser
+
+      - name: Frontend binary DOM position regressions
+        working-directory: frontend
+        run: wasm-pack test --headless --firefox -- --bin ogrenotes-frontend
+
+      - name: Collaboration content preservation
+        working-directory: frontend
+        run: wasm-pack test --headless --firefox -- --test collab_semantics

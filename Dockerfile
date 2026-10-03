@@ -45,6 +45,7 @@ WORKDIR /app
 # recompile.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+COPY vendor/ vendor/
 
 # `release-fast` (defined in workspace Cargo.toml) trades runtime perf for
 # faster compilation — appropriate for the 1-task ECS test stack. Output
@@ -106,6 +107,7 @@ RUN case "${TARGETARCH}" in \
 # deploys rebuild the backend stage anyway.
 COPY Cargo.toml Cargo.lock /app/
 COPY crates/ /app/crates/
+COPY vendor/ /app/vendor/
 
 WORKDIR /app/frontend
 

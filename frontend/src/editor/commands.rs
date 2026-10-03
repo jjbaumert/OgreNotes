@@ -2787,7 +2787,8 @@ pub fn insert_hard_break(
         let content = Fragment::from(vec![br_node]);
         let slice = Slice::new(content, 0, 0);
 
-        if let Ok(txn) = state.transaction().replace(from, to, slice) {
+        if let Ok(mut txn) = state.transaction().replace(from, to, slice) {
+            txn.selection = Selection::cursor(from + 1);
             dispatch(txn);
         }
     }
@@ -4298,6 +4299,7 @@ mod tests {
         };
         let txn = run_command(&state, insert_hard_break).unwrap();
         let new_state = state.apply(txn);
+        assert_eq!(new_state.selection, Selection::cursor(7));
         let para = new_state.doc.child(0).unwrap();
         let has_br = (0..para.child_count())
             .any(|i| para.child(i).unwrap().node_type() == Some(NodeType::HardBreak));
