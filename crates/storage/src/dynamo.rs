@@ -44,6 +44,22 @@ impl DynamoClient {
         Ok(result.item)
     }
 
+    /// Read authoritative state for security decisions and conditional writes.
+    /// Ordinary document reads can continue to use `get_item`.
+    pub async fn get_item_consistent(
+        &self,
+        pk: &str,
+        sk: &str,
+    ) -> Result<Option<HashMap<String, AttributeValue>>, aws_sdk_dynamodb::Error> {
+        let result = self.client.get_item()
+            .table_name(&self.table_name)
+            .key("PK", AttributeValue::S(pk.to_string()))
+            .key("SK", AttributeValue::S(sk.to_string()))
+            .consistent_read(true)
+            .send().await.map_err(|e| e.into_service_error())?;
+        Ok(result.item)
+    }
+
     /// Put a single item.
     pub async fn put_item(
         &self,
@@ -117,6 +133,25 @@ impl DynamoClient {
         pk: &str,
         sk_prefix: Option<&str>,
     ) -> Result<Vec<HashMap<String, AttributeValue>>, aws_sdk_dynamodb::Error> {
+        self.query_with_consistency(pk, sk_prefix, false).await
+    }
+
+    /// Query all pages with strongly consistent reads, for decisions such
+    /// as revoking every existing session after token reuse.
+    pub async fn query_consistent(
+        &self,
+        pk: &str,
+        sk_prefix: Option<&str>,
+    ) -> Result<Vec<HashMap<String, AttributeValue>>, aws_sdk_dynamodb::Error> {
+        self.query_with_consistency(pk, sk_prefix, true).await
+    }
+
+    async fn query_with_consistency(
+        &self,
+        pk: &str,
+        sk_prefix: Option<&str>,
+        consistent: bool,
+    ) -> Result<Vec<HashMap<String, AttributeValue>>, aws_sdk_dynamodb::Error> {
         let mut all_items: Vec<HashMap<String, AttributeValue>> = Vec::new();
         let mut last_key: Option<HashMap<String, AttributeValue>> = None;
 
@@ -125,6 +160,7 @@ impl DynamoClient {
                 .client
                 .query()
                 .table_name(&self.table_name)
+                .set_consistent_read(consistent.then_some(true))
                 .key_condition_expression(if sk_prefix.is_some() {
                     "PK = :pk AND begins_with(SK, :sk)"
                 } else {
