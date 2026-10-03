@@ -187,6 +187,47 @@ pub const DEFAULT_GROUP: &str = "workers";
 /// XADD's pair shape is `<field> <value>` so we use one pair.
 const ENVELOPE_FIELD: &str = "envelope";
 
+// Publish Running only while the first-delivery receipt is still current.
+// A delayed connection must not overwrite a reaper's terminal status.
+const START_DELIVERY: &str = r#"
+if #redis.call('XRANGE', KEYS[1], ARGV[2], ARGV[2]) == 0 then return 0 end
+local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[2], ARGV[2], 1)
+if #pending == 0 or pending[1][2] ~= ARGV[3] or pending[1][4] ~= 1 then return 0 end
+local fields = {'HSET', KEYS[2], 'json', ARGV[4]}
+if ARGV[5] ~= '' then
+    table.insert(fields, 'owner')
+    table.insert(fields, ARGV[5])
+end
+local expire = {'EXPIRE', KEYS[2], ARGV[6]}
+if not redis.acl_check_cmd(unpack(fields)) or not redis.acl_check_cmd(unpack(expire)) then
+    return redis.error_reply('NOPERM job running status command denied')
+end
+redis.call(unpack(fields))
+redis.call(unpack(expire))
+return 1
+"#;
+
+// Capture delivery count in the same atomic operation as ownership transfer.
+// Excluding this reaper's in-flight IDs before XCLAIM avoids revoking receipts
+// for tasks it is already running. Scan enough candidates to skip all of them.
+const CLAIM_STALE: &str = r#"
+local excluded = {}
+for i = 5, #ARGV do excluded[ARGV[i]] = true end
+local count = tonumber(ARGV[4])
+local pending = redis.call('XPENDING', KEYS[1], ARGV[1], 'IDLE', ARGV[3], '-', '+', count + #ARGV - 4)
+local claimed = {}
+for _, entry in ipairs(pending) do
+    if not excluded[entry[1]] then
+        local values = redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[2], ARGV[3], entry[1])
+        if #values > 0 then
+            table.insert(claimed, {values[1][1], values[1][2], entry[4] + 1})
+            if #claimed == count then break end
+        end
+    end
+end
+return claimed
+"#;
+
 // Redis 7 executes the transition without interleaving other clients. Lua
 // does not roll back on command errors, so validate key types, group state,
 // and every write's ACL before changing anything. XADD is first: a rejected
@@ -197,7 +238,9 @@ const ENVELOPE_FIELD: &str = "envelope";
 // A removed source is the completion marker. Repeating a call after a lost
 // reply, or finalizing a stale claim after another worker, cannot append a
 // duplicate or overwrite the status of a newer attempt.
-// A reclaim keeps the source ID, so also fence against its current PEL owner.
+// A reclaim keeps the source ID, so also fence against its PEL owner and
+// delivery count. The count prevents an A -> B -> A ownership cycle from
+// reviving the first A receipt.
 const FINALIZE_DELIVERY: &str = r#"
 local source, destination, status = KEYS[1], KEYS[2], KEYS[3]
 local group, id = ARGV[1], ARGV[2]
@@ -208,7 +251,7 @@ local pending = redis.call('XPENDING', source, group, id, id, 1)
 if #pending == 0 then
     return redis.error_reply('Delivery is not pending in the consumer group')
 end
-if pending[1][2] ~= ARGV[9] then
+if pending[1][2] ~= ARGV[9] or pending[1][4] ~= tonumber(ARGV[10]) then
     return 2
 end
 local status_type = redis.call('TYPE', status).ok
@@ -342,7 +385,8 @@ impl JobQueue {
     /// Block-read the next entry off the stream as `consumer`.
     /// `block_ms` = 0 → block indefinitely until an entry arrives.
     /// Returns `Ok(None)` on the explicit "no message within the
-    /// block window" timeout (only possible with block_ms > 0).
+    /// block window" timeout (only possible with block_ms > 0), or if another
+    /// worker reclaimed the delivery before Running could be published.
     pub async fn consume_next(
         &self,
         consumer: &str,
@@ -395,12 +439,22 @@ impl JobQueue {
             worker: consumer.to_string(),
             started_at_ms: now_ms(),
         };
-        self.write_status(&envelope.job_id, &started, envelope.owner.as_deref())
-            .await?;
+        let started_json = serde_json::to_string(&started)
+            .map_err(|e| JobError::Serialize(e.to_string()))?;
+        let current: bool = self.client.eval(
+            START_DELIVERY,
+            vec![self.stream.clone(), status_key(&envelope.job_id)],
+            vec![self.group.clone(), stream_id.clone(), consumer.to_string(), started_json,
+                envelope.owner.clone().unwrap_or_default(), JOB_STATUS_TTL_SECS.to_string()],
+        ).await?;
+        if !current {
+            return Ok(None);
+        }
         Ok(Some(ClaimedJob {
             stream_id: stream_id.clone(),
             envelope,
             consumer: consumer.to_string(),
+            delivery_count: 1,
         }))
     }
 
@@ -503,6 +557,7 @@ impl JobQueue {
                 if dead_letter_error.is_some() { "1" } else { "0" }.to_string(),
                 dead_letter_error.unwrap_or_default().to_string(),
                 claimed.consumer.clone(),
+                claimed.delivery_count.to_string(),
             ],
         ).await?;
         match outcome {
@@ -557,29 +612,28 @@ impl JobQueue {
         min_idle_ms: u64,
         max_count: usize,
     ) -> Result<Vec<ClaimedJob>, JobError> {
-        // XAUTOCLAIM walks the consumer-group's pending list
-        // itself and returns up to `count` entries this consumer
-        // can take over without an explicit XPENDING walk first.
-        // fred 9.4's xautoclaim_values returns
-        // (next_cursor, Vec<XReadValue<Ri, Rk, Rv>>) where each
-        // XReadValue is (stream_id, HashMap<field, value>).
-        let (_next_cursor, entries): (
-            String,
-            Vec<(String, std::collections::HashMap<String, String>)>,
-        ) = self
-            .client
-            .xautoclaim_values(
-                self.stream.as_str(),
-                self.group.as_str(),
-                consumer,
-                min_idle_ms,
-                "0-0",
-                Some(max_count as u64),
-                false,
-            )
-            .await?;
+        self.claim_stale_excluding(consumer, min_idle_ms, max_count, &[]).await
+    }
+
+    /// Reclaim stale deliveries without revoking this caller's active tasks.
+    /// `in_flight` IDs must come from the caller's running-task registry.
+    pub async fn claim_stale_excluding(
+        &self,
+        consumer: &str,
+        min_idle_ms: u64,
+        max_count: usize,
+        in_flight: &[String],
+    ) -> Result<Vec<ClaimedJob>, JobError> {
+        if max_count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut args = vec![self.group.clone(), consumer.to_string(),
+            min_idle_ms.to_string(), max_count.to_string()];
+        args.extend_from_slice(in_flight);
+        let entries: Vec<(String, std::collections::HashMap<String, String>, u64)> =
+            self.client.eval(CLAIM_STALE, vec![self.stream.clone()], args).await?;
         let mut out = Vec::with_capacity(entries.len());
-        for (stream_id, fields) in entries {
+        for (stream_id, fields, delivery_count) in entries {
             let envelope_json = fields.get(ENVELOPE_FIELD).ok_or_else(|| {
                 JobError::Serialize(format!(
                     "claimed entry {stream_id} missing field {ENVELOPE_FIELD}"
@@ -587,7 +641,7 @@ impl JobQueue {
             })?;
             let envelope: JobEnvelope = serde_json::from_str(envelope_json)
                 .map_err(|e| JobError::Serialize(e.to_string()))?;
-            out.push(ClaimedJob { stream_id, envelope, consumer: consumer.to_string() });
+            out.push(ClaimedJob { stream_id, envelope, consumer: consumer.to_string(), delivery_count });
         }
         Ok(out)
     }
@@ -630,6 +684,8 @@ pub struct ClaimedJob {
     pub envelope: JobEnvelope,
     // Receipt identity, kept in memory rather than changing the job envelope.
     consumer: String,
+    // PEL delivery count distinguishes receipts even if ownership cycles back.
+    delivery_count: u64,
 }
 
 /// Whether this invocation applied a delivery's finalization.
@@ -639,8 +695,8 @@ pub enum FinalizationOutcome {
     /// A different invocation already retired this delivery. Its outcome may
     /// have been a retry, so this does not authorize terminal side effects.
     AlreadyFinalized,
-    /// Another consumer reclaimed this pending delivery. No change was made;
-    /// the old owner must not perform terminal cleanup or status writes.
+    /// A newer claim replaced this receipt. No change was made; the old
+    /// receipt must not authorize terminal cleanup or status writes.
     ClaimLost,
 }
 
@@ -651,7 +707,7 @@ pub enum RetryOutcome {
     DeadLettered,
     /// No change was made. Do not perform terminal cleanup or status writes.
     AlreadyFinalized,
-    /// Another consumer owns this delivery. No retry, DLQ, or cleanup is due.
+    /// A newer claim owns this delivery. No retry, DLQ, or cleanup is due.
     ClaimLost,
 }
 

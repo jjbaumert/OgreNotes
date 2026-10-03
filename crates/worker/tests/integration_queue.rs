@@ -528,62 +528,79 @@ async fn denied_finalization_commands_cannot_lose_or_duplicate_work() {
     let admin = fresh_client(&url).await;
     for denied in ["xadd", "hset", "expire", "xack", "xdel"] {
         let username = format!("queue-test-{}", nanoid::nanoid!(8));
+        let password = nanoid::nanoid!(32);
+        let credential = format!(">{password}");
+        let keys = format!("~{username}:*");
         let deny = format!("-{denied}");
         admin
             .acl_setuser(
                 username.as_str(),
-                vec!["on", "nopass", "~*", "+@all", deny.as_str()],
+                vec!["reset", "on", credential.as_str(), keys.as_str(),
+                    "+@connection", "+info", "+eval", "+xgroup", "+xrange", "+xpending",
+                    "+type", "+xadd", "+hset", "+expire", "+xack", "+xdel", deny.as_str()],
             )
             .await
             .unwrap();
         let mut config = fred::types::RedisConfig::from_url(&url).unwrap();
         config.username = Some(username.clone());
-        config.password = Some(String::new());
-        let restricted = Arc::new(RedisClient::new(config, None, None, None));
-        restricted.init().await.unwrap();
-        for max_retries in [0, 1] {
-            let queue = fresh_queue(Arc::clone(&admin), "acl-failure").await;
-            let job_id = queue.enqueue(owned_import("acl-owner")).await.unwrap();
-            let claimed = queue.consume_next("original", 1000).await.unwrap().unwrap();
-            let worker = JobQueue::new(Arc::clone(&restricted), queue.stream_name())
-                .await
-                .unwrap();
-            let error = worker
-                .retry_or_dead_letter(&claimed, max_retries, "failed")
-                .await
-                .unwrap_err();
-            assert!(error.to_string().contains("NOPERM"), "{denied}: {error}");
-            assert_eq!(
-                admin.xlen::<u64, _>(queue.stream_name()).await.unwrap(),
-                1,
-                "{denied}"
-            );
-            let dlq = format!("{}:dlq", queue.stream_name());
-            assert_eq!(
-                admin.xlen::<u64, _>(dlq.as_str()).await.unwrap(),
-                0,
-                "{denied}"
-            );
-            let recovered = queue.claim_stale("recovery", 0, 10).await.unwrap();
-            assert_eq!(recovered.len(), 1, "{denied}");
-            assert!(matches!(
-                queue.status(&job_id).await.unwrap(),
-                JobStatus::Running { .. }
-            ));
-            queue
-                .retry_or_dead_letter(&recovered[0], max_retries, "failed")
-                .await
-                .unwrap();
-            if max_retries == 1 {
-                let next = queue.consume_next("recovery", 1000).await.unwrap().unwrap();
-                assert_eq!(next.envelope.attempt, 1);
-                queue.ack(&next, None).await.unwrap();
-            } else {
-                assert_eq!(admin.xlen::<u64, _>(dlq.as_str()).await.unwrap(), 1);
+        config.password = Some(password);
+        // Catch assertion panics at the task boundary so account cleanup is
+        // awaited before propagating failure. A process kill can still leave
+        // an account, but it has an unlogged random password and scoped keys.
+        let result = tokio::spawn({
+            let admin = Arc::clone(&admin);
+            let username = username.clone();
+            async move {
+                let restricted = Arc::new(RedisClient::new(config, None, None, None));
+                restricted.init().await.unwrap();
+                for max_retries in [0, 1] {
+                    let queue = JobQueue::new(Arc::clone(&admin), format!("{username}:{max_retries}"))
+                        .await.unwrap();
+                    let job_id = queue.enqueue(owned_import("acl-owner")).await.unwrap();
+                    admin.acl_setuser(username.as_str(), vec![format!("~job:{job_id}")]).await.unwrap();
+                    let claimed = queue.consume_next("original", 1000).await.unwrap().unwrap();
+                    let worker = JobQueue::new(Arc::clone(&restricted), queue.stream_name())
+                        .await
+                        .unwrap();
+                    let error = worker
+                        .retry_or_dead_letter(&claimed, max_retries, "failed")
+                        .await
+                        .unwrap_err();
+                    assert!(error.to_string().contains("NOPERM"), "{denied}: {error}");
+                    assert_eq!(
+                        admin.xlen::<u64, _>(queue.stream_name()).await.unwrap(),
+                        1,
+                        "{denied}"
+                    );
+                    let dlq = format!("{}:dlq", queue.stream_name());
+                    assert_eq!(
+                        admin.xlen::<u64, _>(dlq.as_str()).await.unwrap(),
+                        0,
+                        "{denied}"
+                    );
+                    let recovered = queue.claim_stale("recovery", 0, 10).await.unwrap();
+                    assert_eq!(recovered.len(), 1, "{denied}");
+                    assert!(matches!(
+                        queue.status(&job_id).await.unwrap(),
+                        JobStatus::Running { .. }
+                    ));
+                    queue
+                        .retry_or_dead_letter(&recovered[0], max_retries, "failed")
+                        .await
+                        .unwrap();
+                    if max_retries == 1 {
+                        let next = queue.consume_next("recovery", 1000).await.unwrap().unwrap();
+                        assert_eq!(next.envelope.attempt, 1);
+                        queue.ack(&next, None).await.unwrap();
+                    } else {
+                        assert_eq!(admin.xlen::<u64, _>(dlq.as_str()).await.unwrap(), 1);
+                    }
+                }
+                restricted.quit().await.unwrap();
             }
-        }
-        restricted.quit().await.unwrap();
+        }).await;
         let _: u64 = admin.acl_deluser(username).await.unwrap();
+        result.unwrap();
     }
 }
 
@@ -611,10 +628,11 @@ async fn reclaimed_delivery_only_allows_the_current_consumer_to_finalize() {
         let dlq = format!("{}:dlq", queue.stream_name());
         assert_eq!(client.xlen::<u64, _>(dlq.as_str()).await.unwrap(), 0);
 
-        // The reaper periodically reclaims entries using its own consumer
-        // name. That must not revoke an existing task's current ownership.
-        let same_owner = queue.claim_stale("recovery", 0, 1).await.unwrap();
-        assert_eq!(same_owner.len(), 1);
+        // The reaper skips active tasks before reclaiming, preserving their
+        // receipt generation even when they are idle-stale again.
+        let same_owner = queue.claim_stale_excluding("recovery", 0, 1,
+            std::slice::from_ref(&current.stream_id)).await.unwrap();
+        assert!(same_owner.is_empty());
         if terminal {
             assert_eq!(queue.retry_or_dead_letter(&current, 0, "current failure").await.unwrap(),
                 RetryOutcome::DeadLettered);
@@ -629,6 +647,108 @@ async fn reclaimed_delivery_only_allows_the_current_consumer_to_finalize() {
         assert_eq!(client.xlen::<u64, _>(queue.stream_name()).await.unwrap(), 0);
         assert!(queue.claim_stale("later", 0, 10).await.unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn reclaim_skips_in_flight_receipts_without_starving_later_jobs() {
+    let url = require_redis!();
+    let client = fresh_client(&url).await;
+    let queue = fresh_queue(client, "reclaim-exclusion").await;
+    queue.enqueue(owned_import("active")).await.unwrap();
+    let active = queue.consume_next("reaper", 1000).await.unwrap().unwrap();
+    queue.enqueue(owned_import("orphan")).await.unwrap();
+    let orphan = queue.consume_next("crashed", 1000).await.unwrap().unwrap();
+    let recovered = queue.claim_stale_excluding("reaper", 0, 1,
+        std::slice::from_ref(&active.stream_id)).await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].stream_id, orphan.stream_id);
+    assert_eq!(queue.ack(&active, None).await.unwrap(), FinalizationOutcome::Applied);
+    assert_eq!(queue.ack(&orphan, None).await.unwrap(), FinalizationOutcome::ClaimLost);
+    assert_eq!(queue.ack(&recovered[0], None).await.unwrap(), FinalizationOutcome::Applied);
+}
+
+#[tokio::test]
+async fn ownership_cycle_does_not_revive_an_old_claim() {
+    let url = require_redis!();
+    let client = fresh_client(&url).await;
+    let queue = fresh_queue(client, "ownership-cycle").await;
+    let job_id = queue.enqueue(owned_import("cycle-owner")).await.unwrap();
+    let original = queue.consume_next("reaper-a", 1000).await.unwrap().unwrap();
+    let intermediate = queue.claim_stale("reaper-b", 0, 1).await.unwrap().pop().unwrap();
+    let current = queue.claim_stale("reaper-a", 0, 1).await.unwrap().pop().unwrap();
+    assert_eq!(current.stream_id, original.stream_id);
+    let running = queue.status(&job_id).await.unwrap();
+    assert_eq!(queue.ack(&original, None).await.unwrap(), FinalizationOutcome::ClaimLost);
+    assert_eq!(queue.retry_or_dead_letter(&intermediate, 0, "obsolete failure").await.unwrap(),
+        RetryOutcome::ClaimLost);
+    assert_eq!(queue.status(&job_id).await.unwrap(), running);
+    assert_eq!(queue.ack(&current, None).await.unwrap(), FinalizationOutcome::Applied);
+}
+
+/// Pause a real Redis request after XREADGROUP has succeeded. This models a
+/// delayed connection across another worker's reclaim and terminal write.
+#[tokio::test]
+async fn delayed_running_status_cannot_overwrite_reclaimed_completion() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let url = require_redis!();
+    let admin = fresh_client(&url).await;
+    let queue = fresh_queue(admin, "delayed-running").await;
+    let job_id = queue.enqueue(owned_import("delayed-owner")).await.unwrap();
+    let mut config = fred::types::RedisConfig::from_url(&url).unwrap();
+    let server = config.server.hosts().remove(0);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    config.server = fred::types::ServerConfig::new_centralized("127.0.0.1", listener.local_addr().unwrap().port());
+    let paused = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let proxy = tokio::spawn({
+        let paused = Arc::clone(&paused);
+        let release = Arc::clone(&release);
+        async move {
+            let (downstream, _) = listener.accept().await.unwrap();
+            let upstream = tokio::net::TcpStream::connect((&*server.host, server.port)).await.unwrap();
+            let (down_read, mut down_write) = downstream.into_split();
+            let (mut up_read, mut up_write) = upstream.into_split();
+            let responses = async { tokio::io::copy(&mut up_read, &mut down_write).await.unwrap(); };
+            let requests = async {
+                let mut reader = BufReader::new(down_read);
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).await.unwrap() == 0 { break; }
+                    let count: usize = header.trim().strip_prefix('*').unwrap().parse().unwrap();
+                    let mut request = header.into_bytes();
+                    for _ in 0..count {
+                        let mut bulk = String::new();
+                        reader.read_line(&mut bulk).await.unwrap();
+                        let len: usize = bulk.trim().strip_prefix('$').unwrap().parse().unwrap();
+                        request.extend_from_slice(bulk.as_bytes());
+                        let mut value = vec![0; len + 2];
+                        reader.read_exact(&mut value).await.unwrap();
+                        request.extend(value);
+                    }
+                    if request.windows(b"\"state\":\"running\"".len()).any(|w| w == b"\"state\":\"running\"") {
+                        paused.notify_one();
+                        release.notified().await;
+                    }
+                    up_write.write_all(&request).await.unwrap();
+                }
+            };
+            tokio::select! { _ = requests => {}, _ = responses => {} }
+        }
+    });
+    let delayed_client = Arc::new(RedisClient::new(config, None, None, None));
+    delayed_client.init().await.unwrap();
+    let delayed_queue = JobQueue::new(delayed_client, queue.stream_name()).await.unwrap();
+    let consumer = tokio::spawn(async move { delayed_queue.consume_next("delayed", 1000).await });
+    tokio::time::timeout(Duration::from_secs(10), paused.notified()).await.unwrap();
+    let recovery = queue.claim_stale("recovery", 0, 1).await.unwrap().pop().unwrap();
+    assert_eq!(queue.ack(&recovery, None).await.unwrap(), FinalizationOutcome::Applied);
+    let terminal = queue.status(&job_id).await.unwrap();
+    release.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(10), consumer).await.unwrap().unwrap().unwrap();
+    assert_eq!(queue.status(&job_id).await.unwrap(), terminal,
+        "delayed Running write replaced terminal status");
+    assert!(result.is_none(), "revoked claim must not reach the handler");
+    proxy.abort();
 }
 
 /// Repeating the same finalization models a client that lost the script reply.

@@ -6,7 +6,7 @@
 //! binary is launched with `--mode=worker`, [`run`] takes over instead
 //! of the HTTP server path. Spawns [`AppConfig::worker_concurrency`]
 //! consumers against the configured Redis stream and one dedicated
-//! reaper task that XAUTOCLAIMs entries left orphaned by a crashed
+//! reaper task that reclaims entries left orphaned by a crashed
 //! peer.
 //!
 //! Wire shape mirrors `crates/worker` exactly — this module is the
@@ -25,7 +25,7 @@
 //!   shared watch channel; consumers wake from their block window
 //!   within [`CONSUME_BLOCK_MS`] and exit. A doubled deadline acts
 //!   as a hard cap if a consumer's `execute` is stuck.
-//! - Reaper: only one task runs XAUTOCLAIM — running it from every
+//! - Reaper: only one task reclaims stale entries; running it from every
 //!   consumer would compete with itself and thrash the pending list.
 //! - Per-job dispatch lives in [`execute`]; DOCX (M-6.5) and PDF
 //!   (M-6.6) variants currently dead-letter with a TODO message so
@@ -181,7 +181,7 @@ const REAPER_INTERVAL_SECS: u64 = 30;
 
 /// Minimum idle time (ms) before the reaper takes over an entry.
 /// 60s gives a normal worker plenty of room to finish a job before
-/// being treated as crashed; XAUTOCLAIM only moves entries past this
+/// being treated as crashed; reclaim only moves entries past this
 /// threshold.
 const REAPER_MIN_IDLE_MS: u64 = 60_000;
 
@@ -429,14 +429,10 @@ async fn reaper_loop(
             tracing::debug!(consumer, "worker mode: reaper at capacity; skipping this tick");
             continue;
         }
-        // Entries this reaper is already running go idle-stale again after
-        // REAPER_MIN_IDLE_MS (nothing refreshes them), and XAUTOCLAIM
-        // returns them first (it walks from the oldest id). Ask for enough
-        // to see past every one of them, or they would fill the whole batch
-        // and starve the orphaned entries the reaper exists to recover.
-        // `admit` still starts at most `free` jobs and skips the running ones.
-        let want = free + slots.running();
-        match queue.claim_stale(&consumer, REAPER_MIN_IDLE_MS, want).await {
+        // Skip active tasks before ownership transfer. Reclaiming them would
+        // increment the delivery generation and revoke their own receipts.
+        let in_flight = slots.in_flight_ids();
+        match queue.claim_stale_excluding(&consumer, REAPER_MIN_IDLE_MS, free, &in_flight).await {
             Ok(entries) if entries.is_empty() => {}
             Ok(entries) => {
                 tracing::info!(
@@ -494,6 +490,10 @@ impl ReaperSlots {
     /// How many reclaimed jobs are running now.
     fn running(&self) -> usize {
         self.in_flight.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    fn in_flight_ids(&self) -> Vec<String> {
+        self.in_flight.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned().collect()
     }
 
     /// A slot for `stream_id`, or `None` when that entry is already running
@@ -582,7 +582,7 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
                 tracing::info!(job_id, attempt, "delivery already finalized; skipping terminal cleanup");
             }
             Ok(FinalizationOutcome::ClaimLost) => {
-                tracing::info!(job_id, attempt, "delivery reclaimed by another consumer; skipping terminal cleanup");
+                tracing::info!(job_id, attempt, "delivery reclaimed; skipping terminal cleanup");
             }
             Err(e) => tracing::warn!(job_id, error = %e, "ack failed; entry orphaned"),
         },
@@ -629,7 +629,7 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
                     tracing::info!(job_id, attempt, "delivery already finalized; skipping terminal cleanup");
                 }
                 Ok(RetryOutcome::ClaimLost) => {
-                    tracing::info!(job_id, attempt, "delivery reclaimed by another consumer; skipping terminal cleanup");
+                    tracing::info!(job_id, attempt, "delivery reclaimed; skipping terminal cleanup");
                 }
                 Err(e) => {
                     tracing::error!(
