@@ -1818,7 +1818,26 @@ fn format_usec_utc(usec: i64) -> String {
 /// and timestamps formatted. Chat/DM threads are not document content and
 /// are excluded. Best-effort: a repo error yields no comments rather than
 /// failing the export (comments are supplementary to the document body).
-async fn load_export_comments(state: &AppState, doc_id: &str) -> Vec<export::ExportComment> {
+async fn load_export_comments(
+    state: &AppState,
+    meta: &DocumentMeta,
+    user_id: &str,
+) -> Vec<export::ExportComment> {
+    // Exports grant document-body access, not an independent conversation
+    // capability. Keep comment content and author names out of exports when
+    // the ordinary conversation read would be denied (or cannot be verified).
+    if enforce_view_link_option(
+        state,
+        meta,
+        user_id,
+        meta.link_view_options.show_conversation || meta.link_view_options.allow_comments,
+    )
+    .await
+    .is_err()
+    {
+        return Vec::new();
+    }
+    let doc_id = &meta.doc_id;
     use ogrenotes_storage::models::thread::{ThreadStatus, ThreadType};
 
     let mut threads = match state.thread_repo.list_threads_for_doc(doc_id).await {
@@ -2075,7 +2094,7 @@ async fn export_document(
     AuthUser { user_id, .. }: AuthUser,
     Path((id, format)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
-    let _meta = get_verified_doc(&state, &id, &user_id).await?;
+    let meta = get_verified_doc(&state, &id, &user_id).await?;
 
     let doc = load_current_doc_state(&state, &id).await?;
     resolve_blob_refs_for_export(&state, &doc, &id).await;
@@ -2087,13 +2106,13 @@ async fn export_document(
             // tabular data, so appending a comment section would corrupt it.
             let (content_type, content) = match format.as_str() {
                 "html" => {
-                    let comments = load_export_comments(&state, &id).await;
+                    let comments = load_export_comments(&state, &meta, &user_id).await;
                     let html =
                         run_export(move || export::to_html_with_comments(doc.inner(), &comments)).await?;
                     ("text/html; charset=utf-8", html)
                 }
                 "markdown" | "md" => {
-                    let comments = load_export_comments(&state, &id).await;
+                    let comments = load_export_comments(&state, &meta, &user_id).await;
                     let md = run_export(move || export::to_markdown_with_comments(doc.inner(), &comments))
                         .await?;
                     ("text/markdown; charset=utf-8", md)
@@ -2115,7 +2134,7 @@ async fn export_document(
         }
         "docx" => {
             counter::inc(MetricKey::new("doc.export_total", &[("format", "docx")]));
-            let comments = load_export_comments(&state, &id).await;
+            let comments = load_export_comments(&state, &meta, &user_id).await;
             let bytes = run_export(move || export::to_docx_with_comments(doc.inner(), &comments)).await?;
             let mut headers = HeaderMap::new();
             headers.insert("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document".parse().unwrap());
@@ -2125,7 +2144,7 @@ async fn export_document(
         #[cfg(feature = "pdf")]
         "pdf" => {
             counter::inc(MetricKey::new("doc.export_total", &[("format", "pdf")]));
-            let comments = load_export_comments(&state, &id).await;
+            let comments = load_export_comments(&state, &meta, &user_id).await;
             let bytes = run_export(move || export::to_pdf_with_comments(doc.inner(), &comments)).await?;
             let mut headers = HeaderMap::new();
             headers.insert("Content-Type", "application/pdf".parse().unwrap());
@@ -3163,7 +3182,7 @@ async fn try_export_one(
     // src-less `<img>`s.
     resolve_blob_refs_for_export(state, &doc, doc_id).await;
     // Comment threads travel with each doc in the bulk archive too (#59 T-6).
-    let comments = load_export_comments(state, doc_id).await;
+    let comments = load_export_comments(state, &meta, user_id).await;
     let body = run_export(move || match format {
         BulkFormat::Markdown => export::to_markdown_with_comments(doc.inner(), &comments),
         BulkFormat::Html => export::to_html_with_comments(doc.inner(), &comments),
