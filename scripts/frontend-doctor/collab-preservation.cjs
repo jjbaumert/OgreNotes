@@ -49,6 +49,36 @@ async function exact(pages, expected) {
     assert.equal(new Set(ids).size, ids.length, 'Block identities must be unique');
   }
 }
+// Hold the 16 ms Yrs receive debounce while leaving the browser's other
+// timers on their real clock. Playwright's global clock fast-forward can call
+// a wasm-bindgen one-shot closure twice, which tests the clock shim rather
+// than this editor's post-apply/pre-render window.
+async function holdReceiveDebounce(page) {
+  await page.evaluate(() => {
+    const set = window.setTimeout.bind(window);
+    const clear = window.clearTimeout.bind(window);
+    const pending = new Map();
+    window.__receiveGate = {
+      pending: () => pending.size,
+      release: () => {
+        window.setTimeout = set;
+        window.clearTimeout = clear;
+        for (const [id, { callback, args }] of pending) {
+          clear(id);
+          set(callback, 0, ...args);
+        }
+        pending.clear();
+      },
+    };
+    window.setTimeout = (callback, ms, ...args) => {
+      if (ms !== 16) return set(callback, ms, ...args);
+      const id = set(() => {}, 2147483647);
+      pending.set(id, { callback, args });
+      return id;
+    };
+    window.clearTimeout = id => { pending.delete(id); clear(id); };
+  });
+}
 async function socketGate(page) {
   const gate = { held: false, pending: [], updates: 0, synced: false };
   await page.routeWebSocket('**/api/v1/documents/*/ws', ws => {
@@ -76,7 +106,7 @@ async function socketGate(page) {
       const doc = await (await api(contexts[0], 'POST', 'documents', { title: `Preservation ${scenario}` }, tokens[0].accessToken)).json();
       await api(contexts[0], 'POST', `documents/${doc.id}/members`, { userId: tokens[1].userId, accessLevel: 'EDIT' }, tokens[0].accessToken);
       const pages = await Promise.all(contexts.map(c => c.newPage()));
-      pages.forEach(p => p.on('pageerror', e => errors.push(e.message)));
+      pages.forEach((p, i) => p.on('pageerror', e => errors.push(`${scenario} tab ${i}: ${e.stack || e.message}`)));
       const gates = await Promise.all(pages.map(socketGate));
       const [a, b] = pages;
       const open = async p => { await p.goto(`${base}/d/${doc.id}`); await p.locator(selector).waitFor(); };
@@ -126,15 +156,14 @@ async function socketGate(page) {
         await b.keyboard.insertText('Peer');
         await exact([b], ['Hello', 'Peer']);
         await until(() => gates[0].pending.length > 0, 'Remote structural update must be queued');
-        await a.clock.install();
-        await a.clock.pauseAt(new Date(Date.now() + 1000));
+        await holdReceiveDebounce(a);
         gates[0].release();
-        await delay(100);
+        await until(() => a.evaluate(() => window.__receiveGate.pending() > 0),
+          'Remote apply must schedule its debounced UI update');
         await select(a, 0, 5);
         await a.keyboard.insertText('!');
         await exact([a], ['Hello!']);
-        await a.clock.runFor(1000);
-        await a.clock.resume();
+        await a.evaluate(() => window.__receiveGate.release());
         expected = ['Hello!', 'Peer'];
       } else if (scenario === 'prepend') {
         // Exercise the actual prepend UI. Deterministic stale-baseline timing
