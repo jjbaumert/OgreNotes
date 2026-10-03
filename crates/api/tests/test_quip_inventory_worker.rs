@@ -135,7 +135,7 @@ fn now_ms() -> i64 {
 /// doesn't compete with concurrent tests on the same Redis. Mirrors the helper
 /// in `test_worker_mode.rs`.
 async fn fresh_queue(suffix: &str) -> JobQueue {
-    let config = fred::types::RedisConfig::from_url("redis://127.0.0.1:6379")
+    let config = fred::types::RedisConfig::from_url("redis://127.0.0.1:6379/13")
         .expect("parse REDIS_URL");
     let client = RedisClient::new(config, None, None, None);
     client.init().await.expect("connect redis");
@@ -781,7 +781,7 @@ async fn terminal_outbox_recovers_without_a_receipt_and_replay_preserves_a_resum
     drop(queue);
 
     let client = Arc::new(RedisClient::new(
-        fred::types::RedisConfig::from_url("redis://127.0.0.1:6379").unwrap(), None, None, None,
+        fred::types::RedisConfig::from_url("redis://127.0.0.1:6379/13").unwrap(), None, None, None,
     ));
     client.init().await.unwrap();
     let restarted = JobQueue::new(Arc::clone(&client), stream.clone()).await.unwrap();
