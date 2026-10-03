@@ -562,6 +562,11 @@ async fn denied_finalization_commands_cannot_lose_or_duplicate_work() {
                     let worker = JobQueue::new(Arc::clone(&restricted), queue.stream_name())
                         .await
                         .unwrap();
+                    if denied == "hset" {
+                        assert!(worker.enqueue(owned_import("denied-producer")).await.is_err());
+                        assert_eq!(admin.xlen::<u64, _>(queue.stream_name()).await.unwrap(), 1,
+                            "a rejected initial status write must not append an orphan delivery");
+                    }
                     let error = worker
                         .retry_or_dead_letter(&claimed, max_retries, "failed")
                         .await
@@ -722,16 +727,12 @@ async fn terminal_outbox_failure_preserves_delivery_and_records_survive_reconnec
     }
 }
 
-/// Pause a real Redis request after XREADGROUP has succeeded. This models a
-/// delayed connection across another worker's reclaim and terminal write.
-#[tokio::test]
-async fn delayed_running_status_cannot_overwrite_reclaimed_completion() {
+async fn gated_status_client(url: &str, state: &str) -> (
+    Arc<RedisClient>, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>, tokio::task::JoinHandle<()>,
+) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-    let url = require_redis!();
-    let admin = fresh_client(&url).await;
-    let queue = fresh_queue(admin, "delayed-running").await;
-    let job_id = queue.enqueue(owned_import("delayed-owner")).await.unwrap();
-    let mut config = fred::types::RedisConfig::from_url(&url).unwrap();
+    let mut config = fred::types::RedisConfig::from_url(url).unwrap();
+    let pattern = format!("\"state\":\"{state}\"").into_bytes();
     let server = config.server.hosts().remove(0);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     config.server = fred::types::ServerConfig::new_centralized("127.0.0.1", listener.local_addr().unwrap().port());
@@ -762,7 +763,7 @@ async fn delayed_running_status_cannot_overwrite_reclaimed_completion() {
                         reader.read_exact(&mut value).await.unwrap();
                         request.extend(value);
                     }
-                    if request.windows(b"\"state\":\"running\"".len()).any(|w| w == b"\"state\":\"running\"") {
+                    if request.windows(pattern.len()).any(|w| w == pattern) {
                         paused.notify_one();
                         release.notified().await;
                     }
@@ -774,6 +775,18 @@ async fn delayed_running_status_cannot_overwrite_reclaimed_completion() {
     });
     let delayed_client = Arc::new(RedisClient::new(config, None, None, None));
     delayed_client.init().await.unwrap();
+    (delayed_client, paused, release, proxy)
+}
+
+/// Pause a real Redis request after XREADGROUP has succeeded. This models a
+/// delayed connection across another worker's reclaim and terminal write.
+#[tokio::test]
+async fn delayed_running_status_cannot_overwrite_reclaimed_completion() {
+    let url = require_redis!();
+    let admin = fresh_client(&url).await;
+    let queue = fresh_queue(admin, "delayed-running").await;
+    let job_id = queue.enqueue(owned_import("delayed-owner")).await.unwrap();
+    let (delayed_client, paused, release, proxy) = gated_status_client(&url, "running").await;
     let delayed_queue = JobQueue::new(delayed_client, queue.stream_name()).await.unwrap();
     let consumer = tokio::spawn(async move { delayed_queue.consume_next("delayed", 1000).await });
     tokio::time::timeout(Duration::from_secs(10), paused.notified()).await.unwrap();
@@ -785,6 +798,31 @@ async fn delayed_running_status_cannot_overwrite_reclaimed_completion() {
     assert_eq!(queue.status(&job_id).await.unwrap(), terminal,
         "delayed Running write replaced terminal status");
     assert!(result.is_none(), "revoked claim must not reach the handler");
+    proxy.abort();
+}
+
+#[tokio::test]
+async fn delayed_pending_publication_cannot_overwrite_a_fast_consumer() {
+    let url = require_redis!();
+    let queue = fresh_queue(fresh_client(&url).await, "delayed-producer").await;
+    let (client, paused, release, proxy) = gated_status_client(&url, "pending").await;
+    let producer = JobQueue::new(client, queue.stream_name()).await.unwrap();
+    let enqueue = tokio::spawn(async move { producer.enqueue(owned_import("producer-owner")).await });
+    tokio::time::timeout(Duration::from_secs(10), paused.notified()).await.unwrap();
+    // Before the fix XADD was already visible while Pending was delayed.
+    // Atomic initialization must keep the job invisible until both are ready.
+    let early = queue.consume_next("fast-worker", 25).await.unwrap();
+    if let Some(claimed) = &early {
+        assert_eq!(queue.ack(claimed, None).await.unwrap(), FinalizationOutcome::Applied);
+    }
+    release.notify_one();
+    let job_id = tokio::time::timeout(Duration::from_secs(10), enqueue).await.unwrap().unwrap().unwrap();
+    if early.is_none() {
+        let claimed = queue.consume_next("fast-worker", 1000).await.unwrap().unwrap();
+        assert_eq!(queue.ack(&claimed, None).await.unwrap(), FinalizationOutcome::Applied);
+    }
+    assert!(matches!(queue.status(&job_id).await.unwrap(), JobStatus::Succeeded { .. }),
+        "a delayed Pending write replaced a fast consumer's Succeeded status");
     proxy.abort();
 }
 

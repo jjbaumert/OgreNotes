@@ -24,6 +24,8 @@
 //!   Side-channel for the GET /jobs/{id} polling API. TTL'd at
 //!   24h so old job records drop out without an explicit cleanup
 //!   job.
+//! - `<stream>:finalizations`: HASH of immutable terminal outcomes awaiting
+//!   application-side reconciliation. Retained until required effects succeed.
 //!
 //! The Redis stream entry's intrinsic id (`<ms>-<seq>`) is not
 //! exposed; we generate a nanoid on enqueue and carry it in the
@@ -186,6 +188,31 @@ pub const DEFAULT_GROUP: &str = "workers";
 /// full JSON envelope is simpler than a multi-field record;
 /// XADD's pair shape is `<field> <value>` so we use one pair.
 const ENVELOPE_FIELD: &str = "envelope";
+
+// Make the initial delivery and Pending status visible together. Preflight
+// every write, then append first so a rejected XADD creates no status record.
+const ENQUEUE_DELIVERY: &str = r#"
+local status_type = redis.call('TYPE', KEYS[2]).ok
+if status_type ~= 'none' and status_type ~= 'hash' then
+    return redis.error_reply('WRONGTYPE job status must be a hash')
+end
+local append = {'XADD', KEYS[1], '*', 'envelope', ARGV[1]}
+local fields = {'HSET', KEYS[2], 'json', ARGV[2]}
+if ARGV[3] ~= '' then
+    table.insert(fields, 'owner')
+    table.insert(fields, ARGV[3])
+end
+local expire = {'EXPIRE', KEYS[2], ARGV[4]}
+for _, command in ipairs({append, fields, expire}) do
+    if not redis.acl_check_cmd(unpack(command)) then
+        return redis.error_reply('NOPERM job enqueue command denied: ' .. command[1])
+    end
+end
+local id = redis.call(unpack(append))
+redis.call(unpack(fields))
+redis.call(unpack(expire))
+return id
+"#;
 
 // Publish Running only while the first-delivery receipt is still current.
 // A delayed connection must not overwrite a reaper's terminal status.
@@ -353,8 +380,8 @@ impl JobQueue {
     }
 
     /// Enqueue a job. Returns the stable [`JobId`] (nanoid). Writes
-    /// the side-channel status hash to `Pending` before returning
-    /// so an immediate poll sees the work.
+    /// the delivery and Pending status atomically, so a delayed producer
+    /// cannot overwrite a fast consumer's terminal status.
     pub async fn enqueue(&self, payload: Job) -> Result<JobId, JobError> {
         let owner = owner_of(&payload).map(String::from);
         let envelope = JobEnvelope {
@@ -364,31 +391,16 @@ impl JobQueue {
             owner: owner.clone(),
             payload,
         };
-        self.xadd(&envelope).await?;
-        self.write_status(&envelope.job_id, &JobStatus::Pending, owner.as_deref())
-            .await?;
-        Ok(envelope.job_id)
-    }
-
-    /// XADD the initial envelope onto the main stream. Retries use the
-    /// atomic finalization script instead.
-    async fn xadd(&self, envelope: &JobEnvelope) -> Result<String, JobError> {
-        let json = serde_json::to_string(envelope)
+        let envelope_json = serde_json::to_string(&envelope)
             .map_err(|e| JobError::Serialize(e.to_string()))?;
-        // fred 9.4 takes a Vec<(&str, &str)> pair directly; no
-        // need to wrap in MultipleOrderedPairs (the trait
-        // resolution there is brittle).
-        let id: String = self
-            .client
-            .xadd(
-                self.stream.as_str(),
-                false,
-                None,
-                "*",
-                vec![(ENVELOPE_FIELD, json.as_str())],
-            )
-            .await?;
-        Ok(id)
+        let pending_json = serde_json::to_string(&JobStatus::Pending)
+            .map_err(|e| JobError::Serialize(e.to_string()))?;
+        let _: String = self.client.eval(
+            ENQUEUE_DELIVERY,
+            vec![self.stream.clone(), status_key(&envelope.job_id)],
+            vec![envelope_json, pending_json, owner.unwrap_or_default(), JOB_STATUS_TTL_SECS.to_string()],
+        ).await?;
+        Ok(envelope.job_id)
     }
 
     /// Block-read the next entry off the stream as `consumer`.
@@ -697,30 +709,7 @@ impl JobQueue {
         Ok(out)
     }
 
-    /// Internal: write the status hash with 24h TTL. Sets `json` and,
-    /// when `owner` is `Some`, the `owner` field used by the poll-time
-    /// ownership check. Re-asserting the same owner on subsequent
-    /// status writes is idempotent.
-    async fn write_status(
-        &self,
-        job_id: &str,
-        status: &JobStatus,
-        owner: Option<&str>,
-    ) -> Result<(), JobError> {
-        let key = status_key(job_id);
-        let json = serde_json::to_string(status)
-            .map_err(|e| JobError::Serialize(e.to_string()))?;
-        let mut fields: Vec<(&str, &str)> = vec![("json", json.as_str())];
-        if let Some(o) = owner {
-            fields.push(("owner", o));
-        }
-        let _: u64 = self.client.hset(key.as_str(), fields).await?;
-        let _: bool = self
-            .client
-            .expire(key.as_str(), JOB_STATUS_TTL_SECS as i64)
-            .await?;
-        Ok(())
-    }
+
 }
 
 fn status_key(job_id: &str) -> String {
