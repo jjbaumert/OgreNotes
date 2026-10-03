@@ -158,6 +158,45 @@ test("a previously thrown error is not overwritten by caught errors", () => {
   assert.deepEqual(result, { ok: false, error: "original failure" });
 });
 
+// A complete calendar/board workflow with one deliberately false observation.
+// All actions still finish, so a failure cannot be attributed to an exception.
+function blockFixture(mode) {
+  const calendar = mode.startsWith("calendar-");
+  const bad = mode.endsWith("false-step");
+  const block = calendar
+    ? `<div class="calendar-block"><table class="calendar-month-grid"><thead><tr>${"<th>Day</th>".repeat(bad ? 6 : 7)}</tr></thead></table><button class="calendar-day" onclick="openModal(false)">Day</button><div id="items"></div></div>`
+    : `<div class="kanban-block">${Array.from({ length: bad ? 2 : 3 }, (_, i) => `<div class="kanban-column">Column ${i}<button data-kanban-action="add-card" onclick="openModal(false)">Add card</button>${i === 0 ? '<div id="items"></div>' : ''}</div>`).join("")}</div>`;
+  return `<!doctype html><body><div contenteditable="true">Editor</div><div class="search-dialog">Palette</div>${block}
+    <div class="calendar-modal" hidden><h3></h3><input type="text"><button onclick="save()">Save</button><button class="btn-danger">Delete</button><button onclick="document.querySelector('.calendar-modal').hidden=true">Cancel</button></div>
+    <script>
+      const modal = document.querySelector('.calendar-modal');
+      function openModal(edit) {
+        modal.hidden = false;
+        modal.querySelector('h3').textContent = edit ? 'Edit' : 'Add';
+        modal.querySelector('input').value = edit ? localStorage.getItem('title') : '';
+      }
+      function render() {
+        const title = localStorage.getItem('title');
+        if (title) {
+          const item = document.createElement('button');
+          item.className = '${calendar ? 'calendar-event' : 'kanban-card'}';
+          item.textContent = title;
+          item.onclick = () => openModal(true);
+          document.getElementById('items').replaceChildren(item);
+        }
+      }
+      function save() {
+        localStorage.setItem('title', modal.querySelector('input').value);
+        modal.hidden = true;
+        render();
+      }
+      document.addEventListener('keydown', event => {
+        if (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 'p') event.preventDefault();
+      });
+      render();
+    </script></body>`;
+}
+
 // Run the unmodified CLI with real Chromium against a deliberately small HTTP
 // fixture. This validates scenario catch paths, artifacts, and OS exit status,
 // independently of the VM contract tests above. Opt in after installing the
@@ -177,13 +216,18 @@ test("browser failures reach the CLI report and process exit status", {
       res.end(JSON.stringify({ id: "fixture" }));
     } else if (url.pathname.endsWith("/marker")) {
       if (req.method === "POST") {
-        marker = "";
-        for await (const chunk of req) marker += chunk;
+        let received = "";
+        for await (const chunk of req) received += chunk;
+        if (received.length > marker.length) marker = received;
       }
       res.end(marker);
     } else {
       const mode = url.pathname.split("/")[1];
       res.setHeader("content-type", "text/html");
+      if (mode.startsWith("calendar-") || mode.startsWith("kanban-")) {
+        res.end(blockFixture(mode));
+        return;
+      }
       res.end(`<!doctype html><body>
         ${mode === "missing-editor" ? "" : '<div contenteditable="true">Fixture editor</div>'}
         ${mode === "missing-cursor" ? "" : '<div class="remote-cursor-caret">Peer</div>'}
@@ -210,6 +254,10 @@ test("browser failures reach the CLI report and process exit status", {
     ["collab-sync", "missing-sync", /syncObservedInB/],
     ["collab-sync", "missing-cursor", /remoteCursorObservedInB/],
     ["calendar-block", "missing-editor", /waitForSelector/],
+    ["calendar-block", "calendar-success", null],
+    ["calendar-block", "calendar-false-step", /sevenWeekdayHeaders/],
+    ["kanban-block", "kanban-success", null],
+    ["kanban-block", "kanban-false-step", /threeDefaultColumns/],
   ];
   for (const [scenario, mode, expectedError] of cases) {
     await t.test(`${scenario}: ${mode}`, async () => {
@@ -237,7 +285,11 @@ test("browser failures reach the CLI report and process exit status", {
         assert.ok(stdout.includes("FRONTEND_DOCTOR_REPORT "));
         assert.ok(existsSync(join(out, "tab-a.png")), "screenshot survives failure");
         assert.ok(existsSync(join(out, "tab-a.har")), "network diagnostics survive failure");
-        if (scenario === "calendar-block") assert.match(report.stepError, /waitForSelector/);
+        if (scenario === "calendar-block" && mode === "missing-editor") assert.match(report.stepError, /waitForSelector/);
+        if (mode.endsWith("false-step")) {
+          assert.ok(!report.stepError, "false observation must finish without an exception");
+          assert.equal(report.scenario.steps.noPageErrors, true);
+        }
       } finally {
         rmSync(out, { recursive: true, force: true });
       }
