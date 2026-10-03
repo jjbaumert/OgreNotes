@@ -233,6 +233,127 @@ fn worker_ctx(app: &common::TestApp) -> WorkerCtx {
 }
 
 #[tokio::test]
+async fn stale_success_must_not_delete_the_live_retrys_staging_blob() {
+    obsolete_success_preserves_staging(false).await;
+}
+
+#[tokio::test]
+async fn reclaimed_delivery_rejects_the_old_workers_terminal_cleanup() {
+    obsolete_success_preserves_staging(true).await;
+}
+
+/// Hold the real S3 GET until the receipt has been transferred. This enters
+/// the handler while its receipt is valid and exercises a genuinely late ack.
+async fn gated_s3(app: &common::TestApp) -> (
+    ogrenotes_storage::s3::S3Client, Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>, tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let paused = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let proxy = tokio::spawn({
+        let paused = Arc::clone(&paused);
+        let release = Arc::clone(&release);
+        async move {
+            let (mut downstream, _) = listener.accept().await.unwrap();
+            let mut first = [0; 4096];
+            let len = downstream.read(&mut first).await.unwrap();
+            paused.notify_one();
+            release.notified().await;
+            let mut upstream = tokio::net::TcpStream::connect("127.0.0.1:9000").await.unwrap();
+            upstream.write_all(&first[..len]).await.unwrap();
+            let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+        }
+    });
+    let config = aws_sdk_s3::config::Builder::new().endpoint_url(endpoint)
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "minioadmin", "minioadmin", None, None, "test"))
+        .force_path_style(true).behavior_version_latest().build();
+    (ogrenotes_storage::s3::S3Client::new(aws_sdk_s3::Client::from_conf(config),
+        app.state.doc_repo.s3().bucket().into()), paused, release, proxy)
+}
+
+async fn obsolete_success_preserves_staging(reclaim_only: bool) {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let ctx = worker_ctx(&app);
+    let (owner_id, token) = app.create_user("stale-worker@test.com").await;
+    let folder_id = app.create_folder(&token, "Imports", None).await;
+    let fixture = {
+        use yrs::{Doc, Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
+        let doc = Doc::new();
+        {
+            let root = doc.get_or_insert_xml_fragment("content");
+            let mut txn = doc.transact_mut();
+            let paragraph = root.insert(&mut txn, 0, XmlElementPrelim::empty("paragraph"));
+            paragraph.insert(&mut txn, 0, XmlTextPrelim::new("Retry payload must survive"));
+        }
+        ogrenotes_collab::export::to_docx(&doc)
+    };
+    let key = format!("imports/{owner_id}/stale-success.docx");
+    let s3 = app.state.doc_repo.s3();
+    s3.put_object(&key, fixture.clone()).await.unwrap();
+    let client = fresh_client("redis://127.0.0.1:6379/13").await;
+    let queue = fresh_queue(client, "stale-success").await;
+    let job_id = queue.enqueue(Job::ImportDocx {
+        s3_key: key.clone(), title: "Retry payload".into(),
+        folder_id: Some(folder_id.clone()), owner_id,
+    }).await.unwrap();
+    let old = queue.consume_next("slow-worker", 1000).await.unwrap().unwrap();
+
+    let (gated, paused, release, proxy) = gated_s3(&app).await;
+    let old_ctx = WorkerCtx::new(
+        app.state.doc_repo.clone(), app.state.folder_repo.clone(), gated,
+        app.state.import_repo.clone(), app.state.user_repo.clone(),
+        app.state.quip_token_store.clone(), None,
+    );
+    let old_task = tokio::spawn({
+        let queue = queue.clone();
+        let old = old.clone();
+        async move { execute_and_finalize(&queue, old, &old_ctx).await }
+    });
+    timeout(Duration::from_secs(5), paused.notified()).await.unwrap();
+
+    let retry = if reclaim_only {
+        // XAUTOCLAIM transfers the PEL owner without changing the entry ID.
+        // The original worker is still running and can finish after transfer.
+        let mut reclaimed = queue.claim_stale("recovery-worker", 0, 1).await.unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        let reclaimed = reclaimed.pop().unwrap();
+        assert_eq!(reclaimed.stream_id, old.stream_id);
+        assert_eq!(reclaimed.envelope.attempt, 0);
+        reclaimed
+    } else {
+        // A recovery worker has already finalized this delivery as a retry.
+        queue.retry_or_dead_letter(&old, 3, "recovery worker failed").await.unwrap();
+        let retry = queue.consume_next("recovery-worker", 1000).await.unwrap().unwrap();
+        assert_eq!(retry.envelope.attempt, 1);
+        retry
+    };
+    let running = queue.status(&job_id).await.unwrap();
+
+    // The old worker completes real S3 parsing and document persistence late.
+    // Its obsolete ack must not delete the live retry's only input object.
+    release.notify_one();
+    timeout(Duration::from_secs(10), old_task).await.unwrap().unwrap();
+    proxy.abort();
+    assert_eq!(app.state.folder_repo.list_children(&folder_id).await.unwrap().len(), 1,
+        "the stale handler must actually succeed to exercise its ack cleanup path");
+    assert_eq!(s3.get_object(&key).await.unwrap(), fixture,
+        "stale completion deleted the live retry's staging upload");
+    assert_eq!(queue.status(&job_id).await.unwrap(), running);
+
+    // Only the current delivery may perform terminal cleanup.
+    execute_and_finalize(&queue, retry, &ctx).await;
+    assert!(matches!(queue.status(&job_id).await.unwrap(), JobStatus::Succeeded { .. }));
+    assert!(!s3.object_exists(&key).await.unwrap());
+    app.cleanup().await;
+}
+
+#[tokio::test]
 async fn execute_and_finalize_retries_to_budget_then_dead_letters() {
     common::require_infra!();
     let app = common::TestApp::new().await;
@@ -325,4 +446,122 @@ async fn reaper_reclaims_orphaned_job_and_finalizes_it() {
         matches!(status, JobStatus::Succeeded { .. }),
         "a reclaimed-and-finalized job must reach Succeeded, got {status:?}"
     );
+}
+
+#[tokio::test]
+async fn stopped_worker_pools_close_their_dedicated_redis_connections() {
+    common::require_infra!();
+    use ogrenotes_api::worker_mode::spawn_workers;
+    use std::collections::HashSet;
+    let app = common::TestApp::new().await;
+    let client = fresh_client("redis://127.0.0.1:6379/13").await;
+    let queue = fresh_queue(Arc::clone(&client), "connection-lifetime").await;
+    let ctx = Arc::new(worker_ctx(&app));
+    for cancel in [true, false] {
+        let before: String = client
+            .custom(fred::cmd!("CLIENT"), vec!["LIST"])
+            .await
+            .unwrap();
+        let before: HashSet<String> = before
+            .lines()
+            .filter_map(|line| {
+                line.split_whitespace()
+                    .find_map(|field| field.strip_prefix("id=").map(str::to_owned))
+            })
+            .collect();
+        let (shutdown, rx) = watch::channel(false);
+        let handles = spawn_workers(queue.clone(), Arc::clone(&ctx), 4, rx);
+        let owned = timeout(Duration::from_secs(10), async {
+            loop {
+                let current: String = client
+                    .custom(fred::cmd!("CLIENT"), vec!["LIST"])
+                    .await
+                    .unwrap();
+                let ids: Vec<String> = current
+                    .lines()
+                    .filter(|line| {
+                        line.split_whitespace().any(|field| field == "db=13")
+                            && line
+                                .split_whitespace()
+                                .any(|field| field == "cmd=xreadgroup")
+                    })
+                    .filter_map(|line| {
+                        line.split_whitespace()
+                            .find_map(|field| field.strip_prefix("id=").map(str::to_owned))
+                    })
+                    .filter(|id| !before.contains(id))
+                    .collect();
+                if ids.len() == 4 {
+                    break ids;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("all four consumers must establish blocking reads");
+        if cancel {
+            for handle in handles {
+                handle.abort();
+                let _ = handle.await;
+            }
+        } else {
+            let job_id = queue
+                .enqueue(Job::Noop {
+                    label: "before-drain".into(),
+                })
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    if matches!(
+                        queue.status(&job_id).await.unwrap(),
+                        JobStatus::Succeeded { .. }
+                    ) {
+                        break;
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            shutdown.send(true).unwrap();
+            timeout(
+                Duration::from_secs(2),
+                futures_util::future::join_all(handles),
+            )
+            .await
+            .unwrap();
+        }
+        let mut remaining_count = owned.len();
+        let closed = timeout(Duration::from_secs(8), async {
+            loop {
+                let remaining: String = client
+                    .custom(
+                        fred::cmd!("CLIENT"),
+                        [vec!["LIST".to_string(), "ID".to_string()], owned.clone()].concat(),
+                    )
+                    .await
+                    .unwrap();
+                remaining_count = remaining
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .count();
+                if remaining_count == 0 {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .is_ok();
+        eprintln!("worker pool cancelled={cancel}: {} owned Redis connections, remaining={remaining_count}, closed={closed}", owned.len());
+        if !closed {
+            app.cleanup().await;
+        }
+        assert!(
+            closed,
+            "stopped pool retained dedicated Redis readers after the blocking window"
+        );
+    }
+    app.cleanup().await;
 }

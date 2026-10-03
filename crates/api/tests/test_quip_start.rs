@@ -993,3 +993,84 @@ async fn a_corrupt_report_row_degrades_to_null_rather_than_500ing_the_poll() {
 
     app.cleanup().await;
 }
+
+#[tokio::test]
+async fn failed_enqueue_can_restart_with_an_authoritative_new_generation() {
+    common::require_infra!();
+    use fred::prelude::*;
+    use ogrenotes_worker::{Job, JobQueue};
+    let app = common::TestApp::new().await;
+    let (owner, token) = app.create_user("restart-enqueue@test.com").await;
+    let folder = app.create_folder(&token, "Destination", None).await;
+    let import_id = seed_scoping_import(&app, &owner, &["root"]).await;
+    let stream = app.state.config.job_stream_name.clone();
+    let client = &app.state.redis;
+    let _: u64 = client.del(&stream).await.unwrap();
+    let _: () = client.set(&stream, "wrong type", None, None, false).await.unwrap();
+    let request = serde_json::json!({"selectedRootFolderIds": ["root"], "targetFolderId": folder});
+    let (status, _) = app.json_request(Method::POST,
+        &format!("/api/v1/imports/quip/{import_id}/start"), Some(&token), Some(request.clone())).await;
+    assert_eq!(status, 503);
+    assert!(app.state.import_repo.current_run_id(&import_id).await.unwrap().is_none(),
+        "failed publication must not activate a run");
+    let _: u64 = client.del(&stream).await.unwrap();
+    let queue = JobQueue::new(std::sync::Arc::clone(client), stream).await.unwrap();
+    let (status, body) = app.json_request(Method::POST,
+        &format!("/api/v1/imports/quip/{import_id}/start"), Some(&token), Some(request)).await;
+    assert_eq!(status, 202, "{body}");
+    let current_run = app.state.import_repo.current_run_id(&import_id).await.unwrap().unwrap();
+    let receipt = queue.consume_next("restart-consumer", 1000).await.unwrap().unwrap();
+    match &receipt.envelope.payload {
+        Job::StartQuipImport { run, .. } => assert_eq!(run.as_ref().map(|run| run.id.as_str()), Some(current_run.as_str())),
+        other => panic!("unexpected job: {other:?}"),
+    }
+    queue.ack(&receipt, None).await.unwrap();
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn rejected_restart_preserves_the_previously_accepted_run() {
+    common::require_infra!();
+    use fred::prelude::*;
+    use ogrenotes_api::worker_mode::{execute_and_finalize, WorkerCtx};
+    use ogrenotes_worker::{JobQueue, JobStatus};
+    let app = common::TestApp::new().await;
+    let (owner, token) = app.create_user("preserve-accepted@test.com").await;
+    let folder = app.create_folder(&token, "Destination", None).await;
+    let import_id = seed_scoping_import(&app, &owner, &["old-root"]).await;
+    let url = format!("/api/v1/imports/quip/{import_id}/start");
+    let (status, body) = app.json_request(Method::POST, &url, Some(&token),
+        Some(serde_json::json!({"selectedRootFolderIds": ["old-root"], "targetFolderId": folder}))).await;
+    assert_eq!(status, 202, "{body}");
+    let accepted_run = app.state.import_repo.current_run_id(&import_id).await.unwrap().unwrap();
+    app.state.import_repo.set_status(&import_id, ImportStatus::Running).await.unwrap();
+    let stream = app.state.config.job_stream_name.clone();
+    let client = &app.state.redis;
+    let queue = JobQueue::new(std::sync::Arc::clone(client), stream.clone()).await.unwrap();
+    let accepted = queue.consume_next("accepted-worker", 1000).await.unwrap().unwrap();
+    let accepted_job_id = accepted.envelope.job_id.clone();
+
+    // Preserve the accepted stream and PEL while faulting only new enqueue.
+    let preserved = format!("{stream}:fault-preserved");
+    let _: () = client.rename(&stream, &preserved).await.unwrap();
+    let _: () = client.set(&stream, "wrong type", None, None, false).await.unwrap();
+    let (rejected, body) = app.json_request(Method::POST, &url, Some(&token),
+        Some(serde_json::json!({"selectedRootFolderIds": ["new-root"], "targetFolderId": folder}))).await;
+    let _: u64 = client.del(&stream).await.unwrap();
+    let _: () = client.rename(&preserved, &stream).await.unwrap();
+    assert_eq!(rejected, 503, "{body}");
+
+    // With Redis restored, J1 must finish without another user start. No
+    // token is present, so its legitimate result is TokenRejected.
+    let ctx = WorkerCtx::new(app.state.doc_repo.clone(), app.state.folder_repo.clone(),
+        app.state.doc_repo.s3().clone(), app.state.import_repo.clone(), app.state.user_repo.clone(),
+        app.state.quip_token_store.clone(), None);
+    execute_and_finalize(&queue, accepted, &ctx).await;
+    assert!(matches!(queue.status(&accepted_job_id).await.unwrap(), JobStatus::Succeeded { .. }));
+    let record = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(record.status, ImportStatus::TokenRejected,
+        "a rejected restart retired the accepted delivery without completing its import");
+    assert_eq!(record.selected_roots, ["old-root"]);
+    assert_eq!(app.state.import_repo.current_run_id(&import_id).await.unwrap().as_deref(), Some(accepted_run.as_str()));
+    app.cleanup().await;
+}

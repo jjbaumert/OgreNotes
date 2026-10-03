@@ -92,6 +92,36 @@ impl ImportRepo {
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
+    /// Apply one queue job's completion at most once. Retain applied IDs so
+    /// an outbox replay cannot regress the status of a later reconnect/run.
+    /// Returns false for replay, a superseded run, or a deleted import.
+    pub async fn apply_job_completion(
+        &self,
+        import_id: &str,
+        job_id: &str,
+        run_id: Option<&str>,
+        status: ImportStatus,
+    ) -> Result<bool, RepoError> {
+        let mut values = HashMap::from([
+            (":status".to_string(), AttributeValue::S(status_to_str(status).to_string())),
+            (":updated_at".to_string(), AttributeValue::N(ogrenotes_common::time::now_usec().to_string())),
+            (":job".to_string(), AttributeValue::S(job_id.to_string())),
+            (":jobs".to_string(), AttributeValue::Ss(vec![job_id.to_string()])),
+        ]);
+        let run_condition = run_condition(run_id, &mut values);
+        let mut update = "SET #status = :status, updated_at = :updated_at".to_string();
+        if status == ImportStatus::Succeeded {
+            update.push_str(", phase = :phase");
+            values.insert(":phase".to_string(), AttributeValue::N("2".to_string()));
+        }
+        update.push_str(" ADD applied_job_completions :jobs");
+        self.db.update_item_conditional(
+            &format!("IMPORT#{import_id}"), ImportRecord::sk(), &update,
+            &format!("attribute_exists(PK) AND ({run_condition}) AND (attribute_not_exists(applied_job_completions) OR NOT contains(applied_job_completions, :job))"),
+            values, Some(HashMap::from([("#status".to_string(), "status".to_string())])),
+        ).await.map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
     /// Write a folder row discovered during inventory BFS.
     ///
     /// Upserts the fields the *inventory walk* owns — title and parentage —
@@ -864,6 +894,125 @@ impl ImportRepo {
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
+    /// Allocate an ordering token without superseding any accepted work.
+    /// Failed publication leaves only a harmless gap in the sequence.
+    pub async fn reserve_run_sequence(&self, import_id: &str) -> Result<u64, RepoError> {
+        let result = self.db.inner().update_item().table_name(self.db.table_name())
+            .key("PK", AttributeValue::S(format!("IMPORT#{import_id}")))
+            .key("SK", AttributeValue::S(ImportRecord::sk().into()))
+            .update_expression("ADD next_run_sequence :one")
+            .condition_expression("attribute_exists(PK)")
+            .expression_attribute_values(":one", AttributeValue::N("1".into()))
+            .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+            .send().await.map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        let item = result.attributes.ok_or_else(|| RepoError::MissingField("next_run_sequence".into()))?;
+        get_n_u64(&item, "next_run_sequence")
+    }
+
+    /// Activate only a published run, ordered against other activated runs.
+    /// Called after enqueue or by a worker holding that durable delivery.
+    pub async fn activate_run(
+        &self, import_id: &str, run_id: &str, sequence: u64, roots: &[String], target: &str,
+    ) -> Result<bool, RepoError> {
+        self.db.update_item_conditional(
+            &format!("IMPORT#{import_id}"), ImportRecord::sk(),
+            "SET selected_roots = :roots, target_folder_id = :target, active_run_id = :run, active_run_sequence = :sequence, updated_at = :now",
+            "attribute_exists(PK) AND (attribute_not_exists(active_run_sequence) OR active_run_sequence < :sequence)",
+            HashMap::from([
+                (":roots".into(), AttributeValue::L(roots.iter().cloned().map(AttributeValue::S).collect())),
+                (":target".into(), AttributeValue::S(target.into())),
+                (":run".into(), AttributeValue::S(run_id.into())),
+                (":sequence".into(), AttributeValue::N(sequence.to_string())),
+                (":now".into(), AttributeValue::N(ogrenotes_common::time::now_usec().to_string())),
+            ]), None,
+        ).await.map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
+    /// Read authoritative generation, including the legacy absent generation.
+    pub async fn current_run_id(&self, import_id: &str) -> Result<Option<String>, RepoError> {
+        let result = self
+            .db
+            .inner()
+            .get_item()
+            .table_name(self.db.table_name())
+            .key("PK", AttributeValue::S(format!("IMPORT#{import_id}")))
+            .key("SK", AttributeValue::S(ImportRecord::sk().into()))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        let item = result
+            .item
+            .ok_or_else(|| RepoError::MissingField(format!("import {import_id} META")))?;
+        Ok(item
+            .get("active_run_id")
+            .and_then(|v| v.as_s().ok())
+            .cloned())
+    }
+
+    /// Read the scope from the same authoritative generation the job carries.
+    /// An eventual read here could execute a freshly queued run against old roots.
+    pub async fn get_for_run(
+        &self,
+        import_id: &str,
+        run_id: Option<&str>,
+    ) -> Result<Option<ImportRecord>, RepoError> {
+        let result = self
+            .db
+            .inner()
+            .get_item()
+            .table_name(self.db.table_name())
+            .key("PK", AttributeValue::S(format!("IMPORT#{import_id}")))
+            .key("SK", AttributeValue::S(ImportRecord::sk().into()))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        let Some(item) = result.item else {
+            return Ok(None);
+        };
+        let current = item
+            .get("active_run_id")
+            .and_then(|v| v.as_s().ok())
+            .map(String::as_str);
+        if current != run_id {
+            return Ok(None);
+        }
+        import_from_item(&item).map(Some)
+    }
+
+    /// Publish Running only while this generation still holds the lease.
+    pub async fn set_running_for_run(
+        &self,
+        import_id: &str,
+        instance: &str,
+        run_id: Option<&str>,
+    ) -> Result<bool, RepoError> {
+        let mut values = HashMap::from([
+            (":inst".into(), AttributeValue::S(instance.into())),
+            (
+                ":status".into(),
+                AttributeValue::S(status_to_str(ImportStatus::Running).into()),
+            ),
+            (
+                ":now".into(),
+                AttributeValue::N(ogrenotes_common::time::now_usec().to_string()),
+            ),
+        ]);
+        let condition = run_condition(run_id, &mut values);
+        self.db
+            .update_item_conditional(
+                &format!("IMPORT#{import_id}"),
+                ImportRecord::sk(),
+                "SET #status = :status, updated_at = :now",
+                &format!("runner_instance = :inst AND ({condition})"),
+                values,
+                Some(HashMap::from([("#status".into(), "status".into())])),
+            )
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))
+    }
+
     /// Record the dedicated per-import destination folder id on `META`, if one
     /// is not already recorded, and return whichever id is now durably recorded.
     ///
@@ -929,6 +1078,13 @@ impl ImportRepo {
         now_ms: i64,
         stale_ms: i64,
     ) -> Result<bool, RepoError> {
+        self.claim_runner_for_run(import_id, instance_id, now_ms, stale_ms, None).await
+    }
+
+    pub async fn claim_runner_for_run(
+        &self, import_id: &str, instance_id: &str, now_ms: i64, stale_ms: i64,
+        run_id: Option<&str>,
+    ) -> Result<bool, RepoError> {
         let pk = format!("IMPORT#{import_id}");
         let mut values = HashMap::new();
         values.insert(":inst".to_string(), AttributeValue::S(instance_id.to_string()));
@@ -938,13 +1094,14 @@ impl ImportRepo {
             AttributeValue::N((now_ms - stale_ms).to_string()),
         );
         // condition: no claim, OR same instance, OR heartbeat older than cutoff.
-        let cond = "attribute_not_exists(runner_instance) OR runner_instance = :inst OR runner_heartbeat_ms < :stale";
+        let run_condition = run_condition(run_id, &mut values);
+        let cond = format!("attribute_exists(PK) AND ({run_condition}) AND (attribute_not_exists(runner_instance) OR runner_instance = :inst OR runner_heartbeat_ms < :stale)");
         self.db
             .update_item_conditional(
                 &pk,
                 ImportRecord::sk(),
                 "SET runner_instance = :inst, runner_heartbeat_ms = :now",
-                cond,
+                &cond,
                 values,
                 None,
             )
@@ -1521,6 +1678,19 @@ fn report_from_item(item: &HashMap<String, AttributeValue>) -> Result<ReportRow,
             .and_then(|n| n.parse::<u64>().ok())
             .unwrap_or(0),
     })
+}
+
+/// Legacy jobs are eligible only until the first generation-aware start.
+fn run_condition(
+    run_id: Option<&str>,
+    values: &mut HashMap<String, AttributeValue>,
+) -> &'static str {
+    if let Some(run_id) = run_id {
+        values.insert(":run".into(), AttributeValue::S(run_id.into()));
+        "active_run_id = :run"
+    } else {
+        "attribute_not_exists(active_run_id)"
+    }
 }
 
 #[cfg(test)]

@@ -20,7 +20,8 @@ nanoid = { workspace = true }
 # Streams + ack on the same Redis client family the rest of the
 # stack already uses. We don't need subscriber-client here; XADD /
 # XREADGROUP / XACK / XCLAIM all flow through the regular RedisClient.
-fred = { workspace = true }
+fred = { workspace = true, features = ["i-scripts"] }
 
 [dev-dependencies]
+fred = { workspace = true, features = ["i-acl"] }
 proptest = { workspace = true }

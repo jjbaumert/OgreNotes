@@ -24,6 +24,8 @@
 //!   Side-channel for the GET /jobs/{id} polling API. TTL'd at
 //!   24h so old job records drop out without an explicit cleanup
 //!   job.
+//! - `<stream>:finalizations`: HASH of immutable terminal outcomes awaiting
+//!   application-side reconciliation. Retained until required effects succeed.
 //!
 //! The Redis stream entry's intrinsic id (`<ms>-<seq>`) is not
 //! exposed; we generate a nanoid on enqueue and carry it in the
@@ -45,6 +47,17 @@ use thiserror::Error;
 /// by another worker, the same `JobId` flows through. Clients
 /// poll on this via the JobStatus API.
 pub type JobId = String;
+
+/// Scope of one published Quip start. The sequence is reserved in DynamoDB
+/// without changing the active run; only a durably queued start may activate it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuipImportRun {
+    pub id: String,
+    pub sequence: u64,
+    pub selected_roots: Vec<String>,
+    pub target_folder_id: String,
+}
 
 /// Typed work payloads. Adding a new job kind:
 /// 1. Add a variant here with the field shape the worker needs.
@@ -80,7 +93,13 @@ pub enum Job {
     /// Token-free trigger for a checkpointed Quip import (Phase 1+). The
     /// token is NEVER carried here — the worker re-reads it from the
     /// TokenStore keyed by import_id. See design §"Enqueue path".
-    StartQuipImport { import_id: String, owner_id: String },
+    StartQuipImport {
+        import_id: String,
+        owner_id: String,
+        /// Published scope and generation. Missing on legacy jobs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<QuipImportRun>,
+    },
     /// No-op job — used by tests to verify the queue mechanics
     /// without dragging in DOCX/PDF deps. Carries an arbitrary
     /// label so a test can correlate the dequeue.
@@ -187,12 +206,191 @@ pub const DEFAULT_GROUP: &str = "workers";
 /// XADD's pair shape is `<field> <value>` so we use one pair.
 const ENVELOPE_FIELD: &str = "envelope";
 
+// Make the initial delivery and Pending status visible together. Preflight
+// every write, then append first so a rejected XADD creates no status record.
+const ENQUEUE_DELIVERY: &str = r#"
+local status_type = redis.call('TYPE', KEYS[2]).ok
+if status_type ~= 'none' and status_type ~= 'hash' then
+    return redis.error_reply('WRONGTYPE job status must be a hash')
+end
+local append = {'XADD', KEYS[1], '*', 'envelope', ARGV[1]}
+local fields = {'HSET', KEYS[2], 'json', ARGV[2]}
+if ARGV[3] ~= '' then
+    table.insert(fields, 'owner')
+    table.insert(fields, ARGV[3])
+end
+local expire = {'EXPIRE', KEYS[2], ARGV[4]}
+for _, command in ipairs({append, fields, expire}) do
+    if not redis.acl_check_cmd(unpack(command)) then
+        return redis.error_reply('NOPERM job enqueue command denied: ' .. command[1])
+    end
+end
+local id = redis.call(unpack(append))
+redis.call(unpack(fields))
+redis.call(unpack(expire))
+return id
+"#;
+
+// Publish Running only while the first-delivery receipt is still current.
+// A delayed connection must not overwrite a reaper's terminal status.
+const START_DELIVERY: &str = r#"
+if #redis.call('XRANGE', KEYS[1], ARGV[2], ARGV[2]) == 0 then return 0 end
+local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[2], ARGV[2], 1)
+if #pending == 0 or pending[1][2] ~= ARGV[3] or pending[1][4] ~= 1 then return 0 end
+local fields = {'HSET', KEYS[2], 'json', ARGV[4]}
+if ARGV[5] ~= '' then
+    table.insert(fields, 'owner')
+    table.insert(fields, ARGV[5])
+end
+local expire = {'EXPIRE', KEYS[2], ARGV[6]}
+if not redis.acl_check_cmd(unpack(fields)) or not redis.acl_check_cmd(unpack(expire)) then
+    return redis.error_reply('NOPERM job running status command denied')
+end
+redis.call(unpack(fields))
+redis.call(unpack(expire))
+return 1
+"#;
+
+// Capture delivery count in the same atomic operation as ownership transfer.
+// Excluding this reaper's in-flight IDs before XCLAIM avoids revoking receipts
+// for tasks it is already running. Scan enough candidates to skip all of them.
+const CLAIM_STALE: &str = r#"
+local excluded = {}
+for i = 5, #ARGV do excluded[ARGV[i]] = true end
+local count = tonumber(ARGV[4])
+local pending = redis.call('XPENDING', KEYS[1], ARGV[1], 'IDLE', ARGV[3], '-', '+', count + #ARGV - 4)
+local claimed = {}
+for _, entry in ipairs(pending) do
+    if not excluded[entry[1]] then
+        local values = redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[2], ARGV[3], entry[1])
+        if #values > 0 then
+            table.insert(claimed, {values[1][1], values[1][2], entry[4] + 1})
+            if #claimed == count then break end
+        end
+    end
+end
+return claimed
+"#;
+
+// Redis 7 executes the transition without interleaving other clients. Lua
+// does not roll back on command errors, so validate key types, group state,
+// and every write's ACL before changing anything. XADD is first: a rejected
+// stream append (for example ID exhaustion) must leave the source pending.
+// Redis rejects an OOM script before its first write; once writing, the
+// remaining validated commands complete in the same atomic execution.
+//
+// A removed source is the completion marker. Repeating a call after a lost
+// reply, or finalizing a stale claim after another worker, cannot append a
+// duplicate or overwrite the status of a newer attempt.
+// A reclaim keeps the source ID, so also fence against its PEL owner and
+// delivery count. The count prevents an A -> B -> A ownership cycle from
+// reviving the first A receipt.
+const FINALIZE_DELIVERY: &str = r#"
+local source, destination, status, finalizations = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
+local group, id = ARGV[1], ARGV[2]
+if #redis.call('XRANGE', source, id, id) == 0 then
+    return 0
+end
+local pending = redis.call('XPENDING', source, group, id, id, 1)
+if #pending == 0 then
+    return redis.error_reply('Delivery is not pending in the consumer group')
+end
+if pending[1][2] ~= ARGV[9] or pending[1][4] ~= tonumber(ARGV[10]) then
+    return 2
+end
+local status_type = redis.call('TYPE', status).ok
+if status_type ~= 'none' and status_type ~= 'hash' then
+    return redis.error_reply('WRONGTYPE job status must be a hash')
+end
+local commands = {}
+if ARGV[11] ~= '' then
+    local finalizations_type = redis.call('TYPE', finalizations).ok
+    if finalizations_type ~= 'none' and finalizations_type ~= 'hash' then
+        return redis.error_reply('WRONGTYPE pending finalizations must be a hash')
+    end
+end
+if ARGV[6] ~= '' then
+    local destination_type = redis.call('TYPE', destination).ok
+    if destination_type ~= 'none' and destination_type ~= 'stream' then
+        return redis.error_reply('WRONGTYPE job destination must be a stream')
+    end
+    local append = {'XADD', destination, '*', 'envelope', ARGV[6]}
+    if ARGV[7] == '1' then
+        table.insert(append, 'lastError')
+        table.insert(append, ARGV[8])
+    end
+    table.insert(commands, append)
+end
+if ARGV[11] ~= '' then
+    table.insert(commands, {'HSET', finalizations, ARGV[12], ARGV[11]})
+end
+local fields = {'HSET', status, 'json', ARGV[3]}
+if ARGV[4] ~= '' then
+    table.insert(fields, 'owner')
+    table.insert(fields, ARGV[4])
+end
+table.insert(commands, fields)
+table.insert(commands, {'EXPIRE', status, ARGV[5]})
+table.insert(commands, {'XACK', source, group, id})
+table.insert(commands, {'XDEL', source, id})
+for _, command in ipairs(commands) do
+    if not redis.acl_check_cmd(unpack(command)) then
+        return redis.error_reply('NOPERM job finalization command denied: ' .. command[1])
+    end
+end
+for _, command in ipairs(commands) do
+    redis.call(unpack(command))
+end
+return 1
+"#;
+
 /// Job queue handle. Cheap to clone (wraps an `Arc<RedisClient>`).
 #[derive(Clone)]
 pub struct JobQueue {
     client: Arc<RedisClient>,
     stream: String,
     group: String,
+    // Present only for independently connected consumers. The last handle
+    // starts graceful shutdown independently of consumer cancellation.
+    _connection: Option<Arc<OwnedConnection>>,
+}
+
+struct OwnedConnection {
+    client: Arc<RedisClient>,
+    task: Option<fred::types::ConnectHandle>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Drop for OwnedConnection {
+    fn drop(&mut self) {
+        let Some(mut task) = self.task.take() else {
+            return;
+        };
+        let client = Arc::clone(&self.client);
+        // Fred's reader is a separate task. Aborting only the router detaches
+        // that reader and can retain its socket. Keep the router alive for QUIT.
+        // This task belongs to the runtime, not the consumer being cancelled.
+        self.runtime.spawn(async move {
+            let closed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                let quit = client.quit().await;
+                let joined = (&mut task).await;
+                if let Err(error) = quit {
+                    tracing::debug!(%error, "consumer Redis QUIT failed");
+                }
+                if let Err(error) = joined {
+                    tracing::debug!(%error, "consumer Redis router stopped during cleanup");
+                }
+            })
+            .await;
+            if closed.is_err() {
+                // Fred9 has no public force-close for the detached reader.
+                // Bound this cleanup task; after a network blackhole, the
+                // reader may linger until transport/runtime shutdown.
+                tracing::warn!("consumer Redis shutdown timed out; aborting router");
+                task.abort();
+            }
+        });
+    }
 }
 
 impl JobQueue {
@@ -228,7 +426,33 @@ impl JobQueue {
             Err(e) if e.to_string().contains("BUSYGROUP") => {}
             Err(e) => return Err(JobError::Redis(e.to_string())),
         }
-        Ok(Self { client, stream, group })
+        Ok(Self { client, stream, group, _connection: None })
+    }
+
+    /// Connect a separate sequential consumer with identical Redis settings.
+    /// Its blocking read cannot delay other consumers or the reaper. Clones
+    /// share this new connection only with the consumer's active heartbeat;
+    /// the caller must finish execution before issuing its next blocking read.
+    pub async fn dedicated_connection(&self) -> Result<Self, JobError> {
+        let client = Arc::new(self.client.clone_new());
+        let mut connection = OwnedConnection {
+            client: Arc::clone(&client),
+            task: Some(client.connect()),
+            runtime: tokio::runtime::Handle::current(),
+        };
+        tokio::select! {
+            ready = client.wait_for_connect() => ready?,
+            ended = connection.task.as_mut().expect("new connection task") => {
+                connection.task.take();
+                return Err(JobError::Redis(format!("consumer connection ended during startup: {ended:?}")));
+            }
+        }
+        Ok(Self {
+            client,
+            _connection: Some(Arc::new(connection)),
+            stream: self.stream.clone(),
+            group: self.group.clone(),
+        })
     }
 
     /// The main work stream key this queue reads/writes. The
@@ -240,8 +464,8 @@ impl JobQueue {
     }
 
     /// Enqueue a job. Returns the stable [`JobId`] (nanoid). Writes
-    /// the side-channel status hash to `Pending` before returning
-    /// so an immediate poll sees the work.
+    /// the delivery and Pending status atomically, so a delayed producer
+    /// cannot overwrite a fast consumer's terminal status.
     pub async fn enqueue(&self, payload: Job) -> Result<JobId, JobError> {
         let owner = owner_of(&payload).map(String::from);
         let envelope = JobEnvelope {
@@ -251,38 +475,23 @@ impl JobQueue {
             owner: owner.clone(),
             payload,
         };
-        self.xadd(&envelope).await?;
-        self.write_status(&envelope.job_id, &JobStatus::Pending, owner.as_deref())
-            .await?;
-        Ok(envelope.job_id)
-    }
-
-    /// XADD the envelope onto the main stream. Used both at first
-    /// enqueue and at retry. Internal — callers go through
-    /// `enqueue` or `retry_or_dead_letter`.
-    async fn xadd(&self, envelope: &JobEnvelope) -> Result<String, JobError> {
-        let json = serde_json::to_string(envelope)
+        let envelope_json = serde_json::to_string(&envelope)
             .map_err(|e| JobError::Serialize(e.to_string()))?;
-        // fred 9.4 takes a Vec<(&str, &str)> pair directly; no
-        // need to wrap in MultipleOrderedPairs (the trait
-        // resolution there is brittle).
-        let id: String = self
-            .client
-            .xadd(
-                self.stream.as_str(),
-                false,
-                None,
-                "*",
-                vec![(ENVELOPE_FIELD, json.as_str())],
-            )
-            .await?;
-        Ok(id)
+        let pending_json = serde_json::to_string(&JobStatus::Pending)
+            .map_err(|e| JobError::Serialize(e.to_string()))?;
+        let _: String = self.client.eval(
+            ENQUEUE_DELIVERY,
+            vec![self.stream.clone(), status_key(&envelope.job_id)],
+            vec![envelope_json, pending_json, owner.unwrap_or_default(), JOB_STATUS_TTL_SECS.to_string()],
+        ).await?;
+        Ok(envelope.job_id)
     }
 
     /// Block-read the next entry off the stream as `consumer`.
     /// `block_ms` = 0 → block indefinitely until an entry arrives.
     /// Returns `Ok(None)` on the explicit "no message within the
-    /// block window" timeout (only possible with block_ms > 0).
+    /// block window" timeout (only possible with block_ms > 0), or if another
+    /// worker reclaimed the delivery before Running could be published.
     pub async fn consume_next(
         &self,
         consumer: &str,
@@ -335,52 +544,51 @@ impl JobQueue {
             worker: consumer.to_string(),
             started_at_ms: now_ms(),
         };
-        self.write_status(&envelope.job_id, &started, envelope.owner.as_deref())
-            .await?;
+        let started_json = serde_json::to_string(&started)
+            .map_err(|e| JobError::Serialize(e.to_string()))?;
+        let current: bool = self.client.eval(
+            START_DELIVERY,
+            vec![self.stream.clone(), status_key(&envelope.job_id)],
+            vec![self.group.clone(), stream_id.clone(), consumer.to_string(), started_json,
+                envelope.owner.clone().unwrap_or_default(), JOB_STATUS_TTL_SECS.to_string()],
+        ).await?;
+        if !current {
+            return Ok(None);
+        }
         Ok(Some(ClaimedJob {
             stream_id: stream_id.clone(),
             envelope,
+            consumer: consumer.to_string(),
+            delivery_count: 1,
         }))
     }
 
-    /// Mark a job complete: XACK + XDEL on the stream, write the
-    /// Succeeded status. `result_json` is whatever the worker
+    /// Atomically publish Succeeded status and retire the delivery.
+    /// Repeated finalization returns [`FinalizationOutcome::AlreadyFinalized`].
+    /// Ownership transferred by reclaim returns [`FinalizationOutcome::ClaimLost`].
+    /// Only [`FinalizationOutcome::Applied`] permits terminal cleanup: an
+    /// earlier finalizer may have retried this job instead of completing it.
+    /// `result_json` is whatever the worker
     /// wants the client to see on GET /jobs/{id}; pass None when
     /// the work has no result body.
     pub async fn ack(
         &self,
         claimed: &ClaimedJob,
         result_json: Option<String>,
-    ) -> Result<(), JobError> {
-        let _: u64 = self
-            .client
-            .xack(
-                self.stream.as_str(),
-                self.group.as_str(),
-                claimed.stream_id.as_str(),
-            )
-            .await?;
-        let _: u64 = self
-            .client
-            .xdel(self.stream.as_str(), vec![claimed.stream_id.as_str()])
-            .await?;
+    ) -> Result<FinalizationOutcome, JobError> {
         let status = JobStatus::Succeeded {
             finished_at_ms: now_ms(),
             result_json,
         };
-        self.write_status(
-            &claimed.envelope.job_id,
-            &status,
-            claimed.envelope.owner.as_deref(),
-        )
-        .await?;
-        Ok(())
+        self.finalize_delivery(claimed, &status, None, None).await
     }
 
     /// Handle a failed work attempt. If `attempt < max_retries`,
-    /// XACK + XDEL the current entry and XADD a new envelope with
-    /// `attempt + 1` — keeps the JobId stable. Otherwise, XACK +
-    /// XDEL + XADD-to-dlq + Failed status.
+    /// atomically replace the current entry with an envelope carrying
+    /// `attempt + 1` and Pending status, keeping the JobId stable.
+    /// Otherwise, atomically move it to the DLQ with Failed status.
+    /// A rejected transition leaves the original delivery reclaimable; a
+    /// lost response can safely be retried without duplicating the handoff.
     ///
     /// The caller decides `max_retries` per-job-kind: cheap
     /// idempotent work (Noop, status writes) tolerates many
@@ -392,18 +600,6 @@ impl JobQueue {
         max_retries: u32,
         error: &str,
     ) -> Result<RetryOutcome, JobError> {
-        let _: u64 = self
-            .client
-            .xack(
-                self.stream.as_str(),
-                self.group.as_str(),
-                claimed.stream_id.as_str(),
-            )
-            .await?;
-        let _: u64 = self
-            .client
-            .xdel(self.stream.as_str(), vec![claimed.stream_id.as_str()])
-            .await?;
         if claimed.envelope.attempt < max_retries {
             let next = JobEnvelope {
                 job_id: claimed.envelope.job_id.clone(),
@@ -412,42 +608,130 @@ impl JobQueue {
                 owner: claimed.envelope.owner.clone(),
                 payload: claimed.envelope.payload.clone(),
             };
-            self.xadd(&next).await?;
-            self.write_status(&next.job_id, &JobStatus::Pending, next.owner.as_deref())
+            let finalized = self.finalize_delivery(claimed, &JobStatus::Pending, Some(&next), None)
                 .await?;
-            Ok(RetryOutcome::Retried { attempt: next.attempt })
+            Ok(match finalized {
+                FinalizationOutcome::Applied => RetryOutcome::Retried { attempt: next.attempt },
+                FinalizationOutcome::AlreadyFinalized => RetryOutcome::AlreadyFinalized,
+                FinalizationOutcome::ClaimLost => RetryOutcome::ClaimLost,
+            })
         } else {
-            // Dead-letter — same envelope written to <stream>:dlq.
-            // Operators inspect manually; XCLAIM from dlq back to
-            // the main stream is the recovery path.
-            let dlq_stream = format!("{}:dlq", self.stream);
-            let json = serde_json::to_string(&claimed.envelope)
-                .map_err(|e| JobError::Serialize(e.to_string()))?;
-            let _: String = self
-                .client
-                .xadd(
-                    dlq_stream.as_str(),
-                    false,
-                    None,
-                    "*",
-                    vec![
-                        (ENVELOPE_FIELD, json.as_str()),
-                        ("lastError", error),
-                    ],
-                )
-                .await?;
             let status = JobStatus::Failed {
                 finished_at_ms: now_ms(),
                 error: error.to_string(),
             };
-            self.write_status(
-                &claimed.envelope.job_id,
-                &status,
-                claimed.envelope.owner.as_deref(),
-            )
-            .await?;
-            Ok(RetryOutcome::DeadLettered)
+            let finalized = self.finalize_delivery(claimed, &status, Some(&claimed.envelope), Some(error))
+                .await?;
+            Ok(match finalized {
+                FinalizationOutcome::Applied => RetryOutcome::DeadLettered,
+                FinalizationOutcome::AlreadyFinalized => RetryOutcome::AlreadyFinalized,
+                FinalizationOutcome::ClaimLost => RetryOutcome::ClaimLost,
+            })
         }
+    }
+
+    /// Finalize one delivery, including its polling status, in one Redis
+    /// script. Serialization happens before Redis can mutate anything.
+    async fn finalize_delivery(
+        &self,
+        claimed: &ClaimedJob,
+        status: &JobStatus,
+        replacement: Option<&JobEnvelope>,
+        dead_letter_error: Option<&str>,
+    ) -> Result<FinalizationOutcome, JobError> {
+        let status_json = serde_json::to_string(status)
+            .map_err(|e| JobError::Serialize(e.to_string()))?;
+        let envelope_json = replacement.map(serde_json::to_string).transpose()
+            .map_err(|e| JobError::Serialize(e.to_string()))?
+            .unwrap_or_default();
+        let destination = if dead_letter_error.is_some() {
+            format!("{}:dlq", self.stream)
+        } else {
+            self.stream.clone()
+        };
+        let finalization_json = if replacement.is_none() || dead_letter_error.is_some() {
+            serde_json::to_string(&PendingFinalization {
+                envelope: claimed.envelope.clone(),
+                status: status.clone(),
+            }).map_err(|e| JobError::Serialize(e.to_string()))?
+        } else {
+            String::new()
+        };
+        let outcome: u64 = self.client.eval(
+            FINALIZE_DELIVERY,
+            vec![self.stream.clone(), destination, status_key(&claimed.envelope.job_id),
+                self.finalizations_key()],
+            vec![
+                self.group.clone(),
+                claimed.stream_id.clone(),
+                status_json,
+                claimed.envelope.owner.clone().unwrap_or_default(),
+                JOB_STATUS_TTL_SECS.to_string(),
+                envelope_json,
+                if dead_letter_error.is_some() { "1" } else { "0" }.to_string(),
+                dead_letter_error.unwrap_or_default().to_string(),
+                claimed.consumer.clone(),
+                claimed.delivery_count.to_string(),
+                finalization_json,
+                claimed.envelope.job_id.clone(),
+            ],
+        ).await?;
+        match outcome {
+            0 => Ok(FinalizationOutcome::AlreadyFinalized),
+            1 => Ok(FinalizationOutcome::Applied),
+            2 => Ok(FinalizationOutcome::ClaimLost),
+            other => Err(JobError::Redis(format!("unexpected finalization outcome: {other}"))),
+        }
+    }
+
+    fn finalizations_key(&self) -> String {
+        format!("{}:finalizations", self.stream)
+    }
+
+    /// Keep a live receipt below the reaper idle threshold without changing
+    /// its delivery count. A superseded receipt can never renew the new owner.
+    pub async fn renew_claim(&self, claimed: &ClaimedJob) -> Result<bool, JobError> {
+        let renewed: bool = self.client.eval(
+            r#"
+local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[2], ARGV[2], 1)
+if #pending == 0 or pending[1][2] ~= ARGV[3] or pending[1][4] ~= tonumber(ARGV[4]) then
+    return 0
+end
+local claimed = redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[3], 0, ARGV[2], 'IDLE', 0, 'JUSTID')
+return #claimed
+"#,
+            vec![self.stream.clone()],
+            vec![self.group.clone(), claimed.stream_id.clone(), claimed.consumer.clone(),
+                claimed.delivery_count.to_string()],
+        ).await?;
+        Ok(renewed)
+    }
+
+    /// Durable terminal effects still owed by the application. Written in
+    /// the same script that retires the source, with no TTL until reconciled.
+    pub async fn pending_finalization(&self, job_id: &str) -> Result<Option<PendingFinalization>, JobError> {
+        let json: Option<String> = self.client.hget(self.finalizations_key(), job_id).await?;
+        json.map(|value| serde_json::from_str(&value)
+            .map_err(|e| JobError::Serialize(e.to_string()))).transpose()
+    }
+
+    /// Scan one batch for recovery after a worker crash or a lost script reply.
+    pub async fn pending_finalizations(&self, cursor: &str, count: usize)
+        -> Result<(String, Vec<PendingFinalization>), JobError>
+    {
+        let (next, entries): (String, std::collections::HashMap<String, String>) = self.client.eval(
+            "return redis.call('HSCAN', KEYS[1], ARGV[1], 'COUNT', ARGV[2])",
+            vec![self.finalizations_key()], vec![cursor.to_string(), count.to_string()],
+        ).await?;
+        let records = entries.into_values().map(|value| serde_json::from_str(&value)
+            .map_err(|e| JobError::Serialize(e.to_string()))).collect::<Result<_, _>>()?;
+        Ok((next, records))
+    }
+
+    /// Remove an immutable terminal outcome only after its effects succeeded.
+    pub async fn complete_finalization(&self, job_id: &str) -> Result<(), JobError> {
+        let _: u64 = self.client.hdel(self.finalizations_key(), job_id).await?;
+        Ok(())
     }
 
     /// Read the side-channel status hash for `job_id`. Returns
@@ -494,29 +778,28 @@ impl JobQueue {
         min_idle_ms: u64,
         max_count: usize,
     ) -> Result<Vec<ClaimedJob>, JobError> {
-        // XAUTOCLAIM walks the consumer-group's pending list
-        // itself and returns up to `count` entries this consumer
-        // can take over without an explicit XPENDING walk first.
-        // fred 9.4's xautoclaim_values returns
-        // (next_cursor, Vec<XReadValue<Ri, Rk, Rv>>) where each
-        // XReadValue is (stream_id, HashMap<field, value>).
-        let (_next_cursor, entries): (
-            String,
-            Vec<(String, std::collections::HashMap<String, String>)>,
-        ) = self
-            .client
-            .xautoclaim_values(
-                self.stream.as_str(),
-                self.group.as_str(),
-                consumer,
-                min_idle_ms,
-                "0-0",
-                Some(max_count as u64),
-                false,
-            )
-            .await?;
+        self.claim_stale_excluding(consumer, min_idle_ms, max_count, &[]).await
+    }
+
+    /// Reclaim stale deliveries without revoking this caller's active tasks.
+    /// `in_flight` IDs must come from the caller's running-task registry.
+    pub async fn claim_stale_excluding(
+        &self,
+        consumer: &str,
+        min_idle_ms: u64,
+        max_count: usize,
+        in_flight: &[String],
+    ) -> Result<Vec<ClaimedJob>, JobError> {
+        if max_count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut args = vec![self.group.clone(), consumer.to_string(),
+            min_idle_ms.to_string(), max_count.to_string()];
+        args.extend_from_slice(in_flight);
+        let entries: Vec<(String, std::collections::HashMap<String, String>, u64)> =
+            self.client.eval(CLAIM_STALE, vec![self.stream.clone()], args).await?;
         let mut out = Vec::with_capacity(entries.len());
-        for (stream_id, fields) in entries {
+        for (stream_id, fields, delivery_count) in entries {
             let envelope_json = fields.get(ENVELOPE_FIELD).ok_or_else(|| {
                 JobError::Serialize(format!(
                     "claimed entry {stream_id} missing field {ENVELOPE_FIELD}"
@@ -524,35 +807,12 @@ impl JobQueue {
             })?;
             let envelope: JobEnvelope = serde_json::from_str(envelope_json)
                 .map_err(|e| JobError::Serialize(e.to_string()))?;
-            out.push(ClaimedJob { stream_id, envelope });
+            out.push(ClaimedJob { stream_id, envelope, consumer: consumer.to_string(), delivery_count });
         }
         Ok(out)
     }
 
-    /// Internal: write the status hash with 24h TTL. Sets `json` and,
-    /// when `owner` is `Some`, the `owner` field used by the poll-time
-    /// ownership check. Re-asserting the same owner on subsequent
-    /// status writes is idempotent.
-    async fn write_status(
-        &self,
-        job_id: &str,
-        status: &JobStatus,
-        owner: Option<&str>,
-    ) -> Result<(), JobError> {
-        let key = status_key(job_id);
-        let json = serde_json::to_string(status)
-            .map_err(|e| JobError::Serialize(e.to_string()))?;
-        let mut fields: Vec<(&str, &str)> = vec![("json", json.as_str())];
-        if let Some(o) = owner {
-            fields.push(("owner", o));
-        }
-        let _: u64 = self.client.hset(key.as_str(), fields).await?;
-        let _: bool = self
-            .client
-            .expire(key.as_str(), JOB_STATUS_TTL_SECS as i64)
-            .await?;
-        Ok(())
-    }
+
 }
 
 fn status_key(job_id: &str) -> String {
@@ -560,11 +820,34 @@ fn status_key(job_id: &str) -> String {
 }
 
 /// A consumer's view of a claimed entry. Wraps the parsed
-/// envelope with the underlying stream id needed for XACK/XDEL.
+/// envelope with the stream ID and consumer identity needed for finalization.
 #[derive(Debug, Clone)]
 pub struct ClaimedJob {
     pub stream_id: String,
     pub envelope: JobEnvelope,
+    // Receipt identity, kept in memory rather than changing the job envelope.
+    consumer: String,
+    // PEL delivery count distinguishes receipts even if ownership cycles back.
+    delivery_count: u64,
+}
+
+/// Durable input for idempotent application-side terminal effects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingFinalization {
+    pub envelope: JobEnvelope,
+    pub status: JobStatus,
+}
+
+/// Whether this invocation applied a delivery's finalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizationOutcome {
+    Applied,
+    /// A different invocation already retired this delivery. Its outcome may
+    /// have been a retry, so this does not authorize terminal side effects.
+    AlreadyFinalized,
+    /// A newer claim replaced this receipt. No change was made; the old
+    /// receipt must not authorize terminal cleanup or status writes.
+    ClaimLost,
 }
 
 /// Outcome of [`JobQueue::retry_or_dead_letter`].
@@ -572,6 +855,10 @@ pub struct ClaimedJob {
 pub enum RetryOutcome {
     Retried { attempt: u32 },
     DeadLettered,
+    /// No change was made. Do not perform terminal cleanup or status writes.
+    AlreadyFinalized,
+    /// A newer claim owns this delivery. No retry, DLQ, or cleanup is due.
+    ClaimLost,
 }
 
 /// Trait-shaped abstraction so the producer side (the API task)
@@ -689,7 +976,7 @@ mod tests {
     /// poll-auth path (#85) doesn't silently fall through to ownerless.
     #[test]
     fn start_quip_import_wire_tag_and_owner() {
-        let job = Job::StartQuipImport { import_id: "imp1".into(), owner_id: "u1".into() };
+        let job = Job::StartQuipImport { import_id: "imp1".into(), owner_id: "u1".into(), run: None };
         let json = serde_json::to_string(&job).unwrap();
         assert!(json.contains(r#""type":"startQuipImport""#), "wire tag pinned: {json}");
         // Token-free trigger: the job envelope must never carry the Quip
@@ -698,6 +985,11 @@ mod tests {
         let lower = json.to_ascii_lowercase();
         assert!(!lower.contains("token"), "trigger must be token-free: {json}");
         assert!(!lower.contains("secret"), "trigger must carry no secret: {json}");
+        assert!(!json.contains("run"), "legacy wire omits the generation");
+        let versioned = Job::StartQuipImport {
+            import_id: "imp1".into(), owner_id: "u1".into(), run: Some(QuipImportRun { id: "run1".into(), sequence: 1, selected_roots: vec!["root".into()], target_folder_id: "target".into() }),
+        };
+        assert_eq!(serde_json::from_str::<Job>(&serde_json::to_string(&versioned).unwrap()).unwrap(), versioned);
         let back: Job = serde_json::from_str(&json).unwrap();
         assert_eq!(back, job);
         // owner_of must return the owner so poll-auth (#85) doesn't silently

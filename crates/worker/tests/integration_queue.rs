@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use fred::clients::RedisClient;
 use fred::prelude::*;
-use ogrenotes_worker::{Job, JobProducer, JobQueue, JobStatus, RetryOutcome};
+use ogrenotes_worker::{FinalizationOutcome, Job, JobProducer, JobQueue, JobStatus, RetryOutcome};
 use tokio::time::sleep;
 
 /// Locally, skips (with a stderr note) when `REDIS_URL` is unset. When
@@ -94,10 +94,11 @@ async fn enqueue_then_consume_then_ack() {
     );
 
     // Ack with a result body.
-    queue
+    let outcome = queue
         .ack(&claimed, Some("{\"docId\":\"abc\"}".to_string()))
         .await
         .expect("ack");
+    assert_eq!(outcome, FinalizationOutcome::Applied);
 
     // Status flipped to Succeeded with the result_json.
     let status = queue.status(&job_id).await.expect("status succeeded");
@@ -396,4 +397,657 @@ async fn poison_stream_entry_surfaces_as_error_not_panic() {
         queue2.consume_next("w", 1000).await.is_err(),
         "entry missing the envelope field must error"
     );
+}
+
+/// A Redis command error during finalization must leave the original
+/// delivery reclaimable. Exercise the queue API against the real server,
+/// including the status failure that used to happen after source deletion.
+#[tokio::test]
+async fn failed_dead_letter_handoff_preserves_reclaimable_delivery() {
+    let url = require_redis!();
+    let client = fresh_client(&url).await;
+    let queue = fresh_queue(Arc::clone(&client), "dlq-write-failure").await;
+    let job_id = queue.enqueue(owned_import("durable-owner")).await.unwrap();
+    let claimed = queue.consume_next("original", 1000).await.unwrap().unwrap();
+    let dlq = format!("{}:dlq", queue.stream_name());
+
+    // XADD fails with WRONGTYPE. The source must still be in the PEL and
+    // retain its payload, so another worker can recover it after repair.
+    let _: () = client
+        .set(dlq.as_str(), "blocked", None, None, false)
+        .await
+        .unwrap();
+    assert!(queue
+        .retry_or_dead_letter(&claimed, 0, "work failed")
+        .await
+        .is_err());
+    let recovered = queue.claim_stale("recovery", 0, 10).await.unwrap();
+    assert_eq!(
+        recovered.len(),
+        1,
+        "failed DLQ write lost the source delivery"
+    );
+    assert_eq!(recovered[0].envelope.job_id, job_id);
+    assert_eq!(recovered[0].envelope.payload, claimed.envelope.payload);
+
+    let _: u64 = client.del(dlq.as_str()).await.unwrap();
+    queue
+        .retry_or_dead_letter(&recovered[0], 0, "work failed")
+        .await
+        .unwrap();
+    assert_eq!(client.xlen::<u64, _>(dlq.as_str()).await.unwrap(), 1);
+    assert!(queue
+        .claim_stale("recovery", 0, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        queue.status(&job_id).await.unwrap(),
+        JobStatus::Failed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn status_write_failure_preserves_each_finalization_for_recovery() {
+    let url = require_redis!();
+    let client = fresh_client(&url).await;
+    for action in ["ack", "retry", "dlq"] {
+        let queue = fresh_queue(Arc::clone(&client), action).await;
+        let job_id = queue.enqueue(owned_import("status-owner")).await.unwrap();
+        let claimed = queue.consume_next("original", 1000).await.unwrap().unwrap();
+        let key = format!("job:{job_id}");
+        let _: u64 = client.del(key.as_str()).await.unwrap();
+        let _: () = client
+            .set(key.as_str(), "wrong-type", None, None, false)
+            .await
+            .unwrap();
+        let failed = match action {
+            "ack" => queue.ack(&claimed, Some("result".into())).await.map(|_| ()),
+            "retry" => queue
+                .retry_or_dead_letter(&claimed, 1, "failed")
+                .await
+                .map(|_| ()),
+            _ => queue
+                .retry_or_dead_letter(&claimed, 0, "failed")
+                .await
+                .map(|_| ()),
+        };
+        assert!(failed.is_err(), "{action} must report a status write error");
+        assert_eq!(client.xlen::<u64, _>(queue.stream_name()).await.unwrap(), 1);
+        let recovered = queue.claim_stale("recovery", 0, 10).await.unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "{action} must preserve the pending delivery"
+        );
+        assert_eq!(recovered[0].envelope.job_id, job_id);
+        let dlq = format!("{}:dlq", queue.stream_name());
+        assert_eq!(client.xlen::<u64, _>(dlq.as_str()).await.unwrap(), 0);
+
+        let _: u64 = client.del(key.as_str()).await.unwrap();
+        match action {
+            "ack" => {
+                assert_eq!(queue.ack(&recovered[0], Some("result".into())).await.unwrap(),
+                    FinalizationOutcome::Applied);
+            }
+            "retry" => {
+                queue
+                    .retry_or_dead_letter(&recovered[0], 1, "failed")
+                    .await
+                    .unwrap();
+                let retry = queue.consume_next("recovery", 1000).await.unwrap().unwrap();
+                assert_eq!(retry.envelope.attempt, 1);
+                queue.ack(&retry, Some("result".into())).await.unwrap();
+            }
+            _ => {
+                queue
+                    .retry_or_dead_letter(&recovered[0], 0, "failed")
+                    .await
+                    .unwrap();
+            }
+        }
+        let (status, owner) = queue.poll(&job_id).await.unwrap();
+        assert_eq!(owner.as_deref(), Some("status-owner"));
+        if action == "dlq" {
+            assert!(matches!(status, JobStatus::Failed { .. }));
+            assert_eq!(client.xlen::<u64, _>(dlq.as_str()).await.unwrap(), 1);
+        } else {
+            assert!(
+                matches!(status, JobStatus::Succeeded { result_json: Some(ref r), .. } if r == "result")
+            );
+        }
+    }
+}
+
+/// A Lua script is atomic but not a transaction with error rollback. Deny
+/// each mutating command in turn to catch partial writes inside the script,
+/// including errors after the destination append would have succeeded.
+#[tokio::test]
+async fn denied_finalization_commands_cannot_lose_or_duplicate_work() {
+    let url = require_redis!();
+    let admin = fresh_client(&url).await;
+    for denied in ["xadd", "hset", "expire", "xack", "xdel"] {
+        let username = format!("queue-test-{}", nanoid::nanoid!(8));
+        let password = nanoid::nanoid!(32);
+        let credential = format!(">{password}");
+        let keys = format!("~{username}:*");
+        let deny = format!("-{denied}");
+        admin
+            .acl_setuser(
+                username.as_str(),
+                vec!["reset", "on", credential.as_str(), keys.as_str(),
+                    "+@connection", "+info", "+eval", "+xgroup", "+xrange", "+xpending",
+                    "+type", "+xadd", "+hset", "+expire", "+xack", "+xdel", deny.as_str()],
+            )
+            .await
+            .unwrap();
+        let mut config = fred::types::RedisConfig::from_url(&url).unwrap();
+        config.username = Some(username.clone());
+        config.password = Some(password);
+        // Catch assertion panics at the task boundary so account cleanup is
+        // awaited before propagating failure. A process kill can still leave
+        // an account, but it has an unlogged random password and scoped keys.
+        let result = tokio::spawn({
+            let admin = Arc::clone(&admin);
+            let username = username.clone();
+            async move {
+                let restricted = Arc::new(RedisClient::new(config, None, None, None));
+                restricted.init().await.unwrap();
+                for max_retries in [0, 1] {
+                    let queue = JobQueue::new(Arc::clone(&admin), format!("{username}:{max_retries}"))
+                        .await.unwrap();
+                    let job_id = queue.enqueue(owned_import("acl-owner")).await.unwrap();
+                    admin.acl_setuser(username.as_str(), vec![format!("~job:{job_id}")]).await.unwrap();
+                    let claimed = queue.consume_next("original", 1000).await.unwrap().unwrap();
+                    let worker = JobQueue::new(Arc::clone(&restricted), queue.stream_name())
+                        .await
+                        .unwrap();
+                    if denied == "hset" {
+                        assert!(worker.enqueue(owned_import("denied-producer")).await.is_err());
+                        assert_eq!(admin.xlen::<u64, _>(queue.stream_name()).await.unwrap(), 1,
+                            "a rejected initial status write must not append an orphan delivery");
+                    }
+                    let error = worker
+                        .retry_or_dead_letter(&claimed, max_retries, "failed")
+                        .await
+                        .unwrap_err();
+                    assert!(error.to_string().contains("NOPERM"), "{denied}: {error}");
+                    assert_eq!(
+                        admin.xlen::<u64, _>(queue.stream_name()).await.unwrap(),
+                        1,
+                        "{denied}"
+                    );
+                    let dlq = format!("{}:dlq", queue.stream_name());
+                    assert_eq!(
+                        admin.xlen::<u64, _>(dlq.as_str()).await.unwrap(),
+                        0,
+                        "{denied}"
+                    );
+                    let recovered = queue.claim_stale("recovery", 0, 10).await.unwrap();
+                    assert_eq!(recovered.len(), 1, "{denied}");
+                    assert!(matches!(
+                        queue.status(&job_id).await.unwrap(),
+                        JobStatus::Running { .. }
+                    ));
+                    queue
+                        .retry_or_dead_letter(&recovered[0], max_retries, "failed")
+                        .await
+                        .unwrap();
+                    if max_retries == 1 {
+                        let next = queue.consume_next("recovery", 1000).await.unwrap().unwrap();
+                        assert_eq!(next.envelope.attempt, 1);
+                        queue.ack(&next, None).await.unwrap();
+                    } else {
+                        assert_eq!(admin.xlen::<u64, _>(dlq.as_str()).await.unwrap(), 1);
+                    }
+                }
+                restricted.quit().await.unwrap();
+            }
+        }).await;
+        let _: u64 = admin.acl_deluser(username).await.unwrap();
+        result.unwrap();
+    }
+}
+
+/// XAUTOCLAIM keeps the stream ID but revokes the previous consumer's right
+/// to finalize, even when its handler is still running.
+#[tokio::test]
+async fn reclaimed_delivery_only_allows_the_current_consumer_to_finalize() {
+    let url = require_redis!();
+    let client = fresh_client(&url).await;
+    for terminal in [false, true] {
+        let queue = fresh_queue(Arc::clone(&client), "claim-owner").await;
+        let job_id = queue.enqueue(owned_import("claim-owner")).await.unwrap();
+        let old = queue.consume_next("original", 1000).await.unwrap().unwrap();
+        let current = queue.claim_stale("recovery", 0, 1).await.unwrap().pop().unwrap();
+        assert_eq!(current.stream_id, old.stream_id);
+        let running = queue.status(&job_id).await.unwrap();
+
+        assert_eq!(queue.ack(&old, None).await.unwrap(), FinalizationOutcome::ClaimLost);
+        assert_eq!(queue.retry_or_dead_letter(&old, 1, "stale retry").await.unwrap(),
+            RetryOutcome::ClaimLost);
+        assert_eq!(queue.retry_or_dead_letter(&old, 0, "stale failure").await.unwrap(),
+            RetryOutcome::ClaimLost);
+        assert_eq!(queue.status(&job_id).await.unwrap(), running);
+        assert_eq!(client.xlen::<u64, _>(queue.stream_name()).await.unwrap(), 1);
+        let dlq = format!("{}:dlq", queue.stream_name());
+        assert_eq!(client.xlen::<u64, _>(dlq.as_str()).await.unwrap(), 0);
+
+        // The reaper skips active tasks before reclaiming, preserving their
+        // receipt generation even when they are idle-stale again.
+        let same_owner = queue.claim_stale_excluding("recovery", 0, 1,
+            std::slice::from_ref(&current.stream_id)).await.unwrap();
+        assert!(same_owner.is_empty());
+        if terminal {
+            assert_eq!(queue.retry_or_dead_letter(&current, 0, "current failure").await.unwrap(),
+                RetryOutcome::DeadLettered);
+            assert_eq!(client.xlen::<u64, _>(dlq.as_str()).await.unwrap(), 1);
+        } else {
+            assert_eq!(queue.retry_or_dead_letter(&current, 1, "current retry").await.unwrap(),
+                RetryOutcome::Retried { attempt: 1 });
+            let next = queue.consume_next("recovery", 1000).await.unwrap().unwrap();
+            assert_eq!(next.envelope.attempt, 1);
+            assert_eq!(queue.ack(&next, None).await.unwrap(), FinalizationOutcome::Applied);
+        }
+        assert_eq!(client.xlen::<u64, _>(queue.stream_name()).await.unwrap(), 0);
+        assert!(queue.claim_stale("later", 0, 10).await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn reclaim_skips_in_flight_receipts_without_starving_later_jobs() {
+    let url = require_redis!();
+    let client = fresh_client(&url).await;
+    let queue = fresh_queue(client, "reclaim-exclusion").await;
+    queue.enqueue(owned_import("active")).await.unwrap();
+    let active = queue.consume_next("reaper", 1000).await.unwrap().unwrap();
+    queue.enqueue(owned_import("orphan")).await.unwrap();
+    let orphan = queue.consume_next("crashed", 1000).await.unwrap().unwrap();
+    let recovered = queue.claim_stale_excluding("reaper", 0, 1,
+        std::slice::from_ref(&active.stream_id)).await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].stream_id, orphan.stream_id);
+    assert_eq!(queue.ack(&active, None).await.unwrap(), FinalizationOutcome::Applied);
+    assert_eq!(queue.ack(&orphan, None).await.unwrap(), FinalizationOutcome::ClaimLost);
+    assert_eq!(queue.ack(&recovered[0], None).await.unwrap(), FinalizationOutcome::Applied);
+}
+
+#[tokio::test]
+async fn ownership_cycle_does_not_revive_an_old_claim() {
+    let url = require_redis!();
+    let client = fresh_client(&url).await;
+    let queue = fresh_queue(client, "ownership-cycle").await;
+    let job_id = queue.enqueue(owned_import("cycle-owner")).await.unwrap();
+    let original = queue.consume_next("reaper-a", 1000).await.unwrap().unwrap();
+    let intermediate = queue.claim_stale("reaper-b", 0, 1).await.unwrap().pop().unwrap();
+    let current = queue.claim_stale("reaper-a", 0, 1).await.unwrap().pop().unwrap();
+    assert_eq!(current.stream_id, original.stream_id);
+    let running = queue.status(&job_id).await.unwrap();
+    assert_eq!(queue.ack(&original, None).await.unwrap(), FinalizationOutcome::ClaimLost);
+    assert_eq!(queue.retry_or_dead_letter(&intermediate, 0, "obsolete failure").await.unwrap(),
+        RetryOutcome::ClaimLost);
+    assert_eq!(queue.status(&job_id).await.unwrap(), running);
+    assert_eq!(queue.ack(&current, None).await.unwrap(), FinalizationOutcome::Applied);
+}
+
+#[tokio::test]
+async fn terminal_outbox_failure_preserves_delivery_and_records_survive_reconnect() {
+    let url = require_redis!();
+    let client = fresh_client(&url).await;
+    for dead_letter in [false, true] {
+        let queue = fresh_queue(Arc::clone(&client), "terminal-outbox").await;
+        let job_id = queue.enqueue(owned_import("outbox-owner")).await.unwrap();
+        let claimed = queue.consume_next("worker", 1000).await.unwrap().unwrap();
+        let running = queue.status(&job_id).await.unwrap();
+        let outbox = format!("{}:finalizations", queue.stream_name());
+        let _: () = client.set(outbox.as_str(), "wrong type", None, None, false).await.unwrap();
+        if dead_letter {
+            assert!(queue.retry_or_dead_letter(&claimed, 0, "terminal error").await.is_err());
+        } else {
+            assert!(queue.ack(&claimed, None).await.is_err());
+        }
+        assert_eq!(queue.status(&job_id).await.unwrap(), running);
+        let _: u64 = client.del(outbox).await.unwrap();
+        let recovered = queue.claim_stale("recovery", 0, 1).await.unwrap().pop().unwrap();
+        if dead_letter {
+            assert_eq!(queue.retry_or_dead_letter(&recovered, 0, "terminal error").await.unwrap(),
+                RetryOutcome::DeadLettered);
+        } else {
+            assert_eq!(queue.ack(&recovered, None).await.unwrap(), FinalizationOutcome::Applied);
+        }
+        let stream = queue.stream_name().to_string();
+        drop(queue);
+        let reconnected = JobQueue::new(fresh_client(&url).await, stream).await.unwrap();
+        let record = reconnected.pending_finalization(&job_id).await.unwrap().unwrap();
+        assert_eq!(record.envelope.owner.as_deref(), Some("outbox-owner"));
+        assert_eq!(matches!(record.status, JobStatus::Failed { .. }), dead_letter);
+        assert!(reconnected.claim_stale("later", 0, 1).await.unwrap().is_empty());
+        reconnected.complete_finalization(&job_id).await.unwrap();
+        assert!(reconnected.pending_finalization(&job_id).await.unwrap().is_none());
+    }
+}
+
+async fn gated_status_client(url: &str, state: &str) -> (
+    Arc<RedisClient>, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>, tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let mut config = fred::types::RedisConfig::from_url(url).unwrap();
+    let pattern = format!("\"state\":\"{state}\"").into_bytes();
+    let server = config.server.hosts().remove(0);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    config.server = fred::types::ServerConfig::new_centralized("127.0.0.1", listener.local_addr().unwrap().port());
+    let paused = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let proxy = tokio::spawn({
+        let paused = Arc::clone(&paused);
+        let release = Arc::clone(&release);
+        async move {
+            let (downstream, _) = listener.accept().await.unwrap();
+            let upstream = tokio::net::TcpStream::connect((&*server.host, server.port)).await.unwrap();
+            let (down_read, mut down_write) = downstream.into_split();
+            let (mut up_read, mut up_write) = upstream.into_split();
+            let responses = async { tokio::io::copy(&mut up_read, &mut down_write).await.unwrap(); };
+            let requests = async {
+                let mut reader = BufReader::new(down_read);
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).await.unwrap() == 0 { break; }
+                    let count: usize = header.trim().strip_prefix('*').unwrap().parse().unwrap();
+                    let mut request = header.into_bytes();
+                    for _ in 0..count {
+                        let mut bulk = String::new();
+                        reader.read_line(&mut bulk).await.unwrap();
+                        let len: usize = bulk.trim().strip_prefix('$').unwrap().parse().unwrap();
+                        request.extend_from_slice(bulk.as_bytes());
+                        let mut value = vec![0; len + 2];
+                        reader.read_exact(&mut value).await.unwrap();
+                        request.extend(value);
+                    }
+                    if request.windows(pattern.len()).any(|w| w == pattern) {
+                        paused.notify_one();
+                        release.notified().await;
+                    }
+                    up_write.write_all(&request).await.unwrap();
+                }
+            };
+            tokio::select! { _ = requests => {}, _ = responses => {} }
+        }
+    });
+    let delayed_client = Arc::new(RedisClient::new(config, None, None, None));
+    delayed_client.init().await.unwrap();
+    (delayed_client, paused, release, proxy)
+}
+
+/// Pause a real Redis request after XREADGROUP has succeeded. This models a
+/// delayed connection across another worker's reclaim and terminal write.
+#[tokio::test]
+async fn delayed_running_status_cannot_overwrite_reclaimed_completion() {
+    let url = require_redis!();
+    let admin = fresh_client(&url).await;
+    let queue = fresh_queue(admin, "delayed-running").await;
+    let job_id = queue.enqueue(owned_import("delayed-owner")).await.unwrap();
+    let (delayed_client, paused, release, proxy) = gated_status_client(&url, "running").await;
+    let delayed_queue = JobQueue::new(delayed_client, queue.stream_name()).await.unwrap();
+    let consumer = tokio::spawn(async move { delayed_queue.consume_next("delayed", 1000).await });
+    tokio::time::timeout(Duration::from_secs(10), paused.notified()).await.unwrap();
+    let recovery = queue.claim_stale("recovery", 0, 1).await.unwrap().pop().unwrap();
+    assert_eq!(queue.ack(&recovery, None).await.unwrap(), FinalizationOutcome::Applied);
+    let terminal = queue.status(&job_id).await.unwrap();
+    release.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(10), consumer).await.unwrap().unwrap().unwrap();
+    assert_eq!(queue.status(&job_id).await.unwrap(), terminal,
+        "delayed Running write replaced terminal status");
+    assert!(result.is_none(), "revoked claim must not reach the handler");
+    proxy.abort();
+}
+
+#[tokio::test]
+async fn delayed_pending_publication_cannot_overwrite_a_fast_consumer() {
+    let url = require_redis!();
+    let queue = fresh_queue(fresh_client(&url).await, "delayed-producer").await;
+    let (client, paused, release, proxy) = gated_status_client(&url, "pending").await;
+    let producer = JobQueue::new(client, queue.stream_name()).await.unwrap();
+    let enqueue = tokio::spawn(async move { producer.enqueue(owned_import("producer-owner")).await });
+    tokio::time::timeout(Duration::from_secs(10), paused.notified()).await.unwrap();
+    // Before the fix XADD was already visible while Pending was delayed.
+    // Atomic initialization must keep the job invisible until both are ready.
+    let early = queue.consume_next("fast-worker", 25).await.unwrap();
+    if let Some(claimed) = &early {
+        assert_eq!(queue.ack(claimed, None).await.unwrap(), FinalizationOutcome::Applied);
+    }
+    release.notify_one();
+    let job_id = tokio::time::timeout(Duration::from_secs(10), enqueue).await.unwrap().unwrap().unwrap();
+    if early.is_none() {
+        let claimed = queue.consume_next("fast-worker", 1000).await.unwrap().unwrap();
+        assert_eq!(queue.ack(&claimed, None).await.unwrap(), FinalizationOutcome::Applied);
+    }
+    assert!(matches!(queue.status(&job_id).await.unwrap(), JobStatus::Succeeded { .. }),
+        "a delayed Pending write replaced a fast consumer's Succeeded status");
+    proxy.abort();
+}
+
+/// Repeating the same finalization models a client that lost the script reply.
+#[tokio::test]
+async fn repeated_and_concurrent_finalization_only_moves_a_delivery_once() {
+    let url = require_redis!();
+    let client = fresh_client(&url).await;
+    let queue = fresh_queue(Arc::clone(&client), "duplicate-finalization").await;
+    let job_id = queue.enqueue(owned_import("once-owner")).await.unwrap();
+    let claimed = queue.consume_next("original", 1000).await.unwrap().unwrap();
+    let (a, b) = tokio::join!(
+        queue.retry_or_dead_letter(&claimed, 1, "failed"),
+        queue.retry_or_dead_letter(&claimed, 1, "failed"),
+    );
+    let outcomes = [a.unwrap(), b.unwrap()];
+    assert!(outcomes.contains(&RetryOutcome::Retried { attempt: 1 }));
+    assert!(outcomes.contains(&RetryOutcome::AlreadyFinalized));
+    assert_eq!(client.xlen::<u64, _>(queue.stream_name()).await.unwrap(), 1);
+    let next = queue.consume_next("next", 1000).await.unwrap().unwrap();
+    assert_eq!(next.envelope.job_id, job_id);
+    assert_eq!(next.envelope.attempt, 1);
+    assert_eq!(next.envelope.owner.as_deref(), Some("once-owner"));
+    let running = queue.status(&job_id).await.unwrap();
+    // A late success or failure from the old claim cannot retire attempt1
+    // or overwrite its Running status.
+    assert_eq!(queue.ack(&claimed, Some("late".into())).await.unwrap(),
+        FinalizationOutcome::AlreadyFinalized);
+    assert_eq!(queue
+        .retry_or_dead_letter(&claimed, 0, "late failure")
+        .await
+        .unwrap(), RetryOutcome::AlreadyFinalized);
+    assert_eq!(queue.status(&job_id).await.unwrap(), running);
+
+    assert_eq!(queue
+        .retry_or_dead_letter(&next, 1, "final failure")
+        .await
+        .unwrap(), RetryOutcome::DeadLettered);
+    let failed = queue.status(&job_id).await.unwrap();
+    assert_eq!(queue
+        .retry_or_dead_letter(&next, 1, "different duplicate error")
+        .await
+        .unwrap(), RetryOutcome::AlreadyFinalized);
+    assert_eq!(queue.ack(&next, None).await.unwrap(), FinalizationOutcome::AlreadyFinalized);
+    assert_eq!(queue.status(&job_id).await.unwrap(), failed);
+    let dlq = format!("{}:dlq", queue.stream_name());
+    assert_eq!(client.xlen::<u64, _>(dlq.as_str()).await.unwrap(), 1);
+    let entries: Vec<(String, std::collections::HashMap<String, String>)> =
+        client.xrange(dlq.as_str(), "-", "+", None).await.unwrap();
+    assert_eq!(
+        entries[0].1.get("lastError").map(String::as_str),
+        Some("final failure")
+    );
+    assert!(queue
+        .claim_stale("recovery", 0, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(client.xlen::<u64, _>(queue.stream_name()).await.unwrap(), 0);
+}
+
+/// A process that cannot finalize must remain recoverable even when killed
+/// before it can retry or shut down gracefully. Use a separate OS process,
+/// not a dropped future on the same Redis client.
+#[tokio::test]
+async fn killed_worker_after_failed_handoff_is_recovered_by_another_process() {
+    let url = require_redis!();
+    const CHILD_STREAM: &str = "OGRE_QUEUE_CRASH_TEST_STREAM";
+    let client = fresh_client(&url).await;
+    if let Ok(stream) = std::env::var(CHILD_STREAM) {
+        let queue = JobQueue::new(Arc::clone(&client), &stream).await.unwrap();
+        let claimed = queue
+            .consume_next("crash-worker", 1000)
+            .await
+            .unwrap()
+            .unwrap();
+        let key = format!("job:{}", claimed.envelope.job_id);
+        let _: u64 = client.del(key.as_str()).await.unwrap();
+        let _: () = client
+            .set(key, "write-fault", None, None, false)
+            .await
+            .unwrap();
+        let max_retries = std::env::var("OGRE_QUEUE_CRASH_TEST_RETRIES")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            queue
+                .retry_or_dead_letter(&claimed, max_retries, "worker failed")
+                .await
+                .is_err()
+        );
+        let _: () = client
+            .set(format!("{stream}:ready"), "ready", None, None, false)
+            .await
+            .unwrap();
+        std::future::pending::<()>().await;
+        return;
+    }
+
+    for max_retries in [0, 1] {
+        let queue = fresh_queue(Arc::clone(&client), "process-crash").await;
+        let payload = owned_import("crash-owner");
+        let job_id = queue.enqueue(payload.clone()).await.unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "killed_worker_after_failed_handoff_is_recovered_by_another_process",
+                "--nocapture",
+            ])
+            .env(CHILD_STREAM, queue.stream_name())
+            .env("OGRE_QUEUE_CRASH_TEST_RETRIES", max_retries.to_string())
+            .spawn()
+            .unwrap();
+        let ready_key = format!("{}:ready", queue.stream_name());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut ready = false;
+        while tokio::time::Instant::now() < deadline {
+            if client
+                .get::<Option<String>, _>(&ready_key)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                ready = true;
+                break;
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        assert!(
+            ready,
+            "child must reach the failed handoff before interruption: {status}"
+        );
+        assert!(!status.success());
+
+        // Connect afresh, as a replacement worker does after a restart.
+        let recovery_client = fresh_client(&url).await;
+        let recovery = JobQueue::new(Arc::clone(&recovery_client), queue.stream_name())
+            .await
+            .unwrap();
+        let recovered = recovery
+            .claim_stale("replacement-worker", 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "killed worker lost the only durable payload"
+        );
+        assert_eq!(recovered[0].envelope.job_id, job_id);
+        assert_eq!(recovered[0].envelope.payload, payload);
+        assert_eq!(recovered[0].envelope.owner.as_deref(), Some("crash-owner"));
+        let _: u64 = recovery_client.del(format!("job:{job_id}")).await.unwrap();
+        recovery
+            .retry_or_dead_letter(&recovered[0], max_retries, "worker failed")
+            .await
+            .unwrap();
+        if max_retries == 1 {
+            let retry = recovery
+                .consume_next("replacement-worker", 1000)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retry.envelope.attempt, 1);
+            assert_eq!(retry.envelope.payload, payload);
+            recovery
+                .ack(&retry, Some("recovered".into()))
+                .await
+                .unwrap();
+            assert!(matches!(
+                recovery.status(&job_id).await.unwrap(),
+                JobStatus::Succeeded { .. }
+            ));
+        } else {
+            let dlq = format!("{}:dlq", queue.stream_name());
+            let entries: Vec<(String, std::collections::HashMap<String, String>)> =
+                recovery_client.xrange(dlq, "-", "+", None).await.unwrap();
+            assert_eq!(entries.len(), 1);
+            let envelope: ogrenotes_worker::JobEnvelope =
+                serde_json::from_str(&entries[0].1["envelope"]).unwrap();
+            assert_eq!(envelope, recovered[0].envelope);
+            assert!(matches!(
+                recovery.status(&job_id).await.unwrap(),
+                JobStatus::Failed { .. }
+            ));
+        }
+        assert!(
+            recovery
+                .claim_stale("replacement-worker", 0, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let _: u64 = client.del(ready_key).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn receipt_renewal_preserves_generation_and_stops_after_loss() {
+    let url = require_redis!();
+    let client = fresh_client(&url).await;
+    let queue = fresh_queue(client, "receipt-renewal").await;
+    queue.enqueue(Job::Noop { label: "renewal".into() }).await.unwrap();
+    let old = queue.consume_next("worker-a", 1000).await.unwrap().unwrap();
+    sleep(Duration::from_millis(120)).await;
+    assert!(queue.renew_claim(&old).await.unwrap());
+    assert!(queue.claim_stale("worker-b", 100, 1).await.unwrap().is_empty());
+    // JUSTID preserves the count, so the same receipt can still finalize.
+    assert_eq!(queue.ack(&old, None).await.unwrap(), FinalizationOutcome::Applied);
+
+    queue.enqueue(Job::Noop { label: "lost-receipt".into() }).await.unwrap();
+    let old = queue.consume_next("worker-a", 1000).await.unwrap().unwrap();
+    assert!(queue.renew_claim(&old).await.unwrap());
+    // A stopped heartbeat permits crash recovery after the idle threshold.
+    sleep(Duration::from_millis(120)).await;
+    let current = queue.claim_stale("worker-b", 100, 1).await.unwrap().pop().unwrap();
+    assert!(!queue.renew_claim(&old).await.unwrap());
+    assert!(queue.renew_claim(&current).await.unwrap());
+    // The owner returns to A, but its old generation must remain fenced.
+    let newest = queue.claim_stale("worker-a", 0, 1).await.unwrap().pop().unwrap();
+    assert!(!queue.renew_claim(&old).await.unwrap());
+    assert_eq!(queue.ack(&newest, None).await.unwrap(), FinalizationOutcome::Applied);
 }

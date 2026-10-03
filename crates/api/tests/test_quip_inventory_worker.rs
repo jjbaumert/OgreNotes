@@ -19,7 +19,7 @@ use std::sync::Arc;
 use fred::clients::RedisClient;
 use fred::prelude::*;
 use ogrenotes_api::worker_mode::{
-    execute_and_finalize, execute_start_quip_import, ImportRunOutcome, WorkerCtx,
+    execute_and_finalize, execute_start_quip_import, reconcile_finalizations, ImportRunOutcome, WorkerCtx,
 };
 use ogrenotes_quip_import::QuipToken;
 use ogrenotes_storage::models::import::{ImportRecord, ImportStatus};
@@ -135,7 +135,7 @@ fn now_ms() -> i64 {
 /// doesn't compete with concurrent tests on the same Redis. Mirrors the helper
 /// in `test_worker_mode.rs`.
 async fn fresh_queue(suffix: &str) -> JobQueue {
-    let config = fred::types::RedisConfig::from_url("redis://127.0.0.1:6379")
+    let config = fred::types::RedisConfig::from_url("redis://127.0.0.1:6379/13")
         .expect("parse REDIS_URL");
     let client = RedisClient::new(config, None, None, None);
     client.init().await.expect("connect redis");
@@ -455,6 +455,7 @@ async fn dead_lettered_quip_import_ends_failed() {
 
     let job_id = queue
         .enqueue(Job::StartQuipImport {
+            run: None,
             import_id: import_id.clone(),
             owner_id: "owner1".to_string(),
         })
@@ -525,6 +526,7 @@ async fn an_acked_token_rejected_job_keeps_the_imports_staging() {
     let queue = fresh_queue("tokenrejected-staging").await;
     queue
         .enqueue(Job::StartQuipImport {
+            run: None,
             import_id: import_id.clone(),
             owner_id: "owner1".to_string(),
         })
@@ -592,6 +594,7 @@ async fn dead_lettered_quip_import_drops_its_staged_thread_html() {
     let queue = fresh_queue("deadletter-staging").await;
     queue
         .enqueue(Job::StartQuipImport {
+            run: None,
             import_id: import_id.clone(),
             owner_id: "owner1".to_string(),
         })
@@ -627,6 +630,261 @@ async fn dead_lettered_quip_import_drops_its_staged_thread_html() {
         app.state.doc_repo.s3().get_object(&other_import_key).await.is_ok(),
         "the sweep must not reach another import's staging",
     );
+}
+
+#[tokio::test]
+async fn stale_failure_must_not_fail_a_completed_import_or_sweep_its_staging() {
+    obsolete_failure_preserves_import(false, 503, false).await;
+}
+
+#[tokio::test]
+async fn reclaimed_failure_must_not_fail_the_live_import_or_sweep_its_staging() {
+    obsolete_failure_preserves_import(true, 503, false).await;
+}
+
+#[tokio::test]
+async fn reclaimed_terminal_forbidden_preserves_the_current_import() {
+    obsolete_failure_preserves_import(true, 403, false).await;
+}
+
+#[tokio::test]
+async fn reclaimed_terminal_success_preserves_the_current_import() {
+    obsolete_failure_preserves_import(true, 200, false).await;
+}
+
+#[tokio::test]
+async fn live_long_handler_keeps_its_receipt_across_another_process_reaper() {
+    obsolete_failure_preserves_import(true, 200, true).await;
+}
+
+async fn obsolete_failure_preserves_import(reclaim_only: bool, status_code: u16, protect_live: bool) {
+    common::require_infra!();
+    // Pause an actual outbound Quip request until another finalizer wins.
+    // Notifications make this interleaving deterministic without timing sleeps.
+    let requested = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let router = axum::Router::new().route("/1/folders/", axum::routing::get({
+        let requested = Arc::clone(&requested);
+        let release = Arc::clone(&release);
+        move |axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>| {
+            let requested = Arc::clone(&requested);
+            let release = Arc::clone(&release);
+            async move {
+                requested.notify_one();
+                use axum::response::IntoResponse;
+                if protect_live {
+                    // Each request stays within Quip's 30-second timeout;
+                    // the seven-level walk keeps the handler busy for 70s.
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    let id = query.get("ids").unwrap().clone();
+                    let level = id.strip_prefix('f').and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                    let children = if level < 6 {
+                        vec![serde_json::json!({"folder_id": format!("f{}", level + 1)})]
+                    } else { Vec::new() };
+                    return axum::Json(std::collections::HashMap::from([(id.clone(), serde_json::json!({
+                        "folder": {"id": id, "title": "Folder"}, "children": children,
+                    }))])).into_response();
+                }
+                release.notified().await;
+                if status_code == 200 {
+                    axum::Json(serde_json::json!({
+                        "root": {"folder": {"id": "root", "title": "Root"}, "children": []}
+                    })).into_response()
+                } else {
+                    axum::http::StatusCode::from_u16(status_code).unwrap().into_response()
+                }
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let app = common::TestApp::new_with_quip_base(base.clone()).await;
+    let import_id = seed_scoping_import(&app, "owner1", &["root"]).await;
+    app.state.quip_token_store.put(&import_id, &QuipToken::new("tok".into())).await.unwrap();
+    let staged_key = format!("imports/{import_id}/threads/t1.html");
+    let staged = b"<p>retained diagnostic content</p>".to_vec();
+    app.state.doc_repo.s3().put_object(&staged_key, staged.clone()).await.unwrap();
+    let client = RedisClient::new(
+        fred::types::RedisConfig::from_url("redis://127.0.0.1:6379/13").unwrap(),
+        None, None, None,
+    );
+    client.init().await.unwrap();
+    let queue = JobQueue::new(Arc::new(client), format!("quip-stale-finalizer:{}", nanoid::nanoid!(8)))
+        .await.unwrap();
+    let job_id = queue.enqueue(Job::StartQuipImport {
+            run: None,
+        import_id: import_id.clone(), owner_id: "owner1".into(),
+    }).await.unwrap();
+    let mut claimed = queue.consume_next("old-worker", 1000).await.unwrap().unwrap();
+    for _ in 0..3 {
+        queue.retry_or_dead_letter(&claimed, 3, "earlier failure").await.unwrap();
+        claimed = queue.consume_next("old-worker", 1000).await.unwrap().unwrap();
+    }
+    assert_eq!(claimed.envelope.attempt, 3);
+    let base_for_recovery = base.clone();
+    let ctx = worker_ctx_with_quip(&app, base);
+    let old_queue = queue.clone();
+    let old_claim = claimed.clone();
+    let worker = tokio::spawn(async move {
+        execute_and_finalize(&old_queue, old_claim, &ctx).await;
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), requested.notified()).await.unwrap();
+
+    if protect_live {
+        // Redis measures idle time itself, so use real elapsed time beyond
+        // the production 60-second reaper threshold. The DDB runner heartbeat
+        // remains live while the outbound Quip request is held.
+        tokio::time::sleep(std::time::Duration::from_secs(65)).await;
+        let competing = queue.claim_stale("another-process-reaper", 60_000, 1).await.unwrap();
+        let was_reclaimed = !competing.is_empty();
+        if let Some(reclaimed) = competing.into_iter().next() {
+            let recovery_ctx = worker_ctx_with_quip(&app, base_for_recovery.clone());
+            let outcome = execute_start_quip_import(&recovery_ctx, &import_id, "owner1").await.unwrap();
+            eprintln!("competing handler outcome: {outcome:?}");
+            assert_eq!(outcome, ImportRunOutcome::HeldByLiveRunner);
+            execute_and_finalize(&queue, reclaimed, &recovery_ctx).await;
+        }
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(20), worker).await.unwrap().unwrap();
+        eprintln!("original completion status: {:?}", queue.status(&job_id).await.unwrap());
+        assert!(!was_reclaimed, "another process reclaimed a healthy long-running handler");
+        assert!(matches!(queue.status(&job_id).await.unwrap(), JobStatus::Succeeded { .. }));
+        assert_eq!(app.state.import_repo.get(&import_id).await.unwrap().unwrap().status, ImportStatus::Succeeded);
+        server.abort();
+        app.cleanup().await;
+        return;
+    }
+
+    // Transfer ownership or complete the delivery while the old handler is
+    // waiting for its failing HTTP response.
+    let recovery = if reclaim_only {
+        let recovery = queue.claim_stale("recovery", 0, 1).await.unwrap().pop().unwrap();
+        assert_eq!(recovery.stream_id, claimed.stream_id);
+        Some(recovery)
+    } else {
+        queue.ack(&claimed, None).await.unwrap();
+        app.state.import_repo.set_status(&import_id, ImportStatus::Succeeded).await.unwrap();
+        None
+    };
+    let expected_status = queue.status(&job_id).await.unwrap();
+    let expected_import_status = app.state.import_repo.get(&import_id).await.unwrap().unwrap().status;
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(10), worker).await.unwrap().unwrap();
+    assert_eq!(queue.status(&job_id).await.unwrap(), expected_status);
+    assert_eq!(app.state.import_repo.get(&import_id).await.unwrap().unwrap().status,
+        expected_import_status, "obsolete dead-letter overwrote the current import status");
+    assert_eq!(app.state.doc_repo.s3().get_object(&staged_key).await.unwrap(), staged,
+        "obsolete dead-letter performed terminal staging cleanup");
+    if let Some(recovery) = recovery {
+        assert_eq!(queue.ack(&recovery, None).await.unwrap(),
+            ogrenotes_worker::FinalizationOutcome::Applied);
+    }
+    server.abort();
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn unobserved_dead_letter_outcome_recovers_terminal_import_effects() {
+    common::require_infra!();
+    let server = quip_transient_error_server().await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1", &["root"]).await;
+    app.state.quip_token_store.put(&import_id, &QuipToken::new("tok".into())).await.unwrap();
+    app.state.import_repo.set_status(&import_id, ImportStatus::Running).await.unwrap();
+    let staged_key = format!("imports/{import_id}/threads/t1.html");
+    app.state.doc_repo.s3().put_object(&staged_key, b"retained".to_vec()).await.unwrap();
+    let queue = fresh_queue("unobserved-terminal").await;
+    let job_id = queue.enqueue(Job::StartQuipImport {
+            run: None,
+        import_id: import_id.clone(), owner_id: "owner1".into(),
+    }).await.unwrap();
+    let claimed = queue.consume_next("lost-reply-worker", 1000).await.unwrap().unwrap();
+    // Redis committed the terminal outcome, but no API side effects ran.
+    // Repeating delivery finalization must recover the committed outcome.
+    queue.retry_or_dead_letter(&claimed, 0, "committed terminal failure").await.unwrap();
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_and_finalize(&queue, claimed, &ctx).await;
+    assert!(matches!(queue.status(&job_id).await.unwrap(), JobStatus::Failed { .. }));
+    assert_eq!(app.state.import_repo.get(&import_id).await.unwrap().unwrap().status,
+        ImportStatus::Failed, "unobserved terminal outcome left the import poll stuck");
+    assert!(app.state.doc_repo.s3().get_object(&staged_key).await.is_err());
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn terminal_outbox_recovers_without_a_receipt_and_replay_preserves_a_resumed_import() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let import_id = seed_scoping_import(&app, "owner1", &["root"]).await;
+    app.state.import_repo.set_status(&import_id, ImportStatus::Running).await.unwrap();
+    let queue = fresh_queue("restart-terminal").await;
+    let job_id = queue.enqueue(Job::StartQuipImport {
+            run: None,
+        import_id: import_id.clone(), owner_id: "owner1".into(),
+    }).await.unwrap();
+    let claimed = queue.consume_next("dead-worker", 1000).await.unwrap().unwrap();
+    queue.retry_or_dead_letter(&claimed, 0, "committed failure").await.unwrap();
+    let record = queue.pending_finalization(&job_id).await.unwrap().unwrap();
+    let stream = queue.stream_name().to_string();
+    drop(claimed);
+    drop(queue);
+
+    let client = Arc::new(RedisClient::new(
+        fred::types::RedisConfig::from_url("redis://127.0.0.1:6379/13").unwrap(), None, None, None,
+    ));
+    client.init().await.unwrap();
+    let restarted = JobQueue::new(Arc::clone(&client), stream.clone()).await.unwrap();
+    let ctx = worker_ctx_with_quip(&app, "http://127.0.0.1:1".into());
+    reconcile_finalizations(&restarted, &ctx, &mut "0".to_string()).await;
+    assert_eq!(app.state.import_repo.get(&import_id).await.unwrap().unwrap().status, ImportStatus::Failed);
+    assert!(restarted.pending_finalization(&job_id).await.unwrap().is_none());
+
+    // Model a lost HDEL response followed by another run of this import.
+    // Replaying the old outcome cannot downgrade or sweep the resumed run.
+    let _: u64 = client.hset(format!("{stream}:finalizations"),
+        vec![(job_id.as_str(), serde_json::to_string(&record).unwrap())]).await.unwrap();
+    app.state.import_repo.set_status(&import_id, ImportStatus::Running).await.unwrap();
+    let staged_key = format!("imports/{import_id}/threads/new.html");
+    app.state.doc_repo.s3().put_object(&staged_key, b"new run".to_vec()).await.unwrap();
+    reconcile_finalizations(&restarted, &ctx, &mut "0".to_string()).await;
+    assert_eq!(app.state.import_repo.get(&import_id).await.unwrap().unwrap().status, ImportStatus::Running);
+    assert_eq!(app.state.doc_repo.s3().get_object(&staged_key).await.unwrap(), b"new run");
+    assert!(restarted.pending_finalization(&job_id).await.unwrap().is_none());
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn first_late_outbox_application_cannot_finalize_a_new_http_start() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let (owner_id, token) = app.create_user("outbox-new-run@test.com").await;
+    let folder = app.create_folder(&token, "Destination", None).await;
+    let import_id = seed_scoping_import(&app, &owner_id, &["root"]).await;
+    app.state.import_repo.set_status(&import_id, ImportStatus::Running).await.unwrap();
+    let queue = fresh_queue("first-late-outbox").await;
+    queue.enqueue(Job::StartQuipImport {
+            run: None,
+        import_id: import_id.clone(), owner_id: owner_id.clone(),
+    }).await.unwrap();
+    let old = queue.consume_next("old-run", 1000).await.unwrap().unwrap();
+    queue.retry_or_dead_letter(&old, 0, "old run failed").await.unwrap();
+
+    // Start a new run through the actual route before J1's first effect.
+    let (status, body) = app.json_request(
+        axum::http::Method::POST, &format!("/api/v1/imports/quip/{import_id}/start"), Some(&token),
+        Some(serde_json::json!({"selectedRootFolderIds": ["root"], "targetFolderId": folder})),
+    ).await;
+    assert_eq!(status, 202, "new start failed: {body}");
+    let run_id = app.state.import_repo.current_run_id(&import_id).await.unwrap().unwrap();
+    let staged_key = format!("imports/{import_id}/runs/{run_id}/threads/new.html");
+    app.state.doc_repo.s3().put_object(&staged_key, b"new run".to_vec()).await.unwrap();
+    let ctx = worker_ctx_with_quip(&app, "http://127.0.0.1:1".into());
+    reconcile_finalizations(&queue, &ctx, &mut "0".to_string()).await;
+    assert_eq!(app.state.import_repo.get(&import_id).await.unwrap().unwrap().status, ImportStatus::Running,
+        "first-late old completion overwrote the new run");
+    assert_eq!(app.state.doc_repo.s3().get_object(&staged_key).await.unwrap(), b"new run");
+    app.cleanup().await;
 }
 
 /// Regression (C1/C2, the critical one): the reaper must NOT ack a job whose
@@ -683,6 +941,7 @@ async fn live_lease_redelivery_leaves_the_entry_pending_instead_of_acking() {
     let queue = fresh_queue("live-lease").await;
     let job_id = queue
         .enqueue(Job::StartQuipImport {
+            run: None,
             import_id: import_id.clone(),
             owner_id: "owner1".to_string(),
         })
@@ -770,4 +1029,156 @@ async fn inventory_forbidden_root_fails_without_blaming_the_token() {
     let note = report.notes.first().expect("a note names the cause");
     assert!(note.detail.contains("403"), "{note:?}");
     assert!(note.detail.contains("folder"), "{note:?}");
+}
+
+#[tokio::test]
+async fn current_run_completion_sweeps_only_its_own_staging() {
+    common::require_infra!();
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/1/folders/"))
+        .respond_with(ResponseTemplate::new(403)).expect(1).mount(&server).await;
+    let app = common::TestApp::new_with_quip_base(server.uri()).await;
+    let import_id = seed_scoping_import(&app, "owner1", &["root"]).await;
+    app.state.quip_token_store.put(&import_id, &QuipToken::new("tok".into())).await.unwrap();
+    app.state.import_repo.activate_run(&import_id, "run-a", 2, &["root".into()], "target").await.unwrap();
+    let old_key = format!("imports/{import_id}/runs/run-a/threads/a.html");
+    let new_key = format!("imports/{import_id}/runs/run-b/threads/b.html");
+    for key in [&old_key, &new_key] {
+        app.state.doc_repo.s3().put_object(key, b"staging".to_vec()).await.unwrap();
+    }
+    let queue = fresh_queue("scoped-cleanup").await;
+    // A superseded queued generation must retire without calling Quip or
+    // publishing a terminal status for the active run.
+    queue.enqueue(Job::StartQuipImport {
+        import_id: import_id.clone(), owner_id: "owner1".into(), run: Some(ogrenotes_worker::QuipImportRun { id: "run-obsolete".into(), sequence: 1, selected_roots: vec!["obsolete".into()], target_folder_id: "target".into() }),
+    }).await.unwrap();
+    let obsolete = queue.consume_next("worker", 1000).await.unwrap().unwrap();
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_and_finalize(&queue, obsolete, &ctx).await;
+    assert_eq!(app.state.import_repo.get(&import_id).await.unwrap().unwrap().status, ImportStatus::Scoping);
+    assert_eq!(app.state.doc_repo.s3().get_object(&old_key).await.unwrap(), b"staging");
+    queue.enqueue(Job::StartQuipImport {
+        import_id: import_id.clone(), owner_id: "owner1".into(), run: Some(ogrenotes_worker::QuipImportRun { id: "run-a".into(), sequence: 2, selected_roots: vec!["root".into()], target_folder_id: "target".into() }),
+    }).await.unwrap();
+    let claimed = queue.consume_next("worker", 1000).await.unwrap().unwrap();
+    let ctx = worker_ctx_with_quip(&app, server.uri());
+    execute_and_finalize(&queue, claimed, &ctx).await;
+    assert_eq!(app.state.import_repo.get(&import_id).await.unwrap().unwrap().status, ImportStatus::Failed);
+    assert!(app.state.doc_repo.s3().get_object(&old_key).await.is_err());
+    assert_eq!(app.state.doc_repo.s3().get_object(&new_key).await.unwrap(), b"staging");
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn published_run_activates_from_its_receipt_after_api_crash() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let import_id = seed_scoping_import(&app, "owner1", &["old-root"]).await;
+    let sequence = app.state.import_repo.reserve_run_sequence(&import_id).await.unwrap();
+    let queue = fresh_queue("published-activation").await;
+    let run = ogrenotes_worker::QuipImportRun {
+        id: "published-run".into(), sequence, selected_roots: vec!["new-root".into()],
+        target_folder_id: "new-target".into(),
+    };
+    queue.enqueue(Job::StartQuipImport {
+        import_id: import_id.clone(), owner_id: "owner1".into(), run: Some(run.clone()),
+    }).await.unwrap();
+    // The API disappears after successful Redis publication and never activates.
+    assert!(app.state.import_repo.current_run_id(&import_id).await.unwrap().is_none());
+    let claimed = queue.consume_next("recovery", 1000).await.unwrap().unwrap();
+    let ctx = worker_ctx_with_quip(&app, "http://127.0.0.1:1".into());
+    execute_and_finalize(&queue, claimed, &ctx).await;
+    let record = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(record.selected_roots, run.selected_roots);
+    assert_eq!(record.target_folder_id.as_deref(), Some("new-target"));
+    assert_eq!(record.status, ImportStatus::TokenRejected);
+    assert_eq!(app.state.import_repo.current_run_id(&import_id).await.unwrap().as_deref(), Some(run.id.as_str()));
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn worker_pool_renews_live_receipts_while_other_consumers_block() {
+    common::require_infra!();
+    use std::time::Duration;
+    use ogrenotes_api::worker_mode::spawn_workers;
+    let ready = Arc::new(tokio::sync::Barrier::new(17));
+    let router = axum::Router::new().route("/1/folders/", axum::routing::get({
+        let ready = Arc::clone(&ready);
+        move |axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>| {
+            let ready = Arc::clone(&ready);
+            async move {
+                let id = query.get("ids").unwrap().clone();
+                if id == "long0" || id.starts_with("short") {
+                    // All 16 handlers enter before 15 finish and start idle
+                    // blocking reads. This exercises the real production pool.
+                    ready.wait().await;
+                }
+                let children = if let Some(level) = id.strip_prefix("long") {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    let level: u32 = level.parse().unwrap();
+                    if level < 6 { vec![serde_json::json!({"folder_id": format!("long{}", level + 1)})] }
+                    else { Vec::new() }
+                } else { Vec::new() };
+                axum::Json(std::collections::HashMap::from([(id.clone(), serde_json::json!({
+                    "folder": {"id": id, "title": "Pool fixture"}, "children": children,
+                }))]))
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let app = common::TestApp::new_with_quip_base(base.clone()).await;
+    let queue = fresh_queue("pool-heartbeat").await;
+    let monitor_client = RedisClient::new(
+        fred::types::RedisConfig::from_url("redis://127.0.0.1:6379/13").unwrap(), None, None, None);
+    monitor_client.init().await.unwrap();
+    let monitor = JobQueue::new(Arc::new(monitor_client), queue.stream_name()).await.unwrap();
+    let mut long_job = String::new();
+    let mut long_import = String::new();
+    for i in 0..16 {
+        let root = if i == 0 { "long0".into() } else { format!("short{i}") };
+        let import_id = seed_scoping_import(&app, "owner1", &[&root]).await;
+        app.state.quip_token_store.put(&import_id, &QuipToken::new("tok".into())).await.unwrap();
+        let job_id = queue.enqueue(Job::StartQuipImport {
+            import_id: import_id.clone(), owner_id: "owner1".into(), run: None,
+        }).await.unwrap();
+        if i == 0 { long_job = job_id; long_import = import_id; }
+    }
+    let ctx = Arc::new(worker_ctx_with_quip(&app, base));
+    let (shutdown, rx) = tokio::sync::watch::channel(false);
+    let handles = spawn_workers(queue, ctx, 16, rx);
+    let started = tokio::time::timeout(Duration::from_secs(20), ready.wait()).await.is_ok();
+    let mut reclaimed_long = false;
+    let mut completed = false;
+    if started {
+        tokio::time::sleep(Duration::from_secs(65)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(80);
+        loop {
+            let reclaimed = monitor.claim_stale("other-process", 60_000, 32).await.unwrap();
+            reclaimed_long = reclaimed.iter().any(|job| job.envelope.job_id == long_job);
+            if reclaimed_long {
+                eprintln!("pool fixture: original long receipt reclaimed while its finalizer was still pending");
+                break;
+            }
+            if matches!(monitor.status(&long_job).await.unwrap(), JobStatus::Succeeded { .. })
+                && app.state.import_repo.get_for_run(&long_import, None).await.unwrap().unwrap().status
+                    == ImportStatus::Succeeded
+            {
+                completed = true;
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline { break; }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    let final_status = app.state.import_repo.get(&long_import).await.unwrap().unwrap().status;
+    let _ = shutdown.send(true);
+    for handle in handles { handle.abort(); let _ = handle.await; }
+    server.abort();
+    app.cleanup().await;
+    assert!(started, "the 16 production handlers failed to enter the fixture");
+    assert!(!reclaimed_long, "idle consumers delayed renewal beyond the 60-second lease");
+    assert!(completed, "the original long handler failed to finalize");
+    assert_eq!(final_status, ImportStatus::Succeeded);
 }
