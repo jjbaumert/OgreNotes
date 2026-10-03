@@ -69,7 +69,7 @@ async function socketGate(page) {
   const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROME_BIN || undefined });
   const errors = [];
   try {
-    for (const scenario of ['disjoint-text', 'formatting', 'inline-formatting', 'prepend', 'unicode-history']) {
+    for (const scenario of ['disjoint-text', 'formatting', 'inline-formatting', 'prepend', 'structural-window', 'unicode-history']) {
       if (process.env.COLLAB_CASE && process.env.COLLAB_CASE !== scenario) continue;
       const contexts = await Promise.all([0, 1].map(() => browser.newContext({ bypassCSP: true, serviceWorkers: 'block' })));
       const tokens = await Promise.all(contexts.map(async (c, i) => (await api(c, 'POST', 'auth/dev-login', { email: `preserve-${scenario}-${Date.now()}-${i}@example.test` })).json()));
@@ -116,6 +116,26 @@ async function socketGate(page) {
         gates.forEach(g => g.release());
         expected = [initial];
         await until(async () => (await Promise.all(pages.map(p => p.locator(`${selector} strong em, ${selector} em strong`).count()))).every(Boolean), 'Both marks must survive');
+      } else if (scenario === 'structural-window') {
+        // Hold remote frames while B appends a block, then pause A's timers.
+        // The local keystroke lands after remote Yrs apply but before the
+        // debounced UI swap and local sync callbacks can run.
+        gates[0].held = true;
+        await select(b, 0, 5);
+        await b.keyboard.press('Enter');
+        await b.keyboard.insertText('Peer');
+        await exact([b], ['Hello', 'Peer']);
+        await until(() => gates[0].pending.length > 0, 'Remote structural update must be queued');
+        await a.clock.install();
+        await a.clock.pauseAt(new Date(Date.now() + 1000));
+        gates[0].release();
+        await delay(100);
+        await select(a, 0, 5);
+        await a.keyboard.insertText('!');
+        await exact([a], ['Hello!']);
+        await a.clock.runFor(1000);
+        await a.clock.resume();
+        expected = ['Hello!', 'Peer'];
       } else if (scenario === 'prepend') {
         // Exercise the actual prepend UI. Deterministic stale-baseline timing
         // is covered separately by collab_semantics using the same bridge.

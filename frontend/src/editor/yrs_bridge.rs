@@ -52,11 +52,13 @@ fn write_doc_attrs(txn: &mut yrs::TransactionMut<'_>, attrs: &HashMap<String, St
     }
 }
 
-/// Reconcile the `docAttrs` map against `attrs`: add/update keys that
-/// differ, remove keys no longer present. Mirrors `sync_attrs`'s
-/// add/update/remove-stale shape for XmlElement attributes, just
-/// against a root Map instead.
-fn sync_doc_attrs(txn: &mut yrs::TransactionMut<'_>, attrs: &HashMap<String, String>) {
+/// Apply only root attributes changed locally since the last synchronized
+/// baseline, preserving peer additions, removals and updates during stale edits.
+fn sync_doc_attrs(
+    txn: &mut yrs::TransactionMut<'_>,
+    attrs: &HashMap<String, String>,
+    baseline: Option<&HashMap<String, String>>,
+) {
     let map = txn.get_or_insert_map(DOC_ATTRS_MAP);
     let mut existing: HashMap<String, String> = map
         .iter(txn)
@@ -70,13 +72,19 @@ fn sync_doc_attrs(txn: &mut yrs::TransactionMut<'_>, attrs: &HashMap<String, Str
         if key == "blockId" {
             continue;
         }
+        if baseline.is_some_and(|old| old.get(key) == Some(value)) {
+            existing.remove(key);
+            continue;
+        }
         if existing.get(key) != Some(value) {
             map.insert(txn, key.as_str(), value.as_str());
         }
         existing.remove(key);
     }
     for key in existing.keys() {
-        map.remove(txn, key);
+        if baseline.is_none_or(|old| old.contains_key(key)) {
+            map.remove(txn, key);
+        }
     }
 }
 
@@ -300,21 +308,15 @@ pub fn sync_model_to_ydoc_diffed(
         };
 
         sync_children(&mut txn, &fragment, new_children, old_children);
-        sync_doc_attrs(&mut txn, new_attrs);
+        sync_doc_attrs(&mut txn, new_attrs, last_synced.map(Node::attrs));
     }
     normalized
 }
 
 
-/// #92: whether two docs have the identical ordered list of top-level
-/// blockIds. This is the safety predicate for folding a possibly-stale
-/// editor model into a ydoc that just applied a remote update:
-/// `sync_children` treats the model's child list as authoritative, so a
-/// fold while the lists differ would delete a remotely-added block (see
-/// the `fold_after_remote_apply_deletes_peer_content` tripwire). When
-/// the lists match, reconciliation can only touch per-block subtrees —
-/// blocks the user hasn't edited are skipped by the equality check and
-/// remote content inside them survives.
+/// Whether two docs have the same ordered top-level block IDs. Structural
+/// differences are diagnostic only: baseline-aware reconciliation can preserve
+/// peer-only blocks while folding a stale local model.
 pub fn same_top_level_block_ids(a: &Node, b: &Node) -> bool {
     fn ids(doc: &Node) -> Option<Vec<&str>> {
         match doc {
@@ -4863,15 +4865,10 @@ mod tests {
         );
     }
 
-    /// #92 (swap-window half): keystrokes typed between a remote apply and
-    /// the debounced swap-read exist only in the editor model. The recv
-    /// timer folds them into the ydoc before swapping — but only when the
-    /// model and the post-merge ydoc agree on top-level structure
-    /// (`same_top_level_block_ids`), which is what makes the fold safe:
-    /// per-block reconciliation can't delete a block. This exercises both
-    /// branches of that guard.
+    /// Structural comparison detects a peer's new block without preventing
+    /// baseline-aware reconciliation of pending local typing.
     #[test]
-    fn swap_window_fold_is_guarded_by_structure() {
+    fn swap_window_fold_preserves_remote_structure() {
         let para = |id: &str, text: &str| {
             Node::element_with_attrs(
                 NodeType::Paragraph,
@@ -4916,7 +4913,7 @@ mod tests {
             doc_text(&merged)
         );
 
-        // ── Guard-negative: remote added a block; fold must be skipped. ──
+        // Remote added a block; the stale local change must still be folded.
         let ydoc2 = Doc::new();
         {
             let mut txn = ydoc2.transact_mut();
@@ -4942,8 +4939,11 @@ mod tests {
         let swap_state2 = read_doc_from_ydoc(&ydoc2).unwrap();
         assert!(
             !same_top_level_block_ids(&typed, &swap_state2),
-            "remote structural change → the guard must refuse the fold \
-             (folding would delete the peer's block, per the tripwire test)"
+            "remote structural change must be detectable"
         );
+        sync_model_to_ydoc_diffed(&ydoc2, &typed, Some(&baseline));
+        let merged = read_doc_from_ydoc(&ydoc2).unwrap();
+        assert_eq!(doc_text(&merged), "alHelloPeer");
+        assert_eq!(merged.child_count(), 2);
     }
 }

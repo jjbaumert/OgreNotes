@@ -260,3 +260,21 @@ fn delivered_remote_reorder_survives_stale_local_typing() {
         &document(vec![paragraph("b1", "First!"), paragraph("b2", "Second")]), Some(&initial));
     assert_merged(&a, &b, &document(vec![paragraph("b2", "Second"), paragraph("b1", "First!")]));
 }
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn stale_typing_preserves_peer_root_attribute_changes() {
+    let root = |attrs: &[(&str, &str)], text| Node::element_with_attrs(
+        NodeType::Doc,
+        attrs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        Fragment::from(vec![paragraph("b1", text)]),
+    );
+    let initial = root(&[("theme", "light"), ("obsolete", "old")], "Hello");
+    let (a, b) = pair(&initial);
+    let remote = root(&[("theme", "dark"), ("peer", "added")], "Hello");
+    sync_model_to_ydoc_diffed(&b, &remote, Some(&initial));
+    send(&b, &a);
+    let local = root(&[("theme", "light"), ("obsolete", "old")], "Hello!");
+    sync_model_to_ydoc_diffed(&a, &local, Some(&initial));
+    assert_merged(&a, &b, &root(&[("theme", "dark"), ("peer", "added")], "Hello!"));
+}
