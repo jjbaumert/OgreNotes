@@ -58,16 +58,31 @@ async function holdReceiveDebounce(page) {
     const set = window.setTimeout.bind(window);
     const clear = window.clearTimeout.bind(window);
     const pending = new Map();
+    const forwarded = new Map();
+    const cancel = id => {
+      if (pending.delete(id)) { clear(id); return; }
+      if (forwarded.has(id)) {
+        clear(forwarded.get(id));
+        forwarded.delete(id);
+        if (!forwarded.size) window.clearTimeout = clear;
+        return;
+      }
+      clear(id);
+    };
     window.__receiveGate = {
       pending: () => pending.size,
       release: () => {
         window.setTimeout = set;
-        window.clearTimeout = clear;
         for (const [id, { callback, args }] of pending) {
           clear(id);
-          set(callback, 0, ...args);
+          forwarded.set(id, set(() => {
+            forwarded.delete(id);
+            if (!forwarded.size) window.clearTimeout = clear;
+            callback(...args);
+          }, 0));
         }
         pending.clear();
+        if (!forwarded.size) window.clearTimeout = clear;
       },
     };
     window.setTimeout = (callback, ms, ...args) => {
@@ -76,7 +91,7 @@ async function holdReceiveDebounce(page) {
       pending.set(id, { callback, args });
       return id;
     };
-    window.clearTimeout = id => { pending.delete(id); clear(id); };
+    window.clearTimeout = cancel;
   });
 }
 async function socketGate(page) {
@@ -147,7 +162,7 @@ async function socketGate(page) {
         expected = [initial];
         await until(async () => (await Promise.all(pages.map(p => p.locator(`${selector} strong em, ${selector} em strong`).count()))).every(Boolean), 'Both marks must survive');
       } else if (scenario === 'structural-window') {
-        // Hold remote frames while B appends a block, then pause A's timers.
+        // Hold remote frames while B appends a block, then gate A's receive debounce.
         // The local keystroke lands after remote Yrs apply but before the
         // debounced UI swap and local sync callbacks can run.
         gates[0].held = true;
@@ -163,7 +178,14 @@ async function socketGate(page) {
         await select(a, 0, 5);
         await a.keyboard.insertText('!');
         await exact([a], ['Hello!']);
-        await a.evaluate(() => window.__receiveGate.release());
+        const cancelledTimer = await a.evaluate(() => {
+          window.__receiveGateProbe = false;
+          return window.setTimeout(() => { window.__receiveGateProbe = true; }, 16);
+        });
+        await a.evaluate(id => { window.__receiveGate.release(); window.clearTimeout(id); }, cancelledTimer);
+        await delay(20);
+        assert.equal(await a.evaluate(() => window.__receiveGateProbe), false,
+          'Released timer must still honor its original cancellation ID');
         expected = ['Hello!', 'Peer'];
       } else if (scenario === 'prepend') {
         // Exercise the actual prepend UI. Deterministic stale-baseline timing
