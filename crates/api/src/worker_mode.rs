@@ -581,6 +581,9 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
             Ok(FinalizationOutcome::AlreadyFinalized) => {
                 tracing::info!(job_id, attempt, "delivery already finalized; skipping terminal cleanup");
             }
+            Ok(FinalizationOutcome::ClaimLost) => {
+                tracing::info!(job_id, attempt, "delivery reclaimed by another consumer; skipping terminal cleanup");
+            }
             Err(e) => tracing::warn!(job_id, error = %e, "ack failed; entry orphaned"),
         },
         // Storage unreachable: the failure says nothing about the job, so it
@@ -624,6 +627,9 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
                 }
                 Ok(RetryOutcome::AlreadyFinalized) => {
                     tracing::info!(job_id, attempt, "delivery already finalized; skipping terminal cleanup");
+                }
+                Ok(RetryOutcome::ClaimLost) => {
+                    tracing::info!(job_id, attempt, "delivery reclaimed by another consumer; skipping terminal cleanup");
                 }
                 Err(e) => {
                     tracing::error!(

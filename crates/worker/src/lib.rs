@@ -197,14 +197,19 @@ const ENVELOPE_FIELD: &str = "envelope";
 // A removed source is the completion marker. Repeating a call after a lost
 // reply, or finalizing a stale claim after another worker, cannot append a
 // duplicate or overwrite the status of a newer attempt.
+// A reclaim keeps the source ID, so also fence against its current PEL owner.
 const FINALIZE_DELIVERY: &str = r#"
 local source, destination, status = KEYS[1], KEYS[2], KEYS[3]
 local group, id = ARGV[1], ARGV[2]
 if #redis.call('XRANGE', source, id, id) == 0 then
     return 0
 end
-if #redis.call('XPENDING', source, group, id, id, 1) == 0 then
+local pending = redis.call('XPENDING', source, group, id, id, 1)
+if #pending == 0 then
     return redis.error_reply('Delivery is not pending in the consumer group')
+end
+if pending[1][2] ~= ARGV[9] then
+    return 2
 end
 local status_type = redis.call('TYPE', status).ok
 if status_type ~= 'none' and status_type ~= 'hash' then
@@ -395,11 +400,13 @@ impl JobQueue {
         Ok(Some(ClaimedJob {
             stream_id: stream_id.clone(),
             envelope,
+            consumer: consumer.to_string(),
         }))
     }
 
     /// Atomically publish Succeeded status and retire the delivery.
     /// Repeated finalization returns [`FinalizationOutcome::AlreadyFinalized`].
+    /// Ownership transferred by reclaim returns [`FinalizationOutcome::ClaimLost`].
     /// Only [`FinalizationOutcome::Applied`] permits terminal cleanup: an
     /// earlier finalizer may have retried this job instead of completing it.
     /// `result_json` is whatever the worker
@@ -447,6 +454,7 @@ impl JobQueue {
             Ok(match finalized {
                 FinalizationOutcome::Applied => RetryOutcome::Retried { attempt: next.attempt },
                 FinalizationOutcome::AlreadyFinalized => RetryOutcome::AlreadyFinalized,
+                FinalizationOutcome::ClaimLost => RetryOutcome::ClaimLost,
             })
         } else {
             let status = JobStatus::Failed {
@@ -458,6 +466,7 @@ impl JobQueue {
             Ok(match finalized {
                 FinalizationOutcome::Applied => RetryOutcome::DeadLettered,
                 FinalizationOutcome::AlreadyFinalized => RetryOutcome::AlreadyFinalized,
+                FinalizationOutcome::ClaimLost => RetryOutcome::ClaimLost,
             })
         }
     }
@@ -481,7 +490,7 @@ impl JobQueue {
         } else {
             self.stream.clone()
         };
-        let applied: bool = self.client.eval(
+        let outcome: u64 = self.client.eval(
             FINALIZE_DELIVERY,
             vec![self.stream.clone(), destination, status_key(&claimed.envelope.job_id)],
             vec![
@@ -493,13 +502,15 @@ impl JobQueue {
                 envelope_json,
                 if dead_letter_error.is_some() { "1" } else { "0" }.to_string(),
                 dead_letter_error.unwrap_or_default().to_string(),
+                claimed.consumer.clone(),
             ],
         ).await?;
-        Ok(if applied {
-            FinalizationOutcome::Applied
-        } else {
-            FinalizationOutcome::AlreadyFinalized
-        })
+        match outcome {
+            0 => Ok(FinalizationOutcome::AlreadyFinalized),
+            1 => Ok(FinalizationOutcome::Applied),
+            2 => Ok(FinalizationOutcome::ClaimLost),
+            other => Err(JobError::Redis(format!("unexpected finalization outcome: {other}"))),
+        }
     }
 
     /// Read the side-channel status hash for `job_id`. Returns
@@ -576,7 +587,7 @@ impl JobQueue {
             })?;
             let envelope: JobEnvelope = serde_json::from_str(envelope_json)
                 .map_err(|e| JobError::Serialize(e.to_string()))?;
-            out.push(ClaimedJob { stream_id, envelope });
+            out.push(ClaimedJob { stream_id, envelope, consumer: consumer.to_string() });
         }
         Ok(out)
     }
@@ -612,11 +623,13 @@ fn status_key(job_id: &str) -> String {
 }
 
 /// A consumer's view of a claimed entry. Wraps the parsed
-/// envelope with the underlying stream id needed for XACK/XDEL.
+/// envelope with the stream ID and consumer identity needed for finalization.
 #[derive(Debug, Clone)]
 pub struct ClaimedJob {
     pub stream_id: String,
     pub envelope: JobEnvelope,
+    // Receipt identity, kept in memory rather than changing the job envelope.
+    consumer: String,
 }
 
 /// Whether this invocation applied a delivery's finalization.
@@ -626,6 +639,9 @@ pub enum FinalizationOutcome {
     /// A different invocation already retired this delivery. Its outcome may
     /// have been a retry, so this does not authorize terminal side effects.
     AlreadyFinalized,
+    /// Another consumer reclaimed this pending delivery. No change was made;
+    /// the old owner must not perform terminal cleanup or status writes.
+    ClaimLost,
 }
 
 /// Outcome of [`JobQueue::retry_or_dead_letter`].
@@ -635,6 +651,8 @@ pub enum RetryOutcome {
     DeadLettered,
     /// No change was made. Do not perform terminal cleanup or status writes.
     AlreadyFinalized,
+    /// Another consumer owns this delivery. No retry, DLQ, or cleanup is due.
+    ClaimLost,
 }
 
 /// Trait-shaped abstraction so the producer side (the API task)

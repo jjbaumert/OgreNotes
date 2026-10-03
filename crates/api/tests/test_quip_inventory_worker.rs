@@ -631,6 +631,15 @@ async fn dead_lettered_quip_import_drops_its_staged_thread_html() {
 
 #[tokio::test]
 async fn stale_failure_must_not_fail_a_completed_import_or_sweep_its_staging() {
+    obsolete_failure_preserves_import(false).await;
+}
+
+#[tokio::test]
+async fn reclaimed_failure_must_not_fail_the_live_import_or_sweep_its_staging() {
+    obsolete_failure_preserves_import(true).await;
+}
+
+async fn obsolete_failure_preserves_import(reclaim_only: bool) {
     common::require_infra!();
     // Pause an actual outbound Quip request until another finalizer wins.
     // Notifications make this interleaving deterministic without timing sleeps.
@@ -682,18 +691,30 @@ async fn stale_failure_must_not_fail_a_completed_import_or_sweep_its_staging() {
     });
     tokio::time::timeout(std::time::Duration::from_secs(10), requested.notified()).await.unwrap();
 
-    // A different worker has completed the same delivery while this handler
-    // is waiting for its failing HTTP response.
-    queue.ack(&claimed, None).await.unwrap();
-    app.state.import_repo.set_status(&import_id, ImportStatus::Succeeded).await.unwrap();
-    let succeeded = queue.status(&job_id).await.unwrap();
+    // Transfer ownership or complete the delivery while the old handler is
+    // waiting for its failing HTTP response.
+    let recovery = if reclaim_only {
+        let recovery = queue.claim_stale("recovery", 0, 1).await.unwrap().pop().unwrap();
+        assert_eq!(recovery.stream_id, claimed.stream_id);
+        Some(recovery)
+    } else {
+        queue.ack(&claimed, None).await.unwrap();
+        app.state.import_repo.set_status(&import_id, ImportStatus::Succeeded).await.unwrap();
+        None
+    };
+    let expected_status = queue.status(&job_id).await.unwrap();
+    let expected_import_status = app.state.import_repo.get(&import_id).await.unwrap().unwrap().status;
     release.notify_one();
     tokio::time::timeout(std::time::Duration::from_secs(10), worker).await.unwrap().unwrap();
-    assert_eq!(queue.status(&job_id).await.unwrap(), succeeded);
+    assert_eq!(queue.status(&job_id).await.unwrap(), expected_status);
     assert_eq!(app.state.import_repo.get(&import_id).await.unwrap().unwrap().status,
-        ImportStatus::Succeeded, "obsolete dead-letter overwrote the winning import status");
+        expected_import_status, "obsolete dead-letter overwrote the current import status");
     assert_eq!(app.state.doc_repo.s3().get_object(&staged_key).await.unwrap(), staged,
         "obsolete dead-letter performed terminal staging cleanup");
+    if let Some(recovery) = recovery {
+        assert_eq!(queue.ack(&recovery, None).await.unwrap(),
+            ogrenotes_worker::FinalizationOutcome::Applied);
+    }
     server.abort();
     app.cleanup().await;
 }

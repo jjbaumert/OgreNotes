@@ -587,8 +587,51 @@ async fn denied_finalization_commands_cannot_lose_or_duplicate_work() {
     }
 }
 
-/// Re-delivering the same request models a client that did not receive the
-/// script's reply. A competing reaper can also finalize the same delivery.
+/// XAUTOCLAIM keeps the stream ID but revokes the previous consumer's right
+/// to finalize, even when its handler is still running.
+#[tokio::test]
+async fn reclaimed_delivery_only_allows_the_current_consumer_to_finalize() {
+    let url = require_redis!();
+    let client = fresh_client(&url).await;
+    for terminal in [false, true] {
+        let queue = fresh_queue(Arc::clone(&client), "claim-owner").await;
+        let job_id = queue.enqueue(owned_import("claim-owner")).await.unwrap();
+        let old = queue.consume_next("original", 1000).await.unwrap().unwrap();
+        let current = queue.claim_stale("recovery", 0, 1).await.unwrap().pop().unwrap();
+        assert_eq!(current.stream_id, old.stream_id);
+        let running = queue.status(&job_id).await.unwrap();
+
+        assert_eq!(queue.ack(&old, None).await.unwrap(), FinalizationOutcome::ClaimLost);
+        assert_eq!(queue.retry_or_dead_letter(&old, 1, "stale retry").await.unwrap(),
+            RetryOutcome::ClaimLost);
+        assert_eq!(queue.retry_or_dead_letter(&old, 0, "stale failure").await.unwrap(),
+            RetryOutcome::ClaimLost);
+        assert_eq!(queue.status(&job_id).await.unwrap(), running);
+        assert_eq!(client.xlen::<u64, _>(queue.stream_name()).await.unwrap(), 1);
+        let dlq = format!("{}:dlq", queue.stream_name());
+        assert_eq!(client.xlen::<u64, _>(dlq.as_str()).await.unwrap(), 0);
+
+        // The reaper periodically reclaims entries using its own consumer
+        // name. That must not revoke an existing task's current ownership.
+        let same_owner = queue.claim_stale("recovery", 0, 1).await.unwrap();
+        assert_eq!(same_owner.len(), 1);
+        if terminal {
+            assert_eq!(queue.retry_or_dead_letter(&current, 0, "current failure").await.unwrap(),
+                RetryOutcome::DeadLettered);
+            assert_eq!(client.xlen::<u64, _>(dlq.as_str()).await.unwrap(), 1);
+        } else {
+            assert_eq!(queue.retry_or_dead_letter(&current, 1, "current retry").await.unwrap(),
+                RetryOutcome::Retried { attempt: 1 });
+            let next = queue.consume_next("recovery", 1000).await.unwrap().unwrap();
+            assert_eq!(next.envelope.attempt, 1);
+            assert_eq!(queue.ack(&next, None).await.unwrap(), FinalizationOutcome::Applied);
+        }
+        assert_eq!(client.xlen::<u64, _>(queue.stream_name()).await.unwrap(), 0);
+        assert!(queue.claim_stale("later", 0, 10).await.unwrap().is_empty());
+    }
+}
+
+/// Repeating the same finalization models a client that lost the script reply.
 #[tokio::test]
 async fn repeated_and_concurrent_finalization_only_moves_a_delivery_once() {
     let url = require_redis!();

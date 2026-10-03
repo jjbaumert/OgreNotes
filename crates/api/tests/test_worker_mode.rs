@@ -234,6 +234,15 @@ fn worker_ctx(app: &common::TestApp) -> WorkerCtx {
 
 #[tokio::test]
 async fn stale_success_must_not_delete_the_live_retrys_staging_blob() {
+    obsolete_success_preserves_staging(false).await;
+}
+
+#[tokio::test]
+async fn reclaimed_delivery_rejects_the_old_workers_terminal_cleanup() {
+    obsolete_success_preserves_staging(true).await;
+}
+
+async fn obsolete_success_preserves_staging(reclaim_only: bool) {
     common::require_infra!();
     let app = common::TestApp::new().await;
     let ctx = worker_ctx(&app);
@@ -261,10 +270,22 @@ async fn stale_success_must_not_delete_the_live_retrys_staging_blob() {
     }).await.unwrap();
     let old = queue.consume_next("slow-worker", 1000).await.unwrap().unwrap();
 
-    // A recovery worker has already finalized this delivery as a retry.
-    queue.retry_or_dead_letter(&old, 3, "recovery worker failed").await.unwrap();
-    let retry = queue.consume_next("recovery-worker", 1000).await.unwrap().unwrap();
-    assert_eq!(retry.envelope.attempt, 1);
+    let retry = if reclaim_only {
+        // XAUTOCLAIM transfers the PEL owner without changing the entry ID.
+        // The original worker is still running and can finish after transfer.
+        let mut reclaimed = queue.claim_stale("recovery-worker", 0, 1).await.unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        let reclaimed = reclaimed.pop().unwrap();
+        assert_eq!(reclaimed.stream_id, old.stream_id);
+        assert_eq!(reclaimed.envelope.attempt, 0);
+        reclaimed
+    } else {
+        // A recovery worker has already finalized this delivery as a retry.
+        queue.retry_or_dead_letter(&old, 3, "recovery worker failed").await.unwrap();
+        let retry = queue.consume_next("recovery-worker", 1000).await.unwrap().unwrap();
+        assert_eq!(retry.envelope.attempt, 1);
+        retry
+    };
     let running = queue.status(&job_id).await.unwrap();
 
     // The old worker completes real S3 parsing and document persistence late.
@@ -272,9 +293,9 @@ async fn stale_success_must_not_delete_the_live_retrys_staging_blob() {
     execute_and_finalize(&queue, old, &ctx).await;
     assert_eq!(app.state.folder_repo.list_children(&folder_id).await.unwrap().len(), 1,
         "the stale handler must actually succeed to exercise its ack cleanup path");
-    assert_eq!(queue.status(&job_id).await.unwrap(), running);
     assert_eq!(s3.get_object(&key).await.unwrap(), fixture,
         "stale completion deleted the live retry's staging upload");
+    assert_eq!(queue.status(&job_id).await.unwrap(), running);
 
     // Only the current delivery may perform terminal cleanup.
     execute_and_finalize(&queue, retry, &ctx).await;
