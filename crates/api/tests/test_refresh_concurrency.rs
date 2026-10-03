@@ -2,7 +2,8 @@
 
 //! Deterministic refresh races over HTTP, with real DynamoDB writes. The
 //! session-only proxy holds completed reads so both requests have observed
-//! the same token before either is allowed to update it.
+//! the same token before either is allowed to update it. A separate update
+//! gate pins the expiry check to the timestamp submitted by the application.
 
 mod common;
 
@@ -18,7 +19,7 @@ use ogrenotes_storage::{dynamo::DynamoClient, repo::session_repo::SessionRepo};
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
@@ -44,6 +45,8 @@ impl Drop for Server {
 }
 
 struct SessionReadGate {
+    capture_update: Option<mpsc::Sender<i64>>,
+    update_held: AtomicBool,
     client: reqwest::Client,
     seen: AtomicUsize,
     hold_count: usize,
@@ -56,12 +59,19 @@ async fn proxy_dynamo(
     mut headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, HeaderMap, Body) {
-    let is_get = headers
-        .get("x-amz-target")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .ends_with(".GetItem");
+    let target = headers.get("x-amz-target").unwrap().to_str().unwrap();
+    let is_get = target.ends_with(".GetItem");
+    if target.ends_with(".UpdateItem") {
+        if let Some(captured) = &gate.capture_update {
+            if !gate.update_held.swap(true, Ordering::SeqCst) {
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let verified_at = request["ExpressionAttributeValues"][":now"]["N"]
+                    .as_str().unwrap().parse::<i64>().unwrap();
+                captured.send(verified_at).await.unwrap();
+                gate.release.acquire().await.unwrap().forget();
+            }
+        }
+    }
     headers.remove("host");
     let response = gate
         .client
@@ -91,9 +101,24 @@ async fn gated_app(
     Arc<SessionReadGate>,
     mpsc::Receiver<()>,
 ) {
+    gated_app_with_update_capture(hold_count, None).await
+}
+
+async fn gated_app_with_update_capture(
+    hold_count: usize,
+    capture_update: Option<mpsc::Sender<i64>>,
+) -> (
+    common::TestApp,
+    Server,
+    Server,
+    Arc<SessionReadGate>,
+    mpsc::Receiver<()>,
+) {
     let mut app = common::TestApp::new().await;
     let (captured, receiver) = mpsc::channel(hold_count.max(1));
     let gate = Arc::new(SessionReadGate {
+        capture_update,
+        update_held: AtomicBool::new(false),
         client: reqwest::Client::new(),
         seen: AtomicUsize::new(0),
         hold_count,
@@ -347,5 +372,63 @@ async fn http_refresh_cannot_extend_a_session_that_expired_after_its_read() {
         .unwrap()
         .unwrap();
     assert_eq!(session.expires_at, 0);
+    app.cleanup().await;
+}
+
+/// Expiry is a credential-verification deadline, sampled by the application
+/// immediately before submitting the conditional update. DynamoDB evaluates
+/// the current row against that timestamp, not against a database wall clock.
+#[tokio::test]
+async fn http_refresh_authorized_before_expiry_can_finish_after_expiry() {
+    common::require_infra!();
+    let (captured, mut updates) = mpsc::channel(1);
+    let (app, server, _proxy, gate, _reads) =
+        gated_app_with_update_capture(0, Some(captured)).await;
+    let (status, login) = post_json(
+        &server.base,
+        "/api/v1/auth/dev-login",
+        &json!({"email":"expiry-boundary@test.com"}),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let base = server.base.clone();
+    let body = refresh_body(&login);
+    let pending = tokio::spawn(async move {
+        post_json(&base, "/api/v1/auth/refresh", &body).await
+    });
+    let verified_at = tokio::time::timeout(Duration::from_secs(10), updates.recv())
+        .await.expect("rotation reached UpdateItem before forwarding")
+        .expect("verification timestamp captured");
+
+    // Put the old row's expiry strictly between the captured verification
+    // time and the delayed write. Choosing the deadline after the handshake
+    // avoids a short-TTL race with CI scheduling. This fixture changes only
+    // the stored expiry; the held production UpdateItem remains untouched.
+    let expires_at = verified_at + 1;
+    use aws_sdk_dynamodb::types::AttributeValue;
+    app.dynamo_client().update_item()
+        .table_name(&app.table_name)
+        .key("PK", AttributeValue::S(format!("USER#{}", login["userId"].as_str().unwrap())))
+        .key("SK", AttributeValue::S(format!("SESSION#{}", login["sessionId"].as_str().unwrap())))
+        .update_expression("SET expires_at = :expiry")
+        .expression_attribute_values(":expiry", AttributeValue::N(expires_at.to_string()))
+        .send().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while ogrenotes_common::time::now_usec() <= expires_at {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }).await.expect("old session deadline passed before forwarding UpdateItem");
+    let session = app.state.session_repo.get(
+        login["userId"].as_str().unwrap(), login["sessionId"].as_str().unwrap(),
+    ).await.unwrap().unwrap();
+    assert_eq!(session.expires_at, expires_at);
+    assert!(session.is_expired(), "the stored old session expired while the update was held");
+
+    gate.release.add_permits(1);
+    let (status, rotated) = pending.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "expiry is checked at verification, not commit");
+    let successor = json!({"userId": login["userId"], "sessionId": login["sessionId"],
+        "refreshToken": rotated["refreshToken"]});
+    assert_eq!(post_json(&server.base, "/api/v1/auth/refresh", &successor).await.0,
+        StatusCode::OK, "the authorized successor remains usable");
     app.cleanup().await;
 }

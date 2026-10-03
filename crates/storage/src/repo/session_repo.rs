@@ -82,7 +82,10 @@ impl SessionRepo {
 
     /// Consume exactly the token hash observed by the caller. Returns
     /// false when another refresh or revocation won the race, or the
-    /// session expired. A failed condition never recreates a deleted row.
+    /// stored expiry is at or before the verification time sampled just
+    /// before submitting this update. An authorized request may finish after
+    /// that deadline: DynamoDB compares the supplied timestamp, not a live
+    /// database clock. A failed condition never recreates a deleted row.
     pub async fn update_refresh_token(
         &self,
         user_id: &str,
