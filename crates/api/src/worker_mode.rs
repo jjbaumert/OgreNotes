@@ -562,8 +562,8 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
     }
     let mut delivery_ctx = ctx.clone();
     delivery_ctx.deferred_import_status = Some(Arc::new(std::sync::Mutex::new(None)));
-    if let Job::StartQuipImport { run_id, .. } = &claimed.envelope.payload {
-        delivery_ctx.import_run_id = run_id.clone();
+    if let Job::StartQuipImport { run, .. } = &claimed.envelope.payload {
+        delivery_ctx.import_run_id = run.as_ref().map(|run| run.id.clone());
     }
     match queue.renew_claim(&claimed).await {
         Ok(true) => {}
@@ -697,7 +697,8 @@ async fn reconcile_finalization(queue: &JobQueue, ctx: &WorkerCtx, record: Pendi
 }
 
 async fn apply_finalization(ctx: &WorkerCtx, record: &PendingFinalization) -> Result<(), String> {
-    if let Job::StartQuipImport { import_id, run_id, .. } = &record.envelope.payload {
+    if let Job::StartQuipImport { import_id, run, .. } = &record.envelope.payload {
+        let run_id = run.as_ref().map(|run| run.id.as_str());
         let status = match &record.status {
             JobStatus::Failed { .. } => Some(ImportStatus::Failed),
             JobStatus::Succeeded { result_json: Some(json), .. } => {
@@ -709,13 +710,13 @@ async fn apply_finalization(ctx: &WorkerCtx, record: &PendingFinalization) -> Re
             _ => None,
         };
         if let Some(status) = status {
-            let applied = ctx.import_repo.apply_job_completion(import_id, &record.envelope.job_id, run_id.as_deref(), status)
+            let applied = ctx.import_repo.apply_job_completion(import_id, &record.envelope.job_id, run_id, status)
                 .await.map_err(|e| e.to_string())?;
             // Never base cleanup on an eventually-consistent status read: a
             // replay could sweep a newer run. Cleanup is advisory after the
             // conditional write; a crash here leaves the lifecycle backstop.
             if applied && matches!(status, ImportStatus::Succeeded | ImportStatus::Failed) {
-                cleanup_quip_staging(ctx, import_id, run_id.as_deref()).await;
+                cleanup_quip_staging(ctx, import_id, run_id).await;
             }
         }
     } else {
@@ -780,7 +781,12 @@ async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<JobDisposition, Strin
         }
         #[cfg(not(feature = "pdf"))]
         Job::ImportPdf { .. } => Err("PDF import not compiled into this build".into()),
-        Job::StartQuipImport { import_id, owner_id, .. } => {
+        Job::StartQuipImport { import_id, owner_id, run } => {
+            if let Some(run) = run {
+                ctx.import_repo.activate_run(import_id, &run.id, run.sequence,
+                    &run.selected_roots, &run.target_folder_id).await
+                    .map_err(|e| format!("activate published import: {e}"))?;
+            }
             match execute_start_quip_import(ctx, import_id, owner_id).await? {
                 ImportRunOutcome::Ran => {
                     let status = ctx.deferred_import_status.as_ref().and_then(|status|

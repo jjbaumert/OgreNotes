@@ -894,22 +894,35 @@ impl ImportRepo {
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
 
-    /// Bind a start's scope and generation before its trigger becomes visible.
-    /// A failed enqueue can be retried by starting a fresh generation.
-    pub async fn set_scope_for_run(
-        &self,
-        import_id: &str,
-        roots: &[String],
-        target: &str,
-        run_id: &str,
-    ) -> Result<(), RepoError> {
-        self.db.update_item(
+    /// Allocate an ordering token without superseding any accepted work.
+    /// Failed publication leaves only a harmless gap in the sequence.
+    pub async fn reserve_run_sequence(&self, import_id: &str) -> Result<u64, RepoError> {
+        let result = self.db.inner().update_item().table_name(self.db.table_name())
+            .key("PK", AttributeValue::S(format!("IMPORT#{import_id}")))
+            .key("SK", AttributeValue::S(ImportRecord::sk().into()))
+            .update_expression("ADD next_run_sequence :one")
+            .condition_expression("attribute_exists(PK)")
+            .expression_attribute_values(":one", AttributeValue::N("1".into()))
+            .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+            .send().await.map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        let item = result.attributes.ok_or_else(|| RepoError::MissingField("next_run_sequence".into()))?;
+        get_n_u64(&item, "next_run_sequence")
+    }
+
+    /// Activate only a published run, ordered against other activated runs.
+    /// Called after enqueue or by a worker holding that durable delivery.
+    pub async fn activate_run(
+        &self, import_id: &str, run_id: &str, sequence: u64, roots: &[String], target: &str,
+    ) -> Result<bool, RepoError> {
+        self.db.update_item_conditional(
             &format!("IMPORT#{import_id}"), ImportRecord::sk(),
-            "SET selected_roots = :roots, target_folder_id = :target, active_run_id = :run, updated_at = :now",
+            "SET selected_roots = :roots, target_folder_id = :target, active_run_id = :run, active_run_sequence = :sequence, updated_at = :now",
+            "attribute_exists(PK) AND (attribute_not_exists(active_run_sequence) OR active_run_sequence < :sequence)",
             HashMap::from([
                 (":roots".into(), AttributeValue::L(roots.iter().cloned().map(AttributeValue::S).collect())),
                 (":target".into(), AttributeValue::S(target.into())),
                 (":run".into(), AttributeValue::S(run_id.into())),
+                (":sequence".into(), AttributeValue::N(sequence.to_string())),
                 (":now".into(), AttributeValue::N(ogrenotes_common::time::now_usec().to_string())),
             ]), None,
         ).await.map_err(|e| RepoError::Dynamo(e.to_string()))

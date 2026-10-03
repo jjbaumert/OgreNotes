@@ -254,10 +254,10 @@ struct StartResponse {
 ///
 /// Owner-gates the import row, authorizes the destination folder
 /// (`check_folder_access` hides an unauthorized/missing folder as 404,
-/// same as a missing/foreign import), persists the chosen scope, then
-/// enqueues the token-free `Job::StartQuipImport` trigger the worker
-/// (Task 3) claims and runs. Deliberately does NOT write `status: Running`
-/// here — the worker sets that authoritatively when it claims the job;
+/// same as a missing/foreign import), reserves a sequence, then enqueues
+/// the token-free scope in `Job::StartQuipImport`. Only a published trigger
+/// activates the scope; the worker also activates before executing.
+/// The worker sets `status: Running` authoritatively when it claims the job;
 /// the `"running"` in the response body is only the optimistic label the
 /// wizard shows while the worker spins up.
 async fn start(
@@ -289,25 +289,30 @@ async fn start(
     let effective_target =
         ensure_import_folder(&state, &record, &import_id, &req.target_folder_id, &user_id).await?;
 
-    let run_id = new_id();
-    state
-        .import_repo
-        .set_scope_for_run(&import_id, &req.selected_root_folder_ids, &effective_target, &run_id)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
     let producer = state
         .job_producer
         .as_ref()
         .ok_or_else(|| ApiError::ServiceUnavailable("job queue unavailable".to_string()))?;
+    let run = ogrenotes_worker::QuipImportRun {
+        id: new_id(),
+        sequence: state.import_repo.reserve_run_sequence(&import_id).await
+            .map_err(|e| ApiError::Internal(e.to_string()))?,
+        selected_roots: req.selected_root_folder_ids,
+        target_folder_id: effective_target,
+    };
     producer
         .enqueue(ogrenotes_worker::Job::StartQuipImport {
             import_id: import_id.clone(),
             owner_id: user_id,
-            run_id: Some(run_id),
+            run: Some(run.clone()),
         })
         .await
         .map_err(|e| ApiError::ServiceUnavailable(format!("enqueue failed: {e}")))?;
+    // The successor is now durable. Workers also activate before import work,
+    // covering a lost reply or API crash between enqueue and this write.
+    state.import_repo.activate_run(&import_id, &run.id, run.sequence,
+        &run.selected_roots, &run.target_folder_id).await
+        .map_err(|e| ApiError::ServiceUnavailable(format!("activate queued import: {e}")))?;
 
     Ok((
         StatusCode::ACCEPTED,

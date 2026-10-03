@@ -48,6 +48,17 @@ use thiserror::Error;
 /// poll on this via the JobStatus API.
 pub type JobId = String;
 
+/// Scope of one published Quip start. The sequence is reserved in DynamoDB
+/// without changing the active run; only a durably queued start may activate it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuipImportRun {
+    pub id: String,
+    pub sequence: u64,
+    pub selected_roots: Vec<String>,
+    pub target_folder_id: String,
+}
+
 /// Typed work payloads. Adding a new job kind:
 /// 1. Add a variant here with the field shape the worker needs.
 /// 2. Update the consumer side's dispatch (typically a `match`
@@ -85,9 +96,9 @@ pub enum Job {
     StartQuipImport {
         import_id: String,
         owner_id: String,
-        /// Scope generation recorded before enqueue. Missing on legacy jobs.
+        /// Published scope and generation. Missing on legacy jobs.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        run_id: Option<String>,
+        run: Option<QuipImportRun>,
     },
     /// No-op job — used by tests to verify the queue mechanics
     /// without dragging in DOCX/PDF deps. Carries an arbitrary
@@ -898,7 +909,7 @@ mod tests {
     /// poll-auth path (#85) doesn't silently fall through to ownerless.
     #[test]
     fn start_quip_import_wire_tag_and_owner() {
-        let job = Job::StartQuipImport { import_id: "imp1".into(), owner_id: "u1".into(), run_id: None };
+        let job = Job::StartQuipImport { import_id: "imp1".into(), owner_id: "u1".into(), run: None };
         let json = serde_json::to_string(&job).unwrap();
         assert!(json.contains(r#""type":"startQuipImport""#), "wire tag pinned: {json}");
         // Token-free trigger: the job envelope must never carry the Quip
@@ -907,9 +918,9 @@ mod tests {
         let lower = json.to_ascii_lowercase();
         assert!(!lower.contains("token"), "trigger must be token-free: {json}");
         assert!(!lower.contains("secret"), "trigger must carry no secret: {json}");
-        assert!(!json.contains("run_id"), "legacy wire omits the generation");
+        assert!(!json.contains("run"), "legacy wire omits the generation");
         let versioned = Job::StartQuipImport {
-            import_id: "imp1".into(), owner_id: "u1".into(), run_id: Some("run1".into()),
+            import_id: "imp1".into(), owner_id: "u1".into(), run: Some(QuipImportRun { id: "run1".into(), sequence: 1, selected_roots: vec!["root".into()], target_folder_id: "target".into() }),
         };
         assert_eq!(serde_json::from_str::<Job>(&serde_json::to_string(&versioned).unwrap()).unwrap(), versioned);
         let back: Job = serde_json::from_str(&json).unwrap();

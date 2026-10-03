@@ -455,7 +455,7 @@ async fn dead_lettered_quip_import_ends_failed() {
 
     let job_id = queue
         .enqueue(Job::StartQuipImport {
-            run_id: None,
+            run: None,
             import_id: import_id.clone(),
             owner_id: "owner1".to_string(),
         })
@@ -526,7 +526,7 @@ async fn an_acked_token_rejected_job_keeps_the_imports_staging() {
     let queue = fresh_queue("tokenrejected-staging").await;
     queue
         .enqueue(Job::StartQuipImport {
-            run_id: None,
+            run: None,
             import_id: import_id.clone(),
             owner_id: "owner1".to_string(),
         })
@@ -594,7 +594,7 @@ async fn dead_lettered_quip_import_drops_its_staged_thread_html() {
     let queue = fresh_queue("deadletter-staging").await;
     queue
         .enqueue(Job::StartQuipImport {
-            run_id: None,
+            run: None,
             import_id: import_id.clone(),
             owner_id: "owner1".to_string(),
         })
@@ -713,7 +713,7 @@ async fn obsolete_failure_preserves_import(reclaim_only: bool, status_code: u16,
     let queue = JobQueue::new(Arc::new(client), format!("quip-stale-finalizer:{}", nanoid::nanoid!(8)))
         .await.unwrap();
     let job_id = queue.enqueue(Job::StartQuipImport {
-            run_id: None,
+            run: None,
         import_id: import_id.clone(), owner_id: "owner1".into(),
     }).await.unwrap();
     let mut claimed = queue.consume_next("old-worker", 1000).await.unwrap().unwrap();
@@ -796,7 +796,7 @@ async fn unobserved_dead_letter_outcome_recovers_terminal_import_effects() {
     app.state.doc_repo.s3().put_object(&staged_key, b"retained".to_vec()).await.unwrap();
     let queue = fresh_queue("unobserved-terminal").await;
     let job_id = queue.enqueue(Job::StartQuipImport {
-            run_id: None,
+            run: None,
         import_id: import_id.clone(), owner_id: "owner1".into(),
     }).await.unwrap();
     let claimed = queue.consume_next("lost-reply-worker", 1000).await.unwrap().unwrap();
@@ -820,7 +820,7 @@ async fn terminal_outbox_recovers_without_a_receipt_and_replay_preserves_a_resum
     app.state.import_repo.set_status(&import_id, ImportStatus::Running).await.unwrap();
     let queue = fresh_queue("restart-terminal").await;
     let job_id = queue.enqueue(Job::StartQuipImport {
-            run_id: None,
+            run: None,
         import_id: import_id.clone(), owner_id: "owner1".into(),
     }).await.unwrap();
     let claimed = queue.consume_next("dead-worker", 1000).await.unwrap().unwrap();
@@ -864,7 +864,7 @@ async fn first_late_outbox_application_cannot_finalize_a_new_http_start() {
     app.state.import_repo.set_status(&import_id, ImportStatus::Running).await.unwrap();
     let queue = fresh_queue("first-late-outbox").await;
     queue.enqueue(Job::StartQuipImport {
-            run_id: None,
+            run: None,
         import_id: import_id.clone(), owner_id: owner_id.clone(),
     }).await.unwrap();
     let old = queue.consume_next("old-run", 1000).await.unwrap().unwrap();
@@ -941,7 +941,7 @@ async fn live_lease_redelivery_leaves_the_entry_pending_instead_of_acking() {
     let queue = fresh_queue("live-lease").await;
     let job_id = queue
         .enqueue(Job::StartQuipImport {
-            run_id: None,
+            run: None,
             import_id: import_id.clone(),
             owner_id: "owner1".to_string(),
         })
@@ -1040,7 +1040,7 @@ async fn current_run_completion_sweeps_only_its_own_staging() {
     let app = common::TestApp::new_with_quip_base(server.uri()).await;
     let import_id = seed_scoping_import(&app, "owner1", &["root"]).await;
     app.state.quip_token_store.put(&import_id, &QuipToken::new("tok".into())).await.unwrap();
-    app.state.import_repo.set_scope_for_run(&import_id, &["root".into()], "target", "run-a").await.unwrap();
+    app.state.import_repo.activate_run(&import_id, "run-a", 2, &["root".into()], "target").await.unwrap();
     let old_key = format!("imports/{import_id}/runs/run-a/threads/a.html");
     let new_key = format!("imports/{import_id}/runs/run-b/threads/b.html");
     for key in [&old_key, &new_key] {
@@ -1050,7 +1050,7 @@ async fn current_run_completion_sweeps_only_its_own_staging() {
     // A superseded queued generation must retire without calling Quip or
     // publishing a terminal status for the active run.
     queue.enqueue(Job::StartQuipImport {
-        import_id: import_id.clone(), owner_id: "owner1".into(), run_id: Some("run-obsolete".into()),
+        import_id: import_id.clone(), owner_id: "owner1".into(), run: Some(ogrenotes_worker::QuipImportRun { id: "run-obsolete".into(), sequence: 1, selected_roots: vec!["obsolete".into()], target_folder_id: "target".into() }),
     }).await.unwrap();
     let obsolete = queue.consume_next("worker", 1000).await.unwrap().unwrap();
     let ctx = worker_ctx_with_quip(&app, server.uri());
@@ -1058,7 +1058,7 @@ async fn current_run_completion_sweeps_only_its_own_staging() {
     assert_eq!(app.state.import_repo.get(&import_id).await.unwrap().unwrap().status, ImportStatus::Scoping);
     assert_eq!(app.state.doc_repo.s3().get_object(&old_key).await.unwrap(), b"staging");
     queue.enqueue(Job::StartQuipImport {
-        import_id: import_id.clone(), owner_id: "owner1".into(), run_id: Some("run-a".into()),
+        import_id: import_id.clone(), owner_id: "owner1".into(), run: Some(ogrenotes_worker::QuipImportRun { id: "run-a".into(), sequence: 2, selected_roots: vec!["root".into()], target_folder_id: "target".into() }),
     }).await.unwrap();
     let claimed = queue.consume_next("worker", 1000).await.unwrap().unwrap();
     let ctx = worker_ctx_with_quip(&app, server.uri());
@@ -1066,5 +1066,32 @@ async fn current_run_completion_sweeps_only_its_own_staging() {
     assert_eq!(app.state.import_repo.get(&import_id).await.unwrap().unwrap().status, ImportStatus::Failed);
     assert!(app.state.doc_repo.s3().get_object(&old_key).await.is_err());
     assert_eq!(app.state.doc_repo.s3().get_object(&new_key).await.unwrap(), b"staging");
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn published_run_activates_from_its_receipt_after_api_crash() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let import_id = seed_scoping_import(&app, "owner1", &["old-root"]).await;
+    let sequence = app.state.import_repo.reserve_run_sequence(&import_id).await.unwrap();
+    let queue = fresh_queue("published-activation").await;
+    let run = ogrenotes_worker::QuipImportRun {
+        id: "published-run".into(), sequence, selected_roots: vec!["new-root".into()],
+        target_folder_id: "new-target".into(),
+    };
+    queue.enqueue(Job::StartQuipImport {
+        import_id: import_id.clone(), owner_id: "owner1".into(), run: Some(run.clone()),
+    }).await.unwrap();
+    // The API disappears after successful Redis publication and never activates.
+    assert!(app.state.import_repo.current_run_id(&import_id).await.unwrap().is_none());
+    let claimed = queue.consume_next("recovery", 1000).await.unwrap().unwrap();
+    let ctx = worker_ctx_with_quip(&app, "http://127.0.0.1:1".into());
+    execute_and_finalize(&queue, claimed, &ctx).await;
+    let record = app.state.import_repo.get(&import_id).await.unwrap().unwrap();
+    assert_eq!(record.selected_roots, run.selected_roots);
+    assert_eq!(record.target_folder_id.as_deref(), Some("new-target"));
+    assert_eq!(record.status, ImportStatus::TokenRejected);
+    assert_eq!(app.state.import_repo.current_run_id(&import_id).await.unwrap().as_deref(), Some(run.id.as_str()));
     app.cleanup().await;
 }
