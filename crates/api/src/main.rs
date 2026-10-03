@@ -160,18 +160,13 @@ async fn run() {
         None
     };
 
-    // Initialize search index. An empty directory (new disk, new server)
-    // is first restored from the S3 snapshot when there is one; either
-    // way it is brought up to date once the server is running (below).
-    let search_index_path = std::path::Path::new(&config.search_index_path);
-    let search_index_was_empty = !search_index_path.join("meta.json").exists();
-    let search_restored_at = if search_index_was_empty {
-        ogrenotes_api::search_backup::restore_if_empty(&s3, search_index_path).await
-    } else {
-        None
-    };
-    let search_index = ogrenotes_search::SearchIndex::open_or_create(search_index_path)
-        .expect("failed to open search index");
+    // Use a child of the configured volume for new indexes, and resume any
+    // startup rebuild that failed before a previous process could finish it.
+    let search_startup = ogrenotes_api::search_backup::initialize(
+        &s3, std::path::Path::new(&config.search_index_path),
+    ).await.expect("failed to open search index");
+    let search_index = search_startup.index;
+    let search_startup_reindex = search_startup.reindex;
 
     // Initialize embedding pipeline (optional — disabled when QDRANT_URL is not set)
     let embedding_pipeline = if let Some(ref qdrant_url) = config.qdrant_url {
@@ -317,11 +312,11 @@ async fn run() {
     // Bring a new or restored search index up to date: re-index what changed
     // since the snapshot, or everything when there was no snapshot. Then keep
     // backing it up (SEARCH_BACKUP_INTERVAL_MINS; off by default).
-    if search_index_was_empty {
+    if let Some(startup_reindex) = search_startup_reindex {
         let state_for_index = state.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                ogrenotes_api::search_backup::reindex(&state_for_index, search_restored_at).await
+                startup_reindex.run(&state_for_index).await
             {
                 tracing::warn!(error = %e, "search index: startup re-index failed");
             }

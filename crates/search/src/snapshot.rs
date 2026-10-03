@@ -136,12 +136,27 @@ pub fn restore_snapshot(dir: &Path, snapshot: &IndexSnapshot) -> Result<(), Sear
             .and_then(|()| file.sync_all())
             .map_err(|e| SearchError::Snapshot(format!("write {name}: {e}")))?;
     }
-    // Opening the reader checks the referenced segment files, not just JSON
-    // syntax. A corrupt or incompatible backup must allow startup to rebuild.
+    // Reader construction checks referenced files but does not decompress
+    // stored document blocks. Verify segment checksums before any reader can
+    // touch corrupt bytes. Index::validate_checksum is insufficient here:
+    // snapshots intentionally omit .managed.json, so its managed-file set is
+    // empty. Check the copied segment files directly instead.
     {
         let index = tantivy::Index::open_in_dir(staging.path())?;
         if index.schema() != SearchIndex::build_schema().0 {
             return Err(SearchError::SchemaMismatch);
+        }
+        let segments = segment_ids(&std::fs::read(staging.path().join("meta.json"))
+            .map_err(|e| SearchError::Snapshot(e.to_string()))?)
+            .map_err(SearchError::Snapshot)?;
+        for (name, _) in &snapshot.files {
+            if segments.contains(name.split('.').next().unwrap_or_default()) {
+                let valid = index.directory().validate_checksum(Path::new(name))
+                    .map_err(|e| SearchError::Snapshot(format!("validate {name}: {e}")))?;
+                if !valid {
+                    return Err(SearchError::Snapshot(format!("checksum mismatch: {name}")));
+                }
+            }
         }
         let _reader = index.reader()?;
     }
@@ -284,6 +299,27 @@ mod tests {
         assert!(!dir.exists());
         // This is the same fallback the server uses when restore fails.
         assert!(SearchIndex::open_or_create(&dir).is_ok());
+    }
+
+    #[test]
+    fn corrupt_stored_document_blocks_are_rejected_before_publication() {
+        let src = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(src.path()).unwrap();
+        index.index_document(&doc("d1", "capybara")).unwrap();
+        let snapshot = index.snapshot().unwrap().unwrap();
+        let mut corrupt = snapshot.clone();
+        let (_, store) = corrupt.files.iter_mut()
+            .find(|(name, _)| name.ends_with(".store")).expect("stored documents");
+        // Change the compressed block, preserving its footer and offset index.
+        // Tantivy reader construction alone does not inspect these bytes.
+        store[0] ^= 0xff;
+        let dst = tempfile::tempdir().unwrap();
+        let dir = dst.path().join("restored");
+        assert!(restore_snapshot(&dir, &corrupt).is_err(), "corrupt document store was published");
+        assert!(!dir.join("meta.json").exists());
+        restore_snapshot(&dir, &snapshot).unwrap();
+        let restored = SearchIndex::open_or_create(&dir).unwrap();
+        assert_eq!(restored.search(&q("capybara")).unwrap()[0].doc_id, "d1");
     }
 
     #[test]

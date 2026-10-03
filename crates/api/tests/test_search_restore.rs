@@ -2,7 +2,9 @@
 
 //! Startup recovery through the real S3 HTTP client and filesystem index.
 
-use ogrenotes_api::search_backup::{encode, restore_if_empty};
+mod common;
+
+use ogrenotes_api::search_backup::{encode, initialize, restore_if_empty};
 use ogrenotes_search::{IndexSnapshot, SearchDocument, SearchIndex, SearchQuery};
 use ogrenotes_storage::s3::S3Client;
 use wiremock::{
@@ -64,7 +66,7 @@ async fn incomplete_s3_snapshot_falls_back_to_an_openable_index() {
     let dir = dst.path().join("index");
     assert_eq!(restore_if_empty(&s3, &dir).await, None);
     assert!(!dir.join("meta.json").exists());
-    // main.rs performs this immediately after restore_if_empty.
+    // Startup initialization performs this after restore_if_empty.
     assert!(SearchIndex::open_or_create(&dir).is_ok());
 }
 
@@ -118,7 +120,7 @@ async fn interrupted_startup_restore_recovers_on_restart() {
         )
         .unwrap();
         let (_server, s3) = serve_snapshot(&snapshot).await;
-        restore_if_empty(&s3, &root.join("index")).await;
+        let _ = initialize(&s3, &root.join("volume")).await;
         panic!("file-size limit did not interrupt the restore");
     }
 
@@ -153,7 +155,8 @@ async fn interrupted_startup_restore_recovers_on_restart() {
         output.status.signal().is_some(),
         "child must be killed by the OS: {output:?}"
     );
-    let abandoned = std::fs::read_dir(dst.path())
+    let volume = dst.path().join("volume");
+    let abandoned = std::fs::read_dir(&volume)
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .find(|path| {
@@ -171,13 +174,15 @@ async fn interrupted_startup_restore_recovers_on_restart() {
         partial > 0 && partial < 1024 * 1024,
         "child must die during a file write"
     );
-    let dir = dst.path().join("index");
+    let dir = volume.join("index");
     assert!(!dir.exists(), "partial index must never be published");
+    assert!(volume.join(".ogrenotes-reindex-pending").exists());
 
-    // Repeat precisely the startup sequence with a valid S3 snapshot.
+    // Repeat the production startup path with a valid S3 snapshot.
     let (_server, s3) = serve_snapshot(&snapshot).await;
-    assert_eq!(restore_if_empty(&s3, &dir).await, Some(4242));
-    let index = SearchIndex::open_or_create(&dir).unwrap();
+    let startup = initialize(&s3, &volume).await.unwrap();
+    assert!(startup.reindex.is_some());
+    let index = startup.index;
     let hits = index
         .search(&SearchQuery {
             text: "capybara".into(),
@@ -193,5 +198,148 @@ async fn interrupted_startup_restore_recovers_on_restart() {
     assert!(
         abandoned.exists(),
         "restart must not delete unowned siblings"
+    );
+}
+
+fn query(text: &str) -> SearchQuery {
+    SearchQuery {
+        text: text.into(),
+        doc_type: None,
+        owner_id: None,
+        folder_id: None,
+        limit: 10,
+        offset: 0,
+    }
+}
+
+#[tokio::test]
+async fn failed_full_startup_does_not_disable_recovery_on_restart() {
+    common::require_infra!();
+    use ogrenotes_storage::{dynamo::DynamoClient, repo::doc_repo::DocRepo};
+    use std::sync::Arc;
+
+    let mut app = common::TestApp::new().await;
+    let (owner_id, token) = app.create_user("startup-rebuild@test.com").await;
+    let older = app
+        .create_doc(&token, "capybara persisted document", None)
+        .await;
+    let valid = populated_snapshot();
+    let mut corrupt = valid.clone();
+    corrupt.files.retain(|(name, _)| name == "meta.json");
+    let (_server, s3) = serve_snapshot(&corrupt).await;
+    let volume = tempfile::tempdir().unwrap();
+    let startup = initialize(&s3, volume.path()).await.unwrap();
+    app.state.search_index = Arc::new(startup.index);
+
+    // Fail the real startup scan against a missing DynamoDB table. The
+    // fallback index already has meta.json, exactly as in server startup.
+    let mut unavailable = app.state.clone();
+    unavailable.doc_repo = Arc::new(DocRepo::new(
+        DynamoClient::new(
+            app.dynamo_client().clone(),
+            format!("{}-missing", app.table_name),
+        ),
+        app.state.doc_repo.s3().clone(),
+    ));
+    assert!(startup.reindex.unwrap().run(&unavailable).await.is_err());
+    drop(unavailable);
+
+    // A document indexed after the failed startup must survive restarting
+    // while an older S3 snapshot is available.
+    let recent = app.create_doc(&token, "puffin recent document", None).await;
+    app.state
+        .search_index
+        .index_document(&SearchDocument {
+            doc_id: recent.clone(),
+            title: "puffin recent document".into(),
+            body: "".into(),
+            owner_id,
+            doc_type: "document".into(),
+            folder_id: None,
+            workspace_id: None,
+            updated_at: 1,
+            created_at: 1,
+        })
+        .unwrap();
+    app.state.search_index = Arc::new(SearchIndex::open_in_memory().unwrap());
+
+    let (_server, s3) = serve_snapshot(&valid).await;
+    let restarted = initialize(&s3, volume.path()).await.unwrap();
+    assert_eq!(
+        restarted.index.search(&query("puffin")).unwrap()[0].doc_id,
+        recent
+    );
+    assert!(
+        restarted
+            .index
+            .search(&query("capybara"))
+            .unwrap()
+            .is_empty(),
+        "the old snapshot must not replace the fallback index"
+    );
+    app.state.search_index = Arc::new(restarted.index);
+    restarted
+        .reindex
+        .expect("unfinished rebuild must resume")
+        .run(&app.state)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.state.search_index.search(&query("capybara")).unwrap()[0].doc_id,
+        older
+    );
+    assert_eq!(
+        app.state.search_index.search(&query("puffin")).unwrap()[0].doc_id,
+        recent
+    );
+    app.state.search_index = Arc::new(SearchIndex::open_in_memory().unwrap());
+
+    let finished = initialize(&s3, volume.path()).await.unwrap();
+    assert!(
+        finished.reindex.is_none(),
+        "completed rebuild must clear the marker"
+    );
+    assert_eq!(
+        finished.index.search(&query("capybara")).unwrap()[0].doc_id,
+        older
+    );
+    app.cleanup().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_restores_when_only_the_configured_volume_is_writable() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_server, s3) = serve_snapshot(&populated_snapshot()).await;
+    let parent = tempfile::tempdir().unwrap();
+    let volume = parent.path().join("search-volume");
+    std::fs::create_dir(&volume).unwrap();
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let startup = initialize(&s3, &volume).await;
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let startup = startup.expect("staging must live inside the configured volume");
+    assert_eq!(
+        startup.index.search(&query("capybara")).unwrap()[0].doc_id,
+        "recovered"
+    );
+    assert!(volume.join("index/meta.json").exists());
+    assert!(!volume.join("meta.json").exists());
+}
+
+#[tokio::test]
+async fn startup_preserves_legacy_indexes_at_the_volume_root() {
+    let volume = tempfile::tempdir().unwrap();
+    let snapshot = populated_snapshot();
+    ogrenotes_search::restore_snapshot(volume.path(), &snapshot).unwrap();
+    let (_server, s3) = serve_snapshot(&snapshot).await;
+    let startup = initialize(&s3, volume.path()).await.unwrap();
+    assert!(startup.reindex.is_none());
+    assert_eq!(
+        startup.index.search(&query("capybara")).unwrap()[0].doc_id,
+        "recovered"
+    );
+    assert!(
+        !volume.path().join("index").exists(),
+        "legacy index must not be replaced or moved"
     );
 }
