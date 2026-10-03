@@ -24,6 +24,9 @@ use crate::{SearchError, SearchIndex};
 
 /// How many times to start over when a merge removes a file mid-copy.
 const ATTEMPTS: usize = 5;
+const RESTORE_LOCK: &str = ".ogrenotes-restore.lock";
+const STAGE_OWNER: &str = ".ogrenotes-restore-owner";
+const STAGE_TAG: &[u8] = b"ogrenotes snapshot restore stage v1\n";
 
 /// The files of one committed index state: `(file name, contents)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,9 +96,15 @@ fn segment_ids(meta: &[u8]) -> Result<HashSet<String>, String> {
         .collect()
 }
 
-/// Write a snapshot's files into `dir`, which must not already hold an
-/// index. File names are checked to be plain names (no path separators),
-/// so a tampered snapshot can't write outside `dir`.
+/// Restore into a missing or empty directory, without replacing an index
+/// or unrelated files. Files are written and validated in a private sibling
+/// directory, then published with one atomic rename. A failed or interrupted
+/// restore never exposes partial metadata at the destination.
+///
+/// Restores sharing a parent directory take an advisory filesystem lock.
+/// A retry reclaims tagged staging directories left by a killed restore;
+/// untagged siblings are never deleted. The small lock file stays in place
+/// so concurrent processes always lock the same inode.
 pub fn restore_snapshot(dir: &Path, snapshot: &IndexSnapshot) -> Result<(), SearchError> {
     if dir.join("meta.json").exists() {
         return Err(SearchError::Snapshot(format!(
@@ -103,21 +112,149 @@ pub fn restore_snapshot(dir: &Path, snapshot: &IndexSnapshot) -> Result<(), Sear
             dir.display()
         )));
     }
-    if !snapshot.files.iter().any(|(name, _)| name == "meta.json") {
+    let mut names = HashSet::new();
+    for (name, _) in &snapshot.files {
+        let plain = !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\']);
+        if !plain || name == STAGE_OWNER || !names.insert(name.as_str()) {
+            return Err(SearchError::Snapshot(format!(
+                "invalid or duplicate file name {name:?}"
+            )));
+        }
+    }
+    if !names.contains("meta.json") {
         return Err(SearchError::Snapshot("snapshot has no meta.json".into()));
     }
-    std::fs::create_dir_all(dir).map_err(|e| SearchError::Snapshot(e.to_string()))?;
+    let parent = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| SearchError::Snapshot(e.to_string()))?;
+    let restore_lock = std::fs::OpenOptions::new()
+        .read(true).write(true).create(true).truncate(false)
+        .open(parent.join(RESTORE_LOCK))
+        .map_err(|e| SearchError::Snapshot(format!("open restore lock: {e}")))?;
+    restore_lock.try_lock()
+        .map_err(|e| SearchError::Snapshot(format!("restore already active or lock unavailable: {e}")))?;
+    reclaim_abandoned_stages(parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".ogrenotes-restore-")
+        .tempdir_in(parent)
+        .map_err(|e| SearchError::Snapshot(format!("create staging directory: {e}")))?;
+    // Persist ownership before writing any potentially large snapshot file.
+    // Only creators holding RESTORE_LOCK may write this reserved marker.
+    {
+        use std::io::Write;
+        let mut owner = std::fs::File::create(staging.path().join(STAGE_OWNER))
+            .map_err(|e| SearchError::Snapshot(format!("create stage owner: {e}")))?;
+        owner.write_all(&stage_tag(staging.path())).and_then(|()| owner.sync_all())
+            .map_err(|e| SearchError::Snapshot(format!("persist stage owner: {e}")))?;
+        sync_directory(staging.path())?;
+    }
     for (name, bytes) in &snapshot.files {
-        let plain = !name.is_empty()
-            && name != "."
-            && name != ".."
-            && !name.contains(['/', '\\']);
-        if !plain {
-            return Err(SearchError::Snapshot(format!("refusing file name {name:?}")));
-        }
-        std::fs::write(dir.join(name), bytes)
+        use std::io::Write;
+        let mut file = std::fs::File::create(staging.path().join(name))
+            .map_err(|e| SearchError::Snapshot(format!("create {name}: {e}")))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
             .map_err(|e| SearchError::Snapshot(format!("write {name}: {e}")))?;
     }
+    // Reader construction checks referenced files but does not decompress
+    // stored document blocks. Verify segment checksums before any reader can
+    // touch corrupt bytes. Index::validate_checksum is insufficient here:
+    // snapshots intentionally omit .managed.json, so its managed-file set is
+    // empty. Check the copied segment files directly instead.
+    {
+        let index = tantivy::Index::open_in_dir(staging.path())?;
+        if index.schema() != SearchIndex::build_schema().0 {
+            return Err(SearchError::SchemaMismatch);
+        }
+        // Our schema indexes positions and field norms. Tantivy lazily opens
+        // inverted indexes, so reader construction alone tolerates a missing
+        // .pos file. Require each permanent component, plus live deletions.
+        use tantivy::SegmentComponent;
+        for segment in index.searchable_segment_metas()? {
+            let mut required = vec![
+                SegmentComponent::Postings, SegmentComponent::Positions,
+                SegmentComponent::Terms, SegmentComponent::Store,
+                SegmentComponent::FastFields, SegmentComponent::FieldNorms,
+            ];
+            if segment.delete_opstamp().is_some() {
+                required.push(SegmentComponent::Delete);
+            }
+            for component in required {
+                let path = segment.relative_path(component);
+                if !names.contains(path.to_string_lossy().as_ref()) {
+                    return Err(SearchError::Snapshot(format!(
+                        "missing required segment file: {}", path.display(),
+                    )));
+                }
+            }
+        }
+        let segments = segment_ids(&std::fs::read(staging.path().join("meta.json"))
+            .map_err(|e| SearchError::Snapshot(e.to_string()))?)
+            .map_err(SearchError::Snapshot)?;
+        for (name, _) in &snapshot.files {
+            if segments.contains(name.split('.').next().unwrap_or_default()) {
+                let valid = index.directory().validate_checksum(Path::new(name))
+                    .map_err(|e| SearchError::Snapshot(format!("validate {name}: {e}")))?;
+                if !valid {
+                    return Err(SearchError::Snapshot(format!("checksum mismatch: {name}")));
+                }
+            }
+        }
+        let _reader = index.reader()?;
+    }
+    sync_directory(staging.path())?;
+    // rename cannot replace a nonempty directory, including an index created
+    // by another process while this restore was being prepared. Do not remove
+    // the destination first: that would both risk data loss and break atomicity.
+    std::fs::rename(staging.path(), dir)
+        .map_err(|e| SearchError::Snapshot(format!("publish restored index: {e}")))?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+// Bind ownership to the original random staging name. After publication,
+// the marker no longer matches, even if an operator chose an index path with
+// our staging prefix. Such a published index must never be reclaimed.
+fn stage_tag(path: &Path) -> Vec<u8> {
+    let mut tag = STAGE_TAG.to_vec();
+    tag.extend_from_slice(path.file_name().unwrap_or_default().as_encoded_bytes());
+    tag
+}
+
+/// Called only while the parent restore lock is held, so no tagged stage
+/// can belong to a live cooperating restore. Symlinks and unowned directories
+/// are left alone, including older untagged restore attempts.
+fn reclaim_abandoned_stages(parent: &Path) -> Result<(), SearchError> {
+    let entries = std::fs::read_dir(parent)
+        .map_err(|e| SearchError::Snapshot(format!("list restore stages: {e}")))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| SearchError::Snapshot(e.to_string()))?;
+        if !entry.file_name().to_string_lossy().starts_with(".ogrenotes-restore-")
+            || !entry.file_type().map_err(|e| SearchError::Snapshot(e.to_string()))?.is_dir()
+        {
+            continue;
+        }
+        let owner = entry.path().join(STAGE_OWNER);
+        if std::fs::symlink_metadata(&owner).is_ok_and(|m| m.is_file())
+            && std::fs::read(&owner).ok().as_deref() == Some(stage_tag(&entry.path()).as_slice())
+        {
+            std::fs::remove_dir_all(entry.path())
+                .map_err(|e| SearchError::Snapshot(format!("reclaim restore stage: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+fn sync_directory(dir: &Path) -> Result<(), SearchError> {
+    // Directory fsync is available on Unix, where production is deployed.
+    #[cfg(unix)]
+    std::fs::File::open(dir)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| SearchError::Snapshot(format!("sync directory {}: {e}", dir.display())))?;
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 
@@ -194,5 +331,192 @@ mod tests {
         std::fs::write(dst.path().join("meta.json"), b"{}").unwrap();
         let ok = IndexSnapshot { files: vec![("meta.json".into(), b"{}".to_vec())] };
         assert!(restore_snapshot(dst.path(), &ok).is_err(), "never overwrite an index");
+    }
+
+    #[test]
+    fn failed_restore_does_not_publish_metadata_and_can_be_retried() {
+        let src = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(src.path()).unwrap();
+        index.index_document(&doc("recovered", "capybara")).unwrap();
+        let snapshot = index.snapshot().unwrap().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let dir = dst.path().join("restored");
+        let mut broken = snapshot.clone();
+        // A plain name that cannot be written on the filesystem. Earlier
+        // snapshot files have already been written when this write fails.
+        broken.files.push(("x".repeat(4096), vec![1]));
+        assert!(restore_snapshot(&dir, &broken).is_err());
+        assert!(
+            !dir.join("meta.json").exists(),
+            "failed restore was published"
+        );
+        assert_eq!(
+            std::fs::read_dir(dst.path()).unwrap().count(),
+            1,
+            "only the persistent restore lock may remain"
+        );
+        restore_snapshot(&dir, &snapshot).unwrap();
+        let restored = SearchIndex::open_or_create(&dir).unwrap();
+        assert_eq!(
+            restored.search(&q("capybara")).unwrap()[0].doc_id,
+            "recovered"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_snapshot_is_not_published() {
+        let src = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(src.path()).unwrap();
+        index.index_document(&doc("d1", "capybara")).unwrap();
+        let mut snapshot = index.snapshot().unwrap().unwrap();
+        snapshot.files.retain(|(name, _)| name == "meta.json");
+        let dst = tempfile::tempdir().unwrap();
+        let dir = dst.path().join("restored");
+        assert!(restore_snapshot(&dir, &snapshot).is_err());
+        assert!(!dir.exists());
+        // This is the same fallback the server uses when restore fails.
+        assert!(SearchIndex::open_or_create(&dir).is_ok());
+    }
+
+    #[test]
+    fn a_snapshot_missing_only_positions_is_not_published() {
+        let src = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(src.path()).unwrap();
+        index.index_document(&doc("d1", "capybara river bank")).unwrap();
+        let mut snapshot = index.snapshot().unwrap().unwrap();
+        let before = snapshot.files.len();
+        snapshot.files.retain(|(name, _)| !name.ends_with(".pos"));
+        assert!(snapshot.files.len() < before);
+        let dst = tempfile::tempdir().unwrap();
+        let dir = dst.path().join("restored");
+        assert!(restore_snapshot(&dir, &snapshot).is_err(), "missing positions were published");
+        assert!(!dir.join("meta.json").exists());
+    }
+
+    #[test]
+    fn corrupt_stored_document_blocks_are_rejected_before_publication() {
+        let src = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(src.path()).unwrap();
+        index.index_document(&doc("d1", "capybara")).unwrap();
+        let snapshot = index.snapshot().unwrap().unwrap();
+        let mut corrupt = snapshot.clone();
+        let (_, store) = corrupt.files.iter_mut()
+            .find(|(name, _)| name.ends_with(".store")).expect("stored documents");
+        // Change the compressed block, preserving its footer and offset index.
+        // Tantivy reader construction alone does not inspect these bytes.
+        store[0] ^= 0xff;
+        let dst = tempfile::tempdir().unwrap();
+        let dir = dst.path().join("restored");
+        assert!(restore_snapshot(&dir, &corrupt).is_err(), "corrupt document store was published");
+        assert!(!dir.join("meta.json").exists());
+        restore_snapshot(&dir, &snapshot).unwrap();
+        let restored = SearchIndex::open_or_create(&dir).unwrap();
+        assert_eq!(restored.search(&q("capybara")).unwrap()[0].doc_id, "d1");
+    }
+
+    #[test]
+    fn restore_preserves_unrelated_destination_files() {
+        let src = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(src.path()).unwrap();
+        let snapshot = index.snapshot().unwrap().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(dst.path().join("operator-notes"), "keep me").unwrap();
+        assert!(restore_snapshot(dst.path(), &snapshot).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("operator-notes")).unwrap(),
+            "keep me"
+        );
+        assert!(!dst.path().join("meta.json").exists());
+    }
+
+    #[test]
+    fn an_interrupted_staging_directory_does_not_block_a_new_restore() {
+        let src = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(src.path()).unwrap();
+        index.index_document(&doc("d1", "capybara")).unwrap();
+        let snapshot = index.snapshot().unwrap().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        // A killed process cannot run TempDir::drop. Its private staging
+        // directory must neither be mistaken for the index nor reused.
+        let abandoned = dst.path().join(".ogrenotes-restore-abandoned");
+        std::fs::create_dir(&abandoned).unwrap();
+        std::fs::write(abandoned.join("meta.json"), &snapshot.files[0].1).unwrap();
+        let dir = dst.path().join("restored");
+        std::fs::create_dir(&dir).unwrap();
+        restore_snapshot(&dir, &snapshot).unwrap();
+        let restored = SearchIndex::open_or_create(&dir).unwrap();
+        assert_eq!(restored.search(&q("capybara")).unwrap()[0].doc_id, "d1");
+        assert!(
+            abandoned.exists(),
+            "never delete unowned sibling directories"
+        );
+    }
+
+    #[test]
+    fn cleanup_preserves_active_and_unowned_stages_but_reclaims_abandoned_ones() {
+        let src = tempfile::tempdir().unwrap();
+        let source = SearchIndex::open_or_create(src.path()).unwrap();
+        let snapshot = source.snapshot().unwrap().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let owned = dst.path().join(".ogrenotes-restore-owned");
+        let unowned = dst.path().join(".ogrenotes-restore-unowned");
+        std::fs::create_dir(&owned).unwrap();
+        std::fs::create_dir(&unowned).unwrap();
+        std::fs::write(owned.join(STAGE_OWNER), stage_tag(&owned)).unwrap();
+        std::fs::write(owned.join("partial-store"), b"partial snapshot").unwrap();
+        let lock = std::fs::OpenOptions::new().read(true).write(true).create(true)
+            .truncate(false).open(dst.path().join(RESTORE_LOCK)).unwrap();
+        lock.try_lock().unwrap();
+        let dir = dst.path().join("index");
+        assert!(restore_snapshot(&dir, &snapshot).is_err());
+        assert!(owned.join("partial-store").exists(), "never clean a live restore");
+        drop(lock);
+        restore_snapshot(&dir, &snapshot).unwrap();
+        assert!(!owned.exists(), "reclaim an abandoned tagged restore before retrying");
+        assert!(unowned.exists(), "never clean an unowned directory");
+    }
+
+    #[test]
+    fn cleanup_never_reclaims_a_published_index_with_a_staging_prefix() {
+        let src = tempfile::tempdir().unwrap();
+        let source = SearchIndex::open_or_create(src.path()).unwrap();
+        source.index_document(&doc("d1", "capybara")).unwrap();
+        let snapshot = source.snapshot().unwrap().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let first = dst.path().join(".ogrenotes-restore-real-index");
+        restore_snapshot(&first, &snapshot).unwrap();
+        restore_snapshot(&dst.path().join("second"), &snapshot).unwrap();
+        let preserved = SearchIndex::open_or_create(&first).unwrap();
+        assert_eq!(preserved.search(&q("capybara")).unwrap()[0].doc_id, "d1");
+    }
+
+    #[test]
+    fn restore_never_replaces_an_existing_valid_index() {
+        let src = tempfile::tempdir().unwrap();
+        let source = SearchIndex::open_or_create(src.path()).unwrap();
+        source.index_document(&doc("new", "capybara")).unwrap();
+        let snapshot = source.snapshot().unwrap().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let existing = SearchIndex::open_or_create(dst.path()).unwrap();
+        existing.index_document(&doc("existing", "marmot")).unwrap();
+        assert!(restore_snapshot(dst.path(), &snapshot).is_err());
+        assert_eq!(existing.search(&q("marmot")).unwrap()[0].doc_id, "existing");
+        assert!(existing.search(&q("capybara")).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_does_not_follow_a_destination_symlink() {
+        let src = tempfile::tempdir().unwrap();
+        let source = SearchIndex::open_or_create(src.path()).unwrap();
+        let snapshot = source.snapshot().unwrap().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let unrelated = dst.path().join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        let link = dst.path().join("index");
+        std::os::unix::fs::symlink(&unrelated, &link).unwrap();
+        assert!(restore_snapshot(&link, &snapshot).is_err());
+        assert!(link.is_symlink());
+        assert_eq!(std::fs::read_dir(unrelated).unwrap().count(), 0);
     }
 }

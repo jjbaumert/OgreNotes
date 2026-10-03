@@ -201,7 +201,7 @@ Both GitHub and Google login resolve to the same user if the email matches — a
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
 | `API_PORT` | `3000` | HTTP server port |
 | `FRONTEND_ORIGIN` | `http://localhost:8080` | CORS origin for the frontend |
-| `SEARCH_INDEX_PATH` | `/tmp/ogrenotes-search-index` | Path for the Tantivy search index on disk |
+| `SEARCH_INDEX_PATH` | `/tmp/ogrenotes-search-index` | Search storage directory (may be a mounted volume). New indexes use its `index` child; existing indexes at the directory root remain supported. |
 | `DEV_MODE` | `false` | Enable dev-only endpoints (dev-login). **Must be false in production.** |
 | `EMBED_YOUTUBE_NOCOOKIE` | `true` | Rewrite YouTube embeds to `youtube-nocookie.com` (privacy-enhanced — no cookies until the viewer plays). Set `false` for the standard `youtube.com` host. |
 

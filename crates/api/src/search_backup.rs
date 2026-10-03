@@ -12,21 +12,23 @@
 //!   ([`ogrenotes_search::SearchIndex::snapshot`]) and uploaded to
 //!   `search-index/snapshot.zip` in the bucket ([`spawn_scheduler`]);
 //! - at startup, an empty index directory is restored from that snapshot
-//!   ([`restore_if_empty`]) and then brought up to date by re-indexing
+//!   ([`initialize`]) and then brought up to date by re-indexing
 //!   the documents changed since it was taken ([`reindex`] with `since`);
 //! - with no snapshot to restore, an empty index is rebuilt from every
 //!   document ([`reindex`] with no `since`) — also available on demand
-//!   to admins as `POST /api/v1/admin/search/reindex`.
+//!   to admins as `POST /api/v1/admin/search/reindex`. A durable startup
+//!   marker resumes unfinished rebuilds after restart while preserving any
+//!   documents already indexed locally.
 //!
 //! Re-indexing only updates this process's Tantivy index; embeddings live
 //! in the shared vector store and are left alone.
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use ogrenotes_search::{IndexSnapshot, restore_snapshot};
+use ogrenotes_search::{IndexSnapshot, SearchIndex, restore_snapshot};
 use ogrenotes_storage::s3::S3Client;
 
 use crate::state::AppState;
@@ -123,6 +125,64 @@ pub fn spawn_scheduler(state: AppState) -> Option<tokio::task::JoinHandle<()>> {
     }))
 }
 
+/// Search state opened by the same startup path used by the server.
+pub struct StartupIndex {
+    pub index: SearchIndex,
+    pub reindex: Option<StartupReindex>,
+}
+
+/// Durable work remaining after a new index is restored or created.
+/// A failed or interrupted rebuild keeps the marker for the next startup.
+pub struct StartupReindex {
+    marker: PathBuf,
+    since: Option<i64>,
+}
+
+impl StartupReindex {
+    pub async fn run(self, state: &AppState) -> Result<ReindexReport, String> {
+        let report = reindex(state, self.since).await?;
+        std::fs::remove_file(&self.marker)
+            .map_err(|e| format!("remove startup reindex marker: {e}"))?;
+        Ok(report)
+    }
+}
+
+/// Open search storage, restore a missing index, and remember unfinished
+/// startup reindexing. `root` can itself be a mounted volume: new indexes
+/// live in its `index` child so staging and atomic publication stay on the
+/// volume. Legacy indexes at the root continue to open without migration.
+///
+/// Once fallback metadata exists, retain that index and resume a full rebuild
+/// from the authoritative document store. Replacing it with an older snapshot
+/// could discard documents indexed after the first startup failed.
+pub async fn initialize(s3: &S3Client, root: &Path) -> Result<StartupIndex, String> {
+    std::fs::create_dir_all(root).map_err(|e| format!("create search storage: {e}"))?;
+    let dir = if root.join("meta.json").exists() {
+        root.to_path_buf()
+    } else {
+        root.join("index")
+    };
+    let missing = !dir.join("meta.json").exists();
+    let marker = root.join(".ogrenotes-reindex-pending");
+    let needs_reindex = missing || marker.exists();
+    if needs_reindex {
+        // Persist before either restore or open_or_create can publish metadata.
+        // If the process dies afterward, the next startup still rebuilds.
+        let file = std::fs::File::create(&marker)
+            .map_err(|e| format!("create startup reindex marker: {e}"))?;
+        file.sync_all().map_err(|e| format!("sync startup reindex marker: {e}"))?;
+        #[cfg(unix)]
+        std::fs::File::open(root).and_then(|dir| dir.sync_all())
+            .map_err(|e| format!("sync search storage: {e}"))?;
+    }
+    let restored_at = if missing { restore_if_empty(s3, &dir).await } else { None };
+    let index = SearchIndex::open_or_create(&dir).map_err(|e| e.to_string())?;
+    Ok(StartupIndex {
+        index,
+        reindex: needs_reindex.then_some(StartupReindex { marker, since: restored_at }),
+    })
+}
+
 /// Before the index is opened: if `dir` holds no index and the bucket has
 /// a snapshot, restore it and return when it was taken. `None` when there
 /// was nothing to do or restoring failed (the caller then rebuilds).
@@ -152,8 +212,8 @@ pub async fn restore_if_empty(s3: &S3Client, dir: &Path) -> Option<i64> {
         }
         Err(e) => {
             tracing::warn!(error = %e, "search index: snapshot restore failed; will rebuild");
-            // Don't leave a half-written directory for the index to open.
-            let _ = std::fs::remove_dir_all(dir);
+            // restore_snapshot publishes atomically and owns its staging
+            // cleanup. Never delete pre-existing or concurrently created data.
             None
         }
     }
@@ -190,6 +250,8 @@ pub async fn reindex(state: &AppState, since: Option<i64>) -> Result<ReindexRepo
 async fn reindex_inner(state: &AppState, since: Option<i64>) -> Result<ReindexReport, String> {
     let cutoff = since.map(|t| t - CATCH_UP_MARGIN_USEC);
     let mut report = ReindexReport::default();
+    let mut failures = 0usize;
+    let mut first_error = None;
     let mut cursor = None;
     loop {
         let (metas, next) = state
@@ -200,8 +262,12 @@ async fn reindex_inner(state: &AppState, since: Option<i64>) -> Result<ReindexRe
         for meta in metas {
             report.scanned += 1;
             if meta.is_deleted {
-                if state.search_index.delete_document(&meta.doc_id).is_ok() {
-                    report.removed += 1;
+                match state.search_index.delete_document(&meta.doc_id) {
+                    Ok(()) => report.removed += 1,
+                    Err(e) => {
+                        failures += 1;
+                        first_error.get_or_insert_with(|| format!("remove {}: {e}", meta.doc_id));
+                    }
                 }
                 continue;
             }
@@ -211,14 +277,23 @@ async fn reindex_inner(state: &AppState, since: Option<i64>) -> Result<ReindexRe
                 Some(_) => state.doc_repo.has_pending_updates(&meta.doc_id).await.unwrap_or(true),
             };
             if changed {
-                crate::routes::documents::index_document_now(state, meta, false).await;
-                report.indexed += 1;
+                let doc_id = meta.doc_id.clone();
+                match crate::routes::documents::try_index_document_now(state, meta, false).await {
+                    Ok(()) => report.indexed += 1,
+                    Err(e) => {
+                        failures += 1;
+                        first_error.get_or_insert_with(|| format!("index {doc_id}: {e}"));
+                    }
+                }
             }
         }
         cursor = next;
         if cursor.is_none() {
             break;
         }
+    }
+    if let Some(error) = first_error {
+        return Err(format!("{failures} document(s) failed during reindex; first error: {error}"));
     }
     tracing::info!(?report, full = since.is_none(), "search re-index complete");
     Ok(report)
