@@ -187,6 +187,62 @@ pub const DEFAULT_GROUP: &str = "workers";
 /// XADD's pair shape is `<field> <value>` so we use one pair.
 const ENVELOPE_FIELD: &str = "envelope";
 
+// Redis 7 executes the transition without interleaving other clients. Lua
+// does not roll back on command errors, so validate key types, group state,
+// and every write's ACL before changing anything. XADD is first: a rejected
+// stream append (for example ID exhaustion) must leave the source pending.
+// Redis rejects an OOM script before its first write; once writing, the
+// remaining validated commands complete in the same atomic execution.
+//
+// A removed source is the completion marker. Repeating a call after a lost
+// reply, or finalizing a stale claim after another worker, cannot append a
+// duplicate or overwrite the status of a newer attempt.
+const FINALIZE_DELIVERY: &str = r#"
+local source, destination, status = KEYS[1], KEYS[2], KEYS[3]
+local group, id = ARGV[1], ARGV[2]
+if #redis.call('XRANGE', source, id, id) == 0 then
+    return 0
+end
+if #redis.call('XPENDING', source, group, id, id, 1) == 0 then
+    return redis.error_reply('Delivery is not pending in the consumer group')
+end
+local status_type = redis.call('TYPE', status).ok
+if status_type ~= 'none' and status_type ~= 'hash' then
+    return redis.error_reply('WRONGTYPE job status must be a hash')
+end
+local commands = {}
+if ARGV[6] ~= '' then
+    local destination_type = redis.call('TYPE', destination).ok
+    if destination_type ~= 'none' and destination_type ~= 'stream' then
+        return redis.error_reply('WRONGTYPE job destination must be a stream')
+    end
+    local append = {'XADD', destination, '*', 'envelope', ARGV[6]}
+    if ARGV[7] == '1' then
+        table.insert(append, 'lastError')
+        table.insert(append, ARGV[8])
+    end
+    table.insert(commands, append)
+end
+local fields = {'HSET', status, 'json', ARGV[3]}
+if ARGV[4] ~= '' then
+    table.insert(fields, 'owner')
+    table.insert(fields, ARGV[4])
+end
+table.insert(commands, fields)
+table.insert(commands, {'EXPIRE', status, ARGV[5]})
+table.insert(commands, {'XACK', source, group, id})
+table.insert(commands, {'XDEL', source, id})
+for _, command in ipairs(commands) do
+    if not redis.acl_check_cmd(unpack(command)) then
+        return redis.error_reply('NOPERM job finalization command denied: ' .. command[1])
+    end
+end
+for _, command in ipairs(commands) do
+    redis.call(unpack(command))
+end
+return 1
+"#;
+
 /// Job queue handle. Cheap to clone (wraps an `Arc<RedisClient>`).
 #[derive(Clone)]
 pub struct JobQueue {
@@ -257,9 +313,8 @@ impl JobQueue {
         Ok(envelope.job_id)
     }
 
-    /// XADD the envelope onto the main stream. Used both at first
-    /// enqueue and at retry. Internal — callers go through
-    /// `enqueue` or `retry_or_dead_letter`.
+    /// XADD the initial envelope onto the main stream. Retries use the
+    /// atomic finalization script instead.
     async fn xadd(&self, envelope: &JobEnvelope) -> Result<String, JobError> {
         let json = serde_json::to_string(envelope)
             .map_err(|e| JobError::Serialize(e.to_string()))?;
@@ -343,8 +398,9 @@ impl JobQueue {
         }))
     }
 
-    /// Mark a job complete: XACK + XDEL on the stream, write the
-    /// Succeeded status. `result_json` is whatever the worker
+    /// Atomically publish Succeeded status and retire the delivery.
+    /// Repeated finalization of the same delivery is a no-op.
+    /// `result_json` is whatever the worker
     /// wants the client to see on GET /jobs/{id}; pass None when
     /// the work has no result body.
     pub async fn ack(
@@ -352,35 +408,19 @@ impl JobQueue {
         claimed: &ClaimedJob,
         result_json: Option<String>,
     ) -> Result<(), JobError> {
-        let _: u64 = self
-            .client
-            .xack(
-                self.stream.as_str(),
-                self.group.as_str(),
-                claimed.stream_id.as_str(),
-            )
-            .await?;
-        let _: u64 = self
-            .client
-            .xdel(self.stream.as_str(), vec![claimed.stream_id.as_str()])
-            .await?;
         let status = JobStatus::Succeeded {
             finished_at_ms: now_ms(),
             result_json,
         };
-        self.write_status(
-            &claimed.envelope.job_id,
-            &status,
-            claimed.envelope.owner.as_deref(),
-        )
-        .await?;
-        Ok(())
+        self.finalize_delivery(claimed, &status, None, None).await
     }
 
     /// Handle a failed work attempt. If `attempt < max_retries`,
-    /// XACK + XDEL the current entry and XADD a new envelope with
-    /// `attempt + 1` — keeps the JobId stable. Otherwise, XACK +
-    /// XDEL + XADD-to-dlq + Failed status.
+    /// atomically replace the current entry with an envelope carrying
+    /// `attempt + 1` and Pending status, keeping the JobId stable.
+    /// Otherwise, atomically move it to the DLQ with Failed status.
+    /// A rejected transition leaves the original delivery reclaimable; a
+    /// lost response can safely be retried without duplicating the handoff.
     ///
     /// The caller decides `max_retries` per-job-kind: cheap
     /// idempotent work (Noop, status writes) tolerates many
@@ -392,18 +432,6 @@ impl JobQueue {
         max_retries: u32,
         error: &str,
     ) -> Result<RetryOutcome, JobError> {
-        let _: u64 = self
-            .client
-            .xack(
-                self.stream.as_str(),
-                self.group.as_str(),
-                claimed.stream_id.as_str(),
-            )
-            .await?;
-        let _: u64 = self
-            .client
-            .xdel(self.stream.as_str(), vec![claimed.stream_id.as_str()])
-            .await?;
         if claimed.envelope.attempt < max_retries {
             let next = JobEnvelope {
                 job_id: claimed.envelope.job_id.clone(),
@@ -412,42 +440,54 @@ impl JobQueue {
                 owner: claimed.envelope.owner.clone(),
                 payload: claimed.envelope.payload.clone(),
             };
-            self.xadd(&next).await?;
-            self.write_status(&next.job_id, &JobStatus::Pending, next.owner.as_deref())
+            self.finalize_delivery(claimed, &JobStatus::Pending, Some(&next), None)
                 .await?;
             Ok(RetryOutcome::Retried { attempt: next.attempt })
         } else {
-            // Dead-letter — same envelope written to <stream>:dlq.
-            // Operators inspect manually; XCLAIM from dlq back to
-            // the main stream is the recovery path.
-            let dlq_stream = format!("{}:dlq", self.stream);
-            let json = serde_json::to_string(&claimed.envelope)
-                .map_err(|e| JobError::Serialize(e.to_string()))?;
-            let _: String = self
-                .client
-                .xadd(
-                    dlq_stream.as_str(),
-                    false,
-                    None,
-                    "*",
-                    vec![
-                        (ENVELOPE_FIELD, json.as_str()),
-                        ("lastError", error),
-                    ],
-                )
-                .await?;
             let status = JobStatus::Failed {
                 finished_at_ms: now_ms(),
                 error: error.to_string(),
             };
-            self.write_status(
-                &claimed.envelope.job_id,
-                &status,
-                claimed.envelope.owner.as_deref(),
-            )
-            .await?;
+            self.finalize_delivery(claimed, &status, Some(&claimed.envelope), Some(error))
+                .await?;
             Ok(RetryOutcome::DeadLettered)
         }
+    }
+
+    /// Finalize one delivery, including its polling status, in one Redis
+    /// script. Serialization happens before Redis can mutate anything.
+    async fn finalize_delivery(
+        &self,
+        claimed: &ClaimedJob,
+        status: &JobStatus,
+        replacement: Option<&JobEnvelope>,
+        dead_letter_error: Option<&str>,
+    ) -> Result<(), JobError> {
+        let status_json = serde_json::to_string(status)
+            .map_err(|e| JobError::Serialize(e.to_string()))?;
+        let envelope_json = replacement.map(serde_json::to_string).transpose()
+            .map_err(|e| JobError::Serialize(e.to_string()))?
+            .unwrap_or_default();
+        let destination = if dead_letter_error.is_some() {
+            format!("{}:dlq", self.stream)
+        } else {
+            self.stream.clone()
+        };
+        let _: u64 = self.client.eval(
+            FINALIZE_DELIVERY,
+            vec![self.stream.clone(), destination, status_key(&claimed.envelope.job_id)],
+            vec![
+                self.group.clone(),
+                claimed.stream_id.clone(),
+                status_json,
+                claimed.envelope.owner.clone().unwrap_or_default(),
+                JOB_STATUS_TTL_SECS.to_string(),
+                envelope_json,
+                if dead_letter_error.is_some() { "1" } else { "0" }.to_string(),
+                dead_letter_error.unwrap_or_default().to_string(),
+            ],
+        ).await?;
+        Ok(())
     }
 
     /// Read the side-channel status hash for `job_id`. Returns
