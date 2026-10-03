@@ -5,7 +5,9 @@
   "description": "Headless-browser diagnostic harness for the OgreNotes deployed frontend. Driven by the .claude/agents/frontend-doctor.md subagent.",
   "type": "module",
   "scripts": {
-    "doctor": "node doctor.js"
+    "doctor": "node doctor.js",
+    "test": "node --test doctor-result.test.js",
+    "test:browser": "DOCTOR_BROWSER_TESTS=1 node --test doctor-result.test.js"
   },
   "dependencies": {
     "@axe-core/playwright": "4.10.1",

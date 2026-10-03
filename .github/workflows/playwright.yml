@@ -250,6 +250,10 @@ jobs:
         working-directory: scripts/frontend-doctor
         run: npx playwright install-deps chromium firefox
 
+      - name: Doctor failure reporting browser regressions
+        working-directory: scripts/frontend-doctor
+        run: npm run test:browser
+
       - name: Run trash-flow scenario
         id: trash-flow
         working-directory: scripts/frontend-doctor
