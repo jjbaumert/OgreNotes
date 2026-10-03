@@ -69,14 +69,22 @@ fn assert_rendered(actual: &Node, expected: &Node) {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn remote_prepend_survives_stale_local_edit() {
-    let initial = document(vec![paragraph("b1", "Hello")]);
-    let (a, b) = pair(&initial);
-    let remote = document(vec![paragraph("peer", "Peer"), paragraph("b1", "Hello")]);
-    sync_model_to_ydoc_diffed(&b, &remote, Some(&initial));
-    send(&b, &a);
-    let local = document(vec![paragraph("b1", "Hello!")]);
-    sync_model_to_ydoc_diffed(&a, &local, Some(&initial));
-    assert_merged(&a, &b, &document(vec![paragraph("peer", "Peer"), paragraph("b1", "Hello!")]));
+    // The Yrs insertion tie-breaker depends on client IDs. Both orderings
+    // must preserve the peer's new block when this client edits a stale view.
+    for (local_id, remote_id) in [(1, 2), (2, 1)] {
+        let initial = document(vec![paragraph("b1", "Hello")]);
+        let local = Doc::with_client_id(local_id);
+        let remote = Doc::with_client_id(remote_id);
+        sync_model_to_ydoc_diffed(&local, &initial, None);
+        send(&local, &remote);
+        sync_model_to_ydoc_diffed(&remote,
+            &document(vec![paragraph("peer", "Peer"), paragraph("b1", "Hello")]), Some(&initial));
+        send(&remote, &local);
+        sync_model_to_ydoc_diffed(&local,
+            &document(vec![paragraph("b1", "Hello!")]), Some(&initial));
+        assert_merged(&local, &remote,
+            &document(vec![paragraph("peer", "Peer"), paragraph("b1", "Hello!")]));
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]

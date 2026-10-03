@@ -437,10 +437,11 @@ fn flush_pending_updates_to_socket(
 /// would otherwise rebuild the view from a ydoc that has never seen the
 /// keystroke — silently dropping it (the "first keystrokes after mount"
 /// bug). Folding first turns the subsequent apply into a true CRDT
-/// merge. Ordering matters: folding AFTER the apply treats remote
-/// content the stale model has never seen as local deletions — see the
-/// `fold_after_remote_apply_deletes_peer_content` tripwire test in
-/// yrs_bridge.
+/// merge. This pre-apply fold covers the gap before the callback runs.
+/// A callback can also observe keystrokes typed after remote apply; its
+/// baseline-aware fold preserves peer content that the stale model has not
+/// rendered yet. The `fold_after_remote_apply_deletes_peer_content` test
+/// shows why folding without that baseline is unsafe.
 ///
 /// No-op without a provider (page registered none) or a baseline (a
 /// full-doc fold is exactly the unsafe overwrite we're avoiding; the

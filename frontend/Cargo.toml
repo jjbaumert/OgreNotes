@@ -76,7 +76,7 @@ ogrenotes-math = { path = "../crates/math" }
 # backend (crates/highlight) — server HTML export uses the same
 # tokenizer + palette, so editor and export always agree.
 ogrenotes-highlight = { path = "../crates/highlight" }
-similar = { version = "2", default-features = false }
+similar = { version = "2", default-features = false, features = ["wasm32_web_time"] }
 
 [dependencies.web-sys]
 version = "0.3"

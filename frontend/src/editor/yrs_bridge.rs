@@ -1082,7 +1082,12 @@ fn text_diff(old: &[char], new: &[char]) -> Vec<similar::DiffOp> {
             old_index: 0, old_len: old.len(), new_index: 0, new_len: new.len(),
         }];
     }
-    similar::capture_diff_slices(similar::Algorithm::Myers, old, new)
+    // On overlapping but mostly replaced text, unbounded Myers can run for
+    // many seconds in the browser's input path. Similar's deadline falls back
+    // to a coarser replacement while retaining common anchors it has found.
+    // Enable wasm32_web_time in Cargo.toml so the deadline also works in WASM.
+    let deadline = similar::Instant::now() + std::time::Duration::from_millis(20);
+    similar::capture_diff_slices_deadline(similar::Algorithm::Myers, old, new, Some(deadline))
 }
 
 fn text_len(text: &str, kind: yrs::OffsetKind) -> usize {
@@ -1524,6 +1529,21 @@ mod tests {
                 Fragment::from(vec![Node::text("Hello world")]),
             )]),
         )
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn large_overlapping_replacement_has_bounded_diff_latency() {
+        // A shared trailing character bypasses the disjoint-alphabet fast
+        // path while leaving Myers with almost the maximum edit distance.
+        let old = vec!['a'; 20_000];
+        let mut new = vec!['b'; 20_000];
+        new.push('a');
+        let start = std::time::Instant::now();
+        let ops = text_diff(&old, &new);
+        assert!(!ops.is_empty());
+        assert!(start.elapsed() < std::time::Duration::from_secs(3),
+            "large replacement stalled the editor diff: {:?}", start.elapsed());
     }
 
     #[test]

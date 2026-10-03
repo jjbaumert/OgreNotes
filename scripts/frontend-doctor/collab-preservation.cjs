@@ -164,6 +164,24 @@ async function socketGate(page) {
         expected = ['A😀XBY'];
       }
       await exact(pages, expected);
+      // Export reads the persisted snapshot plus pending durable updates,
+      // independently of either live WebSocket room. A reload alone could
+      // reconnect to that room and conceal a stale stored snapshot.
+      await until(async () => {
+        const response = await api(contexts[0], 'GET', `documents/${doc.id}/export/html`, undefined, tokens[0].accessToken);
+        const html = await response.text();
+        const stored = await a.evaluate(value => {
+          const body = new DOMParser().parseFromString(value, 'text/html').body;
+          return {
+            paragraphs: [...body.querySelectorAll(':scope > p')].map(p => p.textContent),
+            jointlyMarked: [...body.querySelectorAll('strong em, em strong')].map(n => n.textContent).join(''),
+            hardBreaks: body.querySelectorAll('p br').length,
+          };
+        }, html);
+        return JSON.stringify(stored.paragraphs) === JSON.stringify(expected)
+          && (!scenario.endsWith('formatting') || stored.jointlyMarked === initial)
+          && (scenario !== 'inline-formatting' || stored.hardBreaks === 1);
+      }, `Stored export must contain ${JSON.stringify(expected)} and its formatting`);
       // Fresh editor instances must fetch and render the saved document again.
       await Promise.all(pages.map(p => p.reload()));
       await exact(pages, expected);
