@@ -1024,3 +1024,30 @@ async fn killed_worker_after_failed_handoff_is_recovered_by_another_process() {
         let _: u64 = client.del(ready_key).await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn receipt_renewal_preserves_generation_and_stops_after_loss() {
+    let url = require_redis!();
+    let client = fresh_client(&url).await;
+    let queue = fresh_queue(client, "receipt-renewal").await;
+    queue.enqueue(Job::Noop { label: "renewal".into() }).await.unwrap();
+    let old = queue.consume_next("worker-a", 1000).await.unwrap().unwrap();
+    sleep(Duration::from_millis(120)).await;
+    assert!(queue.renew_claim(&old).await.unwrap());
+    assert!(queue.claim_stale("worker-b", 100, 1).await.unwrap().is_empty());
+    // JUSTID preserves the count, so the same receipt can still finalize.
+    assert_eq!(queue.ack(&old, None).await.unwrap(), FinalizationOutcome::Applied);
+
+    queue.enqueue(Job::Noop { label: "lost-receipt".into() }).await.unwrap();
+    let old = queue.consume_next("worker-a", 1000).await.unwrap().unwrap();
+    assert!(queue.renew_claim(&old).await.unwrap());
+    // A stopped heartbeat permits crash recovery after the idle threshold.
+    sleep(Duration::from_millis(120)).await;
+    let current = queue.claim_stale("worker-b", 100, 1).await.unwrap().pop().unwrap();
+    assert!(!queue.renew_claim(&old).await.unwrap());
+    assert!(queue.renew_claim(&current).await.unwrap());
+    // The owner returns to A, but its old generation must remain fenced.
+    let newest = queue.claim_stale("worker-a", 0, 1).await.unwrap().pop().unwrap();
+    assert!(!queue.renew_claim(&old).await.unwrap());
+    assert_eq!(queue.ack(&newest, None).await.unwrap(), FinalizationOutcome::Applied);
+}

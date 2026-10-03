@@ -82,7 +82,13 @@ pub enum Job {
     /// Token-free trigger for a checkpointed Quip import (Phase 1+). The
     /// token is NEVER carried here — the worker re-reads it from the
     /// TokenStore keyed by import_id. See design §"Enqueue path".
-    StartQuipImport { import_id: String, owner_id: String },
+    StartQuipImport {
+        import_id: String,
+        owner_id: String,
+        /// Scope generation recorded before enqueue. Missing on legacy jobs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+    },
     /// No-op job — used by tests to verify the queue mechanics
     /// without dragging in DOCX/PDF deps. Carries an arbitrary
     /// label so a test can correlate the dequeue.
@@ -604,6 +610,25 @@ impl JobQueue {
         format!("{}:finalizations", self.stream)
     }
 
+    /// Keep a live receipt below the reaper idle threshold without changing
+    /// its delivery count. A superseded receipt can never renew the new owner.
+    pub async fn renew_claim(&self, claimed: &ClaimedJob) -> Result<bool, JobError> {
+        let renewed: bool = self.client.eval(
+            r#"
+local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[2], ARGV[2], 1)
+if #pending == 0 or pending[1][2] ~= ARGV[3] or pending[1][4] ~= tonumber(ARGV[4]) then
+    return 0
+end
+local claimed = redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[3], 0, ARGV[2], 'IDLE', 0, 'JUSTID')
+return #claimed
+"#,
+            vec![self.stream.clone()],
+            vec![self.group.clone(), claimed.stream_id.clone(), claimed.consumer.clone(),
+                claimed.delivery_count.to_string()],
+        ).await?;
+        Ok(renewed)
+    }
+
     /// Durable terminal effects still owed by the application. Written in
     /// the same script that retires the source, with no TTL until reconciled.
     pub async fn pending_finalization(&self, job_id: &str) -> Result<Option<PendingFinalization>, JobError> {
@@ -873,7 +898,7 @@ mod tests {
     /// poll-auth path (#85) doesn't silently fall through to ownerless.
     #[test]
     fn start_quip_import_wire_tag_and_owner() {
-        let job = Job::StartQuipImport { import_id: "imp1".into(), owner_id: "u1".into() };
+        let job = Job::StartQuipImport { import_id: "imp1".into(), owner_id: "u1".into(), run_id: None };
         let json = serde_json::to_string(&job).unwrap();
         assert!(json.contains(r#""type":"startQuipImport""#), "wire tag pinned: {json}");
         // Token-free trigger: the job envelope must never carry the Quip
@@ -882,6 +907,11 @@ mod tests {
         let lower = json.to_ascii_lowercase();
         assert!(!lower.contains("token"), "trigger must be token-free: {json}");
         assert!(!lower.contains("secret"), "trigger must carry no secret: {json}");
+        assert!(!json.contains("run_id"), "legacy wire omits the generation");
+        let versioned = Job::StartQuipImport {
+            import_id: "imp1".into(), owner_id: "u1".into(), run_id: Some("run1".into()),
+        };
+        assert_eq!(serde_json::from_str::<Job>(&serde_json::to_string(&versioned).unwrap()).unwrap(), versioned);
         let back: Job = serde_json::from_str(&json).unwrap();
         assert_eq!(back, job);
         // owner_of must return the owner so poll-auth (#85) doesn't silently

@@ -289,9 +289,10 @@ async fn start(
     let effective_target =
         ensure_import_folder(&state, &record, &import_id, &req.target_folder_id, &user_id).await?;
 
+    let run_id = new_id();
     state
         .import_repo
-        .set_scope(&import_id, &req.selected_root_folder_ids, &effective_target)
+        .set_scope_for_run(&import_id, &req.selected_root_folder_ids, &effective_target, &run_id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -303,6 +304,7 @@ async fn start(
         .enqueue(ogrenotes_worker::Job::StartQuipImport {
             import_id: import_id.clone(),
             owner_id: user_id,
+            run_id: Some(run_id),
         })
         .await
         .map_err(|e| ApiError::ServiceUnavailable(format!("enqueue failed: {e}")))?;

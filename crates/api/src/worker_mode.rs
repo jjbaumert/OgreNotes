@@ -92,6 +92,7 @@ pub struct WorkerCtx {
     // Per-delivery completion intent. Queue execution defers terminal writes
     // until its receipt wins; direct handler callers keep their old contract.
     deferred_import_status: Option<Arc<std::sync::Mutex<Option<ImportStatus>>>>,
+    import_run_id: Option<String>,
 }
 
 impl WorkerCtx {
@@ -114,6 +115,7 @@ impl WorkerCtx {
             quip_base,
             reindex: None,
             deferred_import_status: None,
+            import_run_id: None,
         }
     }
 
@@ -560,6 +562,18 @@ pub async fn execute_and_finalize(queue: &JobQueue, claimed: ClaimedJob, ctx: &W
     }
     let mut delivery_ctx = ctx.clone();
     delivery_ctx.deferred_import_status = Some(Arc::new(std::sync::Mutex::new(None)));
+    if let Job::StartQuipImport { run_id, .. } = &claimed.envelope.payload {
+        delivery_ctx.import_run_id = run_id.clone();
+    }
+    match queue.renew_claim(&claimed).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            tracing::warn!(job_id, error = %e, "cannot renew receipt; leaving delivery pending");
+            return;
+        }
+    }
+    let _receipt_heartbeat = ReceiptHeartbeat::spawn(queue.clone(), claimed.clone());
     // Isolate the handler behind catch_unwind: a panic in any job kind
     // (e.g. a malformed-PDF panic in a parser dependency — see the
     // `catch_unwind` in import_pdf.rs for why this class is real) must
@@ -683,7 +697,7 @@ async fn reconcile_finalization(queue: &JobQueue, ctx: &WorkerCtx, record: Pendi
 }
 
 async fn apply_finalization(ctx: &WorkerCtx, record: &PendingFinalization) -> Result<(), String> {
-    if let Job::StartQuipImport { import_id, .. } = &record.envelope.payload {
+    if let Job::StartQuipImport { import_id, run_id, .. } = &record.envelope.payload {
         let status = match &record.status {
             JobStatus::Failed { .. } => Some(ImportStatus::Failed),
             JobStatus::Succeeded { result_json: Some(json), .. } => {
@@ -695,13 +709,13 @@ async fn apply_finalization(ctx: &WorkerCtx, record: &PendingFinalization) -> Re
             _ => None,
         };
         if let Some(status) = status {
-            let applied = ctx.import_repo.apply_job_completion(import_id, &record.envelope.job_id, status)
+            let applied = ctx.import_repo.apply_job_completion(import_id, &record.envelope.job_id, run_id.as_deref(), status)
                 .await.map_err(|e| e.to_string())?;
             // Never base cleanup on an eventually-consistent status read: a
             // replay could sweep a newer run. Cleanup is advisory after the
             // conditional write; a crash here leaves the lifecycle backstop.
             if applied && matches!(status, ImportStatus::Succeeded | ImportStatus::Failed) {
-                cleanup_quip_staging(ctx, import_id).await;
+                cleanup_quip_staging(ctx, import_id, run_id.as_deref()).await;
             }
         }
     } else {
@@ -766,7 +780,7 @@ async fn execute(ctx: &WorkerCtx, payload: &Job) -> Result<JobDisposition, Strin
         }
         #[cfg(not(feature = "pdf"))]
         Job::ImportPdf { .. } => Err("PDF import not compiled into this build".into()),
-        Job::StartQuipImport { import_id, owner_id } => {
+        Job::StartQuipImport { import_id, owner_id, .. } => {
             match execute_start_quip_import(ctx, import_id, owner_id).await? {
                 ImportRunOutcome::Ran => {
                     let status = ctx.deferred_import_status.as_ref().and_then(|status|
@@ -811,7 +825,8 @@ async fn cleanup_staging_blob(ctx: &WorkerCtx, payload: &Job) {
 /// The S3 prefix a Quip import stages its per-thread raw HTML under.
 ///
 /// One object per thread lives directly beneath it
-/// (`imports/{import_id}/threads/{quip_thread_id}.html`), written by
+/// (`imports/{import_id}/runs/{run_id}/threads/{quip_thread_id}.html` for
+/// generation-aware starts; legacy jobs keep their original prefix), written by
 /// [`import_one_thread`] and swept by [`cleanup_quip_staging`]. Both spell it
 /// through this function so the writer and the deleter cannot drift apart —
 /// a deleter aimed at a prefix the writer no longer uses is a silent leak of
@@ -823,8 +838,11 @@ async fn cleanup_staging_blob(ctx: &WorkerCtx, payload: &Job) {
 /// PDF staging that shares the `imports/` root but has a different shape
 /// (`imports/{user_id}/{id}.{ext}` — those are single objects owned by their
 /// own job, cleaned by [`cleanup_staging_blob`]).
-fn quip_staging_prefix(import_id: &str) -> String {
-    format!("imports/{import_id}/threads/")
+fn quip_staging_prefix(import_id: &str, run_id: Option<&str>) -> String {
+    match run_id {
+        Some(run_id) => format!("imports/{import_id}/runs/{run_id}/threads/"),
+        None => format!("imports/{import_id}/threads/"),
+    }
 }
 
 /// Drop an import's staged raw Quip HTML. **Call only once the import itself
@@ -848,8 +866,8 @@ fn quip_staging_prefix(import_id: &str) -> String {
 /// could not reach S3; the failure is logged, and the `imports/` lifecycle
 /// rule (see `infra/lib/data.ts`) is the backstop that catches what a lost
 /// delete leaves behind.
-async fn cleanup_quip_staging(ctx: &WorkerCtx, import_id: &str) {
-    let prefix = quip_staging_prefix(import_id);
+async fn cleanup_quip_staging(ctx: &WorkerCtx, import_id: &str, run_id: Option<&str>) {
+    let prefix = quip_staging_prefix(import_id, run_id);
     match ctx.s3.delete_prefix(&prefix).await {
         Ok(()) => tracing::info!(
             import_id,
@@ -879,7 +897,7 @@ async fn finish_quip_import(ctx: &WorkerCtx, import_id: &str, status: ImportStat
     }
     ctx.import_repo.set_status(import_id, status).await.map_err(|e| e.to_string())?;
     if matches!(status, ImportStatus::Succeeded | ImportStatus::Failed) {
-        cleanup_quip_staging(ctx, import_id).await;
+        cleanup_quip_staging(ctx, import_id, ctx.import_run_id.as_deref()).await;
     }
     Ok(())
 }
@@ -1222,6 +1240,13 @@ pub async fn execute_start_quip_import(
 ) -> Result<ImportRunOutcome, String> {
     let instance = worker_instance_id();
     let now_ms = ogrenotes_common::time::now_usec() / 1000;
+    if ctx.import_repo.current_run_id(import_id).await.map_err(|e| e.to_string())?
+        != ctx.import_run_id
+    {
+        // The start route superseded this queued run. Retire its delivery
+        // without executing against the newer scope or publishing completion.
+        return Ok(ImportRunOutcome::Ran);
+    }
 
     // Best-effort lease. `Ok(false)` means a genuinely-live *other* runner
     // owns this import — nothing to do (NOT an error), and we must NOT clear
@@ -1231,7 +1256,7 @@ pub async fn execute_start_quip_import(
     // reclaimable by the time the entry is redelivered).
     if !ctx
         .import_repo
-        .claim_runner(import_id, &instance, now_ms, CLAIM_STALE_MS)
+        .claim_runner_for_run(import_id, &instance, now_ms, CLAIM_STALE_MS, ctx.import_run_id.as_deref())
         .await
         .map_err(|e| format!("claim runner: {e}"))?
     {
@@ -1269,6 +1294,31 @@ pub async fn execute_start_quip_import(
         Err(e) => tracing::warn!(import_id, error = %e, "quip import: clearing the lease failed"),
     }
     result.map(|()| ImportRunOutcome::Ran)
+}
+
+/// Keeps the Redis receipt live independently of handler progress. Renewal is
+/// fenced by owner and delivery count; cancellation drops and stops the timer.
+struct ReceiptHeartbeat(tokio::task::JoinHandle<()>);
+
+impl ReceiptHeartbeat {
+    fn spawn(queue: JobQueue, claimed: ClaimedJob) -> Self {
+        Self(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(REAPER_MIN_IDLE_MS / 3));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                match queue.renew_claim(&claimed).await {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(e) => tracing::warn!(error = %e, "queue receipt heartbeat failed"),
+                }
+            }
+        }))
+    }
+}
+
+impl Drop for ReceiptHeartbeat {
+    fn drop(&mut self) { self.0.abort(); }
 }
 
 /// Keeps the DynamoDB runner lease fresh for as long as the handler holds it,
@@ -1335,12 +1385,12 @@ async fn run_inventory(
     owner_id: &str,
     instance: &str,
 ) -> Result<(), String> {
-    let record = ctx
+    let Some(record) = ctx
         .import_repo
-        .get(import_id)
+        .get_for_run(import_id, ctx.import_run_id.as_deref())
         .await
         .map_err(|e| format!("get import: {e}"))?
-        .ok_or_else(|| format!("import {import_id} not found"))?;
+    else { return Ok(()); };
     if record.owner_id != owner_id {
         return Err(format!("owner mismatch for import {import_id}"));
     }
@@ -1364,10 +1414,11 @@ async fn run_inventory(
     // Per-import client: a fresh 45/min throttle isolates each import's
     // rate budget (never reuse the API's shared `quip_client`).
     let client = QuipClient::new(ctx.quip_base.clone());
-    ctx.import_repo
-        .set_status(import_id, ImportStatus::Running)
-        .await
-        .map_err(|e| format!("set running: {e}"))?;
+    if !ctx.import_repo.set_running_for_run(import_id, instance, ctx.import_run_id.as_deref())
+        .await.map_err(|e| format!("set running: {e}"))?
+    {
+        return Ok(());
+    }
 
     // BFS the selected roots. The walker's closure captures references to
     // the client and token (not moving the client) so the per-BFS-level
@@ -2959,7 +3010,7 @@ pub async fn import_one_thread(
     //    resumed pass skips on the `THREAD#` row's `ContentDone` checkpoint
     //    and re-fetches anything still `Pending` — so its lifetime is purely
     //    a retention decision.
-    let staged_key = format!("{}{}.html", quip_staging_prefix(import_id), thread.quip_thread_id);
+    let staged_key = format!("{}{}.html", quip_staging_prefix(import_id, ctx.import_run_id.as_deref()), thread.quip_thread_id);
     ctx.s3
         .put_object(&staged_key, html.clone().into_bytes())
         .await

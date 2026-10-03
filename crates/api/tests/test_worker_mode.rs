@@ -242,6 +242,40 @@ async fn reclaimed_delivery_rejects_the_old_workers_terminal_cleanup() {
     obsolete_success_preserves_staging(true).await;
 }
 
+/// Hold the real S3 GET until the receipt has been transferred. This enters
+/// the handler while its receipt is valid and exercises a genuinely late ack.
+async fn gated_s3(app: &common::TestApp) -> (
+    ogrenotes_storage::s3::S3Client, Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>, tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let paused = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let proxy = tokio::spawn({
+        let paused = Arc::clone(&paused);
+        let release = Arc::clone(&release);
+        async move {
+            let (mut downstream, _) = listener.accept().await.unwrap();
+            let mut first = [0; 4096];
+            let len = downstream.read(&mut first).await.unwrap();
+            paused.notify_one();
+            release.notified().await;
+            let mut upstream = tokio::net::TcpStream::connect("127.0.0.1:9000").await.unwrap();
+            upstream.write_all(&first[..len]).await.unwrap();
+            let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+        }
+    });
+    let config = aws_sdk_s3::config::Builder::new().endpoint_url(endpoint)
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "minioadmin", "minioadmin", None, None, "test"))
+        .force_path_style(true).behavior_version_latest().build();
+    (ogrenotes_storage::s3::S3Client::new(aws_sdk_s3::Client::from_conf(config),
+        app.state.doc_repo.s3().bucket().into()), paused, release, proxy)
+}
+
 async fn obsolete_success_preserves_staging(reclaim_only: bool) {
     common::require_infra!();
     let app = common::TestApp::new().await;
@@ -270,6 +304,19 @@ async fn obsolete_success_preserves_staging(reclaim_only: bool) {
     }).await.unwrap();
     let old = queue.consume_next("slow-worker", 1000).await.unwrap().unwrap();
 
+    let (gated, paused, release, proxy) = gated_s3(&app).await;
+    let old_ctx = WorkerCtx::new(
+        app.state.doc_repo.clone(), app.state.folder_repo.clone(), gated,
+        app.state.import_repo.clone(), app.state.user_repo.clone(),
+        app.state.quip_token_store.clone(), None,
+    );
+    let old_task = tokio::spawn({
+        let queue = queue.clone();
+        let old = old.clone();
+        async move { execute_and_finalize(&queue, old, &old_ctx).await }
+    });
+    timeout(Duration::from_secs(5), paused.notified()).await.unwrap();
+
     let retry = if reclaim_only {
         // XAUTOCLAIM transfers the PEL owner without changing the entry ID.
         // The original worker is still running and can finish after transfer.
@@ -290,7 +337,9 @@ async fn obsolete_success_preserves_staging(reclaim_only: bool) {
 
     // The old worker completes real S3 parsing and document persistence late.
     // Its obsolete ack must not delete the live retry's only input object.
-    execute_and_finalize(&queue, old, &ctx).await;
+    release.notify_one();
+    timeout(Duration::from_secs(10), old_task).await.unwrap().unwrap();
+    proxy.abort();
     assert_eq!(app.state.folder_repo.list_children(&folder_id).await.unwrap().len(), 1,
         "the stale handler must actually succeed to exercise its ack cleanup path");
     assert_eq!(s3.get_object(&key).await.unwrap(), fixture,

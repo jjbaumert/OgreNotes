@@ -993,3 +993,37 @@ async fn a_corrupt_report_row_degrades_to_null_rather_than_500ing_the_poll() {
 
     app.cleanup().await;
 }
+
+#[tokio::test]
+async fn failed_enqueue_can_restart_with_an_authoritative_new_generation() {
+    common::require_infra!();
+    use fred::prelude::*;
+    use ogrenotes_worker::{Job, JobQueue};
+    let app = common::TestApp::new().await;
+    let (owner, token) = app.create_user("restart-enqueue@test.com").await;
+    let folder = app.create_folder(&token, "Destination", None).await;
+    let import_id = seed_scoping_import(&app, &owner, &["root"]).await;
+    let stream = app.state.config.job_stream_name.clone();
+    let client = &app.state.redis;
+    let _: u64 = client.del(&stream).await.unwrap();
+    let _: () = client.set(&stream, "wrong type", None, None, false).await.unwrap();
+    let request = serde_json::json!({"selectedRootFolderIds": ["root"], "targetFolderId": folder});
+    let (status, _) = app.json_request(Method::POST,
+        &format!("/api/v1/imports/quip/{import_id}/start"), Some(&token), Some(request.clone())).await;
+    assert_eq!(status, 503);
+    let failed_run = app.state.import_repo.current_run_id(&import_id).await.unwrap().unwrap();
+    let _: u64 = client.del(&stream).await.unwrap();
+    let queue = JobQueue::new(std::sync::Arc::clone(client), stream).await.unwrap();
+    let (status, body) = app.json_request(Method::POST,
+        &format!("/api/v1/imports/quip/{import_id}/start"), Some(&token), Some(request)).await;
+    assert_eq!(status, 202, "{body}");
+    let current_run = app.state.import_repo.current_run_id(&import_id).await.unwrap().unwrap();
+    assert_ne!(failed_run, current_run);
+    let receipt = queue.consume_next("restart-consumer", 1000).await.unwrap().unwrap();
+    match &receipt.envelope.payload {
+        Job::StartQuipImport { run_id, .. } => assert_eq!(run_id.as_deref(), Some(current_run.as_str())),
+        other => panic!("unexpected job: {other:?}"),
+    }
+    queue.ack(&receipt, None).await.unwrap();
+    app.cleanup().await;
+}
