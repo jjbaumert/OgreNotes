@@ -1,0 +1,26 @@
+flowchart TB
+N0[Node zero]
+N1[Node one]
+N2[Node two]
+N3[Node three]
+N4[Node four]
+subgraph C0[Outer]
+direction RL
+N4
+subgraph C1[First]
+direction TB
+N1
+end
+subgraph C2[Second]
+direction RL
+N0
+N2
+N3
+end
+end
+N0 --> N2
+N0 --> N1
+N0 --> N1
+N2 --> N3
+N4 --> N3
+N2 --> N0

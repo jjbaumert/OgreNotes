@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 1386218223b2693d0f0ce0443c24549dd3a4f128b4b988680bef6a43f1aa114b # shrinks to input = LayoutInput { nodes: [LNode { width: 64.49219066978553, height: 10.0, cluster: Some(1) }, LNode { width: 111.70746362329389, height: 10.0, cluster: Some(1) }], edges: [LEdge { from: 0, to: 1, label: None }], clusters: [LCluster { parent: None, title: (30.0, 14.0) }, LCluster { parent: None, title: (30.0, 14.0) }], direction: LR }
 cc 542c0946cc516b5efe1be28980c558119e31aa7a8edfe014f22bdb83d934c777 # shrinks to input = LayoutInput { nodes: [LNode { width: 10.0, height: 10.0, cluster: None }, LNode { width: 10.0, height: 10.0, cluster: None }], edges: [LEdge { from: 0, to: 0, label: Some((10.0, 14.0)) }, LEdge { from: 0, to: 0, label: Some((10.0, 14.0)) }], clusters: [], direction: TB }
+cc c4da98a063a296a3fcbad12d2e008df60646010bbc18159200bdb7b0655ea84f # CI: nested RL cluster boundary join crosses a sibling node
