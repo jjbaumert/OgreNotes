@@ -236,15 +236,17 @@ fn build_level(
             local_edge_orig.push(LocalRole::Leg(ei));
         }
         // Pin the exit port below every sink and the entry port above every
-        // source, so legs leave through the cluster's far side rather than
-        // ending beside a sibling mid-cluster.
+        // source in the ranking DAG. In the original graph a cycle can hide
+        // those sources/sinks, leaving a port beside a sibling mid-cluster;
+        // the boundary join would then cut through that sibling. Adding pins
+        // cannot change DFS back-edges: entry ports have no incoming edges and
+        // exit ports have no outgoing edges.
         let n = entities.len();
         let (mut has_out, mut has_in) = (vec![false; n], vec![false; n]);
-        for e in &local_edges {
-            if e.from != e.to {
-                has_out[e.from] = true;
-                has_in[e.to] = true;
-            }
+        let ranked = super::acyclic::make_acyclic(n, &local_edges);
+        for e in &ranked.edges {
+            has_out[e.from] = true;
+            has_in[e.to] = true;
         }
         for (i, ent) in entities.clone().iter().enumerate() {
             if matches!(ent, Entity::Port(_)) {
