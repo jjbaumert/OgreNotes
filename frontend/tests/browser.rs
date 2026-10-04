@@ -6266,6 +6266,215 @@ fn paste_dollar_math_text_becomes_an_equation() {
     }
 }
 
+const DISPLAY_PASTE_SOURCE: &str = r"\sum_{k \in K_P} d_k \cdot \left( \delta_{k,1}^e \cdot x_{k,1} + \delta_{k,2}^e \cdot x_{k,2} \right) \le C_e \quad \forall e \in E";
+
+#[wasm_bindgen_test]
+fn paste_display_equation_from_plain_and_rich_clipboards() {
+    let text = format!("$${DISPLAY_PASTE_SOURCE}$$");
+    let rich = format!("<p><strong>{text}</strong></p>");
+    let bare = format!("<strong>{text}</strong>");
+    let split =
+        format!("<p><strong>$$</strong><em>{DISPLAY_PASTE_SOURCE}</em><strong>$$</strong></p>");
+    for (plain, html) in [
+        (&text[..], ""),
+        (&text[..], &rich[..]),
+        (&text[..], &split[..]),
+        ("", &rich[..]),
+        (&text[..], &bare[..]),
+        ("", &bare[..]),
+    ] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+        set_cursor(&view, 1);
+        dispatch_paste_html(&view, &txns, plain, html);
+        let eq = view
+            .container()
+            .query_selector(".math-block")
+            .unwrap()
+            .expect("display equation");
+        assert_eq!(
+            eq.get_attribute("data-source").as_deref(),
+            Some(DISPLAY_PASTE_SOURCE)
+        );
+        assert!(
+            eq.query_selector("math[display=block] mo")
+                .unwrap()
+                .is_some(),
+            "{}",
+            inner_html(&view)
+        );
+        assert!(
+            view.container()
+                .query_selector(".math-error")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!inner_html(&view).contains("$$"), "{}", inner_html(&view));
+        ogrenotes_frontend::editor::schema::default_schema()
+            .validate(&view.state().doc)
+            .unwrap();
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn paste_display_math_in_rich_prose_preserves_marks() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "before $$x^2$$ after",
+        "<p><strong>before $$x</strong><em>^2$$ after</em></p>",
+    );
+    let eq = view
+        .container()
+        .query_selector(".math-inline math[display=inline]")
+        .unwrap();
+    assert!(eq.is_some(), "{}", inner_html(&view));
+    assert!(
+        view.container()
+            .query_selector(".math-block")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        view.container()
+            .query_selector("strong")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .as_deref(),
+        Some("before ")
+    );
+    assert_eq!(
+        view.container()
+            .query_selector("em")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .as_deref(),
+        Some(" after")
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn paste_display_math_keeps_code_and_invalid_sources_literal() {
+    for html in [
+        "<p><code>$$x^2$$</code></p>",
+        "<pre><code>$$x^2$$</code></pre>",
+        "<p><strong>$$\\unknowncommand$$</strong></p>",
+    ] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+        set_cursor(&view, 1);
+        dispatch_paste_html(&view, &txns, "", html);
+        assert!(
+            view.container().query_selector("math").unwrap().is_none(),
+            "{html}: {}",
+            inner_html(&view)
+        );
+        assert!(view.container().text_content().unwrap().contains("$$"));
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn paste_display_math_into_existing_list_and_table_stays_valid() {
+    for rich in [false, true] {
+        for table in [false, true] {
+            let paragraph = Node::element_with_content(
+                NodeType::Paragraph,
+                Fragment::from(vec![Node::text("before after")]),
+            );
+            let child = if table {
+                Node::element_with_content(
+                    NodeType::Table,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::TableRow,
+                        Fragment::from(vec![Node::element_with_content(
+                            NodeType::TableCell,
+                            Fragment::from(vec![paragraph]),
+                        )]),
+                    )]),
+                )
+            } else {
+                Node::element_with_content(
+                    NodeType::BulletList,
+                    Fragment::from(vec![Node::element_with_content(
+                        NodeType::ListItem,
+                        Fragment::from(vec![paragraph]),
+                    )]),
+                )
+            };
+            let container = create_container();
+            let (view, txns) = create_editor(
+                container.clone(),
+                Node::element_with_content(NodeType::Doc, Fragment::from(vec![child])),
+            );
+            set_cursor(&view, if table { 11 } else { 10 });
+            dispatch_paste_html(
+                &view,
+                &txns,
+                "$$x^2$$",
+                if rich {
+                    "<p><strong>$$x^2$$</strong></p>"
+                } else {
+                    ""
+                },
+            );
+            ogrenotes_frontend::editor::schema::default_schema()
+                .validate(&view.state().doc)
+                .unwrap();
+            assert!(
+                view.container()
+                    .query_selector(".math-inline math")
+                    .unwrap()
+                    .is_some(),
+                "{}",
+                inner_html(&view)
+            );
+            assert!(
+                view.container()
+                    .query_selector(".math-block")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(view.state().doc.text_content(), "before x^2after");
+            cleanup(&container);
+        }
+    }
+}
+
+#[wasm_bindgen_test]
+fn paste_display_math_splits_existing_paragraph_at_caret() {
+    let container = create_container();
+    let doc = Node::element_with_content(
+        NodeType::Doc,
+        Fragment::from(vec![Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(vec![Node::text("before after")]),
+        )]),
+    );
+    let (view, txns) = create_editor(container.clone(), doc);
+    set_cursor(&view, 8);
+    dispatch_paste_html(&view, &txns, "$$x^2$$", "<p><strong>$$x^2$$</strong></p>");
+    let state = view.state();
+    ogrenotes_frontend::editor::schema::default_schema()
+        .validate(&state.doc)
+        .unwrap();
+    assert_eq!(state.doc.child_count(), 3);
+    assert_eq!(state.doc.child(0).unwrap().text_content(), "before ");
+    assert_eq!(
+        state.doc.child(1).unwrap().node_type(),
+        Some(NodeType::MathBlock)
+    );
+    assert_eq!(state.doc.child(2).unwrap().text_content(), "after");
+    cleanup(&container);
+}
+
 #[wasm_bindgen_test]
 fn paste_dollar_amounts_stay_text() {
     let container = create_container();
