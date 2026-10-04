@@ -6,9 +6,13 @@
 //! (strikethrough, tasklists, tables) constructs map onto the editor's node
 //! types. Plain prose with no markdown syntax parses into Paragraph nodes
 //! identically to `clipboard::parse_from_text` for paste-flow purposes.
+//! TeX `\(...\)` / `\[...\]` is protected before Markdown can unescape
+//! delimiters or interpret punctuation inside equation sources.
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ops::Range;
 
 use super::model::{Fragment, Mark, MarkType, Node, NodeType, Slice};
 use super::view::is_safe_url;
@@ -67,10 +71,14 @@ pub fn parse_from_markdown(src: &str) -> Slice {
     // writes (`$…$` inline, a ```` ```math ```` fence for blocks).
     opts.insert(Options::ENABLE_MATH);
 
-    let parser = Parser::new_ext(&normalized, opts);
+    let (protected, equations) = protect_tex_math(&normalized, opts);
     let mut builder = Builder::new();
-    for event in parser {
-        builder.handle(event);
+    if equations.is_empty() {
+        for event in Parser::new_ext(&protected, opts) {
+            builder.handle(event);
+        }
+    } else {
+        build_protected_markdown(&mut builder, &protected, opts, &equations);
     }
     let mut children = builder.finish();
     super::clipboard::preserve_mermaid_nesting(&mut children, NodeType::Doc);
@@ -78,6 +86,375 @@ pub fn parse_from_markdown(src: &str) -> Slice {
         return Slice::empty();
     }
     Slice::new(Fragment::from(children), 0, 0)
+}
+
+fn build_protected_markdown(
+    builder: &mut Builder,
+    protected: &str,
+    opts: Options,
+    equations: &[ProtectedTex<'_>],
+) {
+    let events: Vec<_> = Parser::new_ext(protected, opts)
+        .into_offset_iter()
+        .collect();
+    let payload_ranges: Vec<_> = events
+        .iter()
+        .filter_map(|(event, range)| {
+            matches!(
+                event,
+                Event::Text(_)
+                    | Event::Code(_)
+                    | Event::InlineMath(_)
+                    | Event::DisplayMath(_)
+                    | Event::InlineHtml(_)
+                    | Event::Html(_)
+            )
+            .then_some(range.clone())
+        })
+        .collect();
+    let attribute_offsets: Vec<_> = equations
+        .iter()
+        .filter_map(|equation| {
+            range_at(&payload_ranges, equation.offset)
+                .is_none()
+                .then_some(equation.offset)
+        })
+        .collect();
+    let mut skipped_depth = 0;
+    for (event, range) in events {
+        if skipped_depth > 0 {
+            match event {
+                Event::Start(_) => skipped_depth += 1,
+                Event::End(_) => skipped_depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        let source = &protected[range.clone()];
+        match event {
+            Event::Start(tag @ (Tag::Link { .. } | Tag::Image { .. } | Tag::Table(_))) => {
+                let index = attribute_offsets.partition_point(|offset| *offset < range.start);
+                let mapped_index =
+                    equations.partition_point(|equation| equation.offset < range.start);
+                let mapped_autolink = matches!(
+                    &tag,
+                    Tag::Link {
+                        link_type: LinkType::Autolink | LinkType::Email,
+                        ..
+                    }
+                ) && equations
+                    .get(mapped_index)
+                    .is_some_and(|equation| equation.offset < range.end);
+                if mapped_autolink
+                    || attribute_offsets
+                        .get(index)
+                        .is_some_and(|offset| *offset < range.end)
+                {
+                    // Rejected pairs can move markers into attributes or
+                    // discarded table cells. Preserve the affected construct
+                    // as exact literal source instead of losing pasted content.
+                    let literal = restore_protected_literal(source, source, range.start, equations);
+                    if matches!(tag, Tag::Table(_)) {
+                        builder.close_auto_frames();
+                    }
+                    builder.push_text(&literal);
+                    skipped_depth = 1;
+                } else {
+                    builder.start_tag(tag);
+                }
+            }
+            Event::Text(text) => {
+                push_protected_text(builder, &text, source, range.start, equations);
+            }
+            Event::Code(text) => {
+                let literal = restore_protected_literal(&text, source, range.start, equations);
+                builder.push_code(&literal);
+            }
+            Event::InlineMath(text) => {
+                let literal = restore_protected_literal(&text, source, range.start, equations);
+                builder.push_math(&literal, false);
+            }
+            Event::DisplayMath(text) => {
+                let literal = restore_protected_literal(&text, source, range.start, equations);
+                builder.push_math(&literal, true);
+            }
+            Event::InlineHtml(text) => {
+                let literal = restore_protected_literal(&text, source, range.start, equations);
+                builder.handle_inline_html(&literal);
+            }
+            _ => builder.handle(event),
+        }
+    }
+}
+
+// An ordinary, non-punctuation character keeps equations opaque to Markdown
+// without introducing code delimiters that can merge with adjacent backticks.
+// Its meaning comes exclusively from the recorded source position.
+const TEX_MARKER: char = '\u{fffc}';
+
+struct ProtectedTex<'a> {
+    candidate_index: usize,
+    offset: usize,
+    original: &'a str,
+    source: &'a str,
+    display: bool,
+}
+
+fn protect_tex_math(src: &str, opts: Options) -> (Cow<'_, str>, Vec<ProtectedTex<'_>>) {
+    let candidates = super::paste_math::tex_math_spans(src);
+    if candidates.is_empty() {
+        return (Cow::Borrowed(src), Vec::new());
+    }
+    // Three bounded parses: discover external constructs, check provisionally
+    // protected candidates, then build from the final protected Markdown.
+    // Preliminary inline parsing can hide later equations behind a code span
+    // beginning inside TeX, or discard table cells created by equation pipes.
+    let original = tex_context(src, opts);
+    let html_code = merged_ranges(original.html_code_ranges);
+    let external = merged_ranges(
+        original
+            .excluded
+            .into_iter()
+            .filter(|range| {
+                let index =
+                    candidates.partition_point(|candidate| candidate.range.start <= range.start);
+                !index
+                    .checked_sub(1)
+                    .is_some_and(|index| candidates[index].range.contains(&range.start))
+            })
+            .collect(),
+    );
+    let tentative_indices: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            let scope = range_at(&original.scopes, candidate.range.start + 1)?;
+            let closing_scope = range_at(&original.scopes, candidate.range.end - 1);
+            (candidate.range.end <= scope.end
+                && closing_scope.is_none_or(|end_scope| end_scope == scope)
+                && range_at(&html_code, candidate.range.start)
+                    .is_none_or(|code| candidate.range.end <= code.end)
+                && range_at(&external, candidate.range.start).is_none())
+            .then_some(index)
+        })
+        .collect();
+    let (tentative, equations) = protect_tex_candidates(src, &candidates, &tentative_indices);
+    if equations.is_empty() {
+        return (tentative, equations);
+    }
+    let provisional = tex_context(&tentative, opts);
+    let excluded = merged_ranges(provisional.excluded);
+    let accepted: Vec<usize> = equations
+        .iter()
+        .filter_map(|equation| {
+            (range_at(&provisional.text_ranges, equation.offset).is_some()
+                && range_at(&excluded, equation.offset).is_none())
+            .then_some(equation.candidate_index)
+        })
+        .collect();
+    if accepted.len() == equations.len() {
+        (tentative, equations)
+    } else {
+        // Rejected pairs keep their original source, including real code
+        // delimiters or link destinations that provisional masking replaced.
+        protect_tex_candidates(src, &candidates, &accepted)
+    }
+}
+
+struct TexContext {
+    scopes: Vec<Range<usize>>,
+    text_ranges: Vec<Range<usize>>,
+    excluded: Vec<Range<usize>>,
+    html_code_ranges: Vec<Range<usize>>,
+}
+
+fn tex_context(src: &str, opts: Options) -> TexContext {
+    let mut text_ranges = Vec::new();
+    let mut excluded = Vec::new();
+    let mut scopes: Vec<(TagEnd, Range<usize>)> = Vec::new();
+    let mut scope_ranges = Vec::new();
+    let mut html_code_starts = Vec::new();
+    let mut html_code_ranges = Vec::new();
+    for (event, range) in Parser::new_ext(src, opts).into_offset_iter() {
+        match event {
+            Event::Start(tag) => {
+                if matches!(tag, Tag::CodeBlock(_) | Tag::HtmlBlock | Tag::Image { .. })
+                    || matches!(
+                        tag,
+                        Tag::Link {
+                            link_type: LinkType::Autolink | LinkType::Email,
+                            ..
+                        }
+                    )
+                {
+                    excluded.push(range.clone());
+                }
+                // A formula's pipes must be protected before they can split
+                // table cells, but formulas must never consume another row.
+                if matches!(
+                    tag,
+                    Tag::Paragraph
+                        | Tag::Heading { .. }
+                        | Tag::TableHead
+                        | Tag::TableRow
+                        | Tag::Item
+                ) {
+                    scope_ranges.push(range.clone());
+                    scopes.push((tag.to_end(), range));
+                }
+            }
+            Event::End(tag) => {
+                if scopes.last().is_some_and(|(end, _)| *end == tag) {
+                    scopes.pop();
+                }
+            }
+            Event::Text(_) => {
+                if !scopes.is_empty() {
+                    text_ranges.push(range);
+                }
+            }
+            Event::InlineHtml(html) => {
+                if let Some(tag) = parse_html_tag(&html)
+                    && html_mark_type(&tag.name.to_ascii_lowercase()) == Some(MarkType::Code)
+                {
+                    if tag.is_close {
+                        if let Some(start) = html_code_starts.pop() {
+                            html_code_ranges.push(start..range.start);
+                        }
+                    } else if !tag.self_close {
+                        html_code_starts.push(range.end);
+                    }
+                }
+                excluded.push(range);
+            }
+            Event::Code(_) | Event::Html(_) | Event::InlineMath(_) | Event::DisplayMath(_) => {
+                excluded.push(range)
+            }
+            _ => {}
+        }
+    }
+    for start in html_code_starts {
+        html_code_ranges.push(start..src.len());
+    }
+    let mut cursor = 0;
+    while let Some((start, end)) = find_bare_url(src, cursor) {
+        excluded.push(start..end);
+        cursor = end;
+    }
+    TexContext {
+        scopes: scope_ranges,
+        text_ranges,
+        excluded,
+        html_code_ranges,
+    }
+}
+
+fn merged_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut barriers: Vec<Range<usize>> = Vec::new();
+    for range in ranges {
+        if let Some(last) = barriers.last_mut().filter(|last| range.start <= last.end) {
+            last.end = last.end.max(range.end);
+        } else {
+            barriers.push(range);
+        }
+    }
+    barriers
+}
+
+fn range_at(ranges: &[Range<usize>], position: usize) -> Option<&Range<usize>> {
+    let index = ranges
+        .partition_point(|range| range.start <= position)
+        .checked_sub(1)?;
+    ranges[index].contains(&position).then_some(&ranges[index])
+}
+
+fn protect_tex_candidates<'a>(
+    src: &'a str,
+    candidates: &[super::paste_math::TexMathSpan<'a>],
+    indices: &[usize],
+) -> (Cow<'a, str>, Vec<ProtectedTex<'a>>) {
+    if indices.is_empty() {
+        return (Cow::Borrowed(src), Vec::new());
+    }
+    let mut protected = String::with_capacity(src.len());
+    let mut equations = Vec::new();
+    let mut copied_to = 0;
+    for &candidate_index in indices {
+        let candidate = &candidates[candidate_index];
+        protected.push_str(&src[copied_to..candidate.range.start]);
+        equations.push(ProtectedTex {
+            candidate_index,
+            offset: protected.len(),
+            original: &src[candidate.range.clone()],
+            source: candidate.source,
+            display: candidate.display,
+        });
+        protected.push(TEX_MARKER);
+        copied_to = candidate.range.end;
+    }
+    protected.push_str(&src[copied_to..]);
+    (Cow::Owned(protected), equations)
+}
+
+fn push_protected_text(
+    builder: &mut Builder,
+    text: &str,
+    source: &str,
+    offset: usize,
+    equations: &[ProtectedTex<'_>],
+) {
+    let mut copied_to = 0;
+    // Escapes and entities have their own pulldown Text events. Literal marker
+    // characters retain their order within each source range. An entity that
+    // decodes to U+FFFC has no literal source marker and therefore no mapping.
+    for ((source_at, _), (text_at, _)) in source
+        .match_indices(TEX_MARKER)
+        .zip(text.match_indices(TEX_MARKER))
+    {
+        let Ok(index) =
+            equations.binary_search_by_key(&(offset + source_at), |equation| equation.offset)
+        else {
+            continue;
+        };
+        builder.push_text(&text[copied_to..text_at]);
+        let equation = &equations[index];
+        builder.push_math_or_literal(equation.source, equation.display, equation.original);
+        copied_to = text_at + TEX_MARKER.len_utf8();
+    }
+    builder.push_text(&text[copied_to..]);
+}
+
+fn restore_protected_literal<'a>(
+    text: &'a str,
+    source: &str,
+    offset: usize,
+    equations: &[ProtectedTex<'_>],
+) -> Cow<'a, str> {
+    let mut restored = String::new();
+    let mut copied_to = 0;
+    // A rejected pair can change the final parse context of a later marker.
+    // Restore that pair's exact spelling when it ends up inside literal code
+    // or native math, rather than interpreting it as another equation.
+    for ((source_at, _), (text_at, _)) in source
+        .match_indices(TEX_MARKER)
+        .zip(text.match_indices(TEX_MARKER))
+    {
+        let Ok(index) =
+            equations.binary_search_by_key(&(offset + source_at), |equation| equation.offset)
+        else {
+            continue;
+        };
+        restored.push_str(&text[copied_to..text_at]);
+        restored.push_str(equations[index].original);
+        copied_to = text_at + TEX_MARKER.len_utf8();
+    }
+    if copied_to == 0 {
+        Cow::Borrowed(text)
+    } else {
+        restored.push_str(&text[copied_to..]);
+        Cow::Owned(restored)
+    }
 }
 
 // ─── Builder ────────────────────────────────────────────────────
@@ -586,18 +963,47 @@ impl Builder {
     /// `finalize_frame` promotes a paragraph holding only that to the block.
     fn push_math(&mut self, source: &str, display: bool) {
         let delim = if display { "$$" } else { "$" };
-        if self.code_buffer.is_some() {
-            self.push_text(&format!("{delim}{source}{delim}"));
+        let source = if self.is_literal_math_context() {
+            source
+        } else {
+            source.trim()
+        };
+        self.push_math_or_literal(source, display, &format!("{delim}{source}{delim}"));
+    }
+
+    fn is_literal_math_context(&self) -> bool {
+        self.code_buffer.is_some()
+            || self
+                .stack
+                .last()
+                .is_some_and(|frame| frame.node_type == NodeType::Image)
+            || self
+                .marks
+                .iter()
+                .any(|mark| mark.mark_type == MarkType::Code)
+    }
+
+    fn push_math_or_literal(&mut self, source: &str, display: bool, literal: &str) {
+        if self.is_literal_math_context() {
+            self.push_text(literal);
             return;
         }
-        let mode = if display { ogrenotes_math::Display::Block } else { ogrenotes_math::Display::Inline };
+        let mode = if display {
+            ogrenotes_math::Display::Block
+        } else {
+            ogrenotes_math::Display::Inline
+        };
         let source = source.trim();
         if source.is_empty() || ogrenotes_math::to_mathml(source, mode).is_err() {
-            self.push_text(&format!("{delim}{source}{delim}"));
+            self.push_text(literal);
             return;
         }
         self.ensure_textblock();
-        let node_type = if display { NodeType::MathBlock } else { NodeType::MathInline };
+        let node_type = if display {
+            NodeType::MathBlock
+        } else {
+            NodeType::MathInline
+        };
         self.push_child(math_node(node_type, source));
     }
 
@@ -618,17 +1024,7 @@ impl Builder {
     fn handle_inline_html(&mut self, raw: &str) {
         let Some(tag) = parse_html_tag(raw) else { return };
         let name = tag.name.to_ascii_lowercase();
-        let mark_type = match name.as_str() {
-            "b" | "strong" => Some(MarkType::Bold),
-            "i" | "em" => Some(MarkType::Italic),
-            "u" => Some(MarkType::Underline),
-            "s" | "strike" | "del" => Some(MarkType::Strike),
-            "code" | "kbd" | "tt" | "samp" => Some(MarkType::Code),
-            "mark" => Some(MarkType::Highlight),
-            "sub" => Some(MarkType::Subscript),
-            "sup" => Some(MarkType::Superscript),
-            _ => None,
-        };
+        let mark_type = html_mark_type(&name);
         if let Some(mt) = mark_type {
             if tag.is_close {
                 // Remove the innermost matching mark. Non-LIFO removal is safe
@@ -690,10 +1086,24 @@ impl Builder {
     }
 }
 
+/// Shared by source protection and rendering. Callers normalize tag names.
+fn html_mark_type(name: &str) -> Option<MarkType> {
+    match name {
+        "b" | "strong" => Some(MarkType::Bold),
+        "i" | "em" => Some(MarkType::Italic),
+        "u" => Some(MarkType::Underline),
+        "s" | "strike" | "del" => Some(MarkType::Strike),
+        "code" | "kbd" | "tt" | "samp" => Some(MarkType::Code),
+        "mark" => Some(MarkType::Highlight),
+        "sub" => Some(MarkType::Subscript),
+        "sup" => Some(MarkType::Superscript),
+        _ => None,
+    }
+}
+
 /// A parsed inline HTML tag, enough for the whitelist mapping in
-/// `Builder::handle_inline_html`. Not a general-purpose HTML parser —
-/// only handles the single-tag payloads pulldown-cmark emits as
-/// `Event::InlineHtml`.
+/// `Builder::handle_inline_html`. This handles the single-tag payloads
+/// pulldown-cmark emits as `Event::InlineHtml`.
 struct HtmlTag {
     name: String,
     is_close: bool,
@@ -803,7 +1213,7 @@ fn parse_html_attrs(s: &str) -> Vec<(String, String)> {
 /// excluded from the URL, so `"see https://x.com."` yields a URL without the
 /// final `.`. Matches only at a word boundary (not preceded by a letter/digit)
 /// to avoid rewriting `xhttps://...` occurrences.
-fn find_bare_url(s: &str, from: usize) -> Option<(usize, usize)> {
+pub(super) fn find_bare_url(s: &str, from: usize) -> Option<(usize, usize)> {
     let bytes = s.as_bytes();
     let mut i = from;
     while i < bytes.len() {
@@ -834,6 +1244,15 @@ fn find_bare_url(s: &str, from: usize) -> Option<(usize, usize)> {
             }
             end += 1;
         }
+        // Count parentheses once so long runs of trailing ')' remain linear.
+        let mut paren_balance = bytes[i..end].iter().fold(0isize, |balance, byte| {
+            balance
+                + match byte {
+                    b'(' => 1,
+                    b')' => -1,
+                    _ => 0,
+                }
+        });
         // Strip trailing punctuation that's typically sentence-level, and
         // balance parentheses so `(see https://x.com)` excludes the final `)`.
         while end > i + scheme_len {
@@ -842,13 +1261,10 @@ fn find_bare_url(s: &str, from: usize) -> Option<(usize, usize)> {
                 end -= 1;
                 continue;
             }
-            if c == b')' {
-                let open = s[i..end].bytes().filter(|&b| b == b'(').count();
-                let close = s[i..end].bytes().filter(|&b| b == b')').count();
-                if close > open {
-                    end -= 1;
-                    continue;
-                }
+            if c == b')' && paren_balance < 0 {
+                end -= 1;
+                paren_balance += 1;
+                continue;
             }
             if c == b']' || c == b'}' {
                 end -= 1;
@@ -980,6 +1396,511 @@ mod tests {
         assert!(slice.content.children.iter().all(|n| !format!("{n:?}").contains("Math")), "{slice:?}");
     }
 
+    fn math_sources(slice: &Slice) -> Vec<String> {
+        fn collect(nodes: &[Node], sources: &mut Vec<String>) {
+            for node in nodes {
+                if let Node::Element {
+                    node_type,
+                    attrs,
+                    content,
+                    ..
+                } = node
+                {
+                    if matches!(node_type, NodeType::MathInline | NodeType::MathBlock) {
+                        sources.push(attrs.get("source").unwrap().clone());
+                    }
+                    collect(&content.children, sources);
+                }
+            }
+        }
+        let mut sources = Vec::new();
+        collect(&slice.content.children, &mut sources);
+        sources
+    }
+
+    #[test]
+    fn md_tex_preserves_all_academic_equation_sources() {
+        let passage = include_str!("../../tests/fixtures/academic-math-paste.txt");
+        let expected: Vec<String> = super::super::paste_math::tex_math_spans(passage)
+            .iter()
+            .map(|span| span.source.trim().to_string())
+            .collect();
+        assert_eq!(expected.len(), 32);
+        assert_eq!(math_sources(&parse_from_markdown(passage)), expected);
+    }
+
+    #[test]
+    fn md_tex_protects_formula_punctuation_and_surrounding_marks() {
+        let slice = parse_from_markdown(r"**before \(a_b+c_{d}\) after** and *\(x\) tail*");
+        assert_eq!(math_sources(&slice), ["a_b+c_{d}", "x"]);
+        assert_eq!(
+            text_with_mark(&slice.content.children, MarkType::Bold).as_deref(),
+            Some("before ")
+        );
+        assert_eq!(
+            text_with_mark(&slice.content.children, MarkType::Italic).as_deref(),
+            Some(" tail")
+        );
+        assert!(
+            find(
+                &slice.content.children,
+                &|node| matches!(node, Node::Text { text, marks }
+            if text == " after" && marks.iter().any(|mark| mark.mark_type == MarkType::Bold))
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn md_tex_display_equations_keep_existing_block_rules() {
+        for source in [r"\[\frac{a}{b}\]", "\\[\n\\frac{a}{b}\n\\]"] {
+            let slice = parse_from_markdown(source);
+            assert_eq!(
+                slice.content.children[0].node_type(),
+                Some(NodeType::MathBlock),
+                "{source}"
+            );
+            assert_eq!(math_sources(&slice), [r"\frac{a}{b}"]);
+        }
+        let slice = parse_from_markdown(r"see \[x\] here");
+        assert_eq!(
+            slice.content.children[0].node_type(),
+            Some(NodeType::Paragraph)
+        );
+        assert_eq!(
+            find_by_type(&slice.content.children, NodeType::MathInline)
+                .unwrap()
+                .attrs()
+                .get("source")
+                .unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn md_tex_does_not_merge_adjacent_markdown_delimiters() {
+        for source in [
+            r"`code`\(x\)`tail`",
+            r"\(x\)$y$",
+            r"$y$\(x\)",
+            r"\(x\)\(y\)",
+        ] {
+            let slice = parse_from_markdown(source);
+            let expected: Vec<&str> = if source.contains("code") {
+                vec!["x"]
+            } else if source.starts_with('$') {
+                vec!["y", "x"]
+            } else {
+                vec!["x", "y"]
+            };
+            assert_eq!(math_sources(&slice), expected, "{source}");
+        }
+        let slice = parse_from_markdown(r"`code`\(x\)`tail`");
+        assert_eq!(
+            text_with_mark(&slice.content.children, MarkType::Code).as_deref(),
+            Some("code")
+        );
+    }
+
+    #[test]
+    fn md_tex_markers_and_decoded_entities_cannot_collide() {
+        let source = "\u{fffc} &#xfffc; &#65532; \\(x\\) &amp; \u{fffc} \\(y\\) &#xFFFC;";
+        let slice = parse_from_markdown(source);
+        assert_eq!(math_sources(&slice), ["x", "y"]);
+        assert_eq!(
+            slice.content.children[0].text_content(),
+            "\u{fffc} \u{fffc} \u{fffc} x & \u{fffc} y \u{fffc}"
+        );
+        let literal = parse_from_markdown("\u{fffc} &#xfffc;");
+        assert_eq!(
+            literal.content.children[0].text_content(),
+            "\u{fffc} \u{fffc}"
+        );
+        assert!(math_sources(&literal).is_empty());
+    }
+
+    #[test]
+    fn md_tex_invalid_formulas_preserve_exact_original_source() {
+        for source in [
+            r"before \(  \unknown{a_b &amp; **bold**  \) after",
+            r"\[  \unknown{x_ &amp;  \]",
+            r"\(\)",
+            r"\[ \]",
+        ] {
+            let slice = parse_from_markdown(source);
+            assert!(math_sources(&slice).is_empty(), "{source}");
+            assert_eq!(slice.content.children[0].text_content(), source, "{source}");
+        }
+    }
+
+    #[test]
+    fn md_tex_stays_literal_inside_all_code_contexts() {
+        for source in [
+            r"`\(a_b\)`",
+            r"`` \[x\] ``",
+            "```rust\n\\(a_b\\)\n```",
+            "~~~text\n\\[x\\]\n~~~",
+            "    \\(a_b\\)\n",
+            r"<code>\(a_b\)</code>",
+            r"<code>\(a_b\)",
+        ] {
+            let slice = parse_from_markdown(source);
+            assert!(math_sources(&slice).is_empty(), "{source}: {slice:?}");
+        }
+    }
+
+    #[test]
+    fn md_tex_stays_literal_inside_html_code_aliases() {
+        for tag in ["kbd", "tt", "samp", "CODE", "KbD", "SaMp"] {
+            let source = format!("<{tag}>\\(x\\)</{tag}>");
+            assert!(
+                math_sources(&parse_from_markdown(&source)).is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn md_tex_nested_html_code_marks_end_at_matching_depth() {
+        for source in [
+            r"<code><code>\(x\)</code>\(y\)</code>\(z\)",
+            r"<kbd><samp>\(x\)</samp>\(y\)</kbd>\(z\)",
+        ] {
+            assert_eq!(
+                math_sources(&parse_from_markdown(source)),
+                ["z"],
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn md_tex_self_closing_code_tags_do_not_open_code_marks() {
+        for tag in ["code", "kbd", "tt", "samp", "CODE"] {
+            let source = format!("<{tag}/>\\(x\\)");
+            assert_eq!(
+                math_sources(&parse_from_markdown(&source)),
+                ["x"],
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn md_tex_markdown_punctuation_inside_text_commands_is_opaque() {
+        for equation in [
+            r"\text{a`b`c}",
+            r"\text{a**b**c}",
+            r"\text{a_b_c}",
+            r"\text{[a](b)}",
+            r"\text{a|b}",
+        ] {
+            let source = format!("before \\({equation}\\) after");
+            assert_eq!(
+                math_sources(&parse_from_markdown(&source)),
+                [equation],
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn md_tex_pipes_inside_table_equations_do_not_create_columns() {
+        let source = "| Formula | Value |\n| --- | --- |\n| \\(\\text{a|b}\\) | \\(x\\) |";
+        let slice = parse_from_markdown(source);
+        assert_eq!(math_sources(&slice), [r"\text{a|b}", "x"]);
+        let table = find_by_type(&slice.content.children, NodeType::Table).unwrap();
+        let row = table.child(1).unwrap();
+        assert_eq!(row.child_count(), 2);
+        assert_eq!(row.child(1).unwrap().text_content(), "x");
+    }
+
+    #[test]
+    fn md_tex_backticks_in_separate_formulas_do_not_create_code_spans() {
+        let source = r"\(\text{a`b}\) and \(\text{c`d}\)";
+        assert_eq!(
+            math_sources(&parse_from_markdown(source)),
+            [r"\text{a`b}", r"\text{c`d}"]
+        );
+    }
+
+    #[test]
+    fn md_tex_protection_preserves_code_opened_before_a_formula() {
+        let source = r"`code \(\text{a`b}\) and \(x\)";
+        let slice = parse_from_markdown(source);
+        assert_eq!(math_sources(&slice), ["x"]);
+        assert_eq!(
+            text_with_mark(&slice.content.children, MarkType::Code).as_deref(),
+            Some(r"code \(\text{a")
+        );
+
+        let crossing = r"`\(x` end\) and \(y\)";
+        let slice = parse_from_markdown(crossing);
+        assert_eq!(math_sources(&slice), ["y"]);
+        assert_eq!(
+            text_with_mark(&slice.content.children, MarkType::Code).as_deref(),
+            Some(r"\(x")
+        );
+    }
+
+    #[test]
+    fn md_tex_rejected_link_candidate_cannot_leak_markers_into_code() {
+        for source in [
+            r"[link](\(\text{a` b}\)) and \(x\) tail`",
+            r"[link](\(\text{a$b c}\)) and \(x\) tail$",
+            r"[link](\(\text{a$$ b}\)) and \(x\) tail$$",
+        ] {
+            let slice = parse_from_markdown(source);
+            let text = slice.content.children[0].text_content();
+            assert!(!text.contains(TEX_MARKER), "{slice:?}");
+            assert!(text.contains('x'), "{slice:?}");
+        }
+        let original = parse_from_markdown(r"[link](\(\text{a` b}\)) and \(x\) tail`");
+        assert!(
+            text_with_mark(&original.content.children, MarkType::Code)
+                .unwrap()
+                .contains(r"\(x\)")
+        );
+        let source = "[link](\\(\\text{a` b}\\)) and \u{fffc} &#xfffc; \\(x\\) tail`";
+        let slice = parse_from_markdown(source);
+        let code = text_with_mark(&slice.content.children, MarkType::Code).unwrap();
+        assert_eq!(code.matches(TEX_MARKER).count(), 1);
+        assert!(code.contains("&#xfffc;"));
+        assert!(code.contains(r"\(x\)"));
+    }
+
+    #[test]
+    fn md_tex_html_code_preserves_literal_tex_delimiters() {
+        for tag in ["code", "kbd", "tt", "samp", "CODE", "KbD"] {
+            let source = format!("before <{tag}>\\(K_P\\) \\[x\\] $y$</{tag}> after");
+            let slice = parse_from_markdown(&source);
+            assert!(
+                slice.content.children[0]
+                    .text_content()
+                    .contains(r"\(K_P\)"),
+                "{slice:?}"
+            );
+            let code = text_with_mark(&slice.content.children, MarkType::Code).unwrap();
+            assert_eq!(code, r"\(K_P\) \[x\] $y$");
+            assert!(
+                slice.content.children[0]
+                    .text_content()
+                    .contains(r"\[x\] $y$"),
+                "{slice:?}"
+            );
+            assert!(math_sources(&slice).is_empty());
+        }
+    }
+
+    #[test]
+    fn md_tex_rejected_link_candidate_cannot_leak_markers_into_html_attributes() {
+        let source = r#"[link](\(\text{<a href="https://example.com/a b}\)) and \(x\) tail">z</a>"#;
+        let slice = parse_from_markdown(source);
+        fn assert_no_marker(node: &Node) {
+            match node {
+                Node::Text { marks, .. } => {
+                    for mark in marks {
+                        for value in mark.attrs.values() {
+                            assert!(!value.contains(TEX_MARKER), "{node:?}");
+                        }
+                    }
+                }
+                Node::Element {
+                    attrs,
+                    marks,
+                    content,
+                    ..
+                } => {
+                    for value in attrs.values() {
+                        assert!(!value.contains(TEX_MARKER), "{node:?}");
+                    }
+                    for mark in marks {
+                        for value in mark.attrs.values() {
+                            assert!(!value.contains(TEX_MARKER), "{node:?}");
+                        }
+                    }
+                    for child in &content.children {
+                        assert_no_marker(child);
+                    }
+                }
+            }
+        }
+        for node in &slice.content.children {
+            assert_no_marker(node);
+        }
+    }
+
+    #[test]
+    fn md_tex_rejected_link_candidate_cannot_leak_markers_into_markdown_attributes() {
+        let sources = [
+            r"[outer](\(\text{[go](<https://example.com/a b}\)) and \(x\) tail>)",
+            r"[outer](\(\text{![go](<https://example.com/a b}\)) and \(x\) tail>)",
+            r#"[outer](\(\text{[go](https://example.com "a b}\)) and \(x\) tail")"#,
+            r#"[outer](\(\text{![go](https://example.com "a b}\)) and \(x\) tail")"#,
+        ];
+        for source in sources {
+            let slice = parse_from_markdown(source);
+            assert!(
+                !format!("{slice:?}").contains(TEX_MARKER),
+                "{source}: {slice:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn md_tex_reclassified_image_alt_preserves_literal_delimiters() {
+        let source = r"[outer](\(\text{![alt a b}\)) and \(x\) tail](https://example.com)";
+        let slice = parse_from_markdown(source);
+        let image = find_by_type(&slice.content.children, NodeType::Image).unwrap();
+        assert!(
+            image.attrs().get("alt").unwrap().contains(r"\(x\)"),
+            "{slice:?}"
+        );
+    }
+
+    #[test]
+    fn md_tex_attribute_fallback_preserves_real_marker_and_entity_source() {
+        let base = [
+            r"[outer](\(\text{[go](<https://example.com/a b}\)) and \(x\) tail>)",
+            r"[outer](\(\text{![go](<https://example.com/a b}\)) and \(x\) tail>)",
+            r#"[outer](\(\text{[go](https://example.com "a b}\)) and \(x\) tail")"#,
+            r#"[outer](\(\text{![go](https://example.com "a b}\)) and \(x\) tail")"#,
+        ];
+        for source in base {
+            for source in [
+                source.replace("[go]", "[\u{fffc} &#xfffc; go]"),
+                source.replace("a b", "\u{fffc} &#xfffc; a b"),
+            ] {
+                let slice = parse_from_markdown(&source);
+                let text = slice
+                    .content
+                    .children
+                    .iter()
+                    .map(Node::text_content)
+                    .collect::<String>();
+                assert_eq!(text.matches(TEX_MARKER).count(), 1, "{slice:?}");
+                assert!(text.contains("&#xfffc;"), "{slice:?}");
+                assert!(text.contains(r"\(x\)"), "{slice:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn md_tex_marker_entities_in_genuine_link_and_image_attributes_stay_normal() {
+        let source = "[label\u{fffc} &#xfffc; \\(x\\)](https://example.com/\u{fffc}/&#xfffc; \"\u{fffc} &#xfffc;\")";
+        let slice = parse_from_markdown(source);
+        assert_eq!(math_sources(&slice), ["x"]);
+        let link_text = find(&slice.content.children, &|node| {
+            matches!(node, Node::Text { marks, .. }
+            if marks.iter().any(|mark| mark.mark_type == MarkType::Link))
+        })
+        .unwrap();
+        let Node::Text { marks, .. } = link_text else {
+            panic!()
+        };
+        let link = marks
+            .iter()
+            .find(|mark| mark.mark_type == MarkType::Link)
+            .unwrap();
+        assert_eq!(
+            link.attrs.get("href").unwrap(),
+            "https://example.com/\u{fffc}/\u{fffc}"
+        );
+        assert_eq!(link.attrs.get("title").unwrap(), "\u{fffc} \u{fffc}");
+
+        let source = "![alt\u{fffc} &#xfffc;](https://example.com/\u{fffc}/&#xfffc; \"\u{fffc} &#xfffc;\") \\(x\\)";
+        let slice = parse_from_markdown(source);
+        assert_eq!(math_sources(&slice), ["x"]);
+        let image = find_by_type(&slice.content.children, NodeType::Image).unwrap();
+        assert_eq!(
+            image.attrs().get("src").unwrap(),
+            "https://example.com/\u{fffc}/\u{fffc}"
+        );
+        assert_eq!(image.attrs().get("title").unwrap(), "\u{fffc} \u{fffc}");
+        assert_eq!(image.attrs().get("alt").unwrap(), "alt\u{fffc} \u{fffc}");
+    }
+
+    #[test]
+    fn md_tex_rejected_table_candidate_preserves_discarded_cell_source() {
+        let source =
+            "| Formula | Value |\n| --- | --- |\n| [outer](\\(\\text{a| b}\\)) | \\(x\\) |";
+        let slice = parse_from_markdown(source);
+        let text = slice
+            .content
+            .children
+            .iter()
+            .map(Node::text_content)
+            .collect::<String>();
+        assert!(text.contains(r"\(x\)"), "{slice:?}");
+        assert_eq!(text, source);
+    }
+
+    #[test]
+    fn md_tex_url_scanning_handles_long_unmatched_parenthesis_runs() {
+        let base = "https://example.com/a(b)";
+        let url = format!("{base}{}", ")".repeat(65_536));
+        assert_eq!(find_bare_url(&url, 0), Some((0, base.len())));
+        let source = format!("\\(x\\)\n\n```text\n{url}\n```");
+        let slice = parse_from_markdown(&source);
+        assert_eq!(math_sources(&slice), ["x"]);
+        let code = find_by_type(&slice.content.children, NodeType::CodeBlock).unwrap();
+        assert_eq!(code.text_content(), format!("{url}\n"));
+    }
+
+    #[test]
+    fn md_tex_respects_escaped_delimiters_and_block_boundaries() {
+        for source in [
+            r"\\(x\\)",
+            r"\\[x\\]",
+            "\\(x\n\ny\\)",
+            "\\(x\n\n- y\\)",
+            r"\(unclosed",
+        ] {
+            assert!(
+                math_sources(&parse_from_markdown(source)).is_empty(),
+                "{source}"
+            );
+        }
+        let slice = parse_from_markdown(r"\\\(x\)");
+        assert_eq!(math_sources(&slice), ["x"]);
+        assert_eq!(slice.content.children[0].text_content(), "\\x");
+    }
+
+    #[test]
+    fn md_tex_respects_urls_and_link_destinations() {
+        for source in [
+            r"https://example.com/\(x\)",
+            r"<https://example.com/\(x\)>",
+            r"[link](https://example.com/\(x\))",
+            r#"[link](https://example.com "\(x\)")"#,
+            "[link][id]\n\n[id]: https://example.com/\\(x\\)",
+        ] {
+            assert!(
+                math_sources(&parse_from_markdown(source)).is_empty(),
+                "{source}"
+            );
+        }
+        let slice = parse_from_markdown(r"[before \(x\) after](https://example.com)");
+        assert_eq!(math_sources(&slice), ["x"]);
+        assert_eq!(
+            text_with_mark(&slice.content.children, MarkType::Link).as_deref(),
+            Some("before ")
+        );
+    }
+
+    #[test]
+    fn md_tex_preserves_tables_headings_quotes_and_lists() {
+        for source in [
+            "| Formula | Value |\n| --- | --- |\n| \\(a_b\\) | 1 |",
+            r"# Heading \(a_b\)",
+            r"> Quote \(a_b\)",
+            r"- Item \(a_b\)",
+        ] {
+            let slice = parse_from_markdown(source);
+            assert_eq!(math_sources(&slice), ["a_b"], "{source}");
+        }
+    }
+
     #[test]
     fn md_plain_paragraph() {
         let slice = parse_from_markdown("hello world");
@@ -993,7 +1914,10 @@ mod tests {
     fn md_two_paragraphs() {
         let slice = parse_from_markdown("a\n\nb");
         assert_eq!(slice.content.children.len(), 2);
-        assert_eq!(slice.content.children[0].node_type(), Some(NodeType::Paragraph));
+        assert_eq!(
+            slice.content.children[0].node_type(),
+            Some(NodeType::Paragraph)
+        );
         assert_eq!(slice.content.children[0].text_content(), "a");
         assert_eq!(slice.content.children[1].text_content(), "b");
     }

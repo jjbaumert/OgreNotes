@@ -1189,7 +1189,7 @@ impl EditorView {
                 }
             }
 
-            let slice = if !html.is_empty() {
+            let (slice, parsed_markdown) = if !html.is_empty() {
                 let html_slice = super::clipboard::parse_from_html(&html);
                 // Sources like terminals, file viewers, and "view source" panels
                 // wrap copied content in a bare `<pre>` block — sometimes with
@@ -1225,23 +1225,23 @@ impl EditorView {
                             "markdown (HTML was trivial)"
                         }),
                     ]);
-                    super::markdown::parse_from_markdown(&text)
+                    (super::markdown::parse_from_markdown(&text), true)
                 } else if plain_pre_wrapper {
                     super::debug::log("paste", "branch", &[
                         ("chosen", "markdown (plain <pre> wrapper, text/plain empty)"),
                     ]);
                     let cb_text = html_slice.content.children[0].text_content();
-                    super::markdown::parse_from_markdown(&cb_text)
+                    (super::markdown::parse_from_markdown(&cb_text), true)
                 } else {
                     super::debug::log("paste", "branch", &[
                         ("chosen", "html"),
                         ("root_children", &html_slice.content.children.len().to_string()),
                     ]);
-                    html_slice
+                    (html_slice, false)
                 }
             } else if !text.is_empty() {
                 super::debug::log("paste", "branch", &[("chosen", "markdown (no HTML)")]);
-                super::markdown::parse_from_markdown(&text)
+                (super::markdown::parse_from_markdown(&text), true)
             } else {
                 super::debug::warn("paste", "clipboard empty — nothing to paste");
                 return;
@@ -1270,7 +1270,11 @@ impl EditorView {
                         .unwrap_or(NodeType::Doc)
                 })
                 .unwrap_or(NodeType::Doc);
-            let slice = super::paste_math::convert_math(slice, math_destination);
+            let slice = if parsed_markdown {
+                super::paste_math::adapt_markdown_math(slice, math_destination)
+            } else {
+                super::paste_math::convert_math(slice, math_destination)
+            };
 
             // Determine paste context and strategy
             let in_list = super::state::find_item_at(&state_with_sel.doc, pos).is_some();

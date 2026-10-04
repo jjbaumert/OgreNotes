@@ -1,0 +1,40 @@
+Since you are targeting an academic paper, you need to frame this problem using precise, formal operations research and networking terminology. In academic literature, your architecture is classified as a Time-Varying Topology (TVT) Virtual Topology Design and Call Admission Control (CAC) problem.
+To structure your paper effectively, here is the exact theoretical framing, mathematical formulation, and a high-level literature roadmap you will need.
+1. Formal Problem Definition & Classifications
+In the abstract and methodology sections of your paper, you should classify the problem using these established domain concepts:
+• Time-Sliced Space-Time Graph: Because you discretize the continuous orbit into 5-minute increments, your network is modeled as a sequence of static snapshot graphs \(G_t = (V_t, E_t)\).
+• Restricted Route Multi-Commodity Flow (RR-MCF): A traditional Multi-Commodity Flow (MCF) problem allows traffic to split across any arbitrary paths. Because your hardware restricts routing to exactly two pre-configured interfaces (Primary and Secondary), you must explicitly define this as a Restricted Route or Path-Constrained MCF.
+• Non-Preemptive Priority Call Admission Control: Your absolute priority rules mean that higher-tier traffic cannot be degraded by lower-tier traffic, and your "all-or-nothing" constraint makes it a binary admission problem rather than a continuous flow problem.
+2. The Formal Mathematical Formulation (MILP)
+Academic papers require a formal optimization model, even if you ultimately implement a heuristic to solve it. Here is the Mixed-Integer Linear Program (MILP) formulation for a single 5-minute snapshot \(t\), isolated to a single priority tier \(P\).
+Sets and Parameters:
+• \(K_{P}\): The set of active communication requests (commodities) belonging to priority tier \(P\).
+• \(E\): The set of active directed links (Optical Crosslinks + RF Uplinks/Downlinks) in the current snapshot.
+• \(C_{e}\): The residual bandwidth capacity of link \(e \in E\) (after higher priority tiers have been routed).
+• \(d_{k}\): The hard bandwidth demand requested by mobile terminal \(k \in K_P\).
+• \(L_{k,1}, L_{k,2}\): The end-to-end latency of the Primary and Secondary paths for request \(k\).
+• \(S_k \in \{0, 1\}\): A parameter indicating if the primary path of request \(k\) utilizes the same first-hop satellite as the previous time slice (1 if sticky, 0 if roaming).
+Decision Variables:
+• \(x_{k,1} \in \{0, 1\}\): 1 if request \(k\) is accepted on its Primary path; 0 otherwise.
+• \(x_{k,2} \in \{0, 1\}\): 1 if request \(k\) is accepted on its Secondary path; 0 otherwise.
+Objective Function:
+To minimize latency while maximizing admission under absolute priorities, you use a lexicographic weight approach:
+\(\text{Maximize\ }\sum _{k\in K_{P}}\mathbf{M}\cdot (x_{k,1}+x_{k,2})-\sum _{k\in K_{P}}\left(L_{k,1}\cdot x_{k,1}+L_{k,2}\cdot x_{k,2}\right)+\sum _{k\in K_{P}}\mathbf{\gamma }\cdot S_{k}\cdot x_{k,1}\)
+• \(\mathbf{M}\): A dominant scale factor (\(\mathbf{M} \gg L\)) enforcing throughput maximization first.
+• \(\mathbf{\gamma }\): A tuning parameter that rewards the system for maintaining a "sticky" first hop.
+Constraints:
+1. All-or-Nothing Path Selection: A request can use at most one path, and cannot be fractionally split.
+\(x_{k,1}+x_{k,2}\le 1\quad \forall k\in K_{P}\)
+2. Strict Residual Link Capacity: The aggregate traffic admitted across all paths using link \(e\) cannot exceed its residual capacity.
+\(\sum _{k\in K_{P}}d_{k}\cdot \left(\delta _{k,1}^{e}\cdot x_{k,1}+\delta _{k,2}^{e}\cdot x_{k,2}\right)\le C_{e}\quad \forall e\in E\)
+(Where \(\delta_{k,p}^e = 1\) if path \(p\) of request \(k\) traverses link \(e\), and 0 otherwise).
+3. Key Academic Literature to Cite
+To anchor your paper, look up and cite papers covering these specific paradigms:
+• Predictive Space-Time Graph Models: Read papers by H. Chang et al. on "Topological Design and Routing in Mega-Constellations." They pioneered the concept of discretizing LEO orbits into predictable, periodic graph snapshots.
+• Max-Min Fairness in Constrained Networks: Look into Bertsekas and Gallager's foundational work on data networks for how to mathematically prove your tie-breaking/gap-splitting rule.
+• Greedy Heuristics vs. LP Relaxations: Cite literature comparing MILP performance bounds to greedy sorting algorithms (specifically Greedy Randomized Adaptive Search Procedures - GRASP) in satellite network admission control.
+4. Structuring Your Paper's "Contributions" Section
+In academic peer reviews, your paper will be judged heavily on its clear articulation of novelty. You should position your core contributions as:
+1. Enforcing Static Routing Layouts via 2-Path Confinement: Most academic papers assume satellites can dynamically recalculate routing matrices on the fly. Your paper provides a realistic constraint by forcing the optimization to choose strictly between a pre-configured Primary and Secondary path.
+2. Multi-Objective Heuristic for High-Density admission: Proposing the multi-key sorting strategy (Priority \(\rightarrow \) Stickiness \(\rightarrow \) First-Hop Load \(\rightarrow \) Latency) proves that a low-complexity algorithm can mimic an NP-Hard MILP solver within the tight 5-minute operational windows of massive LEO constellations.
+Are you planning to include a simulation baseline in your paper to compare the mathematical solver against the greedy heuristic, or are you focusing primarily on the theoretical framework? I can help you structure the Experimental Design section if needed.
