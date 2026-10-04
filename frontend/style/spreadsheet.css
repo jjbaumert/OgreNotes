@@ -1,27 +1,9 @@
 /* ─── Spreadsheet View ─────────────────────────────────────── */
 
-/* The spreadsheet grid is rendered LTR regardless of UI locale.
- * v1 of i18n (M-P2) deliberately scopes RTL out of the grid for
- * three reasons that compound:
- *   1. Column-order semantics: A1 → B1 → C1 is universally
- *      left-to-right in every spreadsheet tool users have used,
- *      including Arabic/Hebrew localizations of Excel and Numbers.
- *      Flipping the grid would surprise users far more than not
- *      flipping it.
- *   2. The sticky row-header gutter, the resize handles, the
- *      paste-target overlay, and the cell-selection corner-handle
- *      were all built against physical edges; an RTL flip would
- *      need a separate audit pass per primitive.
- *   3. Formula syntax stays LTR (`=SUM(A1:B2)`) — mixing an RTL
- *      grid with LTR formulas creates a worse bidi mess than a
- *      consistent LTR grid embedded in an otherwise-RTL page.
- *
- * The `direction: ltr` declaration below pins the wrapper LTR;
- * everything below this rule can keep using physical `left`/
- * `right` properties without breaking under `<html dir="rtl">`.
- * See design/i18n.md §RTL strategy for the v2 carry-forward. */
+/* The grid follows the viewer's inline direction. Column indices and
+ * formula references remain logical: column A is at inline-start. */
 .spreadsheet-wrapper {
-  direction: ltr;
+  direction: inherit;
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -76,6 +58,7 @@
   padding: 2px 6px;
   outline: none;
   font-family: var(--font-mono);
+  direction: ltr;
 }
 
 /* Tool strip — sits between the formula bar and the grid. Currently
@@ -122,7 +105,7 @@
    user has to engage with it before continuing. */
 .ss-foreign-consent-backdrop {
   position: fixed;
-  top: 0; left: 0; right: 0; bottom: 0;
+  top: 0; inset-inline-start: 0; inset-inline-end: 0; bottom: 0;
   background: rgba(0, 0, 0, 0.4);
   z-index: 200;
 }
@@ -149,7 +132,7 @@
 
 .ss-foreign-consent-list {
   margin: 0 0 12px 0;
-  padding-left: 18px;
+  padding-inline-start: 18px;
   max-height: 200px;
   overflow-y: auto;
 }
@@ -189,7 +172,7 @@
      with the grid content. The grid container is the natural
      anchor. */
   position: relative;
-  /* The 40px row-number column is `position: sticky; left: 0`, so
+  /* The 40px row-number column is `position: sticky; inset-inline-start: 0`, so
      it visually covers the leftmost 40px of the scroll viewport.
      Without `scroll-padding-left`, both manual horizontal scrolling
      and `scrollIntoView({inline:"nearest"})` consider that area
@@ -199,7 +182,7 @@
      scroll machinery to treat those 40px as reserved. Same applies
      vertically once the column-header row is taken into account
      (24px). */
-  scroll-padding-left: 40px;
+  scroll-padding-inline-start: 40px;
   scroll-padding-top: 24px;
 }
 
@@ -226,7 +209,7 @@
   border: 1px solid var(--color-border);
   position: sticky;
   top: 0;
-  left: 0;
+  inset-inline-start: 0;
   z-index: 3;
 }
 
@@ -252,7 +235,7 @@
 
 .col-resize-handle {
   position: absolute;
-  right: -2px;
+  inset-inline-end: -2px;
   top: 0;
   width: 5px;
   height: 100%;
@@ -268,7 +251,7 @@
 .row-resize-handle {
   position: absolute;
   bottom: -2px;
-  left: 0;
+  inset-inline-start: 0;
   width: 100%;
   height: 5px;
   cursor: row-resize;
@@ -296,7 +279,7 @@
   color: var(--color-text-secondary);
   text-align: center;
   position: sticky;
-  left: 0;
+  inset-inline-start: 0;
   /* Sit above non-frozen cells during horizontal scroll. The
      `.spreadsheet-cell.cursor` class also uses z-index: 1 with a
      `position: relative` (so the cursor outline doesn't get clipped
@@ -390,8 +373,8 @@
  */
 .formula-keyboard {
   position: fixed;
-  left: 0;
-  right: 0;
+  inset-inline-start: 0;
+  inset-inline-end: 0;
   bottom: 0;
   z-index: 95;
   background: var(--color-surface);
@@ -599,7 +582,7 @@
    so the glyph + text move together. */
 .ss-cf-icon {
   display: inline-block;
-  margin-right: 4px;
+  margin-inline-end: 4px;
   font-style: normal;
 }
 
@@ -620,7 +603,7 @@
 .ss-comment-marker {
   position: absolute;
   top: 0;
-  right: 0;
+  inset-inline-end: 0;
   width: 0;
   height: 0;
   border-style: solid;
@@ -634,6 +617,15 @@
   border-width: 0 10px 10px 0;
 }
 
+[dir="rtl"] .ss-comment-marker {
+  border-width: 0 0 8px 8px;
+  border-color: transparent transparent transparent var(--color-error, #c0392b);
+}
+
+[dir="rtl"] .ss-comment-marker:hover {
+  border-width: 0 0 10px 10px;
+}
+
 .ss-comment-marker:focus-visible {
   outline: 2px solid var(--color-focus, #2d7ff9);
   outline-offset: 1px;
@@ -643,7 +635,7 @@
   display: none;
   position: absolute;
   top: 0;
-  left: calc(100% + 4px);
+  inset-inline-start: calc(100% + 4px);
   z-index: 30;
   padding: 6px 8px;
   background: var(--color-surface, #fff);
@@ -719,7 +711,7 @@
 .ss-autocomplete {
   position: absolute;
   top: 100%;
-  left: 0;
+  inset-inline-start: 0;
   z-index: 50;
   background: var(--color-surface);
   border: 1px solid var(--color-border);
@@ -744,13 +736,13 @@
 .ss-autocomplete.is-above-keyboard {
   position: fixed;
   top: auto;
-  left: 0;
-  right: 0;
+  inset-inline-start: 0;
+  inset-inline-end: 0;
   bottom: calc(env(safe-area-inset-bottom) + var(--mobile-kb-height, 380px));
   z-index: 96;
   max-height: 30vh;
-  border-left: none;
-  border-right: none;
+  border-inline-start: none;
+  border-inline-end: none;
   border-radius: 0;
 }
 
@@ -788,7 +780,7 @@
   font-size: 9px;
   opacity: 0.4;
   cursor: pointer;
-  margin-left: 2px;
+  margin-inline-start: 2px;
 }
 
 .col-filter-icon:hover {
@@ -799,7 +791,7 @@
 .ss-filter-popup {
   position: fixed;
   top: 80px;
-  right: 20px;
+  inset-inline-end: 20px;
   z-index: 100;
   background: var(--color-surface);
   border: 1px solid var(--color-border);
@@ -822,7 +814,7 @@
 .ss-find-bar {
   position: absolute;
   top: 0;
-  right: 0;
+  inset-inline-end: 0;
   z-index: 60;
   display: flex;
   align-items: center;
@@ -885,7 +877,7 @@
 .ss-remote-cell-label {
   position: absolute;
   top: -16px;
-  left: -2px;
+  inset-inline-start: -2px;
   font-size: 10px;
   color: white;
   padding: 1px 4px;
@@ -1009,7 +1001,7 @@
 .ss-chart-remove {
   position: absolute;
   top: 4px;
-  right: 4px;
+  inset-inline-end: 4px;
   background: none;
   border: none;
   cursor: pointer;
@@ -1038,7 +1030,7 @@
 .ss-pivot-editor {
   position: fixed;
   top: 60px;
-  right: 12px;
+  inset-inline-end: 12px;
   width: 320px;
   max-height: calc(100vh - 80px);
   overflow-y: auto;
@@ -1110,7 +1102,7 @@
 }
 
 .ss-pivot-remove {
-  margin-left: auto;
+  margin-inline-start: auto;
   background: none;
   border: 1px solid var(--color-border, #d0d0d0);
   padding: 4px 8px;

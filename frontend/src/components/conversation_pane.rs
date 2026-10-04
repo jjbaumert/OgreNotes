@@ -262,10 +262,10 @@ pub fn ConversationPane(
                     set_selected_thread.set(Some(resp.thread_id));
                 }
                 Err(crate::api::client::ApiClientError::Http(409, _)) => {
-                    set_error_msg.set(Some("This block already has a comment. Select the existing thread to reply.".to_string()));
+                    set_error_msg.set(Some(crate::t!("conversation-error-existing-thread")));
                 }
                 Err(e) => {
-                    set_error_msg.set(Some(format!("Failed to create thread: {e}")));
+                    set_error_msg.set(Some(crate::t!("conversation-error-create-thread", error = e.to_string())));
                 }
             }
         });

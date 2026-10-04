@@ -41,13 +41,13 @@ pub fn CodeLangChip(
                         style=format!("top:{}px;right:{}px;", s.top, s.right)
                     >
                         <select
-                            aria-label="Code block language"
+                            aria-label=ogrenotes_frontend::t!("code-language-aria")
                             on:change=move |ev| {
                                 on_select.run(event_target_value(&ev));
                             }
                         >
                             <option value="" selected=current.is_empty()>
-                                "Plain text"
+                                {ogrenotes_frontend::t!("code-language-plain")}
                             </option>
                             <option value="mermaid" selected=current == "mermaid">
                                 "Mermaid"

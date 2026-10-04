@@ -1136,6 +1136,7 @@ dependencies = [
  "base64",
  "console_error_panic_hook",
  "fluent-bundle",
+ "fluent-syntax",
  "futures-channel",
  "futures-util",
  "fuzzy-matcher",

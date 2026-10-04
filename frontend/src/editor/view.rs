@@ -1358,6 +1358,42 @@ impl EditorView {
                         .unwrap_or(super::model::NodeType::Doc)
                 };
 
+                // Fitting a paragraph to inline content removes its wrapper.
+                // An empty destination adopts the copied presentation through
+                // attribute steps, retaining the destination block's identity.
+                let paragraph_presentation = if !has_blocks && state_with_sel.selection.empty() {
+                    super::state::find_block_at(&state_with_sel.doc, pos)
+                        .filter(|block| {
+                            block.node_type == NodeType::Paragraph && block.content.size() == 0
+                        })
+                        .and_then(|block| match slice.content.children.as_slice() {
+                            [
+                                Node::Element {
+                                    node_type: NodeType::Paragraph,
+                                    attrs,
+                                    ..
+                                },
+                            ] => {
+                                let values: Vec<_> = ["dir", "align"]
+                                    .into_iter()
+                                    .filter_map(|key| {
+                                        let value = attrs.get(key)?;
+                                        let valid = match key {
+                                            "dir" => matches!(value.as_str(), "auto" | "ltr" | "rtl"),
+                                            _ => matches!(value.as_str(), "left" | "center" | "right"),
+                                        };
+                                        (valid && block.attrs.get(key) != Some(value))
+                                            .then(|| (key.to_string(), value.clone()))
+                                    })
+                                    .collect();
+                                Some((block.offset, values))
+                            }
+                            _ => None,
+                        })
+                } else {
+                    None
+                };
+
                 let fitted = super::clipboard::fit_slice_to_context(slice, parent_type);
 
                 if has_blocks {
@@ -1369,7 +1405,15 @@ impl EditorView {
                     }
                 } else {
                     // Inline paste: insert into the current block
-                    if let Ok(txn) = state_with_sel.transaction().replace_selection(fitted) {
+                    let mut txn = Ok(state_with_sel.transaction());
+                    if let Some((pos, attrs)) = paragraph_presentation {
+                        for (attr, value) in attrs {
+                            txn = txn.and_then(|txn| {
+                                txn.step(super::transform::Step::SetAttr { pos, attr, value })
+                            });
+                        }
+                    }
+                    if let Ok(txn) = txn.and_then(|txn| txn.replace_selection(fitted)) {
                         dispatch_paste(txn);
                     }
                 }
@@ -1618,6 +1662,7 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                     if let Some(bid) = attrs.get("blockId") {
                         el.set_attribute("data-block-id", bid).ok()?;
                     }
+                    apply_text_direction(&el, attrs);
                     apply_block_align(&el, attrs);
                     render_children(doc, &el, content);
                     return Some(el.into());
@@ -1905,6 +1950,9 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
             if let Some(bid) = attrs.get("blockId") {
                 el.set_attribute("data-block-id", bid).ok()?;
             }
+            if *node_type == NodeType::Paragraph {
+                apply_text_direction(&el, attrs);
+            }
 
             // Set data attributes for special types
             match node_type {
@@ -1942,18 +1990,25 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
     }
 }
 
+/// Limit persisted direction values before applying them to editable DOM.
+fn apply_text_direction(el: &Element, attrs: &std::collections::HashMap<String, String>) {
+    let direction = attrs
+        .get("dir")
+        .map(String::as_str)
+        .filter(|d| matches!(*d, "auto" | "ltr" | "rtl"))
+        .unwrap_or("auto");
+    let _ = el.set_attribute("dir", direction);
+}
+
 /// Apply block-level `text-align` styling from a node's `align`
-/// attribute. Reads `attrs["align"]` and sets the element's inline
-/// `style` to `text-align: <value>` when the value is "center" or
-/// "right". "left" is the natural default and is intentionally NOT
-/// written so the cleared state matches the no-attr state. Mirrors
-/// the same allowlist that `commands::set_alignment` enforces.
+/// attribute. Explicit physical alignment must override the paragraph's
+/// base direction; an absent value follows the direction's natural start.
 fn apply_block_align(
     el: &Element,
     attrs: &std::collections::HashMap<String, String>,
 ) {
     if let Some(align) = attrs.get("align") {
-        if matches!(align.as_str(), "center" | "right") {
+        if matches!(align.as_str(), "left" | "center" | "right") {
             let _ = el.set_attribute("style", &format!("text-align: {align}"));
         }
     }

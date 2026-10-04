@@ -204,10 +204,7 @@ pub fn HomePage() -> impl IntoView {
                             // The text formats import synchronously.
                             let lowered = file.name().to_lowercase();
                             if lowered.ends_with(".docx") || lowered.ends_with(".pdf") {
-                                set_import_error.set(Some(format!(
-                                    "Converting {}… this can take a few seconds.",
-                                    file.name()
-                                )));
+                                set_import_error.set(Some(crate::t!("home-import-converting", name = file.name())));
                                 match import_dropped_async(&file, target_folder.as_deref()).await {
                                     Ok(doc_id) => {
                                         set_import_error.set(None);
@@ -589,11 +586,10 @@ pub fn HomePage() -> impl IntoView {
                 match documents::bulk_delete(ids).await {
                     Ok(resp) => {
                         if resp.failed > 0 {
-                            set_bulk_error.set(Some(format!(
-                                "Deleted {} of {} — {} failed",
-                                resp.succeeded,
-                                resp.succeeded + resp.failed,
-                                resp.failed,
+                            set_bulk_error.set(Some(crate::t!("home-bulk-delete-partial",
+                                succeeded = resp.succeeded as i64,
+                                total = (resp.succeeded + resp.failed) as i64,
+                                failed = resp.failed as i64,
                             )));
                         } else {
                             set_bulk_error.set(None);
@@ -1166,9 +1162,7 @@ async fn import_dropped_file(
     let name = file.name();
     let size = file.size() as u64;
     if size > IMPORT_MAX_BYTES {
-        return Err(format!(
-            "{name} is {size} bytes; import limit is {IMPORT_MAX_BYTES} bytes"
-        ));
+        return Err(crate::t!("home-import-too-large", name = name, size = size as i64, limit = IMPORT_MAX_BYTES as i64));
     }
     let lowered = name.to_lowercase();
     let format = if lowered.ends_with(".md") || lowered.ends_with(".markdown") {
@@ -1176,9 +1170,7 @@ async fn import_dropped_file(
     } else if lowered.ends_with(".html") || lowered.ends_with(".htm") {
         "html"
     } else {
-        return Err(format!(
-            "unsupported file type: {name} — use .md, .markdown, .html, .htm, .docx, or .pdf"
-        ));
+        return Err(crate::t!("home-import-unsupported", name = name));
     };
     // Title default: filename minus extension. Server enforces its
     // own title rules; we just want something sensible by default.
@@ -1195,14 +1187,14 @@ async fn import_dropped_file(
     let text_promise = file.text();
     let text_js = wasm_bindgen_futures::JsFuture::from(text_promise)
         .await
-        .map_err(|e| format!("failed to read {name}: {e:?}"))?;
+        .map_err(|e| crate::t!("home-import-read-failed", name = name.as_str(), error = format!("{e:?}")))?;
     let content = text_js
         .as_string()
-        .ok_or_else(|| format!("{name} did not yield a UTF-8 string"))?;
+        .ok_or_else(|| crate::t!("home-import-invalid-text", name = name))?;
 
     crate::api::documents::import_document_from_text(format, &title, &content, folder_id)
         .await
-        .map_err(|e| format!("import failed: {e}"))
+        .map_err(|e| crate::t!("home-import-failed", error = e.to_string()))
 }
 
 /// Async binary drop path (M-6.5 / M-6.6 piece D) for DOCX and PDF.
@@ -1218,13 +1210,11 @@ async fn import_dropped_async(
     let name = file.name();
     let size = file.size() as u64;
     if size > ASYNC_IMPORT_MAX_BYTES {
-        return Err(format!(
-            "{name} is {size} bytes; import limit is {ASYNC_IMPORT_MAX_BYTES} bytes"
-        ));
+        return Err(crate::t!("home-import-too-large", name = name, size = size as i64, limit = ASYNC_IMPORT_MAX_BYTES as i64));
     }
     crate::api::documents::import_document_via_job(file, folder_id)
         .await
-        .map_err(|e| format!("import failed: {e}"))
+        .map_err(|e| crate::t!("home-import-failed", error = e.to_string()))
 }
 
 /// User-facing message for a failed folder delete. A 409 means the backend

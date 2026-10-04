@@ -42,7 +42,7 @@ html, body {
 #boot-skeleton {
   position: fixed;
   top: 0;
-  left: 0;
+  inset-inline-start: 0;
   bottom: 0;
   width: var(--sidebar-width);
   background: var(--color-brand-anchor);
@@ -1742,7 +1742,7 @@ html, body {
 }
 .favorite-menu-backdrop {
   position: fixed;
-  top: 0; left: 0; right: 0; bottom: 0;
+  top: 0; inset-inline-start: 0; inset-inline-end: 0; bottom: 0;
   z-index: 99;
 }
 .favorite-menu-dropdown {
@@ -2807,8 +2807,14 @@ html, body {
   position: fixed;
   pointer-events: none;
   z-index: 6;
-  width: 2px;
+  width: 0;
   border-left: 2px solid;
+}
+
+.remote-cursor-caret[data-rtl="true"] {
+  border-left: 0;
+  border-right: 2px solid;
+  transform: translateX(-2px);
 }
 
 .remote-cursor-label {
@@ -2830,6 +2836,12 @@ html, body {
    * legible through it; the caret bar stays fully opaque so presence is
    * still obvious. A full opt-out lives at View → Show Cursors. */
   opacity: 0.6;
+}
+
+.remote-cursor-caret[data-rtl="true"] .remote-cursor-label {
+  left: auto;
+  right: -1px;
+  border-radius: 3px 3px 0 3px;
 }
 
 /* ─── Search Dialog ─────────────────────────────────────────── */
@@ -3140,7 +3152,7 @@ html, body {
   cursor: pointer;
   font: inherit;
   color: inherit;
-  text-align: left;
+  text-align: start;
 }
 .template-picker-row:hover:not(:disabled) {
   background: var(--color-mist);
@@ -4518,7 +4530,7 @@ tr:hover .folder-row-actions,
   font-size: 13px;
   font-weight: 600;
   color: var(--color-text);
-  padding-right: var(--space-sm, 8px);
+  padding-inline-end: var(--space-sm, 8px);
 }
 
 .file-row-select {
@@ -4708,7 +4720,7 @@ tr:hover .folder-row-actions,
 .calendar-week-day-header {
   padding: 8px 6px;
   text-align: center;
-  border-left: 1px solid var(--color-border);
+  border-inline-start: 1px solid var(--color-border);
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -4733,15 +4745,15 @@ tr:hover .folder-row-actions,
   padding: 4px 6px;
   font-size: 11px;
   color: var(--color-fg-muted, #6b7280);
-  text-align: right;
-  border-right: 1px solid var(--color-border);
+  text-align: end;
+  border-inline-end: 1px solid var(--color-border);
 }
 .calendar-week-allday {
   border-bottom: 1px solid var(--color-border);
   min-height: 32px;
 }
 .calendar-week-allday-cell {
-  border-left: 1px solid var(--color-border);
+  border-inline-start: 1px solid var(--color-border);
   padding: 2px 4px;
   cursor: pointer;
   min-height: 32px;
@@ -4756,19 +4768,20 @@ tr:hover .folder-row-actions,
 .calendar-time-axis {
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--color-border);
+  border-inline-end: 1px solid var(--color-border);
 }
 .calendar-time-label {
   height: 40px;
-  padding: 2px 6px 0 0;
+  padding-block: 2px 0;
+  padding-inline: 0 6px;
   font-size: 10px;
   color: var(--color-fg-muted, #6b7280);
-  text-align: right;
+  text-align: end;
   box-sizing: border-box;
 }
 .calendar-week-day-column {
   position: relative;
-  border-left: 1px solid var(--color-border);
+  border-inline-start: 1px solid var(--color-border);
 }
 .calendar-hour-cell {
   height: 40px;
@@ -4781,8 +4794,8 @@ tr:hover .folder-row-actions,
 }
 .calendar-event--timed {
   position: absolute;
-  left: 2px;
-  right: 2px;
+  inset-inline-start: 2px;
+  inset-inline-end: 2px;
   padding: 2px 6px;
   border-radius: 4px;
   font-size: 11px;
@@ -4810,14 +4823,14 @@ tr:hover .folder-row-actions,
 }
 .calendar-event-resize--x {
   top: 0;
-  right: -2px;
+  inset-inline-end: -2px;
   width: 6px;
   height: 100%;
   cursor: ew-resize;
 }
 .calendar-event-resize--y {
-  left: 0;
-  right: 0;
+  inset-inline-start: 0;
+  inset-inline-end: 0;
   bottom: -3px;
   height: 6px;
   cursor: ns-resize;
@@ -5024,18 +5037,18 @@ tr:hover .folder-row-actions,
   min-height: 40px;
 }
 .kanban-card {
-  border-left: 3px solid var(--color-border);
+  border-inline-start: 3px solid var(--color-border);
   border-radius: 3px;
   background: var(--color-bg-subtle-2, rgba(0, 0, 0, 0.02));
   padding: 6px 8px;
   cursor: pointer;
   font-size: 12px;
   box-shadow: 0 1px 1px rgba(0, 0, 0, 0.05);
-  /* Positioning context for the top-right assignee chip. */
+  /* Positioning context for the inline-end assignee chip. */
   position: relative;
-  /* Reserve inline space at the top-right so long titles wrap
+  /* Reserve inline space at inline-end so long titles wrap
      around the assignee circle instead of overlapping it. */
-  padding-right: 30px;
+  padding-inline-end: 30px;
 }
 .kanban-card:hover {
   background: var(--color-hover, rgba(0, 0, 0, 0.04));
@@ -5056,12 +5069,12 @@ tr:hover .folder-row-actions,
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
 }
-.kanban-card--red    { border-left-color: var(--color-red, #dc2626); }
-.kanban-card--orange { border-left-color: var(--color-orange, #ea580c); }
-.kanban-card--yellow { border-left-color: var(--color-yellow, #ca8a04); }
-.kanban-card--green  { border-left-color: var(--color-green, #16a34a); }
-.kanban-card--blue   { border-left-color: var(--color-blue, #2563eb); }
-.kanban-card--violet { border-left-color: var(--color-violet, #7c3aed); }
+.kanban-card--red    { border-inline-start-color: var(--color-red, #dc2626); }
+.kanban-card--orange { border-inline-start-color: var(--color-orange, #ea580c); }
+.kanban-card--yellow { border-inline-start-color: var(--color-yellow, #ca8a04); }
+.kanban-card--green  { border-inline-start-color: var(--color-green, #16a34a); }
+.kanban-card--blue   { border-inline-start-color: var(--color-blue, #2563eb); }
+.kanban-card--violet { border-inline-start-color: var(--color-violet, #7c3aed); }
 
 /* Phase 3 drag states. `--dragging` rides during the pointer
    move; `--hidden-hit` is toggled around the elementFromPoint
@@ -5169,8 +5182,8 @@ tr:hover .folder-row-actions,
 .kanban-modal-user-picker {
   position: absolute;
   top: 100%;
-  left: 0;
-  right: 0;
+  inset-inline-start: 0;
+  inset-inline-end: 0;
   z-index: 10;
   border: 1px solid var(--color-border);
   background: var(--color-bg, white);
@@ -5185,7 +5198,7 @@ tr:hover .folder-row-actions,
   padding: 6px 10px;
   border: none;
   background: transparent;
-  text-align: left;
+  text-align: start;
   cursor: pointer;
   font-size: 12px;
 }
@@ -5213,11 +5226,11 @@ tr:hover .folder-row-actions,
   font-weight: 600;
   background: var(--color-accent, #2563eb);
   color: #fff;
-  /* Anchor to the card's top-right corner, matching the
+  /* Anchor to the card's block-start, inline-end corner, matching the
      avatar-badge idiom users expect from Jira / Trello etc. */
   position: absolute;
   top: 6px;
-  right: 6px;
+  inset-inline-end: 6px;
   /* Above the card's cursor: pointer target but doesn't
      eat the card click — parent's `edit-card` action is what
      the click observer resolves. */
@@ -5270,7 +5283,7 @@ tr:hover .folder-row-actions,
 .collab-liveapp-toast {
   position: fixed;
   bottom: 16px;
-  right: 16px;
+  inset-inline-end: 16px;
   z-index: 99;
   max-width: 360px;
   padding: 10px 14px;
@@ -5290,7 +5303,7 @@ tr:hover .folder-row-actions,
 .home-import-error {
   position: fixed;
   bottom: 16px;
-  right: 16px;
+  inset-inline-end: 16px;
   z-index: 99;
   max-width: 360px;
   padding: 10px 14px;
@@ -5325,7 +5338,7 @@ tr:hover .folder-row-actions,
 .skip-to-content {
   position: absolute;
   top: -40px;
-  left: 8px;
+  inset-inline-start: 8px;
   z-index: 100000;
   padding: 8px 16px;
   background: var(--color-bg);

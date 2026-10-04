@@ -562,6 +562,7 @@ pub enum ToolbarCommand {
     /// "right"). Reuses `commands::set_alignment`, the same path the
     /// right-click menu's Alignment submenu already drives.
     SetAlignment(String),
+    SetTextDirection(String),
     /// #134: strip all inline marks from the selection ("Clear
     /// Formatting").
     ClearFormatting,

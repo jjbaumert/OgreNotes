@@ -28,6 +28,7 @@ use super::view::is_safe_url;
 /// - It is non-empty.
 /// - Every top-level child is a Paragraph with zero marks.
 /// - Every Paragraph's content is zero or more Text nodes with zero marks.
+/// - No Paragraph has explicit direction or physical alignment to preserve.
 ///
 /// In particular, a top-level bare `HardBreak`, `HorizontalRule`, or any
 /// structural/formatted element is non-trivial; and a Paragraph containing a
@@ -41,15 +42,25 @@ pub fn is_trivial_slice(slice: &Slice) -> bool {
     fn top_child_is_trivial(n: &Node) -> bool {
         match n {
             Node::Text { marks, .. } => marks.is_empty(),
-            Node::Element { node_type, content, marks, .. } => {
+            Node::Element {
+                node_type,
+                attrs,
+                content,
+                marks,
+            } => {
                 marks.is_empty()
                     && *node_type == NodeType::Paragraph
+                    && !attrs
+                        .get("dir")
+                        .is_some_and(|d| matches!(d.as_str(), "ltr" | "rtl"))
+                    && !attrs
+                        .get("align")
+                        .is_some_and(|a| matches!(a.as_str(), "left" | "center" | "right"))
                     && content.children.iter().all(paragraph_child_is_trivial)
             }
         }
     }
-    !slice.content.children.is_empty()
-        && slice.content.children.iter().all(top_child_is_trivial)
+    !slice.content.children.is_empty() && slice.content.children.iter().all(top_child_is_trivial)
 }
 
 /// Parse a markdown string into a document `Slice`.
@@ -2731,6 +2742,44 @@ mod tests {
             0, 0,
         );
         assert!(is_trivial_slice(&multi));
+    }
+
+    #[test]
+    fn is_trivial_slice_preserves_explicit_block_presentation() {
+        for (key, value) in [
+            ("dir", "rtl"),
+            ("dir", "ltr"),
+            ("align", "left"),
+            ("align", "center"),
+            ("align", "right"),
+        ] {
+            let slice = Slice::new(
+                Fragment::from(vec![Node::element_with_attrs(
+                    NodeType::Paragraph,
+                    [(key.into(), value.into())].into(),
+                    Fragment::from(vec![Node::text("مرحبا Hello")]),
+                )]),
+                0,
+                0,
+            );
+            assert!(
+                !is_trivial_slice(&slice),
+                "{key}={value} must survive rich paste"
+            );
+        }
+        let auto = Slice::new(
+            Fragment::from(vec![Node::element_with_attrs(
+                NodeType::Paragraph,
+                [("dir".into(), "auto".into())].into(),
+                Fragment::from(vec![Node::text("**bold**")]),
+            )]),
+            0,
+            0,
+        );
+        assert!(
+            is_trivial_slice(&auto),
+            "default auto direction permits Markdown clipboard fallback"
+        );
     }
 
     #[test]

@@ -707,9 +707,6 @@ ss-ctx-open-comment = Open Comment Thread…
 ss-ctx-comment-prompt = Comment:
 ss-ctx-remove-comment = Remove Comment
 ss-comment-preview-empty = No messages yet
-ss-comment-replies-none = No replies
-ss-comment-replies-one = 1 reply
-ss-comment-replies-many = { $count } replies
 ss-ctx-define-name = Define Name…
 ss-ctx-name-prompt = Name for this range:
 ss-ctx-remove-name = Remove Name…
@@ -761,11 +758,6 @@ ss-pivot-date-hour = Hour
 # echo the formula language's function names (which are not
 # localized — see scripts/i18n-audit.sh exclusion of
 # spreadsheet/{eval,parser,functions}.rs).
-#
-# Also not translated: filter_cond_label output strings (mix of
-# operators "<", ">", "=" with English words "empty", "contains").
-# Treat as v1 limitation; a future commit can split into Fluent
-# templates if a translator complains.
 
 # ─── App-level / router ─────────────────────────────────────────
 
@@ -805,8 +797,8 @@ at-menu-ai-rewrite = Rewrite this
 at-menu-ai-brainstorm = Brainstorm ideas
 
 # @date / /date insertable — one entry per format style.
-at-menu-insert-date-medium = Today's date (May 19, 2026)
-at-menu-insert-date-short = Today's date (5/19/26)
+at-menu-insert-date-medium = Today's date ({ $date })
+at-menu-insert-date-short = Today's date ({ $date })
 at-menu-insert-date-long = Today's date + time
 at-menu-insert-date-iso = Today's date (ISO 8601)
 
@@ -1251,3 +1243,46 @@ deck-present-notes = Speaker notes
 
 deck-present-follow = Follow { $name }
 deck-present-rejoin = Rejoin presenter
+
+# Language controls and import feedback
+sidebar-chats = Chats
+code-language-aria = Code block language
+code-language-plain = Plain text
+home-import-converting = Converting { $name }… This can take a few seconds.
+home-bulk-delete-partial = Deleted { $succeeded } of { $total }; { $failed } failed
+home-import-too-large = { $name } is { $size } bytes; the import limit is { $limit } bytes.
+home-import-unsupported = Unsupported file type: { $name }. Use .md, .markdown, .html, .htm, .docx, or .pdf.
+home-import-read-failed = Couldn't read { $name }: { $error }
+home-import-invalid-text = { $name } does not contain valid UTF-8 text.
+home-import-failed = Import failed: { $error }
+
+ss-comment-replies =
+    { $count ->
+        [0] No replies
+        [one] { $count } reply
+       *[other] { $count } replies
+    }
+
+# Chat, history, and filter feedback
+at-menu-ask-ai-query = Ask AI: { $query }
+chat-direct-default = Direct message ({ $count })
+chat-group-default = Chat ({ $count })
+conversation-error-existing-thread = This block already has a comment. Select the existing thread to reply.
+conversation-error-create-thread = Couldn't create the thread: { $error }
+history-error-restore = Restore failed: { $error }
+notifications-on-document = on { $title }
+diff-image-placeholder = [image]
+diff-image-description = [image: { $alt }]
+kanban-assignee-placeholder = User name
+ss-pivot-default-column = Column { $number }
+ss-pivot-condition-in = in [{ $values }]
+ss-pivot-condition-contains = contains "{ $text }"
+ss-pivot-condition-starts = starts with "{ $text }"
+ss-pivot-condition-empty = empty
+ss-pivot-condition-not-empty = not empty
+
+# Paragraph base direction
+menu-text-direction = Text direction
+menu-direction-auto = Automatic
+menu-direction-ltr = Left to right
+menu-direction-rtl = Right to left

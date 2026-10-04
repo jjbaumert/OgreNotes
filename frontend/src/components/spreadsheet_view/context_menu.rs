@@ -311,12 +311,12 @@ where
         let row_count = r2 - r1 + 1;
         let col_count = c2 - c1 + 1;
         let row_label = if row_count > 1 {
-            crate::t!("ss-ctx-delete-rows", count = row_count.to_string())
+            crate::t!("ss-ctx-delete-rows", count = row_count as i64)
         } else {
             crate::t!("ss-ctx-delete-row")
         };
         let col_label = if col_count > 1 {
-            crate::t!("ss-ctx-delete-cols", count = col_count.to_string())
+            crate::t!("ss-ctx-delete-cols", count = col_count as i64)
         } else {
             crate::t!("ss-ctx-delete-col")
         };

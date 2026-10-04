@@ -624,7 +624,7 @@ pub fn DocumentPage() -> impl IntoView {
             return;
         }
         set_current_id.set(id.clone());
-        set_title.set("Loading...".to_string());
+        set_title.set(crate::t!("common-loading"));
         set_error.set(None);
         set_content_loaded.set(false);
         // #149: clear stale folder chips immediately so we don't show the

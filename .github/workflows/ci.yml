@@ -108,6 +108,11 @@ jobs:
       - name: Frontend doctor result contracts
         run: node --test scripts/frontend-doctor/doctor-result.test.js
 
+      - name: Internationalization source audit
+        run: |
+          python3 scripts/test_i18n_audit.py
+          scripts/i18n-audit.sh
+
       - name: Frontend lib tests
         working-directory: frontend
         run: cargo test --lib --bins --test collab_semantics --locked

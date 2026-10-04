@@ -603,7 +603,15 @@ fn date_items(query: &str) -> Vec<AtMenuItem> {
             matches_date || style_key.starts_with(&q) || q.starts_with(*style_key)
         })
         .map(|(style, _, label_key)| AtMenuItem {
-            label: crate::i18n::translate(label_key, None),
+            label: {
+                let mut args = fluent_bundle::FluentArgs::new();
+                // Date previews require the browser clock and Intl formatter.
+                #[cfg(target_arch = "wasm32")]
+                args.set("date", format_date_now(*style));
+                #[cfg(not(target_arch = "wasm32"))]
+                args.set("date", "");
+                crate::i18n::translate(label_key, Some(&args))
+            },
             icon: "\u{1F4C5}".to_string(), // 📅
             section: AtMenuSection::Insert,
             kind: AtMenuItemKind::InsertDate { style: *style },
@@ -868,7 +876,7 @@ fn ai_items(query: &str) -> Vec<AtMenuItem> {
     let base_label = if trimmed.is_empty() {
         crate::t!("at-menu-ask-ai-hint")
     } else {
-        format!("Ask AI: {trimmed}")
+        crate::t!("at-menu-ask-ai-query", query = trimmed)
     };
     items.push(AtMenuItem {
         label: base_label,

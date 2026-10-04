@@ -219,8 +219,8 @@ pub fn NotificationBell() -> impl IntoView {
                                                         " "
                                                         {message}
                                                         {doc_title.map(|t| view! {
-                                                            " on "
-                                                            <span class="notification-doc">{t}</span>
+                                                            " "
+                                                            <span class="notification-doc">{crate::t!("notifications-on-document", title = t)}</span>
                                                         })}
                                                     </div>
                                                     {preview.map(|p| view! {

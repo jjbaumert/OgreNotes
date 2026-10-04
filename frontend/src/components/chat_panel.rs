@@ -32,9 +32,9 @@ pub fn ChatPanel() -> impl IntoView {
                             id: c.id,
                             title: c.title.unwrap_or_else(|| {
                                 if c.chat_type == "directMessage" {
-                                    format!("DM ({})", c.member_ids.len())
+                                    crate::t!("chat-direct-default", count = c.member_ids.len() as i64)
                                 } else {
-                                    format!("Chat ({})", c.member_ids.len())
+                                    crate::t!("chat-group-default", count = c.member_ids.len() as i64)
                                 }
                             }),
                         })

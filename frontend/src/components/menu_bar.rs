@@ -332,6 +332,14 @@ pub fn MenuBar(
                 ],
             ),
             MenuEntry::submenu(
+                crate::t!("menu-text-direction"),
+                vec![
+                    cmd(crate::t!("menu-direction-auto"), ToolbarCommand::SetTextDirection("auto".to_string())),
+                    cmd(crate::t!("menu-direction-ltr"), ToolbarCommand::SetTextDirection("ltr".to_string())),
+                    cmd(crate::t!("menu-direction-rtl"), ToolbarCommand::SetTextDirection("rtl".to_string())),
+                ],
+            ),
+            MenuEntry::submenu(
                 crate::t!("menubar-format-list"),
                 vec![
                     cmd(
