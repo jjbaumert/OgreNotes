@@ -6266,6 +6266,388 @@ fn paste_dollar_math_text_becomes_an_equation() {
     }
 }
 
+const ACADEMIC_MATH_PASTE: &str = include_str!("fixtures/academic-math-paste.txt");
+
+#[wasm_bindgen_test]
+fn paste_complete_academic_passage_recognizes_all_tex_equations() {
+    let expected: Vec<_> = ACADEMIC_MATH_PASTE
+        .split(r"\(")
+        .skip(1)
+        .map(|s| s.split_once(r"\)").unwrap().0.trim().to_string())
+        .collect();
+    assert_eq!(expected.len(), 32);
+    let rich = ACADEMIC_MATH_PASTE
+        .lines()
+        .map(|line| {
+            format!(
+                "<p><strong>{}</strong></p>",
+                line.replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+            )
+        })
+        .collect::<String>();
+    let trivial = rich.replace("<strong>", "").replace("</strong>", "");
+    let pre = format!(
+        "<pre>{}</pre>",
+        ACADEMIC_MATH_PASTE
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    );
+    for (plain, html) in [
+        (ACADEMIC_MATH_PASTE, ""),
+        (ACADEMIC_MATH_PASTE, rich.as_str()),
+        ("", rich.as_str()),
+        (ACADEMIC_MATH_PASTE, trivial.as_str()),
+        (ACADEMIC_MATH_PASTE, pre.as_str()),
+    ] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+        set_cursor(&view, 1);
+        dispatch_paste_html(&view, &txns, plain, html);
+        let formulas = view.container().query_selector_all(".math-inline").unwrap();
+        let actual: Vec<_> = (0..formulas.length())
+            .map(|i| {
+                formulas
+                    .item(i)
+                    .unwrap()
+                    .dyn_into::<web_sys::Element>()
+                    .unwrap()
+                    .get_attribute("data-source")
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(actual, expected, "{html:?}: {}", inner_html(&view));
+        assert_eq!(
+            view.container()
+                .query_selector_all("math")
+                .unwrap()
+                .length(),
+            32
+        );
+        assert!(
+            view.container()
+                .query_selector(".math-block, .math-error")
+                .unwrap()
+                .is_none()
+        );
+        let text = view.state().doc.text_content();
+        for phrase in [
+            "Time-Sliced Space-Time Graph:",
+            "All-or-Nothing Path Selection:",
+            "Strict Residual Link Capacity:",
+            "Contributions",
+            "Experimental Design",
+        ] {
+            assert!(text.contains(phrase), "missing prose: {phrase}");
+        }
+        ogrenotes_frontend::editor::schema::default_schema()
+            .validate(&view.state().doc)
+            .unwrap();
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn paste_tex_across_formatting_spans_preserves_surrounding_marks() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        r"😀 before \(K_{P}\) after",
+        r"<p><strong>😀 before \</strong><em>(K_{P}\) after</em></p>",
+    );
+    let eq = view
+        .container()
+        .query_selector(".math-inline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(eq.get_attribute("data-source").as_deref(), Some("K_{P}"));
+    assert_eq!(
+        view.container()
+            .query_selector("strong")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .as_deref(),
+        Some("😀 before ")
+    );
+    assert_eq!(
+        view.container()
+            .query_selector("em")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .as_deref(),
+        Some(" after")
+    );
+    ogrenotes_frontend::editor::schema::default_schema()
+        .validate(&view.state().doc)
+        .unwrap();
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn paste_tex_code_and_invalid_expressions_stay_literal() {
+    for (plain, html) in [
+        (r"`\(K_P\)`", ""),
+        (r"before <kbd>\(K_P\)</kbd> after", ""),
+        (r"before <CODE>\(K_P\)</CODE> after", ""),
+        (r"\(K_P\)", r"<p><code>\(K_P\)</code></p>"),
+        (r"\(\unknowncommand_{P}\)", ""),
+        (
+            r"\(\unknowncommand_{P}\)",
+            r"<p><strong>\(\unknowncommand_{P}\)</strong></p>",
+        ),
+        (
+            r"```latex
+\(K_P\)
+```",
+            "",
+        ),
+    ] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+        set_cursor(&view, 1);
+        dispatch_paste_html(&view, &txns, plain, html);
+        assert!(
+            view.container().query_selector("math").unwrap().is_none(),
+            "{}",
+            inner_html(&view)
+        );
+        assert!(view.state().doc.text_content().contains(r"\("));
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn paste_tex_display_math_stays_schema_valid_in_existing_contexts() {
+    let paragraphs = vec![Node::element_with_content(
+        NodeType::Paragraph,
+        Fragment::from(vec![Node::text("before after")]),
+    )];
+    let list = Node::element_with_content(
+        NodeType::BulletList,
+        Fragment::from(vec![Node::element_with_content(
+            NodeType::ListItem,
+            Fragment::from(paragraphs.clone()),
+        )]),
+    );
+    let table = Node::element_with_content(
+        NodeType::Table,
+        Fragment::from(vec![Node::element_with_content(
+            NodeType::TableRow,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::TableCell,
+                Fragment::from(paragraphs),
+            )]),
+        )]),
+    );
+    for block in [None, Some(list), Some(table)] {
+        for html in ["", "<p><strong>\\[</strong><br>x^2<br>\\]</p>"] {
+            let container = create_container();
+            let doc = if let Some(block) = &block {
+                Node::element_with_content(NodeType::Doc, Fragment::from(vec![block.clone()]))
+            } else {
+                Node::empty_doc()
+            };
+            let (view, txns) = create_editor(container.clone(), doc);
+            let cursor = if block.is_none() {
+                1
+            } else {
+                // Paste after the existing "before " prefix in the paragraph.
+                if block.as_ref().unwrap().node_type() == Some(NodeType::Table) {
+                    11
+                } else {
+                    10
+                }
+            };
+            set_cursor(&view, cursor);
+            dispatch_paste_html(&view, &txns, "\\[\nx^2\n\\]", html);
+            let eq = view
+                .container()
+                .query_selector("[data-math-action]")
+                .unwrap()
+                .unwrap();
+            assert_eq!(eq.get_attribute("data-source").as_deref(), Some("x^2"));
+            assert_eq!(
+                view.container()
+                    .query_selector(".math-block")
+                    .unwrap()
+                    .is_some(),
+                block.is_none()
+            );
+            assert_eq!(
+                view.container()
+                    .query_selector_all("math")
+                    .unwrap()
+                    .length(),
+                1
+            );
+            ogrenotes_frontend::editor::schema::default_schema()
+                .validate(&view.state().doc)
+                .unwrap();
+            cleanup(&container);
+        }
+    }
+}
+
+#[wasm_bindgen_test]
+fn paste_escaped_math_delimiters_stay_literal() {
+    for (plain, expected) in [
+        (r"\\(K_P\\)", r"\(K_P\)"),
+        (r"\\[x^2\\]", r"\[x^2\]"),
+        (r"\$x$", "$x$"),
+        ("&#92;(x&#92;)", r"\(x\)"),
+    ] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+        set_cursor(&view, 1);
+        dispatch_paste_html(&view, &txns, plain, "");
+        assert!(
+            view.container().query_selector("math").unwrap().is_none(),
+            "{plain}: {}",
+            inner_html(&view)
+        );
+        assert_eq!(view.state().doc.text_content(), expected);
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn paste_rich_urls_with_tex_delimiters_stay_literal() {
+    let url = r"https://example.com/\(x\)";
+    for html in [
+        format!("<p><strong>{url}</strong></p>"),
+        format!("<p><a href=\"{url}\">{url}</a></p>"),
+    ] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+        set_cursor(&view, 1);
+        dispatch_paste_html(&view, &txns, url, &html);
+        assert!(
+            view.container().query_selector("math").unwrap().is_none(),
+            "{}",
+            inner_html(&view)
+        );
+        assert_eq!(view.state().doc.text_content(), url);
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn paste_tex_punctuation_does_not_hide_adjacent_formulas() {
+    for (plain, expected) in [
+        (
+            r"\(\text{a`b}\) and \(\text{c`d}\)",
+            [r"\text{a`b}", r"\text{c`d}"],
+        ),
+        (
+            "| Formula | Value |\n| --- | --- |\n| \\(\\text{a|b}\\) | \\(x\\) |",
+            [r"\text{a|b}", "x"],
+        ),
+    ] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+        set_cursor(&view, 1);
+        dispatch_paste_html(&view, &txns, plain, "");
+        let formulas = view.container().query_selector_all(".math-inline").unwrap();
+        let actual: Vec<_> = (0..formulas.length())
+            .map(|i| {
+                formulas
+                    .item(i)
+                    .unwrap()
+                    .dyn_into::<web_sys::Element>()
+                    .unwrap()
+                    .get_attribute("data-source")
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(actual, expected, "{plain}: {}", inner_html(&view));
+        assert!(
+            view.container()
+                .query_selector(".math-error")
+                .unwrap()
+                .is_none()
+        );
+        ogrenotes_frontend::editor::schema::default_schema()
+            .validate(&view.state().doc)
+            .unwrap();
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn paste_tex_restores_literal_source_when_final_markdown_context_is_code() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste_html(&view, &txns, r"[link](\(\text{a` b}\)) and \(x\) tail`", "");
+    let text = view.state().doc.text_content();
+    assert!(!text.contains('\u{fffc}'), "{}", inner_html(&view));
+    assert!(text.contains(r"\(x\)"), "{}", inner_html(&view));
+    assert!(view.container().query_selector("math").unwrap().is_none());
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn paste_tex_preserves_literals_in_reclassified_link_and_image_attributes() {
+    for source in [
+        r#"[link](\(\text{<a href="https://example.com/a b}\)) and \(x\) tail">z</a>"#,
+        r"[outer](\(\text{[go](<https://example.com/a b}\)) and \(x\) tail>)",
+        r"[outer](\(\text{![go](<https://example.com/a b}\)) and \(x\) tail>)",
+        r#"[outer](\(\text{[go](https://example.com "a b}\)) and \(x\) tail")"#,
+        r#"[outer](\(\text{![go](https://example.com "a b}\)) and \(x\) tail")"#,
+    ] {
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+        set_cursor(&view, 1);
+        dispatch_paste_html(&view, &txns, source, "");
+        assert!(
+            !format!("{:?}", view.state().doc).contains('\u{fffc}'),
+            "{source}: {}",
+            inner_html(&view)
+        );
+        ogrenotes_frontend::editor::schema::default_schema()
+            .validate(&view.state().doc)
+            .unwrap();
+        cleanup(&container);
+    }
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        r"[outer](\(\text{![alt a b}\)) and \(x\) tail](https://example.com)",
+        "",
+    );
+    let image = view.container().query_selector("img").unwrap().unwrap();
+    assert!(
+        image.get_attribute("alt").unwrap().contains(r"\(x\)"),
+        "{}",
+        inner_html(&view)
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn paste_tex_keeps_malformed_table_source_when_parsing_would_drop_a_formula() {
+    let source = "| Formula | Value |\n| --- | --- |\n| [outer](\\(\\text{a| b}\\)) | \\(x\\) |";
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste_html(&view, &txns, source, "");
+    assert_eq!(view.state().doc.text_content(), source);
+    ogrenotes_frontend::editor::schema::default_schema()
+        .validate(&view.state().doc)
+        .unwrap();
+    cleanup(&container);
+}
+
 const DISPLAY_PASTE_SOURCE: &str = r"\sum_{k \in K_P} d_k \cdot \left( \delta_{k,1}^e \cdot x_{k,1} + \delta_{k,2}^e \cdot x_{k,2} \right) \le C_e \quad \forall e \in E";
 
 #[wasm_bindgen_test]
