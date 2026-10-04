@@ -1251,12 +1251,28 @@ impl EditorView {
                 super::debug::warn("paste", "parsed slice is empty");
                 return;
             }
-            // `$…$` in pasted text (rich or plain) becomes an equation,
-            // as it would have if typed.
-            let slice = super::paste_math::convert_inline_math(slice);
+            // Lists and table cells cannot contain display blocks. Determine
+            // the enclosing block container before converting pasted math.
+            let pos = state_with_sel.selection.from();
+            let math_destination = super::position::resolve(&state_with_sel.doc, pos)
+                .map(|rp| {
+                    let depth = if rp
+                        .node_at(rp.depth, &state_with_sel.doc)
+                        .node_type()
+                        .is_some_and(|node_type| node_type.is_textblock())
+                    {
+                        rp.depth.saturating_sub(1)
+                    } else {
+                        rp.depth
+                    };
+                    rp.node_at(depth, &state_with_sel.doc)
+                        .node_type()
+                        .unwrap_or(NodeType::Doc)
+                })
+                .unwrap_or(NodeType::Doc);
+            let slice = super::paste_math::convert_math(slice, math_destination);
 
             // Determine paste context and strategy
-            let pos = state_with_sel.selection.from();
             let in_list = super::state::find_item_at(&state_with_sel.doc, pos).is_some();
             super::debug::log("paste", "context", &[
                 ("pos", &pos.to_string()),
@@ -1326,6 +1342,7 @@ impl EditorView {
                             | Some(super::model::NodeType::Table)
                             | Some(super::model::NodeType::Image)
                             | Some(super::model::NodeType::Mermaid)
+                            | Some(super::model::NodeType::MathBlock)
                     )
                 });
 
