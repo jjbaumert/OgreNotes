@@ -4021,19 +4021,30 @@ fn replace_url_if_changed(new_path: &str) {
 }
 
 fn slugify(text: &str) -> String {
-    let slug: String = text
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    // Collapse consecutive hyphens and trim
-    let mut result = String::new();
-    for c in slug.chars() {
-        if c == '-' && result.ends_with('-') {
+    // The slug is cosmetic. Bound this URL segment even when the first
+    // document block contains an entire pasted paper rather than a title.
+    const MAX_SLUG_BYTES: usize = 128;
+    let mut result = String::with_capacity(text.len().min(MAX_SLUG_BYTES));
+    let mut separator_pending = false;
+    for byte in text.bytes() {
+        if !byte.is_ascii_alphanumeric() {
+            separator_pending = !result.is_empty();
             continue;
         }
-        result.push(c);
+        if separator_pending {
+            // Reserve room for the next letter so truncation never ends on
+            // a hyphen. Delaying separators also trims leading/trailing ones.
+            if result.len() + 1 >= MAX_SLUG_BYTES {
+                break;
+            }
+            result.push('-');
+            separator_pending = false;
+        }
+        result.push(char::from(byte));
+        if result.len() == MAX_SLUG_BYTES {
+            break;
+        }
     }
-    let result = result.trim_matches('-').to_string();
     if result.is_empty() {
         "untitled".to_string()
     } else {
@@ -4045,7 +4056,52 @@ fn slugify(text: &str) -> String {
 mod tests {
     use super::block_id_selector;
     use super::remote_doc_degrades_spreadsheet;
+    use super::slugify;
     use crate::editor::model::{Fragment, Node, NodeType};
+
+    #[test]
+    fn cosmetic_slug_preserves_short_titles_and_trims_separators() {
+        for (source, expected) in [
+            ("Academic Paper 2026", "Academic-Paper-2026"),
+            (" --A___B / C!?-- ", "A-B-C"),
+            ("café 東京 notes", "caf-notes"),
+            ("", "untitled"),
+            (" ---!? 東京 📝 ", "untitled"),
+        ] {
+            assert_eq!(slugify(source), expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn cosmetic_slug_bounds_a_whole_pasted_paper() {
+        let paper = "Since you are targeting an academic paper, frame this problem using precise operations research and networking terminology. ".repeat(100);
+        let slug = slugify(&paper);
+        assert!(slug.len() <= 128);
+        assert!(slug.starts_with("Since-you-are-targeting-an-academic-paper"));
+        assert!(
+            slug.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        );
+        assert!(!slug.ends_with('-'));
+        assert_eq!(slugify(&"A".repeat(50_000)), "A".repeat(128));
+    }
+
+    #[test]
+    fn cosmetic_slug_truncation_keeps_normalized_prefix() {
+        assert_eq!(slugify(&"A".repeat(128)), "A".repeat(128));
+        assert_eq!(
+            slugify(&format!("{} tail", "A".repeat(127))),
+            "A".repeat(127)
+        );
+        assert_eq!(
+            slugify(&format!("{} -- tail", "A".repeat(126))),
+            format!("{}-t", "A".repeat(126))
+        );
+        assert_eq!(
+            slugify(&format!("{}東京B", "A".repeat(126))),
+            format!("{}-B", "A".repeat(126))
+        );
+    }
 
     fn doc_with_table() -> Node {
         Node::element_with_content(
