@@ -604,8 +604,8 @@ pub fn set_paragraph(
 
 /// Set the `text-align` of the textblock at the cursor. `align`
 /// is one of "left", "center", "right" — anything else is rejected.
-/// Passing "left" clears the attribute (left is the natural default
-/// so we don't bother persisting it). Operates on the innermost
+/// Persist physical alignment so "left" stays left in an RTL block.
+/// Operates on the innermost
 /// textblock returned by `find_block_at` — Paragraph / Heading /
 /// CodeBlock / list-item-paragraphs all benefit from this. Returns
 /// true when a transaction was dispatched (or could have been), so
@@ -627,11 +627,7 @@ pub fn set_alignment(
         return false;
     }
     let mut attrs = block.attrs.clone();
-    if align == "left" {
-        attrs.remove("align");
-    } else {
-        attrs.insert("align".to_string(), align.to_string());
-    }
+    attrs.insert("align".to_string(), align.to_string());
     // No-op when the requested alignment matches the current state.
     if attrs == block.attrs {
         return true;
@@ -644,6 +640,37 @@ pub fn set_alignment(
         }) {
             dispatch(txn);
         }
+    }
+    true
+}
+
+/// Set a text block's base direction without replacing its text or identity.
+/// The attribute is shared through yrs; `auto` follows the block's content.
+pub fn set_text_direction(
+    direction: &str,
+    state: &EditorState,
+    dispatch: Option<&dyn Fn(Transaction)>,
+) -> bool {
+    if !matches!(direction, "auto" | "ltr" | "rtl") {
+        return false;
+    }
+    let Some(block) = find_block_at(&state.doc, state.selection.from()) else {
+        return false;
+    };
+    if !matches!(block.node_type, NodeType::Paragraph | NodeType::Heading) {
+        return false;
+    }
+    if block.attrs.get("dir").map(String::as_str) == Some(direction) {
+        return true;
+    }
+    if let Some(dispatch) = dispatch
+        && let Ok(txn) = state.transaction().step(Step::SetAttr {
+            pos: block.offset,
+            attr: "dir".to_string(),
+            value: direction.to_string(),
+        })
+    {
+        dispatch(txn);
     }
     true
 }
@@ -4442,6 +4469,51 @@ mod tests {
     }
 
     #[test]
+    fn text_direction_uses_targeted_attribute_step() {
+        use crate::editor::plugins::HistoryPlugin;
+        let block = Node::element_with_attrs(
+            NodeType::Paragraph,
+            [
+                ("blockId".into(), "shared-paragraph".into()),
+                ("dir".into(), "auto".into()),
+            ]
+            .into(),
+            Fragment::from(vec![Node::text_with_marks(
+                "مرحبا Hello😀",
+                vec![Mark::new(MarkType::Bold)],
+            )]),
+        );
+        let state = EditorState::create_default(Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![block.clone()]),
+        ));
+        let txn = run_command(&state, |s, d| set_text_direction("rtl", s, d)).unwrap();
+        assert!(
+            matches!(txn.steps.as_slice(), [Step::SetAttr { pos: 0, attr, value }] if attr == "dir" && value == "rtl")
+        );
+        let mut history = HistoryPlugin::new();
+        history.record(&txn, &state.doc);
+        let new_state = state.apply(txn);
+        let first = new_state.doc.child(0).unwrap();
+        assert_eq!(first.attrs().get("dir").map(String::as_str), Some("rtl"));
+        assert_eq!(
+            first.attrs().get("blockId").map(String::as_str),
+            Some("shared-paragraph")
+        );
+        assert_eq!(
+            first.child(0),
+            block.child(0),
+            "direction preserves text and inline marks"
+        );
+        let undone = new_state.apply(history.undo(&new_state).expect("direction is undoable"));
+        assert_eq!(undone.doc, state.doc);
+        let redone = undone.apply(history.redo(&undone).expect("direction is redoable"));
+        assert_eq!(redone.doc, new_state.doc);
+        assert!(run_command(&redone, |s, d| set_text_direction("rtl", s, d)).is_none());
+        assert!(!set_text_direction("sideways", &state, None));
+    }
+
+    #[test]
     fn set_alignment_right_writes_attr_on_heading() {
         let state = EditorState::create_default(heading_doc());
         let txn = run_command(&state, |s, d| set_alignment("right", s, d)).unwrap();
@@ -4456,13 +4528,12 @@ mod tests {
     }
 
     #[test]
-    fn set_alignment_left_clears_existing_align_attr() {
-        // Pre-state: a paragraph already centered. set_alignment("left")
-        // should remove the attr rather than set it to "left", so the
-        // rendered DOM matches the natural-default state.
+    fn set_alignment_left_is_explicit_in_rtl_block() {
+        // A left-aligned RTL paragraph must remain left-aligned after render.
         let para_with_align = {
             let mut attrs = HashMap::new();
             attrs.insert("align".to_string(), "center".to_string());
+            attrs.insert("dir".to_string(), "rtl".to_string());
             Node::Element {
                 node_type: NodeType::Paragraph,
                 attrs,
@@ -4479,8 +4550,8 @@ mod tests {
         let new_state = state.apply(txn);
         let first = new_state.doc.child(0).unwrap();
         if let Node::Element { attrs, .. } = first {
-            assert!(!attrs.contains_key("align"),
-                "left should clear the attr, found {:?}", attrs);
+            assert_eq!(attrs.get("align").map(String::as_str), Some("left"));
+            assert_eq!(attrs.get("dir").map(String::as_str), Some("rtl"));
         } else {
             panic!("expected an element node");
         }

@@ -3,12 +3,13 @@
 use leptos::prelude::*;
 
 use crate::collab::ws_client::RemoteCursor;
+use crate::editor::model::{char_to_utf16_offset, utf16_to_char_offset};
 use super::dom_position;
 
 /// Resolve a block-relative position (block_id, char_offset) to viewport
-/// coordinates (left, top, height) by finding the block element in the DOM
+/// coordinates (left, top, height, run_is_rtl) by finding the block element in the DOM
 /// and walking its text nodes.
-fn block_pos_to_viewport(block_id: &str, char_offset: u32) -> Option<(f64, f64, f64)> {
+fn block_pos_to_viewport(block_id: &str, char_offset: u32) -> Option<(f64, f64, f64, bool)> {
     let block_el = dom_position::find_block_element(block_id)?;
     let (node, offset) = dom_position::find_text_offset_in_element(&block_el, char_offset)?;
 
@@ -23,7 +24,47 @@ fn block_pos_to_viewport(block_id: &str, char_offset: u32) -> Option<(f64, f64, 
         return None;
     }
 
-    Some((rect.left(), rect.top(), rect.height()))
+    let base_rtl = window
+        .get_computed_style(&block_el)
+        .ok()
+        .flatten()
+        .and_then(|style| style.get_property_value("direction").ok())
+        .is_some_and(|direction| direction == "rtl");
+    // Compare the collapsed caret with its neighboring rendered glyph. This
+    // picks the run direction even when Latin and Arabic share one text node.
+    let text = node.text_content().unwrap_or_default();
+    let scalar = utf16_to_char_offset(&text, offset as usize);
+    let neighbor = if scalar > 0 {
+        Some((char_to_utf16_offset(&text, scalar - 1) as u32, offset, true))
+    } else if scalar < text.chars().count() {
+        Some((
+            offset,
+            char_to_utf16_offset(&text, scalar + 1) as u32,
+            false,
+        ))
+    } else {
+        None
+    };
+    let run_rtl = neighbor
+        .and_then(|(from, to, preceding)| {
+            let glyph = document.create_range().ok()?;
+            glyph.set_start(&node, from).ok()?;
+            glyph.set_end(&node, to).ok()?;
+            let box_rect = glyph.get_bounding_client_rect();
+            if box_rect.width() < 1.0 || (box_rect.top() - rect.top()).abs() > rect.height() {
+                return None;
+            }
+            let left_distance = (rect.left() - box_rect.left()).abs();
+            let right_distance = (rect.left() - box_rect.right()).abs();
+            Some(if preceding {
+                left_distance < right_distance
+            } else {
+                right_distance < left_distance
+            })
+        })
+        .unwrap_or(base_rtl);
+
+    Some((rect.left(), rect.top(), rect.height(), run_rtl))
 }
 
 /// Resolve a (block_id, char_offset) to the DOM (node, offset) pair needed
@@ -105,7 +146,7 @@ pub fn CursorOverlay(
             let _tick = scroll_tick.get();
             cursors.get().into_iter().filter_map(|cursor| {
                 let (block_id, char_offset) = cursor.cursor_block.as_ref()?;
-                let (left, top, height) = block_pos_to_viewport(block_id, *char_offset)?;
+                let (left, top, height, run_rtl) = block_pos_to_viewport(block_id, *char_offset)?;
 
                 let color = cursor.color.clone();
                 let name = cursor.name.clone();
@@ -143,13 +184,15 @@ pub fn CursorOverlay(
                     />
                     <div
                         class="remote-cursor-caret"
+                        data-rtl=if run_rtl { "true" } else { "false" }
                         style:left=format!("{}px", left)
                         style:top=format!("{}px", top)
                         style:height=format!("{}px", height)
-                        style:border-left-color=color_caret
+                        style:border-color=color_caret
                     >
                         <span
                             class="remote-cursor-label"
+                            dir="auto"
                             style:background-color=color
                         >{name}</span>
                     </div>
@@ -177,6 +220,66 @@ mod browser_tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn cursor_stripe_follows_mixed_direction_runs() {
+        let p = make_block("test-bidi-caret", "مرحبا Hello", 800);
+        p.set_attribute("dir", "rtl").unwrap();
+        let arabic = block_pos_to_viewport("test-bidi-caret", 5).unwrap();
+        let latin = block_pos_to_viewport("test-bidi-caret", 11).unwrap();
+        assert!(arabic.3, "caret after Arabic should follow the RTL run");
+        assert!(!latin.3, "caret after Latin should follow the LTR run");
+        cleanup(&[&p]);
+    }
+
+    #[wasm_bindgen_test]
+    fn cursor_stripe_border_box_follows_run_direction() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let stylesheet = include_str!("../../style/main.css");
+        let production_rule = |selector: &str| {
+            let start = stylesheet
+                .find(selector)
+                .expect("production caret selector");
+            let end = start + stylesheet[start..].find('}').unwrap() + 1;
+            &stylesheet[start..end]
+        };
+        let style: web_sys::HtmlElement =
+            document.create_element("style").unwrap().unchecked_into();
+        style.set_text_content(Some(&format!(
+            "{}\n{}",
+            production_rule(".remote-cursor-caret {"),
+            production_rule(".remote-cursor-caret[data-rtl=\"true\"] {")
+        )));
+        document.body().unwrap().append_child(&style).unwrap();
+        let caret: web_sys::HtmlElement = document.create_element("div").unwrap().unchecked_into();
+        caret.set_class_name("remote-cursor-caret");
+        caret
+            .set_attribute("style", "left: 120px; top: 120px; height: 20px;")
+            .unwrap();
+        document.body().unwrap().append_child(&caret).unwrap();
+        for (rtl, expected_left, expected_right) in
+            [("false", 120.0, 122.0), ("true", 118.0, 120.0)]
+        {
+            caret.set_attribute("data-rtl", rtl).unwrap();
+            let rect = caret.get_bounding_client_rect();
+            assert!(
+                (rect.left() - expected_left).abs() < 0.01,
+                "{rtl}: left {}",
+                rect.left()
+            );
+            assert!(
+                (rect.right() - expected_right).abs() < 0.01,
+                "{rtl}: right {}",
+                rect.right()
+            );
+            assert_eq!(
+                caret.style().get_property_value("left").unwrap(),
+                "120px",
+                "the native caret point remains fixed"
+            );
+        }
+        cleanup(&[&caret, &style]);
+    }
 
     /// Build a paragraph element with the given inner HTML and a known
     /// `data-block-id`, append to body, return it.

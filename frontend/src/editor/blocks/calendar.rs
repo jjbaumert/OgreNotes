@@ -404,7 +404,7 @@ fn render_month_grid(
 
             let day_num = doc.create_element("span").ok()?;
             day_num.set_attribute("class", "calendar-day-num").ok()?;
-            day_num.set_text_content(Some(&d.to_string()));
+            day_num.set_text_content(Some(&crate::i18n::format_number(d as f64)));
             td.append_child(&day_num).ok()?;
 
             if let Some(evs) = events_by_day.get(&iso) {
@@ -506,7 +506,7 @@ fn render_time_grid(
         name.set_text_content(Some(&localized_short_weekday(day_of_week(y, m, d))));
         let num = doc.create_element("span").ok()?;
         num.set_attribute("class", "day-num").ok()?;
-        num.set_text_content(Some(&d.to_string()));
+        num.set_text_content(Some(&crate::i18n::format_number(d as f64)));
         cell.append_child(&name).ok()?;
         cell.append_child(&num).ok()?;
         header.append_child(&cell).ok()?;
@@ -725,9 +725,9 @@ fn render_timed_event_block(
         (0, 0)
     };
     let label = if content.is_empty() {
-        format!("(no title)  {label_h:02}:{label_m:02}")
+        format!("{}  {}", crate::t!("calendar-event-untitled"), localized_time_label(label_h, label_m))
     } else {
-        format!("{content}  {label_h:02}:{label_m:02}")
+        format!("{content}  {}", localized_time_label(label_h, label_m))
     };
     let label_span = doc.create_element("span").ok()?;
     label_span.set_attribute("class", "calendar-event-label").ok()?;
@@ -815,12 +815,13 @@ fn render_event_span(doc: &Document, attrs: &HashMap<String, String>) -> Option<
     }
     stamp_event_time_attrs(&span, attrs);
     let content = safe_optional_text(attrs, "content", MAX_EVENT_CONTENT_LEN);
+    let untitled = crate::t!("calendar-event-untitled");
     let display = match content.as_deref() {
         Some(c) if !c.is_empty() => c,
-        _ => "(no title)",
+        _ => &untitled,
     };
     span.set_text_content(Some(display));
-    // Right-edge resize handle: extends endDate on drag.
+    // Inline-end resize handle: extends endDate on drag.
     let handle = doc.create_element("span").ok()?;
     handle.set_attribute("class", "calendar-event-resize calendar-event-resize--x").ok()?;
     handle.set_attribute("data-calendar-resize", "allday").ok()?;
@@ -1111,14 +1112,12 @@ fn month_name(m: u32) -> &'static str {
 
 /// Locale-aware "Month YYYY" using the shared `IntlDateTimeFormat`
 /// binding. Falls back to English `month_name(m) + " " + y` if
-/// the Intl construct returns Err. Reads the empty-locales array
-/// so Intl picks up `navigator.language` — matches other browser-
-/// visible date UI.
+/// the Intl construct returns Err. Uses the active UI locale.
 fn localized_month_year(y: u32, m: u32) -> String {
     let opts = js_sys::Object::new();
     let _ = js_sys::Reflect::set(&opts, &"month".into(), &"long".into());
     let _ = js_sys::Reflect::set(&opts, &"year".into(), &"numeric".into());
-    let fmt = match crate::i18n::IntlDateTimeFormat::new("", &opts) {
+    let fmt = match crate::i18n::IntlDateTimeFormat::new(&crate::i18n::active_locale(), &opts) {
         Ok(f) => f,
         Err(_) => return format!("{} {y}", month_name(m)),
     };
@@ -1128,18 +1127,23 @@ fn localized_month_year(y: u32, m: u32) -> String {
 
 /// Locale-aware hour label for the time-grid views. Passes
 /// `hour: "numeric"` to Intl so 12-hour locales (en-US) render
-/// `1 AM`, `2 PM`, and 24-hour locales (de-DE, fr-FR) render
-/// `01`, `13`. Falls back to `HH:00` (24-hour) on Intl failure.
+/// `1:00 AM`, `2:00 PM`, and 24-hour locales (de-DE, fr-FR) render
+/// `01:00`, `13:00`. Falls back to `HH:00` (24-hour) on Intl failure.
 fn localized_hour_label(hour: u32) -> String {
+    localized_time_label(hour, 0)
+}
+
+fn localized_time_label(hour: u32, minute: u32) -> String {
     let opts = js_sys::Object::new();
     let _ = js_sys::Reflect::set(&opts, &"hour".into(), &"numeric".into());
-    let fmt = match crate::i18n::IntlDateTimeFormat::new("", &opts) {
+    let _ = js_sys::Reflect::set(&opts, &"minute".into(), &"2-digit".into());
+    let fmt = match crate::i18n::IntlDateTimeFormat::new(&crate::i18n::active_locale(), &opts) {
         Ok(f) => f,
-        Err(_) => return format!("{hour:02}:00"),
+        Err(_) => return format!("{hour:02}:{minute:02}"),
     };
     // Any date works — we only need the hour component.
     let date = js_sys::Date::new_with_year_month_day_hr_min_sec(
-        2024, 0, 1, hour as i32, 0, 0,
+        2024, 0, 1, hour as i32, minute as i32, 0,
     );
     fmt.format(&date)
 }
@@ -1151,7 +1155,7 @@ fn localized_hour_label(hour: u32) -> String {
 fn localized_short_weekday(dow: u32) -> String {
     let opts = js_sys::Object::new();
     let _ = js_sys::Reflect::set(&opts, &"weekday".into(), &"short".into());
-    let fmt = match crate::i18n::IntlDateTimeFormat::new("", &opts) {
+    let fmt = match crate::i18n::IntlDateTimeFormat::new(&crate::i18n::active_locale(), &opts) {
         Ok(f) => f,
         Err(_) => return short_weekday(dow).to_string(),
     };

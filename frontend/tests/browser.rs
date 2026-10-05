@@ -224,6 +224,13 @@ fn normalized_html(view: &EditorView) -> String {
     html
 }
 
+fn assert_text_block(view: &EditorView, selector: &str, text: &str) {
+    let element = view.container().query_selector(selector).unwrap()
+        .unwrap_or_else(|| panic!("missing {selector}: {}", inner_html(view)));
+    assert_eq!(element.text_content().as_deref(), Some(text));
+    assert_eq!(element.get_attribute("dir").as_deref(), Some("auto"));
+}
+
 /// Dispatch a synthetic `paste` event with a given plain-text payload.
 /// Applies any transactions the handler dispatches, then updates the DOM.
 fn dispatch_paste(
@@ -504,8 +511,7 @@ fn renders_paragraph_text() {
     let container = create_container();
     let (view, _txns) = create_editor(container.clone(), simple_doc());
 
-    let html = normalized_html(&view);
-    assert!(html.contains("<p>Hello world</p>"), "Expected paragraph, got: {html}");
+    assert_text_block(&view, "p", "Hello world");
 
     cleanup(&container);
 }
@@ -536,8 +542,7 @@ fn renders_heading() {
     let container = create_container();
     let (view, _txns) = create_editor(container.clone(), doc);
 
-    let html = normalized_html(&view);
-    assert!(html.contains("<h1>Title</h1>"), "Expected h1, got: {html}");
+    assert_text_block(&view, "h1", "Title");
 
     cleanup(&container);
 }
@@ -1102,7 +1107,7 @@ fn hr_renders_hr_element_in_dom() {
 
     let html = normalized_html(&view);
     assert!(html.contains("<hr"), "DOM should contain <hr> element, got: {html}");
-    assert!(html.contains("<p>"), "DOM should contain a new paragraph after HR, got: {html}");
+    assert_text_block(&view, "hr + p", "");
 
     cleanup(&container);
 }
@@ -1563,8 +1568,7 @@ fn ctrl_alt_1_converts_to_h1() {
     let block = state.doc.child(0).unwrap();
     assert_eq!(block.node_type(), Some(NodeType::Heading));
     assert_eq!(block.attrs().get("level").unwrap(), "1");
-    let html = inner_html(&view);
-    assert!(html.contains("<h1>"), "DOM: {html}");
+    assert_text_block(&view, "h1", "Hello world");
 
     cleanup(&container);
 }
@@ -1581,8 +1585,7 @@ fn ctrl_alt_2_converts_to_h2() {
     let block = state.doc.child(0).unwrap();
     assert_eq!(block.node_type(), Some(NodeType::Heading));
     assert_eq!(block.attrs().get("level").unwrap(), "2");
-    let html = inner_html(&view);
-    assert!(html.contains("<h2>"), "DOM: {html}");
+    assert_text_block(&view, "h2", "Hello world");
 
     cleanup(&container);
 }
@@ -1599,8 +1602,7 @@ fn ctrl_alt_3_converts_to_h3() {
     let block = state.doc.child(0).unwrap();
     assert_eq!(block.node_type(), Some(NodeType::Heading));
     assert_eq!(block.attrs().get("level").unwrap(), "3");
-    let html = inner_html(&view);
-    assert!(html.contains("<h3>"), "DOM: {html}");
+    assert_text_block(&view, "h3", "Hello world");
 
     cleanup(&container);
 }
@@ -2234,8 +2236,7 @@ fn ctrl_alt_2_on_h1_changes_level() {
     let block = state.doc.child(0).unwrap();
     assert_eq!(block.node_type(), Some(NodeType::Heading));
     assert_eq!(block.attrs().get("level").unwrap(), "2");
-    let html = normalized_html(&view);
-    assert!(html.contains("<h2>"), "DOM: {html}");
+    assert_text_block(&view, "h2", "Title");
 
     cleanup(&container);
 }
@@ -2476,8 +2477,8 @@ fn heading_preserves_marks() {
         first.marks().iter().any(|m| m.mark_type == MarkType::Bold),
         "Bold mark should be preserved after heading conversion"
     );
-    let html = inner_html(&view);
-    assert!(html.contains("<h1>") && html.contains("<strong>"), "DOM: {html}");
+    assert_text_block(&view, "h1", "Hello world");
+    assert_eq!(view.container().query_selector("h1 strong").unwrap().unwrap().text_content().as_deref(), Some("Hello"));
 
     cleanup(&container);
 }
@@ -2506,8 +2507,7 @@ fn typing_in_empty_doc() {
 
     let state = apply_all(&view, &txns);
     assert_eq!(state.doc.child(0).unwrap().text_content(), "X");
-    let html = normalized_html(&view);
-    assert!(html.contains("<p>X</p>"), "DOM: {html}");
+    assert_text_block(&view, "p", "X");
 
     cleanup(&container);
 }
@@ -7124,4 +7124,336 @@ fn unicode_selection_copy_paste_preserves_text_and_marks() {
     assert_eq!(pasted.container().query_selector("strong").unwrap().unwrap().text_content().as_deref(), Some("😀"));
     cleanup(&target);
     cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn text_blocks_choose_direction_independently_of_ui_locale() {
+    for ui_direction in ["ltr", "rtl"] {
+        let container = create_container();
+        container.set_attribute("dir", ui_direction).unwrap();
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("مرحبا Hello")]),
+                ),
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("Hello مرحبا")]),
+                ),
+                Node::element_with_attrs(
+                    NodeType::Heading,
+                    [("level".into(), "2".into())].into(),
+                    Fragment::from(vec![Node::text("عنوان Heading")]),
+                ),
+            ]),
+        );
+        let (view, _) = create_editor(container.clone(), doc);
+        let blocks = view.container().query_selector_all("p, h2").unwrap();
+        for (index, direction) in ["rtl", "ltr", "rtl"].into_iter().enumerate() {
+            let block: web_sys::Element = blocks.item(index as u32).unwrap().unchecked_into();
+            assert_eq!(block.get_attribute("dir").as_deref(), Some("auto"));
+            let style = web_sys::window()
+                .unwrap()
+                .get_computed_style(&block)
+                .unwrap()
+                .unwrap();
+            assert_eq!(style.get_property_value("direction").unwrap(), direction);
+        }
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn explicit_direction_and_physical_alignment_render_without_replacing_text() {
+    use ogrenotes_frontend::editor::commands::{set_alignment, set_text_direction};
+    let container = create_container();
+    let block = Node::element_with_attrs(
+        NodeType::Paragraph,
+        [("blockId".into(), "direction-block".into())].into(),
+        Fragment::from(vec![Node::text_with_marks(
+            "Hello مرحبا😀",
+            vec![Mark::new(MarkType::Bold)],
+        )]),
+    );
+    let (view, _) = create_editor(
+        container.clone(),
+        Node::element_with_content(NodeType::Doc, Fragment::from(vec![block])),
+    );
+    let apply = |txn| {
+        let state = view.state();
+        view.update_state(state.apply(txn));
+    };
+    assert!(set_text_direction("rtl", &view.state(), Some(&apply)));
+    assert!(set_alignment("left", &view.state(), Some(&apply)));
+    let p = view.container().query_selector("p").unwrap().unwrap();
+    assert_eq!(p.get_attribute("dir").as_deref(), Some("rtl"));
+    assert_eq!(
+        p.get_attribute("data-block-id").as_deref(),
+        Some("direction-block")
+    );
+    let style = web_sys::window()
+        .unwrap()
+        .get_computed_style(&p)
+        .unwrap()
+        .unwrap();
+    assert_eq!(style.get_property_value("direction").unwrap(), "rtl");
+    assert_eq!(style.get_property_value("text-align").unwrap(), "left");
+    assert_eq!(
+        p.query_selector("strong")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .as_deref(),
+        Some("Hello مرحبا😀")
+    );
+    assert!(set_text_direction("auto", &view.state(), Some(&apply)));
+    assert_eq!(
+        view.container()
+            .query_selector("p")
+            .unwrap()
+            .unwrap()
+            .get_attribute("dir")
+            .as_deref(),
+        Some("auto")
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn invalid_persisted_direction_uses_content_direction() {
+    let container = create_container();
+    container.set_attribute("dir", "ltr").unwrap();
+    let block = Node::element_with_attrs(
+        NodeType::Paragraph,
+        [("dir".into(), "sideways".into())].into(),
+        Fragment::from(vec![Node::text("مرحبا")]),
+    );
+    let (view, _) = create_editor(
+        container.clone(),
+        Node::element_with_content(NodeType::Doc, Fragment::from(vec![block])),
+    );
+    let p = view.container().query_selector("p").unwrap().unwrap();
+    assert_eq!(p.get_attribute("dir").as_deref(), Some("auto"));
+    assert_eq!(
+        web_sys::window()
+            .unwrap()
+            .get_computed_style(&p)
+            .unwrap()
+            .unwrap()
+            .get_property_value("direction")
+            .unwrap(),
+        "rtl"
+    );
+    cleanup(&container);
+}
+
+fn copy_editor_clipboard(view: &EditorView) -> web_sys::DataTransfer {
+    let clipboard = web_sys::DataTransfer::new().unwrap();
+    let init = web_sys::ClipboardEventInit::new();
+    init.set_bubbles(true);
+    init.set_cancelable(true);
+    init.set_clipboard_data(Some(&clipboard));
+    let event = web_sys::ClipboardEvent::new_with_event_init_dict("copy", &init).unwrap();
+    let desc = js_sys::Object::new();
+    js_sys::Reflect::set(&desc, &"value".into(), &clipboard).unwrap();
+    js_sys::Object::define_property(&event, &"clipboardData".into(), &desc);
+    view.container().dispatch_event(&event).unwrap();
+    assert!(event.default_prevented());
+    clipboard
+}
+
+#[wasm_bindgen_test]
+fn directional_blocks_and_bidi_controls_survive_rich_copy_paste() {
+    let text = "Hello \u{200f}مرحبا\u{200e} \u{2067}RTL😀\u{2069} \u{2066}abc\u{2069} \u{2068}ع\u{2069} \u{202a}LTR\u{202c}";
+    for (node_type, direction) in [(NodeType::Paragraph, "rtl"), (NodeType::Heading, "ltr")] {
+        let source = create_container();
+        let attrs = [
+            ("dir".into(), direction.into()),
+            ("align".into(), "left".into()),
+            ("level".into(), "2".into()),
+        ]
+        .into();
+        let block =
+            Node::element_with_attrs(node_type, attrs, Fragment::from(vec![Node::text(text)]));
+        let (view, _) = create_editor(
+            source.clone(),
+            Node::element_with_content(NodeType::Doc, Fragment::from(vec![block])),
+        );
+        set_selection(&view, 1, 1 + text.chars().count());
+        let clipboard = copy_editor_clipboard(&view);
+        assert_eq!(
+            clipboard.get_data("text/plain").unwrap(),
+            format!("{text}\n")
+        );
+        let html = clipboard.get_data("text/html").unwrap();
+        assert!(html.contains(&format!("dir=\"{direction}\"")), "{html}");
+        assert!(html.contains("text-align: left"), "{html}");
+        let target = create_container();
+        let (pasted, txns) = create_editor(target.clone(), Node::empty_doc());
+        set_cursor(&pasted, 1);
+        dispatch_paste_html(&pasted, &txns, text, &html);
+        let state = pasted.state();
+        let block = state.doc.child(0).unwrap();
+        assert_eq!(block.node_type(), Some(node_type));
+        assert_eq!(block.text_content(), text);
+        assert_eq!(
+            block.attrs().get("dir").map(String::as_str),
+            Some(direction)
+        );
+        assert_eq!(block.attrs().get("align").map(String::as_str), Some("left"));
+        assert_eq!(pasted.container().text_content().as_deref(), Some(text));
+        cleanup(&target);
+        cleanup(&source);
+    }
+}
+
+#[wasm_bindgen_test]
+fn pasted_paragraph_presentation_keeps_destination_identity_and_merge_behavior() {
+    use ogrenotes_frontend::editor::transform::Step;
+    for initial in ["", "Existing ", " "] {
+        let container = create_container();
+        let block = Node::element_with_attrs(
+            NodeType::Paragraph,
+            [
+                ("blockId".into(), "destination".into()),
+                ("dir".into(), "ltr".into()),
+                ("align".into(), "right".into()),
+            ]
+            .into(),
+            Fragment::from(if initial.is_empty() {
+                vec![]
+            } else {
+                vec![Node::text(initial)]
+            }),
+        );
+        let (view, txns) = create_editor(
+            container.clone(),
+            Node::element_with_content(NodeType::Doc, Fragment::from(vec![block])),
+        );
+        set_cursor(&view, 1 + initial.chars().count());
+        dispatch_paste_html(
+            &view,
+            &txns,
+            "مرحبا😀",
+            "<p dir=\"rtl\" style=\"text-align: left\"><strong>مرحبا😀</strong></p>",
+        );
+        let state = view.state();
+        assert_eq!(
+            state.doc.child_count(),
+            1,
+            "paste merges into the destination paragraph"
+        );
+        let block = state.doc.child(0).unwrap();
+        assert_eq!(
+            block.attrs().get("blockId").map(String::as_str),
+            Some("destination")
+        );
+        assert_eq!(block.text_content(), format!("{initial}مرحبا😀"));
+        assert_eq!(
+            block.attrs().get("dir").map(String::as_str),
+            Some(if initial.is_empty() { "rtl" } else { "ltr" })
+        );
+        assert_eq!(
+            block.attrs().get("align").map(String::as_str),
+            Some(if initial.is_empty() { "left" } else { "right" })
+        );
+        assert_eq!(
+            view.container()
+                .query_selector("strong")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("مرحبا😀")
+        );
+        let transactions = txns.borrow();
+        assert_eq!(
+            transactions.len(),
+            1,
+            "attributes and content form one paste transaction"
+        );
+        let attrs: Vec<_> = transactions[0]
+            .steps
+            .iter()
+            .filter(|step| matches!(step, Step::SetAttr { .. }))
+            .collect();
+        assert_eq!(attrs.len(), if initial.is_empty() { 2 } else { 0 });
+        assert!(
+            attrs
+                .iter()
+                .all(|step| matches!(step, Step::SetAttr { pos: 0, .. }))
+        );
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn directional_paste_across_blocks_keeps_existing_presentation() {
+    use ogrenotes_frontend::editor::transform::Step;
+    let container = create_container();
+    let empty = Node::element_with_attrs(
+        NodeType::Paragraph,
+        [
+            ("blockId".into(), "destination".into()),
+            ("dir".into(), "ltr".into()),
+        ]
+        .into(),
+        Fragment::empty(),
+    );
+    let existing = Node::element_with_content(
+        NodeType::Paragraph,
+        Fragment::from(vec![Node::text("Existing")]),
+    );
+    let (view, txns) = create_editor(
+        container.clone(),
+        Node::element_with_content(NodeType::Doc, Fragment::from(vec![empty, existing])),
+    );
+    set_selection(&view, 1, 4);
+    dispatch_paste_html(&view, &txns, "مرحبا😀", "<p dir=\"rtl\">مرحبا😀</p>");
+    let state = view.state();
+    assert_eq!(state.doc.text_content(), "مرحبا😀xisting");
+    assert_eq!(
+        state
+            .doc
+            .child(0)
+            .unwrap()
+            .attrs()
+            .get("dir")
+            .map(String::as_str),
+        Some("ltr")
+    );
+    assert!(
+        !txns
+            .borrow()
+            .iter()
+            .flat_map(|txn| &txn.steps)
+            .any(|step| matches!(step, Step::SetAttr { .. }))
+    );
+    cleanup(&container);
+}
+
+#[wasm_bindgen_test]
+fn bidi_controls_survive_typing_and_plain_clipboard() {
+    let text = "A\u{200e}\u{200f}\u{2066}😀 مرحبا\u{2069}\u{2067}abc\u{2069}\u{2068}ع\u{2069}\u{202a}B\u{202c}";
+    let source = create_container();
+    let (view, txns) = create_editor(source.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_before_input(view.container(), "insertText", Some(text));
+    assert_eq!(apply_all(&view, &txns).doc.text_content(), text);
+    set_selection(&view, 1, 1 + text.chars().count());
+    let clipboard = copy_editor_clipboard(&view);
+    assert_eq!(
+        clipboard.get_data("text/plain").unwrap(),
+        format!("{text}\n")
+    );
+    let target = create_container();
+    let (pasted, txns) = create_editor(target.clone(), Node::empty_doc());
+    set_cursor(&pasted, 1);
+    dispatch_paste(&pasted, &txns, text);
+    assert_eq!(pasted.state().doc.text_content(), text);
+    assert_eq!(pasted.container().text_content().as_deref(), Some(text));
+    cleanup(&target);
+    cleanup(&source);
 }

@@ -1,21 +1,14 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
-//! Phase 5 M-P2 piece 1 — i18n harness scaffolding.
+//! Embedded UI catalogs, locale selection, and browser Intl formatting.
 //!
 //! Loads the active-locale and en-US-fallback bundles at bootstrap
 //! and exposes a `t!()` macro that resolves a message id against
 //! the active bundle, falling back to en-US, falling back to the
 //! key itself. Never panics, never returns empty.
 //!
-//! v1 ships en-US + Arabic (RTL pilot). Both bundles are
-//! `include_str!`-ed at compile time — instant locale switching,
-//! no network round-trip, +~10 KB per locale on the WASM bundle.
-//!
-//! Architecture rationale + library-choice notes in
-//! `design/i18n.md`. The mass string-extraction pass that wires
-//! `t!()` calls through every `view!` macro lands in subsequent
-//! M-P2 pieces; this one establishes the harness with a single
-//! string converted as proof.
+//! Six embedded catalogs provide the UI languages. Regional tags select
+//! the matching language catalog while retaining regional Intl formatting.
 //!
 //! Bootstrap entry point: `i18n::init()`, called once from
 //! `main.rs` before mount. After init, any code (component or
@@ -37,6 +30,33 @@ const ES_MAIN_FTL: &str = include_str!("../locales/es/main.ftl");
 const IT_MAIN_FTL: &str = include_str!("../locales/it/main.ftl");
 const FR_MAIN_FTL: &str = include_str!("../locales/fr/main.ftl");
 const DE_MAIN_FTL: &str = include_str!("../locales/de/main.ftl");
+
+/// Six shipped UI languages, labeled in their own language.
+pub const LOCALE_CHOICES: &[(&str, &str)] = &[
+    ("en-US", "English"),
+    ("de", "Deutsch"),
+    ("es", "Español"),
+    ("fr", "Français"),
+    ("it", "Italiano"),
+    ("ar", "العربية"),
+];
+
+fn supported_locale(locale: &str) -> Option<LanguageIdentifier> {
+    let id = locale.parse::<LanguageIdentifier>().ok()?;
+    LOCALE_CHOICES
+        .iter()
+        .any(|(tag, _)| same_locale(tag, locale))
+        .then_some(id)
+}
+
+/// Map a regional tag to the corresponding option in the language selector.
+pub fn locale_choice(locale: &str) -> &'static str {
+    LOCALE_CHOICES
+        .iter()
+        .find(|(tag, _)| same_locale(tag, locale))
+        .map(|(tag, _)| *tag)
+        .unwrap_or("en-US")
+}
 
 thread_local! {
     /// The active bundle + the en-US fallback bundle. Initialized
@@ -66,16 +86,14 @@ struct LoadedBundles {
     fallback: FluentBundle<FluentResource>,
 }
 
-/// Initialize the i18n harness. Call once from `main.rs` before
-/// mount.
+/// Initialize the embedded catalogs. Call once from `main.rs` before mount.
 ///
-/// `locale` is the BCP-47 tag the harness should use as the active
-/// locale. Pass `"en-US"` to default; pass `"ar"` for the Arabic
-/// pilot. Unknown / unsupported tags fall back to en-US.
+/// `locale` is the active BCP-47 tag. Regional tags use the matching
+/// language catalog; unknown or unsupported tags fall back to en-US.
 ///
-/// Most callers should NOT hardcode a locale — use
-/// [`resolve_locale`] to walk the URL → navigator.language → en-US
-/// precedence chain that `design/i18n.md` specifies.
+/// Most callers should use
+/// [`resolve_locale_with_hint`] to apply URL, server preference, local
+/// preference, browser language, and en-US fallback in precedence order.
 pub fn init(locale: &str) {
     let active_id = parse_or_default(locale);
     let active = build_bundle(&active_id, ftl_for(&active_id));
@@ -92,17 +110,11 @@ pub fn init(locale: &str) {
 
 /// Swap the active locale at runtime. Rebuilds the active bundle;
 /// the en-US fallback stays put. Also writes the choice to
-/// `localStorage["locale"]` so subsequent page loads pick it up
-/// without an `/users/me` round-trip (see [`resolve_locale`]).
+/// `localStorage["ogrenotes.locale"]` so subsequent page loads can use it
+/// (see [`resolve_locale`]).
 ///
-/// Used by the locale switcher UI (M-P2 piece 3). DOES NOT trigger
-/// any Leptos re-render on its own — every component that already
-/// rendered a `t!()` string will keep showing the previous
-/// translation until it re-renders for some other reason. Piece 3
-/// works around this by calling `window.location.reload()` after
-/// `set_locale`, which is honest about the trade-off (a full page
-/// reload is a non-zero cost UX-wise; a future piece can add the
-/// reactive-signal plumbing to avoid it).
+/// This does not trigger a Leptos re-render. The locale selector saves the
+/// server preference and reloads the page after calling `set_locale`.
 pub fn set_locale(locale: &str) {
     let active_id = parse_or_default(locale);
     let active = build_bundle(&active_id, ftl_for(&active_id));
@@ -122,7 +134,7 @@ pub fn set_locale(locale: &str) {
 /// precedence chain documented in `design/i18n.md`:
 ///
 ///   1. URL `?locale=<bcp47>` query parameter
-///   2. `localStorage["locale"]` (warm cache of the user's pick,
+///   2. `localStorage["ogrenotes.locale"]` (cache of the user's pick,
 ///      written by [`set_locale`] when the switcher fires)
 ///   3. `navigator.language` (browser default)
 ///   4. `en-US` (last-resort fallback)
@@ -148,8 +160,9 @@ pub fn resolve_locale() -> String {
 
 /// Like [`resolve_locale`] but folds the server-stored pref (delivered
 /// on the auth response) into tier 2 of the precedence chain, matching
-/// `design/i18n.md`: URL → stored pref → localStorage → navigator →
-/// en-US. Called from `main.rs` once the boot refresh resolves.
+/// URL > server preference > `localStorage["ogrenotes.locale"]` >
+/// `navigator.language` > en-US. Unsupported tags are skipped.
+/// Called from `main.rs` once the boot refresh resolves.
 pub fn resolve_locale_with_hint(server_hint: Option<&str>) -> String {
     pick_locale(
         locale_from_url(),
@@ -159,7 +172,7 @@ pub fn resolve_locale_with_hint(server_hint: Option<&str>) -> String {
     )
 }
 
-/// Pure precedence pick — first non-empty layer wins, else en-US.
+/// First valid, supported locale in precedence order wins, else en-US.
 /// Split out from the web_sys readers so it is unit-testable natively.
 fn pick_locale(
     url: Option<String>,
@@ -170,7 +183,7 @@ fn pick_locale(
     [url, hint, stored, navigator]
         .into_iter()
         .flatten()
-        .find(|s| !s.is_empty())
+        .find_map(|s| supported_locale(&s).map(|id| id.to_string()))
         .unwrap_or_else(|| "en-US".to_string())
 }
 
@@ -269,6 +282,28 @@ mod locale_precedence_tests {
     fn empty_strings_are_skipped_and_default_applies() {
         assert_eq!(pick_locale(s(""), None, None, None), "en-US");
         assert_eq!(pick_locale(s(""), s(""), s(""), s("de")), "de");
+    }
+
+    #[test]
+    fn invalid_and_untranslated_locales_fall_through() {
+        assert_eq!(pick_locale(s("INVALID!"), s("ja"), s("de"), s("fr")), "de");
+        assert_eq!(pick_locale(s("ja"), s("ar-EG"), s("de"), s("fr")), "ar-EG");
+        assert_eq!(pick_locale(None, None, s("INVALID!"), s("fr-CA")), "fr-CA");
+        assert_eq!(pick_locale(s("ja"), None, None, s("ja-JP")), "en-US");
+    }
+
+    #[test]
+    fn regional_tags_keep_their_formatting_region_and_select_the_base_language() {
+        for (regional, option) in [
+            ("de-AT", "de"),
+            ("fr-CA", "fr"),
+            ("ar-EG", "ar"),
+            ("en-GB", "en-US"),
+        ] {
+            assert_eq!(pick_locale(None, None, None, s(regional)), regional);
+            assert_eq!(super::locale_choice(regional), option);
+        }
+        assert_eq!(super::parse_or_default("he").to_string(), "en-US");
     }
 }
 
@@ -386,17 +421,15 @@ fn format_from(
     if !errors.is_empty() {
         // Format errors are usually missing args or wrong variant
         // selectors — debug-log them, don't fail the call.
-        web_sys::console::warn_1(
-            &format!("fluent format errors for {key:?}: {errors:?}").into(),
-        );
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::warn_1(&format!("fluent format errors for {key:?}: {errors:?}").into());
+        return None;
     }
     Some(formatted.into_owned())
 }
 
 fn parse_or_default(locale: &str) -> LanguageIdentifier {
-    locale
-        .parse::<LanguageIdentifier>()
-        .unwrap_or_else(|_| langid!("en-US"))
+    supported_locale(locale).unwrap_or_else(|| langid!("en-US"))
 }
 
 fn ftl_for(id: &LanguageIdentifier) -> &'static str {
@@ -419,18 +452,13 @@ fn ftl_for(id: &LanguageIdentifier) -> &'static str {
 }
 
 fn build_bundle(id: &LanguageIdentifier, ftl: &str) -> FluentBundle<FluentResource> {
-    let resource = FluentResource::try_new(ftl.to_string())
-        .unwrap_or_else(|(r, errs)| {
-            web_sys::console::error_1(
-                &format!(
-                    "fluent: {} ftl has {} parse errors; loading partial",
-                    id,
-                    errs.len()
-                )
-                .into(),
-            );
-            r
-        });
+    let resource = FluentResource::try_new(ftl.to_string()).unwrap_or_else(|(r, errs)| {
+        log_catalog_error(&format!(
+            "fluent: {id} ftl has {} parse errors; loading partial",
+            errs.len()
+        ));
+        r
+    });
     let mut bundle = FluentBundle::new(vec![id.clone()]);
     // Disable Unicode bidi isolation marks (U+2068 / U+2069) around
     // interpolated values. They render as visible boxes in browsers
@@ -438,12 +466,22 @@ fn build_bundle(id: &LanguageIdentifier, ftl: &str) -> FluentBundle<FluentResour
     // in v2 when we add proper bidi handling for mixed-direction
     // content per `design/i18n.md`'s bidi note.
     bundle.set_use_isolating(false);
+    #[cfg(target_arch = "wasm32")]
+    bundle.set_formatter(Some(|value, _| match value {
+        fluent_bundle::FluentValue::Number(number) => Some(format_fluent_number(number)),
+        _ => None,
+    }));
     if let Err(errs) = bundle.add_resource(resource) {
-        web_sys::console::error_1(
-            &format!("fluent: bundle errors for {}: {:?}", id, errs).into(),
-        );
+        log_catalog_error(&format!("fluent: bundle errors for {id}: {errs:?}"));
     }
     bundle
+}
+
+fn log_catalog_error(message: &str) {
+    #[cfg(target_arch = "wasm32")]
+    web_sys::console::error_1(&message.into());
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("{message}");
 }
 
 /// Translate a message id. Wraps `i18n::translate` with macro
@@ -489,8 +527,8 @@ macro_rules! t {
 extern "C" {
     #[wasm_bindgen(js_namespace = Intl, js_name = NumberFormat)]
     type IntlNumberFormat;
-    #[wasm_bindgen(constructor, js_namespace = Intl, js_class = "NumberFormat")]
-    fn new(locale: &str) -> IntlNumberFormat;
+    #[wasm_bindgen(constructor, js_namespace = Intl, js_class = "NumberFormat", catch)]
+    fn new(locale: &str, options: &Object) -> Result<IntlNumberFormat, JsValue>;
     #[wasm_bindgen(method, structural)]
     fn format(this: &IntlNumberFormat, value: f64) -> String;
 }
@@ -594,9 +632,69 @@ fn date_style_options(style: DateStyle) -> Object {
 /// digit shapes.
 /// en-US: "1,234,567".  de: "1.234.567".  ar: "١٬٢٣٤٬٥٦٧".
 pub fn format_number(value: f64) -> String {
+    format_number_with_precision(value, 3)
+}
+
+/// Locale-aware numbers with a surface-specific fractional precision limit.
+/// Unsupported precision falls back to the numeric string without panicking.
+pub fn format_number_with_precision(value: f64, max_fractional_digits: u8) -> String {
     let locale = current_locale_or_default();
-    let fmt = IntlNumberFormat::new(&locale);
-    fmt.format(value)
+    let opts = Object::new();
+    let _ = Reflect::set(
+        &opts,
+        &"maximumFractionDigits".into(),
+        &JsValue::from(max_fractional_digits),
+    );
+    IntlNumberFormat::new(&locale, &opts)
+        .map_or_else(|_| value.to_string(), |fmt| fmt.format(value))
+}
+
+/// Preserve Fluent's number options and let Intl validate their combinations.
+/// Invalid options use the locale's default number format instead.
+#[cfg(target_arch = "wasm32")]
+fn format_fluent_number(number: &fluent_bundle::types::FluentNumber) -> String {
+    use fluent_bundle::types::{FluentNumberCurrencyDisplayStyle, FluentNumberStyle};
+
+    let opts = Object::new();
+    let set = |key: &str, value: JsValue| {
+        let _ = Reflect::set(&opts, &JsValue::from_str(key), &value);
+    };
+    let options = &number.options;
+    set(
+        "style",
+        JsValue::from_str(match options.style {
+            FluentNumberStyle::Decimal => "decimal",
+            FluentNumberStyle::Currency => "currency",
+            FluentNumberStyle::Percent => "percent",
+        }),
+    );
+    if let Some(currency) = options.currency.as_deref() {
+        set("currency", JsValue::from_str(currency));
+    }
+    set(
+        "currencyDisplay",
+        JsValue::from_str(match options.currency_display {
+            FluentNumberCurrencyDisplayStyle::Symbol => "symbol",
+            FluentNumberCurrencyDisplayStyle::Code => "code",
+            FluentNumberCurrencyDisplayStyle::Name => "name",
+        }),
+    );
+    set("useGrouping", JsValue::from_bool(options.use_grouping));
+    for (key, digits) in [
+        ("minimumIntegerDigits", options.minimum_integer_digits),
+        ("minimumFractionDigits", options.minimum_fraction_digits),
+        ("maximumFractionDigits", options.maximum_fraction_digits),
+        ("minimumSignificantDigits", options.minimum_significant_digits),
+        ("maximumSignificantDigits", options.maximum_significant_digits),
+    ] {
+        if let Some(digits) = digits {
+            set(key, JsValue::from_f64(digits as f64));
+        }
+    }
+    let locale = current_locale_or_default();
+    IntlNumberFormat::new(&locale, &opts)
+        .or_else(|_| IntlNumberFormat::new(&locale, &Object::new()))
+        .map_or_else(|_| number.value.to_string(), |fmt| fmt.format(number.value))
 }
 
 /// Format a microsecond timestamp as relative time when recent
@@ -683,3 +781,6 @@ fn current_locale_or_default() -> String {
 pub fn active_locale() -> String {
     current_locale_or_default()
 }
+
+#[cfg(test)]
+mod catalog_tests;

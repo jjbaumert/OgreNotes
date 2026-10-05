@@ -35,7 +35,7 @@
 .deck-view__strip {
   grid-area: strip;
   overflow-y: auto;
-  border-right: 1px solid var(--color-border);
+  border-inline-end: 1px solid var(--color-border);
   background: var(--color-surface);
   padding: var(--space-sm);
   display: flex;
@@ -55,7 +55,7 @@
 .deck-view__pane {
   grid-area: pane;
   overflow-y: auto;
-  border-left: 1px solid var(--color-border);
+  border-inline-start: 1px solid var(--color-border);
   background: var(--color-surface);
   padding: var(--space-md);
 }
@@ -476,7 +476,7 @@
 .deck-slide-thumb__actions {
   position: absolute;
   top: 4px;
-  right: 4px;
+  inset-inline-end: 4px;
   display: flex;
   gap: 2px;
   opacity: 0;
@@ -531,8 +531,8 @@
   position: absolute;
   z-index: 20;
   top: 100%;
-  left: 0;
-  right: 0;
+  inset-inline-start: 0;
+  inset-inline-end: 0;
   margin-top: 4px;
   display: flex;
   flex-direction: column;
@@ -547,7 +547,7 @@
   padding: var(--space-sm);
   border: none;
   background: transparent;
-  text-align: left;
+  text-align: start;
   cursor: pointer;
   color: var(--color-text);
 }
@@ -575,7 +575,7 @@
 .deck-frame__comment-btn {
   position: absolute;
   top: 2px;
-  right: 2px;
+  inset-inline-end: 2px;
   width: 20px;
   height: 20px;
   line-height: 1;
@@ -641,7 +641,7 @@
 
 .deck-present__counter {
   position: fixed;
-  right: var(--space-md);
+  inset-inline-end: var(--space-md);
   bottom: var(--space-sm);
   color: rgba(255, 255, 255, 0.6);
   font-size: 0.85rem;
@@ -699,7 +699,7 @@
 
 .deck-present__follow {
   position: fixed;
-  left: var(--space-md);
+  inset-inline-start: var(--space-md);
   bottom: var(--space-md);
   display: flex;
   gap: var(--space-sm);

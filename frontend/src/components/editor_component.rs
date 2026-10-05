@@ -345,6 +345,13 @@ fn drag_on_pointer_move(ev: &web_sys::PointerEvent) {
                     .set_attribute("style", &format!("{base_style} height: {new_h}px;"));
             }
             (DragMode::Resize, DragKind::AllDay) => {
+                // The resize handle sits at inline-end. Its physical motion
+                // grows the event in the opposite direction in RTL layouts.
+                let rtl = web_sys::window()
+                    .and_then(|w| w.get_computed_style(&state.element).ok().flatten())
+                    .and_then(|style| style.get_property_value("direction").ok())
+                    .is_some_and(|direction| direction == "rtl");
+                let dx = if rtl { -dx } else { dx };
                 let _ = state.element.set_attribute(
                     "style",
                     &format!("width: calc(100% + {dx}px);"),
@@ -2919,6 +2926,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             ToolbarCommand::ToggleBlockquote => { commands::toggle_blockquote(&state, Some(&dispatch_fn)); }
             ToolbarCommand::SetCodeBlock => { commands::set_code_block(&state, Some(&dispatch_fn)); }
             ToolbarCommand::SetAlignment(ref align) => { commands::set_alignment(align, &state, Some(&dispatch_fn)); }
+            ToolbarCommand::SetTextDirection(ref dir) => { commands::set_text_direction(dir, &state, Some(&dispatch_fn)); }
             ToolbarCommand::ClearFormatting => { commands::clear_formatting(&state, Some(&dispatch_fn)); }
             ToolbarCommand::SelectRange { from, to } => { commands::select_range(from, to, &state, Some(&dispatch_fn)); }
             ToolbarCommand::ReplaceRange { from, to, ref text } => { commands::replace_range(from, to, text, &state, Some(&dispatch_fn)); }

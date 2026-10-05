@@ -93,9 +93,9 @@ fn render_block(block: RichBlock) -> AnyView {
         "image" => {
             let alt = block.attrs.get("alt").cloned().unwrap_or_default();
             let label = if alt.is_empty() {
-                "[image]".to_string()
+                crate::t!("diff-image-placeholder")
             } else {
-                format!("[image: {alt}]")
+                crate::t!("diff-image-description", alt = alt)
             };
             view! { <span class="diff-image-placeholder">{label}</span> }.into_any()
         }

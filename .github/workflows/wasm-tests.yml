@@ -283,6 +283,10 @@ jobs:
         working-directory: frontend
         run: python3 ../scripts/with-test-cleanup.py -- wasm-pack test --headless --firefox -- --test collab_semantics
 
+      - name: Internationalization browser formatting tests
+        working-directory: frontend
+        run: python3 ../scripts/with-test-cleanup.py -- wasm-pack test --headless --firefox -- --test i18n_browser
+
       - name: Verify Firefox cleanup after interruption
         run: python3 scripts/test_browser_cleanup.py firefox
 

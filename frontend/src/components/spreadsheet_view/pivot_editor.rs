@@ -93,7 +93,7 @@ fn infer_field_type(eng: &SpreadsheetEngine, col: usize, src_top_row: usize, src
 
 fn header_label(eng: &SpreadsheetEngine, col: usize, src_top_row: usize) -> String {
     let label = eng.get_display((col, src_top_row));
-    if label.is_empty() { format!("Column {}", col + 1) } else { label }
+    if label.is_empty() { crate::t!("ss-pivot-default-column", number = (col + 1) as i64) } else { label }
 }
 
 /// Distinct displayed values in `col` between rows `[src_top_row + 1,
@@ -1191,16 +1191,16 @@ fn summarize_fn_options(current: SummarizeFn) -> impl IntoView {
 
 fn filter_cond_label(c: &PivotFilterCondition) -> String {
     match c {
-        PivotFilterCondition::ValueIn(v) => format!("in [{}]", v.join(", ")),
+        PivotFilterCondition::ValueIn(v) => crate::t!("ss-pivot-condition-in", values = v.join(", ")),
         PivotFilterCondition::NumberGreater(n) => format!("> {n}"),
         PivotFilterCondition::NumberLess(n) => format!("< {n}"),
         PivotFilterCondition::NumberEqual(n) => format!("= {n}"),
         PivotFilterCondition::NumberBetween(lo, hi) => format!("{lo}–{hi}"),
-        PivotFilterCondition::TextContains(s) => format!("contains \"{s}\""),
+        PivotFilterCondition::TextContains(s) => crate::t!("ss-pivot-condition-contains", text = s.as_str()),
         PivotFilterCondition::TextEquals(s) => format!("= \"{s}\""),
-        PivotFilterCondition::TextStartsWith(s) => format!("starts \"{s}\""),
-        PivotFilterCondition::Empty => "empty".to_string(),
-        PivotFilterCondition::NotEmpty => "not empty".to_string(),
+        PivotFilterCondition::TextStartsWith(s) => crate::t!("ss-pivot-condition-starts", text = s.as_str()),
+        PivotFilterCondition::Empty => crate::t!("ss-pivot-condition-empty"),
+        PivotFilterCondition::NotEmpty => crate::t!("ss-pivot-condition-not-empty"),
     }
 }
 

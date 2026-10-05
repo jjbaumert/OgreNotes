@@ -1196,6 +1196,13 @@ fn cell_rc_from_mouse_event(e: &web_sys::MouseEvent) -> Option<(usize, usize)> {
     Some((r, c))
 }
 
+fn rtl_grid() -> bool {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+        .is_some_and(|el| el.get_attribute("dir").as_deref() == Some("rtl"))
+}
+
 /// Inject the spreadsheet stylesheet on demand (#30). It is served from
 /// the dist root (`/spreadsheet.css`, a Trunk `copy-file` rather than a
 /// bundled `rel="css"`) so it is *not* fetched on document-only page
@@ -2249,12 +2256,13 @@ pub fn SpreadsheetView(
             let x: f64 = 40.0 + (0..c).map(col_px).sum::<f64>();
             let w = col_px(c);
             let frozen_w: f64 = (0..frozen_c_n).map(col_px).sum();
-            let sl = el.scroll_left() as f64;
+            let sign = if rtl_grid() { -1.0 } else { 1.0 };
+            let sl = sign * el.scroll_left() as f64;
             let cw = el.client_width() as f64;
             if x < sl + 40.0 + frozen_w {
-                el.set_scroll_left((x - 40.0 - frozen_w).max(0.0) as i32);
+                el.set_scroll_left((sign * (x - 40.0 - frozen_w).max(0.0)) as i32);
             } else if x + w > sl + cw {
-                el.set_scroll_left(((x + w) - cw).ceil() as i32);
+                el.set_scroll_left((sign * ((x + w) - cw).ceil()) as i32);
             }
         }
     };
@@ -2547,8 +2555,8 @@ pub fn SpreadsheetView(
                 let (dr, dc) = match e.key().as_str() {
                     "ArrowUp" => (-1, 0),
                     "ArrowDown" => (1, 0),
-                    "ArrowLeft" => (0, -1),
-                    _ => (0, 1),
+                    "ArrowLeft" => (0, if rtl_grid() { 1 } else { -1 }),
+                    _ => (0, if rtl_grid() { -1 } else { 1 }),
                 };
                 let ar = active_row.get_untracked();
                 let ac = active_col.get_untracked();
@@ -2562,8 +2570,8 @@ pub fn SpreadsheetView(
             }
             "ArrowUp" => { e.prevent_default(); move_active(-1, 0, shift); }
             "ArrowDown" => { e.prevent_default(); move_active(1, 0, shift); }
-            "ArrowLeft" => { e.prevent_default(); move_active(0, -1, shift); }
-            "ArrowRight" => { e.prevent_default(); move_active(0, 1, shift); }
+            "ArrowLeft" => { e.prevent_default(); move_active(0, if rtl_grid() { 1 } else { -1 }, shift); }
+            "ArrowRight" => { e.prevent_default(); move_active(0, if rtl_grid() { -1 } else { 1 }, shift); }
             // #57: Ctrl+Home → A1, Home → first column of the row.
             "Home" if ctrl => {
                 e.prevent_default();
@@ -3509,7 +3517,8 @@ pub fn SpreadsheetView(
             }
             on:mousemove=move |e: web_sys::MouseEvent| {
                 if let Some(col) = resize_col.get_untracked() {
-                    let dx = e.client_x() as f64 - resize_start_x.get_untracked();
+                    let dx = (e.client_x() as f64 - resize_start_x.get_untracked())
+                        * if rtl_grid() { -1.0 } else { 1.0 };
                     let new_w = (resize_start_w.get_untracked() + dx).max(30.0);
                     set_col_widths.update(|widths| {
                         if col < widths.len() { widths[col] = new_w; }
@@ -4270,11 +4279,7 @@ pub fn SpreadsheetView(
                                                     if let Some(info) = thread_preview.clone() {
                                                         let first = info.first_message.unwrap_or_else(
                                                             || crate::t!("ss-comment-preview-empty"));
-                                                        let replies = match info.reply_count {
-                                                            0 => crate::t!("ss-comment-replies-none"),
-                                                            1 => crate::t!("ss-comment-replies-one"),
-                                                            n => crate::t!("ss-comment-replies-many", count = n.to_string()),
-                                                        };
+                                                        let replies = crate::t!("ss-comment-replies", count = info.reply_count as i64);
                                                         view! {
                                                             <div class="ss-comment-popup">
                                                                 <div class="ss-comment-popup-msg">{first}</div>
@@ -4328,7 +4333,7 @@ pub fn SpreadsheetView(
                                                             offset += widths.get(prev).copied().unwrap_or(80.0);
                                                         }
                                                     }
-                                                    cell_css.push_str(&format!("left:{offset}px;"));
+                                                    cell_css.push_str(&format!("inset-inline-start:{offset}px;"));
                                                 }
                                                 let is_editing_this = is_cursor && editing_now && !is_checkbox;
                                                 let in_cut = cut_source.get().map_or(false, |(c1, r1, c2, r2)| {
@@ -4597,8 +4602,8 @@ pub fn SpreadsheetView(
                                                                                     let (dr, dc): (isize, isize) = match e.key().as_str() {
                                                                                         "ArrowUp" => (-1, 0),
                                                                                         "ArrowDown" => (1, 0),
-                                                                                        "ArrowLeft" => (0, -1),
-                                                                                        "ArrowRight" => (0, 1),
+                                                                                        "ArrowLeft" => (0, if rtl_grid() { 1 } else { -1 }),
+                                                                                        "ArrowRight" => (0, if rtl_grid() { -1 } else { 1 }),
                                                                                         _ => (0, 0),
                                                                                     };
                                                                                     let max_cols = grid_cols.get_untracked();
@@ -4659,8 +4664,8 @@ pub fn SpreadsheetView(
                                                                                     match e.key().as_str() {
                                                                                         "ArrowUp" => move_active(-1, 0, false),
                                                                                         "ArrowDown" => move_active(1, 0, false),
-                                                                                        "ArrowLeft" => move_active(0, -1, false),
-                                                                                        "ArrowRight" => move_active(0, 1, false),
+                                                                                        "ArrowLeft" => move_active(0, if rtl_grid() { 1 } else { -1 }, false),
+                                                                                        "ArrowRight" => move_active(0, if rtl_grid() { -1 } else { 1 }, false),
                                                                                         _ => {}
                                                                                     }
                                                                                 }
@@ -4832,23 +4837,11 @@ pub fn SpreadsheetView(
                         }
                     }
                 }
-                // Format numeric stats with at most 4 fractional digits,
-                // trimming trailing zeros so integers render as "5"
-                // not "5.0000". Locale-independent — keeps the bar
-                // compact and predictable for screenshots/tests.
-                let fmt = |n: f64| -> String {
-                    if n == n.trunc() && n.abs() < 1e15 {
-                        format!("{}", n as i64)
-                    } else {
-                        let s = format!("{:.4}", n);
-                        let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
-                        s
-                    }
-                };
+                let fmt = |n: f64| crate::i18n::format_number_with_precision(n, 4);
                 let avg = if numeric > 0 { Some(sum / numeric as f64) } else { None };
                 view! {
                     <div class="ss-status-bar">
-                        <span class="ss-status-stat">{crate::t!("ss-status-count", value = count.to_string())}</span>
+                        <span class="ss-status-stat">{crate::t!("ss-status-count", value = crate::i18n::format_number(count as f64))}</span>
                         {(numeric > 0).then(|| view! {
                             <>
                                 <span class="ss-status-sep">"|"</span>

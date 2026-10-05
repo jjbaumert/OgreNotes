@@ -596,8 +596,8 @@ pub fn Sidebar(
 
                 <button
                     class="sidebar-icon-btn"
-                    title="Chats"
-                    aria-label="Chats"
+                    title=crate::t!("sidebar-chats")
+                    aria-label=crate::t!("sidebar-chats")
                     // Click expands the sidebar so the ChatPanel becomes
                     // visible; re-collapse via the ← button in the header.
                     // Above the rail band this persists the expand (the manual
@@ -621,8 +621,8 @@ pub fn Sidebar(
 
                 <button
                     class="sidebar-icon-btn"
-                    title="Profile"
-                    aria-label="Profile"
+                    title=crate::t!("settings-tab-profile")
+                    aria-label=crate::t!("settings-tab-profile")
                     // #152: client-side nav straight to the (in-shell) settings
                     // route — no full reload, and skips the /profile redirect
                     // bounce (which is a flat, shell-less route).

@@ -145,7 +145,7 @@ pub fn HistoryViewer(
                     }
                 }
                 Err(e) => {
-                    set_restore_error.set(Some(format!("Restore failed: {e}")));
+                    set_restore_error.set(Some(crate::t!("history-error-restore", error = e.to_string())));
                 }
             }
             set_restoring.set(false);

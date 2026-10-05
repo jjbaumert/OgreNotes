@@ -292,7 +292,7 @@ fn render_modal(
                         <span>{crate::t!("kanban-modal-assignee-label")}</span>
                         <input
                             type="text"
-                            placeholder="username"
+                            placeholder=crate::t!("kanban-assignee-placeholder")
                             maxlength="120"
                             prop:value=move || assignee_name.get()
                             on:input=move |e| {

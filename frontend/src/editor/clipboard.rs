@@ -514,6 +514,15 @@ fn convert_block_element(
             };
             let mut attrs = std::collections::HashMap::new();
             attrs.insert("level".to_string(), level.to_string());
+            if let Some(direction) = el
+                .get_attribute("dir")
+                .filter(|d| matches!(d.as_str(), "auto" | "ltr" | "rtl"))
+            {
+                attrs.insert("dir".to_string(), direction);
+            }
+            if let Some(align) = extract_cell_align(el) {
+                attrs.insert("align".to_string(), align);
+            }
             let children = walk_block_children(child, true);
             out.push(Node::element_with_attrs(
                 NodeType::Heading, attrs, Fragment::from(children),
@@ -566,7 +575,23 @@ fn convert_block_element(
         _ => {
             // Paragraph, Blockquote, etc.
             let children = walk_block_children(child, true);
-            out.push(Node::element_with_content(node_type, Fragment::from(children)));
+            let mut attrs = std::collections::HashMap::new();
+            if node_type == NodeType::Paragraph {
+                if let Some(direction) = el
+                    .get_attribute("dir")
+                    .filter(|d| matches!(d.as_str(), "auto" | "ltr" | "rtl"))
+                {
+                    attrs.insert("dir".to_string(), direction);
+                }
+                if let Some(align) = extract_cell_align(el) {
+                    attrs.insert("align".to_string(), align);
+                }
+            }
+            out.push(Node::element_with_attrs(
+                node_type,
+                attrs,
+                Fragment::from(children),
+            ));
         }
     }
 }
@@ -1306,12 +1331,33 @@ fn close_mark_tag(mark: &Mark) -> String {
     }
 }
 
+/// Preserve text-block presentation while restricting HTML attributes to safe values.
+fn text_block_html_attrs(attrs: &std::collections::HashMap<String, String>) -> String {
+    let mut html = String::new();
+    if let Some(dir) = attrs
+        .get("dir")
+        .filter(|d| matches!(d.as_str(), "auto" | "ltr" | "rtl"))
+    {
+        html.push_str(&format!(" dir=\"{dir}\""));
+    }
+    if let Some(align) = attrs
+        .get("align")
+        .filter(|a| matches!(a.as_str(), "left" | "center" | "right"))
+    {
+        html.push_str(&format!(" style=\"text-align: {align}\""));
+    }
+    html
+}
+
 fn element_tags(
     nt: NodeType,
     attrs: &std::collections::HashMap<String, String>,
 ) -> (String, Option<String>) {
     match nt {
-        NodeType::Paragraph => ("<p>".into(), Some("</p>".into())),
+        NodeType::Paragraph => (
+            format!("<p{}>", text_block_html_attrs(attrs)),
+            Some("</p>".into()),
+        ),
         NodeType::Heading => {
             let level = attrs.get("level").map(|s| s.as_str()).unwrap_or("1");
             let tag = match level {
@@ -1319,7 +1365,10 @@ fn element_tags(
                 "3" => "h3",
                 _ => "h1",
             };
-            (format!("<{tag}>"), Some(format!("</{tag}>")))
+            (
+                format!("<{tag}{}>", text_block_html_attrs(attrs)),
+                Some(format!("</{tag}>")),
+            )
         }
         NodeType::BulletList => ("<ul>".into(), Some("</ul>".into())),
         NodeType::OrderedList => ("<ol>".into(), Some("</ol>".into())),
@@ -2131,6 +2180,55 @@ mod tests {
             0,
         );
         assert_eq!(serialize_to_html(&slice), "<p>Hello</p>");
+    }
+
+    #[test]
+    fn serialize_directional_paragraph_preserves_base_direction() {
+        let paragraph = Node::element_with_attrs(
+            NodeType::Paragraph,
+            [("dir".to_string(), "rtl".to_string())].into(),
+            Fragment::from(vec![Node::text("مرحبا Hello")]),
+        );
+        let slice = Slice::new(Fragment::from(vec![paragraph]), 0, 0);
+        assert_eq!(serialize_to_html(&slice), "<p dir=\"rtl\">مرحبا Hello</p>");
+    }
+
+    #[test]
+    fn serialize_direction_and_alignment_restricts_attribute_values() {
+        for node_type in [NodeType::Paragraph, NodeType::Heading] {
+            let block = Node::element_with_attrs(
+                node_type,
+                [
+                    ("dir".into(), "rtl".into()),
+                    ("align".into(), "left".into()),
+                    ("level".into(), "2".into()),
+                ]
+                .into(),
+                Fragment::from(vec![Node::text("A\u{200f}\u{2067}مرحبا😀\u{2069}\u{200e}")]),
+            );
+            let slice = Slice::new(Fragment::from(vec![block]), 0, 0);
+            let tag = if node_type == NodeType::Heading {
+                "h2"
+            } else {
+                "p"
+            };
+            assert_eq!(
+                serialize_to_html(&slice),
+                format!(
+                    "<{tag} dir=\"rtl\" style=\"text-align: left\">A\u{200f}\u{2067}مرحبا😀\u{2069}\u{200e}</{tag}>"
+                )
+            );
+            assert_eq!(
+                serialize_to_text(&slice),
+                "A\u{200f}\u{2067}مرحبا😀\u{2069}\u{200e}\n"
+            );
+        }
+        let unsafe_attrs = [
+            ("dir".into(), "rtl\" onclick=\"bad".into()),
+            ("align".into(), "left; color: red".into()),
+        ]
+        .into();
+        assert!(text_block_html_attrs(&unsafe_attrs).is_empty());
     }
 
     #[test]

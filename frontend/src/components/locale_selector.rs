@@ -2,7 +2,7 @@
 
 //! Phase 5 M-P2 piece 3 — locale switcher in the sidebar footer.
 //!
-//! Lets a user pick between the shipped locales (en-US, ar in v1)
+//! Lets a user pick English, German, Spanish, French, Italian, or Arabic
 //! and persists the choice both client-side (localStorage, via
 //! `i18n::set_locale`) and server-side (`PUT /users/me/prefs`).
 //!
@@ -22,22 +22,7 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::api::client;
-use crate::i18n;
-
-/// Locale catalog: the shipping locales. Adding a new locale here
-/// + dropping a `frontend/locales/<bcp47>/main.ftl` file + wiring
-/// the language subtag into `i18n::ftl_for` is the full extension
-/// surface. Labels are rendered in the native language so users
-/// can self-identify without already understanding the current UI
-/// locale.
-const LOCALE_CHOICES: &[(&str, &str)] = &[
-    ("en-US", "English"),
-    ("de", "Deutsch"),
-    ("es", "Español"),
-    ("fr", "Français"),
-    ("it", "Italiano"),
-    ("ar", "العربية"),
-];
+use crate::i18n::{self, LOCALE_CHOICES};
 
 /// Compact locale switcher for the sidebar footer. Renders a
 /// native `<select>` (zero CSS overhead vs a custom dropdown,
@@ -50,7 +35,7 @@ pub fn LocaleSelector() -> impl IntoView {
     // folded in at boot) rather than re-resolving precedence — on a
     // fresh device with a stored server pref, `resolve_locale()`
     // would disagree with what's actually rendered.
-    let initial = i18n::active_locale();
+    let initial = i18n::locale_choice(&i18n::active_locale()).to_string();
     let (current, set_current) = signal(initial);
 
     let on_change = move |ev: web_sys::Event| {
@@ -78,6 +63,18 @@ pub fn LocaleSelector() -> impl IntoView {
                 );
             }
             i18n::set_locale(&picked);
+            // Preserve the explicit choice across reloads, including when
+            // the URL had an override or saving the server preference failed.
+            if let Some(window) = web_sys::window() {
+                if let Ok(href) = window.location().href() {
+                    if let Ok(url) = web_sys::Url::new(&href) {
+                        url.search_params().set("locale", &picked);
+                        if let Ok(history) = window.history() {
+                            let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&url.href()));
+                        }
+                    }
+                }
+            }
             reload_page();
         });
     };
