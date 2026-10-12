@@ -144,7 +144,8 @@ impl EvalCatalog {
 // ─── Recall scoring ────────────────────────────────────────────
 
 /// Recall@k: fraction of expected docs that appear in the
-/// retrieved top-k.
+/// retrieved top-k. Both inputs are sets: repeated IDs cannot add credit
+/// or increase the denominator.
 ///
 ///   |retrieved ∩ expected| / |expected|
 ///
@@ -157,10 +158,10 @@ pub fn recall_at_k(retrieved: &[String], expected: &[String]) -> f64 {
     if expected.is_empty() {
         return if retrieved.is_empty() { 1.0 } else { 0.0 };
     }
-    let exp: std::collections::HashSet<&str> =
-        expected.iter().map(|s| s.as_str()).collect();
-    let hit = retrieved.iter().filter(|r| exp.contains(r.as_str())).count();
-    hit as f64 / expected.len() as f64
+    let exp: std::collections::HashSet<&str> = expected.iter().map(|s| s.as_str()).collect();
+    let retrieved: std::collections::HashSet<&str> = retrieved.iter().map(|s| s.as_str()).collect();
+    let hit = retrieved.intersection(&exp).count();
+    hit as f64 / exp.len() as f64
 }
 
 // ─── Seed state — bridges `seed` to `run` ──────────────────────

@@ -296,6 +296,17 @@ async fn run_eval(
         .map(|(k, v)| (v.clone(), k.clone()))
         .collect();
 
+    // Score in the server-ID namespace. An unknown returned server ID must
+    // never accidentally count as a hit merely because it equals a catalog ID.
+    for q in &catalog.queries {
+        for id in &q.expected_doc_ids {
+            if !state.doc_ids.contains_key(id) {
+                return Err(anyhow!(
+                    "seed state is missing catalog id {id:?}; re-seed first"
+                ));
+            }
+        }
+    }
     let client = Client::builder().build()?;
     let token = dev_login(&client, &base_url, &state.email).await?;
 
@@ -320,6 +331,8 @@ async fn run_eval(
     let mut total_search_recall = 0.0;
     let mut total_ask_recall = 0.0;
     let mut ask_attempted = 0usize;
+    let mut search_failures = 0usize;
+    let mut ask_failures = 0usize;
     // p95 buckets — small enough to sort at the end rather than
     // running a streaming p95 estimator.
     let mut search_latencies: Vec<u64> = Vec::with_capacity(catalog.queries.len());
@@ -328,20 +341,30 @@ async fn run_eval(
     let total = catalog.queries.len();
 
     for q in &catalog.queries {
+        let expected: Vec<String> = q
+            .expected_doc_ids
+            .iter()
+            .map(|id| state.doc_ids[id].clone())
+            .collect();
+        let display_ids = |ids: Vec<String>| {
+            ids.into_iter()
+                .map(|id| server_to_catalog.get(&id).cloned().unwrap_or(id))
+                .collect::<Vec<_>>()
+        };
         let search_start = std::time::Instant::now();
         let search_hits =
             run_search(&client, &base_url, &token, &q.text).await;
         let search_latency_ms = search_start.elapsed().as_millis() as u64;
-        let (search_top10, search_err) = match search_hits {
-            Ok(v) => (
-                v.into_iter()
-                    .filter_map(|id| server_to_catalog.get(&id).cloned())
-                    .collect::<Vec<_>>(),
-                None,
-            ),
-            Err(e) => (Vec::new(), Some(format!("search: {e}"))),
+        let (search_top10, search_recall, search_err) = match search_hits {
+            Ok(ids) => {
+                let recall = recall_at_k(&ids, &expected);
+                (display_ids(ids), recall, None)
+            }
+            Err(e) => {
+                search_failures += 1;
+                (Vec::new(), 0.0, Some(format!("search: {e}")))
+            }
         };
-        let search_recall = recall_at_k(&search_top10, &q.expected_doc_ids);
         total_search_recall += search_recall;
         if search_err.is_none() {
             search_latencies.push(search_latency_ms);
@@ -359,11 +382,8 @@ async fn run_eval(
                     (Vec::new(), 0.0, lat, 0, 0, 0.0, true, None)
                 }
                 AskOutcome::Ok(ok) => {
-                    let mapped: Vec<String> = ok.sources
-                        .into_iter()
-                        .filter_map(|id| server_to_catalog.get(&id).cloned())
-                        .collect();
-                    let r = recall_at_k(&mapped, &q.expected_doc_ids);
+                    let r = recall_at_k(&ok.sources, &expected);
+                    let mapped = display_ids(ok.sources);
                     let cost = claude_cost_usd(ok.input_tokens, ok.output_tokens);
                     total_ask_recall += r;
                     total_ask_cost_usd += cost;
@@ -372,6 +392,8 @@ async fn run_eval(
                     (mapped, r, lat, ok.input_tokens, ok.output_tokens, cost, false, None)
                 }
                 AskOutcome::Err(msg) => {
+                    ask_attempted += 1;
+                    ask_failures += 1;
                     (Vec::new(), 0.0, lat, 0, 0, 0.0, false, Some(format!("ask: {msg}")))
                 }
             }
@@ -391,7 +413,11 @@ async fn run_eval(
             ask_output.to_string(),
             format!("{ask_cost:.5}"),
             ask_skipped.to_string(),
-            search_err.or(ask_err).unwrap_or_default(),
+            [search_err, ask_err]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; "),
         ])?;
 
         println!(
@@ -411,6 +437,8 @@ async fn run_eval(
     println!();
     println!("Summary");
     println!("  queries:                {total}");
+    println!("  search failures:        {search_failures}");
+    println!("  ask failures:           {ask_failures}");
     println!(
         "  mean search recall@10:  {:.3}",
         total_search_recall / total as f64,
@@ -570,11 +598,7 @@ async fn run_ask(
             }
         }
     }
-    AskOutcome::Ok(AskOk {
-        sources,
-        input_tokens,
-        output_tokens,
-    })
+    AskOutcome::Err("stream ended before the done event".into())
 }
 
 enum SseFrame {
