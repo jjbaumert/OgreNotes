@@ -3026,11 +3026,10 @@ async fn bulk_export(
         let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
 
-        // Track filename collisions inside the archive — two docs
-        // titled "Untitled" would otherwise overwrite each other.
-        // Suffix with "-<n>" on repeat. v1 keeps it dumb; Phase 6's
-        // async exporter can do something fancier.
-        let mut filename_dedup: std::collections::HashMap<String, u32> =
+        // Reserve every final name, including generated suffixes. Fold ASCII
+        // case so archives also extract safely on case-insensitive filesystems.
+        let mut allocated_names = std::collections::HashSet::new();
+        let mut next_suffix: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
 
         for doc_id in &req.doc_ids {
@@ -3038,13 +3037,17 @@ async fn bulk_export(
                 Ok((title, body)) => {
                     let stem = sanitize_filename(&title);
                     let key = format!("{stem}.{ext}");
-                    let entry_count = filename_dedup.entry(key.clone()).or_insert(0);
-                    *entry_count += 1;
-                    let unique = if *entry_count == 1 {
-                        key.clone()
-                    } else {
-                        let n = *entry_count - 1;
-                        format!("{stem}-{n}.{ext}")
+                    let suffix = next_suffix.entry(key.to_ascii_lowercase()).or_default();
+                    let unique = loop {
+                        let candidate = if *suffix == 0 {
+                            key.clone()
+                        } else {
+                            format!("{stem}-{suffix}.{ext}")
+                        };
+                        *suffix += 1;
+                        if allocated_names.insert(candidate.to_ascii_lowercase()) {
+                            break candidate;
+                        }
                     };
                     // Mid-zip write failures are exceptional — bail
                     // with 500 rather than continue with a partial
