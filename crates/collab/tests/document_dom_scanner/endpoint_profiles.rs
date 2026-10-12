@@ -6,9 +6,8 @@ struct ProfileFiles(std::path::PathBuf);
 impl ProfileFiles {
     fn new(contents: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "dom-endpoint-profile-{}-{}",
-            std::process::id(),
-            ogrenotes_common::time::now_usec()
+            "dom-endpoint-profile-{}",
+            ogrenotes_common::id::new_id()
         ));
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("config"), contents).unwrap();
