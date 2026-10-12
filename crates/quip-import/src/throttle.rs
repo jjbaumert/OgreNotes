@@ -8,9 +8,12 @@
 //!   functions over plain data, unit-testable without a clock or an
 //!   executor.
 //! - [`Throttle`], the async wrapper `QuipClient` actually holds: it owns
-//!   the mutable [`RateState`] behind a `tokio::sync::Mutex` and turns the
-//!   pure `plan_delay`/`backoff_ms` results into real `tokio::time::sleep`s.
-use tokio::sync::Mutex;
+//!   mutable [`RateState`] behind a short synchronous lock. Admission
+//!   rechecks the bucket and current response headers after every sleep.
+use std::sync::Mutex;
+
+use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use ogrenotes_common::time::now_usec;
 
@@ -30,7 +33,7 @@ fn now_ms_wall() -> i64 {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RateState {
     /// Tokens currently banked (fractional — refills continuously, not in
-    /// whole-token steps).
+    /// whole-token steps). Negative values represent reserved future tokens.
     pub tokens: f64,
     /// Wall-clock ms at which `tokens` was last refilled.
     pub last_refill_ms: i64,
@@ -68,40 +71,31 @@ impl RateState {
 /// superseded it by then) and is cleared so the local bucket resumes normal
 /// accounting rather than returning `0` unconditionally forever.
 pub fn plan_delay(state: &mut RateState, now_ms: i64, rate_per_min: u32) -> u64 {
-    let capacity = (rate_per_min.max(1)) as f64;
-
-    // Refill continuously since the last reservation.
-    let elapsed_ms = (now_ms - state.last_refill_ms).max(0) as f64;
-    if elapsed_ms > 0.0 {
-        let refilled = elapsed_ms * capacity / 60_000.0;
-        state.tokens = (state.tokens + refilled).min(capacity);
-    }
-    state.last_refill_ms = now_ms;
-
-    if state.remaining_hint == Some(0) && let Some(reset_at) = state.reset_at_ms {
-        if now_ms < reset_at {
-            return (reset_at - now_ms).max(0) as u64;
-        }
-        // The server's reset window has passed without fresh headers
-        // arriving to supersede it. Treating the stale hint as
-        // authoritative forever would permanently bypass the local bucket
-        // (return 0 without ever spending a token). Clear it and fall
-        // through to normal token-bucket accounting.
+    let capacity = rate_per_min.max(1) as f64;
+    if state.remaining_hint == Some(0) && state.reset_at_ms.is_some_and(|reset| now_ms >= reset) {
         state.remaining_hint = None;
         state.reset_at_ms = None;
     }
 
-    if state.tokens >= 1.0 {
-        state.tokens -= 1.0;
-        return 0;
-    }
+    // Reserve at the server reset when it forbids earlier requests. Refilling
+    // at that instant before spending tokens also bounds the post-reset burst.
+    let reset_floor = if state.remaining_hint == Some(0) {
+        state.reset_at_ms.unwrap_or(now_ms)
+    } else {
+        now_ms
+    };
+    // A backward wall-clock jump must not refill the same interval twice.
+    let reservation_ms = now_ms.max(state.last_refill_ms).max(reset_floor);
+    let elapsed_ms = reservation_ms.saturating_sub(state.last_refill_ms) as f64;
+    state.tokens = (state.tokens + elapsed_ms * capacity / 60_000.0).min(capacity);
+    state.last_refill_ms = reservation_ms;
+    state.tokens -= 1.0;
 
-    // Not enough banked — reserve the token anyway (bucket bottoms out at
-    // 0) and report how long until it would naturally have accrued.
-    let deficit = 1.0 - state.tokens;
-    let ms_per_token = 60_000.0 / capacity;
-    state.tokens = 0.0;
-    (deficit * ms_per_token).ceil().max(1.0) as u64
+    // Keep debt rather than clamping to zero: every caller owns a distinct
+    // future token even when all reservations happen at the same instant.
+    let refill_delay = ((-state.tokens).max(0.0) * 60_000.0 / capacity).ceil() as u64;
+    let floor_delay = reservation_ms.saturating_sub(now_ms) as u64;
+    floor_delay.saturating_add(refill_delay)
 }
 
 /// Exponential backoff with full jitter (base 1000ms, cap 60000ms) for a
@@ -124,15 +118,16 @@ pub fn backoff_ms(attempt: u32, reset_at_ms: Option<i64>, now_ms: i64, rng01: f6
     jittered.max(floor)
 }
 
-/// Async gate `QuipClient` acquires before every Quip API call. Wraps a
-/// [`RateState`] behind a `tokio::sync::Mutex` so concurrent callers
-/// serialize on the same bucket; the lock is held only long enough to run
-/// the pure [`plan_delay`]/[`backoff_ms`] calculators, never across an
-/// `.await`.
+/// Async gate `QuipClient` acquires before every Quip API call. Bucket
+/// decisions and header updates share a short synchronous lock, never held
+/// across a sleep. Pending callers recheck admission rather than spending a
+/// token until they can send, so cancellation does not strand reservations.
 pub struct Throttle {
     state: Mutex<RateState>,
     rate_per_min: u32,
-    clock: fn() -> i64,
+    started_ms: i64,
+    started_at: Instant,
+    headers_changed: Notify,
 }
 
 impl Throttle {
@@ -149,45 +144,58 @@ impl Throttle {
         Self {
             state: Mutex::new(RateState::full(rate_per_min, now)),
             rate_per_min,
-            clock: now_ms_wall,
+            started_ms: now,
+            started_at: Instant::now(),
+            headers_changed: Notify::new(),
         }
+    }
+
+    // Anchor the epoch used by reset headers to monotonic elapsed time. Wall
+    // clock corrections cannot grant extra tokens or make a sleep repeat.
+    fn now_ms(&self) -> i64 {
+        let elapsed = self.started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
+        self.started_ms.saturating_add(elapsed)
     }
 
     /// Block until a token is available per the bucket / header hints, then
     /// return. Call this immediately before sending a Quip API request.
     pub async fn acquire(&self) {
-        let now = (self.clock)();
-        let delay_ms = {
-            let mut state = self.state.lock().await;
-            plan_delay(&mut state, now, self.rate_per_min)
-        };
-        if delay_ms > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        loop {
+            // Register before inspecting state so a header update between the
+            // decision and the sleep cannot be missed.
+            let changed = self.headers_changed.notified();
+            let delay_ms = {
+                let mut state = self.state.lock().expect("throttle state lock poisoned");
+                let mut candidate = *state;
+                let delay = plan_delay(&mut candidate, self.now_ms(), self.rate_per_min);
+                if delay == 0 {
+                    *state = candidate;
+                    return;
+                }
+                delay
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+                _ = changed => {}
+            }
         }
     }
 
-    /// Feed the last response's `x-ratelimit-remaining` /
-    /// `x-ratelimit-reset` headers back into the bucket. Synchronous by
-    /// contract, so this uses `try_lock` rather than awaiting: the lock is
-    /// only ever held briefly inside `plan_delay`/here, never across an
-    /// `.await`, so contention is momentary at worst; on the rare miss we
-    /// just drop the hint and let the next response's headers supersede it
-    /// (nothing correctness-critical hinges on any single header read).
+    /// Feed response rate-limit headers back into the bucket. Header updates
+    /// cannot be dropped under contention and wake pending callers to recheck
+    /// both extended and shortened reset windows.
     pub fn observe_headers(&self, remaining: Option<u32>, reset_at_ms: Option<i64>) {
-        match self.state.try_lock() {
-            Ok(mut state) => {
-                if remaining.is_some() {
-                    state.remaining_hint = remaining;
-                }
-                if reset_at_ms.is_some() {
-                    state.reset_at_ms = reset_at_ms;
-                }
+        {
+            let mut state = self.state.lock().expect("throttle state lock poisoned");
+            if remaining.is_some() {
+                state.remaining_hint = remaining;
             }
-            Err(_) => {
-                tracing::debug!(
-                    "throttle: skipped rate-limit header update, bucket was locked"
-                );
+            if reset_at_ms.is_some() {
+                state.reset_at_ms = reset_at_ms;
             }
+        }
+        if remaining.is_some() || reset_at_ms.is_some() {
+            self.headers_changed.notify_waiters();
         }
     }
 
@@ -197,8 +205,13 @@ impl Throttle {
     /// see the module's crate-level notes; this avoids pulling in an rng
     /// dependency for one call site.
     pub async fn backoff(&self, attempt: u32) {
-        let now = (self.clock)();
-        let reset_at_ms = { self.state.lock().await.reset_at_ms };
+        let now = self.now_ms();
+        let reset_at_ms = {
+            self.state
+                .lock()
+                .expect("throttle state lock poisoned")
+                .reset_at_ms
+        };
         let rng01 = (now.rem_euclid(1000)) as f64 / 1000.0;
         let delay_ms = backoff_ms(attempt, reset_at_ms, now, rng01);
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
