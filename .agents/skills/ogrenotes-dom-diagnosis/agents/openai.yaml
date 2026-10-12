@@ -1,0 +1,4 @@
+interface:
+  display_name: "OgreNotes DOM Diagnosis"
+  short_description: "Trace persisted document corruption with retained evidence"
+  default_prompt: "Use $ogrenotes-dom-diagnosis to investigate these OgreNotes documents read-only and distinguish proven invalid states from unresolved causes."
