@@ -221,6 +221,11 @@ jobs:
       - name: Storage integration tests
         run: cargo test -p ogrenotes-storage --tests --locked --no-fail-fast
 
+      # The scanner binary is feature-gated and its real CLI contracts need
+      # DynamoDB Local plus MinIO. Unit-job services include only Redis.
+      - name: Document DOM scanner contracts
+        run: cargo test -p ogrenotes-collab --features replay --test document_dom_scanner --locked
+
       - name: Compose logs on failure
         if: failure()
         run: docker compose logs --no-color

@@ -58,14 +58,17 @@ ammonia = "4"
 html5ever = "0.39"
 markup5ever_rcdom = "0.39"
 
-# Optional: only needed by the replay binary
+# Optional: only needed by the replay and DOM scanner binaries
 ogrenotes-storage = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
+aws-types = { version = "1", optional = true }
+libc = { version = "0.2", optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 [features]
-replay = ["ogrenotes-storage", "aws-config", "aws-sdk-dynamodb", "aws-sdk-s3"]
+replay = ["ogrenotes-storage", "aws-config", "aws-sdk-dynamodb", "aws-sdk-s3", "aws-types", "libc", "sha2"]
 xlsx = ["calamine", "rust_xlsxwriter"]
 docx = ["zip", "quick-xml", "docx-rs"]
 pdf = ["pdf-extract", "printpdf"]
@@ -91,3 +94,8 @@ lopdf = "0.42"
 name = "yrs_ops"
 harness = false
 path = "benches/yrs_ops.rs"
+
+[[bin]]
+name = "scan_document_dom"
+path = "src/bin/scan_document_dom/main.rs"
+required-features = ["replay"]
