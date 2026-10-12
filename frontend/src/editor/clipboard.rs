@@ -366,9 +366,7 @@ fn convert_element_node(
 fn is_inline_content(n: &Node) -> bool {
     match n {
         Node::Text { .. } => true,
-        Node::Element { node_type, .. } => {
-            n.is_leaf() && !matches!(node_type, NodeType::MathBlock | NodeType::Mermaid)
-        }
+        Node::Element { node_type, .. } => node_type.is_inline(),
     }
 }
 
@@ -533,7 +531,7 @@ fn convert_block_element(
         NodeType::HardBreak => out.push(Node::element(NodeType::HardBreak)),
         NodeType::Image => { if let Some(n) = convert_image(el) { out.push(n); } }
         NodeType::ListItem => {
-            out.push(convert_list_item(walk_block_children(child, false)));
+            out.push(convert_list_item(walk_block_children(child, true)));
         }
         NodeType::BulletList | NodeType::OrderedList => {
             let children = walk_block_children(child, false);
@@ -773,15 +771,47 @@ fn convert_image(el: &web_sys::Element) -> Option<Node> {
 }
 
 /// Convert a <li> element's children into a ListItem node.
-/// If all children are inline, wraps them in a Paragraph first.
+/// Inline runs need paragraphs even when nested blocks share the item.
 #[cfg(target_arch = "wasm32")]
 fn convert_list_item(children: Vec<Node>) -> Node {
-    let all_inline = children.iter().all(is_inline_content);
-    if all_inline {
-        let para = Node::element_with_content(NodeType::Paragraph, Fragment::from(children));
-        Node::element_with_content(NodeType::ListItem, Fragment::from(vec![para]))
+    let mut children = wrap_inline_runs(children);
+    if children.is_empty() {
+        children.push(Node::element(NodeType::Paragraph));
+    }
+    Node::element_with_content(NodeType::ListItem, Fragment::from(children))
+}
+
+/// Preserve existing blocks/IDs and wrap each adjacent inline run together.
+/// New paragraphs use model constructors so the ordinary Yrs bridge receives
+/// stable block IDs, without rebuilding or normalizing the live document.
+fn wrap_inline_runs(children: Vec<Node>) -> Vec<Node> {
+    let mut out = Vec::with_capacity(children.len());
+    let mut inline = Vec::new();
+    for child in children {
+        if is_inline_content(&child) {
+            inline.push(child);
+        } else {
+            flush_inline_run(&mut out, &mut inline);
+            out.push(child);
+        }
+    }
+    flush_inline_run(&mut out, &mut inline);
+    out
+}
+
+fn flush_inline_run(out: &mut Vec<Node>, inline: &mut Vec<Node>) {
+    // Drop HTML indentation between blocks, but retain word-separating
+    // whitespace within a run containing text or inline atoms.
+    if inline
+        .iter()
+        .any(|node| !matches!(node, Node::Text { text, .. } if text.trim().is_empty()))
+    {
+        out.push(Node::element_with_content(
+            NodeType::Paragraph,
+            Fragment::from(std::mem::take(inline)),
+        ));
     } else {
-        Node::element_with_content(NodeType::ListItem, Fragment::from(children))
+        inline.clear();
     }
 }
 
@@ -1007,9 +1037,12 @@ pub fn fit_slice_to_context(slice: Slice, parent_type: NodeType) -> Slice {
         return slice;
     }
 
-    let fitted: Vec<Node> = slice
-        .content
-        .children
+    let children = if matches!(parent_type, NodeType::ListItem | NodeType::TaskItem) {
+        wrap_inline_runs(slice.content.children)
+    } else {
+        slice.content.children
+    };
+    let fitted: Vec<Node> = children
         .into_iter()
         .flat_map(|node| fit_node(node, parent_type))
         .collect();
