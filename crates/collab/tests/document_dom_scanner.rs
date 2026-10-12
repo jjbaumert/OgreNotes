@@ -78,11 +78,12 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let (ddb, s3) = clients();
-        let name = format!(
-            "dom-scan-test-{}-{}",
-            std::process::id(),
-            ogrenotes_common::time::now_usec()
-        );
+        // Hex preserves the random ID's entropy using only S3-safe characters.
+        let suffix: String = ogrenotes_common::id::new_id()
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let name = format!("dom-scan-test-{suffix}");
         ddb.create_table()
             .table_name(&name)
             .billing_mode(BillingMode::PayPerRequest)
@@ -243,11 +244,7 @@ fn run(command: &mut Command) -> (i32, Vec<Value>) {
     if let Some(directory) = std::env::var_os("DOM_SCANNER_EVIDENCE_DIR") {
         let path = std::path::PathBuf::from(directory);
         std::fs::create_dir_all(&path).unwrap();
-        let name = format!(
-            "scan-{}-{}.ndjson",
-            std::process::id(),
-            ogrenotes_common::time::now_usec()
-        );
+        let name = format!("scan-{}.ndjson", ogrenotes_common::id::new_id());
         std::fs::write(path.join(name), &text).unwrap();
     }
     assert!(

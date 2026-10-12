@@ -7457,3 +7457,150 @@ fn bidi_controls_survive_typing_and_plain_clipboard() {
     cleanup(&target);
     cleanup(&source);
 }
+
+#[wasm_bindgen_test]
+fn rich_mixed_list_math_paste_keeps_paragraph_wrapper() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "before $x$ after\n nested",
+        "<ul><li>before $x$ after<ul><li>nested</li></ul></li></ul>",
+    );
+    let state = view.state();
+    let list = state.doc.child(0).expect("pasted list");
+    let item = list.child(0).expect("pasted list item");
+    let direct_types: Vec<_> = (0..item.child_count())
+        .map(|i| item.child(i).unwrap().node_type())
+        .collect();
+    web_sys::console::log_1(&format!("Direct list-item child types: {direct_types:?}").into());
+    let validation = ogrenotes_frontend::editor::schema::default_schema().validate(&state.doc);
+    assert!(
+        validation.is_ok(),
+        "paste produced invalid structure: {validation:?}; direct children: {direct_types:?}"
+    );
+    assert_eq!(
+        item.child(0).unwrap().node_type(),
+        Some(NodeType::Paragraph)
+    );
+    cleanup(&container);
+}
+
+#[path = "browser/paste_yrs.rs"]
+mod paste_yrs;
+
+#[wasm_bindgen_test]
+fn rich_mixed_list_paste_preserves_marks_blocks_and_undo_redo() {
+    fn find_paragraph(node: &Node) -> Option<&Node> {
+        if node.node_type() == Some(NodeType::Paragraph) && node.text_content().contains("before") {
+            return Some(node);
+        }
+        (0..node.child_count()).find_map(|i| find_paragraph(node.child(i).unwrap()))
+    }
+    for destination in [None, Some(NodeType::BulletList), Some(NodeType::TaskList)] {
+        let initial = if let Some(list_type) = destination {
+            let item_type = if list_type == NodeType::TaskList {
+                NodeType::TaskItem
+            } else {
+                NodeType::ListItem
+            };
+            Node::element_with_content(
+                NodeType::Doc,
+                Fragment::from(vec![Node::element_with_content(
+                    list_type,
+                    Fragment::from(vec![Node::element_with_content(
+                        item_type,
+                        Fragment::from(vec![Node::element(NodeType::Paragraph)]),
+                    )]),
+                )]),
+            )
+        } else {
+            Node::empty_doc()
+        };
+        let container = create_container();
+        let (view, txns) = create_editor(container.clone(), initial);
+        set_cursor(&view, if destination.is_some() { 3 } else { 1 });
+        let before = view.state().doc;
+        dispatch_paste_html(
+            &view,
+            &txns,
+            "before $x$ after\nnested\ntail\nlast\nend",
+            "<ul><li><strong>before</strong> $x$ <em>after</em><ul><li>nested</li></ul>tail<p>last</p>end</li></ul>",
+        );
+        let pasted = view.state().doc;
+        ogrenotes_frontend::editor::schema::default_schema()
+            .validate(&pasted)
+            .unwrap();
+        let paragraph = find_paragraph(&pasted).unwrap();
+        assert_eq!(
+            paragraph.text_content(),
+            "before x after",
+            "spaces around the inline math remain intact"
+        );
+        assert!(
+            paragraph
+                .child(0)
+                .unwrap()
+                .marks()
+                .iter()
+                .any(|m| m.mark_type == MarkType::Bold)
+        );
+        assert!(
+            paragraph
+                .child(paragraph.child_count() - 1)
+                .unwrap()
+                .marks()
+                .iter()
+                .any(|m| m.mark_type == MarkType::Italic)
+        );
+        assert_eq!(
+            view.container()
+                .query_selector_all("span.math-inline")
+                .unwrap()
+                .length(),
+            1
+        );
+        assert!(pasted.text_content().contains("nestedtaillastend"));
+        dispatch_keydown(view.container(), "z", true, false, false);
+        apply_all(&view, &txns);
+        assert_eq!(
+            view.state().doc,
+            before,
+            "undo returns to the exact pre-paste tree"
+        );
+        dispatch_keydown(view.container(), "z", true, true, false);
+        apply_all(&view, &txns);
+        assert_eq!(
+            view.state().doc,
+            pasted,
+            "redo restores the normalized tree and IDs"
+        );
+        cleanup(&container);
+    }
+}
+
+#[wasm_bindgen_test]
+fn rich_list_indentation_does_not_create_empty_paragraphs() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "lead\nnested",
+        "<ul><li>\n  <p>lead</p>\n  <ul><li>\n    <p>nested</p>\n  </li></ul>\n</li></ul>",
+    );
+    let doc = view.state().doc;
+    ogrenotes_frontend::editor::schema::default_schema()
+        .validate(&doc)
+        .unwrap();
+    let item = doc.child(0).unwrap().child(0).unwrap();
+    assert_eq!(item.child_count(), 2);
+    assert_eq!(item.child(0).unwrap().text_content(), "lead");
+    let nested_item = item.child(1).unwrap().child(0).unwrap();
+    assert_eq!(nested_item.child_count(), 1);
+    assert_eq!(nested_item.child(0).unwrap().text_content(), "nested");
+    cleanup(&container);
+}
