@@ -7457,3 +7457,25 @@ fn bidi_controls_survive_typing_and_plain_clipboard() {
     cleanup(&target);
     cleanup(&source);
 }
+
+#[wasm_bindgen_test]
+fn diagnosis_mixed_html_list_math_paste_keeps_paragraph_wrapper() {
+    let container = create_container();
+    let (view, txns) = create_editor(container.clone(), Node::empty_doc());
+    set_cursor(&view, 1);
+    dispatch_paste_html(
+        &view,
+        &txns,
+        "before $x$ after\n nested",
+        "<ul><li>before $x$ after<ul><li>nested</li></ul></li></ul>",
+    );
+    let state = view.state();
+    let list = state.doc.child(0).expect("pasted list");
+    let item = list.child(0).expect("pasted list item");
+    let direct_types: Vec<_> = (0..item.child_count()).map(|i| item.child(i).unwrap().node_type()).collect();
+    web_sys::console::log_1(&format!("Direct list-item child types: {direct_types:?}").into());
+    let validation = ogrenotes_frontend::editor::schema::default_schema().validate(&state.doc);
+    assert!(validation.is_ok(), "paste produced invalid structure: {validation:?}; direct children: {direct_types:?}");
+    assert_eq!(item.child(0).unwrap().node_type(), Some(NodeType::Paragraph));
+    cleanup(&container);
+}
