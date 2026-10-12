@@ -46,10 +46,10 @@ cargo run --bin rag-eval -- run --base-url https://ogrenotes.example.com
 | `query_id`              | Stable query id from the catalog (e.g. `kw-03`). |
 | `category`              | `keyword` / `semantic` / `multi-hop` / `gap-analysis`. |
 | `expected_count`        | Length of the query's `expectedDocIds` array. |
-| `search_top10`          | Pipe-joined catalog ids the keyword search surfaced. |
-| `search_recall_at_10`   | `\|retrieved ∩ expected\| / \|expected\|`. Gap queries score 1.0 on empty-and-empty, 0.0 on retrieving a false cite. |
+| `search_top10`          | Pipe-joined returned IDs, mapped to catalog IDs when known; unknown server IDs remain visible. |
+| `search_recall_at_10`   | Set recall `\|retrieved ∩ expected\| / \|expected\|`, without duplicate credit. Successful gap queries score 1.0 only for an empty result; failures score 0.0. |
 | `search_latency_ms`     | Wall-clock time for the `/search` round trip. |
-| `ask_cites`             | Pipe-joined catalog ids the agent cited as Source events. |
+| `ask_cites`             | Pipe-joined Source IDs, mapped to catalog IDs when known; unknown server IDs remain visible. |
 | `ask_recall_at_10`      | Recall@10 against the agent citations. |
 | `ask_latency_ms`        | Wall-clock time for the `/ask` SSE round trip end-to-end. |
 | `ask_input_tokens`      | Input tokens summed across every Claude call in the agent loop (from the Usage SSE event). 0 when the backend predates M-6.3 piece C. |
@@ -58,9 +58,32 @@ cargo run --bin rag-eval -- run --base-url https://ogrenotes.example.com
 | `ask_skipped`           | `true` when the /ask call was skipped (no ANTHROPIC_API_KEY or `--no-ask`). |
 | `error`                 | Search / ask error text if either path failed. |
 
-Summary stats printed to stdout: mean recall (search + ask),
-total Claude spend across all queries, and search/ask p95
-latency in ms.
+Summary stats printed to stdout: mean recall (search + ask), search and ask
+failure counts, total Claude spend across successful queries, and search/ask
+p95 latency in ms for successful requests.
+
+Failed requests score 0.0 and retain their errors in the CSV. Search means
+include every query. Ask means include every attempted, non-skipped query,
+including failures. Only `--no-ask` and HTTP 503 skip ask scoring. An SSE
+response must reach its `done` event; EOF without `done` is a failed attempt,
+even after citations arrived. Unknown IDs remain visible and count as false
+citations for gap queries. Scoring uses server IDs, so an unknown ID cannot
+match a catalog name accidentally.
+
+`run` continues after per-query failures and exits 0 once it writes the full
+report. This preserves the reporting CLI contract; inspect the failure counts
+and CSV errors before comparing retrieval quality. Setup failures (including
+an incomplete seed mapping) and output-write failures exit nonzero.
+
+## Tests and CI
+
+`cargo test --manifest-path tests/rag-eval/Cargo.toml --locked` runs the library
+and CLI regressions. The CLI tests launch the actual binary against loopback
+HTTP/SSE fixtures and inspect its CSV and summary. They need no AWS services,
+model credentials, or running OgreNotes server.
+
+The dedicated `RAG evaluation harness` workflow runs on changes to this
+excluded crate or its workflow and can also be launched manually.
 
 Piece D adds tuning-knob columns to support the chunk-size /
 RRF-k / title-boost sweep.

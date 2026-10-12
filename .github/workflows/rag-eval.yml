@@ -1,0 +1,32 @@
+name: RAG evaluation harness
+
+on:
+  pull_request:
+    paths:
+      - 'tests/rag-eval/**'
+      - '.github/workflows/rag-eval.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'tests/rag-eval/**'
+      - '.github/workflows/rag-eval.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rag-eval:
+    name: RAG evaluator CLI contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tests/rag-eval -> target
+      # This crate is excluded from the workspace. Its CLI fixtures use only
+      # loopback HTTP servers, with no AWS services or model credentials.
+      - name: Test evaluator library and real CLI
+        run: cargo test --manifest-path tests/rag-eval/Cargo.toml --locked
