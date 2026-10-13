@@ -170,6 +170,7 @@ const mime = {
       !process.env.I18N_CASE || spec.name.includes(process.env.I18N_CASE));
     assert.ok(selectedCases.length, `No cases matched I18N_CASE=${process.env.I18N_CASE}`);
     for (const spec of selectedCases) {
+      console.log(`START ${spec.name}`);
       let hint = spec.hint;
       const saves = [];
       const errors = [];
@@ -280,7 +281,12 @@ const mime = {
         });
       });
       const page = await context.newPage();
-      page.on("pageerror", (e) => errors.push(e.message));
+      page.on("pageerror", (e) => {
+        errors.push(e.message);
+        console.error(`${spec.name}: page error: ${e.message}`);
+      });
+      page.on("crash", () => console.error(`${spec.name}: page crashed`));
+      page.on("close", () => console.log(`${spec.name}: page closed`));
       await page.goto(origin + spec.url);
       await page.waitForSelector(
         spec.docType === "document"
