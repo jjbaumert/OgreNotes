@@ -1014,13 +1014,18 @@ fn update_kanban_drop_indicator(
         ev.client_x() as f32,
         ev.client_y() as f32,
     );
-    // Skip hits on our own indicator or the source ghost —
-    // they'd otherwise be moving hit targets that resolve to
-    // "no valid drop."
-    let target = target.filter(|t| {
-        if let Some(ref e) = existing {
-            if t.is_same_node(Some(e.as_ref())) { return false; }
+    // The indicator occupies the intended drop slot. Keep it when the
+    // pointer crosses it instead of removing it and cancelling the drop.
+    // In particular, a full-width column indicator pushes its target aside.
+    if let (Some(target), Some(indicator)) = (&target, &existing) {
+        if target.is_same_node(Some(indicator.as_ref())) {
+            state.drop_indicator = existing;
+            return;
         }
+    }
+    // The source ghost is not a destination. Leaving the board still clears
+    // the indicator below, so releasing outside a valid target cancels.
+    let target = target.filter(|t| {
         if let Some(ref g) = state.source_ghost {
             if t.is_same_node(Some(g.as_ref())) { return false; }
         }

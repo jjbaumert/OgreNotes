@@ -166,8 +166,8 @@ function blockFixture(mode) {
   const block = calendar
     ? `<div class="calendar-block"><table class="calendar-month-grid"><thead><tr>${"<th>Day</th>".repeat(bad ? 6 : 7)}</tr></thead></table><button class="calendar-day" onclick="openModal(false)">Day</button><div id="items"></div></div>`
     : `<div class="kanban-block">${Array.from({ length: bad ? 2 : 3 }, (_, i) => `<div class="kanban-column">Column ${i}<button data-kanban-action="add-card" onclick="openModal(false)">Add card</button>${i === 0 ? '<div id="items"></div>' : ''}</div>`).join("")}</div>`;
-  return `<!doctype html><body><div contenteditable="true">Editor</div><div class="search-dialog">Palette</div>${block}
-    <div class="calendar-modal" hidden><h3></h3><input type="text"><button onclick="save()">Save</button><button class="btn-danger">Delete</button><button onclick="document.querySelector('.calendar-modal').hidden=true">Cancel</button></div>
+  return `<!doctype html><body><div contenteditable="true">Editor</div><div class="search-dialog"><input aria-label="Search commands"></div>${block}
+    <div class="calendar-modal" hidden><h3></h3><label>Title<input type="text"></label><button onclick="save()">Save</button><button class="btn-danger">Delete</button><button onclick="document.querySelector('.calendar-modal').hidden=true">Cancel</button></div>
     <script>
       const modal = document.querySelector('.calendar-modal');
       function openModal(edit) {
@@ -187,6 +187,7 @@ function blockFixture(mode) {
       }
       function save() {
         localStorage.setItem('title', modal.querySelector('input').value);
+        fetch('/${mode}/marker', { method: 'POST', body: modal.querySelector('input').value });
         modal.hidden = true;
         render();
       }
@@ -214,6 +215,9 @@ test("browser failures reach the CLI report and process exit status", {
     } else if (url.pathname.endsWith("/documents")) {
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ id: "fixture" }));
+    } else if (url.pathname.endsWith("/export/html")) {
+      res.setHeader("content-type", "text/html");
+      res.end(marker);
     } else if (url.pathname.endsWith("/marker")) {
       if (req.method === "POST") {
         let received = "";

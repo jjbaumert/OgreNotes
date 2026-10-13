@@ -4013,9 +4013,10 @@ async function scenarioKanbanBlock(ctx, collector) {
     await page.locator('[contenteditable="true"]').first().click();
     await page.keyboard.press("Control+Shift+P");
     await page.waitForSelector(".search-dialog", { timeout: 5000 });
-    await page.keyboard.type("Kanban", { delay: 10 });
+    const paletteInput = page.locator('.search-dialog input');
+    await paletteInput.fill('>Kanban');
     await page.waitForTimeout(150);
-    await page.keyboard.press("Enter");
+    await paletteInput.press('Enter');
 
     await page.waitForSelector(".kanban-block", { timeout: 5000 });
     steps.kanbanBlockRendered = true;
@@ -4033,7 +4034,7 @@ async function scenarioKanbanBlock(ctx, collector) {
     await page.waitForSelector(".calendar-modal", { timeout: 3000 });
     steps.addModalOpened = true;
 
-    await page.locator('.calendar-modal input[type="text"]').fill(CARD_TITLE);
+    await page.locator('.calendar-modal').getByLabel('Title', { exact: true }).fill(CARD_TITLE);
     await page.getByRole("button", { name: /^Save$/ }).click();
 
     await page.waitForSelector(".kanban-card", { timeout: 5000 });
@@ -4045,6 +4046,17 @@ async function scenarioKanbanBlock(ctx, collector) {
       .locator(".kanban-column:first-child .kanban-card").count();
     steps.cardLandedInFirstColumn = firstColCards === 1;
 
+    // Rendering and the status badge can precede the debounced CRDT send.
+    // Require this specific card in server content before testing reload.
+    await page.waitForFunction(async ({ url, token, title }) => {
+      const response = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+      if (!response.ok) throw new Error(`Kanban export: HTTP ${response.status}`);
+      return (await response.text()).includes(title);
+    }, {
+      url: `${target}/api/v1/documents/${doc.id}/export/html`,
+      token: tokens.accessToken,
+      title: CARD_TITLE,
+    }, { timeout: 15000, polling: 100 });
     // Reload → the card persists through yrs-bridge write-out/read-in.
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector(".kanban-card", { timeout: 10000 });
@@ -4055,7 +4067,7 @@ async function scenarioKanbanBlock(ctx, collector) {
     await page.locator(".kanban-card").first().click();
     await page.waitForSelector(".calendar-modal", { timeout: 3000 });
     const modalInput = await page
-      .locator('.calendar-modal input[type="text"]').inputValue();
+      .locator('.calendar-modal').getByLabel('Title', { exact: true }).inputValue();
     steps.editModalTitlePrefilled = modalInput === CARD_TITLE;
     // Delete button only appears in Edit mode.
     const deleteVisible = await page
@@ -4128,9 +4140,10 @@ async function scenarioKanbanDrag(ctx, collector) {
     await page.locator('[contenteditable="true"]').first().click();
     await page.keyboard.press("Control+Shift+P");
     await page.waitForSelector(".search-dialog", { timeout: 5000 });
-    await page.keyboard.type("Kanban", { delay: 10 });
+    const paletteInput = page.locator('.search-dialog input');
+    await paletteInput.fill('>Kanban');
     await page.waitForTimeout(150);
-    await page.keyboard.press("Enter");
+    await paletteInput.press('Enter');
     await page.waitForSelector(".kanban-block", { timeout: 5000 });
     steps.kanbanInserted = true;
 
@@ -4141,7 +4154,7 @@ async function scenarioKanbanDrag(ctx, collector) {
         .first()
         .click();
       await page.waitForSelector(".calendar-modal", { timeout: 3000 });
-      await page.locator('.calendar-modal input[type="text"]').fill(cardTitle);
+      await page.locator('.calendar-modal').getByLabel('Title', { exact: true }).fill(cardTitle);
       await page.getByRole("button", { name: /^Save$/ }).click();
       // Wait for modal to fully close before the next add.
       await page.waitForSelector(".calendar-modal", {
@@ -4251,9 +4264,10 @@ async function scenarioKanbanColumnReorder(ctx, collector) {
     await page.locator('[contenteditable="true"]').first().click();
     await page.keyboard.press("Control+Shift+P");
     await page.waitForSelector(".search-dialog", { timeout: 5000 });
-    await page.keyboard.type("Kanban", { delay: 10 });
+    const paletteInput = page.locator('.search-dialog input');
+    await paletteInput.fill('>Kanban');
     await page.waitForTimeout(150);
-    await page.keyboard.press("Enter");
+    await paletteInput.press('Enter');
     await page.waitForSelector(".kanban-block", { timeout: 5000 });
 
     // Read the default column titles for sanity.
@@ -4294,6 +4308,21 @@ async function scenarioKanbanColumnReorder(ctx, collector) {
     );
     steps.columnReorderedInDom =
       after[0] === "Done" && after[1] === "To Do" && after[2] === "In Progress";
+
+    // A valid hover followed by leaving the board must cancel the move,
+    // even though hovering the drop indicator itself retains the destination.
+    const cancelSource = await page.locator('.kanban-column:nth-child(3) .kanban-column-title').boundingBox();
+    const cancelTarget = await page.locator('.kanban-column:nth-child(1)').boundingBox();
+    if (!cancelSource || !cancelTarget) throw new Error("cancel drag boxes not resolved");
+    await page.mouse.move(cancelSource.x + cancelSource.width / 2, cancelSource.y + cancelSource.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(cancelTarget.x + cancelTarget.width * 0.15, cancelTarget.y + cancelSource.height / 2, { steps: 10 });
+    await page.locator('.kanban-drop-indicator').waitFor();
+    await page.mouse.move(20, 20, { steps: 10 });
+    await page.mouse.up();
+    const afterCancel = await page.locator('.kanban-column-title').allTextContents();
+    steps.offBoardDropCancelled = afterCancel.map(text => text.trim()).join('|') === after.join('|');
+    steps.dragPlaceholdersRemoved = await page.locator('.kanban-column-placeholder').count() === 0;
 
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector(".kanban-block", { timeout: 10000 });
@@ -4357,9 +4386,10 @@ async function scenarioKanbanWipLimit(ctx, collector) {
     await page.locator('[contenteditable="true"]').first().click();
     await page.keyboard.press("Control+Shift+P");
     await page.waitForSelector(".search-dialog", { timeout: 5000 });
-    await page.keyboard.type("Kanban", { delay: 10 });
+    const paletteInput = page.locator('.search-dialog input');
+    await paletteInput.fill('>Kanban');
     await page.waitForTimeout(150);
-    await page.keyboard.press("Enter");
+    await paletteInput.press('Enter');
     await page.waitForSelector(".kanban-block", { timeout: 5000 });
 
     // Pre-fill the prompt response before triggering it.
@@ -4383,7 +4413,7 @@ async function scenarioKanbanWipLimit(ctx, collector) {
         .first()
         .click();
       await page.waitForSelector(".calendar-modal", { timeout: 3000 });
-      await page.locator('.calendar-modal input[type="text"]').fill(cardTitle);
+      await page.locator('.calendar-modal').getByLabel('Title', { exact: true }).fill(cardTitle);
       await page.getByRole("button", { name: /^Save$/ }).click();
       // Modal auto-closes on save.
       await page.waitForSelector(".calendar-modal", {
@@ -4437,6 +4467,29 @@ async function scenarioKanbanCardMetadata(ctx, collector) {
   const tokens = await devLogin(
     target, emailA || "doctor-kanban-metadata@ogrenotes.example.com",
   );
+  const NAME = "Ada Lovelace";
+  const assigneeEmail = `doctor-kanban-assignee-${Date.now()}@ogrenotes.example.com`;
+  const assigneeTokens = await devLogin(target, assigneeEmail, NAME);
+  // User search is workspace-scoped. Give the real assignee membership
+  // before exercising the modal's picker and persisting its resolved ID.
+  const meResponse = await fetch(`${target}/api/v1/users/me`, {
+    headers: { authorization: `Bearer ${tokens.accessToken}` },
+  });
+  if (!meResponse.ok) throw new Error(`Kanban owner lookup: HTTP ${meResponse.status}`);
+  const owner = await meResponse.json();
+  if (!owner.defaultWorkspaceId) throw new Error("Kanban owner has no default workspace");
+  const memberResponse = await fetch(
+    `${target}/api/v1/workspaces/${owner.defaultWorkspaceId}/members`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${tokens.accessToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ userId: assigneeTokens.userId, role: "member" }),
+    },
+  );
+  if (!memberResponse.ok) throw new Error(`Kanban assignee membership: HTTP ${memberResponse.status}`);
   const title = `doctor-kanban-metadata-${Date.now()}`;
   const doc = await createDocViaApi(target, tokens.accessToken, title);
   logJson({ at: "doc-created", docId: doc.id });
@@ -4457,7 +4510,6 @@ async function scenarioKanbanCardMetadata(ctx, collector) {
   const steps = {};
   const DUE = "2026-08-15";
   const LABELS = "bug|red;ux|blue";
-  const NAME = "Ada Lovelace";
   try {
     await page.waitForSelector('[contenteditable="true"]', { timeout: 15000 });
 
@@ -4465,9 +4517,10 @@ async function scenarioKanbanCardMetadata(ctx, collector) {
     await page.locator('[contenteditable="true"]').first().click();
     await page.keyboard.press("Control+Shift+P");
     await page.waitForSelector(".search-dialog", { timeout: 5000 });
-    await page.keyboard.type("Kanban", { delay: 10 });
+    const paletteInput = page.locator('.search-dialog input');
+    await paletteInput.fill('>Kanban');
     await page.waitForTimeout(150);
-    await page.keyboard.press("Enter");
+    await paletteInput.press('Enter');
     await page.waitForSelector(".kanban-block", { timeout: 5000 });
 
     // Add card in column 1 and fill all metadata fields.
@@ -4475,14 +4528,17 @@ async function scenarioKanbanCardMetadata(ctx, collector) {
       .locator('.kanban-column:nth-child(1) [data-kanban-action="add-card"]')
       .first().click();
     await page.waitForSelector(".calendar-modal", { timeout: 3000 });
-    await page.locator('.calendar-modal input[type="text"]').first().fill("Test card");
+    await page.locator('.calendar-modal').getByLabel('Title', { exact: true }).fill("Test card");
     await page.locator('.calendar-modal input[type="date"]').fill(DUE);
     // The labels input is the second text input in the modal
     // (title=first, labels=second).
     const textInputs = page.locator('.calendar-modal input[type="text"]');
     await textInputs.nth(1).fill(LABELS);
-    // Assignee is the third text input.
-    await textInputs.nth(2).fill(NAME);
+    // Search the unique email and choose a real result, so Save includes
+    // both assigneeId and assigneeName rather than unresolved free text.
+    await page.locator('.calendar-modal').getByLabel('Assignee', { exact: true }).fill(assigneeEmail);
+    await page.locator('.kanban-modal-user-picker-item')
+      .filter({ hasText: assigneeEmail }).click({ timeout: 10000 });
     await page.getByRole("button", { name: /^Save$/ }).click();
     await page.waitForSelector(".calendar-modal", {
       state: "detached", timeout: 3000,

@@ -412,7 +412,8 @@ export function evaluateScenarioResult(scenario, collector, ok = true, errMsg = 
       "cardArrivedInDestColumn", "movePersistsAfterReload", "noPageErrors",
     ],
     "kanban-column-reorder": [
-      "initialOrderIsDefault", "columnReorderedInDom", "columnOrderPersistsAfterReload", "noPageErrors",
+      "initialOrderIsDefault", "columnReorderedInDom", "offBoardDropCancelled",
+      "dragPlaceholdersRemoved", "columnOrderPersistsAfterReload", "noPageErrors",
     ],
     "kanban-wip-limit": [
       "wipLimitVisibleInPill", "firstCardAddedSuccessfully", "secondCardBlockedByWipLimit",
