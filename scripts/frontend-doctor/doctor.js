@@ -4046,6 +4046,17 @@ async function scenarioKanbanBlock(ctx, collector) {
       .locator(".kanban-column:first-child .kanban-card").count();
     steps.cardLandedInFirstColumn = firstColCards === 1;
 
+    // Rendering and the status badge can precede the debounced CRDT send.
+    // Require this specific card in server content before testing reload.
+    await page.waitForFunction(async ({ url, token, title }) => {
+      const response = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+      if (!response.ok) throw new Error(`Kanban export: HTTP ${response.status}`);
+      return (await response.text()).includes(title);
+    }, {
+      url: `${target}/api/v1/documents/${doc.id}/export/html`,
+      token: tokens.accessToken,
+      title: CARD_TITLE,
+    }, { timeout: 15000, polling: 100 });
     // Reload → the card persists through yrs-bridge write-out/read-in.
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector(".kanban-card", { timeout: 10000 });

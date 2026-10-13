@@ -187,6 +187,7 @@ function blockFixture(mode) {
       }
       function save() {
         localStorage.setItem('title', modal.querySelector('input').value);
+        fetch('/${mode}/marker', { method: 'POST', body: modal.querySelector('input').value });
         modal.hidden = true;
         render();
       }
@@ -214,6 +215,9 @@ test("browser failures reach the CLI report and process exit status", {
     } else if (url.pathname.endsWith("/documents")) {
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ id: "fixture" }));
+    } else if (url.pathname.endsWith("/export/html")) {
+      res.setHeader("content-type", "text/html");
+      res.end(marker);
     } else if (url.pathname.endsWith("/marker")) {
       if (req.method === "POST") {
         let received = "";
