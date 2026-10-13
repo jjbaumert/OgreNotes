@@ -6,6 +6,8 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const http = require("node:http");
+const { pipeline } = require("node:stream");
 const { chromium } = require("playwright");
 const dist = path.resolve(
   process.argv[2] || path.join(__dirname, "../../frontend/dist"),
@@ -17,7 +19,6 @@ assert.ok(
 const fixtures = JSON.parse(
   fs.readFileSync(process.argv[3] || "/tmp/ogre-i18n-fixtures.json", "utf8"),
 );
-const origin = "https://ogre-i18n.test";
 const taglines = {
   ar: "مستندات بأنياب.", de: "Dokumente mit Biss.",
   es: "Documentos con garra.", fr: "Des documents qui ont du mordant.",
@@ -56,12 +57,53 @@ const mime = {
   ".webmanifest": "application/manifest+json",
 };
 (async () => {
-  const browser = await chromium.launch({
-    executablePath: process.env.CHROME_BIN || undefined,
-    headless: true,
-    args: ["--no-sandbox"],
+  // Stream build assets over HTTP. Fulfilling a debug WASM response through
+  // Playwright base64-encodes it and can exceed Chrome's DevTools pipe limit.
+  const server = http.createServer((request, response) => {
+    let relative;
+    try {
+      relative = decodeURIComponent(new URL(request.url, "http://localhost").pathname);
+    } catch {
+      response.writeHead(400).end();
+      return;
+    }
+    let file = path.resolve(dist, "." + relative);
+    if (!file.startsWith(dist + path.sep) && file !== dist) {
+      response.writeHead(403).end();
+      return;
+    }
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      response.writeHead(405).end();
+      return;
+    }
+    if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
+      if (!request.headers.accept?.includes("text/html")) {
+        response.writeHead(404).end();
+        return;
+      }
+      file = path.join(dist, "index.html");
+    }
+    response.writeHead(200, {
+      "Content-Type": mime[path.extname(file)] || "application/octet-stream",
+      "Cache-Control": "no-store",
+    });
+    if (request.method === "HEAD") response.end();
+    else pipeline(fs.createReadStream(file), response, (error) => {
+      if (error && error.code !== "ERR_STREAM_PREMATURE_CLOSE") console.error(error);
+    });
   });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  let browser;
   try {
+    browser = await chromium.launch({
+      executablePath: process.env.CHROME_BIN || undefined,
+      headless: true,
+      args: ["--no-sandbox"],
+    });
     const cases = [
       { name: "Arabic login", url: "/login?locale=ar", expected: "ar" },
       { name: "German login", url: "/login?locale=de", expected: "de" },
@@ -270,15 +312,7 @@ const mime = {
             body: JSON.stringify(body),
           });
         }
-        let relative = decodeURIComponent(url.pathname).replace(/^\//, "");
-        let file = path.join(dist, relative);
-        if (!fs.existsSync(file) || !fs.statSync(file).isFile())
-          file = path.join(dist, "index.html");
-        return route.fulfill({
-          status: 200,
-          contentType: mime[path.extname(file)] || "application/octet-stream",
-          body: fs.readFileSync(file),
-        });
+        return route.continue();
       });
       const page = await context.newPage();
       page.on("pageerror", (e) => {
@@ -286,7 +320,6 @@ const mime = {
         console.error(`${spec.name}: page error: ${e.message}`);
       });
       page.on("crash", () => console.error(`${spec.name}: page crashed`));
-      page.on("close", () => console.log(`${spec.name}: page closed`));
       await page.goto(origin + spec.url);
       await page.waitForSelector(
         spec.docType === "document"
@@ -536,7 +569,15 @@ const mime = {
       await context.close();
     }
   } finally {
-    await browser.close();
+    // Always close the listener, including when browser launch fails.
+    try {
+      await browser?.close();
+    } finally {
+      await new Promise((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve());
+        server.closeAllConnections();
+      });
+    }
   }
 })().catch((e) => {
   console.error(e);

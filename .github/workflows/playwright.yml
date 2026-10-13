@@ -265,8 +265,6 @@ jobs:
         run: |
           set -o pipefail
           cargo run --locked --manifest-path ../../frontend/Cargo.toml --example i18n_fixtures > /tmp/ogre-i18n-fixtures.json
-          free -m
-          df -h /dev/shm
           python3 ../with-test-cleanup.py -- node i18n-check.cjs 2>&1 | tee /tmp/ci-logs/i18n-browser.log
 
       - name: Internationalization live persistence and collaboration
@@ -951,6 +949,7 @@ jobs:
           path: |
             artifacts/doctor/**
             /tmp/ci-logs/server.log
+            /tmp/ci-logs/i18n-browser.log
           if-no-files-found: warn
           retention-days: 14
 
