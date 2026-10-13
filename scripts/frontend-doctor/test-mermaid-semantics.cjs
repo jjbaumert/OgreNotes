@@ -120,6 +120,8 @@ const cases = [
       await page.waitForFunction(() => document.activeElement?.classList.contains('mermaid-source'));
       await page.keyboard.press('Escape');
       await modal.waitFor({ state: 'detached' });
+      // Focus restoration runs on a deferred task after modal teardown.
+      await page.waitForFunction(() => document.activeElement?.matches('.mermaid-block .mermaid-edit-control'), null, { timeout: 5000 });
       check(await button.evaluate(button => document.activeElement === button), 'Space opens the modal and Escape restores button focus');
     }
     if (!observe) {
