@@ -14,7 +14,7 @@ canonical form you actually type at the CLI.
 
 | Scenario (display) | CLI form | Status | Mix |
 |---|---|---|---|
-| `read-heavy` | `readheavy` | Smoke baseline | 80% `GET /documents`, 20% `GET /users/me` |
+| `read-heavy` | `readheavy` | Smoke baseline | 80% home-folder listing, 20% `GET /users/me` |
 | `edit-heavy` | tbd | 30% list, 70% WS edit |
 | `chat-heavy` | tbd | 50% read, 50% post-message |
 | `search-spike` | tbd | All search, varied queries |
@@ -38,7 +38,7 @@ cargo run --release -p ogrenotes-load --manifest-path tests/load/Cargo.toml -- \
 The HTML report shows per-request latency and throughput. The driver also
 prints a JSON gate summary and exits nonzero if login fails, fewer than
 100 authenticated requests succeed, either measured route has no successes,
-the total request error rate exceeds 1%, `GET /documents` p95 exceeds
+the total request error rate exceeds 1%, `GET /home-folder` p95 exceeds
 300 ms, or `GET /users/me` p95 exceeds the 500 ms catch-all API budget.
 Set `LOAD_SUMMARY_FILE` to retain the JSON summary,
 `LOAD_MIN_SUCCESSFUL_LOGINS` to require a specific number of usable
@@ -55,7 +55,9 @@ and a release-built API server. The job uploads the goose report
 and gate summary as artifacts, including on failure. It fails when any
 of the gates above are breached.
 
-This baseline creates fresh users and reads their empty document lists.
+This baseline creates fresh users, resolves each home folder from
+`GET /users/me`, and reads that folder's empty child list through
+`GET /folders/{id}`. The API's `/documents` collection is POST-only.
 It does not seed accessible documents, open document content, or edit.
 It therefore does not yet exercise the `read_heavy` list+open/edit mix
 or the 1000-user target in `design/performance-budgets.md`; its nightly
