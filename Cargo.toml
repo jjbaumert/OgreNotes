@@ -57,9 +57,11 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # AWS
 aws-config = "1"
-aws-sdk-dynamodb = "1"
-aws-sdk-s3 = "1"
-aws-sdk-bedrockruntime = "1"
+# The SDK's `rustls` feature selects its legacy hyper 0.14 / rustls 0.21
+# connector. Use the current HTTPS client while retaining the other defaults.
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "http-1x", "sigv4a"] }
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 serde_dynamo = { version = "4.3", features = ["aws-sdk-dynamodb+1"] }
 
 # CRDT
@@ -134,7 +136,7 @@ minijinja = "2"
 secrecy = "0.8"
 
 # AWS (Quip import)
-aws-sdk-ssm = "1"
+aws-sdk-ssm = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 
 # Workspace crates
 ogrenotes-common = { path = "crates/common" }
