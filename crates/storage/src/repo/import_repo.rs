@@ -1696,7 +1696,7 @@ fn run_condition(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_smithy_runtime::client::http::test_util::StaticReplayClient;
+    use aws_smithy_http_client::test_util::StaticReplayClient;
     use std::collections::BTreeSet;
 
     fn record_fixture() -> ImportRecord {
@@ -2144,7 +2144,7 @@ mod tests {
     /// DynamoDB Local serves every read from one store and so behaves
     /// identically with and without it.
     fn replaying_repo(responses: Vec<&str>) -> (ImportRepo, StaticReplayClient) {
-        use aws_smithy_runtime::client::http::test_util::ReplayEvent;
+        use aws_smithy_http_client::test_util::ReplayEvent;
         use aws_smithy_types::body::SdkBody;
 
         let replay = StaticReplayClient::new(

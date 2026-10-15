@@ -8,7 +8,7 @@
 //! — the only way to pin behaviour DynamoDB Local cannot distinguish.
 
 use crate::dynamo::DynamoClient;
-use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
+use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
 use aws_smithy_types::body::SdkBody;
 
 /// A `DynamoClient` whose HTTP layer replays `responses` (all HTTP 200)
