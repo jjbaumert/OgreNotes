@@ -5,7 +5,7 @@ name: Load tests (nightly)
 # is in tests/load/ and is excluded from the main workspace so its
 # reqwest 0.11 pin doesn't enter the production build graph.
 #
-# The job uploads the goose HTML report + per-run scalar metrics as
+# The job uploads the Goose HTML report + JSON gate summary as
 # artifacts. A failing run blocks no merges (nightly only, not on
 # PR push) — the alarms in `runbook/sla-alarms.md` (M-P9 piece F)
 # are the merge-gating signal; this workflow gives engineers an
@@ -126,6 +126,8 @@ jobs:
         env:
           USERS: ${{ github.event.inputs.users || '50' }}
           RUN_TIME: ${{ github.event.inputs.run_time || '60s' }}
+          LOAD_SUMMARY_FILE: ../../artifacts/load/gate-summary.json
+          LOAD_MIN_SUCCESSFUL_LOGINS: ${{ github.event.inputs.users || '50' }}
         run: |
           mkdir -p ../../artifacts/load
           ./target/release/load \
@@ -135,7 +137,6 @@ jobs:
             --hatch-rate 5 \
             --run-time "$RUN_TIME" \
             --report-file ../../artifacts/load/goose-report.html \
-            --report-file ../../artifacts/load/goose-report.json \
             --no-reset-metrics
 
       - name: Stop axum server
