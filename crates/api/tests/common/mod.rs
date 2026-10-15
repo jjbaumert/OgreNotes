@@ -379,6 +379,7 @@ impl TestApp {
             rate_limit_comments_per_min: 5,
             rate_limit_content_write_per_min: 5,
             rate_limit_user_search_per_min: 3,
+            user_search_index_reads_enabled: true,
             rate_limit_ws_upgrade_per_min: 5,
             rate_limit_ws_messages_per_min: 6000,
             rate_limit_dev_login_per_min: 1000,
@@ -528,6 +529,10 @@ impl TestApp {
         // `test_refresh_*` was burning the same bucket). Using the
         // unique prefix removes the collision surface entirely.
         let default_xff = format!("test-{prefix}");
+
+        // Fresh test tables start with a complete (empty) user search index.
+        // Production tables use the explicit backfill before indexed reads.
+        state.user_repo.backfill_user_search_index().await.unwrap();
 
         Self {
             router,

@@ -1,12 +1,15 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
-use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_dynamodb::types::{
+    AttributeValue, ConditionCheck, Delete, Put, TransactWriteItem, Update,
+};
 use std::collections::HashMap;
 
 use crate::dynamo::DynamoClient;
-use crate::models::workspace::{Workspace, WorkspaceMember};
 use crate::models::WorkspaceRole;
-use crate::repo::{get_n, get_s, RepoError};
+use crate::models::user::User;
+use crate::models::workspace::{Workspace, WorkspaceMember};
+use crate::repo::{RepoError, get_n, get_s};
 
 /// Repository for workspace operations.
 pub struct WorkspaceRepo {
@@ -22,7 +25,10 @@ impl WorkspaceRepo {
     pub async fn create(&self, workspace: &Workspace) -> Result<(), RepoError> {
         let mut item = workspace_to_item(workspace);
         item.insert("PK".to_string(), AttributeValue::S(workspace.pk()));
-        item.insert("SK".to_string(), AttributeValue::S(Workspace::sk().to_string()));
+        item.insert(
+            "SK".to_string(),
+            AttributeValue::S(Workspace::sk().to_string()),
+        );
 
         self.db
             .put_item(item)
@@ -65,7 +71,10 @@ impl WorkspaceRepo {
         let mut expr_parts = vec!["updated_at = :updated_at".to_string()];
         let mut values = HashMap::new();
 
-        values.insert(":updated_at".to_string(), AttributeValue::N(updated_at.to_string()));
+        values.insert(
+            ":updated_at".to_string(),
+            AttributeValue::N(updated_at.to_string()),
+        );
 
         if let Some(n) = name {
             expr_parts.push("#n = :name".to_string());
@@ -139,16 +148,102 @@ impl WorkspaceRepo {
                     .to_string(),
             ),
         );
-        item.insert("joined_at".to_string(), AttributeValue::N(member.joined_at.to_string()));
-        item.insert("user_id".to_string(), AttributeValue::S(member.user_id.clone()));
+        item.insert(
+            "joined_at".to_string(),
+            AttributeValue::N(member.joined_at.to_string()),
+        );
+        item.insert(
+            "user_id".to_string(),
+            AttributeValue::S(member.user_id.clone()),
+        );
         // GSI4: list a user's workspace memberships by join time.
-        item.insert("user_id_gsi".to_string(), AttributeValue::S(member.user_id.clone()));
-        item.insert("created_at".to_string(), AttributeValue::N(member.joined_at.to_string()));
+        item.insert(
+            "user_id_gsi".to_string(),
+            AttributeValue::S(member.user_id.clone()),
+        );
+        item.insert(
+            "created_at".to_string(),
+            AttributeValue::N(member.joined_at.to_string()),
+        );
 
-        self.db
-            .put_item(item)
-            .await
-            .map_err(|e| RepoError::Dynamo(e.to_string()))
+        let users = crate::repo::user_repo::UserRepo::new(self.db.clone());
+        for _ in 0..8 {
+            let (user, revision) = users
+                .get_with_search_revision_consistent(&member.user_id)
+                .await?
+                .ok_or_else(|| RepoError::NotFound(format!("USER#{}", member.user_id)))?;
+            // Derived postings become durable before membership can be seen.
+            users
+                .index_user_in_workspace(&member.workspace_id, &member.user_id)
+                .await?;
+            let mirror = HashMap::from([
+                (
+                    "PK".into(),
+                    AttributeValue::S(format!("USER#{}", member.user_id)),
+                ),
+                (
+                    "SK".into(),
+                    AttributeValue::S(format!("WORKSPACE#{}", member.workspace_id)),
+                ),
+                (
+                    "workspace_id".into(),
+                    AttributeValue::S(member.workspace_id.clone()),
+                ),
+            ]);
+            let condition = if revision == 0 {
+                "attribute_exists(PK) AND (attribute_not_exists(search_revision) OR search_revision = :revision)"
+            } else {
+                "attribute_exists(PK) AND search_revision = :revision"
+            };
+            let transaction = vec![
+                TransactWriteItem::builder()
+                    .put(
+                        Put::builder()
+                            .table_name(self.db.table_name())
+                            .set_item(Some(item.clone()))
+                            .build()
+                            .map_err(|e| RepoError::Dynamo(e.to_string()))?,
+                    )
+                    .build(),
+                TransactWriteItem::builder()
+                    .put(
+                        Put::builder()
+                            .table_name(self.db.table_name())
+                            .set_item(Some(mirror))
+                            .build()
+                            .map_err(|e| RepoError::Dynamo(e.to_string()))?,
+                    )
+                    .build(),
+                TransactWriteItem::builder()
+                    .update(
+                        Update::builder()
+                            .table_name(self.db.table_name())
+                            .key("PK", AttributeValue::S(format!("USER#{}", user.user_id)))
+                            .key("SK", AttributeValue::S("PROFILE".into()))
+                            .update_expression("SET search_revision = :next_revision")
+                            .condition_expression(condition)
+                            .expression_attribute_values(
+                                ":revision",
+                                AttributeValue::N(revision.to_string()),
+                            )
+                            .expression_attribute_values(
+                                ":next_revision",
+                                AttributeValue::N((revision + 1).to_string()),
+                            )
+                            .build()
+                            .map_err(|e| RepoError::Dynamo(e.to_string()))?,
+                    )
+                    .build(),
+            ];
+            match self.db.transact_write(transaction).await {
+                Ok(()) => return Ok(()),
+                Err(e) if e.to_string().contains("TransactionCanceledException") => continue,
+                Err(e) => return Err(RepoError::Dynamo(e.to_string())),
+            }
+        }
+        Err(RepoError::Dynamo(
+            "concurrent user search revision changes; retry member add".into(),
+        ))
     }
 
     /// Get a specific member's role in a workspace.
@@ -181,47 +276,243 @@ impl WorkspaceRepo {
     /// Used by `/users/search` to workspace-scope directory
     /// enumeration: intersect the caller's workspaces with each
     /// candidate hit's workspaces, drop non-overlapping.
-    pub async fn list_workspaces_for_user(
-        &self,
-        user_id: &str,
-    ) -> Result<Vec<String>, RepoError> {
-        let result = self
-            .db
-            .inner()
-            .query()
-            .table_name(self.db.table_name())
-            .index_name("GSI4-user-created")
-            .key_condition_expression("user_id_gsi = :uid")
-            .expression_attribute_values(":uid", AttributeValue::S(user_id.to_string()))
-            .send()
-            .await
-            .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
-
-        let items = result.items.unwrap_or_default();
+    pub async fn list_workspaces_for_user(&self, user_id: &str) -> Result<Vec<String>, RepoError> {
         let mut out = Vec::new();
-        for item in items {
-            let sk = item
-                .get("SK")
-                .and_then(|v| v.as_s().ok())
-                .cloned()
-                .unwrap_or_default();
-            if let Some(rest) = sk.strip_prefix("MEMBER#") {
-                let _ = rest;
-                let pk = item
-                    .get("PK")
+        let mut last_key = None;
+        loop {
+            let mut request = self
+                .db
+                .inner()
+                .query()
+                .table_name(self.db.table_name())
+                .index_name("GSI4-user-created")
+                .key_condition_expression("user_id_gsi = :uid")
+                .expression_attribute_values(":uid", AttributeValue::S(user_id.to_string()));
+            if let Some(key) = last_key.take() {
+                request = request.set_exclusive_start_key(Some(key));
+            }
+            let page = request
+                .send()
+                .await
+                .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+            for item in page.items.unwrap_or_default() {
+                let sk = item
+                    .get("SK")
                     .and_then(|v| v.as_s().ok())
                     .cloned()
                     .unwrap_or_default();
-                if let Some(ws_id) = pk.strip_prefix("WORKSPACE#") {
-                    out.push(ws_id.to_string());
+                if let Some(rest) = sk.strip_prefix("MEMBER#") {
+                    let _ = rest;
+                    let pk = item
+                        .get("PK")
+                        .and_then(|v| v.as_s().ok())
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(ws_id) = pk.strip_prefix("WORKSPACE#") {
+                        out.push(ws_id.to_string());
+                    }
                 }
+            }
+            match page.last_evaluated_key {
+                Some(key) => last_key = Some(key),
+                None => break,
             }
         }
         Ok(out)
     }
 
+    /// Strong base-table mirror of canonical membership, used when a
+    /// workspace grant must be visible immediately to directory search.
+    pub async fn list_workspaces_for_user_consistent(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<String>, RepoError> {
+        let items = self
+            .db
+            .query_consistent(&format!("USER#{user_id}"), Some("WORKSPACE#"))
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        let mut result = Vec::new();
+        for item in items {
+            if let Ok(sk) = get_s(&item, "SK") {
+                if let Some(workspace_id) = sk.strip_prefix("WORKSPACE#") {
+                    // Backfill may leave an orphan mirror if removal races
+                    // its scan. Canonical membership remains authoritative.
+                    if self
+                        .db
+                        .get_item_consistent(
+                            &format!("WORKSPACE#{workspace_id}"),
+                            &format!("MEMBER#{user_id}"),
+                        )
+                        .await
+                        .map_err(|e| RepoError::Dynamo(e.to_string()))?
+                        .is_some()
+                    {
+                        result.push(workspace_id.to_string());
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Repair reverse edges and scoped postings for pre-index memberships.
+    pub async fn backfill_user_membership_search_index(
+        &self,
+        users: &crate::repo::user_repo::UserRepo,
+    ) -> Result<(), RepoError> {
+        let mut last_key = None;
+        loop {
+            let mut request = self
+                .db
+                .inner()
+                .scan()
+                .table_name(self.db.table_name())
+                .filter_expression("begins_with(SK, :member)")
+                .expression_attribute_values(":member", AttributeValue::S("MEMBER#".into()));
+            if let Some(key) = last_key.take() {
+                request = request.set_exclusive_start_key(Some(key));
+            }
+            let page = request
+                .send()
+                .await
+                .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+            for item in page.items.unwrap_or_default() {
+                let pk = get_s(&item, "PK")?;
+                let sk = get_s(&item, "SK")?;
+                let (Some(workspace_id), Some(user_id)) =
+                    (pk.strip_prefix("WORKSPACE#"), sk.strip_prefix("MEMBER#"))
+                else {
+                    continue;
+                };
+                let mut repaired_or_removed = false;
+                for _ in 0..8 {
+                    if self
+                        .db
+                        .get_item_consistent(&pk, &sk)
+                        .await
+                        .map_err(|e| RepoError::Dynamo(e.to_string()))?
+                        .is_none()
+                    {
+                        repaired_or_removed = true;
+                        break;
+                    }
+                    let Some((user, revision)) =
+                        users.get_with_search_revision_consistent(user_id).await?
+                    else {
+                        return Err(RepoError::Dynamo(format!(
+                            "membership references missing user during search backfill: {workspace_id}/{user_id}"
+                        )));
+                    };
+                    if self
+                        .backfill_member_search_edge_once(users, workspace_id, &user, revision)
+                        .await?
+                    {
+                        repaired_or_removed = true;
+                        break;
+                    }
+                }
+                // A persistent conflict must not let the completeness marker
+                // advance. It can be retried by rerunning the migration.
+                if !repaired_or_removed {
+                    return Err(RepoError::Dynamo(format!(
+                        "membership edge remained unindexed after retries: {workspace_id}/{user_id}"
+                    )));
+                }
+            }
+            match page.last_evaluated_key {
+                Some(key) => last_key = Some(key),
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// One backfill attempt against an observed profile revision. `false`
+    /// means a concurrent rename/grant changed the profile or the member was
+    /// removed; the caller rereads source and retries. Kept public so the
+    /// stale-snapshot E2E test can force the otherwise rare interleaving.
+    pub async fn backfill_member_search_edge_once(
+        &self,
+        users: &crate::repo::user_repo::UserRepo,
+        workspace_id: &str,
+        user: &User,
+        revision: i64,
+    ) -> Result<bool, RepoError> {
+        users
+            .index_user_snapshot_in_workspace(workspace_id, user)
+            .await?;
+        let user_id = &user.user_id;
+        let mirror = HashMap::from([
+            ("PK".into(), AttributeValue::S(format!("USER#{user_id}"))),
+            (
+                "SK".into(),
+                AttributeValue::S(format!("WORKSPACE#{workspace_id}")),
+            ),
+            (
+                "workspace_id".into(),
+                AttributeValue::S(workspace_id.to_string()),
+            ),
+        ]);
+        let condition = if revision == 0 {
+            "attribute_exists(PK) AND (attribute_not_exists(search_revision) OR search_revision = :revision)"
+        } else {
+            "attribute_exists(PK) AND search_revision = :revision"
+        };
+        let transaction = vec![
+            TransactWriteItem::builder()
+                .condition_check(
+                    ConditionCheck::builder()
+                        .table_name(self.db.table_name())
+                        .key("PK", AttributeValue::S(format!("WORKSPACE#{workspace_id}")))
+                        .key("SK", AttributeValue::S(format!("MEMBER#{user_id}")))
+                        .condition_expression("attribute_exists(PK)")
+                        .build()
+                        .map_err(|e| RepoError::Dynamo(e.to_string()))?,
+                )
+                .build(),
+            TransactWriteItem::builder()
+                .put(
+                    Put::builder()
+                        .table_name(self.db.table_name())
+                        .set_item(Some(mirror))
+                        .build()
+                        .map_err(|e| RepoError::Dynamo(e.to_string()))?,
+                )
+                .build(),
+            TransactWriteItem::builder()
+                .update(
+                    Update::builder()
+                        .table_name(self.db.table_name())
+                        .key("PK", AttributeValue::S(format!("USER#{user_id}")))
+                        .key("SK", AttributeValue::S("PROFILE".into()))
+                        .update_expression("SET search_revision = :next_revision")
+                        .condition_expression(condition)
+                        .expression_attribute_values(
+                            ":revision",
+                            AttributeValue::N(revision.to_string()),
+                        )
+                        .expression_attribute_values(
+                            ":next_revision",
+                            AttributeValue::N((revision + 1).to_string()),
+                        )
+                        .build()
+                        .map_err(|e| RepoError::Dynamo(e.to_string()))?,
+                )
+                .build(),
+        ];
+        match self.db.transact_write(transaction).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.to_string().contains("TransactionCanceledException") => Ok(false),
+            Err(e) => Err(RepoError::Dynamo(e.to_string())),
+        }
+    }
+
     /// List all members of a workspace.
-    pub async fn list_members(&self, workspace_id: &str) -> Result<Vec<WorkspaceMember>, RepoError> {
+    pub async fn list_members(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<WorkspaceMember>, RepoError> {
         let pk = format!("WORKSPACE#{workspace_id}");
         let items = self
             .db
@@ -239,18 +530,54 @@ impl WorkspaceRepo {
     pub async fn remove_member(&self, workspace_id: &str, user_id: &str) -> Result<(), RepoError> {
         let pk = format!("WORKSPACE#{workspace_id}");
         let sk = format!("MEMBER#{user_id}");
+        let key = |pk: String, sk: String| {
+            HashMap::from([
+                ("PK".into(), AttributeValue::S(pk)),
+                ("SK".into(), AttributeValue::S(sk)),
+            ])
+        };
+        let transaction = vec![
+            TransactWriteItem::builder()
+                .delete(
+                    Delete::builder()
+                        .table_name(self.db.table_name())
+                        .set_key(Some(key(pk, sk)))
+                        .build()
+                        .map_err(|e| RepoError::Dynamo(e.to_string()))?,
+                )
+                .build(),
+            TransactWriteItem::builder()
+                .delete(
+                    Delete::builder()
+                        .table_name(self.db.table_name())
+                        .set_key(Some(key(
+                            format!("USER#{user_id}"),
+                            format!("WORKSPACE#{workspace_id}"),
+                        )))
+                        .build()
+                        .map_err(|e| RepoError::Dynamo(e.to_string()))?,
+                )
+                .build(),
+        ];
         self.db
-            .delete_item(&pk, &sk)
+            .transact_write(transaction)
             .await
-            .map_err(|e| RepoError::Dynamo(e.to_string()))
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        Ok(())
     }
 }
 
 fn workspace_to_item(ws: &Workspace) -> HashMap<String, AttributeValue> {
     let mut item = HashMap::new();
-    item.insert("workspace_id".to_string(), AttributeValue::S(ws.workspace_id.clone()));
+    item.insert(
+        "workspace_id".to_string(),
+        AttributeValue::S(ws.workspace_id.clone()),
+    );
     item.insert("name".to_string(), AttributeValue::S(ws.name.clone()));
-    item.insert("owner_id".to_string(), AttributeValue::S(ws.owner_id.clone()));
+    item.insert(
+        "owner_id".to_string(),
+        AttributeValue::S(ws.owner_id.clone()),
+    );
     // `mfa_required` written conditionally — pre-M-E3 rows didn't
     // have the attribute, and an explicit `false` would needlessly
     // bloat every row. `workspace_from_item` defaults absent values
@@ -258,8 +585,14 @@ fn workspace_to_item(ws: &Workspace) -> HashMap<String, AttributeValue> {
     if ws.mfa_required {
         item.insert("mfa_required".to_string(), AttributeValue::Bool(true));
     }
-    item.insert("created_at".to_string(), AttributeValue::N(ws.created_at.to_string()));
-    item.insert("updated_at".to_string(), AttributeValue::N(ws.updated_at.to_string()));
+    item.insert(
+        "created_at".to_string(),
+        AttributeValue::N(ws.created_at.to_string()),
+    );
+    item.insert(
+        "updated_at".to_string(),
+        AttributeValue::N(ws.updated_at.to_string()),
+    );
     item
 }
 
@@ -356,8 +689,14 @@ mod tests {
                     .to_string(),
             ),
         );
-        item.insert("joined_at".to_string(), AttributeValue::N(member.joined_at.to_string()));
-        item.insert("user_id".to_string(), AttributeValue::S(member.user_id.clone()));
+        item.insert(
+            "joined_at".to_string(),
+            AttributeValue::N(member.joined_at.to_string()),
+        );
+        item.insert(
+            "user_id".to_string(),
+            AttributeValue::S(member.user_id.clone()),
+        );
         item
     }
 
@@ -367,7 +706,11 @@ mod tests {
         // member_from_item parses it back the same way. All three
         // tiers must survive — losing Owner/Admin on read would
         // silently demote a workspace's administration.
-        for role in [WorkspaceRole::Owner, WorkspaceRole::Admin, WorkspaceRole::Member] {
+        for role in [
+            WorkspaceRole::Owner,
+            WorkspaceRole::Admin,
+            WorkspaceRole::Member,
+        ] {
             let back = member_from_item(&member_item(&role), "ws-1")
                 .unwrap_or_else(|e| panic!("roundtrip failed for {role:?}: {e}"));
             assert_eq!(back.role, role);
@@ -380,7 +723,10 @@ mod tests {
     #[test]
     fn member_unknown_role_string_errors() {
         let mut item = member_item(&WorkspaceRole::Member);
-        item.insert("role".to_string(), AttributeValue::S("superowner".to_string()));
+        item.insert(
+            "role".to_string(),
+            AttributeValue::S("superowner".to_string()),
+        );
         let err = member_from_item(&item, "ws-1").expect_err("unknown role must error");
         match err {
             RepoError::MissingField(msg) => {

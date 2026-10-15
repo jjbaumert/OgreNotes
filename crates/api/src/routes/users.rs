@@ -3,9 +3,9 @@
 use axum::extract::{Query, State};
 use axum::routing::{get, put};
 use axum::{Json, Router};
+use ogrenotes_storage::models::NotifEmailPref;
 use ogrenotes_storage::models::security_audit::SecurityAuditAction;
 use ogrenotes_storage::models::user::{UiPrefs, User, UserStatus};
-use ogrenotes_storage::models::NotifEmailPref;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
@@ -225,7 +225,10 @@ async fn put_profile(
         super::audit::record_security_event(
             &state,
             &user_id,
-            SecurityAuditAction::ProfileUpdated { name_changed, avatar_changed },
+            SecurityAuditAction::ProfileUpdated {
+                name_changed,
+                avatar_changed,
+            },
         );
 
         // Apply the change onto the already-loaded row so the response
@@ -277,7 +280,11 @@ fn build_status(req: SetStatusRequest) -> Option<UserStatus> {
         .map(|e| e.trim().to_string())
         .filter(|e| !e.is_empty())
         .map(|e| super::auth::truncate_chars(e, MAX_STATUS_EMOJI_LEN));
-    Some(UserStatus { text, emoji, expires_at: req.expires_at })
+    Some(UserStatus {
+        text,
+        emoji,
+        expires_at: req.expires_at,
+    })
 }
 
 /// PUT /users/me/status -- set or clear the caller's own status. Not
@@ -446,7 +453,9 @@ struct SearchResponse {
 /// the error itself would be an enumeration oracle.
 async fn search_users(
     State(state): State<AppState>,
-    AuthUser { user_id, is_admin, .. }: AuthUser,
+    AuthUser {
+        user_id, is_admin, ..
+    }: AuthUser,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<SearchResponse>, ApiError> {
     // gap-002 from the post-hardening audit — the picker's 250 ms
@@ -465,6 +474,14 @@ async fn search_users(
     )
     .await?;
 
+    if state.config.user_search_index_reads_enabled {
+        state
+            .user_repo
+            .require_search_index_ready()
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
+
     // Resolve caller's workspace set once per request (admin
     // callers skip). Empty set = user in no workspace → all
     // non-admin searches return empty. That's the desired
@@ -473,11 +490,18 @@ async fn search_users(
     let caller_workspaces: Option<std::collections::HashSet<String>> = if is_admin {
         None
     } else {
-        let ws = state
-            .workspace_repo
-            .list_workspaces_for_user(&user_id)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let ws = if state.config.user_search_index_reads_enabled {
+            state
+                .workspace_repo
+                .list_workspaces_for_user_consistent(&user_id)
+                .await
+        } else {
+            state
+                .workspace_repo
+                .list_workspaces_for_user(&user_id)
+                .await
+        }
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
         Some(ws.into_iter().collect())
     };
 
@@ -489,12 +513,8 @@ async fn search_users(
         }
         return match state.user_repo.get_by_email(&email).await {
             Ok(Some(user)) => {
-                if !shares_workspace_with_caller(
-                    &state,
-                    caller_workspaces.as_ref(),
-                    &user.user_id,
-                )
-                .await?
+                if !shares_workspace_with_caller(&state, caller_workspaces.as_ref(), &user.user_id)
+                    .await?
                 {
                     // Non-shared → indistinguishable from "not found"
                     // to keep the endpoint from doubling as an
@@ -520,16 +540,29 @@ async fn search_users(
         if q.is_empty() {
             return Ok(Json(SearchResponse { users: Vec::new() }));
         }
-        return match state.user_repo.search_users(&q).await {
+        let result = if state.config.user_search_index_reads_enabled {
+            state
+                .user_repo
+                .search_users_scoped(
+                    &q,
+                    caller_workspaces.as_ref(),
+                    (!is_admin).then_some(user_id.as_str()),
+                )
+                .await
+        } else {
+            state.user_repo.search_users_legacy(&q).await
+        };
+        return match result {
             Ok(users) => {
                 let mut out = Vec::with_capacity(users.len());
                 for u in users {
-                    if shares_workspace_with_caller(
-                        &state,
-                        caller_workspaces.as_ref(),
-                        &u.user_id,
-                    )
-                    .await?
+                    if state.config.user_search_index_reads_enabled
+                        || shares_workspace_with_caller(
+                            &state,
+                            caller_workspaces.as_ref(),
+                            &u.user_id,
+                        )
+                        .await?
                     {
                         out.push(SearchResult {
                             user_id: u.user_id,
@@ -564,11 +597,18 @@ async fn shares_workspace_with_caller(
     if caller_ws.is_empty() {
         return Ok(false);
     }
-    let hit_ws = state
-        .workspace_repo
-        .list_workspaces_for_user(hit_user_id)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let hit_ws = if state.config.user_search_index_reads_enabled {
+        state
+            .workspace_repo
+            .list_workspaces_for_user_consistent(hit_user_id)
+            .await
+    } else {
+        state
+            .workspace_repo
+            .list_workspaces_for_user(hit_user_id)
+            .await
+    }
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(sets_intersect(caller_ws, &hit_ws))
 }
 
@@ -641,7 +681,11 @@ mod tests {
         assert!(validate_profile_patch(patch(None, Some("ftp://x/a.png"))).is_err());
     }
 
-    fn status_req(text: Option<&str>, emoji: Option<&str>, expires_at: Option<i64>) -> SetStatusRequest {
+    fn status_req(
+        text: Option<&str>,
+        emoji: Option<&str>,
+        expires_at: Option<i64>,
+    ) -> SetStatusRequest {
         SetStatusRequest {
             text: text.map(str::to_string),
             emoji: emoji.map(str::to_string),
@@ -705,8 +749,7 @@ mod tests {
 
     #[test]
     fn intersect_hit_membership_alone_returns_false() {
-        let caller: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let caller: std::collections::HashSet<String> = std::collections::HashSet::new();
         let hit = vec!["ws-2".into()];
         assert!(!sets_intersect(&caller, &hit));
     }

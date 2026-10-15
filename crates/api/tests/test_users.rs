@@ -239,6 +239,351 @@ async fn test_search_by_query() {
     app.cleanup().await;
 }
 
+/// A global result cap used to fill with users from unrelated workspaces
+/// before the route applied its access check. The index now scopes first.
+#[tokio::test]
+async fn test_substring_search_scopes_before_ten_result_limit() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let (searcher_id, token) = app.create_user("directory-searcher@test.com").await;
+    for i in 0..12 {
+        app.create_user(&format!("crowded-needle-{i}@test.com"))
+            .await;
+    }
+    let (target_id, _) = app.create_user("crowded-needle-target@test.com").await;
+    let target_ws = app
+        .state
+        .user_repo
+        .get_by_id(&target_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .default_workspace_id
+        .unwrap();
+    app.state
+        .workspace_repo
+        .add_member(&ogrenotes_storage::models::workspace::WorkspaceMember {
+            workspace_id: target_ws,
+            user_id: searcher_id,
+            role: ogrenotes_storage::models::WorkspaceRole::Member,
+            joined_at: 0,
+        })
+        .await
+        .unwrap();
+
+    let (status, json) = app
+        .json_request(
+            Method::GET,
+            "/api/v1/users/search?q=needle",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    let users = json["users"].as_array().unwrap();
+    assert_eq!(
+        users.len(),
+        1,
+        "workspace scope must precede the result limit: {json}"
+    );
+    assert_eq!(users[0]["email"], "crowded-needle-target@test.com");
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_substring_index_tracks_name_and_membership_changes() {
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let (owner_id, owner_token) = app.create_user("index-owner@test.com").await;
+    let (member_id, member_token) = app.create_user("index-member@test.com").await;
+    let workspace_id = app
+        .state
+        .user_repo
+        .get_by_id(&owner_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .default_workspace_id
+        .unwrap();
+    app.state
+        .workspace_repo
+        .add_member(&ogrenotes_storage::models::workspace::WorkspaceMember {
+            workspace_id: workspace_id.clone(),
+            user_id: member_id.clone(),
+            role: ogrenotes_storage::models::WorkspaceRole::Member,
+            joined_at: 0,
+        })
+        .await
+        .unwrap();
+
+    let (status, _) = app
+        .json_request(
+            Method::PUT,
+            "/api/v1/users/me",
+            Some(&owner_token),
+            Some(serde_json::json!({"name": "Quasarflame"})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (_, found) = app
+        .json_request(
+            Method::GET,
+            "/api/v1/users/search?q=asarfl",
+            Some(&member_token),
+            None,
+        )
+        .await;
+    assert_eq!(found["users"][0]["userId"], owner_id);
+
+    // The caller's newly granted workspace must be visible immediately from
+    // the strongly consistent reverse edge, without waiting for GSI4.
+    app.state
+        .workspace_repo
+        .remove_member(&workspace_id, &member_id)
+        .await
+        .unwrap();
+    let (_, revoked) = app
+        .json_request(
+            Method::GET,
+            "/api/v1/users/search?q=asarfl",
+            Some(&member_token),
+            None,
+        )
+        .await;
+    assert!(revoked["users"].as_array().unwrap().is_empty());
+    let (_, revoked_exact) = app
+        .json_request(
+            Method::GET,
+            "/api/v1/users/search?email=index-owner@test.com",
+            Some(&member_token),
+            None,
+        )
+        .await;
+    assert!(revoked_exact["users"].as_array().unwrap().is_empty());
+    app.cleanup().await;
+}
+
+/// Every overlapping name edit and grant must end with postings for the
+/// committed name in the newly granted workspace. The two tasks start at the
+/// same barrier to exercise the profile-revision retry path.
+#[tokio::test]
+async fn test_substring_concurrent_name_edit_and_workspace_grant() {
+    use ogrenotes_storage::models::{WorkspaceRole, workspace::WorkspaceMember};
+    use std::sync::Arc;
+
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let (target_id, _) = app.create_user("overlap-target@test.com").await;
+    for i in 0..4 {
+        let (owner_id, owner_token) = app
+            .create_user(&format!("overlap-owner-{i}@test.com"))
+            .await;
+        let workspace_id = app
+            .state
+            .user_repo
+            .get_by_id(&owner_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .default_workspace_id
+            .unwrap();
+        let next_name = format!("Concurrencyword{i}");
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let update = async {
+            barrier.wait().await;
+            app.state
+                .user_repo
+                .update(&target_id, Some(&next_name), None, i as i64 + 1)
+                .await
+        };
+        let grant = async {
+            barrier.wait().await;
+            app.state
+                .workspace_repo
+                .add_member(&WorkspaceMember {
+                    workspace_id: workspace_id.clone(),
+                    user_id: target_id.clone(),
+                    role: WorkspaceRole::Member,
+                    joined_at: i as i64 + 1,
+                })
+                .await
+        };
+        let joined = async {
+            barrier.wait().await;
+        };
+        let (updated, granted, _) = tokio::join!(update, grant, joined);
+        updated.unwrap();
+        granted.unwrap();
+        let (status, result) = app
+            .json_request(
+                Method::GET,
+                &format!("/api/v1/users/search?q=currencyword{i}"),
+                Some(&owner_token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{result}");
+        assert!(
+            result["users"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|u| u["userId"] == target_id),
+            "concurrent name/grant omitted committed result: {result}"
+        );
+    }
+    app.cleanup().await;
+}
+
+/// Reproduce the migration race deterministically: an old member has no
+/// reverse edge, rename commits, then an in-flight backfill tries to publish
+/// its old profile snapshot. The stale edge transaction must be refused.
+#[tokio::test]
+async fn test_substring_backfill_retries_stale_name_snapshot() {
+    use aws_sdk_dynamodb::types::AttributeValue;
+
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let (owner_id, owner_token) = app.create_user("legacy-race-owner@test.com").await;
+    let (target_id, _) = app.create_user("legacy-race-target@test.com").await;
+    let workspace_id = app
+        .state
+        .user_repo
+        .get_by_id(&owner_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .default_workspace_id
+        .unwrap();
+    app.state
+        .user_repo
+        .update(&target_id, Some("Oldmigrationname"), None, 1)
+        .await
+        .unwrap();
+
+    // Simulate a canonical membership written before reverse edges existed.
+    app.dynamo_client()
+        .put_item()
+        .table_name(&app.table_name)
+        .item("PK", AttributeValue::S(format!("WORKSPACE#{workspace_id}")))
+        .item("SK", AttributeValue::S(format!("MEMBER#{target_id}")))
+        .item("user_id", AttributeValue::S(target_id.clone()))
+        .item("user_id_gsi", AttributeValue::S(target_id.clone()))
+        .item("role", AttributeValue::S("member".into()))
+        .item("joined_at", AttributeValue::N("1".into()))
+        .item("created_at", AttributeValue::N("1".into()))
+        .send()
+        .await
+        .unwrap();
+    let (stale_user, stale_revision) = app
+        .state
+        .user_repo
+        .get_with_search_revision_consistent(&target_id)
+        .await
+        .unwrap()
+        .unwrap();
+    app.state
+        .user_repo
+        .update(&target_id, Some("Newmigrationname"), None, 2)
+        .await
+        .unwrap();
+    assert!(
+        !app.state
+            .workspace_repo
+            .backfill_member_search_edge_once(
+                &app.state.user_repo,
+                &workspace_id,
+                &stale_user,
+                stale_revision,
+            )
+            .await
+            .unwrap(),
+        "old-name backfill must lose the profile revision race"
+    );
+
+    // Until the full migration repairs the edge, this constructed legacy
+    // state reproduces the missing result from the original implementation.
+    let (_, before) = app
+        .json_request(
+            Method::GET,
+            "/api/v1/users/search?q=newmigrationname",
+            Some(&owner_token),
+            None,
+        )
+        .await;
+    assert!(before["users"].as_array().unwrap().is_empty());
+    app.state
+        .user_repo
+        .backfill_user_search_index()
+        .await
+        .unwrap();
+    let (status, after) = app
+        .json_request(
+            Method::GET,
+            "/api/v1/users/search?q=newmigrationname",
+            Some(&owner_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{after}");
+    assert!(
+        after["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["userId"] == target_id),
+        "backfill must publish the committed name: {after}"
+    );
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_substring_search_requires_completed_backfill() {
+    use aws_sdk_dynamodb::types::AttributeValue;
+
+    common::require_infra!();
+    let app = common::TestApp::new().await;
+    let token = app.create_user_token("backfill-query@test.com").await;
+    app.dynamo_client()
+        .delete_item()
+        .table_name(&app.table_name)
+        .key("PK", AttributeValue::S("META#USER_SEARCH_INDEX".into()))
+        .key("SK", AttributeValue::S("COMPLETE".into()))
+        .send()
+        .await
+        .unwrap();
+
+    let (status, _) = app
+        .json_request(
+            Method::GET,
+            "/api/v1/users/search?q=backfill-query",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 500,
+        "an unbuilt index must not silently return no users"
+    );
+
+    app.state
+        .user_repo
+        .backfill_user_search_index()
+        .await
+        .unwrap();
+    let (status, json) = app
+        .json_request(
+            Method::GET,
+            "/api/v1/users/search?q=backfill-query",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(json["users"][0]["email"], "backfill-query@test.com");
+    app.cleanup().await;
+}
+
 #[tokio::test]
 async fn test_search_no_params() {
     common::require_infra!();

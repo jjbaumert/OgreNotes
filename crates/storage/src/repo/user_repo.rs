@@ -1,11 +1,12 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
-use aws_sdk_dynamodb::types::AttributeValue;
-use std::collections::HashMap;
+use aws_sdk_dynamodb::types::{AttributeValue, PutRequest, WriteRequest};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 
 use crate::dynamo::DynamoClient;
 use crate::models::user::{AskPolicy, EncryptedString, User, UserRole};
-use crate::repo::{RepoError, get_s, get_n};
+use crate::repo::{RepoError, get_n, get_s};
 
 /// Repository for user operations.
 pub struct UserRepo {
@@ -19,6 +20,9 @@ impl UserRepo {
 
     /// Create a new user record.
     pub async fn create(&self, user: &User) -> Result<(), RepoError> {
+        // Postings must be durable before PROFILE becomes visible. Failed
+        // posting writes leave only harmless orphan rows and abort create.
+        self.index_user_global(user).await?;
         let mut item = user_to_item(user);
         item.insert("PK".to_string(), AttributeValue::S(user.pk()));
         item.insert("SK".to_string(), AttributeValue::S(User::sk().to_string()));
@@ -64,9 +68,18 @@ impl UserRepo {
     async fn put_email_pointer(&self, email: &str, user_id: &str) -> Result<(), RepoError> {
         let email_lc = email.trim().to_lowercase();
         let mut item = HashMap::new();
-        item.insert("PK".to_string(), AttributeValue::S(email_pointer_pk(&email_lc)));
-        item.insert("SK".to_string(), AttributeValue::S(EMAIL_POINTER_SK.to_string()));
-        item.insert("user_id".to_string(), AttributeValue::S(user_id.to_string()));
+        item.insert(
+            "PK".to_string(),
+            AttributeValue::S(email_pointer_pk(&email_lc)),
+        );
+        item.insert(
+            "SK".to_string(),
+            AttributeValue::S(EMAIL_POINTER_SK.to_string()),
+        );
+        item.insert(
+            "user_id".to_string(),
+            AttributeValue::S(user_id.to_string()),
+        );
         self.db
             .put_item(item)
             .await
@@ -86,6 +99,39 @@ impl UserRepo {
             Some(item) => Ok(Some(user_from_item(&item)?)),
             None => Ok(None),
         }
+    }
+
+    /// Strong source read for validating search-index candidates and
+    /// prewriting a name change before the PROFILE mutation.
+    pub async fn get_by_id_consistent(&self, user_id: &str) -> Result<Option<User>, RepoError> {
+        Ok(self
+            .get_with_search_revision_consistent(user_id)
+            .await?
+            .map(|(user, _)| user))
+    }
+
+    /// The revision serializes name changes with workspace grants. Both
+    /// prewrite postings based on this source snapshot, then conditionally
+    /// advance the revision in their authoritative source mutation.
+    pub async fn get_with_search_revision_consistent(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<(User, i64)>, RepoError> {
+        let item = self
+            .db
+            .get_item_consistent(&format!("USER#{user_id}"), User::sk())
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        item.as_ref()
+            .map(|item| {
+                let revision = if item.contains_key("search_revision") {
+                    get_n(item, "search_revision")?
+                } else {
+                    0
+                };
+                Ok((user_from_item(item)?, revision))
+            })
+            .transpose()
     }
 
     /// Batch-fetch users by id in one chunked `BatchGetItem` round-trip
@@ -162,7 +208,8 @@ impl UserRepo {
                         attempt += 1;
                         // Linear backoff so a throttled table gets a chance
                         // to recover instead of five back-to-back retries.
-                        tokio::time::sleep(std::time::Duration::from_millis(50 * attempt as u64)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(50 * attempt as u64))
+                            .await;
                         request_items = unprocessed;
                     }
                     _ => break,
@@ -231,8 +278,14 @@ impl UserRepo {
         run_id: Option<&str>,
     ) -> Result<(), RepoError> {
         let mut item = HashMap::from([
-            ("PK".to_string(), AttributeValue::S(EMAIL_POINTERS_COMPLETE_PK.to_string())),
-            ("SK".to_string(), AttributeValue::S(EMAIL_POINTERS_COMPLETE_SK.to_string())),
+            (
+                "PK".to_string(),
+                AttributeValue::S(EMAIL_POINTERS_COMPLETE_PK.to_string()),
+            ),
+            (
+                "SK".to_string(),
+                AttributeValue::S(EMAIL_POINTERS_COMPLETE_SK.to_string()),
+            ),
             ("state".to_string(), AttributeValue::S(state.to_string())),
         ]);
         if let Some(run_id) = run_id {
@@ -307,7 +360,8 @@ impl UserRepo {
         // drops our run id), and the conditional write at the end then
         // refuses to mark the table complete.
         let run_id = ogrenotes_common::id::new_id();
-        self.put_email_pointers_marker(MARKER_BACKFILLING, Some(&run_id)).await?;
+        self.put_email_pointers_marker(MARKER_BACKFILLING, Some(&run_id))
+            .await?;
 
         let mut scanned = 0usize;
         let mut written = 0usize;
@@ -355,8 +409,14 @@ impl UserRepo {
             .inner()
             .put_item()
             .table_name(self.db.table_name())
-            .item("PK", AttributeValue::S(EMAIL_POINTERS_COMPLETE_PK.to_string()))
-            .item("SK", AttributeValue::S(EMAIL_POINTERS_COMPLETE_SK.to_string()))
+            .item(
+                "PK",
+                AttributeValue::S(EMAIL_POINTERS_COMPLETE_PK.to_string()),
+            )
+            .item(
+                "SK",
+                AttributeValue::S(EMAIL_POINTERS_COMPLETE_SK.to_string()),
+            )
             .item("state", AttributeValue::S(MARKER_COMPLETE.to_string()))
             .condition_expression("run_id = :run")
             .expression_attribute_values(":run", AttributeValue::S(run_id))
@@ -385,10 +445,7 @@ impl UserRepo {
     /// helper). Returns `None` when no row has this external_id —
     /// callers (SAML JIT, SCIM provisioning) typically interpret
     /// that as "fall through to create-new-user."
-    pub async fn get_by_external_id(
-        &self,
-        external_id: &str,
-    ) -> Result<Option<User>, RepoError> {
+    pub async fn get_by_external_id(&self, external_id: &str) -> Result<Option<User>, RepoError> {
         let items = self
             .db
             .query_index(
@@ -415,73 +472,334 @@ impl UserRepo {
         Ok(None)
     }
 
-    /// Search users by email or name substring (case-insensitive).
-    /// Returns up to `MAX_MATCHES` matches.
-    ///
-    /// This is a `Scan` with a post-read `contains()` filter — DynamoDB
-    /// can't index a substring. It stops early once enough matches are
-    /// collected, but a query that matches *few or no* users would
-    /// otherwise paginate the whole table (the filter discards most
-    /// items server-side), so cost scaled with the entire user set, not
-    /// the result (issue #35). A **scanned-items budget** bounds that:
-    /// once `MAX_SCANNED_ITEMS` rows have been examined we stop and
-    /// return what we have. The budget comfortably exceeds expected
-    /// per-deployment user counts (typical workspaces are <500 members),
-    /// so real searches stay exhaustive; only a pathologically large
-    /// table is truncated to a best-effort result. The lasting fix is a
-    /// real search index (qdrant) rather than a scan — tracked in #35.
+    /// Admin/global substring search. Ordinary callers should use
+    /// `search_users_scoped` with their workspace IDs.
     pub async fn search_users(&self, query: &str) -> Result<Vec<User>, RepoError> {
-        const MAX_MATCHES: usize = 10;
-        // Cost guardrail: cap total rows examined across pages.
-        const MAX_SCANNED_ITEMS: i32 = 5000;
-        // Per-page evaluation cap so the budget is enforced at page
-        // granularity and no single page reads an unbounded slice.
-        const PAGE_LIMIT: i32 = 500;
+        self.search_users_scoped(query, None, None).await
+    }
 
+    /// Temporary read path for the writer-first index migration. This is
+    /// the pre-#35 bounded scan and retains its sparse/crowded limitations.
+    /// Remove after every deployment has enabled indexed reads.
+    pub async fn search_users_legacy(&self, query: &str) -> Result<Vec<User>, RepoError> {
+        const MAX_MATCHES: usize = 10;
+        const MAX_SCANNED_ITEMS: i32 = 5000;
+        const PAGE_LIMIT: i32 = 500;
         let query_lower = query.trim().to_lowercase();
-        let mut out: Vec<User> = Vec::new();
-        let mut scanned: i32 = 0;
+        let mut out = Vec::new();
+        let mut scanned = 0;
         let mut last_key: Option<HashMap<String, AttributeValue>> = None;
         loop {
-            let mut builder = self
+            let mut request = self
                 .db
                 .inner()
                 .scan()
                 .table_name(self.db.table_name())
                 .limit(PAGE_LIMIT)
                 .filter_expression("SK = :sk AND (contains(email, :q) OR contains(#n, :q))")
-                .expression_attribute_values(":sk", AttributeValue::S("PROFILE".to_string()))
+                .expression_attribute_values(":sk", AttributeValue::S("PROFILE".into()))
                 .expression_attribute_values(":q", AttributeValue::S(query_lower.clone()))
                 .expression_attribute_names("#n", "name");
             if let Some(key) = last_key.take() {
-                builder = builder.set_exclusive_start_key(Some(key));
+                request = request.set_exclusive_start_key(Some(key));
             }
-            let result = builder
+            let page = request
                 .send()
                 .await
                 .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
-
-            // `scanned_count` is rows *examined* (the RCU-bearing figure),
-            // not rows matched — that's exactly what the budget bounds.
-            scanned += result.scanned_count();
-
-            if let Some(items) = result.items {
-                for item in items {
-                    out.push(user_from_item(&item)?);
-                    if out.len() >= MAX_MATCHES {
-                        return Ok(out);
-                    }
+            scanned += page.scanned_count();
+            for item in page.items.unwrap_or_default() {
+                out.push(user_from_item(&item)?);
+                if out.len() == MAX_MATCHES {
+                    return Ok(out);
                 }
             }
-
-            match result.last_evaluated_key {
-                // Keep paging only while under the scan budget; otherwise
-                // return a best-effort result rather than traverse the
-                // whole table for a sparse-match query.
+            match page.last_evaluated_key {
                 Some(key) if scanned < MAX_SCANNED_ITEMS => last_key = Some(key),
                 _ => return Ok(out),
             }
         }
+    }
+
+    /// Search durable n-gram postings inside the caller's workspaces before
+    /// applying the ten-result limit. `None` is reserved for admin search.
+    /// Each posting is rechecked against the current profile and membership,
+    /// so stale derived rows cannot disclose a revoked member or old name.
+    pub async fn search_users_scoped(
+        &self,
+        query: &str,
+        workspace_ids: Option<&HashSet<String>>,
+        caller_user_id: Option<&str>,
+    ) -> Result<Vec<User>, RepoError> {
+        self.require_search_index_ready().await?;
+        const MAX_MATCHES: usize = 10;
+        const PAGE_LIMIT: i32 = 40;
+        let query_lower = query.trim().to_lowercase();
+        if query_lower.is_empty() {
+            return Ok(Vec::new());
+        }
+        let needle: String = query_lower.chars().take(3).collect();
+        let mut scopes: Vec<String> = match workspace_ids {
+            Some(ids) => ids.iter().map(|id| format!("WS#{id}")).collect(),
+            None => vec!["GLOBAL".to_string()],
+        };
+        scopes.sort();
+        let mut out: Vec<User> = Vec::new();
+        let mut seen = HashSet::new();
+        for scope in scopes {
+            let pk = search_pk(&scope, &needle);
+            let mut last_key: Option<HashMap<String, AttributeValue>> = None;
+            loop {
+                let mut request = self
+                    .db
+                    .inner()
+                    .query()
+                    .table_name(self.db.table_name())
+                    .key_condition_expression("PK = :pk")
+                    .expression_attribute_values(":pk", AttributeValue::S(pk.clone()))
+                    .consistent_read(true)
+                    .limit(PAGE_LIMIT);
+                if let Some(key) = last_key.take() {
+                    request = request.set_exclusive_start_key(Some(key));
+                }
+                let page = request
+                    .send()
+                    .await
+                    .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+                for item in page.items.unwrap_or_default() {
+                    let user_id = get_s(&item, "user_id")?;
+                    if seen.contains(&user_id) {
+                        continue;
+                    }
+                    let Some(user) = self.get_by_id_consistent(&user_id).await? else {
+                        continue;
+                    };
+                    if !user.email.to_lowercase().contains(&query_lower)
+                        && !user.name.to_lowercase().contains(&query_lower)
+                    {
+                        continue;
+                    }
+                    if let Some(ws_id) = scope.strip_prefix("WS#") {
+                        if self
+                            .db
+                            .get_item_consistent(
+                                &format!("WORKSPACE#{ws_id}"),
+                                &format!("MEMBER#{user_id}"),
+                            )
+                            .await
+                            .map_err(|e| RepoError::Dynamo(e.to_string()))?
+                            .is_none()
+                        {
+                            continue;
+                        }
+                        if let Some(caller_id) = caller_user_id {
+                            if self
+                                .db
+                                .get_item_consistent(
+                                    &format!("WORKSPACE#{ws_id}"),
+                                    &format!("MEMBER#{caller_id}"),
+                                )
+                                .await
+                                .map_err(|e| RepoError::Dynamo(e.to_string()))?
+                                .is_none()
+                            {
+                                continue;
+                            }
+                        }
+                    }
+                    seen.insert(user_id);
+                    out.push(user);
+                    if out.len() == MAX_MATCHES {
+                        return Ok(out);
+                    }
+                }
+                match page.last_evaluated_key {
+                    Some(key) => last_key = Some(key),
+                    None => break,
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Add postings for a user in the global directory. Idempotent.
+    pub async fn index_user_global(&self, user: &User) -> Result<(), RepoError> {
+        self.sync_search_scope("GLOBAL", user, true).await
+    }
+
+    pub async fn require_search_index_ready(&self) -> Result<(), RepoError> {
+        let ready = self
+            .db
+            .get_item_consistent(SEARCH_INDEX_MARKER_PK, SEARCH_INDEX_MARKER_SK)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?
+            .is_some_and(|item| get_s(&item, "state").is_ok_and(|state| state == MARKER_COMPLETE));
+        if ready {
+            Ok(())
+        } else {
+            Err(RepoError::Dynamo(
+                "user search index is not ready; run backfill_user_search_index".into(),
+            ))
+        }
+    }
+
+    /// Add postings when workspace membership is granted. The membership
+    /// itself remains authoritative at query time.
+    pub async fn index_user_in_workspace(
+        &self,
+        workspace_id: &str,
+        user_id: &str,
+    ) -> Result<(), RepoError> {
+        if let Some(user) = self.get_by_id_consistent(user_id).await? {
+            self.index_user_snapshot_in_workspace(workspace_id, &user)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn index_user_snapshot_in_workspace(
+        &self,
+        workspace_id: &str,
+        user: &User,
+    ) -> Result<(), RepoError> {
+        self.sync_search_scope(&format!("WS#{workspace_id}"), user, true)
+            .await
+    }
+
+    async fn sync_search_scope(
+        &self,
+        scope: &str,
+        user: &User,
+        include_email: bool,
+    ) -> Result<(), RepoError> {
+        let mut writes = Vec::new();
+        // Email is immutable. Renames only add name grams; rewriting email
+        // grams in every scope would multiply BatchWriteItem cost for no gain.
+        let email = if include_email {
+            user.email.as_str()
+        } else {
+            ""
+        };
+        for gram in search_grams(email, &user.name) {
+            let mut item = HashMap::new();
+            item.insert("PK".into(), AttributeValue::S(search_pk(scope, &gram)));
+            item.insert(
+                "SK".into(),
+                AttributeValue::S(format!("USER#{}", user.user_id)),
+            );
+            item.insert("user_id".into(), AttributeValue::S(user.user_id.clone()));
+            let put = PutRequest::builder()
+                .set_item(Some(item))
+                .build()
+                .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+            writes.push(WriteRequest::builder().put_request(put).build());
+        }
+        self.write_search_postings(writes).await
+    }
+
+    /// BatchWriteItem allows 25 postings per request and can return
+    /// UnprocessedItems without an error. Retry those explicitly, or search
+    /// would silently miss users under table pressure.
+    async fn write_search_postings(&self, writes: Vec<WriteRequest>) -> Result<(), RepoError> {
+        let table = self.db.table_name().to_string();
+        for chunk in writes.chunks(25) {
+            let mut pending = HashMap::from([(table.clone(), chunk.to_vec())]);
+            for attempt in 0..=5 {
+                let result = self
+                    .db
+                    .inner()
+                    .batch_write_item()
+                    .set_request_items(Some(pending))
+                    .send()
+                    .await
+                    .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+                pending = result.unprocessed_items.unwrap_or_default();
+                if pending.is_empty() {
+                    break;
+                }
+                if attempt == 5 {
+                    return Err(RepoError::Dynamo(
+                        "user search index BatchWriteItem left unprocessed postings".into(),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt + 1))).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// One-time migration and repair for the derived search postings.
+    /// Run before switching traffic to the indexed search path. Safe to rerun.
+    pub async fn backfill_user_search_index(&self) -> Result<usize, RepoError> {
+        let run_id = ogrenotes_common::id::new_id();
+        let marker = HashMap::from([
+            (
+                "PK".into(),
+                AttributeValue::S(SEARCH_INDEX_MARKER_PK.into()),
+            ),
+            (
+                "SK".into(),
+                AttributeValue::S(SEARCH_INDEX_MARKER_SK.into()),
+            ),
+            ("state".into(), AttributeValue::S(MARKER_BACKFILLING.into())),
+            ("run_id".into(), AttributeValue::S(run_id.clone())),
+        ]);
+        self.db
+            .put_item(marker)
+            .await
+            .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+        let workspace_repo = crate::repo::workspace_repo::WorkspaceRepo::new(self.db.clone());
+        let mut indexed = 0;
+        let mut last_key: Option<HashMap<String, AttributeValue>> = None;
+        loop {
+            let mut request = self
+                .db
+                .inner()
+                .scan()
+                .table_name(self.db.table_name())
+                .filter_expression("SK = :sk")
+                .expression_attribute_values(":sk", AttributeValue::S("PROFILE".into()));
+            if let Some(key) = last_key.take() {
+                request = request.set_exclusive_start_key(Some(key));
+            }
+            let page = request
+                .send()
+                .await
+                .map_err(|e| RepoError::Dynamo(e.into_service_error().to_string()))?;
+            for item in page.items.unwrap_or_default() {
+                let user = user_from_item(&item)?;
+                self.index_user_global(&user).await?;
+                indexed += 1;
+            }
+            match page.last_evaluated_key {
+                Some(key) => last_key = Some(key),
+                None => break,
+            }
+        }
+        // Scan canonical membership rows rather than the eventually
+        // consistent GSI. Writers deployed before this pass atomically create
+        // the reverse edge; this pass repairs edges for older memberships.
+        workspace_repo
+            .backfill_user_membership_search_index(self)
+            .await?;
+        self.db
+            .inner()
+            .put_item()
+            .table_name(self.db.table_name())
+            .item("PK", AttributeValue::S(SEARCH_INDEX_MARKER_PK.into()))
+            .item("SK", AttributeValue::S(SEARCH_INDEX_MARKER_SK.into()))
+            .item("state", AttributeValue::S(MARKER_COMPLETE.into()))
+            .condition_expression("run_id = :run")
+            .expression_attribute_values(":run", AttributeValue::S(run_id))
+            .send()
+            .await
+            .map_err(|e| {
+                RepoError::Dynamo(format!(
+                    "search index changed during backfill; rerun migration: {}",
+                    e.into_service_error()
+                ))
+            })?;
+        Ok(indexed)
     }
 
     /// Update a user's profile fields.
@@ -492,47 +810,118 @@ impl UserRepo {
         avatar_url: Option<Option<&str>>,
         updated_at: i64,
     ) -> Result<(), RepoError> {
-        let pk = format!("USER#{user_id}");
-        let mut expr_parts = vec!["#updated_at = :updated_at".to_string()];
-        let mut remove_parts = Vec::new();
-        let mut values = HashMap::new();
-        let mut names = HashMap::new();
+        let workspace_repo = crate::repo::workspace_repo::WorkspaceRepo::new(self.db.clone());
+        // Name edits and membership grants advance the same profile revision.
+        // If a grant races this edit, one retries and prewrites postings for
+        // the resulting name/workspace combination before committing source.
+        for _ in 0..8 {
+            let snapshot = if name.is_some() {
+                self.get_with_search_revision_consistent(user_id).await?
+            } else {
+                None
+            };
+            if let (Some((old, _)), Some(new_name)) = (&snapshot, name) {
+                let mut current = old.clone();
+                current.name = new_name.to_string();
+                self.sync_search_scope("GLOBAL", &current, false).await?;
+                for workspace_id in workspace_repo
+                    .list_workspaces_for_user_consistent(user_id)
+                    .await?
+                {
+                    self.sync_search_scope(&format!("WS#{workspace_id}"), &current, false)
+                        .await?;
+                }
+            }
+            let pk = format!("USER#{user_id}");
+            let mut expr_parts = vec!["#updated_at = :updated_at".to_string()];
+            let mut remove_parts = Vec::new();
+            let mut values = HashMap::new();
+            let mut names = HashMap::new();
 
-        names.insert("#updated_at".to_string(), "updated_at".to_string());
-        values.insert(
-            ":updated_at".to_string(),
-            AttributeValue::N(updated_at.to_string()),
-        );
+            names.insert("#updated_at".to_string(), "updated_at".to_string());
+            values.insert(
+                ":updated_at".to_string(),
+                AttributeValue::N(updated_at.to_string()),
+            );
 
-        if let Some(n) = name {
-            expr_parts.push("#name = :name".to_string());
-            names.insert("#name".to_string(), "name".to_string());
-            values.insert(":name".to_string(), AttributeValue::S(n.to_string()));
-        }
-
-        match avatar_url {
-            Some(Some(url)) => {
-                expr_parts.push("avatar_url = :avatar_url".to_string());
+            if let Some(n) = name {
+                expr_parts.push("#name = :name".to_string());
+                names.insert("#name".to_string(), "name".to_string());
+                values.insert(":name".to_string(), AttributeValue::S(n.to_string()));
+                let revision = snapshot
+                    .as_ref()
+                    .ok_or_else(|| RepoError::NotFound(format!("USER#{user_id}")))?
+                    .1;
+                expr_parts.push("search_revision = :next_revision".to_string());
                 values.insert(
-                    ":avatar_url".to_string(),
-                    AttributeValue::S(url.to_string()),
+                    ":next_revision".to_string(),
+                    AttributeValue::N((revision + 1).to_string()),
                 );
             }
-            Some(None) => {
-                remove_parts.push("avatar_url".to_string());
+
+            match avatar_url {
+                Some(Some(url)) => {
+                    expr_parts.push("avatar_url = :avatar_url".to_string());
+                    values.insert(
+                        ":avatar_url".to_string(),
+                        AttributeValue::S(url.to_string()),
+                    );
+                }
+                Some(None) => {
+                    remove_parts.push("avatar_url".to_string());
+                }
+                None => {} // Don't touch the field
             }
-            None => {} // Don't touch the field
-        }
 
-        let mut update_expr = format!("SET {}", expr_parts.join(", "));
-        if !remove_parts.is_empty() {
-            update_expr.push_str(&format!(" REMOVE {}", remove_parts.join(", ")));
-        }
+            let mut update_expr = format!("SET {}", expr_parts.join(", "));
+            if !remove_parts.is_empty() {
+                update_expr.push_str(&format!(" REMOVE {}", remove_parts.join(", ")));
+            }
 
-        self.db
-            .update_item(&pk, User::sk(), &update_expr, values, Some(names))
-            .await
-            .map_err(|e| RepoError::Dynamo(e.to_string()))
+            if let Some((_, revision)) = snapshot {
+                let condition = if revision == 0 {
+                    "attribute_exists(PK) AND (attribute_not_exists(search_revision) OR search_revision = :revision)"
+                } else {
+                    "attribute_exists(PK) AND search_revision = :revision"
+                };
+                values.insert(
+                    ":revision".to_string(),
+                    AttributeValue::N(revision.to_string()),
+                );
+                let result = self
+                    .db
+                    .inner()
+                    .update_item()
+                    .table_name(self.db.table_name())
+                    .key("PK", AttributeValue::S(pk.clone()))
+                    .key("SK", AttributeValue::S(User::sk().into()))
+                    .update_expression(update_expr)
+                    .condition_expression(condition)
+                    .set_expression_attribute_values(Some(values))
+                    .set_expression_attribute_names(Some(names))
+                    .send()
+                    .await;
+                match result {
+                    Ok(_) => return Ok(()),
+                    Err(e)
+                        if e.as_service_error()
+                            .is_some_and(|s| s.is_conditional_check_failed_exception()) =>
+                    {
+                        continue;
+                    }
+                    Err(e) => return Err(RepoError::Dynamo(e.into_service_error().to_string())),
+                }
+            } else {
+                self.db
+                    .update_item(&pk, User::sk(), &update_expr, values, Some(names))
+                    .await
+                    .map_err(|e| RepoError::Dynamo(e.to_string()))?;
+                return Ok(());
+            }
+        }
+        Err(RepoError::Dynamo(
+            "concurrent user search revision changes; retry profile update".into(),
+        ))
     }
 
     /// Bind a SCIM `externalId` / SAML NameID onto an existing user
@@ -540,11 +929,7 @@ impl UserRepo {
     /// `external_id_gsi` (the sparse-GSI hash key, so the row
     /// becomes discoverable via `get_by_external_id`). Phase 4 M-E4
     /// piece D consumer.
-    pub async fn set_external_id(
-        &self,
-        user_id: &str,
-        external_id: &str,
-    ) -> Result<(), RepoError> {
+    pub async fn set_external_id(&self, user_id: &str, external_id: &str) -> Result<(), RepoError> {
         let pk = format!("USER#{user_id}");
         let mut values = HashMap::new();
         values.insert(
@@ -747,7 +1132,11 @@ impl UserRepo {
     /// existing promote/demote call sites. New code with finer-grained
     /// role needs should call `set_role` directly.
     pub async fn set_admin(&self, user_id: &str, is_admin: bool) -> Result<(), RepoError> {
-        let role = if is_admin { UserRole::Admin } else { UserRole::User };
+        let role = if is_admin {
+            UserRole::Admin
+        } else {
+            UserRole::User
+        };
         self.set_role(user_id, role).await
     }
 
@@ -755,10 +1144,7 @@ impl UserRepo {
     pub async fn set_disabled(&self, user_id: &str, is_disabled: bool) -> Result<(), RepoError> {
         let pk = format!("USER#{user_id}");
         let mut values = HashMap::new();
-        values.insert(
-            ":val".to_string(),
-            AttributeValue::Bool(is_disabled),
-        );
+        values.insert(":val".to_string(), AttributeValue::Bool(is_disabled));
         self.db
             .update_item(&pk, User::sk(), "SET is_disabled = :val", values, None)
             .await
@@ -777,11 +1163,7 @@ impl UserRepo {
     /// derivation path in `User::ask_policy()` becomes dead
     /// code and can be deleted. Safe to remove an attribute
     /// that doesn't exist (DDB is a no-op).
-    pub async fn set_ask_policy(
-        &self,
-        user_id: &str,
-        policy: AskPolicy,
-    ) -> Result<(), RepoError> {
+    pub async fn set_ask_policy(&self, user_id: &str, policy: AskPolicy) -> Result<(), RepoError> {
         let pk = format!("USER#{user_id}");
         let mut values = HashMap::new();
         values.insert(
@@ -827,10 +1209,7 @@ impl UserRepo {
         );
 
         let expr = if let Some(sub) = subject_id {
-            values.insert(
-                ":s".to_string(),
-                AttributeValue::S(sub.to_string()),
-            );
+            values.insert(":s".to_string(), AttributeValue::S(sub.to_string()));
             "SET provider = :p, provider_subject_id = :s"
         } else {
             "SET provider = :p REMOVE provider_subject_id"
@@ -846,11 +1225,7 @@ impl UserRepo {
     /// debounced middleware — expect at most one write per user per 5
     /// minutes. The value feeds the "active in-app" suppression window
     /// used by the email notification service.
-    pub async fn update_last_active_at(
-        &self,
-        user_id: &str,
-        ts: i64,
-    ) -> Result<(), RepoError> {
+    pub async fn update_last_active_at(&self, user_id: &str, ts: i64) -> Result<(), RepoError> {
         let pk = format!("USER#{user_id}");
         let mut values = HashMap::new();
         values.insert(":ts".to_string(), AttributeValue::N(ts.to_string()));
@@ -874,7 +1249,13 @@ impl UserRepo {
             AttributeValue::S(workspace_id.to_string()),
         );
         self.db
-            .update_item(&pk, User::sk(), "SET default_workspace_id = :ws", values, None)
+            .update_item(
+                &pk,
+                User::sk(),
+                "SET default_workspace_id = :ws",
+                values,
+                None,
+            )
             .await
             .map_err(|e| RepoError::Dynamo(e.to_string()))
     }
@@ -948,6 +1329,28 @@ impl UserRepo {
 
 /// Sort key for the email→user pointer item (#36).
 const EMAIL_POINTER_SK: &str = "POINTER";
+const SEARCH_INDEX_MARKER_PK: &str = "META#USER_SEARCH_INDEX";
+const SEARCH_INDEX_MARKER_SK: &str = "COMPLETE";
+
+fn search_pk(scope: &str, gram: &str) -> String {
+    // Hash the gram so email fragments and names do not appear in keys or
+    // DynamoDB validation errors. The scope stays visible for diagnostics.
+    let digest = Sha256::digest(gram.as_bytes());
+    format!("USER_SEARCH#{scope}#{digest:x}")
+}
+
+fn search_grams(email: &str, name: &str) -> HashSet<String> {
+    let mut grams = HashSet::new();
+    for text in [email, name] {
+        let chars: Vec<char> = text.to_lowercase().chars().collect();
+        for start in 0..chars.len() {
+            for length in 1..=3.min(chars.len() - start) {
+                grams.insert(chars[start..start + length].iter().collect());
+            }
+        }
+    }
+    grams
+}
 
 /// Marker row recording whether every PROFILE has an `EMAIL#` pointer
 /// (#178). Only `state = complete` lets `get_by_email` treat a pointer miss
@@ -973,23 +1376,44 @@ fn email_pointer_pk(email_lc: &str) -> String {
 
 fn user_to_item(user: &User) -> HashMap<String, AttributeValue> {
     let mut item = HashMap::new();
-    item.insert("user_id".to_string(), AttributeValue::S(user.user_id.clone()));
+    item.insert(
+        "user_id".to_string(),
+        AttributeValue::S(user.user_id.clone()),
+    );
     item.insert("name".to_string(), AttributeValue::S(user.name.clone()));
     item.insert("email".to_string(), AttributeValue::S(user.email.clone()));
     if let Some(ref url) = user.avatar_url {
         item.insert("avatar_url".to_string(), AttributeValue::S(url.clone()));
     }
-    item.insert("home_folder_id".to_string(), AttributeValue::S(user.home_folder_id.clone()));
-    item.insert("private_folder_id".to_string(), AttributeValue::S(user.private_folder_id.clone()));
-    item.insert("trash_folder_id".to_string(), AttributeValue::S(user.trash_folder_id.clone()));
+    item.insert(
+        "home_folder_id".to_string(),
+        AttributeValue::S(user.home_folder_id.clone()),
+    );
+    item.insert(
+        "private_folder_id".to_string(),
+        AttributeValue::S(user.private_folder_id.clone()),
+    );
+    item.insert(
+        "trash_folder_id".to_string(),
+        AttributeValue::S(user.trash_folder_id.clone()),
+    );
     if let Some(ref id) = user.archive_folder_id {
-        item.insert("archive_folder_id".to_string(), AttributeValue::S(id.clone()));
+        item.insert(
+            "archive_folder_id".to_string(),
+            AttributeValue::S(id.clone()),
+        );
     }
     if let Some(ref id) = user.pinned_folder_id {
-        item.insert("pinned_folder_id".to_string(), AttributeValue::S(id.clone()));
+        item.insert(
+            "pinned_folder_id".to_string(),
+            AttributeValue::S(id.clone()),
+        );
     }
     if let Some(ref id) = user.default_workspace_id {
-        item.insert("default_workspace_id".to_string(), AttributeValue::S(id.clone()));
+        item.insert(
+            "default_workspace_id".to_string(),
+            AttributeValue::S(id.clone()),
+        );
     }
     // Sparse GSI: write both the semantic field and the GSI hash-key
     // attribute, only when `external_id` is Some. Rows without an
@@ -997,7 +1421,10 @@ fn user_to_item(user: &User) -> HashMap<String, AttributeValue> {
     // entirely — no storage cost, no fan-out churn.
     if let Some(ref ext) = user.external_id {
         item.insert("external_id".to_string(), AttributeValue::S(ext.clone()));
-        item.insert("external_id_gsi".to_string(), AttributeValue::S(ext.clone()));
+        item.insert(
+            "external_id_gsi".to_string(),
+            AttributeValue::S(ext.clone()),
+        );
     }
     // Always write provider — serde's rename_all=lowercase emits strings
     // like "github" / "google" / "dev" / "unknown".
@@ -1091,10 +1518,19 @@ fn user_to_item(user: &User) -> HashMap<String, AttributeValue> {
         );
     }
     if user.last_active_at != 0 {
-        item.insert("last_active_at".to_string(), AttributeValue::N(user.last_active_at.to_string()));
+        item.insert(
+            "last_active_at".to_string(),
+            AttributeValue::N(user.last_active_at.to_string()),
+        );
     }
-    item.insert("created_at".to_string(), AttributeValue::N(user.created_at.to_string()));
-    item.insert("updated_at".to_string(), AttributeValue::N(user.updated_at.to_string()));
+    item.insert(
+        "created_at".to_string(),
+        AttributeValue::N(user.created_at.to_string()),
+    );
+    item.insert(
+        "updated_at".to_string(),
+        AttributeValue::N(user.updated_at.to_string()),
+    );
     item
 }
 
@@ -1121,17 +1557,29 @@ fn user_from_item(item: &HashMap<String, AttributeValue>) -> Result<User, RepoEr
         home_folder_id: get_s(item, "home_folder_id")?,
         private_folder_id: get_s(item, "private_folder_id")?,
         trash_folder_id: get_s(item, "trash_folder_id")?,
-        archive_folder_id: item.get("archive_folder_id").and_then(|v| v.as_s().ok()).cloned(),
-        pinned_folder_id: item.get("pinned_folder_id").and_then(|v| v.as_s().ok()).cloned(),
-        default_workspace_id: item.get("default_workspace_id").and_then(|v| v.as_s().ok()).cloned(),
-        mfa_secret: item.get("mfa_secret").and_then(|v| v.as_m().ok()).and_then(|m| {
-            let nonce = m.get("nonce").and_then(|v| v.as_s().ok())?;
-            let ct = m.get("ct").and_then(|v| v.as_s().ok())?;
-            Some(crate::models::user::EncryptedString {
-                nonce: nonce.clone(),
-                ct: ct.clone(),
-            })
-        }),
+        archive_folder_id: item
+            .get("archive_folder_id")
+            .and_then(|v| v.as_s().ok())
+            .cloned(),
+        pinned_folder_id: item
+            .get("pinned_folder_id")
+            .and_then(|v| v.as_s().ok())
+            .cloned(),
+        default_workspace_id: item
+            .get("default_workspace_id")
+            .and_then(|v| v.as_s().ok())
+            .cloned(),
+        mfa_secret: item
+            .get("mfa_secret")
+            .and_then(|v| v.as_m().ok())
+            .and_then(|m| {
+                let nonce = m.get("nonce").and_then(|v| v.as_s().ok())?;
+                let ct = m.get("ct").and_then(|v| v.as_s().ok())?;
+                Some(crate::models::user::EncryptedString {
+                    nonce: nonce.clone(),
+                    ct: ct.clone(),
+                })
+            }),
         mfa_enrolled_at: item
             .get("mfa_enrolled_at")
             .and_then(|v| v.as_n().ok())
@@ -1148,12 +1596,15 @@ fn user_from_item(item: &HashMap<String, AttributeValue>) -> Result<User, RepoEr
             // that distinctly so an operator doesn't waste time re-running a
             // backfill that wouldn't help.
             let s = get_s(item, "role")?;
-            serde_json::from_str::<UserRole>(&format!("\"{s}\""))
-                .map_err(|e| {
-                    RepoError::MissingField(format!("role (unrecognized value {s:?}): {e}"))
-                })?
+            serde_json::from_str::<UserRole>(&format!("\"{s}\"")).map_err(|e| {
+                RepoError::MissingField(format!("role (unrecognized value {s:?}): {e}"))
+            })?
         },
-        is_disabled: item.get("is_disabled").and_then(|v| v.as_bool().ok()).copied().unwrap_or(false),
+        is_disabled: item
+            .get("is_disabled")
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(false),
         // #148 — new `ask_policy` field. Absent on pre-migration
         // rows; the `User::ask_policy()` getter derives from the
         // legacy `ask_enabled` in that case.
@@ -1166,21 +1617,30 @@ fn user_from_item(item: &HashMap<String, AttributeValue>) -> Result<User, RepoEr
             .and_then(|v| v.as_bool().ok())
             .copied()
             .unwrap_or(false),
-        email_notifications: item.get("email_notifications").and_then(|v| v.as_s().ok())
+        email_notifications: item
+            .get("email_notifications")
+            .and_then(|v| v.as_s().ok())
             .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
             .unwrap_or_default(),
         // Phase 5 M-P1 piece B. JSON-stringified blob; absent on
         // every row written before this commit. Treat "absent" or
         // "unparseable" as `None` — a corrupted prefs row should
         // degrade gracefully to defaults, not block login.
-        ui_prefs: item.get("ui_prefs").and_then(|v| v.as_s().ok())
+        ui_prefs: item
+            .get("ui_prefs")
+            .and_then(|v| v.as_s().ok())
             .and_then(|s| serde_json::from_str(s).ok()),
         // Status: JSON-string blob, same graceful-degrade posture as
         // ui_prefs — absent / unparseable reads as `None`.
-        status: item.get("status").and_then(|v| v.as_s().ok())
+        status: item
+            .get("status")
+            .and_then(|v| v.as_s().ok())
             .and_then(|s| serde_json::from_str(s).ok()),
-        last_active_at: item.get("last_active_at").and_then(|v| v.as_n().ok())
-            .and_then(|n| n.parse::<i64>().ok()).unwrap_or(0),
+        last_active_at: item
+            .get("last_active_at")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<i64>().ok())
+            .unwrap_or(0),
         created_at: get_n(item, "created_at")?,
         updated_at: get_n(item, "updated_at")?,
     })
@@ -1380,7 +1840,10 @@ mod tests {
         // Documented graceful-degrade posture: a corrupted prefs blob
         // must read as None (defaults) rather than block login.
         let mut item = user_to_item(&sample_user());
-        item.insert("ui_prefs".to_string(), AttributeValue::S("{broken".to_string()));
+        item.insert(
+            "ui_prefs".to_string(),
+            AttributeValue::S("{broken".to_string()),
+        );
         let back = user_from_item(&item).expect("from_item");
         assert!(back.ui_prefs.is_none());
     }
@@ -1434,8 +1897,16 @@ mod tests {
             .get("mfa_secret")
             .and_then(|v| v.as_m().ok())
             .expect("mfa_secret must be an M attribute");
-        assert_eq!(m.get("nonce").and_then(|v| v.as_s().ok()).map(String::as_str), Some("n1"));
-        assert_eq!(m.get("ct").and_then(|v| v.as_s().ok()).map(String::as_str), Some("c1"));
+        assert_eq!(
+            m.get("nonce")
+                .and_then(|v| v.as_s().ok())
+                .map(String::as_str),
+            Some("n1")
+        );
+        assert_eq!(
+            m.get("ct").and_then(|v| v.as_s().ok()).map(String::as_str),
+            Some("c1")
+        );
         let back = user_from_item(&item).expect("from_item");
         assert_eq!(back.mfa_secret, user.mfa_secret);
     }
@@ -1458,11 +1929,17 @@ mod tests {
         // problem is visible.
         let user = sample_user();
         let mut item = user_to_item(&user);
-        item.insert("role".to_string(), AttributeValue::S("superadmin".to_string()));
+        item.insert(
+            "role".to_string(),
+            AttributeValue::S("superadmin".to_string()),
+        );
         let err = user_from_item(&item).expect_err("must reject unknown role value");
         match err {
             RepoError::MissingField(f) => {
-                assert!(f.contains("superadmin"), "expected value in error, got: {f}");
+                assert!(
+                    f.contains("superadmin"),
+                    "expected value in error, got: {f}"
+                );
                 assert_ne!(f, "role", "message must distinguish from absent-field case");
             }
             other => panic!("expected MissingField(...), got {other:?}"),
@@ -1492,6 +1969,9 @@ mod batch_tests {
             .get_by_ids(&["u1".to_string()])
             .await
             .expect_err("persistent UnprocessedKeys must not look like absence");
-        assert!(matches!(err, RepoError::Dynamo(ref m) if m.contains("unprocessed")), "got {err:?}");
+        assert!(
+            matches!(err, RepoError::Dynamo(ref m) if m.contains("unprocessed")),
+            "got {err:?}"
+        );
     }
 }
