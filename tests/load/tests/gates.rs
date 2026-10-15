@@ -17,6 +17,7 @@ enum StubMode {
     BadLogin,
     EmptyToken,
     MalformedToken,
+    MissingHomeFolder,
     ServerErrors,
     Slow,
 }
@@ -45,14 +46,14 @@ fn respond(mut stream: TcpStream, mode: StubMode) {
             StubMode::MalformedToken => ("200 OK", "{invalid-json"),
             _ => ("200 OK", r#"{"accessToken":"test-token"}"#),
         }
-    } else if request.starts_with("GET /api/v1/documents ")
+    } else if request.starts_with("GET /api/v1/folders/test-home ")
         && request
             .to_ascii_lowercase()
             .contains("authorization: bearer test-token")
     {
         match mode {
             StubMode::ServerErrors => ("500 Internal Server Error", "failure"),
-            _ => ("200 OK", "[]"),
+            _ => ("200 OK", r#"{"id":"test-home","children":[]}"#),
         }
     } else if request.starts_with("GET /api/v1/users/me ")
         && request
@@ -60,13 +61,13 @@ fn respond(mut stream: TcpStream, mode: StubMode) {
             .contains("authorization: bearer test-token")
     {
         match mode {
-            StubMode::ServerErrors => ("500 Internal Server Error", "failure"),
-            _ => ("200 OK", r#"{"id":"test-user"}"#),
+            StubMode::MissingHomeFolder => ("200 OK", r#"{"homeFolderId":""}"#),
+            _ => ("200 OK", r#"{"homeFolderId":"test-home"}"#),
         }
     } else {
         ("404 Not Found", "missing")
     };
-    if matches!(mode, StubMode::Slow) && request.starts_with("GET /api/v1/documents ") {
+    if matches!(mode, StubMode::Slow) && request.starts_with("GET /api/v1/folders/test-home ") {
         thread::sleep(Duration::from_millis(304));
     }
     let response = format!(
@@ -175,6 +176,13 @@ fn malformed_login_token_fails_without_authenticated_traffic() {
 }
 
 #[test]
+fn missing_home_folder_fails_before_measuring_traffic() {
+    let (success, _, report) = run(StubMode::MissingHomeFolder);
+    assert!(!success);
+    assert_eq!(report["successful_authenticated_requests"], 0);
+}
+
+#[test]
 fn repeated_server_errors_fail() {
     let (success, _, report) = run(StubMode::ServerErrors);
     assert!(!success);
@@ -190,7 +198,7 @@ fn repeated_server_errors_fail() {
 }
 
 #[test]
-fn slow_document_responses_fail_the_sla() {
+fn slow_home_folder_responses_fail_the_sla() {
     let (success, _, report) = run(StubMode::Slow);
     assert!(!success);
     assert!(report["documents_p95_ms"].as_u64().unwrap() > 300);
@@ -199,6 +207,6 @@ fn slow_document_responses_fail_the_sla() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|failure| failure.as_str().unwrap().contains("GET /documents p95"))
+            .any(|failure| failure.as_str().unwrap().contains("GET /home-folder p95"))
     );
 }

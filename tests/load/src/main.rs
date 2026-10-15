@@ -29,8 +29,8 @@
 //!         --no-reset-metrics
 //!
 //! Goose tracks per-request p50/p95/p99/max + RPS into the report.
-//! The driver checks the `GET /documents` p95 against the documented
-//! 300 ms budget and rejects empty or error-heavy runs.
+//! The driver checks the home-folder listing p95 against the documented
+//! 300 ms read budget and rejects empty or error-heavy runs.
 
 use goose::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -88,11 +88,18 @@ struct TokenResponse {
     access_token: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MeResponse {
+    home_folder_id: String,
+}
+
 /// Per-user session cached after `dev_login` runs at session start.
 /// Pulled out of `user.get_session_data` by every measured
 /// transaction so the bearer token follows the user.
 struct Session {
     token: String,
+    home_folder_id: String,
 }
 
 async fn dev_login(user: &mut GooseUser) -> TransactionResult {
@@ -136,8 +143,39 @@ async fn dev_login(user: &mut GooseUser) -> TransactionResult {
     if token.access_token.trim().is_empty() {
         return user.set_failure("dev login empty access token", &mut request, None, None);
     }
+    // The document list is the caller's home folder, not GET /documents
+    // (which is POST-only). Resolve its id from the same profile response
+    // the frontend uses, and fail setup if it is missing.
+    let profile_builder = user
+        .get_request_builder(&GooseMethod::Get, "/api/v1/users/me")?
+        .header("authorization", format!("Bearer {}", token.access_token));
+    let profile_request = GooseRequest::builder()
+        .set_request_builder(profile_builder)
+        .name("resolve_home_folder")
+        .build();
+    let profile_response = user.request(profile_request).await?;
+    let mut request = profile_response.request;
+    let response = match profile_response.response {
+        Ok(response) => response,
+        Err(_) => {
+            return user.set_failure("profile lookup transport failure", &mut request, None, None);
+        }
+    };
+    if !response.status().is_success() {
+        return user.set_failure("profile lookup rejected", &mut request, None, None);
+    }
+    let profile: MeResponse = match response.json().await {
+        Ok(profile) => profile,
+        Err(_) => {
+            return user.set_failure("profile lookup invalid response", &mut request, None, None);
+        }
+    };
+    if profile.home_folder_id.trim().is_empty() {
+        return user.set_failure("profile missing home folder", &mut request, None, None);
+    }
     user.set_session_data(Session {
         token: token.access_token,
+        home_folder_id: profile.home_folder_id,
     });
     Ok(())
 }
@@ -148,21 +186,24 @@ async fn dev_login(user: &mut GooseUser) -> TransactionResult {
 fn authed_builder(
     user: &mut GooseUser,
     method: &GooseMethod,
-    path: &str,
+    path: impl FnOnce(&Session) -> String,
 ) -> Result<Option<reqwest::RequestBuilder>, Box<TransactionError>> {
     let Some(session) = user.get_session_data::<Session>() else {
         MISSING_SESSIONS.fetch_add(1, Ordering::Relaxed);
         return Ok(None);
     };
     let token = session.token.clone();
-    let builder = user.get_request_builder(method, path)?;
+    let path = path(session);
+    let builder = user.get_request_builder(method, &path)?;
     Ok(Some(
         builder.header("authorization", format!("Bearer {token}")),
     ))
 }
 
 async fn list_documents(user: &mut GooseUser) -> TransactionResult {
-    let Some(request_builder) = authed_builder(user, &GooseMethod::Get, "/api/v1/documents")?
+    let Some(request_builder) = authed_builder(user, &GooseMethod::Get, |session| {
+        format!("/api/v1/folders/{}", session.home_folder_id)
+    })?
     else {
         // An on_start login failure leaves this user without a session.
         // Yield so the no-op transaction loop cannot starve Goose's
@@ -172,7 +213,7 @@ async fn list_documents(user: &mut GooseUser) -> TransactionResult {
     };
     let req = GooseRequest::builder()
         .set_request_builder(request_builder)
-        .name("GET /documents")
+        .name("GET /home-folder")
         .build();
     let response = user.request(req).await?;
     if response.response.is_ok() {
@@ -182,7 +223,9 @@ async fn list_documents(user: &mut GooseUser) -> TransactionResult {
 }
 
 async fn get_me(user: &mut GooseUser) -> TransactionResult {
-    let Some(request_builder) = authed_builder(user, &GooseMethod::Get, "/api/v1/users/me")? else {
+    let Some(request_builder) =
+        authed_builder(user, &GooseMethod::Get, |_| "/api/v1/users/me".to_string())?
+    else {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         return Ok(());
     };
@@ -276,7 +319,7 @@ fn assess(metrics: &goose::metrics::GooseMetrics) -> Result<LoadSummary, Box<dyn
             .find(|request| names.contains(&request.path.as_str()))
     };
     let login = find(&["dev_login", "/api/v1/auth/dev-login"]);
-    let documents = find(&["GET /documents", "/api/v1/documents"]);
+    let documents = find(&["GET /home-folder"]);
     let me = find(&["GET /users/me", "/api/v1/users/me"]);
     let successful_logins = login.map_or(0, |request| request.success_count);
     let successful_authenticated_requests = [documents, me]
@@ -335,7 +378,7 @@ fn assess(metrics: &goose::metrics::GooseMetrics) -> Result<LoadSummary, Box<dyn
         ));
     }
     for (route, latency, budget) in [
-        ("GET /documents", documents_p95_ms, 300),
+        ("GET /home-folder", documents_p95_ms, 300),
         ("GET /users/me", me_p95_ms, 500),
     ] {
         if latency.is_none_or(|p95| p95 > budget) {
