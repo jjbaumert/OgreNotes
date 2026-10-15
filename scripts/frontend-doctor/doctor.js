@@ -78,6 +78,18 @@ async function devLogin(baseUrl, email, name = "Doctor Probe") {
   return json;
 }
 
+// The editor can render a local CRDT edit before its debounced WebSocket
+// update is persisted. Gate reload checks on the specific server export.
+async function waitForExportText(page, baseUrl, docId, token, text) {
+  await page.waitForFunction(async ({ url, token, text }) => {
+    const response = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+    if (!response.ok) throw new Error(`Document export: HTTP ${response.status}`);
+    return (await response.text()).includes(text);
+  }, {
+    url: `${baseUrl}/api/v1/documents/${docId}/export/html`, token, text,
+  }, { timeout: 15000, polling: 100 });
+}
+
 // Attach every observable signal to a context/page and push events into the
 // shared collector. The collector is per-context ("tab-A", "tab-B").
 function instrument(context, page, tag, collector) {
@@ -3925,6 +3937,7 @@ async function scenarioCalendarBlock(ctx, collector) {
 
     // Reload and re-check — the event should persist through
     // yrs-bridge write-out + read-in.
+    await waitForExportText(page, target, doc.id, tokens.accessToken, EVENT_TITLE);
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector(".calendar-event", { timeout: 10000 });
     const eventTextReload = await page.locator(".calendar-event").first().textContent();
@@ -4048,15 +4061,7 @@ async function scenarioKanbanBlock(ctx, collector) {
 
     // Rendering and the status badge can precede the debounced CRDT send.
     // Require this specific card in server content before testing reload.
-    await page.waitForFunction(async ({ url, token, title }) => {
-      const response = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
-      if (!response.ok) throw new Error(`Kanban export: HTTP ${response.status}`);
-      return (await response.text()).includes(title);
-    }, {
-      url: `${target}/api/v1/documents/${doc.id}/export/html`,
-      token: tokens.accessToken,
-      title: CARD_TITLE,
-    }, { timeout: 15000, polling: 100 });
+    await waitForExportText(page, target, doc.id, tokens.accessToken, CARD_TITLE);
     // Reload → the card persists through yrs-bridge write-out/read-in.
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector(".kanban-card", { timeout: 10000 });
@@ -4558,6 +4563,7 @@ async function scenarioKanbanCardMetadata(ctx, collector) {
     steps.assigneeInitialsRendered = (assignee || "").trim() === "AL";
 
     // Reload and re-open card in Edit mode.
+    await waitForExportText(page, target, doc.id, tokens.accessToken, "Test card");
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector(".kanban-card", { timeout: 10000 });
     await page.locator(".kanban-card").first().click();
