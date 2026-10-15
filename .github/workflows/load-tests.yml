@@ -121,6 +121,10 @@ jobs:
         working-directory: tests/load
         run: cargo build --release --locked
 
+      - name: Verify load gates against stub server
+        working-directory: tests/load
+        run: cargo test --locked --test gates --bin load -- --test-threads=1
+
       - name: Run read_heavy scenario
         working-directory: tests/load
         env:
