@@ -55,9 +55,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target,id=ogre-backend-target-${TARGETARCH} \
     cargo build --profile release-fast --bin ogrenotes-api --bin setup_dev \
+        --bin backfill_user_search_index \
         --no-default-features --features "$CARGO_FEATURES" \
  && mkdir -p /out \
- && cp target/release-fast/ogrenotes-api target/release-fast/setup_dev /out/
+ && cp target/release-fast/ogrenotes-api target/release-fast/setup_dev \
+       target/release-fast/backfill_user_search_index /out/
 
 # ─── Git metadata (optional) ───────────────────────────────────
 # Empty by default. The self-host compose file replaces it with the repo's
@@ -150,6 +152,7 @@ RUN apt-get update && apt-get install -y \
 COPY --from=backend-builder /out/ogrenotes-api /usr/local/bin/ogrenotes-api
 # One-time table/bucket creation (deploy/selfhost/setup.sh runs it).
 COPY --from=backend-builder /out/setup_dev /usr/local/bin/setup_dev
+COPY --from=backend-builder /out/backfill_user_search_index /usr/local/bin/backfill_user_search_index
 
 # Frontend static files
 COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist

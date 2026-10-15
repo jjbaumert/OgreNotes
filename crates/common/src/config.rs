@@ -194,6 +194,9 @@ pub struct AppConfig {
     /// enumeration within a workspace. gap-002 from the
     /// post-hardening security audit.
     pub rate_limit_user_search_per_min: u64,
+    /// Switch substring user search to the durable scoped index after
+    /// all writers have been deployed and its backfill has completed.
+    pub user_search_index_reads_enabled: bool,
     /// Per-user cap on WS upgrade attempts per minute. Connection
     /// open is rare in steady state; this bounds reconnect-storm
     /// damage from a compromised token.
@@ -583,6 +586,9 @@ impl AppConfig {
             rate_limit_user_search_per_min: env_or("RATE_LIMIT_USER_SEARCH_PER_MIN", "60")
                 .parse()
                 .unwrap_or_else(|_| panic!("RATE_LIMIT_USER_SEARCH_PER_MIN must be a positive integer")),
+            user_search_index_reads_enabled: env_or("USER_SEARCH_INDEX_READS_ENABLED", "false")
+                .parse()
+                .unwrap_or_else(|_| panic!("USER_SEARCH_INDEX_READS_ENABLED must be true or false")),
             rate_limit_ws_upgrade_per_min: env_or("RATE_LIMIT_WS_UPGRADE_PER_MIN", "30")
                 .parse()
                 .unwrap_or_else(|_| panic!("RATE_LIMIT_WS_UPGRADE_PER_MIN must be a positive integer")),
@@ -842,6 +848,7 @@ mod tests {
             rate_limit_comments_per_min: 30,
             rate_limit_content_write_per_min: 60,
             rate_limit_user_search_per_min: 60,
+            user_search_index_reads_enabled: false,
             rate_limit_ws_upgrade_per_min: 30,
             rate_limit_ws_messages_per_min: 6000,
             rate_limit_client_telemetry_per_min: 12,
@@ -1058,6 +1065,7 @@ mod tests {
             rate_limit_comments_per_min: 30,
             rate_limit_content_write_per_min: 60,
             rate_limit_user_search_per_min: 60,
+            user_search_index_reads_enabled: false,
             rate_limit_ws_upgrade_per_min: 30,
             rate_limit_ws_messages_per_min: 6000,
             rate_limit_client_telemetry_per_min: 12,
