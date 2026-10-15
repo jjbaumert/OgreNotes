@@ -59,6 +59,9 @@ env:
   OAUTH_CLIENT_SECRET: "ci-not-used"
   OAUTH_REDIRECT_URI: "http://localhost:3000/auth/callback"
   SEARCH_INDEX_PATH: "/tmp/ogrenotes-ci-search"
+  # Exercise the indexed search path used by deployed API instances. The
+  # legacy scan can miss users created late in this long scenario suite.
+  USER_SEARCH_INDEX_READS_ENABLED: "true"
   API_PORT: "3000"
   # Bump the per-IP rate-limit ceiling well above defaults. In CI
   # axum receives connections without X-Forwarded-For, so every
@@ -194,7 +197,11 @@ jobs:
       - name: Build axum server (release)
         run: |
           cargo build --release --locked --bin ogrenotes-api \
+            --bin backfill_user_search_index \
             --no-default-features --features "dev-login,xlsx,docx"
+
+      - name: Backfill user-search index
+        run: ./target/release/backfill_user_search_index
 
       - name: Start axum server
         run: |
