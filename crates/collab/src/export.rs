@@ -4577,12 +4577,44 @@ mod tests {
 
     #[cfg(feature = "pdf")]
     #[test]
-    fn pdf_export_with_comments_is_valid_and_nonempty() {
+    fn pdf_export_renders_comments_and_omits_them_when_disabled() {
         let doc = one_para_doc();
         let with = to_pdf_with_comments(&doc, &sample_comments());
         assert!(!with.is_empty(), "pdf bytes produced");
         assert_eq!(&with[..5], b"%PDF-", "valid PDF header");
-        assert_ne!(with, to_pdf(&doc), "comment lines must change the pdf");
+
+        let with_text = pdf_extract::extract_text_from_mem(&with).expect("extract commented PDF");
+        assert!(with_text.contains("Body text"), "document body: {with_text}");
+        let comment_text = [
+            "Comments",
+            "Comment on block blk7",
+            "Alice (2026-07-13 14:22 UTC): Needs a citation here.",
+            "Bob (2026-07-13 15:01 UTC): Added one.",
+            "Document comment (resolved)",
+            "Carol: Overall looks good.",
+        ];
+        for expected in comment_text {
+            assert!(with_text.contains(expected), "missing {expected:?}: {with_text}");
+        }
+
+        let without_text = pdf_extract::extract_text_from_mem(&to_pdf(&doc))
+            .expect("extract PDF without comments");
+        assert!(without_text.contains("Body text"), "document body: {without_text}");
+        for omitted in [
+            "Comments",
+            "Comment on block blk7",
+            "Document comment (resolved)",
+            "Alice",
+            "2026-07-13 14:22 UTC",
+            "Needs a citation here.",
+            "Bob",
+            "2026-07-13 15:01 UTC",
+            "Added one.",
+            "Carol",
+            "Overall looks good.",
+        ] {
+            assert!(!without_text.contains(omitted), "unexpected {omitted:?}: {without_text}");
+        }
     }
 
     // ── Presentation deck PDF export (Task 3) ──────────────────────
