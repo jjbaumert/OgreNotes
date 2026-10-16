@@ -1977,6 +1977,13 @@ fn render_node(doc: &Document, node: &Node) -> Option<DomNode> {
                     el.set_attribute("data-type", "taskList").ok()?;
                 }
                 NodeType::TableCell | NodeType::TableHeader => {
+                    for attr in ["colspan", "rowspan"] {
+                        if let Some(span) = attrs.get(attr).and_then(|v| v.parse::<usize>().ok()) {
+                            if span >= 2 {
+                                el.set_attribute(attr, &span.to_string()).ok()?;
+                            }
+                        }
+                    }
                     if let Some(align) = attrs.get("align") {
                         if matches!(align.as_str(), "left" | "center" | "right") {
                             el.set_attribute("style", &format!("text-align: {align}")).ok()?;

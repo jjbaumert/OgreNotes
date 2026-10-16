@@ -90,6 +90,8 @@ pub fn EditorContextMenu(
     selection_empty: Signal<bool>,
     /// True when the context menu opened over a document-table cell.
     in_table: Signal<bool>,
+    can_insert_row: Signal<bool>,
+    can_insert_column: Signal<bool>,
     /// The right-clicked DocMention chip, if any. When `Some`, two
     /// extra entries (Copy Original URL / Convert to Plain Link)
     /// appear; when `None` (a normal right-click elsewhere in the
@@ -174,8 +176,10 @@ pub fn EditorContextMenu(
             entries.push(MenuEntry::submenu(
                 crate::t!("node-table"),
                 vec![
-                    item("ss-ctx-insert-row-below", EditorContextCommand::InsertTableRowBelow),
-                    item("ss-ctx-insert-col-right", EditorContextCommand::InsertTableColumnRight),
+                    item("ss-ctx-insert-row-below", EditorContextCommand::InsertTableRowBelow)
+                        .disabled_when(!can_insert_row.get()),
+                    item("ss-ctx-insert-col-right", EditorContextCommand::InsertTableColumnRight)
+                        .disabled_when(!can_insert_column.get()),
                 ],
             ));
         }

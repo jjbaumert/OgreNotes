@@ -1232,19 +1232,31 @@ fn normalize_node(node: &Node, parent_type: NodeType) -> Vec<Node> {
                 // an empty sheet is a 0-row table). Document-mode tables
                 // carry neither attr and are still removed when empty.
                 NodeType::Table => {
-                    if children.is_empty() && !is_spreadsheet_table(node) {
+                    // A row with no own cells can still be occupied by a
+                    // rowspan from an earlier row. Keep those rows so Yrs
+                    // round trips do not shorten the merged table.
+                    let mut covered_until = 0;
+                    let rows: Vec<Node> = children.into_iter().enumerate().filter_map(|(row_i, row)| {
+                        for cell_i in 0..row.child_count() {
+                            if let Some(cell) = row.child(cell_i) {
+                                let span = cell.attrs().get("rowspan")
+                                    .and_then(|value| value.parse::<usize>().ok())
+                                    .unwrap_or(1);
+                                covered_until = covered_until.max(row_i.saturating_add(span));
+                            }
+                        }
+                        (row.child_count() > 0 || row_i < covered_until).then_some(row)
+                    }).collect();
+                    if rows.is_empty() && !is_spreadsheet_table(node) {
                         vec![]
                     } else {
-                        vec![node.copy_with_content(Fragment::from(children))]
+                        vec![node.copy_with_content(Fragment::from(rows))]
                     }
                 }
-                // Empty table rows → remove
+                // Let the table parent decide whether a row covered by a
+                // preceding rowspan should be retained.
                 NodeType::TableRow => {
-                    if children.is_empty() {
-                        vec![]
-                    } else {
-                        vec![node.copy_with_content(Fragment::from(children))]
-                    }
+                    vec![node.copy_with_content(Fragment::from(children))]
                 }
                 // Empty list items / table cells → add an empty Paragraph
                 NodeType::ListItem | NodeType::TaskItem
@@ -2050,6 +2062,28 @@ mod tests {
         let normalized = normalize_doc(&doc);
         assert_eq!(normalized.text_content(), doc.text_content());
         assert_eq!(normalized.child_count(), 2);
+    }
+
+    #[test]
+    fn normalize_preserves_row_covered_by_rowspan() {
+        let mut attrs = HashMap::new();
+        attrs.insert("rowspan".to_string(), "2".to_string());
+        let spanning = Node::element_with_attrs(
+            NodeType::TableCell,
+            attrs,
+            Fragment::from(vec![Node::element(NodeType::Paragraph)]),
+        );
+        let table = Node::element_with_content(NodeType::Table, Fragment::from(vec![
+            Node::element_with_content(NodeType::TableRow, Fragment::from(vec![spanning])),
+            Node::element(NodeType::TableRow),
+            Node::element(NodeType::TableRow),
+        ]));
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![table]));
+        let normalized = normalize_doc(&doc);
+        let table = normalized.child(0).unwrap();
+        assert_eq!(table.child_count(), 2);
+        assert_eq!(table.child(1).unwrap().child_count(), 0);
+        assert_eq!(table.child(0).unwrap().child(0).unwrap().attrs()["rowspan"], "2");
     }
 
     #[test]

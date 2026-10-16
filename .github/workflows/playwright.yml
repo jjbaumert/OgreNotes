@@ -823,6 +823,11 @@ jobs:
         working-directory: scripts/frontend-doctor
         run: node test-table-structure.cjs --base-url http://127.0.0.1:3000
 
+      - name: Run merged document table structure regression
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: node test-merged-table-structure.cjs --base-url http://127.0.0.1:3000
+
       - name: Run calendar-block scenario
         id: calendar-block
         if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
