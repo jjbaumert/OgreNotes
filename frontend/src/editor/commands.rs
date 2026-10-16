@@ -3041,6 +3041,32 @@ pub fn is_in_table(state: &EditorState) -> bool {
     find_table_at(&state.doc, state.selection.from()).is_some()
 }
 
+/// Structural edits require a rectangular table. Imported cells can carry
+/// spans, which the row and column commands do not yet reconcile.
+pub fn can_edit_table_structure(state: &EditorState) -> bool {
+    let Some(info) = find_table_at(&state.doc, state.selection.from()) else {
+        return false;
+    };
+    let Some(table) = extract_node_at(&state.doc, info.table_offset) else {
+        return false;
+    };
+    let expected_cells = table.child(0).map(Node::child_count).unwrap_or(0);
+    expected_cells > 0
+        && (0..table.child_count()).all(|row_i| {
+            let Some(row) = table.child(row_i) else {
+                return false;
+            };
+            row.child_count() == expected_cells && (0..row.child_count()).all(|cell_i| {
+                let Some(cell) = row.child(cell_i) else {
+                    return false;
+                };
+                ["colspan", "rowspan"].iter().all(|key| {
+                    cell.attrs().get(*key).map(String::as_str).unwrap_or("1") == "1"
+                })
+            })
+        })
+}
+
 /// Insert a table with the given number of rows and columns after the current block.
 pub fn insert_table(
     rows: usize,
@@ -3097,6 +3123,9 @@ pub fn add_row(
     state: &EditorState,
     dispatch: Option<&dyn Fn(Transaction)>,
 ) -> bool {
+    if !can_edit_table_structure(state) {
+        return false;
+    }
     let Some(info) = find_table_at(&state.doc, state.selection.from()) else {
         return false;
     };
@@ -3170,6 +3199,9 @@ pub fn add_column(
     state: &EditorState,
     dispatch: Option<&dyn Fn(Transaction)>,
 ) -> bool {
+    if !can_edit_table_structure(state) {
+        return false;
+    }
     let Some(info) = find_table_at(&state.doc, state.selection.from()) else {
         return false;
     };
@@ -3201,8 +3233,13 @@ pub fn add_column(
                 }
             }
             // Insert new empty cell at cell_offset
+            let cell_type = row
+                .child(col_idx)
+                .filter(|cell| cell.node_type() == Some(NodeType::TableHeader))
+                .map(|_| NodeType::TableHeader)
+                .unwrap_or(NodeType::TableCell);
             let new_cell = Node::element_with_content(
-                NodeType::TableCell,
+                cell_type,
                 Fragment::from(vec![Node::element(NodeType::Paragraph)]),
             );
             let slice = Slice::new(Fragment::from(vec![new_cell]), 0, 0);
@@ -5904,6 +5941,70 @@ mod tests {
         let new_state = state.apply(txn);
         let table = new_state.doc.child(0).unwrap();
         assert_eq!(table.child_count(), 3, "should have 3 rows after add_row");
+    }
+
+    #[test]
+    fn add_column_preserves_header_row() {
+        let header = Node::element_with_content(
+            NodeType::TableHeader,
+            Fragment::from(vec![Node::element(NodeType::Paragraph)]),
+        );
+        let body = Node::element_with_content(
+            NodeType::TableCell,
+            Fragment::from(vec![Node::element(NodeType::Paragraph)]),
+        );
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Table,
+                Fragment::from(vec![
+                    Node::element_with_content(NodeType::TableRow, Fragment::from(vec![header])),
+                    Node::element_with_content(NodeType::TableRow, Fragment::from(vec![body])),
+                ]),
+            )]),
+        );
+        let state = EditorState {
+            selection: Selection::cursor(4),
+            ..EditorState::create_default(doc)
+        };
+        let txn = run_command(&state, add_column).unwrap();
+        let table = state.apply(txn).doc.child(0).unwrap().clone();
+        assert_eq!(
+            table.child(0).unwrap().child(1).unwrap().node_type(),
+            Some(NodeType::TableHeader)
+        );
+        assert_eq!(
+            table.child(1).unwrap().child(1).unwrap().node_type(),
+            Some(NodeType::TableCell)
+        );
+    }
+
+    #[test]
+    fn structural_edits_reject_merged_table() {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("colspan".to_string(), "2".to_string());
+        let merged = Node::element_with_attrs(
+            NodeType::TableCell,
+            attrs,
+            Fragment::from(vec![Node::element(NodeType::Paragraph)]),
+        );
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![Node::element_with_content(
+                NodeType::Table,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::TableRow,
+                    Fragment::from(vec![merged]),
+                )]),
+            )]),
+        );
+        let state = EditorState {
+            selection: Selection::cursor(4),
+            ..EditorState::create_default(doc)
+        };
+        assert!(!can_edit_table_structure(&state));
+        assert!(run_command(&state, add_row).is_none());
+        assert!(run_command(&state, add_column).is_none());
     }
 
     #[test]

@@ -458,6 +458,14 @@ impl EditorView {
         read_dom_selection_from(&self.container)
     }
 
+    /// Map the start of a rendered element to its model position. Context
+    /// menus use this for the cell under the pointer: right-clicking a cell
+    /// does not reliably move the browser's text selection first.
+    pub fn model_position_at_element_start(&self, element: &Element) -> Option<usize> {
+        let node: DomNode = element.clone().into();
+        dom_position_to_model(&self.container, &node, 0)
+    }
+
     /// Attach keyboard, input, and composition event listeners.
     fn attach_listeners(&mut self) {
         // Keydown -- dispatch to keymap for keyboard shortcuts
