@@ -59,6 +59,8 @@ pub enum EditorContextCommand {
     AlignLeft,
     AlignCenter,
     AlignRight,
+    InsertTableRowBelow,
+    InsertTableColumnRight,
 }
 
 /// Snapshot of the DocMention chip under the cursor at the moment the
@@ -86,6 +88,8 @@ pub fn EditorContextMenu(
     /// as `Signal<bool>` so callers can pass a `Memo` or a
     /// `Signal::derive` rather than only a `ReadSignal`.
     selection_empty: Signal<bool>,
+    /// True when the context menu opened over a document-table cell.
+    in_table: Signal<bool>,
     /// The right-clicked DocMention chip, if any. When `Some`, two
     /// extra entries (Copy Original URL / Convert to Plain Link)
     /// appear; when `None` (a normal right-click elsewhere in the
@@ -165,6 +169,16 @@ pub fn EditorContextMenu(
             MenuEntry::Separator,
             item("editorctx-insert-link", EditorContextCommand::InsertLink).with_shortcut("Ctrl+K"),
         ]);
+        if in_table.get() {
+            entries.push(MenuEntry::Separator);
+            entries.push(MenuEntry::submenu(
+                crate::t!("node-table"),
+                vec![
+                    item("ss-ctx-insert-row-below", EditorContextCommand::InsertTableRowBelow),
+                    item("ss-ctx-insert-col-right", EditorContextCommand::InsertTableColumnRight),
+                ],
+            ));
+        }
         entries
     });
 

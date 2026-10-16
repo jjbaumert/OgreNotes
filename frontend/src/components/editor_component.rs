@@ -3012,6 +3012,27 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     // backed approach keeps the closure free of the Rc.
     let (selection_empty, set_selection_empty) = signal(true);
 
+    // Keep the actual right-clicked cell as the menu anchor. A numeric model
+    // position can go stale if a collaborator edits before that cell while
+    // the menu is open; a re-render detaches this element and the action
+    // safely does nothing instead of editing a different cell.
+    let (ctx_in_table, set_ctx_in_table) = signal(false);
+    let ctx_table_cell: Rc<RefCell<Option<web_sys::Element>>> = Rc::new(RefCell::new(None));
+    let table_context_readonly = props.readonly;
+    let remote_state_for_ctx = props.remote_state;
+    let ctx_table_cell_for_remote = Rc::clone(&ctx_table_cell);
+    Effect::new(move |_| {
+        remote_state_for_ctx.with(|_| ());
+        if ctx_menu_visible.get_untracked() {
+            // A remote document update can replace the clicked cell's DOM
+            // element. Close the menu instead of leaving an action that
+            // appears available but cannot safely target that cell.
+            set_ctx_menu_visible.set(false);
+            set_ctx_in_table.set(false);
+            ctx_table_cell_for_remote.borrow_mut().take();
+        }
+    });
+
     // The DocMention chip under the cursor at the moment the menu
     // opened, if the right-click landed on one — set by the
     // `on:contextmenu` handler's ancestry walk (same idiom as
@@ -3036,6 +3057,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     let on_state_change_cmd2 = on_state_change_shared.clone();
     let on_mapping_cmd2 = props.on_mapping.clone();
     let on_request_comment_prop = props.on_request_comment;
+    let ctx_table_cell_for_cmd = Rc::clone(&ctx_table_cell);
 
     Effect::new(move |_| {
         let Some(cmd) = pending_ctx_cmd.get() else { return };
@@ -3136,7 +3158,17 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
         let Some(view) = view.as_ref() else { return };
         let state = {
             let mut s = view.state();
-            if let Some(dom_sel) = view.read_dom_selection() {
+            if matches!(
+                &cmd,
+                EditorContextCommand::InsertTableRowBelow
+                    | EditorContextCommand::InsertTableColumnRight
+            ) {
+                if table_context_readonly { return; }
+                let Some(cell) = ctx_table_cell_for_cmd.borrow().as_ref().cloned() else { return };
+                let Some(pos) = view.model_position_at_element_start(&cell) else { return };
+                s.selection = Selection::cursor(pos);
+                if !commands::can_edit_table_structure(&s) { return; }
+            } else if let Some(dom_sel) = view.read_dom_selection() {
                 let dom_collapsed_over_range =
                     dom_sel.empty() && !s.selection.empty();
                 if !dom_collapsed_over_range {
@@ -3163,6 +3195,12 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
         };
 
         match cmd {
+            EditorContextCommand::InsertTableRowBelow => {
+                commands::add_row(&state, Some(&dispatch_fn));
+            }
+            EditorContextCommand::InsertTableColumnRight => {
+                commands::add_column(&state, Some(&dispatch_fn));
+            }
             EditorContextCommand::ToggleBold => {
                 commands::toggle_mark(MarkType::Bold, &state, Some(&dispatch_fn));
             }
@@ -3347,6 +3385,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
 
     let on_scroll = props.on_scroll.clone();
     let view_ref_ctx_open = Rc::clone(&view_ref);
+    let ctx_table_cell_for_open = Rc::clone(&ctx_table_cell);
     view! {
         <div
             node_ref=editor_wrapper_ref
@@ -3399,6 +3438,24 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                     }
                     set_ctx_doc_mention.set(mention_ctx);
 
+                    let table_cell = if table_context_readonly {
+                        None
+                    } else {
+                        e.target()
+                            .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+                            .and_then(|target| target.closest("td, th").ok().flatten())
+                            .filter(|cell| {
+                                let view = view_ref_ctx_open.borrow();
+                                let Some(view) = view.as_ref() else { return false };
+                                let Some(pos) = view.model_position_at_element_start(cell) else { return false };
+                                let mut state = view.state();
+                                state.selection = Selection::cursor(pos);
+                                commands::can_edit_table_structure(&state)
+                            })
+                    };
+                    set_ctx_in_table.set(table_cell.is_some());
+                    *ctx_table_cell_for_open.borrow_mut() = table_cell;
+
                     set_ctx_menu_x.set(e.client_x() as f64);
                     set_ctx_menu_y.set(e.client_y() as f64);
                     set_ctx_menu_visible.set(true);
@@ -3409,6 +3466,7 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                 x=ctx_menu_x
                 y=ctx_menu_y
                 selection_empty=selection_empty.into()
+                in_table=ctx_in_table.into()
                 doc_mention=ctx_doc_mention
                 on_command=on_ctx_command
                 on_close=Callback::new(move |()| set_ctx_menu_visible.set(false))
