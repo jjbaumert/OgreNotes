@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::model::{Fragment, Mark, MarkType, Node, NodeType, Slice};
 use super::position::resolve;
@@ -3041,8 +3041,104 @@ pub fn is_in_table(state: &EditorState) -> bool {
     find_table_at(&state.doc, state.selection.from()).is_some()
 }
 
-/// Structural edits require a rectangular table. Imported cells can carry
-/// spans, which the row and column commands do not yet reconcile.
+#[derive(Clone)]
+struct TableCellSlot {
+    row: usize,
+    cell: usize,
+    col: usize,
+    colspan: usize,
+    rowspan: usize,
+    offset: usize,
+    node_type: NodeType,
+}
+
+struct TableGrid {
+    cells: Vec<TableCellSlot>,
+    row_offsets: Vec<usize>,
+    width: usize,
+    rows: usize,
+}
+
+fn table_span(cell: &Node, key: &str) -> Option<usize> {
+    let span = cell.attrs().get(key).map(String::as_str).unwrap_or("1")
+        .parse::<usize>().ok()?;
+    let max = if key == "colspan" { 1000 } else { 65534 };
+    (1..=max).contains(&span).then_some(span)
+}
+
+/// Lay out cells as HTML does, accounting for cells that occupy later rows.
+/// Reject malformed or incomplete imported tables before editing them.
+fn table_grid(table: &Node, table_offset: usize) -> Option<TableGrid> {
+    let rows = table.child_count();
+    if rows == 0 { return None; }
+    // Keep intervals rather than one boolean per visual slot. A pasted
+    // colspan can be wide while containing only a few actual model cells.
+    let mut occupied = vec![BTreeMap::<usize, usize>::new(); rows];
+    let mut cells = Vec::new();
+    let mut row_offsets = Vec::with_capacity(rows + 1);
+    let mut row_offset = table_offset + 1;
+    for row_i in 0..rows {
+        let row = table.child(row_i)?;
+        row_offsets.push(row_offset);
+        let mut col = 0;
+        let mut cell_offset = row_offset + 1;
+        for cell_i in 0..row.child_count() {
+            let cell = row.child(cell_i)?;
+            while let Some((_, &end)) = occupied[row_i].range(..=col).next_back() {
+                if col >= end { break; }
+                col = end;
+            }
+            let colspan = table_span(cell, "colspan")?;
+            let rowspan = table_span(cell, "rowspan")?;
+            let end_col = col.checked_add(colspan)?;
+            let end_row = row_i.checked_add(rowspan)?;
+            if end_row > rows { return None; }
+            for slots in occupied.iter_mut().take(end_row).skip(row_i) {
+                if slots.range(..end_col).next_back().is_some_and(|(_, end)| *end > col) {
+                    return None;
+                }
+                slots.insert(col, end_col);
+            }
+            cells.push(TableCellSlot {
+                row: row_i, cell: cell_i, col, colspan, rowspan,
+                offset: cell_offset,
+                node_type: cell.node_type()?,
+            });
+            cell_offset += cell.node_size();
+            col = end_col;
+        }
+        row_offset += row.node_size();
+    }
+    row_offsets.push(row_offset);
+    let width = occupied.iter().flat_map(|row| row.values().copied()).max()?;
+    if width == 0 { return None; }
+    for row in &occupied {
+        let mut next = 0;
+        for (start, end) in row {
+            if *start != next { return None; }
+            next = *end;
+        }
+        if next != width { return None; }
+    }
+    Some(TableGrid { cells, row_offsets, width, rows })
+}
+
+fn empty_table_cell(node_type: NodeType, colspan: usize) -> Node {
+    let content = Fragment::from(vec![Node::element(NodeType::Paragraph)]);
+    if colspan == 1 {
+        Node::element_with_content(node_type, content)
+    } else {
+        let mut attrs = HashMap::new();
+        attrs.insert("colspan".to_string(), colspan.to_string());
+        Node::element_with_attrs(node_type, attrs, content)
+    }
+}
+
+fn append_empty_row_cells(out: &mut Vec<Node>, width: usize) {
+    out.extend((0..width).map(|_| empty_table_cell(NodeType::TableCell, 1)));
+}
+
+/// A table must have a complete visual grid before structural edits.
 pub fn can_edit_table_structure(state: &EditorState) -> bool {
     let Some(info) = find_table_at(&state.doc, state.selection.from()) else {
         return false;
@@ -3050,21 +3146,31 @@ pub fn can_edit_table_structure(state: &EditorState) -> bool {
     let Some(table) = extract_node_at(&state.doc, info.table_offset) else {
         return false;
     };
-    let expected_cells = table.child(0).map(Node::child_count).unwrap_or(0);
-    expected_cells > 0
-        && (0..table.child_count()).all(|row_i| {
-            let Some(row) = table.child(row_i) else {
-                return false;
-            };
-            row.child_count() == expected_cells && (0..row.child_count()).all(|cell_i| {
-                let Some(cell) = row.child(cell_i) else {
-                    return false;
-                };
-                ["colspan", "rowspan"].iter().all(|key| {
-                    cell.attrs().get(*key).map(String::as_str).unwrap_or("1") == "1"
-                })
-            })
-        })
+    table_grid(&table, info.table_offset).is_some()
+}
+
+pub fn can_add_table_row(state: &EditorState) -> bool {
+    let Some(info) = find_table_at(&state.doc, state.selection.from()) else { return false; };
+    let Some(table) = extract_node_at(&state.doc, info.table_offset) else { return false; };
+    let Some(grid) = table_grid(&table, info.table_offset) else { return false; };
+    let Some(clicked) = grid.cells.iter().find(|cell| cell.row == info.row_index && cell.cell == info.cell_index) else {
+        return false;
+    };
+    let boundary = clicked.row + clicked.rowspan;
+    grid.cells.iter().filter(|cell| cell.row < boundary && cell.row + cell.rowspan > boundary)
+        .all(|cell| cell.rowspan < 65534)
+}
+
+pub fn can_add_table_column(state: &EditorState) -> bool {
+    let Some(info) = find_table_at(&state.doc, state.selection.from()) else { return false; };
+    let Some(table) = extract_node_at(&state.doc, info.table_offset) else { return false; };
+    let Some(grid) = table_grid(&table, info.table_offset) else { return false; };
+    let Some(clicked) = grid.cells.iter().find(|cell| cell.row == info.row_index && cell.cell == info.cell_index) else {
+        return false;
+    };
+    let boundary = clicked.col + clicked.colspan;
+    grid.cells.iter().filter(|cell| cell.col < boundary && cell.col + cell.colspan > boundary)
+        .all(|cell| cell.colspan < 1000)
 }
 
 /// Insert a table with the given number of rows and columns after the current block.
@@ -3123,32 +3229,48 @@ pub fn add_row(
     state: &EditorState,
     dispatch: Option<&dyn Fn(Transaction)>,
 ) -> bool {
-    if !can_edit_table_structure(state) {
-        return false;
-    }
+    if !can_add_table_row(state) { return false; }
     let Some(info) = find_table_at(&state.doc, state.selection.from()) else {
         return false;
     };
+    let Some(table) = extract_node_at(&state.doc, info.table_offset) else { return false; };
+    let Some(grid) = table_grid(&table, info.table_offset) else { return false; };
+    let Some(clicked) = grid.cells.iter().find(|cell| cell.row == info.row_index && cell.cell == info.cell_index) else {
+        return false;
+    };
+    // Below a spanning cell means below its visual bottom edge.
+    let boundary = clicked.row + clicked.rowspan;
 
     if let Some(dispatch) = dispatch {
-        // Build a new row with the same number of cells
-        let cells: Vec<Node> = (0..info.num_cols)
-            .map(|_| {
-                Node::element_with_content(
-                    NodeType::TableCell,
-                    Fragment::from(vec![Node::element(NodeType::Paragraph)]),
-                )
-            })
-            .collect();
-        let new_row = Node::element_with_content(NodeType::TableRow, Fragment::from(cells));
-        let insert_pos = info.row_offset + info.row_node_size;
-        let slice = Slice::new(Fragment::from(vec![new_row]), 0, 0);
-
-        if let Ok(mut txn) = state.transaction().replace(insert_pos, insert_pos, slice) {
-            // Cursor in first cell of new row: row(+1) + cell(+1) + para(+1) = +3
-            txn.selection = Selection::cursor(insert_pos + 3);
-            dispatch(txn);
+        let mut crossing: Vec<_> = grid.cells.iter().filter(|cell| {
+            cell.row < boundary && cell.row + cell.rowspan > boundary
+        }).collect();
+        crossing.sort_unstable_by_key(|cell| cell.col);
+        let mut cells = Vec::new();
+        let mut next_col = 0;
+        for cell in &crossing {
+            append_empty_row_cells(&mut cells, cell.col - next_col);
+            next_col = cell.col + cell.colspan;
         }
+        append_empty_row_cells(&mut cells, grid.width - next_col);
+        if cells.is_empty() { return false; }
+        let new_row = Node::element_with_content(NodeType::TableRow, Fragment::from(cells));
+        let insert_pos = grid.row_offsets[boundary];
+        let slice = Slice::new(Fragment::from(vec![new_row]), 0, 0);
+        let mut txn = state.transaction();
+        for cell in crossing {
+            match txn.step(Step::SetAttr {
+                pos: cell.offset,
+                attr: "rowspan".to_string(),
+                value: (cell.rowspan + 1).to_string(),
+            }) {
+                Ok(next) => txn = next,
+                Err(_) => return false,
+            }
+        }
+        let Ok(mut txn) = txn.replace(insert_pos, insert_pos, slice) else { return false; };
+        txn.selection = Selection::cursor(insert_pos + 3);
+        dispatch(txn);
     }
     true
 }
@@ -3199,49 +3321,49 @@ pub fn add_column(
     state: &EditorState,
     dispatch: Option<&dyn Fn(Transaction)>,
 ) -> bool {
-    if !can_edit_table_structure(state) {
-        return false;
-    }
+    if !can_add_table_column(state) { return false; }
     let Some(info) = find_table_at(&state.doc, state.selection.from()) else {
         return false;
     };
+    let Some(table) = extract_node_at(&state.doc, info.table_offset) else { return false; };
+    let Some(grid) = table_grid(&table, info.table_offset) else { return false; };
+    let Some(clicked) = grid.cells.iter().find(|cell| cell.row == info.row_index && cell.cell == info.cell_index) else {
+        return false;
+    };
+    // Right of a spanning cell means beyond its visual right edge.
+    let boundary = clicked.col + clicked.colspan;
 
     if let Some(dispatch) = dispatch {
-        let table_node = extract_node_at(&state.doc, info.table_offset);
-        let Some(table) = table_node else { return false };
-
-        let col_idx = info.cell_index;
         let mut txn = state.transaction();
-
-        // Process rows bottom-to-top so position shifts don't affect earlier rows
-        let rows: Vec<_> = (0..table.child_count()).collect();
-        for &row_i in rows.iter().rev() {
-            let Some(row) = table.child(row_i) else { continue };
-            // Find the cell at col_idx in this row
-            let mut cell_offset = info.table_offset + 1; // table content start
-            // Walk to this row
-            for ri in 0..row_i {
-                if let Some(r) = table.child(ri) {
-                    cell_offset += r.node_size();
+        // Work bottom-to-top: edits in a lower row cannot shift positions in
+        // a higher row. A cell crossing this boundary grows; otherwise the
+        // row receives one new cell at the boundary.
+        for row_i in (0..grid.rows).rev() {
+            for cell in grid.cells.iter().filter(|cell| {
+                cell.row == row_i && cell.col < boundary && cell.col + cell.colspan > boundary
+            }) {
+                match txn.step(Step::SetAttr {
+                    pos: cell.offset,
+                    attr: "colspan".to_string(),
+                    value: (cell.colspan + 1).to_string(),
+                }) {
+                    Ok(next) => txn = next,
+                    Err(_) => return false,
                 }
             }
-            cell_offset += 1; // row open boundary
-            // Walk to the cell after col_idx
-            for ci in 0..=col_idx.min(row.child_count().saturating_sub(1)) {
-                if let Some(c) = row.child(ci) {
-                    cell_offset += c.node_size();
-                }
-            }
-            // Insert new empty cell at cell_offset
-            let cell_type = row
-                .child(col_idx)
-                .filter(|cell| cell.node_type() == Some(NodeType::TableHeader))
-                .map(|_| NodeType::TableHeader)
-                .unwrap_or(NodeType::TableCell);
-            let new_cell = Node::element_with_content(
-                cell_type,
-                Fragment::from(vec![Node::element(NodeType::Paragraph)]),
-            );
+            let covered = grid.cells.iter().any(|cell| {
+                cell.row <= row_i && row_i < cell.row + cell.rowspan
+                    && cell.col < boundary && cell.col + cell.colspan > boundary
+            });
+            if covered { continue; }
+            let row_cells: Vec<_> = grid.cells.iter().filter(|cell| cell.row == row_i).collect();
+            let insert_before = row_cells.iter().find(|cell| cell.col >= boundary);
+            let cell_offset = insert_before.map(|cell| cell.offset)
+                .unwrap_or(grid.row_offsets[row_i + 1] - 1);
+            let neighbor = row_cells.iter().rev().find(|cell| cell.col < boundary)
+                .or_else(|| row_cells.first());
+            let cell_type = neighbor.map(|cell| cell.node_type).unwrap_or(NodeType::TableCell);
+            let new_cell = empty_table_cell(cell_type, 1);
             let slice = Slice::new(Fragment::from(vec![new_cell]), 0, 0);
             match txn.step(Step::Replace {
                 from: cell_offset,
@@ -5980,31 +6102,201 @@ mod tests {
     }
 
     #[test]
-    fn structural_edits_reject_merged_table() {
+    fn structural_edits_preserve_merged_grid() {
+        fn cell(text: &str, colspan: usize, rowspan: usize) -> Node {
+            let mut attrs = std::collections::HashMap::new();
+            attrs.insert("colspan".to_string(), colspan.to_string());
+            attrs.insert("rowspan".to_string(), rowspan.to_string());
+            Node::element_with_attrs(
+                NodeType::TableCell,
+                attrs,
+                Fragment::from(vec![Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text(text)]),
+                )]),
+            )
+        }
+        let rows = vec![
+            vec![cell("A", 2, 2), cell("B", 1, 1)],
+            vec![cell("C", 1, 1)],
+            vec![cell("D", 1, 1), cell("E", 1, 1), cell("F", 1, 1)],
+        ];
+        let table = Node::element_with_content(NodeType::Table, Fragment::from(
+            rows.into_iter().map(|row| Node::element_with_content(
+                NodeType::TableRow, Fragment::from(row),
+            )).collect::<Vec<_>>(),
+        ));
+        let grid = table_grid(&table, 0).unwrap();
+        assert_eq!((grid.width, grid.rows), (3, 3));
+        let merged_id = table.child(0).unwrap().child(0).unwrap().attrs()["blockId"].clone();
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![table]));
+
+        for clicked in &grid.cells {
+            let state = EditorState {
+                selection: Selection::cursor(clicked.offset + 2),
+                ..EditorState::create_default(doc.clone())
+            };
+            let row_txn = run_command(&state, add_row).unwrap();
+            let row_state = state.apply(row_txn);
+            let row_grid = table_grid(row_state.doc.child(0).unwrap(), 0).unwrap();
+            assert_eq!((row_grid.width, row_grid.rows), (3, 4));
+            let col_txn = run_command(&state, add_column).unwrap();
+            let col_state = state.apply(col_txn);
+            let col_grid = table_grid(col_state.doc.child(0).unwrap(), 0).unwrap();
+            assert_eq!((col_grid.width, col_grid.rows), (4, 3));
+        }
+
+        // Insert right of D at visual column 1. A crosses that boundary
+        // above, so it grows instead of receiving overlapping new cells.
+        let d = grid.cells.iter().find(|cell| cell.row == 2 && cell.cell == 0).unwrap();
+        let state = EditorState {
+            selection: Selection::cursor(d.offset + 2),
+            ..EditorState::create_default(doc.clone())
+        };
+        assert!(can_edit_table_structure(&state));
+        let txn = run_command(&state, add_column).unwrap();
+        let next = state.apply(txn);
+        let table = next.doc.child(0).unwrap();
+        let next_grid = table_grid(table, 0).unwrap();
+        assert_eq!((next_grid.width, next_grid.rows), (4, 3));
+        assert_eq!(table.child(0).unwrap().child(0).unwrap().attrs()["colspan"], "3");
+        assert_eq!(table.child(0).unwrap().child(0).unwrap().attrs()["blockId"], merged_id);
+        assert_eq!(table.child(2).unwrap().child_count(), 4);
+
+        // Insert below B at visual row 1. A crosses that boundary and
+        // grows down; the new row needs only cells outside A's span.
+        let b = grid.cells.iter().find(|cell| cell.row == 0 && cell.cell == 1).unwrap();
+        let state = EditorState {
+            selection: Selection::cursor(b.offset + 2),
+            ..EditorState::create_default(doc)
+        };
+        let txn = run_command(&state, add_row).unwrap();
+        let next = state.apply(txn);
+        let table = next.doc.child(0).unwrap();
+        let next_grid = table_grid(table, 0).unwrap();
+        assert_eq!((next_grid.width, next_grid.rows), (3, 4));
+        assert_eq!(table.child(0).unwrap().child(0).unwrap().attrs()["rowspan"], "3");
+        assert_eq!(table.child(1).unwrap().child_count(), 1);
+        assert_eq!(table.child(0).unwrap().child(0).unwrap().attrs()["blockId"], merged_id);
+    }
+
+    #[test]
+    fn insertion_keeps_large_spans_editable() {
         let mut attrs = std::collections::HashMap::new();
-        attrs.insert("colspan".to_string(), "2".to_string());
-        let merged = Node::element_with_attrs(
+        attrs.insert("colspan".to_string(), "512".to_string());
+        let wide = Node::element_with_attrs(
             NodeType::TableCell,
             attrs,
             Fragment::from(vec![Node::element(NodeType::Paragraph)]),
         );
-        let doc = Node::element_with_content(
-            NodeType::Doc,
-            Fragment::from(vec![Node::element_with_content(
-                NodeType::Table,
-                Fragment::from(vec![Node::element_with_content(
-                    NodeType::TableRow,
-                    Fragment::from(vec![merged]),
-                )]),
-            )]),
+        let second_row = (0..512).map(|_| empty_table_cell(NodeType::TableCell, 1)).collect();
+        let table = Node::element_with_content(NodeType::Table, Fragment::from(vec![
+            Node::element_with_content(NodeType::TableRow, Fragment::from(vec![wide])),
+            Node::element_with_content(NodeType::TableRow, Fragment::from(second_row)),
+        ]));
+        let grid = table_grid(&table, 0).unwrap();
+        let clicked = grid.cells.iter().find(|cell| cell.row == 1 && cell.cell == 0).unwrap();
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![table]));
+        let state = EditorState {
+            selection: Selection::cursor(clicked.offset + 2),
+            ..EditorState::create_default(doc)
+        };
+        let next = state.apply(run_command(&state, add_column).unwrap());
+        let table = next.doc.child(0).unwrap();
+        assert_eq!(table.child(0).unwrap().child(0).unwrap().attrs()["colspan"], "513");
+        assert_eq!(table_grid(table, 0).unwrap().width, 513);
+        assert!(can_edit_table_structure(&next));
+
+        let mut cells = Vec::new();
+        append_empty_row_cells(&mut cells, 1001);
+        assert_eq!(cells.len(), 1001);
+        assert!(cells.iter().all(|cell| cell.attrs()["colspan"] == "1"));
+    }
+
+    #[test]
+    fn column_insertion_respects_html_colspan_limit() {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("colspan".to_string(), "1000".to_string());
+        let wide = Node::element_with_attrs(
+            NodeType::TableCell,
+            attrs,
+            Fragment::from(vec![Node::element(NodeType::Paragraph)]),
         );
+        let second_row = (0..1000).map(|_| empty_table_cell(NodeType::TableCell, 1)).collect();
+        let table = Node::element_with_content(NodeType::Table, Fragment::from(vec![
+            Node::element_with_content(NodeType::TableRow, Fragment::from(vec![wide])),
+            Node::element_with_content(NodeType::TableRow, Fragment::from(second_row)),
+        ]));
+        let grid = table_grid(&table, 0).unwrap();
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![table]));
+        let below = grid.cells.iter().find(|cell| cell.row == 1 && cell.cell == 0).unwrap();
+        let state = EditorState {
+            selection: Selection::cursor(below.offset + 2),
+            ..EditorState::create_default(doc.clone())
+        };
+        assert!(!can_add_table_column(&state));
+        assert!(run_command(&state, add_column).is_none());
+
+        // Right of the wide cell does not expand it, so insertion works.
+        let state = EditorState {
+            selection: Selection::cursor(grid.cells[0].offset + 2),
+            ..EditorState::create_default(doc)
+        };
+        assert!(can_add_table_column(&state));
+        let next = state.apply(run_command(&state, add_column).unwrap());
+        assert_eq!(table_grid(next.doc.child(0).unwrap(), 0).unwrap().width, 1001);
+    }
+
+    #[test]
+    fn wide_rectangular_row_insertion_keeps_individual_cells() {
+        let cells = (0..1001).map(|_| empty_table_cell(NodeType::TableCell, 1)).collect();
+        let row = Node::element_with_content(NodeType::TableRow, Fragment::from(cells));
+        let table = Node::element_with_content(NodeType::Table, Fragment::from(vec![row]));
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![table]));
         let state = EditorState {
             selection: Selection::cursor(4),
             ..EditorState::create_default(doc)
         };
-        assert!(!can_edit_table_structure(&state));
-        assert!(run_command(&state, add_row).is_none());
-        assert!(run_command(&state, add_column).is_none());
+        let next = state.apply(run_command(&state, add_row).unwrap());
+        let table = next.doc.child(0).unwrap();
+        assert_eq!(table.child(1).unwrap().child_count(), 1001);
+        assert_eq!(table_grid(table, 0).unwrap().width, 1001);
+    }
+
+    #[test]
+    fn wide_merged_row_still_allows_column_insertion() {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("rowspan".to_string(), "2".to_string());
+        let spanning = Node::element_with_attrs(
+            NodeType::TableCell,
+            attrs,
+            Fragment::from(vec![Node::element(NodeType::Paragraph)]),
+        );
+        let mut first = (0..1001).map(|_| empty_table_cell(NodeType::TableCell, 1))
+            .collect::<Vec<_>>();
+        first.push(spanning);
+        let second = (0..1001).map(|_| empty_table_cell(NodeType::TableCell, 1)).collect();
+        let table = Node::element_with_content(NodeType::Table, Fragment::from(vec![
+            Node::element_with_content(NodeType::TableRow, Fragment::from(first)),
+            Node::element_with_content(NodeType::TableRow, Fragment::from(second)),
+        ]));
+        let doc = Node::element_with_content(NodeType::Doc, Fragment::from(vec![table]));
+        let state = EditorState {
+            selection: Selection::cursor(4),
+            ..EditorState::create_default(doc)
+        };
+        let with_row = state.apply(run_command(&state, add_row).unwrap());
+        let table = with_row.doc.child(0).unwrap();
+        assert_eq!(table.child(1).unwrap().child_count(), 1001);
+        let grid = table_grid(table, 0).unwrap();
+        let new_cell = grid.cells.iter().find(|cell| cell.row == 1 && cell.cell == 0).unwrap();
+        let state = EditorState {
+            selection: Selection::cursor(new_cell.offset + 2),
+            ..with_row
+        };
+        assert!(can_add_table_column(&state));
+        let with_column = state.apply(run_command(&state, add_column).unwrap());
+        assert_eq!(table_grid(with_column.doc.child(0).unwrap(), 0).unwrap().width, 1003);
     }
 
     #[test]

@@ -3017,6 +3017,8 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
     // the menu is open; a re-render detaches this element and the action
     // safely does nothing instead of editing a different cell.
     let (ctx_in_table, set_ctx_in_table) = signal(false);
+    let (ctx_can_insert_row, set_ctx_can_insert_row) = signal(false);
+    let (ctx_can_insert_column, set_ctx_can_insert_column) = signal(false);
     let ctx_table_cell: Rc<RefCell<Option<web_sys::Element>>> = Rc::new(RefCell::new(None));
     let table_context_readonly = props.readonly;
     let remote_state_for_ctx = props.remote_state;
@@ -3029,6 +3031,8 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
             // appears available but cannot safely target that cell.
             set_ctx_menu_visible.set(false);
             set_ctx_in_table.set(false);
+            set_ctx_can_insert_row.set(false);
+            set_ctx_can_insert_column.set(false);
             ctx_table_cell_for_remote.borrow_mut().take();
         }
     });
@@ -3167,7 +3171,12 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                 let Some(cell) = ctx_table_cell_for_cmd.borrow().as_ref().cloned() else { return };
                 let Some(pos) = view.model_position_at_element_start(&cell) else { return };
                 s.selection = Selection::cursor(pos);
-                if !commands::can_edit_table_structure(&s) { return; }
+                let permitted = match &cmd {
+                    EditorContextCommand::InsertTableRowBelow => commands::can_add_table_row(&s),
+                    EditorContextCommand::InsertTableColumnRight => commands::can_add_table_column(&s),
+                    _ => false,
+                };
+                if !permitted { return; }
             } else if let Some(dom_sel) = view.read_dom_selection() {
                 let dom_collapsed_over_range =
                     dom_sel.empty() && !s.selection.empty();
@@ -3453,7 +3462,17 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                                 commands::can_edit_table_structure(&state)
                             })
                     };
+                    let (can_row, can_column) = table_cell.as_ref().and_then(|cell| {
+                        let view = view_ref_ctx_open.borrow();
+                        let view = view.as_ref()?;
+                        let pos = view.model_position_at_element_start(cell)?;
+                        let mut state = view.state();
+                        state.selection = Selection::cursor(pos);
+                        Some((commands::can_add_table_row(&state), commands::can_add_table_column(&state)))
+                    }).unwrap_or((false, false));
                     set_ctx_in_table.set(table_cell.is_some());
+                    set_ctx_can_insert_row.set(can_row);
+                    set_ctx_can_insert_column.set(can_column);
                     *ctx_table_cell_for_open.borrow_mut() = table_cell;
 
                     set_ctx_menu_x.set(e.client_x() as f64);
@@ -3467,6 +3486,8 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
                 y=ctx_menu_y
                 selection_empty=selection_empty.into()
                 in_table=ctx_in_table.into()
+                can_insert_row=ctx_can_insert_row.into()
+                can_insert_column=ctx_can_insert_column.into()
                 doc_mention=ctx_doc_mention
                 on_command=on_ctx_command
                 on_close=Callback::new(move |()| set_ctx_menu_visible.set(false))

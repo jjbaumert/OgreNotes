@@ -546,9 +546,9 @@ fn convert_block_element(
         }
         NodeType::TableRow => {
             let children = walk_block_children(child, false);
-            if !children.is_empty() {
-                out.push(Node::element_with_content(NodeType::TableRow, Fragment::from(children)));
-            }
+            // A row may contain no own cells because rowspans from above
+            // cover it completely. Keep it so the table grid stays intact.
+            out.push(Node::element_with_content(NodeType::TableRow, Fragment::from(children)));
         }
         NodeType::TableCell | NodeType::TableHeader => {
             let children = walk_block_children(child, false);
@@ -560,10 +560,24 @@ fn convert_block_element(
             };
             let mut attrs = std::collections::HashMap::new();
             if let Some(cs) = el.get_attribute("colspan") {
-                attrs.insert("colspan".into(), cs);
+                let span = cs.trim().parse::<usize>().unwrap_or(1).clamp(1, 1000);
+                attrs.insert("colspan".into(), span.to_string());
             }
             if let Some(rs) = el.get_attribute("rowspan") {
-                attrs.insert("rowspan".into(), rs);
+                // Row-group boundaries are flattened in the model. Resolve
+                // zero and clamp nonzero spans before losing that boundary.
+                let mut remaining = 0_usize;
+                let mut row = el.closest("tr").ok().flatten();
+                while let Some(current) = row {
+                    if current.tag_name().eq_ignore_ascii_case("tr") {
+                        remaining += 1;
+                    }
+                    row = current.next_element_sibling();
+                }
+                let requested = rs.trim().parse::<usize>().unwrap_or(1);
+                let span = if requested == 0 { remaining } else { requested.min(remaining) }
+                    .clamp(1, 65534);
+                attrs.insert("rowspan".into(), span.to_string());
             }
             if let Some(align) = extract_cell_align(el) {
                 attrs.insert("align".into(), align);
