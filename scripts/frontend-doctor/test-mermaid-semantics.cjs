@@ -145,12 +145,19 @@ const cases = [
       await input.fill('gantt\nexcludes weekends\nt :2024-01-05, 2d');
       await page.locator('.mermaid-modal button.btn-primary').click();
       await modal.waitFor({ state: 'detached' });
-      await page.locator('.sync-indicator.is-saved').waitFor();
-      const exported = await context.request.get(base + `/api/v1/documents/${id}/export/html`, {
-        headers: { Authorization: 'Bearer ' + token },
-      });
-      assert(exported.ok());
-      check((await exported.text()).includes('Line 2: unsupported Gantt directive'), 'HTML export keeps the original Mermaid error line');
+      // The sync pill is polled and may still show "Saved" from the prior
+      // edit. Check the actual export until this specific update is visible.
+      const deadline = Date.now() + 5000;
+      let exportHasError = false;
+      do {
+        const exported = await context.request.get(base + `/api/v1/documents/${id}/export/html`, {
+          headers: { Authorization: 'Bearer ' + token },
+        });
+        assert(exported.ok());
+        exportHasError = (await exported.text()).includes('Line 2: unsupported Gantt directive');
+        if (!exportHasError) await page.waitForTimeout(100);
+      } while (!exportHasError && Date.now() < deadline);
+      check(exportHasError, 'HTML export keeps the original Mermaid error line');
     }
     assert.deepEqual(errors, [], 'Browser raised an error');
     if (observe) console.log(`Observed ${failures.length} reproduced defects`);
