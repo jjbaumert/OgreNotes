@@ -58,6 +58,14 @@ ignore = [
     # docx-rs bumps or when we replace it.
     { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.36.2 parse-DoS: reachable only through docx-rs writer path (not parse); no upstream fix" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.36.2 NsReader alloc-DoS: reachable only through docx-rs writer path (not parse); no upstream fix" },
+
+    # zip 0.6, 2, and 7 are pinned by docx-rs, this workspace, and calamine.
+    # The advisories affect archive extraction and symlink handling; our code
+    # reads named entries and writes archives, and never calls extract().
+    # The patched 9.0.0 release is not available to these dependency ranges.
+    { id = "RUSTSEC-2026-0367", reason = "zip extraction permission-bit issue; repository uses read-by-name and write APIs only; upstream dependencies do not support patched zip 9" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extraction symlink issue; repository uses read-by-name and write APIs only; upstream dependencies do not support patched zip 9" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extraction symlink permission issue; repository uses read-by-name and write APIs only; upstream dependencies do not support patched zip 9" },
 ]
 
 [licenses]

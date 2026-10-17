@@ -1,8 +1,8 @@
 pub(crate) mod parse;
-pub(crate) mod shapes;
-pub(crate) mod svg;
 #[cfg(test)]
 mod props;
+pub(crate) mod shapes;
+pub(crate) mod svg;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShapeKind {
@@ -45,17 +45,18 @@ pub(crate) enum Head {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FlowNode {
-    /// Mermaid source identifier. Read by the post-parse
-    /// edge-to-subgraph check (parse.rs) and asserted on by parser
-    /// tests; downstream render stages address nodes by index.
+    /// Mermaid source identifier. Downstream render stages use node indices.
     pub id: String,
-    pub label: String,          // raw; escaped only at SVG emission
+    pub label: String, // raw; escaped only at SVG emission
     pub shape: ShapeKind,
     pub classes: Vec<String>,
     /// Inline `style <id> ...` — sanitized `prop:value;` pairs (same
     /// allowlist as `classDef`), applied on top of any class styles.
     pub style: Option<String>,
     pub subgraph: Option<usize>,
+    /// An anchor for an otherwise empty subgraph. It affects layout but is
+    /// never painted as a node.
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +73,10 @@ pub(crate) struct FlowEdge {
     /// `linkStyle <index> ...` — sanitized `prop:value;` pairs applied to
     /// this edge's `<path>`. Falls back to `FlowGraph::default_link_style`.
     pub style: Option<String>,
+    /// Cluster endpoints are routed through member representatives, then
+    /// clipped to these cluster borders when painted.
+    pub from_cluster: Option<usize>,
+    pub to_cluster: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,8 +109,16 @@ pub(crate) fn render_flowchart(source: &str) -> Result<String, crate::ParseError
     let mut nodes = Vec::with_capacity(g.nodes.len());
     for n in &g.nodes {
         let (tw, th) = crate::measure::text_size(&n.label);
-        let (w, h) = shapes::size_for(n.shape, tw, th);
-        nodes.push(crate::layout::LNode { width: w, height: h, cluster: n.subgraph });
+        let (w, h) = if n.hidden {
+            (2.0, 2.0)
+        } else {
+            shapes::size_for(n.shape, tw, th)
+        };
+        nodes.push(crate::layout::LNode {
+            width: w,
+            height: h,
+            cluster: n.subgraph,
+        });
     }
     let edges = g
         .edges
@@ -134,7 +147,9 @@ pub(crate) fn render_flowchart(source: &str) -> Result<String, crate::ParseError
         clusters,
         direction: g.direction,
     };
-    let layout = crate::layout::run(&input)
-        .map_err(|message| crate::ParseError { message, line: None })?;
+    let layout = crate::layout::run(&input).map_err(|message| crate::ParseError {
+        message,
+        line: None,
+    })?;
     Ok(svg::emit(&g, &layout))
 }

@@ -8,8 +8,8 @@
 
 use crate::escape_xml;
 use crate::flowchart::{shapes, EdgeKind, FlowGraph, Head};
+use crate::layout::{Direction, Layout, Rect};
 use crate::measure;
-use crate::layout::{Direction, Layout};
 
 /// Horizontal (or vertical, in LR/RL flow) bow between paired edges so
 /// opposing/parallel edges don't overlap.
@@ -17,6 +17,51 @@ const PARALLEL_BOW: f64 = 20.0;
 /// Tangential spread applied to a diamond's edge anchors when two edges share
 /// the same neighbour, so a decision loop's out/back edges don't collide.
 const DIAMOND_PORT_SPREAD: f64 = 14.0;
+
+/// Remove the portion of an edge inside its source cluster. The layout path
+/// starts at a member representative and crosses the cluster boundary; only
+/// the portion from that boundary onward is visible for a cluster endpoint.
+fn clip_start_to_cluster(points: &mut Vec<(f64, f64)>, rect: &Rect) {
+    let inside = |p: (f64, f64)| {
+        p.0 >= rect.x - 1e-6
+            && p.0 <= rect.x + rect.w + 1e-6
+            && p.1 >= rect.y - 1e-6
+            && p.1 <= rect.y + rect.h + 1e-6
+    };
+    for i in 1..points.len() {
+        if inside(points[i - 1]) && !inside(points[i]) {
+            let (a, b) = (points[i - 1], points[i]);
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let mut t = 1.0_f64;
+            for (d, edge) in [(dx, rect.x), (dx, rect.x + rect.w)] {
+                if d.abs() > 1e-9 {
+                    let candidate = (edge - a.0) / d;
+                    if (0.0..=1.0).contains(&candidate) {
+                        let y = a.1 + candidate * dy;
+                        if y >= rect.y - 1e-6 && y <= rect.y + rect.h + 1e-6 {
+                            t = t.min(candidate);
+                        }
+                    }
+                }
+            }
+            for (d, edge) in [(dy, rect.y), (dy, rect.y + rect.h)] {
+                if d.abs() > 1e-9 {
+                    let candidate = (edge - a.1) / d;
+                    if (0.0..=1.0).contains(&candidate) {
+                        let x = a.0 + candidate * dx;
+                        if x >= rect.x - 1e-6 && x <= rect.x + rect.w + 1e-6 {
+                            t = t.min(candidate);
+                        }
+                    }
+                }
+            }
+            let boundary = (a.0 + t * dx, a.1 + t * dy);
+            points.drain(..i);
+            points.insert(0, boundary);
+            return;
+        }
+    }
+}
 
 /// A curve between two endpoints bowed off its midpoint (perpendicular to the
 /// flow axis) so parallel edges between the same node pair separate.
@@ -29,12 +74,32 @@ fn bowed_path(points: &[(f64, f64)], off: f64, vertical: bool) -> String {
     let mx = (start.0 + end.0) / 2.0;
     let my = (start.1 + end.1) / 2.0;
     // In top-down flow bow horizontally; in left-right flow bow vertically.
-    let mid = if vertical { (mx + off, my) } else { (mx, my + off) };
+    let mid = if vertical {
+        (mx + off, my)
+    } else {
+        (mx, my + off)
+    };
     crate::curved_path(&[start, mid, end], vertical)
 }
 
 pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
-    let (w, h) = l.size;
+    let loop_label_width = g
+        .edges
+        .iter()
+        .filter(|e| e.from_cluster.is_some() && e.from_cluster == e.to_cluster)
+        .filter_map(|e| e.label.as_deref())
+        .map(|label| measure::text_size(label).0)
+        .fold(0.0_f64, f64::max);
+    let loop_margin = if g
+        .edges
+        .iter()
+        .any(|e| e.from_cluster.is_some() && e.from_cluster == e.to_cluster)
+    {
+        48.0 + loop_label_width
+    } else {
+        0.0
+    };
+    let (w, h) = (l.size.0 + loop_margin, l.size.1);
     let mut out = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:14px">"#
     );
@@ -92,11 +157,12 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
     // its rhombus outline (|x|/hw + |y|/hh = 1). A near-vertical edge lands on
     // the top/bottom vertex; a diagonal branch lands on a lower face — matching
     // Mermaid's polygon clip instead of snapping to the bounding-box vertex.
-    let diamond_clip = |gi: &(f64, f64, f64, f64, crate::flowchart::ShapeKind), tx: f64, ty: f64| {
-        let (dx, dy) = (tx - gi.0, ty - gi.1);
-        let t = 1.0 / (dx.abs() / gi.2 + dy.abs() / gi.3).max(1e-6);
-        (gi.0 + dx * t, gi.1 + dy * t)
-    };
+    let diamond_clip =
+        |gi: &(f64, f64, f64, f64, crate::flowchart::ShapeKind), tx: f64, ty: f64| {
+            let (dx, dy) = (tx - gi.0, ty - gi.1);
+            let t = 1.0 / (dx.abs() / gi.2 + dy.abs() / gi.3).max(1e-6);
+            (gi.0 + dx * t, gi.1 + dy * t)
+        };
 
     // 4. edges (+ label mask rects + label texts)
     // Detect node pairs joined by more than one edge (parallel or opposing,
@@ -107,7 +173,10 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
     for (i, ep) in l.edge_paths.iter().enumerate() {
         let e = &g.edges[ep.edge];
         if e.from != e.to {
-            multi.entry((e.from.min(e.to), e.from.max(e.to))).or_default().push(i);
+            multi
+                .entry((e.from.min(e.to), e.from.max(e.to)))
+                .or_default()
+                .push(i);
         }
     }
     for (i, ep) in l.edge_paths.iter().enumerate() {
@@ -141,6 +210,26 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
             if geom[e.to].4 == crate::flowchart::ShapeKind::Diamond {
                 let (ax, ay) = diamond_clip(&geom[e.to], sc_x, sc_y);
                 pts[last] = (ax + spread, ay);
+            }
+        }
+        let mut label_at = ep.label_at;
+        if let Some(c) = e.from_cluster.filter(|c| Some(*c) == e.to_cluster) {
+            // A cluster-to-itself edge has no inside-to-outside crossing to
+            // clip. Give it an explicit outside loop instead.
+            let r = &l.cluster_rects[c];
+            let right = r.x + r.w;
+            let outer = right + 32.0;
+            let (y1, y2) = (r.y + r.h / 3.0, r.y + 2.0 * r.h / 3.0);
+            pts = vec![(right, y1), (outer, y1), (outer, y2), (right, y2)];
+            label_at = e.label.as_ref().map(|_| (outer + 4.0, (y1 + y2) / 2.0));
+        } else {
+            if let Some(c) = e.from_cluster {
+                clip_start_to_cluster(&mut pts, &l.cluster_rects[c]);
+            }
+            if let Some(c) = e.to_cluster {
+                pts.reverse();
+                clip_start_to_cluster(&mut pts, &l.cluster_rects[c]);
+                pts.reverse();
             }
         }
         // Bow apart only genuine multi-edges between the same pair, and only
@@ -181,13 +270,16 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
         }
         out.push_str(&format!(r#"<path d="{d}" {attrs}/>"#));
 
-        if let (Some(label), Some(at)) = (&e.label, ep.label_at) {
+        if let (Some(label), Some(at)) = (&e.label, label_at) {
             out.push_str(&crate::edge_label_svg(label, at));
         }
     }
 
     // 5. nodes
     for (i, n) in g.nodes.iter().enumerate() {
+        if n.hidden {
+            continue;
+        }
         let (cx, cy) = l.node_centers[i];
         let (tw, th) = measure::text_size(&n.label);
         let (nw, nh) = shapes::size_for(n.shape, tw, th);
@@ -231,8 +323,6 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
 mod tests {
     use crate::flowchart::render_flowchart;
 
-
-
     #[test]
     fn simple_chain_renders() {
         let svg = render_flowchart("graph TD\nA[Start] --> B{Choice} -->|yes| C(End)").unwrap();
@@ -249,12 +339,28 @@ mod tests {
         // Defect 1: the rhombus bounding box must be square regardless of label
         // aspect (Mermaid sizes it as a rotated square).
         let svg = render_flowchart("graph TD\nB{Is it working?} --> C[x]").unwrap();
-        let poly = svg.split("<polygon points=\"").nth(1).unwrap().split('"').next().unwrap();
-        let xs: Vec<f64> = poly.split([' ', ',']).step_by(2).map(|s| s.parse().unwrap()).collect();
-        let ys: Vec<f64> =
-            poly.split([' ', ',']).skip(1).step_by(2).map(|s| s.parse().unwrap()).collect();
-        let w = xs.iter().cloned().fold(f64::MIN, f64::max) - xs.iter().cloned().fold(f64::MAX, f64::min);
-        let h = ys.iter().cloned().fold(f64::MIN, f64::max) - ys.iter().cloned().fold(f64::MAX, f64::min);
+        let poly = svg
+            .split("<polygon points=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let xs: Vec<f64> = poly
+            .split([' ', ','])
+            .step_by(2)
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let ys: Vec<f64> = poly
+            .split([' ', ','])
+            .skip(1)
+            .step_by(2)
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let w = xs.iter().cloned().fold(f64::MIN, f64::max)
+            - xs.iter().cloned().fold(f64::MAX, f64::min);
+        let h = ys.iter().cloned().fold(f64::MIN, f64::max)
+            - ys.iter().cloned().fold(f64::MAX, f64::min);
         assert!((w - h).abs() / w < 0.02, "diamond not square: {w} x {h}");
     }
 
@@ -262,20 +368,26 @@ mod tests {
     fn decision_branch_edges_leave_distinct_faces() {
         // Defect 4/3: the two branch edges from a decision node (and a back
         // edge) must not share one attachment point on the diamond.
-        let svg =
-            render_flowchart("graph TD\nB{q} -->|Yes| C[Ship]\nB -->|No| D[Debug]\nD --> B").unwrap();
+        let svg = render_flowchart("graph TD\nB{q} -->|Yes| C[Ship]\nB -->|No| D[Debug]\nD --> B")
+            .unwrap();
         // Collect the start point of every edge path (`<path d="M x y ...`).
         let starts: Vec<(String, String)> = svg
             .split("<path d=\"M ")
             .skip(1)
             .map(|s| {
                 let mut it = s.split_whitespace();
-                (it.next().unwrap().to_string(), it.next().unwrap().to_string())
+                (
+                    it.next().unwrap().to_string(),
+                    it.next().unwrap().to_string(),
+                )
             })
             .collect();
         // The two branch starts (Yes, No) must differ — they leave opposite faces.
         assert!(starts.len() >= 3, "expected edge paths: {starts:?}");
-        assert_ne!(starts[1], starts[2], "Yes/No branches share an anchor: {starts:?}");
+        assert_ne!(
+            starts[1], starts[2],
+            "Yes/No branches share an anchor: {starts:?}"
+        );
     }
 
     #[test]
@@ -284,7 +396,10 @@ mod tests {
             "graph TD\nA[Hot]-->B[Cold]\nstyle A fill:#f00,stroke:#900\nlinkStyle 0 stroke:green",
         )
         .unwrap();
-        assert!(svg.contains("fill:#f00;stroke:#900;color:#fff"), "node style: {svg}");
+        assert!(
+            svg.contains("fill:#f00;stroke:#900;color:#fff"),
+            "node style: {svg}"
+        );
         assert!(svg.contains("stroke:green"), "link style: {svg}");
     }
 
@@ -310,7 +425,8 @@ mod tests {
 
     #[test]
     fn subgraph_renders_cluster_box_with_title() {
-        let svg = render_flowchart("graph TD\nsubgraph grp[The Group]\nA --> B\nend\nC --> A").unwrap();
+        let svg =
+            render_flowchart("graph TD\nsubgraph grp[The Group]\nA --> B\nend\nC --> A").unwrap();
         assert!(svg.contains("stroke-dasharray=\"4 2\"")); // cluster rect
         assert!(svg.contains("The Group"));
     }
@@ -352,9 +468,16 @@ mod tests {
     #[test]
     fn lr_direction_wider_than_tall() {
         let svg = render_flowchart("graph LR\nA --> B --> C --> D").unwrap();
-        let vb: Vec<f64> = svg.split("viewBox=\"").nth(1).unwrap()
-            .split('"').next().unwrap()
-            .split(' ').map(|v| v.parse().unwrap()).collect();
+        let vb: Vec<f64> = svg
+            .split("viewBox=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .split(' ')
+            .map(|v| v.parse().unwrap())
+            .collect();
         assert!(vb[2] > vb[3], "LR chain should be wider than tall: {vb:?}");
     }
 
@@ -427,9 +550,16 @@ mod tests {
         // Each of the two unclassed nodes carries the style twice: on the
         // `<g>` (so `color:` reaches the label) AND on the shape element
         // (so `fill`/`stroke` actually override the shape's own attrs).
-        assert_eq!(svg.matches("style=\"fill:#f9f;color:#000\"").count(), 4, "{svg}");
+        assert_eq!(
+            svg.matches("style=\"fill:#f9f;color:#000\"").count(),
+            4,
+            "{svg}"
+        );
         // The shape element itself must carry it (the group alone can't
         // override the shape's `fill` presentation attribute).
-        assert!(svg.contains("stroke-width=\"1\" style=\"fill:#f9f;color:#000\""), "style on shape: {svg}");
+        assert!(
+            svg.contains("stroke-width=\"1\" style=\"fill:#f9f;color:#000\""),
+            "style on shape: {svg}"
+        );
     }
 }
