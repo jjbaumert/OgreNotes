@@ -1,0 +1,21 @@
+flowchart TD
+    H["14 preceding log lines<br/>7 ordered groups × 2 lines"]
+    C["Candidate log line<br/>actual next line or line +8"]
+    H --> E
+    C --> E
+
+    subgraph E["Shared line encoder"]
+      B["Payload bytes<br/>up to 1,024 bytes"]
+      B --> EMB["Byte embedding<br/>256 × 8"]
+      EMB --> CONV["1D convolutions<br/>widths 3 and 5<br/>8 channels each"]
+      CONV --> POOL["Mean + max pooling"]
+      POOL --> PROJ["Project to 16 dimensions<br/>add line position"]
+    end
+
+    E --> LOCAL["Within-group attention<br/>2 heads, hidden size 16<br/>feed-forward size 32"]
+    LOCAL --> WP["Learned pooling<br/>one vector per group"]
+    WP --> TEMP["Causal attention across<br/>8 ordered groups<br/>2 heads, hidden size 16"]
+    TEMP --> LAST["Read candidate group"]
+    LAST --> HEAD["16 → 16, ReLU"]
+    HEAD --> OUT["16 → 2 logits"]
+    OUT --> P["Candidate score:<br/>actual next line vs. line 8 records later"]

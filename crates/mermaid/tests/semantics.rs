@@ -2,6 +2,141 @@
 use ogrenotes_mermaid::render;
 
 #[test]
+fn pasted_flowchart_edges_attach_to_subgraph_border() {
+    let source = include_str!("fixtures/subgraph-edge-user.mmd");
+    let output = render(source);
+    let svg = output.svg.unwrap_or_else(|| panic!("{:?}", output.error));
+    assert!(svg.contains("Shared line encoder"));
+    assert!(
+        !svg.contains(">E</tspan>"),
+        "subgraph id must not become a node"
+    );
+    let body = svg.split("</defs>").nth(1).unwrap();
+    let paths: Vec<&str> = body
+        .split("<path d=\"")
+        .skip(1)
+        .map(|part| part.split('"').next().unwrap())
+        .collect();
+    assert_eq!(paths.len(), 13, "every source edge must render once");
+    assert!(
+        paths.iter().all(|d| d.contains('C') || d.contains('L')),
+        "every edge needs a visible segment: {paths:?}"
+    );
+
+    let cluster = body
+        .split("<rect ")
+        .skip(1)
+        .find(|r| {
+            r.split("/>")
+                .next()
+                .unwrap()
+                .contains("stroke-dasharray=\"4 2\"")
+        })
+        .expect("cluster rectangle");
+    let attr = |name: &str| -> f64 {
+        let prefix = format!("{name}=\"");
+        cluster
+            .split(&prefix)
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let (left, top, right, bottom) = (
+        attr("x"),
+        attr("y"),
+        attr("x") + attr("width"),
+        attr("y") + attr("height"),
+    );
+    let endpoints = |d: &str| -> ((f64, f64), (f64, f64)) {
+        let values: Vec<f64> = d
+            .split_whitespace()
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        (
+            (values[0], values[1]),
+            (values[values.len() - 2], values[values.len() - 1]),
+        )
+    };
+    for &index in &[0, 1] {
+        let (start, end) = endpoints(paths[index]);
+        assert!(
+            start.1 < top,
+            "incoming edge must start above cluster: {start:?}"
+        );
+        assert!(
+            (end.1 - top).abs() <= 1.1 && end.0 >= left && end.0 <= right,
+            "incoming edge must meet top border: {end:?}, rect {left},{top},{right},{bottom}"
+        );
+    }
+    let (start, end) = endpoints(paths[6]);
+    assert!(
+        (start.1 - bottom).abs() <= 1.1 && start.0 >= left && start.0 <= right,
+        "outgoing edge must start at bottom border: {start:?}, rect {left},{top},{right},{bottom}"
+    );
+    assert!(end.1 > bottom, "outgoing edge must leave cluster: {end:?}");
+}
+
+#[test]
+fn cluster_self_loop_runs_outside_its_border() {
+    let svg = render("flowchart TD\nsubgraph E[Group]\nA\nend\nE -->|again| E")
+        .svg
+        .expect("cluster loop renders");
+    let body = svg.split("</defs>").nth(1).unwrap();
+    let cluster = body
+        .split("<rect ")
+        .skip(1)
+        .find(|r| {
+            r.split("/>")
+                .next()
+                .unwrap()
+                .contains("stroke-dasharray=\"4 2\"")
+        })
+        .unwrap();
+    let right: f64 = ["x", "width"]
+        .iter()
+        .map(|name| {
+            cluster
+                .split(&format!("{name}=\""))
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap()
+        })
+        .sum();
+    let path = body
+        .split("<path d=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    let coords: Vec<f64> = path
+        .split_whitespace()
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    assert!(
+        (coords[0] - right).abs() <= 1.1,
+        "loop starts on border: {path}"
+    );
+    assert!(
+        (coords[coords.len() - 2] - right).abs() <= 1.1,
+        "loop ends on border: {path}"
+    );
+    assert!(
+        coords.iter().step_by(2).any(|x| *x > right + 20.0),
+        "loop stays inside: {path}"
+    );
+    assert!(svg.contains("again"));
+}
+
+#[test]
 fn unsupported_and_malformed_statements_keep_original_error_lines() {
     for (source, line) in [
         ("gantt\ndateFormat YYYY-DD-MM\nt :2024-01-02, 2d", 2),
@@ -100,11 +235,9 @@ fn axis_edge_cases_do_not_overlap_or_lose_error_lines() {
     }
     let error = render("xychart-beta\nline [-1e308, 1e308]").error.unwrap();
     assert_eq!(error.line, Some(2));
-    assert!(
-        render("xychart-beta\ny-axis Infinity\nbar [1]")
-            .svg
-            .is_some()
-    );
+    assert!(render("xychart-beta\ny-axis Infinity\nbar [1]")
+        .svg
+        .is_some());
     let svg = render("xychart-beta\ny-axis -0.1 --> 0.10000000000000001\nbar [0]")
         .svg
         .unwrap();

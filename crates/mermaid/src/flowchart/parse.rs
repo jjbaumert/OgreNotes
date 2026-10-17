@@ -7,7 +7,7 @@
 use crate::flowchart::{EdgeKind, FlowEdge, FlowGraph, FlowNode, Head, ShapeKind};
 use crate::layout::Direction;
 use crate::ParseError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A fully-resolved edge operator, including any inline label.
 struct EdgeOp {
@@ -24,10 +24,10 @@ struct Parser {
     /// Open subgraphs: (subgraph index, opening line). Top of stack is
     /// the innermost currently-open subgraph.
     stack: Vec<(usize, usize)>,
-    /// Source line of each pushed edge (parallel to `g.edges`), for the
-    /// post-parse edge-to-subgraph check — errors must point at the
-    /// edge's own line, but subgraph ids can be declared later.
-    edge_lines: Vec<usize>,
+    /// The containing subgraph for each source edge, before endpoint resolution.
+    edge_scopes: Vec<Option<usize>>,
+    /// Nodes declared on their own or with an explicit shape/label.
+    explicit_nodes: HashSet<usize>,
 }
 
 /// Split a line into `;`-separated statements, ignoring `;` inside
@@ -67,7 +67,8 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
         ids: HashMap::new(),
         line: 0,
         stack: Vec::new(),
-        edge_lines: Vec::new(),
+        edge_scopes: Vec::new(),
+        explicit_nodes: HashSet::new(),
     };
     let mut seen_header = false;
     for (idx, raw) in source.lines().enumerate() {
@@ -116,23 +117,7 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
             line: Some(opening_line),
         });
     }
-    // Post-parse: edges whose endpoint id names a subgraph are real
-    // mermaid syntax (edge attaches to the cluster box) that we don't
-    // lay out yet — error loudly instead of drawing a phantom node.
-    // Post-parse because subgraph ids may be declared below the edge.
-    for (i, e) in p.g.edges.iter().enumerate() {
-        for end in [e.from, e.to] {
-            let id = &p.g.nodes[end].id;
-            if p.g.subgraphs.iter().any(|s| &s.id == id) {
-                return Err(ParseError {
-                    message: format!(
-                        "edges to/from subgraph ids are not yet supported (subgraph {id:?})"
-                    ),
-                    line: Some(p.edge_lines[i]),
-                });
-            }
-        }
-    }
+    resolve_subgraph_edges(&mut p.g, &p.edge_scopes, &p.explicit_nodes)?;
     // mermaid auto-applies the class named `default` to every node with
     // no explicit class assignment (explicitly-classed nodes keep their
     // own resolution order untouched).
@@ -146,9 +131,215 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
     Ok(p.g)
 }
 
+/// Resolve cluster endpoints after all subgraphs have been declared. Each
+/// referenced cluster gets a hidden entry or exit port as a direct member.
+/// Invisible pin edges place those ports before sources and after sinks, while
+/// visible edges terminate at the cluster border during SVG emission.
+fn resolve_subgraph_edges(
+    g: &mut FlowGraph,
+    scopes: &[Option<usize>],
+    explicit: &HashSet<usize>,
+) -> Result<(), ParseError> {
+    let by_id: HashMap<String, usize> = g
+        .subgraphs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.clone(), i))
+        .collect();
+    let is_cluster_ref = |node: usize, scope: Option<usize>| -> Option<usize> {
+        let c = *by_id.get(g.nodes[node].id.as_str())?;
+        (!cluster_contains_scope(&g.subgraphs, scope, c)).then_some(c)
+    };
+    let mut used = HashSet::new();
+    let mut incoming = HashSet::new();
+    let mut outgoing = HashSet::new();
+    for (e, &scope) in g.edges.iter().zip(scopes) {
+        if let Some(c) = is_cluster_ref(e.from, scope) {
+            used.insert(c);
+            outgoing.insert(c);
+        }
+        if let Some(c) = is_cluster_ref(e.to, scope) {
+            used.insert(c);
+            incoming.insert(c);
+        }
+    }
+    if used.is_empty() {
+        return Ok(());
+    }
+
+    let mut ports = vec![(None, None); g.subgraphs.len()];
+    let mut pins = Vec::new();
+    let mut remove = HashSet::new();
+    let mut sorted: Vec<usize> = used.into_iter().collect();
+    sorted.sort_unstable();
+    // A temporary node can acquire membership in an unrelated cluster when
+    // its ID is used on an edge there. Remove it unless the source actually
+    // declared that node or used it as a node inside its namesake cluster.
+    for &c in &sorted {
+        let pseudo = g
+            .nodes
+            .iter()
+            .position(|n| n.id == g.subgraphs[c].id)
+            .expect("an edge endpoint created its node");
+        let used_as_real = explicit.contains(&pseudo)
+            || g.edges.iter().zip(scopes).any(|(e, &scope)| {
+                (e.from == pseudo || e.to == pseudo)
+                    && cluster_contains_scope(&g.subgraphs, scope, c)
+            });
+        if !used_as_real {
+            remove.insert(pseudo);
+        } else if explicit.contains(&pseudo) && g.nodes[pseudo].subgraph.is_none() {
+            return Err(ParseError {
+                message: format!("node and subgraph share the id {:?}", g.subgraphs[c].id),
+                line: None,
+            });
+        }
+    }
+    for c in sorted {
+        let members: Vec<usize> = g
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| {
+                !remove.contains(i)
+                    && !n.hidden
+                    && cluster_contains_scope(&g.subgraphs, n.subgraph, c)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let member_set: HashSet<usize> = members.iter().copied().collect();
+        let mut has_in = HashSet::new();
+        let mut has_out = HashSet::new();
+        for e in &g.edges {
+            if member_set.contains(&e.from) && member_set.contains(&e.to) {
+                has_out.insert(e.from);
+                has_in.insert(e.to);
+            }
+        }
+        if incoming.contains(&c) {
+            let port = push_cluster_port(g, c, "entry");
+            ports[c].0 = Some(port);
+            for &member in members.iter().filter(|i| !has_in.contains(i)) {
+                if member != port {
+                    pins.push((port, member));
+                }
+            }
+            if !members.is_empty() && !pins.iter().any(|&(from, _)| from == port) {
+                pins.push((port, members[0]));
+            }
+        }
+        if outgoing.contains(&c) {
+            let port = push_cluster_port(g, c, "exit");
+            ports[c].1 = Some(port);
+            for &member in members.iter().filter(|i| !has_out.contains(i)) {
+                if member != port {
+                    pins.push((member, port));
+                }
+            }
+            if !members.is_empty() && !pins.iter().any(|&(_, to)| to == port) {
+                pins.push((*members.last().unwrap(), port));
+            }
+        }
+    }
+
+    for (e, &scope) in g.edges.iter_mut().zip(scopes) {
+        if let Some(&c) = by_id.get(g.nodes[e.from].id.as_str()) {
+            if !cluster_contains_scope(&g.subgraphs, scope, c) {
+                e.from_cluster = Some(c);
+                e.from = ports[c].1.expect("outgoing cluster port exists");
+            }
+        }
+        if let Some(&c) = by_id.get(g.nodes[e.to].id.as_str()) {
+            if !cluster_contains_scope(&g.subgraphs, scope, c) {
+                e.to_cluster = Some(c);
+                e.to = ports[c].0.expect("incoming cluster port exists");
+            }
+        }
+    }
+    for (from, to) in pins {
+        g.edges.push(FlowEdge {
+            from,
+            to,
+            kind: EdgeKind::Invisible,
+            from_head: Head::None,
+            to_head: Head::None,
+            label: None,
+            style: None,
+            from_cluster: None,
+            to_cluster: None,
+        });
+    }
+    if g.edges.len() > crate::layout::MAX_EDGES {
+        return Err(ParseError {
+            message: format!(
+                "diagram too large: too many edges (max {})",
+                crate::layout::MAX_EDGES
+            ),
+            line: None,
+        });
+    }
+    if g.nodes.len() > crate::layout::MAX_NODES {
+        return Err(ParseError {
+            message: format!(
+                "diagram too large: {} nodes (max {})",
+                g.nodes.len(),
+                crate::layout::MAX_NODES
+            ),
+            line: None,
+        });
+    }
+    if !remove.is_empty() {
+        let mut remap = vec![0usize; g.nodes.len()];
+        let mut nodes = Vec::with_capacity(g.nodes.len() - remove.len());
+        for (old, node) in g.nodes.drain(..).enumerate() {
+            if !remove.contains(&old) {
+                remap[old] = nodes.len();
+                nodes.push(node);
+            }
+        }
+        g.nodes = nodes;
+        for e in &mut g.edges {
+            e.from = remap[e.from];
+            e.to = remap[e.to];
+        }
+    }
+    Ok(())
+}
+
+fn push_cluster_port(g: &mut FlowGraph, cluster: usize, side: &str) -> usize {
+    let index = g.nodes.len();
+    g.nodes.push(FlowNode {
+        id: format!("__cluster_{side}_{cluster}"),
+        label: String::new(),
+        shape: ShapeKind::Rect,
+        classes: Vec::new(),
+        style: None,
+        subgraph: Some(cluster),
+        hidden: true,
+    });
+    index
+}
+
+fn cluster_contains_scope(
+    subgraphs: &[crate::flowchart::FlowSubgraph],
+    mut scope: Option<usize>,
+    target: usize,
+) -> bool {
+    while let Some(c) = scope {
+        if c == target {
+            return true;
+        }
+        scope = subgraphs[c].parent;
+    }
+    false
+}
+
 impl Parser {
     fn err(&self, msg: impl Into<String>) -> ParseError {
-        ParseError { message: msg.into(), line: Some(self.line) }
+        ParseError {
+            message: msg.into(),
+            line: Some(self.line),
+        }
     }
 
     fn parse_header(&mut self, line: &str) -> Result<(), ParseError> {
@@ -240,6 +431,9 @@ impl Parser {
         if id.is_empty() {
             return Err(self.err("subgraph needs an id or title"));
         }
+        if self.g.subgraphs.iter().any(|s| s.id == id) {
+            return Err(self.err(format!("duplicate subgraph id {id:?}")));
+        }
         if self.stack.len() >= crate::MAX_NESTING {
             return Err(self.err(format!(
                 "subgraphs nested too deeply (more than {})",
@@ -269,11 +463,16 @@ impl Parser {
     fn parse_chain(&mut self, stmt: &str) -> Result<(), ParseError> {
         let mut rest = stmt;
         let mut lhs = self.parse_node_group(&mut rest)?;
+        let mut saw_edge = false;
         loop {
             let r = rest.trim_start();
             if r.is_empty() {
+                if !saw_edge {
+                    self.explicit_nodes.extend(lhs);
+                }
                 return Ok(());
             }
+            saw_edge = true;
             rest = r;
             let op = self.parse_edge_op(&mut rest)?;
             let rhs = self.parse_node_group(&mut rest)?;
@@ -287,8 +486,10 @@ impl Parser {
                         to_head: op.to_head,
                         label: op.label.clone(),
                         style: None,
+                        from_cluster: None,
+                        to_cluster: None,
                     });
-                    self.edge_lines.push(self.line);
+                    self.edge_scopes.push(self.stack.last().map(|&(i, _)| i));
                     // Bail INSIDE the fan-out loop, not after it: an
                     // `a&a&...&a --> a&...&a` chain with N ids on each
                     // side pushes N*N edges before this loop would
@@ -329,7 +530,10 @@ impl Parser {
         let r = rest.trim_start();
         // char count == byte length ONLY because the predicate is
         // ASCII-only; do not relax without a byte-position scan.
-        let id_len = r.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+        let id_len = r
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
         if id_len == 0 {
             return Err(self.err(format!("expected a node id, found {r:?}")));
         }
@@ -342,7 +546,10 @@ impl Parser {
         let mut classes = Vec::new();
         let mut after2 = after;
         if let Some(rest_c) = r2.strip_prefix(":::") {
-            let n = rest_c.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+            let n = rest_c
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count();
             if n == 0 {
                 return Err(self.err("expected a class name after `:::`"));
             }
@@ -362,6 +569,7 @@ impl Parser {
                     classes: vec![],
                     style: None,
                     subgraph: self.stack.last().map(|&(i, _)| i),
+                    hidden: false,
                 });
                 self.ids.insert(id, i);
                 i
@@ -373,6 +581,7 @@ impl Parser {
             self.g.nodes[idx].subgraph = self.stack.last().map(|&(i, _)| i);
         }
         if let Some((shape, label)) = shape_label {
+            self.explicit_nodes.insert(idx);
             self.g.nodes[idx].shape = shape;
             self.g.nodes[idx].label = label;
         }
@@ -392,8 +601,20 @@ impl Parser {
             ("([", &[("])", ShapeKind::Stadium)]),
             ("[[", &[("]]", ShapeKind::Subroutine)]),
             ("[(", &[(")]", ShapeKind::Cylinder)]),
-            ("[/", &[("/]", ShapeKind::Parallelogram), ("\\]", ShapeKind::Trapezoid)]),
-            ("[\\", &[("\\]", ShapeKind::ParallelogramRev), ("/]", ShapeKind::TrapezoidRev)]),
+            (
+                "[/",
+                &[
+                    ("/]", ShapeKind::Parallelogram),
+                    ("\\]", ShapeKind::Trapezoid),
+                ],
+            ),
+            (
+                "[\\",
+                &[
+                    ("\\]", ShapeKind::ParallelogramRev),
+                    ("/]", ShapeKind::TrapezoidRev),
+                ],
+            ),
             ("{{", &[("}}", ShapeKind::Hexagon)]),
             ("{", &[("}", ShapeKind::Diamond)]),
             ("[", &[("]", ShapeKind::Rect)]),
@@ -553,7 +774,11 @@ impl Parser {
                     rest,
                     r,
                     from_head,
-                    if family == EdgeKind::Thick { EdgeKind::Thick } else { EdgeKind::Arrow },
+                    if family == EdgeKind::Thick {
+                        EdgeKind::Thick
+                    } else {
+                        EdgeKind::Arrow
+                    },
                 );
             }
             return Err(self.err(expected()));
@@ -584,7 +809,12 @@ impl Parser {
             }
         };
         *rest = rest2;
-        Ok(EdgeOp { kind, from_head, to_head, label })
+        Ok(EdgeOp {
+            kind,
+            from_head,
+            to_head,
+            label,
+        })
     }
 
     /// Inline-label forms. `r` starts at the opener (`--`, `==`, or
@@ -606,9 +836,7 @@ impl Parser {
             return Err(self.err(format!("expected an edge (e.g. `-->`), found {r:?}")));
         };
         let Some(i) = after_open.find(close) else {
-            return Err(self.err(format!(
-                "unclosed inline edge label (missing `{close}`)"
-            )));
+            return Err(self.err(format!("unclosed inline edge label (missing `{close}`)")));
         };
         let label = after_open[..i].trim().to_string();
         let after_close = &after_open[i + close.len()..];
@@ -636,7 +864,12 @@ impl Parser {
             other => other,
         };
         *rest = after_run;
-        Ok(EdgeOp { kind, from_head, to_head, label: Some(label) })
+        Ok(EdgeOp {
+            kind,
+            from_head,
+            to_head,
+            label: Some(label),
+        })
     }
 
     fn parse_class_def(&mut self, stmt: &str) -> Result<(), ParseError> {
@@ -687,8 +920,12 @@ impl Parser {
             // index is a no-op, not a hard error — a cosmetic styling typo
             // shouldn't fail the whole diagram (same fail-soft stance as the
             // `sanitize_style` allowlist, which drops unknown props silently).
-            let Ok(n) = tok.parse::<usize>() else { continue };
-            let Some(edge) = self.g.edges.get_mut(n) else { continue };
+            let Ok(n) = tok.parse::<usize>() else {
+                continue;
+            };
+            let Some(edge) = self.g.edges.get_mut(n) else {
+                continue;
+            };
             // Only set a non-empty style: a `Some("")` would suppress the
             // `linkStyle default` fallback for this edge at render time
             // (`edge.style.or(default)`). Mirrors `parse_style`.
@@ -769,9 +1006,16 @@ mod tests {
 
     #[test]
     fn unknown_direction_still_errors_with_and_without_semicolon() {
-        assert!(parse("graph XX").unwrap_err().message.contains("unknown direction"));
+        assert!(parse("graph XX")
+            .unwrap_err()
+            .message
+            .contains("unknown direction"));
         let e = parse("graph XX;").unwrap_err();
-        assert!(e.message.contains("unknown direction"), "got: {}", e.message);
+        assert!(
+            e.message.contains("unknown direction"),
+            "got: {}",
+            e.message
+        );
     }
 
     #[test]
@@ -1029,12 +1273,21 @@ mod tests {
 
     #[test]
     fn out_of_scope_statements_error_with_line() {
-        for stmt in ["click A callback", "accTitle: x", "accDescr: y", "direction LR"] {
+        for stmt in [
+            "click A callback",
+            "accTitle: x",
+            "accDescr: y",
+            "direction LR",
+        ] {
             let src = format!("graph TD\nA\n{stmt}");
             let e = parse(&src).unwrap_err();
             assert_eq!(e.line, Some(3), "for {stmt}");
             let kw = stmt.split([' ', ':']).next().unwrap();
-            assert!(e.message.contains(kw), "message names the keyword: {}", e.message);
+            assert!(
+                e.message.contains(kw),
+                "message names the keyword: {}",
+                e.message
+            );
         }
     }
 
@@ -1079,8 +1332,12 @@ mod tests {
         // The graph direction still comes from the header.
         assert_eq!(g.direction, Direction::TB);
         // All four directions accepted; TD normalizes to TB.
-        for (kw, want) in [("TB", Direction::TB), ("TD", Direction::TB),
-                           ("BT", Direction::BT), ("RL", Direction::RL)] {
+        for (kw, want) in [
+            ("TB", Direction::TB),
+            ("TD", Direction::TB),
+            ("BT", Direction::BT),
+            ("RL", Direction::RL),
+        ] {
             let g = p(&format!("graph LR\nsubgraph s\ndirection {kw}\nA\nend"));
             assert_eq!(g.subgraphs[0].direction, Some(want), "for {kw}");
         }
@@ -1099,7 +1356,11 @@ mod tests {
     fn unknown_subgraph_direction_errors() {
         let e = parse("graph TD\nsubgraph s\ndirection XX\nend").unwrap_err();
         assert_eq!(e.line, Some(3));
-        assert!(e.message.contains("unknown direction"), "got: {}", e.message);
+        assert!(
+            e.message.contains("unknown direction"),
+            "got: {}",
+            e.message
+        );
     }
 
     #[test]
@@ -1298,29 +1559,93 @@ mod tests {
     }
 
     #[test]
-    fn edge_to_subgraph_id_errors_loudly() {
-        // Silent-misparse #2 (issue #32): this used to create a phantom
-        // node `sgID`. Real edge-to-subgraph routing is deferred; v1
-        // errors loudly, naming the subgraph.
-        let e = parse("graph TD\nsubgraph sgID[T]\nA --> B\nend\nsgID --> C").unwrap_err();
-        assert_eq!(e.line, Some(5));
-        assert!(e.message.contains("subgraph"), "got: {}", e.message);
-        assert!(e.message.contains("sgID"), "got: {}", e.message);
+    fn edges_to_subgraph_use_dedicated_hidden_ports() {
+        let g = p("graph TD\nH --> E\nsubgraph E[T]\nB --> P\nend\nE --> C");
+        assert!(!g.nodes.iter().any(|n| n.id == "E"));
+        assert_eq!(g.edges[0].to_cluster, Some(0));
+        let entry = &g.nodes[g.edges[0].to];
+        assert!(entry.hidden && entry.id.starts_with("__cluster_entry_"));
+        assert_eq!(entry.subgraph, Some(0));
+        assert_eq!(g.edges[2].from_cluster, Some(0));
+        let exit = &g.nodes[g.edges[2].from];
+        assert!(exit.hidden && exit.id.starts_with("__cluster_exit_"));
+        assert_eq!(exit.subgraph, Some(0));
     }
 
     #[test]
-    fn edge_from_and_to_subgraph_both_error() {
-        let e = parse("graph TD\nsubgraph s\nA\nend\nC --> s").unwrap_err();
-        assert_eq!(e.line, Some(5));
+    fn edge_to_empty_subgraph_uses_hidden_ports() {
+        let g = p("graph TD\nsubgraph s\nend\nC --> s\ns --> D");
+        assert!(!g.nodes.iter().any(|n| n.id == "s"));
+        assert!(g.nodes[g.edges[0].to].hidden);
+        assert!(g.nodes[g.edges[1].from].hidden);
+        assert_eq!(g.edges[0].to_cluster, Some(0));
+        assert_eq!(g.edges[1].from_cluster, Some(0));
     }
 
     #[test]
-    fn edge_above_subgraph_declaration_still_errors() {
-        // Real mermaid resolves subgraph ids declared LATER; the check
-        // must therefore run post-parse, not inline.
-        let e = parse("graph TD\ns --> C\nsubgraph s\nA\nend").unwrap_err();
-        assert_eq!(e.line, Some(2));
-        assert!(e.message.contains("\"s\""), "got: {}", e.message);
+    fn edge_above_subgraph_declaration_resolves() {
+        let g = p("graph TD\ns --> C\nsubgraph s\nA\nend");
+        assert_eq!(g.edges[0].from_cluster, Some(0));
+        assert!(g.nodes[g.edges[0].from].hidden);
+    }
+
+    #[test]
+    fn real_node_with_same_id_as_subgraph_is_preserved() {
+        let g = p("flowchart TD\nsubgraph E[Group]\nE[Real node] --> B\nend\nE --> C");
+        let real = g.nodes.iter().find(|n| n.label == "Real node").unwrap();
+        assert!(!real.hidden);
+        assert_eq!(real.subgraph, Some(0));
+        assert_eq!(g.edges[0].from_cluster, None);
+        assert_eq!(g.edges[1].from_cluster, Some(0));
+        assert!(g.nodes[g.edges[1].from].hidden);
+    }
+
+    #[test]
+    fn forward_references_to_cluster_are_not_real_top_level_nodes() {
+        let g = p("flowchart TD\nE --> X\nsubgraph E[Group]\nA\nend\nE --> C");
+        assert!(!g.nodes.iter().any(|n| n.id == "E"));
+        assert_eq!(g.edges[0].from_cluster, Some(0));
+        assert_eq!(g.edges[1].from_cluster, Some(0));
+        assert_eq!(g.nodes[g.edges[0].to].id, "X");
+        assert_eq!(g.nodes[g.edges[1].to].id, "C");
+    }
+
+    #[test]
+    fn explicit_top_level_node_colliding_with_cluster_errors() {
+        for node in ["E[Real node]", "E"] {
+            let src = format!("flowchart TD\n{node}\nsubgraph E[Group]\nA\nend\nE --> C");
+            let err = parse(&src).unwrap_err();
+            assert!(
+                err.message.contains("node and subgraph share the id"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn implicit_cluster_reference_inside_another_cluster_is_not_a_node() {
+        let g = p("flowchart TD\nsubgraph Outer\nE --> X\nend\nsubgraph E[Group]\nA\nend\nE --> C");
+        assert!(!g.nodes.iter().any(|n| n.id == "E"));
+        assert_eq!(g.edges[0].from_cluster, Some(1));
+        assert_eq!(g.edges[1].from_cluster, Some(1));
+    }
+
+    #[test]
+    fn explicit_node_inside_another_cluster_remains_visible() {
+        let g = p("flowchart TD\nsubgraph Outer\nE\nend\nsubgraph E[Group]\nA\nend\nE --> C");
+        let real = g.nodes.iter().find(|n| n.id == "E").unwrap();
+        assert!(!real.hidden);
+        assert_eq!(real.subgraph, Some(0));
+        assert_eq!(g.edges[0].from_cluster, Some(1));
+    }
+
+    #[test]
+    fn duplicate_subgraph_ids_error_before_edge_resolution() {
+        let err =
+            parse("flowchart TD\nsubgraph E[First]\nA\nend\nsubgraph E[Second]\nB\nend\nE --> C")
+                .unwrap_err();
+        assert_eq!(err.line, Some(5));
+        assert!(err.message.contains("duplicate subgraph id"));
     }
 
     #[test]
@@ -1335,7 +1660,7 @@ mod tests {
     fn class_def_default_applies_to_unclassed_nodes_only() {
         let g = p("graph TD\nclassDef default fill:#f9f\nclassDef hot fill:#f00\nA --> B:::hot");
         assert_eq!(g.nodes[0].classes, vec!["default"]); // A: auto
-        assert_eq!(g.nodes[1].classes, vec!["hot"]);     // B: explicit wins
+        assert_eq!(g.nodes[1].classes, vec!["hot"]); // B: explicit wins
     }
 
     #[test]
