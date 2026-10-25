@@ -12,6 +12,14 @@ function check(condition, message) {
   else if (observe) { failures.push(message); console.log('REPRO ' + message); }
   else assert(condition, message);
 }
+async function waitForFocus(locator, message, timeout = 5000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await locator.evaluate(element => document.activeElement === element).catch(() => false)) return;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  assert.fail(`Timed out waiting for focus: ${message}`);
+}
 const cases = [
   ['calendar', 'gantt\nexcludes weekends\nt :2024-01-05, 2d', 'Line 2: unsupported Gantt directive'],
   ['date-format', 'gantt\ndateFormat YYYY-DD-MM\nt :2024-02-01, 2d', 'Line 2: unsupported Gantt directive'],
@@ -117,11 +125,11 @@ const cases = [
     if (await button.count()) {
       await button.focus(); await page.keyboard.press('Space');
       await modal.waitFor();
-      await page.waitForFunction(() => document.activeElement?.classList.contains('mermaid-source'));
+      await waitForFocus(input, 'Mermaid source after opening with Space');
       await page.keyboard.press('Escape');
       await modal.waitFor({ state: 'detached' });
       // Focus restoration runs on a deferred task after modal teardown.
-      await page.waitForFunction(() => document.activeElement?.matches('.mermaid-block .mermaid-edit-control'), null, { timeout: 5000 });
+      await waitForFocus(button, 'edit button after Escape');
       check(await button.evaluate(button => document.activeElement === button), 'Space opens the modal and Escape restores button focus');
     }
     if (!observe) {
