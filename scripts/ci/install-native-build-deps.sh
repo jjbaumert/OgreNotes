@@ -4,7 +4,7 @@ set -euo pipefail
 sudo apt-get update
 
 xmlsec_runtime_package=""
-for candidate in libxmlsec1-openssl libxmlsec1-openssl1; do
+for candidate in libxmlsec1-openssl libxmlsec1t64-openssl libxmlsec1-openssl1; do
     version="$(apt-cache policy "$candidate" | awk '/Candidate:/ { print $2; exit }')"
     if [[ -n "$version" && "$version" != "(none)" ]]; then
         xmlsec_runtime_package="$candidate"
