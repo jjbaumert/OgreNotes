@@ -7061,6 +7061,43 @@ async function scenarioDeckPresent(ctx, collector) {
     recordHar: { path: join(outDir, "tab-a.har"), mode: "full" },
   });
   await seedAuth(context, tokens);
+  await context.addInitScript(() => {
+    const nativeSetTimeout = window.setTimeout;
+    window.setTimeout = function (callback, delay, ...args) {
+      if (
+        window.__doctorHoldRemoteCallback &&
+        !window.__doctorRemoteCallbackQueued &&
+        delay === 16
+      ) {
+        window.__doctorHoldRemoteCallback = false;
+        window.__doctorRemoteCallbackQueued = true;
+        window.__doctorPendingRemoteCallback = callback;
+        window.__doctorRemoteCallbackTimerId = nativeSetTimeout.call(this, () => {}, 60000);
+        return window.__doctorRemoteCallbackTimerId;
+      }
+      return nativeSetTimeout.call(this, callback, delay, ...args);
+    };
+  });
+
+  // Hold the reload's initial collaboration SyncStep2 until the test can
+  // release it, then hold its debounced callback until Present is mounted.
+  let holdNextSyncStep2 = false;
+  let releaseHeldSyncStep2 = null;
+  await context.routeWebSocket(/\/api\/v1\/documents\/.*\/ws/, (ws) => {
+    const server = ws.connectToServer();
+    server.onMessage((message) => {
+      const bytes =
+        message instanceof Buffer
+          ? message
+          : Buffer.from(message instanceof ArrayBuffer ? new Uint8Array(message) : message);
+      if (holdNextSyncStep2 && bytes.length > 0 && bytes[0] === 0x02) {
+        holdNextSyncStep2 = false;
+        releaseHeldSyncStep2 = () => ws.send(message);
+        return;
+      }
+      ws.send(message);
+    });
+  });
 
   const page = await context.newPage();
   instrument(context, page, "tab-a", collector);
@@ -7129,20 +7166,36 @@ async function scenarioDeckPresent(ctx, collector) {
     // reproduced 0 corrupt loads across 10 runs (vs ~50% without it).
     // Worth a ticket: the underlying race is real and not present-mode-
     // specific to fix (see task-10 report).
+    holdNextSyncStep2 = true;
     await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
     await page.locator('.deck-canvas[tabindex="0"]').first().waitFor({ timeout: 20000 });
     steps.thumbCountPersistedBeforeOpen = await waitFor(
       async () => (await page.locator(".deck-slide-thumb").count()) === 2,
       10000
     );
+    steps.remoteSyncHeld = await waitFor(
+      () => Promise.resolve(typeof releaseHeldSyncStep2 === "function"),
+      10000
+    );
 
-    // ── Click Present ──
+    // Release SyncStep2 while still on the document route. The init-script
+    // holds its 16 ms remote callback until after the editor route is gone.
+    await page.evaluate(() => {
+      window.__doctorHoldRemoteCallback = true;
+      window.__doctorRemoteCallbackQueued = false;
+    });
+    releaseHeldSyncStep2?.();
+    releaseHeldSyncStep2 = null;
+    steps.lateRemoteSyncQueuedBeforeNavigation = await page.waitForFunction(
+      () => window.__doctorRemoteCallbackQueued === true,
+      undefined,
+      { timeout: 10000 }
+    ).then(() => true).catch(() => false);
     await page.locator("button.deck-present-btn").click();
     steps.presentRouteReached = await waitFor(
       () => Promise.resolve(/\/d\/[^/?#]+\/present$/.test(page.url())),
       10000
     );
-
     // ── Stage renders the (blank, index-0) slide at real size. Assert
     // SIZE, not mere presence: the P1 launch bug was a 0×0 canvas that
     // a bare presence check sailed right through. ──
@@ -7151,6 +7204,13 @@ async function scenarioDeckPresent(ctx, collector) {
       const box = await stageCanvas.boundingBox();
       return !!box && box.width > 600;
     }, 15000);
+    steps.lateRemoteSyncDelivered = await page.evaluate(() => {
+      const callback = window.__doctorPendingRemoteCallback;
+      if (typeof callback !== "function") return false;
+      clearTimeout(window.__doctorRemoteCallbackTimerId);
+      callback();
+      return true;
+    }).catch(() => false);
     await page.screenshot({ path: join(outDir, "1-present-opened.png") }).catch(() => {});
 
     // ── Keyboard navigation: ArrowRight advances the counter and
@@ -7199,6 +7259,28 @@ async function scenarioDeckPresent(ctx, collector) {
       const notes = await page.locator(".deck-present__notes").count();
       return timer > 0 && next > 0 && notes > 0;
     }, 15000);
+
+    // Query-only navigation keeps the same route component mounted. The
+    // presenter controls must follow the router's updated query in both
+    // directions without reloading the page.
+    await page.evaluate(() => {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("presenter");
+      window.history.pushState({}, "", url);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    steps.presenterQueryHidesPanel = await waitFor(
+      async () => (await page.locator(".deck-present__panel").count()) === 0
+    );
+    await page.evaluate(() => {
+      const url = new URL(window.location.href);
+      url.searchParams.set("presenter", "1");
+      window.history.pushState({}, "", url);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    steps.presenterQueryRestoresPanel = await waitFor(
+      async () => (await page.locator(".deck-present__panel").count()) > 0
+    );
     await page.screenshot({ path: join(outDir, "3-presenter-view.png") }).catch(() => {});
 
     // ── Timer advances ──
@@ -7256,6 +7338,11 @@ async function scenarioDeckPresent(ctx, collector) {
     (m) => m.type === "error" && !/Failed to fetch|loading was aborted|compilation aborted|status of 409 \(Conflict\)|Auto-save failed: HTTP 409/i.test(m.text || "")
   );
   steps.noConsoleErrors = realErrors.length === 0;
+  steps.noReactiveContextWarnings = !(tab.console || []).some(
+    (entry) =>
+      entry.type === "warning" &&
+      /outside a reactive tracking context/.test(entry.text || "")
+  );
 
   collector.scenario = {
     name: collector.scenario?.name || "deck-present",

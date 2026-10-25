@@ -532,8 +532,11 @@ export function evaluateScenarioResult(scenario, collector, ok = true, errMsg = 
     "deck-present": [
       "presentRouteReached", "stageRendersSlide", "slideTextVisible",
       "arrowAdvances", "arrowGoesBack", "escapeReturnsToEditor",
-      "presenterViewPanels", "timerAdvances", "pdfExportDownloads",
-      "noConsoleErrors",
+      "remoteSyncHeld", "lateRemoteSyncQueuedBeforeNavigation",
+      "lateRemoteSyncDelivered",
+      "presenterViewPanels", "presenterQueryHidesPanel",
+      "presenterQueryRestoresPanel", "noReactiveContextWarnings",
+      "timerAdvances", "pdfExportDownloads", "noConsoleErrors",
     ],
   };
   if (ok && Object.prototype.hasOwnProperty.call(requiredSteps, scenario)) {

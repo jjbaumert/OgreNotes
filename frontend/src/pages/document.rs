@@ -937,7 +937,12 @@ pub fn DocumentPage() -> impl IntoView {
                 // block-relative coordinates — otherwise absolute indices
                 // drift by one per character the remote inserts above the
                 // selection, and the user's highlight visibly slides.
-                let prior = editor_state_for_ws.get_untracked();
+                // A remote update can already be queued when this document
+                // route is torn down (for example, when opening Present).
+                // Do not read or write route-owned signals after disposal.
+                let Some(prior) = editor_state_for_ws.try_get_untracked() else {
+                    return;
+                };
                 let mut state = crate::editor::state::EditorState::create_default(doc);
                 if let Some(ref prior) = prior {
                     state.selection = crate::editor::state::remap_selection_across_doc_swap(
