@@ -124,11 +124,16 @@ jobs:
       - name: Install trunk
         uses: jetli/trunk-action@v0.5.0
         env:
-          # trunk-action downloads under /tmp and renames into $CARGO_HOME/bin.
+          # trunk-action downloads under /tmp and installs under $HOME/.cargo/bin.
           # Keep both paths on the same filesystem on ubuntu-latest.
-          CARGO_HOME: /tmp/trunk-cargo-home
+          HOME: /tmp/trunk-action-home
         with:
           version: v0.21.14
+
+      - name: Add trunk to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        env:
+          HOME: /tmp/trunk-action-home
 
       - name: Setup Node 20
         uses: actions/setup-node@v4
