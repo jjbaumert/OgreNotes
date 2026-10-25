@@ -63,13 +63,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install xmlsec1 + clang (samael dependencies)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config libssl-dev \
-            libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
-            clang libclang-dev
+      - name: Install native build dependencies
+        run: bash scripts/ci/install-native-build-deps.sh
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -82,20 +77,8 @@ jobs:
             tests/load -> target
           shared-key: load-tests
 
-      - name: Start infra (DynamoDB / MinIO / Redis)
-        run: docker compose up -d
-
-      - name: Wait for services
-        run: |
-          for port in 8000 9000 6379; do
-            for i in $(seq 1 30); do
-              nc -z 127.0.0.1 "$port" && break
-              sleep 1
-            done
-          done
-
-      - name: Provision DynamoDB table + S3 bucket
-        run: cargo run --release --locked --bin setup_dev -p ogrenotes-api
+      - name: Start, check, and provision local test services
+        run: bash scripts/ci/prepare-local-test-services.sh --provision --release
 
       - name: Build axum server (release, with dev-login)
         run: cargo build --release --locked --bin ogrenotes-api --features dev-login

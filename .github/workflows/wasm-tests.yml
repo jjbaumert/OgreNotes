@@ -70,21 +70,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ─── System libs ──────────────────────────────────────────
-      # samael's `xmlsec` feature (SAML signature verification)
-      # needs libxml2 + xmlsec1 + clang at compile time. The
-      # Dockerfile got these in 45e086e; playwright.yml in 508b1c3;
-      # ci.yml in 402aae0; this workflow was missed all three times.
-      # `cargo run --bin setup_dev` (Provision DDB step) compiles
-      # the full workspace including samael, so the build crashes
-      # here without these packages.
-      - name: Install xmlsec1 + clang (samael dependencies)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config libssl-dev \
-            libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
-            clang libclang-dev
+      - name: Install native build dependencies
+        run: bash scripts/ci/install-native-build-deps.sh
 
       # ─── Toolchain ────────────────────────────────────────────
       - name: Install Rust (stable + wasm32)
@@ -114,32 +101,16 @@ jobs:
       # found"; fix by adding `sudo apt-get install -y firefox-geckodriver`.
 
       # ─── Infra ────────────────────────────────────────────────
-      - name: Start infra (DynamoDB / MinIO / Redis)
-        run: docker compose up -d
-
-      - name: Wait for services
-        run: |
-          for port in 8000 9000 6379; do
-            echo "Waiting for port $port..."
-            for i in $(seq 1 30); do
-              if nc -z 127.0.0.1 "$port"; then
-                echo "  port $port ready"
-                break
-              fi
-              sleep 1
-            done
-          done
-
       # Strip the `pdf` feature here for the same reason as the
       # axum build below — symmetric to playwright.yml — and apply
       # it to `setup_dev` too because it lives in the same crate
       # and inherits the same default feature set. setup_dev is a
       # pure DDB + S3 provisioner; it doesn't touch the pdf code
       # paths.
-      - name: Provision DynamoDB table + S3 bucket
-        run: |
-          cargo run --locked --bin setup_dev -p ogrenotes-api \
-            --no-default-features --features "dev-login,xlsx,docx"
+      - name: Start, check, and provision local test services
+        run: >-
+          bash scripts/ci/prepare-local-test-services.sh --provision
+          --no-default-features --features dev-login,xlsx,docx
 
       # ─── Start API server ─────────────────────────────────────
       # collab_e2e expects the server at http://localhost:3000 and uses

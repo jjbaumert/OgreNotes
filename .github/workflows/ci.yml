@@ -42,18 +42,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # samael's `xmlsec` feature wraps libxml2 + xmlsec1 for SAML
-      # signature verification. Mirrors the Dockerfile (commit
-      # 45e086e) and playwright.yml (commit 508b1c3) — ci.yml was
-      # missed when the SAML feature went live with 0b8aee1, which
-      # is why unit + integration have been red since 2026-05-14.
-      - name: Install xmlsec1 + clang (samael dependencies)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config libssl-dev \
-            libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
-            clang libclang-dev
+      - name: Install native build dependencies
+        run: bash scripts/ci/install-native-build-deps.sh
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -157,15 +147,8 @@ jobs:
                       /usr/local/share/boost /opt/hostedtoolcache/CodeQL
           df -h /
 
-      # See the unit job's identical step for context — samael's
-      # xmlsec feature needs these at compile time.
-      - name: Install xmlsec1 + clang (samael dependencies)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config libssl-dev \
-            libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
-            clang libclang-dev
+      - name: Install native build dependencies
+        run: bash scripts/ci/install-native-build-deps.sh
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -176,21 +159,8 @@ jobs:
           workspaces: . -> target
           shared-key: integration
 
-      - name: Start infra (DynamoDB / MinIO / Redis)
-        run: docker compose up -d
-
-      - name: Wait for services
-        run: |
-          for port in 8000 9000 6379; do
-            echo "Waiting for port $port..."
-            for i in $(seq 1 30); do
-              if nc -z 127.0.0.1 "$port"; then
-                echo "  port $port ready"
-                break
-              fi
-              sleep 1
-            done
-          done
+      - name: Start and check local test services
+        run: bash scripts/ci/prepare-local-test-services.sh
 
       # `--no-fail-fast` so all test binaries run even if one fails.
       # Default cargo test aborts at the first failing binary, which

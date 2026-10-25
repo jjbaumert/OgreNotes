@@ -94,23 +94,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ─── System libs ──────────────────────────────────────────
-      # samael's `xmlsec` feature wraps libxml2 + xmlsec1 for SAML
-      # signature verification. The Dockerfile got these in commit
-      # 45e086e; the playwright workflow was missed in that pass,
-      # so every run since 2026-05-15 (when the feature went live)
-      # has crashed the `cargo run --bin setup_dev` step before any
-      # scenario could execute. Mirror the Dockerfile package set:
-      # -dev headers + libclang for bindgen at compile time; the
-      # `libxmlsec1-openssl` shim is what the runtime binary
-      # dlopens for the actual crypto backend.
-      - name: Install xmlsec1 + clang (samael dependencies)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config libssl-dev \
-            libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
-            clang libclang-dev librsvg2-bin imagemagick
+      - name: Install native build dependencies
+        run: bash scripts/ci/install-native-build-deps.sh librsvg2-bin imagemagick
 
       # ─── Toolchain ────────────────────────────────────────────
       - name: Install Rust (stable + wasm32)
@@ -147,24 +132,8 @@ jobs:
           node-version: 20
 
       # ─── Infra ────────────────────────────────────────────────
-      - name: Start infra (DynamoDB / MinIO / Redis)
-        run: docker compose up -d
-
-      - name: Wait for services
-        run: |
-          for port in 8000 9000 6379; do
-            echo "Waiting for port $port..."
-            for i in $(seq 1 30); do
-              if nc -z 127.0.0.1 "$port"; then
-                echo "  port $port ready"
-                break
-              fi
-              sleep 1
-            done
-          done
-
-      - name: Provision DynamoDB table + S3 bucket
-        run: cargo run --locked --bin setup_dev -p ogrenotes-api
+      - name: Start, check, and provision local test services
+        run: bash scripts/ci/prepare-local-test-services.sh --provision
 
       # ─── Frontend build ───────────────────────────────────────
       # main.rs serves static assets from /app/frontend/dist. We symlink
