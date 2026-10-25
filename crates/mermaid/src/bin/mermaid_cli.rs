@@ -388,29 +388,50 @@ fn compatible_svg_delegate(tool: &str) -> bool {
     if input.write_all(probe.as_bytes()).is_err() {
         return false;
     }
-    let Ok(output) = Command::new(tool)
+    let output = match Command::new(tool)
         .args(["-density", "96"])
         .arg(input.path())
         .args(["-depth", "8", "rgb:-"])
-        .stderr(Stdio::null())
         .output()
-    else {
+    {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("{tool} SVG delegate probe could not start: {error}");
+            return false;
+        }
+    };
+    if !output.status.success() {
+        eprintln!(
+            "{tool} SVG delegate probe exited with {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
         return false;
     };
-    if !output.status.success() || output.stdout.len() != 24 * 8 * 3 {
+    if output.stdout.len() != 24 * 8 * 3 {
+        eprintln!(
+            "{tool} SVG delegate probe returned {} bytes; expected 576",
+            output.stdout.len()
+        );
         return false;
     }
-    [
+    for (x, color) in [
         (4, [0, 255, 0]),
         (9, [255, 255, 255]),
         (14, [255, 0, 0]),
         (20, [0, 0, 255]),
-    ]
-    .iter()
-    .all(|(x, color)| {
+    ] {
         let offset = (4 * 24 + x) * 3;
-        output.stdout[offset..offset + 3] == *color
-    })
+        if output.stdout[offset..offset + 3] != color {
+            eprintln!(
+                "{tool} SVG delegate probe pixel ({x}, 4) was {:?}; expected {:?}",
+                &output.stdout[offset..offset + 3],
+                color
+            );
+            return false;
+        }
+    }
+    true
 }
 
 fn die(msg: &str) -> ! {
