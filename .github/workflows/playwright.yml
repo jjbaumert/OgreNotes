@@ -83,7 +83,11 @@ env:
 jobs:
   frontend-doctor:
     name: Playwright frontend-doctor
-    runs-on: ubuntu-latest
+    # Ubuntu 26's ImageMagick package has no SVG delegate, which makes the
+    # explicit ImageMagick-only Mermaid fallback regression untestable there.
+    # Keep this rendering suite on 24.04 while the other workflows exercise
+    # the shared setup on ubuntu-latest.
+    runs-on: ubuntu-24.04
     # 30 was too tight on a cold-cache day: the release build alone swings from
     # ~3 min (warm) to ~16.5 min (cold), and a cold run measured 30.6 min — so
     # it tripped the cap and was *cancelled*, which skips the rust-cache save
