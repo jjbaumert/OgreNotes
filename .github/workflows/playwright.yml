@@ -97,6 +97,9 @@ jobs:
       - name: Install native build dependencies
         run: bash scripts/ci/install-native-build-deps.sh librsvg2-bin imagemagick
 
+      - name: Preflight ImageMagick SVG delegate
+        run: python3 scripts/frontend-doctor/configure-mermaid-imagemagick.py /tmp/mermaid-imagemagick-preflight
+
       # ─── Toolchain ────────────────────────────────────────────
       - name: Install Rust (stable + wasm32)
         uses: dtolnay/rust-toolchain@stable
