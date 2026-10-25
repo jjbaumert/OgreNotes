@@ -123,6 +123,10 @@ jobs:
       # bulk-memory ops rustc now emits for wasm32. 0.21.14 matches local dev.
       - name: Install trunk
         uses: jetli/trunk-action@v0.5.0
+        env:
+          # trunk-action downloads under /tmp and renames into $CARGO_HOME/bin.
+          # Keep both paths on the same filesystem on ubuntu-latest.
+          CARGO_HOME: /tmp/trunk-cargo-home
         with:
           version: v0.21.14
 
