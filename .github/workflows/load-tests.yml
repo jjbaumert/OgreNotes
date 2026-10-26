@@ -72,6 +72,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
+          env-vars: LIBCLANG_PATH OGRE_NATIVE_ABI
           workspaces: |
             . -> target
             tests/load -> target
