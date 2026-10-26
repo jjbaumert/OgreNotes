@@ -66,6 +66,25 @@ ignore = [
     { id = "RUSTSEC-2026-0367", reason = "zip extraction permission-bit issue; repository uses read-by-name and write APIs only; upstream dependencies do not support patched zip 9" },
     { id = "RUSTSEC-2026-0368", reason = "zip extraction symlink issue; repository uses read-by-name and write APIs only; upstream dependencies do not support patched zip 9" },
     { id = "RUSTSEC-2026-0369", reason = "zip extraction symlink permission issue; repository uses read-by-name and write APIs only; upstream dependencies do not support patched zip 9" },
+
+    # aws-sigv4 1.6.3 upgrades p256's secret arithmetic to crypto-bigint 0.7.10.
+    # Its separate 0.5 dependency only converts/range-checks/adds scalar bytes
+    # and subtracts from the public curve order. None of the advisory's
+    # secret subtraction/division/Montgomery/inversion paths are used there.
+    # No released signer removes that residual dependency yet.
+    { id = "RUSTSEC-2026-0387", reason = "aws-sigv4 1.6.3 residual crypto-bigint 0.5 uses only scalar conversion/range/add and public-order subtraction; p256 secret arithmetic upgraded to patched 0.7.10; no upstream fix for residual dependency" },
+
+    # Tantivy 0.22 -> tantivy-sstable 0.3 pins zstd 0.13 / zstd-safe 7.
+    # Its only compression calls are fresh bulk Compressor/Decompressor
+    # instances (delta.rs and block_reader.rs). It never uses stream
+    # with_context, seekable APIs, or streaming write decoders. The bulk
+    # decoder is explicitly unaffected by the legacy-frame advisory, and
+    # the seekable feature is disabled. There are no patched compatible
+    # releases on these dependency lines; remove these when Tantivy moves.
+    # zstd-sys is upgraded independently to patched 2.1.2.
+    { id = "RUSTSEC-2026-0391", reason = "Tantivy sstable uses fresh zstd bulk contexts, never stream with_context; no compatible patched zstd 0.13 release" },
+    { id = "RUSTSEC-2026-0398", reason = "zstd-safe seekable feature is disabled and no seekable API is called; no compatible patched zstd-safe 7 release" },
+    { id = "RUSTSEC-2026-0403", reason = "Tantivy uses the explicitly unaffected bulk decompressor, never stream write decoding; no compatible patched zstd-safe 7 release" },
 ]
 
 [licenses]
