@@ -68,6 +68,20 @@ Required steps in the report: `gridMounted`, `cellsPopulated`,
 `pasteExecuted`, `pastedFormulaTranslated`, `pastedValueIs12`,
 `noPermissionDialog`.
 
+### spreadsheet-remote-cursor and spreadsheet-remote-cursor-delayed
+
+Both scenarios create a shared spreadsheet, wait for both peers to complete
+their actual collaboration handshake, move user A to B5, and verify A's badge
+on B5 as seen by B. The delayed variant holds B's initial sync frame until both grids
+are visible, verifies it is still withheld, and then releases it explicitly.
+
+```bash
+node doctor.js --scenario spreadsheet-remote-cursor \
+    --base-url http://127.0.0.1:3000 --out /tmp/cursor-normal
+node doctor.js --scenario spreadsheet-remote-cursor-delayed \
+    --base-url http://127.0.0.1:3000 --out /tmp/cursor-delayed
+```
+
 ### spreadsheet-lifecycle (creates two spreadsheets)
 
 Exercises the spreadsheet view's mount/unmount reclaim path (#76). After

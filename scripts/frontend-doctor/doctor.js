@@ -120,7 +120,7 @@ function instrument(context, page, tag, collector) {
       requestId: res.headers()["x-request-id"] || null,
     });
   });
-  context.on("websocket", (ws) => {
+  page.on("websocket", (ws) => {
     const wsEvents = { url: ws.url(), frames: [] };
     collector[tag].ws.push(wsEvents);
     ws.on("framesent", (f) => {
@@ -3630,13 +3630,43 @@ async function scenarioSpreadsheetSheetTabs(ctx, collector) {
   await browser.close();
 }
 
+// Observe the real message dispatch, including when Playwright routes the
+// socket. A Saved badge alone can be the initial no-client placeholder.
+async function installCollabSyncProbe(context) {
+  await context.addInitScript(() => {
+    const OriginalWebSocket = window.WebSocket;
+    window.__doctorCollabSyncCompleted = false;
+    window.WebSocket = class extends OriginalWebSocket {
+      constructor(...args) {
+        super(...args);
+        if (!/\/api\/v1\/documents\/[^/]+\/ws(?:[?#]|$)/.test(this.url)) return;
+        window.__doctorCollabSocket = this;
+        window.__doctorCollabSyncCompleted = false;
+        this.addEventListener("message", (event) => {
+          if (!(event.data instanceof ArrayBuffer) || new Uint8Array(event.data)[0] !== 0x02) return;
+          // A separate task runs after the entire message dispatch, including
+          // the WASM handler that marks the client synced.
+          setTimeout(() => {
+            if (window.__doctorCollabSocket === this && this.readyState === OriginalWebSocket.OPEN) {
+              window.__doctorCollabSyncCompleted = true;
+            }
+          }, 0);
+        });
+        this.addEventListener("close", () => {
+          if (window.__doctorCollabSocket === this) window.__doctorCollabSyncCompleted = false;
+        });
+      }
+    };
+  });
+}
+
 /// #63 + #70 — two users open the same spreadsheet; user A moves the
 /// active cell, user B sees a remote-cursor badge on the matching
 /// cell. After the #70 fix the indicator is rendered inline on the
 /// `<td>` itself (via the `.ss-remote-cell-label` badge child), not
 /// as an absolute-positioned overlay.
 async function scenarioSpreadsheetRemoteCursor(ctx, collector) {
-  const { baseUrlA, baseUrl, emailA, emailB, outDir } = ctx;
+  const { baseUrlA, baseUrl, emailA, emailB, outDir, delayPeerSync = false } = ctx;
   const target = baseUrlA || baseUrl;
   const tokensA = await devLogin(target, emailA);
   const tokensB = await devLogin(target, emailB);
@@ -3680,6 +3710,7 @@ async function scenarioSpreadsheetRemoteCursor(ctx, collector) {
     recordHar: { path: join(outDir, "tab-a.har"), mode: "full" },
   });
   await seedAuth(contextA, tokensA);
+  await installCollabSyncProbe(contextA);
   const pageA = await contextA.newPage();
   instrument(contextA, pageA, "tab-a", collector);
 
@@ -3688,6 +3719,23 @@ async function scenarioSpreadsheetRemoteCursor(ctx, collector) {
     recordHar: { path: join(outDir, "tab-b.har"), mode: "full" },
   });
   await seedAuth(contextB, tokensB);
+  let releasePeerSync = null;
+  if (delayPeerSync) {
+    await contextB.routeWebSocket(/\/api\/v1\/documents\/.*\/ws/, (ws) => {
+      const server = ws.connectToServer();
+      let held = false;
+      server.onMessage((message) => {
+        const bytes = Buffer.from(message);
+        if (!held && bytes[0] === 0x02) {
+          held = true;
+          releasePeerSync = () => ws.send(message);
+          return;
+        }
+        ws.send(message);
+      });
+    });
+  }
+  await installCollabSyncProbe(contextB);
   const pageB = await contextB.newPage();
   instrument(contextB, pageB, "tab-b", collector);
 
@@ -3702,17 +3750,41 @@ async function scenarioSpreadsheetRemoteCursor(ctx, collector) {
     await pageB.waitForSelector(".spreadsheet-wrapper", { timeout: 15000 });
     steps.tabBGridMounted = true;
 
+    // The grid and the initial Saved placeholder can precede sync. Observe
+    // the actual handshake before accepting either peer's UI readiness.
+    await pageA.waitForFunction(() => window.__doctorCollabSyncCompleted === true, undefined, { timeout: 15000 });
+    await pageA.waitForSelector(".sync-indicator.is-saved", { timeout: 15000 });
+    steps.tabACollabReady = true;
+    if (delayPeerSync) {
+      const deadline = Date.now() + 15000;
+      while (!releasePeerSync && Date.now() < deadline) await pageB.waitForTimeout(50);
+      if (!releasePeerSync) throw new Error("Peer SyncStep2 was not captured");
+      steps.peerSyncHeldWhileGridVisible = await pageB.evaluate(
+        () => window.__doctorCollabSyncCompleted === false
+      );
+      if (!steps.peerSyncHeldWhileGridVisible) throw new Error("Peer synced before the held frame was released");
+      releasePeerSync();
+      releasePeerSync = null;
+      steps.peerSyncReleased = true;
+    }
+    await pageB.waitForFunction(() => window.__doctorCollabSyncCompleted === true, undefined, { timeout: 15000 });
+    await pageB.waitForSelector(".sync-indicator.is-saved", { timeout: 15000 });
+    steps.tabBCollabReady = true;
+
     // In tab A, navigate the active cell to B5 by clicking the cell
     // directly. Row 4 (5th tr) × col 1 (B).
     await pageA.locator(".spreadsheet-grid tbody tr").nth(4)
       .locator("td.spreadsheet-cell").nth(1).click();
     steps.tabANavigated = true;
 
-    // Wait for the remote-cell overlay to appear in tab B.
+    // Wait for the badge on B5 specifically. A separate count after an
+    // any-badge wait can observe the transient gap when the old badge is
+    // removed and the newly selected cell's badge is mounted.
     try {
-      await pageB.waitForSelector(".ss-remote-cell-label", { timeout: 8000 });
-      const badgeCount = await pageB.locator(".ss-remote-cell-label").count();
-      steps.tabBSeesRemoteCell = badgeCount >= 1;
+      await pageB.locator(".spreadsheet-grid tbody tr").nth(4)
+        .locator("td.spreadsheet-cell").nth(1)
+        .locator(".ss-remote-cell-label").waitFor({ state: "visible", timeout: 8000 });
+      steps.tabBSeesRemoteCell = true;
     } catch (e) {
       steps.tabBSeesRemoteCell = false;
       // Record why the wait failed — a genuine 8s timeout (peer never
@@ -3726,7 +3798,7 @@ async function scenarioSpreadsheetRemoteCursor(ctx, collector) {
   }
 
   collector.scenario = {
-    name: "spreadsheet-remote-cursor", docId: doc.id, title, steps,
+    name: delayPeerSync ? "spreadsheet-remote-cursor-delayed" : "spreadsheet-remote-cursor", docId: doc.id, title, steps,
   };
   await pageA.screenshot({
     path: join(outDir, "tab-a.png"), fullPage: false,
@@ -7374,7 +7446,7 @@ async function main() {
         "spreadsheet-features|pivot-editor|comment-live-sync|" +
         "spreadsheet-keyboard|spreadsheet-headers|spreadsheet-toolbar|" +
         "spreadsheet-freeze|spreadsheet-sheet-tabs|" +
-        "spreadsheet-remote-cursor|mobile-spreadsheet-keyboards|" +
+        "spreadsheet-remote-cursor|spreadsheet-remote-cursor-delayed|mobile-spreadsheet-keyboards|" +
         "command-palette-actions|embed-youtube|calendar-block|kanban-block|kanban-drag|kanban-column-reorder|kanban-wip-limit|kanban-card-metadata|type-past-atom|code-block-enter|bulk-delete|" +
         "a11y-audit|ask-flow|admin-console|mfa-flow|" +
         "semantic-search|import-job-round-trip|" +
@@ -7440,8 +7512,8 @@ async function main() {
       await scenarioSpreadsheetFreeze(ctx, collector);
     } else if (scenario === "spreadsheet-sheet-tabs") {
       await scenarioSpreadsheetSheetTabs(ctx, collector);
-    } else if (scenario === "spreadsheet-remote-cursor") {
-      await scenarioSpreadsheetRemoteCursor(ctx, collector);
+    } else if (scenario === "spreadsheet-remote-cursor" || scenario === "spreadsheet-remote-cursor-delayed") {
+      await scenarioSpreadsheetRemoteCursor({ ...ctx, delayPeerSync: scenario.endsWith("-delayed") }, collector);
     } else if (scenario === "mobile-spreadsheet-keyboards") {
       await scenarioMobileSpreadsheetKeyboards(ctx, collector);
     } else if (scenario === "command-palette-actions") {

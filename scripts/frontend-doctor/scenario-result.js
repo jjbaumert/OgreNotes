@@ -452,8 +452,13 @@ export function evaluateScenarioResult(scenario, collector, ok = true, errMsg = 
       "contextMenuFitsInViewport", "deleteRemovesTab",
     ],
     "spreadsheet-remote-cursor": [
-      "tabAGridMounted", "tabBGridMounted", "tabANavigated",
-      "tabBSeesRemoteCell",
+      "tabAGridMounted", "tabBGridMounted", "tabACollabReady",
+      "tabBCollabReady", "tabANavigated", "tabBSeesRemoteCell",
+    ],
+    "spreadsheet-remote-cursor-delayed": [
+      "tabAGridMounted", "tabBGridMounted", "tabACollabReady",
+      "tabBCollabReady", "peerSyncHeldWhileGridVisible", "peerSyncReleased",
+      "tabANavigated", "tabBSeesRemoteCell",
     ],
     "mobile-spreadsheet-keyboards": [
       "gridMounted", "touchPrimaryActive", "cellEditing",

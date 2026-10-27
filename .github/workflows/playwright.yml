@@ -539,6 +539,16 @@ jobs:
             --base-url http://127.0.0.1:3000 \
             --out ../../artifacts/doctor/spreadsheet-remote-cursor
 
+      - name: Run spreadsheet cursor delayed-handshake regression
+        id: spreadsheet-remote-cursor-delayed
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario spreadsheet-remote-cursor-delayed \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/spreadsheet-remote-cursor-delayed
+
       - name: Run mobile-spreadsheet-keyboards scenario (M-P3 piece E)
         id: mobile-spreadsheet-keyboards
         if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')

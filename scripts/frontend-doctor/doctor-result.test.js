@@ -145,6 +145,50 @@ test("existing required-step contracts remain effective", () => {
   assert.equal(evaluateScenarioResult("trash-flow", { scenario: { steps: {} } }).ok, false);
 });
 
+const cursorSteps = {
+  tabAGridMounted: true, tabBGridMounted: true,
+  tabACollabReady: true, tabBCollabReady: true,
+  tabANavigated: true, tabBSeesRemoteCell: true,
+};
+
+test("ordinary cursor scenario requires both handshakes and the target badge", () => {
+  assert.equal(evaluateScenarioResult("spreadsheet-remote-cursor", {
+    scenario: { steps: cursorSteps },
+  }).ok, true);
+  for (const field of ["tabACollabReady", "tabBCollabReady", "tabBSeesRemoteCell"]) {
+    const result = evaluateScenarioResult("spreadsheet-remote-cursor", {
+      scenario: { steps: { ...cursorSteps, [field]: false } },
+    });
+    assert.equal(result.ok, false);
+    assert.ok(result.error.includes(field));
+  }
+});
+
+test("delayed cursor scenario cannot pass without holding and releasing sync", () => {
+  const delayedSteps = {
+    ...cursorSteps, peerSyncHeldWhileGridVisible: true, peerSyncReleased: true,
+  };
+  assert.equal(evaluateScenarioResult("spreadsheet-remote-cursor-delayed", {
+    scenario: { steps: delayedSteps },
+  }).ok, true);
+  for (const field of ["peerSyncHeldWhileGridVisible", "peerSyncReleased"]) {
+    assert.equal(evaluateScenarioResult("spreadsheet-remote-cursor-delayed", {
+      scenario: { steps: { ...delayedSteps, [field]: false } },
+    }).ok, false);
+  }
+});
+
+test("delayed cursor CLI dispatches the delayed variant", async () => {
+  const result = await runDoctor("spreadsheet-remote-cursor-delayed", "scenarioSpreadsheetRemoteCursor", async (ctx, collector) => {
+    assert.equal(ctx.delayPeerSync, true);
+    collector.scenario = { name: "spreadsheet-remote-cursor-delayed", steps: {
+      ...cursorSteps, peerSyncHeldWhileGridVisible: true, peerSyncReleased: true,
+    } };
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.report.ok, true);
+});
+
 test("an uncaught browser panic still fails a self-asserting scenario", async () => {
   const result = await runDoctor("semantic-search", "scenarioSemanticSearch", async (_, collector) => {
     collector["tab-a"] = { errors: [{ message: "WASM panic" }] };
