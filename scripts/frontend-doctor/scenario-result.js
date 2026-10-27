@@ -452,8 +452,13 @@ export function evaluateScenarioResult(scenario, collector, ok = true, errMsg = 
       "contextMenuFitsInViewport", "deleteRemovesTab",
     ],
     "spreadsheet-remote-cursor": [
-      "tabAGridMounted", "tabBGridMounted", "tabANavigated",
-      "tabBSeesRemoteCell",
+      "tabAGridMounted", "tabBGridMounted", "tabACollabReady",
+      "tabBCollabReady", "tabANavigated", "tabBSeesRemoteCell",
+    ],
+    "spreadsheet-remote-cursor-delayed": [
+      "tabAGridMounted", "tabBGridMounted", "tabACollabReady",
+      "tabBCollabReady", "peerSyncHeldWhileGridVisible", "peerSyncReleased",
+      "tabANavigated", "tabBSeesRemoteCell",
     ],
     "mobile-spreadsheet-keyboards": [
       "gridMounted", "touchPrimaryActive", "cellEditing",
@@ -532,8 +537,11 @@ export function evaluateScenarioResult(scenario, collector, ok = true, errMsg = 
     "deck-present": [
       "presentRouteReached", "stageRendersSlide", "slideTextVisible",
       "arrowAdvances", "arrowGoesBack", "escapeReturnsToEditor",
-      "presenterViewPanels", "timerAdvances", "pdfExportDownloads",
-      "noConsoleErrors",
+      "remoteSyncHeld", "lateRemoteSyncQueuedBeforeNavigation",
+      "lateRemoteSyncDelivered",
+      "presenterViewPanels", "presenterQueryHidesPanel",
+      "presenterQueryRestoresPanel", "noReactiveContextWarnings",
+      "timerAdvances", "pdfExportDownloads", "noConsoleErrors",
     ],
   };
   if (ok && Object.prototype.hasOwnProperty.call(requiredSteps, scenario)) {

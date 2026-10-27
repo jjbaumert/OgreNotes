@@ -102,15 +102,10 @@ jobs:
       # has crashed the `cargo run --bin setup_dev` step before any
       # scenario could execute. Mirror the Dockerfile package set:
       # -dev headers + libclang for bindgen at compile time; the
-      # `libxmlsec1-openssl` shim is what the runtime binary
+      # xmlsec OpenSSL runtime is what the runtime binary
       # dlopens for the actual crypto backend.
       - name: Install xmlsec1 + clang (samael dependencies)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config libssl-dev \
-            libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
-            clang libclang-dev librsvg2-bin imagemagick
+        run: bash scripts/ci-install-native-deps.sh librsvg2-bin imagemagick
 
       # ─── Toolchain ────────────────────────────────────────────
       - name: Install Rust (stable + wasm32)
@@ -121,6 +116,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
+          env-vars: LIBCLANG_PATH OGRE_NATIVE_ABI
           workspaces: |
             . -> target
             frontend -> target
@@ -137,9 +133,9 @@ jobs:
       # index.html's data-wasm-opt-params, so its wasm-opt 116 rejected the
       # bulk-memory ops rustc now emits for wasm32. 0.21.14 matches local dev.
       - name: Install trunk
-        uses: jetli/trunk-action@v0.5.0
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
         with:
-          version: v0.21.14
+          tool: trunk@0.21.14
 
       - name: Setup Node 20
         uses: actions/setup-node@v4
@@ -542,6 +538,16 @@ jobs:
             --scenario spreadsheet-remote-cursor \
             --base-url http://127.0.0.1:3000 \
             --out ../../artifacts/doctor/spreadsheet-remote-cursor
+
+      - name: Run spreadsheet cursor delayed-handshake regression
+        id: spreadsheet-remote-cursor-delayed
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: |
+          node doctor.js \
+            --scenario spreadsheet-remote-cursor-delayed \
+            --base-url http://127.0.0.1:3000 \
+            --out ../../artifacts/doctor/spreadsheet-remote-cursor-delayed
 
       - name: Run mobile-spreadsheet-keyboards scenario (M-P3 piece E)
         id: mobile-spreadsheet-keyboards

@@ -79,12 +79,7 @@ jobs:
       # the full workspace including samael, so the build crashes
       # here without these packages.
       - name: Install xmlsec1 + clang (samael dependencies)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config libssl-dev \
-            libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
-            clang libclang-dev
+        run: bash scripts/ci-install-native-deps.sh
 
       # ─── Toolchain ────────────────────────────────────────────
       - name: Install Rust (stable + wasm32)
@@ -95,6 +90,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
+          env-vars: LIBCLANG_PATH OGRE_NATIVE_ABI
           workspaces: |
             . -> target
             frontend -> target
@@ -104,9 +100,9 @@ jobs:
           shared-key: wasm-tests
 
       - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
         with:
-          version: latest
+          tool: wasm-pack@0.15.0
 
       # geckodriver + Firefox are preinstalled on ubuntu-latest. wasm-pack
       # uses them transparently when --firefox is passed. If the runner
@@ -250,9 +246,9 @@ jobs:
           shared-key: wasm-tests-lib
 
       - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
         with:
-          version: latest
+          tool: wasm-pack@0.15.0
 
       - name: Verify browser process cleanup
         run: python3 scripts/test_test_cleanup.py
@@ -260,9 +256,8 @@ jobs:
       # geckodriver + Firefox are preinstalled on ubuntu-latest; wasm-pack
       # uses them transparently when --firefox is passed.
       # `--lib` goes AFTER the `--` separator (a cargo passthrough arg, same
-      # as collab-e2e's `-- --test collab_e2e`): the wasm-pack-action pins
-      # `version: latest`, so don't rely on wasm-pack forwarding an unknown
-      # `--lib` from before the separator.
+      # as collab-e2e's `-- --test collab_e2e`). Keep cargo arguments after
+      # the separator rather than relying on wasm-pack's argument forwarding.
       - name: Run frontend lib wasm-bindgen tests
         working-directory: frontend
         run: python3 ../scripts/with-test-cleanup.py -- wasm-pack test --headless --firefox -- --lib

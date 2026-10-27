@@ -152,9 +152,15 @@ pub fn PresentPage() -> impl IntoView {
 
     ensure_presentation_css();
     let params = use_params_map();
-    let doc_id = move || params.read().get("id").unwrap_or_default();
+    // This page is mounted for one document; the ID is copied before async
+    // work and event handlers capture it, so retaining the router memo only
+    // risks reading it after the route owner has been disposed.
+    let doc_id = params.with_untracked(|params| params.get("id").unwrap_or_default());
     let query = use_query_map();
-    let is_presenter_view = move || query.read().get("presenter").is_some();
+    // Retain a reactive query read for presenter controls and timer behavior,
+    // which must follow query-only navigation while this route remains mounted.
+    let presenter_query = query.clone();
+    let is_presenter_view = move || presenter_query.read().get("presenter").is_some();
 
     let deck = RwSignal::new(Deck {
         theme: DEFAULT_THEME.to_string(),
@@ -200,11 +206,11 @@ pub fn PresentPage() -> impl IntoView {
     // fetch here races the editor's WS persistence of the last edit and
     // could load a half-persisted deck (an extra empty slide). REST remains
     // the path for a direct load or refresh of this URL.
-    if let Some(node) = crate::presentation::handoff::take(&doc_id()) {
+    if let Some(node) = crate::presentation::handoff::take(&doc_id) {
         deck.set(deck_from_doc(&node));
         set_loaded.set(true);
     } else {
-        let id = doc_id();
+        let id = doc_id.clone();
         leptos::task::spawn_local(async move {
             if let Ok(bytes) = crate::api::documents::get_content(&id).await {
                 if let Ok(node) = ydoc_bytes_to_doc(&bytes) {
@@ -304,7 +310,7 @@ pub fn PresentPage() -> impl IntoView {
     // deck_view.rs's outside-click handler.
     {
         let navigate = use_navigate();
-        let id = doc_id();
+        let id = doc_id.clone();
         let handle = window_event_listener_untyped("keydown", move |ev: web_sys::Event| {
             let Ok(ke) = ev.clone().dyn_into::<web_sys::KeyboardEvent>() else { return };
             match ke.key().as_str() {
@@ -344,20 +350,21 @@ pub fn PresentPage() -> impl IntoView {
     // firing — and touching a disposed `set_elapsed` — after the
     // presenter navigates away from this page.
     let (elapsed, set_elapsed) = signal(0u64);
-    if is_presenter_view() {
-        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let active_for_cleanup = active.clone();
-        on_cleanup(move || active_for_cleanup.store(false, std::sync::atomic::Ordering::Relaxed));
-        leptos::task::spawn_local(async move {
-            loop {
-                gloo_timers::future::TimeoutFuture::new(1000).await;
-                if !active.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
+    let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let active_for_cleanup = active.clone();
+    on_cleanup(move || active_for_cleanup.store(false, std::sync::atomic::Ordering::Relaxed));
+    let timer_query = query.clone();
+    leptos::task::spawn_local(async move {
+        loop {
+            gloo_timers::future::TimeoutFuture::new(1000).await;
+            if !active.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            if timer_query.with_untracked(|query| query.get("presenter").is_some()) {
                 set_elapsed.update(|v| *v += 1);
             }
-        });
-    }
+        }
+    });
 
     // ── Live follow-the-presenter (Task 8) ──────────────────────────
     //
@@ -411,7 +418,7 @@ pub fn PresentPage() -> impl IntoView {
     let reconnect_in_flight = std::rc::Rc::new(std::cell::Cell::new(false));
 
     {
-        let id = doc_id();
+        let id = doc_id.clone();
         let collab_for_connect = std::rc::Rc::clone(&collab_client);
         let synced_for_connect = std::sync::Arc::clone(&ws_synced_flag);
         let in_flight = std::rc::Rc::clone(&reconnect_in_flight);
