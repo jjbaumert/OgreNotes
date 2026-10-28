@@ -50,7 +50,7 @@ pdf-extract = { version = "0.12", optional = true }
 # plain-text output by hand. Reader stays pdf-extract above.
 printpdf = { version = "0.9", optional = true }
 # Markdown import — Phase 5 M-P5 piece A.
-pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+pulldown-cmark = { version = "0.13.5", default-features = false, features = ["html"] }
 # HTML import — Phase 5 M-P5 piece B. ammonia sanitizes BEFORE
 # html5ever sees the input; html5ever + markup5ever_rcdom build
 # a walkable DOM tree we map to NodeType variants.
