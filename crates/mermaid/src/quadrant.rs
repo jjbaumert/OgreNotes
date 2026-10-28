@@ -6,7 +6,7 @@
 //! split by a center cross, quadrant labels in each cell, axis labels on the
 //! edges, and a labeled dot per point.
 
-use crate::{ParseError, escape_xml};
+use crate::{escape_xml, ParseError};
 
 const PAD: f64 = 20.0;
 const PLOT: f64 = 380.0; // square plot side
@@ -22,8 +22,9 @@ const QUAD_TINT: [&str; 4] = [
     "var(--mermaid-quadrant-4, #eefaf1)",
 ];
 /// Categorical fill palette for the plotted points, cycled.
-const POINT_PALETTE: &[&str] =
-    &["#3b82f6", "#ef4444", "#22c55e", "#a855f7", "#f59e0b", "#14b8a6", "#ec4899", "#64748b"];
+const POINT_PALETTE: &[&str] = &[
+    "#3b82f6", "#ef4444", "#22c55e", "#a855f7", "#f59e0b", "#14b8a6", "#ec4899", "#64748b",
+];
 
 #[derive(Debug, Clone)]
 pub(crate) struct QuadrantChart {
@@ -52,7 +53,10 @@ pub(crate) fn parse(source: &str) -> Result<QuadrantChart, ParseError> {
         }
         if !seen_header {
             if line.strip_suffix(';').unwrap_or(line).trim_end() != "quadrantChart" {
-                return Err(err("quadrant chart must start with `quadrantChart`", line_no));
+                return Err(err(
+                    "quadrant chart must start with `quadrantChart`",
+                    line_no,
+                ));
             }
             seen_header = true;
             continue;
@@ -72,15 +76,20 @@ pub(crate) fn parse(source: &str) -> Result<QuadrantChart, ParseError> {
                 .ok_or_else(|| err("quadrant number must be 1–4", line_no))?;
             c.quadrants[n - 1] = Some(label.trim().to_string());
         } else if let Some((name, coords)) = line.split_once(':') {
-            let (x, y) = parse_point(coords).ok_or_else(|| {
-                err("data point needs `[x, y]` with x,y in 0..1", line_no)
-            })?;
+            let (x, y) = parse_point(coords)
+                .ok_or_else(|| err("data point needs `[x, y]` with x,y in 0..1", line_no))?;
             if c.points.len() >= MAX_POINTS {
-                return Err(err(format!("quadrant chart too large: >{MAX_POINTS} points"), line_no));
+                return Err(err(
+                    format!("quadrant chart too large: >{MAX_POINTS} points"),
+                    line_no,
+                ));
             }
             c.points.push((name.trim().to_string(), x, y));
         } else {
-            return Err(err(format!("unrecognized quadrantChart line {line:?}"), line_no));
+            return Err(err(
+                format!("unrecognized quadrantChart line {line:?}"),
+                line_no,
+            ));
         }
     }
     if !seen_header {
@@ -105,14 +114,17 @@ fn split_axis(s: &str) -> (String, String) {
 fn parse_point(s: &str) -> Option<(f64, f64)> {
     let inner = s.trim().strip_prefix('[')?.strip_suffix(']')?;
     let (xs, ys) = inner.split_once(',')?;
-    let x: f64 = xs.trim().parse().ok()?;
-    let y: f64 = ys.trim().parse().ok()?;
+    let x = crate::parse_number(xs)?;
+    let y = crate::parse_number(ys)?;
     (x.is_finite() && y.is_finite() && (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y))
         .then_some((x, y))
 }
 
 fn err(message: impl Into<String>, line: usize) -> ParseError {
-    ParseError { message: message.into(), line: Some(line) }
+    ParseError {
+        message: message.into(),
+        line: Some(line),
+    }
 }
 
 pub(crate) fn render_svg(c: &QuadrantChart) -> String {
@@ -140,10 +152,10 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
     // behind the border/cross. Order matches quadrant-1..4: TR, TL, BL, BR.
     let half = side / 2.0;
     let cells = [
-        (cx0, top, QUAD_TINT[0]),  // 1 top-right
-        (l, top, QUAD_TINT[1]),    // 2 top-left
-        (l, cy0, QUAD_TINT[2]),    // 3 bottom-left
-        (cx0, cy0, QUAD_TINT[3]),  // 4 bottom-right
+        (cx0, top, QUAD_TINT[0]), // 1 top-right
+        (l, top, QUAD_TINT[1]),   // 2 top-left
+        (l, cy0, QUAD_TINT[2]),   // 3 bottom-left
+        (cx0, cy0, QUAD_TINT[3]), // 4 bottom-right
     ];
     for (qx, qy, tint) in cells {
         body.push_str(&format!(
@@ -251,11 +263,12 @@ pub(crate) fn render_svg(c: &QuadrantChart) -> String {
     ));
 
     // Clear marker paint only at label glyphs, retaining the rest of each
-    // marker. A thin expansion also clears antialiased glyph interiors.
+    // marker. A one-pixel expansion clears antialiased glyph interiors,
+    // including light text against dark-theme rings beside axis captions.
     let point_mask_body = format!(
         r##"<rect width="{total_w:.1}" height="{:.1}" fill="#fff"/>{}"##,
         top + side + AXIS_GAP + PAD,
-        holes.replace("stroke-width=\"3\"", "stroke-width=\"0.3\"")
+        holes.replace("stroke-width=\"3\"", "stroke-width=\"1\"")
     );
     let point_mask_id = crate::theme::paint_mask_id("quad-points", &point_mask_body);
     body.push_str(&format!(
@@ -341,7 +354,8 @@ mod tests {
     #[test]
     fn renders_grid_quadrants_and_points() {
         let svg = render_svg(
-            &parse("quadrantChart\n title T\n x-axis Lo --> Hi\n quadrant-1 Q1\n A: [0.8, 0.8]").unwrap(),
+            &parse("quadrantChart\n title T\n x-axis Lo --> Hi\n quadrant-1 Q1\n A: [0.8, 0.8]")
+                .unwrap(),
         );
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
         assert!(svg.contains(">T<") && svg.contains(">Q1<") && svg.contains(">A<"));
@@ -351,15 +365,19 @@ mod tests {
 
     #[test]
     fn quadrants_are_tinted_and_points_filled() {
-        let svg = render_svg(
-            &parse("quadrantChart\n A: [0.8, 0.8]\n B: [0.2, 0.2]").unwrap(),
-        );
+        let svg = render_svg(&parse("quadrantChart\n A: [0.8, 0.8]\n B: [0.2, 0.2]").unwrap());
         // Each of the four quadrant tints appears as a cell fill.
         for tint in QUAD_TINT {
             assert!(svg.contains(tint), "missing quadrant tint {tint}: {svg}");
         }
         // Points are filled with the palette (not the old hollow node-fill).
-        assert!(svg.contains(POINT_PALETTE[0]), "first point uses palette fill: {svg}");
-        assert!(!svg.contains("var(--mermaid-node-fill"), "points no longer hollow: {svg}");
+        assert!(
+            svg.contains(POINT_PALETTE[0]),
+            "first point uses palette fill: {svg}"
+        );
+        assert!(
+            !svg.contains("var(--mermaid-node-fill"),
+            "points no longer hollow: {svg}"
+        );
     }
 }

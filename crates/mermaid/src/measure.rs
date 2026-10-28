@@ -9,8 +9,11 @@ pub(crate) const LINE_H: f64 = 19.0;
 /// Relative advance width per char class, multiplied by FONT_PX.
 fn char_w(c: char) -> f64 {
     match c {
-        'i' | 'l' | 'j' | 't' | 'f' | 'r' | '.' | ',' | ':' | ';' | '!'
-        | '|' | '\'' | '`' | ' ' | '(' | ')' | '[' | ']' => 0.45,
+        '\u{200c}' | '\u{200d}' | '\u{fe0e}' | '\u{fe0f}' => 0.0,
+        c if is_combining_mark(c) => 0.0,
+        '\u{2600}'..='\u{2bff}' | '\u{1f000}'..='\u{1faff}' => 1.35,
+        'i' | 'l' | 'j' | 't' | 'f' | 'r' | '.' | ',' | ':' | ';' | '!' | '|' | '\'' | '`'
+        | ' ' | '(' | ')' | '[' | ']' => 0.45,
         'm' | 'w' | 'M' | 'W' | '@' | '%' => 0.95,
         'A'..='Z' | '0'..='9' | '#' | '&' | '$' => 0.72,
         c if (c as u32) > 0x2E7F => 1.05, // CJK & wide scripts
@@ -57,21 +60,45 @@ pub(crate) fn lines(s: &str) -> Vec<&str> {
 }
 
 /// `s` cut down with a trailing ellipsis so it measures at most `max_w`
-/// (unchanged if it already fits). Binary search over char boundaries:
-/// re-measuring after dropping one char at a time was quadratic.
+/// (unchanged if it already fits). Measure the full label and fitting
+/// prefix together, without repeatedly scanning progressively shorter strings.
 pub(crate) fn truncate_to_width(s: &str, max_w: f64) -> String {
     if text_size(s).0 <= max_w {
         return s.to_string();
     }
-    let bounds: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
-    let fits = |n: usize| text_size(&format!("{}…", &s[..bounds[n]])).0 <= max_w;
-    // Longest prefix of `n` chars (0 <= n < len) that fits with the ellipsis.
-    let (mut lo, mut hi) = (0, bounds.len());
-    while lo + 1 < hi {
-        let mid = (lo + hi) / 2;
-        if fits(mid) { lo = mid } else { hi = mid }
+    let budget = max_w - text_size("…").0;
+    if budget < 0.0 {
+        return String::new();
     }
-    format!("{}…", &s[..bounds[lo]])
+    lines(s)
+        .iter()
+        .map(|line| {
+            if text_size(line).0 <= max_w {
+                return line.to_string();
+            }
+            let mut width = 0.0;
+            let mut end = 0;
+            for (index, grapheme) in line.grapheme_indices(true) {
+                width += text_size(grapheme).0;
+                if width > budget {
+                    break;
+                }
+                end = index + grapheme.len();
+            }
+            format!("{}…", &line[..end])
+        })
+        .collect::<Vec<_>>()
+        .join("<br/>")
+}
+
+/// Wrap labels at whitespace, splitting overlong words at grapheme boundaries.
+/// Explicit Mermaid line breaks are preserved. Each input grapheme is measured a bounded number of times; the returned spelling is understood by text_size and SVG label emitters.
+pub(crate) fn wrap_to_width(s: &str, max_w: f64) -> String {
+    lines(s)
+        .into_iter()
+        .flat_map(|line| wrap_literal_to_width(line, max_w, FONT_PX, false))
+        .collect::<Vec<_>>()
+        .join("<br/>")
 }
 
 include!(concat!(env!("OUT_DIR"), "/compact_unicode.rs"));
@@ -175,6 +202,57 @@ fn literal_advance(grapheme: &str, font_size: f64, bold: bool) -> f64 {
         });
     }
     em * font_size * weight
+}
+
+/// Wrap literal SVG labels at their actual font size, retaining complete
+/// grapheme clusters. Unlike Mermaid text_size, `<br>` remains literal text.
+pub(crate) fn wrap_literal_to_width(
+    text: &str,
+    max_width: f64,
+    font_size: f64,
+    bold: bool,
+) -> Vec<String> {
+    let graphemes: Vec<_> = text.grapheme_indices(true).collect();
+    if graphemes.is_empty() {
+        return vec![String::new()];
+    }
+    let mut output = Vec::new();
+    let mut start = 0;
+    while start < graphemes.len() {
+        let mut end = start;
+        let mut width = 0.0;
+        let mut word_boundary = None;
+        while end < graphemes.len() {
+            let grapheme = graphemes[end].1;
+            let next = width + literal_advance(grapheme, font_size, bold);
+            // Keep an oversized single grapheme intact; the final fitting
+            // policy can truncate it, but wrapping must never split it.
+            if end > start && next > max_width {
+                break;
+            }
+            width = next;
+            end += 1;
+            if grapheme
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_whitespace() && !matches!(ch, '\u{00a0}' | '\u{202f}'))
+            {
+                word_boundary = Some(end);
+            }
+        }
+        if end < graphemes.len() {
+            if let Some(boundary) = word_boundary {
+                end = boundary;
+            }
+        }
+        let byte_start = graphemes[start].0;
+        let byte_end = graphemes.get(end).map_or(text.len(), |&(offset, _)| offset);
+        // Slice the original text, preserving spaces, NBSP and marks attached
+        // to whitespace. A carried word is rescanned at most once.
+        output.push(text[byte_start..byte_end].to_string());
+        start = end;
+    }
+    output
 }
 
 /// Conservative literal glyph bounds for overlap detection, without HTML breaks.
@@ -282,6 +360,48 @@ mod tests {
     }
 
     #[test]
+    fn wrapping_and_truncation_preserve_graphemes_and_line_breaks() {
+        let text = "e\u{301}".repeat(20);
+        let wrapped = wrap_literal_to_width(&text, 35.0, 13.0, false);
+        assert_eq!(wrapped.concat(), text);
+        assert!(wrapped.iter().all(|line| !line.starts_with('\u{301}')));
+        assert_eq!(
+            wrap_literal_to_width("A<br>B", 1000.0, 13.0, false),
+            vec!["A<br>B"]
+        );
+        let truncated = truncate_to_width("short<br/>a long line that does not fit", 65.0);
+        assert!(truncated.starts_with("short<br/>"));
+        assert!(text_size(&truncated).0 <= 65.0);
+        assert_eq!(text_size("e\u{301}"), text_size("e"));
+        assert!(text_size("✅").0 > text_size("x").0);
+    }
+
+    #[test]
+    fn literal_wrapping_preserves_original_whitespace_graphemes() {
+        for text in [
+            format!("{} \u{0301}B", "W".repeat(15)),
+            "A\u{00a0}B".to_string(),
+            "A  B".to_string(),
+            "A\u{202f}B".to_string(),
+        ] {
+            let wrapped = wrap_literal_to_width(&text, 212.0, 13.0, true);
+            assert_eq!(wrapped.concat(), text);
+            let boundaries: std::collections::HashSet<_> = text
+                .grapheme_indices(true)
+                .map(|(offset, grapheme)| offset + grapheme.len())
+                .collect();
+            let mut offset = 0;
+            for line in wrapped {
+                offset += line.len();
+                assert!(
+                    boundaries.contains(&offset),
+                    "a wrapping boundary split an original grapheme"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn wider_text_measures_wider() {
         assert!(text_size("wide text here").0 > text_size("hi").0);
     }
@@ -324,7 +444,10 @@ mod tests {
     #[test]
     fn truncation_fits_and_keeps_char_boundaries() {
         assert_eq!(truncate_to_width("short", 1000.0), "short");
-        for s in ["a fairly long label that will not fit", "图表图表图表图表图表图表"] {
+        for s in [
+            "a fairly long label that will not fit",
+            "图表图表图表图表图表图表",
+        ] {
             let t = truncate_to_width(s, 60.0);
             assert!(t.ends_with('…') && t.len() < s.len() + 3, "{t}");
             assert!(text_size(&t).0 <= 60.0, "{t}");

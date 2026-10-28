@@ -14,37 +14,38 @@
 //! and docs/superpowers/specs/2026-07-10-mermaid-slice4-state-class-er-design.md
 //! (state/class/ER).
 
-mod theme;
-mod pie;
-mod gantt;
-mod gitgraph;
-mod mindmap;
-mod timeline;
-mod journey;
-mod quadrant;
-mod xychart;
-mod kanban;
-mod packet;
-mod requirement;
-mod block;
-mod radar;
-mod treemap;
-mod sankey;
-mod c4;
 mod architecture;
-mod layout;
-pub(crate) mod measure;
-pub(crate) mod style;
-pub(crate) mod flowchart;
-pub(crate) mod sequence;
+mod block;
 pub(crate) mod boxgraph;
-pub(crate) mod state;
+mod c4;
 pub(crate) mod class;
 pub(crate) mod er;
 #[cfg(test)]
-mod props;
-#[cfg(test)]
 mod extent;
+pub(crate) mod flowchart;
+mod gantt;
+mod gitgraph;
+mod journey;
+mod kanban;
+mod layout;
+pub(crate) mod measure;
+mod mindmap;
+mod packet;
+mod pie;
+#[cfg(test)]
+mod props;
+mod quadrant;
+mod radar;
+mod requirement;
+mod sankey;
+pub(crate) mod sequence;
+mod source;
+pub(crate) mod state;
+pub(crate) mod style;
+mod theme;
+mod timeline;
+mod treemap;
+mod xychart;
 
 /// Max diagram source length (chars). Shared cap: the single source of
 /// truth for both the `crates/collab` write-gate validator
@@ -137,11 +138,20 @@ pub(crate) fn edge_label_svg(label: &str, at: (f64, f64)) -> String {
         ));
         return out;
     }
-    out.push_str(&format!(r#"<text x="{lx:.1}" y="{ly:.1}" text-anchor="middle" fill="currentColor">"#));
+    out.push_str(&format!(
+        r#"<text x="{lx:.1}" y="{ly:.1}" text-anchor="middle" fill="currentColor">"#
+    ));
     let n = lines.len() as f64;
     for (i, line) in lines.iter().enumerate() {
-        let dy = if i == 0 { -(n - 1.0) / 2.0 * measure::LINE_H + 4.0 } else { measure::LINE_H };
-        out.push_str(&format!(r#"<tspan x="{lx:.1}" dy="{dy:.1}">{}</tspan>"#, escape_xml(line)));
+        let dy = if i == 0 {
+            -(n - 1.0) / 2.0 * measure::LINE_H + 4.0
+        } else {
+            measure::LINE_H
+        };
+        out.push_str(&format!(
+            r#"<tspan x="{lx:.1}" dy="{dy:.1}">{}</tspan>"#,
+            escape_xml(line)
+        ));
     }
     out.push_str("</text>");
     out
@@ -168,6 +178,25 @@ pub(crate) fn escape_xml(s: &str) -> String {
         }
     }
     out
+}
+
+/// Remove one matching pair of ordinary label quotes. Markdown backticks
+/// remain visible to parsers so unsupported markdown is rejected explicitly.
+pub(crate) fn unquote_label(s: &str) -> &str {
+    s.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| s.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(s)
+}
+
+/// Common numeric grammar for chart data. A leading `+` is reserved for
+/// relative lengths (packet fields); exponents such as `1e+3` remain valid.
+pub(crate) fn parse_number(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.starts_with('+') {
+        return None;
+    }
+    s.parse::<f64>().ok().filter(|number| number.is_finite())
 }
 
 /// Recognize accessibility statements without reserving similarly named node
@@ -290,37 +319,6 @@ pub fn detect_kind(source: &str) -> DiagramKind {
         "architecture" | "architecture-beta" => DiagramKind::Architecture,
         _ => DiagramKind::Unknown,
     }
-}
-
-/// Mermaid sources may open with a YAML front-matter block
-/// (`---` … `---`) carrying config/theme data we don't consume. When
-/// the very first line is `---`, blank the block's lines (delimiters
-/// inclusive) rather than slicing them away, so every downstream error
-/// still points at the original 1-based line numbers. Contents are
-/// ignored in v1.
-///
-/// Only ever called from `render()` AFTER the `MAX_SOURCE_LEN` gate, so
-/// its line scan and the `Vec`/`String::join` allocation it performs are
-/// bounded by the cap — this function must not be called on untrusted,
-/// unbounded input directly.
-fn strip_front_matter(source: &str) -> Result<Option<String>, ParseError> {
-    match source.lines().next() {
-        Some(first) if first.trim() == "---" => {}
-        _ => return Ok(None),
-    }
-    let Some(close_rel) = source.lines().skip(1).position(|l| l.trim() == "---") else {
-        return Err(ParseError {
-            message: "unterminated front matter: missing closing `---`".into(),
-            line: Some(1),
-        });
-    };
-    let close_idx = close_rel + 1; // position() counted from line 2
-    let blanked: Vec<&str> = source
-        .lines()
-        .enumerate()
-        .map(|(i, l)| if i <= close_idx { "" } else { l })
-        .collect();
-    Ok(Some(blanked.join("\n")))
 }
 
 /// Extract shared accessibility statements while retaining original error lines.
@@ -497,18 +495,18 @@ pub fn render(source: &str) -> RenderOutput {
             }),
         };
     }
-    let stripped;
-    let (source, kind) = match strip_front_matter(source) {
-        Ok(None) => (source, kind),
-        Ok(Some(s)) => {
-            stripped = s;
-            let kind = detect_kind(&stripped);
-            (stripped.as_str(), kind)
-        }
-        Err(e) => {
-            return RenderOutput { kind: DiagramKind::Unknown, svg: None, error: Some(e) }
+    let prepared = match source::prepare(source) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return RenderOutput {
+                kind,
+                svg: None,
+                error: Some(error),
+            }
         }
     };
+    let source = prepared.source.as_str();
+    let kind = detect_kind(source);
     let (accessible_source, title, description) = match accessibility_source(source) {
         Ok(values) => values,
         Err(error) => {
@@ -522,94 +520,270 @@ pub fn render(source: &str) -> RenderOutput {
     let source = accessible_source.as_str();
     let out = match kind {
         DiagramKind::Pie => match pie::parse(source) {
-            Ok(p) => RenderOutput { kind, svg: Some(pie::render_svg(&p)), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(p) => RenderOutput {
+                kind,
+                svg: Some(pie::render_svg(&p)),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Flowchart => match flowchart::render_flowchart(source) {
-            Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(svg) => RenderOutput {
+                kind,
+                svg: Some(svg),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Sequence => match sequence::render_sequence(source) {
-            Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(svg) => RenderOutput {
+                kind,
+                svg: Some(svg),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::State => match state::render_state(source) {
-            Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(svg) => RenderOutput {
+                kind,
+                svg: Some(svg),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Class => match class::render_class(source) {
-            Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(svg) => RenderOutput {
+                kind,
+                svg: Some(svg),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Er => match er::render_er(source) {
-            Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(svg) => RenderOutput {
+                kind,
+                svg: Some(svg),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Gantt => match gantt::parse(source) {
-            Ok(g) => RenderOutput { kind, svg: Some(gantt::render_svg(&g)), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(g) => RenderOutput {
+                kind,
+                svg: Some(gantt::render_svg(&g)),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::GitGraph => match gitgraph::parse(source) {
-            Ok(g) => RenderOutput { kind, svg: Some(gitgraph::render_svg(&g)), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(g) => RenderOutput {
+                kind,
+                svg: Some(gitgraph::render_svg(&g)),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Mindmap => match mindmap::parse(source) {
-            Ok(m) => RenderOutput { kind, svg: Some(mindmap::render_svg(&m)), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(m) => RenderOutput {
+                kind,
+                svg: Some(mindmap::render_svg(&m)),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Timeline => match timeline::parse(source) {
-            Ok(t) => RenderOutput { kind, svg: Some(timeline::render_svg(&t)), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(t) => RenderOutput {
+                kind,
+                svg: Some(timeline::render_svg(&t)),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Journey => match journey::parse(source) {
-            Ok(j) => RenderOutput { kind, svg: Some(journey::render_svg(&j)), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(j) => RenderOutput {
+                kind,
+                svg: Some(journey::render_svg(&j)),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Quadrant => match quadrant::parse(source) {
-            Ok(q) => RenderOutput { kind, svg: Some(quadrant::render_svg(&q)), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(q) => RenderOutput {
+                kind,
+                svg: Some(quadrant::render_svg(&q)),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::XyChart => match xychart::parse(source) {
-            Ok(x) => RenderOutput { kind, svg: Some(xychart::render_svg(&x)), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(x) => RenderOutput {
+                kind,
+                svg: Some(xychart::render_svg(&x)),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Kanban => match kanban::parse(source) {
-            Ok(k) => RenderOutput { kind, svg: Some(kanban::render_svg(&k)), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(k) => RenderOutput {
+                kind,
+                svg: Some(kanban::render_svg(&k)),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Packet => match packet::parse(source) {
-            Ok(pk) => RenderOutput { kind, svg: Some(packet::render_svg(&pk)), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(pk) => RenderOutput {
+                kind,
+                svg: Some(packet::render_svg(&pk)),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Requirement => {
             match requirement::parse(source).and_then(|g| requirement::render_svg(&g)) {
-                Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
-                Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+                Ok(svg) => RenderOutput {
+                    kind,
+                    svg: Some(svg),
+                    error: None,
+                },
+                Err(e) => RenderOutput {
+                    kind,
+                    svg: None,
+                    error: Some(e),
+                },
             }
         }
         DiagramKind::Radar => match radar::parse(source) {
-            Ok(r) => RenderOutput { kind, svg: Some(radar::render_svg(&r)), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(r) => RenderOutput {
+                kind,
+                svg: Some(radar::render_svg(&r)),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Treemap => match treemap::parse(source) {
-            Ok(tm) => RenderOutput { kind, svg: Some(treemap::render_svg(&tm)), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(tm) => RenderOutput {
+                kind,
+                svg: Some(treemap::render_svg(&tm)),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Sankey => match sankey::parse(source) {
-            Ok(sk) => RenderOutput { kind, svg: Some(sankey::render_svg(&sk)), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(sk) => RenderOutput {
+                kind,
+                svg: Some(sankey::render_svg(&sk)),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::C4 => match c4::parse(source).and_then(|g| c4::render_svg(&g)) {
-            Ok(svg) => RenderOutput { kind, svg: Some(svg), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(svg) => RenderOutput {
+                kind,
+                svg: Some(svg),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Architecture => match architecture::parse(source) {
-            Ok(ar) => RenderOutput { kind, svg: Some(architecture::render_svg(&ar)), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(ar) => RenderOutput {
+                kind,
+                svg: Some(architecture::render_svg(&ar)),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Block => match block::parse(source) {
-            Ok(b) => RenderOutput { kind, svg: Some(block::render_svg(&b)), error: None },
-            Err(e) => RenderOutput { kind, svg: None, error: Some(e) },
+            Ok(b) => RenderOutput {
+                kind,
+                svg: Some(block::render_svg(&b)),
+                error: None,
+            },
+            Err(e) => RenderOutput {
+                kind,
+                svg: None,
+                error: Some(e),
+            },
         },
         DiagramKind::Unknown => RenderOutput {
             kind,
@@ -622,7 +796,16 @@ pub fn render(source: &str) -> RenderOutput {
     };
     let mut out = out;
     if let Some(svg) = out.svg.take() {
-        out.svg = Some(accessible_svg(svg, kind, title, description));
+        let svg = match prepared.title.as_deref() {
+            Some(title) => source::with_title(svg, title),
+            None => svg,
+        };
+        out.svg = Some(accessible_svg(
+            svg,
+            kind,
+            title.or(prepared.title),
+            description,
+        ));
     }
     cap_output(out)
 }
@@ -641,7 +824,10 @@ fn cap_output(out: RenderOutput) -> RenderOutput {
             kind: out.kind,
             svg: None,
             error: Some(ParseError {
-                message: format!("diagram too large to draw (over {} MB of SVG)", MAX_SVG_BYTES >> 20),
+                message: format!(
+                    "diagram too large to draw (over {} MB of SVG)",
+                    MAX_SVG_BYTES >> 20
+                ),
                 line: None,
             }),
         },
@@ -707,7 +893,10 @@ mod tests {
 
     #[test]
     fn detection_skips_blank_and_comment_lines() {
-        assert_eq!(detect_kind("\n\n  %% a comment\npie\n\"A\": 1"), DiagramKind::Pie);
+        assert_eq!(
+            detect_kind("\n\n  %% a comment\npie\n\"A\": 1"),
+            DiagramKind::Pie
+        );
     }
 
     #[test]
@@ -774,7 +963,10 @@ mod tests {
     fn oversized_front_matter_source_is_gated_before_stripping() {
         // The cap must reject before any front-matter scan/allocation;
         // kind comes from the raw source (`---` header -> Unknown).
-        let big = format!("---\ntitle: x\n---\npie\n{}", "\"A\" : 1\n".repeat(MAX_SOURCE_LEN));
+        let big = format!(
+            "---\ntitle: x\n---\npie\n{}",
+            "\"A\" : 1\n".repeat(MAX_SOURCE_LEN)
+        );
         assert!(big.chars().count() > MAX_SOURCE_LEN);
         let out = render(&big);
         assert_eq!(out.kind, DiagramKind::Unknown);
@@ -784,7 +976,8 @@ mod tests {
 
     #[test]
     fn flowchart_with_subgraph_and_classes_renders() {
-        let src = "flowchart LR\nclassDef hot fill:#f00\nsubgraph s[Sub]\nA:::hot --> B\nend\nB --> C";
+        let src =
+            "flowchart LR\nclassDef hot fill:#f00\nsubgraph s[Sub]\nA:::hot --> B\nend\nB --> C";
         let out = render(src);
         assert!(out.error.is_none(), "err: {:?}", out.error);
     }
@@ -810,7 +1003,12 @@ mod tests {
             "graph TD\nsubgraph s\nsubgraph t\nA",
             "graph TD\nend\nend",
             &format!("graph TD\n{}", "A --> B\n".repeat(2000)),
-            &format!("graph LR\n{}", (0..300).map(|i| format!("n{i} --> n{} \n", (i * 7) % 300)).collect::<String>()),
+            &format!(
+                "graph LR\n{}",
+                (0..300)
+                    .map(|i| format!("n{i} --> n{} \n", (i * 7) % 300))
+                    .collect::<String>()
+            ),
             "graph TD\nA --> A --> A",
             "graph TD\nA[🥧<br/>🥧] -->|🥧| B",
             &format!("graph TD\n{}", "A --> B\n".repeat(3000)), // over MAX_SOURCE_LEN
@@ -820,7 +1018,12 @@ mod tests {
             "sequenceDiagram\nend\nend",
             &format!("sequenceDiagram\n{}", "loop l\n".repeat(50)),
             &format!("sequenceDiagram\n{}", "A->>B: x\n".repeat(2000)),
-            &format!("sequenceDiagram\n{}", (0..60).map(|i| format!("participant p{i}\n")).collect::<String>()),
+            &format!(
+                "sequenceDiagram\n{}",
+                (0..60)
+                    .map(|i| format!("participant p{i}\n"))
+                    .collect::<String>()
+            ),
             "sequenceDiagram\nautonumber\nA->>A: 🎭<br/>🎭\nNote left of A: 🎉",
             "sequenceDiagram\nactivate A",
             "sequenceDiagram\nA-->>-B: under",
@@ -884,7 +1087,10 @@ mod tests {
     #[test]
     fn comment_or_blank_only_source_is_unknown() {
         assert_eq!(detect_kind(""), DiagramKind::Unknown);
-        assert_eq!(detect_kind("%% just a comment\n\n  %% another"), DiagramKind::Unknown);
+        assert_eq!(
+            detect_kind("%% just a comment\n\n  %% another"),
+            DiagramKind::Unknown
+        );
     }
 
     #[test]
@@ -1108,16 +1314,29 @@ mod label_space_tests {
         let src = "graph TD\nA-->|a fairly long edge label| B\nA-->|another long edge label| C\nB-->|xx| D\nC-->|line1<br/>line2| D";
         let (_, drawn) = crate::extent::scan(&svg(src));
         // Node labels are single letters; edge labels are longer.
-        let labels: Vec<_> = drawn.iter().filter(|d| d.tag == "text" && d.text.len() > 1).collect();
-        let node_texts: Vec<_> = drawn.iter().filter(|d| d.tag == "text" && d.text.len() == 1).collect();
+        let labels: Vec<_> = drawn
+            .iter()
+            .filter(|d| d.tag == "text" && d.text.len() > 1)
+            .collect();
+        let node_texts: Vec<_> = drawn
+            .iter()
+            .filter(|d| d.tag == "text" && d.text.len() == 1)
+            .collect();
         // A node's shape is the rect around a node label (edge labels
         // sit on their own mask rects).
         let nodes: Vec<_> = drawn
             .iter()
             .filter(|d| d.tag == "rect" && node_texts.iter().any(|t| d.bbox.overlap(&t.bbox) > 0.0))
-            .filter(|d| !labels.iter().any(|l| d.bbox.overlap(&l.bbox) > 0.0 && d.bbox.x1 - d.bbox.x0 >= l.bbox.x1 - l.bbox.x0))
+            .filter(|d| {
+                !labels.iter().any(|l| {
+                    d.bbox.overlap(&l.bbox) > 0.0 && d.bbox.x1 - d.bbox.x0 >= l.bbox.x1 - l.bbox.x0
+                })
+            })
             .collect();
-        assert!(labels.len() == 4 && nodes.len() == 4, "{labels:?} {nodes:?}");
+        assert!(
+            labels.len() == 4 && nodes.len() == 4,
+            "{labels:?} {nodes:?}"
+        );
         for (i, l) in labels.iter().enumerate() {
             for n in &nodes {
                 assert_eq!(l.bbox.overlap(&n.bbox), 0.0, "{l:?} overlaps node {n:?}");
@@ -1137,22 +1356,39 @@ mod label_space_tests {
         };
         let plain = h("graph LR\nA-->B-->C\nA-->C");
         let labeled = h("graph LR\nA-->B-->C\nA-->|a fairly long edge label here| C");
-        assert!(labeled < plain + 60.0, "LR canvas grew {plain} -> {labeled} from a label's width");
+        assert!(
+            labeled < plain + 60.0,
+            "LR canvas grew {plain} -> {labeled} from a label's width"
+        );
     }
 
     #[test]
     fn cluster_is_at_least_as_wide_as_its_title() {
         let s = svg("flowchart LR\nsubgraph S[A very long subgraph title here ok]\nA\nend");
         let (_, drawn) = crate::extent::scan(&s);
-        let title = drawn.iter().find(|d| d.text.starts_with("A very long")).unwrap();
-        let cluster = drawn.iter().find(|d| d.tag == "rect" && d.bbox.x0 <= title.bbox.x0).expect("cluster rect");
-        assert!(cluster.bbox.x1 >= title.bbox.x1, "title {:?} wider than cluster {:?}", title.bbox, cluster.bbox);
+        let title = drawn
+            .iter()
+            .find(|d| d.text.starts_with("A very long"))
+            .unwrap();
+        let cluster = drawn
+            .iter()
+            .find(|d| d.tag == "rect" && d.bbox.x0 <= title.bbox.x0)
+            .expect("cluster rect");
+        assert!(
+            cluster.bbox.x1 >= title.bbox.x1,
+            "title {:?} wider than cluster {:?}",
+            title.bbox,
+            cluster.bbox
+        );
     }
 
     #[test]
     fn br_in_edge_labels_renders_separate_lines() {
         let s = svg("graph TD\nA-->|one<br/>two| B");
-        assert!(s.contains(">one</tspan>") && s.contains(">two</tspan>"), "{s}");
+        assert!(
+            s.contains(">one</tspan>") && s.contains(">two</tspan>"),
+            "{s}"
+        );
         assert!(!s.contains("&lt;br"), "{s}");
     }
 }
@@ -1161,14 +1397,24 @@ mod label_space_tests {
 #[cfg(test)]
 mod subgraph_tests {
     /// Center of the drawn text `t`, and every drawn box.
-    fn scan(src: &str) -> (std::collections::HashMap<String, (f64, f64)>, Vec<crate::extent::Drawn>) {
+    fn scan(
+        src: &str,
+    ) -> (
+        std::collections::HashMap<String, (f64, f64)>,
+        Vec<crate::extent::Drawn>,
+    ) {
         let svg = crate::render(src).svg.expect("renders");
         crate::extent::assert_inside(&svg);
         let (_, drawn) = crate::extent::scan(&svg);
         let centers = drawn
             .iter()
             .filter(|d| d.tag == "text")
-            .map(|d| (d.text.clone(), ((d.bbox.x0 + d.bbox.x1) / 2.0, (d.bbox.y0 + d.bbox.y1) / 2.0)))
+            .map(|d| {
+                (
+                    d.text.clone(),
+                    ((d.bbox.x0 + d.bbox.x1) / 2.0, (d.bbox.y0 + d.bbox.y1) / 2.0),
+                )
+            })
             .collect();
         (centers, drawn)
     }
@@ -1179,10 +1425,17 @@ mod subgraph_tests {
         let title = drawn.iter().find(|d| d.text == "Group").unwrap().bbox;
         let cluster = drawn
             .iter()
-            .find(|d| d.tag == "rect" && d.bbox.x0 <= title.x0 && d.bbox.y0 <= title.y0 && d.bbox.x1 >= title.x1)
+            .find(|d| {
+                d.tag == "rect"
+                    && d.bbox.x0 <= title.x0
+                    && d.bbox.y0 <= title.y0
+                    && d.bbox.x1 >= title.x1
+            })
             .expect("cluster box")
             .bbox;
-        let inside = |p: (f64, f64)| p.0 > cluster.x0 && p.0 < cluster.x1 && p.1 > cluster.y0 && p.1 < cluster.y1;
+        let inside = |p: (f64, f64)| {
+            p.0 > cluster.x0 && p.0 < cluster.x1 && p.1 > cluster.y0 && p.1 < cluster.y1
+        };
         assert!(inside(c["A"]), "A {:?} outside {cluster:?}", c["A"]);
         assert!(!inside(c["B"]), "B {:?} inside {cluster:?}", c["B"]);
     }
@@ -1192,7 +1445,12 @@ mod subgraph_tests {
         // mermaid.js: the parent direction (LR) applies, so A and B sit
         // side by side rather than stacked.
         let (c, _) = scan("flowchart LR\nsubgraph S\ndirection TB\nA-->B\nend\nC-->A");
-        assert!(c["B"].0 > c["A"].0 + 20.0 && (c["B"].1 - c["A"].1).abs() < 5.0, "A {:?} B {:?}", c["A"], c["B"]);
+        assert!(
+            c["B"].0 > c["A"].0 + 20.0 && (c["B"].1 - c["A"].1).abs() < 5.0,
+            "A {:?} B {:?}",
+            c["A"],
+            c["B"]
+        );
         // Without the outside link the subgraph's own TB applies.
         let (c, _) = scan("flowchart LR\nsubgraph S\ndirection TB\nA-->B\nend\nC");
         assert!(c["B"].1 > c["A"].1 + 20.0, "A {:?} B {:?}", c["A"], c["B"]);

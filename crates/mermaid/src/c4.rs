@@ -6,13 +6,12 @@
 //! `Component(...)`, plus `_Ext` / `Db` / `Queue` variants) become boxes;
 //! `*_Boundary(alias, "Label") { … }` (and deployment `Node`s) become dashed
 //! clusters; `Rel(from, to, "Label", "Tech")` becomes a labeled arrow. Laid
-//! out with the shared boxgraph adapter. Styling directives (`Update*`) are
-//! accepted and ignored.
+//! out with the shared boxgraph adapter. Unsupported styling directives return line-numbered errors.
 
 use std::fmt::Write;
 
 use crate::theme::{DATA_TEXT, LABEL_FONT};
-use crate::{ParseError, escape_xml, measure};
+use crate::{escape_xml, measure, ParseError};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Shape {
@@ -57,11 +56,17 @@ pub(crate) struct C4 {
 }
 
 pub(crate) fn parse(source: &str) -> Result<C4, ParseError> {
-    let mut c4 = C4 { title: None, els: Vec::new(), boundaries: Vec::new(), rels: Vec::new() };
+    let mut c4 = C4 {
+        title: None,
+        els: Vec::new(),
+        boundaries: Vec::new(),
+        rels: Vec::new(),
+    };
     let mut ids: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut stack: Vec<usize> = Vec::new(); // open boundary indices
     let mut seen_header = false;
     let mut line_no = 0;
+    let mut pending = Vec::new();
 
     for (idx, raw) in source.lines().enumerate() {
         line_no = idx + 1;
@@ -88,47 +93,48 @@ pub(crate) fn parse(source: &str) -> Result<C4, ParseError> {
             c4.title = Some(t.trim().to_string());
             continue;
         }
-        // Ignore styling / layout directives.
-        if line.starts_with("Update") || line.starts_with("UpdateLayoutConfig") {
-            continue;
-        }
         let Some((kw, args_str)) = split_call(line) else {
             return Err(err(format!("unrecognized C4 line {line:?}"), line_no));
         };
         let args = split_args(args_str);
 
-        if kw.ends_with("Boundary") || kw == "Node" || kw == "Deployment_Node" {
+        if matches!(
+            kw,
+            "Boundary"
+                | "Enterprise_Boundary"
+                | "System_Boundary"
+                | "Container_Boundary"
+                | "Node"
+                | "Deployment_Node"
+        ) {
+            if !line.ends_with('{') {
+                return Err(err("C4 boundary needs an opening `{`", line_no));
+            }
             // Boundary opener: `Kind(alias, "Label"[, …]) {`
             if stack.len() >= crate::MAX_NESTING {
                 return Err(err(
-                    format!("boundaries nested too deeply (more than {})", crate::MAX_NESTING),
+                    format!(
+                        "boundaries nested too deeply (more than {})",
+                        crate::MAX_NESTING
+                    ),
                     line_no,
                 ));
             }
             let alias = args.first().cloned().unwrap_or_default();
             let label = args.get(1).cloned().unwrap_or_else(|| alias.clone());
             let bi = c4.boundaries.len();
-            c4.boundaries.push(Boundary { label, parent: stack.last().copied() });
+            c4.boundaries.push(Boundary {
+                label,
+                parent: stack.last().copied(),
+            });
             if !alias.is_empty() {
                 ids.insert(alias, usize::MAX - bi); // boundary marker (not linkable as node)
             }
             stack.push(bi);
             continue;
         }
-        if is_rel(kw) {
-            // `Rel(from, to, "Label"[, "Tech"])`
-            if args.len() < 2 {
-                return Err(err(format!("{kw} needs a source and target"), line_no));
-            }
-            let from = *ids.get(&args[0]).filter(|v| **v < usize::MAX / 2).ok_or_else(|| {
-                err(format!("{kw} references unknown element `{}`", args[0]), line_no)
-            })?;
-            let to = *ids.get(&args[1]).filter(|v| **v < usize::MAX / 2).ok_or_else(|| {
-                err(format!("{kw} references unknown element `{}`", args[1]), line_no)
-            })?;
-            let label = args.get(2).cloned().unwrap_or_default();
-            let tech = args.get(3).cloned().filter(|s| !s.is_empty());
-            c4.rels.push(Rel { from, to, label, tech, bidir: kw.starts_with("BiRel") });
+        if is_rel(kw) || kw == "RelIndex" {
+            pending.push((kw.to_string(), args, line_no));
             continue;
         }
         // Unknown macros must never turn into plausible-looking elements.
@@ -164,8 +170,12 @@ pub(crate) fn parse(source: &str) -> Result<C4, ParseError> {
             return Err(err(format!("{kw} needs an alias"), line_no));
         }
         let name = args.get(1).cloned().unwrap_or_else(|| alias.clone());
-        let descr: Vec<String> =
-            args.iter().skip(2).filter(|s| !s.is_empty() && !s.starts_with('$')).cloned().collect();
+        let descr: Vec<String> = args
+            .iter()
+            .skip(2)
+            .filter(|s| !s.is_empty() && !s.starts_with('$'))
+            .cloned()
+            .collect();
         let ei = c4.els.len();
         ids.insert(alias, ei);
         c4.els.push(El {
@@ -190,19 +200,70 @@ pub(crate) fn parse(source: &str) -> Result<C4, ParseError> {
     if c4.els.is_empty() {
         return Err(err("C4 diagram has no elements", 1));
     }
+    for (kw, mut args, line) in pending {
+        let indexed = kw == "RelIndex";
+        if indexed {
+            if args.len() < 4 {
+                return Err(err("RelIndex needs index, source, target and label", line));
+            }
+            args.remove(0);
+        }
+        if args.len() < 2 {
+            return Err(err(format!("{kw} needs a source and target"), line));
+        }
+        let resolve = |id: &str| {
+            ids.get(id)
+                .copied()
+                .filter(|&index| index < c4.els.len())
+                .ok_or_else(|| err(format!("{kw} references unknown element `{id}`"), line))
+        };
+        let (mut from, mut to) = (resolve(&args[0])?, resolve(&args[1])?);
+        if matches!(kw.as_str(), "Rel_Back" | "Rel_Back_Neighbor") {
+            std::mem::swap(&mut from, &mut to);
+        }
+        let mut label = args.get(2).cloned().unwrap_or_default();
+        if indexed {
+            label = format!("{}: {label}", c4.rels.len() + 1);
+        }
+        let tech = args.get(3).cloned().filter(|s| !s.is_empty());
+        c4.rels.push(Rel {
+            from,
+            to,
+            label,
+            tech,
+            bidir: kw.starts_with("BiRel"),
+        });
+    }
     Ok(c4)
 }
 
 fn is_c4_header(h: &str) -> bool {
-    matches!(h, "C4Context" | "C4Container" | "C4Component" | "C4Dynamic" | "C4Deployment")
+    matches!(
+        h,
+        "C4Context" | "C4Container" | "C4Component" | "C4Dynamic" | "C4Deployment"
+    )
 }
 
 fn is_rel(kw: &str) -> bool {
     matches!(
         kw,
-        "Rel" | "BiRel" | "Rel_Up" | "Rel_U" | "Rel_Down" | "Rel_D" | "Rel_Left" | "Rel_L"
-            | "Rel_Right" | "Rel_R" | "Rel_Back" | "Rel_Back_Neighbor" | "Rel_Neighbor"
-            | "BiRel_Up" | "BiRel_Down" | "BiRel_Left" | "BiRel_Right"
+        "Rel"
+            | "BiRel"
+            | "Rel_Up"
+            | "Rel_U"
+            | "Rel_Down"
+            | "Rel_D"
+            | "Rel_Left"
+            | "Rel_L"
+            | "Rel_Right"
+            | "Rel_R"
+            | "Rel_Back"
+            | "Rel_Back_Neighbor"
+            | "Rel_Neighbor"
+            | "BiRel_Up"
+            | "BiRel_Down"
+            | "BiRel_Left"
+            | "BiRel_Right"
     )
 }
 
@@ -239,6 +300,9 @@ fn split_call(line: &str) -> Option<(&str, &str)> {
     if close <= open {
         return None;
     }
+    if !matches!(line[close + 1..].trim(), "" | ";" | "{") {
+        return None;
+    }
     let kw = line[..open].trim();
     if kw.is_empty() || !kw.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return None;
@@ -260,11 +324,16 @@ fn split_args(s: &str) -> Vec<String> {
         }
     }
     out.push(cur);
-    out.into_iter().map(|f| f.trim().trim_matches('"').trim().to_string()).collect()
+    out.into_iter()
+        .map(|f| f.trim().trim_matches('"').trim().to_string())
+        .collect()
 }
 
 fn err(message: impl Into<String>, line: usize) -> ParseError {
-    ParseError { message: message.into(), line: Some(line) }
+    ParseError {
+        message: message.into(),
+        line: Some(line),
+    }
 }
 
 // ---- rendering -----------------------------------------------------------
@@ -292,6 +361,7 @@ fn fill_for(el: &El) -> &'static str {
 pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
     // Build boxgraph inputs. Element boxes sized from their text.
     let mut sizes = Vec::with_capacity(c4.els.len());
+    let mut labels = Vec::with_capacity(c4.els.len());
     let nodes: Vec<crate::boxgraph::BoxNode> = c4
         .els
         .iter()
@@ -302,18 +372,45 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
                 widest = widest.max(measure::text_size(d).0);
             }
             let w = (widest + 28.0).clamp(120.0, 240.0);
+            let wrap = |text: &str, font: f64, bold: bool| {
+                measure::wrap_literal_to_width(text, w - 28.0, font, bold)
+            };
+            let names = wrap(&e.name, 13.0, true);
+            let tag = format!(
+                "[{}]",
+                if e.external {
+                    e.kind.replace('_', " ")
+                } else {
+                    e.kind.clone()
+                }
+            );
+            let tags = wrap(&tag, 11.0, false);
+            let descriptions: Vec<_> = e.descr.iter().flat_map(|d| wrap(d, 11.0, false)).collect();
             let head = if e.shape == Shape::Person { 14.0 } else { 0.0 };
-            let h = (2 + e.descr.len()) as f64 * LINE_H + 20.0 + head;
+            let h = (names.len() + tags.len() + descriptions.len()) as f64 * LINE_H + 20.0 + head;
+            labels.push((names, tags, descriptions));
             sizes.push((w, h));
-            crate::boxgraph::BoxNode { width: w, height: h, cluster: e.boundary }
+            crate::boxgraph::BoxNode {
+                width: w,
+                height: h,
+                cluster: e.boundary,
+            }
         })
         .collect();
     let edges: Vec<crate::boxgraph::BoxEdge> = c4
         .rels
         .iter()
         .map(|r| {
-            let (w, h) = measure::text_size(&r.label);
-            crate::boxgraph::BoxEdge { from: r.from, to: r.to, label: Some((w + 8.0, h + 4.0)) }
+            let text = r
+                .tech
+                .as_ref()
+                .map_or_else(|| r.label.clone(), |tech| format!("{} [{tech}]", r.label));
+            let (w, h) = measure::text_size(&text);
+            crate::boxgraph::BoxEdge {
+                from: r.from,
+                to: r.to,
+                label: Some((w + 8.0, h + 4.0)),
+            }
         })
         .collect();
     let clusters: Vec<crate::boxgraph::BoxCluster> = c4
@@ -325,7 +422,8 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
         })
         .collect();
 
-    let l = crate::boxgraph::layout_boxgraph(&nodes, &edges, &clusters, crate::layout::Direction::TB)?;
+    let l =
+        crate::boxgraph::layout_boxgraph(&nodes, &edges, &clusters, crate::layout::Direction::TB)?;
     let (mut w, mut h) = l.size;
     let title_h = if c4.title.is_some() { 30.0 } else { 0.0 };
     h += title_h;
@@ -338,7 +436,7 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
 
     if let Some(title) = &c4.title {
         write!(out,
-            r#"<text x="{:.1}" y="20" text-anchor="middle" font-weight="bold" font-size="17" fill="currentColor">{}</text>"#,
+            r#"<text xml:space="preserve" x="{:.1}" y="20" text-anchor="middle" font-weight="bold" font-size="17" fill="currentColor">{}</text>"#,
             w / 2.0,
             escape_xml(title)
         ).unwrap();
@@ -353,7 +451,7 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
         ).unwrap();
         write!(
             out,
-            r#"<text x="{:.1}" y="{:.1}" font-weight="600" fill="currentColor">{}</text>"#,
+            r#"<text xml:space="preserve" x="{:.1}" y="{:.1}" font-weight="600" fill="currentColor">{}</text>"#,
             r.x + 8.0,
             r.y + dy + LINE_H,
             escape_xml(&b.label)
@@ -366,7 +464,11 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
         let r = &c4.rels[ep.edge];
         let pts: Vec<(f64, f64)> = ep.points.iter().map(|(x, y)| (*x, y + dy)).collect();
         let d = crate::curved_path(&pts, true);
-        let start_marker = if r.bidir { r#" marker-start="url(#mmd-c4-arrow)""# } else { "" };
+        let start_marker = if r.bidir {
+            r#" marker-start="url(#mmd-c4-arrow)""#
+        } else {
+            ""
+        };
         write!(out,
             r#"<path d="{d}" fill="none" stroke="currentColor" stroke-dasharray="3 3"{start_marker} marker-end="url(#mmd-c4-arrow)"/>"#
         ).unwrap();
@@ -377,7 +479,7 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
             }
             let (tw, _) = measure::text_size(&txt);
             write!(out,
-                r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="16" fill="var(--surface, #fff)"/><text x="{lx:.1}" y="{:.1}" text-anchor="middle" font-size="11" fill="currentColor">{}</text>"#,
+                r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="16" fill="var(--surface, #fff)"/><text xml:space="preserve" x="{lx:.1}" y="{:.1}" text-anchor="middle" font-size="11" fill="currentColor">{}</text>"#,
                 lx - tw / 2.0 - 3.0,
                 ly + dy - 8.0,
                 tw + 6.0,
@@ -405,35 +507,22 @@ pub(crate) fn render_svg(c4: &C4) -> Result<String, ParseError> {
         };
         // Person boxes leave room for a head.
         let mut ty = by + 16.0 + if e.shape == Shape::Person { 14.0 } else { 0.0 };
-        fit_element_label(&e.name, bw, 13.0, true).render(
-            (&mut label_backings, &mut label_foregrounds),
-            (cx, ty),
-            name_text,
-            false,
-            fill,
-        );
-        ty += LINE_H;
-        let tag = if e.external {
-            format!("[{}]", e.kind.replace('_', " "))
-        } else {
-            format!("[{}]", e.kind)
-        };
-        fit_element_label(&tag, bw, 11.0, false).render(
-            (&mut label_backings, &mut label_foregrounds),
-            (cx, ty),
-            tag_text,
-            true,
-            fill,
-        );
-        for d in &e.descr {
-            ty += LINE_H;
-            fit_element_label(d, bw, 11.0, false).render(
-                (&mut label_backings, &mut label_foregrounds),
-                (cx, ty),
-                desc_text,
-                false,
-                fill,
-            );
+        let (names, tags, descriptions) = &labels[i];
+        for (lines, font_size, bold, italic, color) in [
+            (names, 13.0, true, false, name_text),
+            (tags, 11.0, false, true, tag_text),
+            (descriptions, 11.0, false, false, desc_text),
+        ] {
+            for text in lines {
+                fit_element_label(text, bw, font_size, bold).render(
+                    (&mut label_backings, &mut label_foregrounds),
+                    (cx, ty),
+                    color,
+                    italic,
+                    fill,
+                );
+                ty += LINE_H;
+            }
         }
     }
 
@@ -475,7 +564,7 @@ impl FittedLabel {
             (foreground, color, ""),
         ] {
             write!(out,
-            r#"<text x="{cx:.1}" y="{baseline:.1}" text-anchor="middle" font-size="{}" font-weight="{}" font-style="{}" fill="{color}" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke"{extra}>{}</text>"#,
+            r#"<text xml:space="preserve" x="{cx:.1}" y="{baseline:.1}" text-anchor="middle" font-size="{}" font-weight="{}" font-style="{}" fill="{color}" stroke="{background}" stroke-width="3" stroke-linejoin="round" paint-order="stroke"{extra}>{}</text>"#,
             self.font_size,
             if self.bold { 700 } else { 400 },
             if italic { "italic" } else { "normal" },
@@ -485,8 +574,8 @@ impl FittedLabel {
     }
 }
 
-/// Fit visible labels to the element width, using the same ellipsis
-/// policy as architecture and treemap. The diagram source remains complete.
+/// Fit one already-wrapped literal line. Normal lines retain their full text;
+/// only a grapheme wider than the entire line budget needs an ellipsis.
 fn fit_element_label(text: &str, width: f64, font_size: f64, bold: bool) -> FittedLabel {
     let available = (width - 28.0).max(0.0);
     FittedLabel {
@@ -567,7 +656,13 @@ mod tests {
 
     #[test]
     fn all_c4_headers_and_db_shape() {
-        for h in ["C4Context", "C4Container", "C4Component", "C4Dynamic", "C4Deployment"] {
+        for h in [
+            "C4Context",
+            "C4Container",
+            "C4Component",
+            "C4Dynamic",
+            "C4Deployment",
+        ] {
             assert!(parse(&format!("{h}\n Person(a, \"A\")")).is_ok(), "{h}");
         }
         let c4 = parse("C4Container\n ContainerDb(db, \"DB\", \"Postgres\")").unwrap();
@@ -580,7 +675,8 @@ mod tests {
         assert!(parse("Person(a, \"A\")").is_err()); // no header
         assert!(parse("C4Context").is_err()); // no elements
         assert!(parse("C4Context\n System_Boundary(b, \"B\") {\n System(s, \"S\")").is_err()); // unclosed
-        assert!(parse("C4Context\n Person(a,\"A\")\n Rel(a, ghost, \"x\")").is_err()); // unknown target
+        assert!(parse("C4Context\n Person(a,\"A\")\n Rel(a, ghost, \"x\")").is_err());
+        // unknown target
     }
 
     #[test]

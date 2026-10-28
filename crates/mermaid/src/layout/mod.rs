@@ -169,7 +169,12 @@ pub(crate) fn apply_direction(layout: &mut Layout, dir: Direction) {
                 }
             }
             for r in &mut layout.cluster_rects {
-                *r = Rect { x: r.y, y: r.x, w: r.h, h: r.w };
+                *r = Rect {
+                    x: r.y,
+                    y: r.x,
+                    w: r.h,
+                    h: r.w,
+                };
             }
             layout.size = (h, w);
             if dir == Direction::RL {
@@ -232,13 +237,20 @@ pub(crate) fn layout_tb(input: &LayoutInput) -> Result<Layout, String> {
             nodes: input
                 .nodes
                 .iter()
-                .map(|n| LNode { width: n.height, height: n.width, cluster: n.cluster })
+                .map(|n| LNode {
+                    width: n.height,
+                    height: n.width,
+                    cluster: n.cluster,
+                })
                 .collect(),
             // Label boxes turn with the layout like node boxes do.
             edges: input
                 .edges
                 .iter()
-                .map(|e| LEdge { label: e.label.map(|(w, h)| (h, w)), ..e.clone() })
+                .map(|e| LEdge {
+                    label: e.label.map(|(w, h)| (h, w)),
+                    ..e.clone()
+                })
                 .collect(),
             clusters: input.clusters.clone(),
             direction: input.direction,
@@ -254,9 +266,16 @@ pub(crate) fn layout_tb(input: &LayoutInput) -> Result<Layout, String> {
     // and a labeled edge's midpoint dummy — sized to its label — sits on a
     // rank no node occupies. Ordering then keeps labels clear of nodes and
     // of each other. The rank gap halves so spacing stays about the same.
-    let labeled = ac.edges.iter().zip(&ac.orig).any(|(_, &o)| input.edges[o].label.is_some());
+    let labeled = ac
+        .edges
+        .iter()
+        .zip(&ac.orig)
+        .any(|(_, &o)| input.edges[o].label.is_some());
     let (ranks, rank_gap) = if labeled {
-        (ranks.iter().map(|r| r * 2).collect::<Vec<_>>(), RANK_GAP_Y / 2.0)
+        (
+            ranks.iter().map(|r| r * 2).collect::<Vec<_>>(),
+            RANK_GAP_Y / 2.0,
+        )
     } else {
         (ranks, RANK_GAP_Y)
     };
@@ -266,7 +285,11 @@ pub(crate) fn layout_tb(input: &LayoutInput) -> Result<Layout, String> {
         .edges
         .iter()
         .zip(&ac.orig)
-        .map(|(e, &o)| LEdge { from: e.from, to: e.to, label: input.edges[o].label })
+        .map(|(e, &o)| LEdge {
+            from: e.from,
+            to: e.to,
+            label: input.edges[o].label,
+        })
         .collect();
     // Cap total dummy (waypoint) slots BEFORE `build_order_graph` runs.
     // Each surviving edge spanning ranks `rf..rt` gets `rt - rf - 1` dummy
@@ -283,10 +306,22 @@ pub(crate) fn layout_tb(input: &LayoutInput) -> Result<Layout, String> {
             rt.saturating_sub(rf + 1)
         })
         .sum();
-    if dummy_slots > order::MAX_DUMMY_SLOTS {
+    // One waypoint per unordered node pair accommodates a chain with one
+    // return edge per node. Keep the existing floor for small diagrams and
+    // a fixed upper bound so dense repeated long edges still reject early.
+    let waypoint_limit = order::MAX_DUMMY_SLOTS
+        .max(
+            input
+                .nodes
+                .len()
+                .saturating_mul(input.nodes.len().saturating_sub(1))
+                / 2,
+        )
+        .min(80_000);
+    if dummy_slots > waypoint_limit {
         return Err(format!(
             "diagram too large: {dummy_slots} edge waypoints (max {})",
-            order::MAX_DUMMY_SLOTS
+            waypoint_limit
         ));
     }
     // A node with a self-loop reserves room beside it for the loop and its
@@ -327,14 +362,22 @@ mod tests {
     use super::*;
 
     fn node(w: f64, h: f64) -> LNode {
-        LNode { width: w, height: h, cluster: None }
+        LNode {
+            width: w,
+            height: h,
+            cluster: None,
+        }
     }
 
     #[test]
     fn validate_accepts_small_graph() {
         let input = LayoutInput {
             nodes: vec![node(10.0, 10.0), node(10.0, 10.0)],
-            edges: vec![LEdge { from: 0, to: 1, label: None }],
+            edges: vec![LEdge {
+                from: 0,
+                to: 1,
+                label: None,
+            }],
             clusters: vec![],
             direction: Direction::TB,
         };
@@ -357,7 +400,11 @@ mod tests {
     fn validate_rejects_out_of_bounds_edge() {
         let input = LayoutInput {
             nodes: vec![node(1.0, 1.0)],
-            edges: vec![LEdge { from: 0, to: 7, label: None }],
+            edges: vec![LEdge {
+                from: 0,
+                to: 7,
+                label: None,
+            }],
             clusters: vec![],
             direction: Direction::TB,
         };
@@ -370,8 +417,16 @@ mod tests {
             nodes: vec![],
             edges: vec![],
             clusters: vec![
-                LCluster { parent: Some(1), title: (0.0, 0.0), direction: None },
-                LCluster { parent: Some(0), title: (0.0, 0.0), direction: None },
+                LCluster {
+                    parent: Some(1),
+                    title: (0.0, 0.0),
+                    direction: None,
+                },
+                LCluster {
+                    parent: Some(0),
+                    title: (0.0, 0.0),
+                    direction: None,
+                },
             ],
             direction: Direction::TB,
         };
@@ -382,7 +437,12 @@ mod tests {
         Layout {
             node_centers: vec![(10.0, 20.0)],
             edge_paths: vec![],
-            cluster_rects: vec![Rect { x: 5.0, y: 10.0, w: 10.0, h: 20.0 }],
+            cluster_rects: vec![Rect {
+                x: 5.0,
+                y: 10.0,
+                w: 10.0,
+                h: 20.0,
+            }],
             size: (100.0, 200.0),
         }
     }
@@ -428,8 +488,16 @@ mod tests {
         LayoutInput {
             nodes: vec![node(60.0, 24.0), node(60.0, 24.0), node(60.0, 24.0)],
             edges: vec![
-                LEdge { from: 0, to: 1, label: None },
-                LEdge { from: 1, to: 2, label: Some((30.0, 12.0)) },
+                LEdge {
+                    from: 0,
+                    to: 1,
+                    label: None,
+                },
+                LEdge {
+                    from: 1,
+                    to: 2,
+                    label: Some((30.0, 12.0)),
+                },
             ],
             clusters: vec![],
             direction: dir,
@@ -464,14 +532,26 @@ mod tests {
         let input = LayoutInput {
             nodes: vec![node(40.0, 20.0), node(40.0, 20.0)],
             edges: vec![
-                LEdge { from: 0, to: 1, label: None },
-                LEdge { from: 1, to: 0, label: None },
+                LEdge {
+                    from: 0,
+                    to: 1,
+                    label: None,
+                },
+                LEdge {
+                    from: 1,
+                    to: 0,
+                    label: None,
+                },
             ],
             clusters: vec![],
             direction: Direction::TB,
         };
         let l = run(&input).unwrap();
-        let back = l.edge_paths.iter().find(|p| p.reversed).expect("one reversed");
+        let back = l
+            .edge_paths
+            .iter()
+            .find(|p| p.reversed)
+            .expect("one reversed");
         // True direction: starts near node 1, ends near node 0.
         let start = back.points.first().unwrap();
         let end = back.points.last().unwrap();
@@ -485,7 +565,11 @@ mod tests {
     fn run_self_loop_has_points() {
         let input = LayoutInput {
             nodes: vec![node(40.0, 20.0)],
-            edges: vec![LEdge { from: 0, to: 0, label: None }],
+            edges: vec![LEdge {
+                from: 0,
+                to: 0,
+                label: None,
+            }],
             clusters: vec![],
             direction: Direction::TB,
         };
@@ -499,9 +583,7 @@ mod tests {
     #[test]
     fn run_rejects_over_cap() {
         let input = LayoutInput {
-            nodes: (0..=MAX_NODES)
-                .map(|_| node(1.0, 1.0))
-                .collect(),
+            nodes: (0..=MAX_NODES).map(|_| node(1.0, 1.0)).collect(),
             edges: vec![],
             clusters: vec![],
             direction: Direction::TB,
@@ -526,12 +608,20 @@ mod tests {
         let node_count = 200;
         let nodes: Vec<LNode> = (0..node_count).map(|_| node(20.0, 10.0)).collect();
         let mut edges: Vec<LEdge> = (0..node_count - 1)
-            .map(|i| LEdge { from: i, to: i + 1, label: None })
+            .map(|i| LEdge {
+                from: i,
+                to: i + 1,
+                label: None,
+            })
             .collect();
         // 300 edges each spanning nearly the whole chain: ~300 * 198 =
         // 59,400 dummy slots, comfortably over the 20,000 cap.
         for k in 0..300 {
-            edges.push(LEdge { from: k % 2, to: node_count - 1, label: None });
+            edges.push(LEdge {
+                from: k % 2,
+                to: node_count - 1,
+                label: None,
+            });
         }
         let input = LayoutInput {
             nodes,
@@ -553,12 +643,20 @@ mod tests {
         let node_count = 50;
         let nodes: Vec<LNode> = (0..node_count).map(|_| node(20.0, 10.0)).collect();
         let mut edges: Vec<LEdge> = (0..node_count - 1)
-            .map(|i| LEdge { from: i, to: i + 1, label: None })
+            .map(|i| LEdge {
+                from: i,
+                to: i + 1,
+                label: None,
+            })
             .collect();
         // 500 parallel edges from node 0 to the far end: each spans 48
         // ranks -> 48 dummy slots; 500 * 48 = 24,000 > 20,000 cap.
         for _ in 0..500 {
-            edges.push(LEdge { from: 0, to: node_count - 1, label: None });
+            edges.push(LEdge {
+                from: 0,
+                to: node_count - 1,
+                label: None,
+            });
         }
         let input = LayoutInput {
             nodes,
@@ -580,7 +678,11 @@ mod tests {
         let node_count = 200;
         let nodes: Vec<LNode> = (0..node_count).map(|_| node(20.0, 10.0)).collect();
         let mut edges: Vec<LEdge> = (0..node_count - 1)
-            .map(|i| LEdge { from: i, to: i + 1, label: None })
+            .map(|i| LEdge {
+                from: i,
+                to: i + 1,
+                label: None,
+            })
             .collect();
         // 100 edges each spanning ~20 ranks: 100 * 19 = 1,900 dummy slots,
         // well under the 20,000 cap.
@@ -588,7 +690,11 @@ mod tests {
             let from = k;
             let to = (k + 20).min(node_count - 1);
             if to > from {
-                edges.push(LEdge { from, to, label: None });
+                edges.push(LEdge {
+                    from,
+                    to,
+                    label: None,
+                });
             }
         }
         let input = LayoutInput {

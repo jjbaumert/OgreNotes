@@ -116,8 +116,10 @@ pub struct ParseError { pub message: String, pub line: Option<usize> }
   uses `currentColor` on the canvas so it tracks the light/dark theme.
   Labels on fixed light data fills use matching dark foreground tokens in
   both themes; C4 retains light text on its darker person/system fills.
-  C4 element text and treemap values use grapheme-safe ellipses for long
-  labels; source editing and Markdown export retain the complete labels.
+  C4 element text wraps at grapheme boundaries and grows its boxes to retain
+  complete names and descriptions. Only a single grapheme wider than the line
+  budget receives an ellipsis. Treemap values use grapheme-safe ellipses;
+  source editing and Markdown export retain the complete labels.
   Palette-matched glyph halos keep fallback fonts and narrow queue caps
   readable without clipping names or descenders. Treemap cells paint before
   all captions so child fills cannot cover parent descenders. Pie percentages

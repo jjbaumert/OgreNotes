@@ -19,8 +19,9 @@ const MAX_CURVES: usize = 16;
 
 /// Per-curve colors, cycled. Mirrors Mermaid's categorical series palette so
 /// overlaid curves stay distinguishable.
-const PALETTE: &[&str] =
-    &["#3b82f6", "#ef4444", "#22c55e", "#a855f7", "#f59e0b", "#14b8a6", "#ec4899", "#64748b"];
+const PALETTE: &[&str] = &[
+    "#3b82f6", "#ef4444", "#22c55e", "#a855f7", "#f59e0b", "#14b8a6", "#ec4899", "#64748b",
+];
 
 #[derive(Debug, Clone)]
 pub(crate) struct Curve {
@@ -34,6 +35,10 @@ pub(crate) struct Radar {
     pub axes: Vec<String>,
     pub curves: Vec<Curve>,
     pub max: f64,
+    min: f64,
+    ticks: usize,
+    circle: bool,
+    show_legend: bool,
 }
 
 pub(crate) fn parse(source: &str) -> Result<Radar, ParseError> {
@@ -42,6 +47,11 @@ pub(crate) fn parse(source: &str) -> Result<Radar, ParseError> {
     let mut curves: Vec<Curve> = Vec::new();
     let mut max: Option<f64> = None;
     let mut seen_header = false;
+    let mut min = 0.0;
+    let mut ticks = RINGS;
+    let mut circle = false;
+    let mut show_legend = true;
+    let mut range_line = 1;
 
     for (idx, raw) in source.lines().enumerate() {
         let line_no = idx + 1;
@@ -59,17 +69,43 @@ pub(crate) fn parse(source: &str) -> Result<Radar, ParseError> {
         if let Some(t) = line.strip_prefix("title ") {
             title = Some(t.trim().to_string());
         } else if let Some(a) = line.strip_prefix("axis ") {
-            axes = a.split(',').map(|t| label_of(t.trim())).filter(|s| !s.is_empty()).collect();
+            axes.extend(
+                a.split(',')
+                    .map(|t| label_of(t.trim()))
+                    .filter(|s| !s.is_empty()),
+            );
             if axes.len() > MAX_AXES {
                 return Err(err("radar has too many axes", line_no));
             }
         } else if let Some(m) = line.strip_prefix("max ") {
-            // `"1e999"`/`"inf"` parse as f64 infinity — treat non-finite
-            // like non-numeric (ignored) so scale math stays finite.
-            max = m.trim().parse().ok().filter(|v: &f64| v.is_finite());
+            max = Some(
+                crate::parse_number(m).ok_or_else(|| err("radar max must be finite", line_no))?,
+            );
+            range_line = line_no;
+        } else if let Some(m) = line.strip_prefix("min ") {
+            min = crate::parse_number(m).ok_or_else(|| err("radar min must be finite", line_no))?;
+            range_line = line_no;
+        } else if let Some(t) = line.strip_prefix("ticks ") {
+            ticks = t
+                .parse::<usize>()
+                .ok()
+                .filter(|&n| n > 0 && n <= 64 && !t.trim().starts_with('+'))
+                .ok_or_else(|| err("radar ticks must be an integer in 1..64", line_no))?;
+        } else if let Some(g) = line.strip_prefix("graticule ") {
+            circle = match g.trim() {
+                "circle" => true,
+                "polygon" => false,
+                _ => return Err(err("radar graticule must be circle or polygon", line_no)),
+            };
+        } else if let Some(value) = line.strip_prefix("showLegend ") {
+            show_legend = match value.trim() {
+                "true" => true,
+                "false" => false,
+                _ => return Err(err("radar showLegend must be true or false", line_no)),
+            };
         } else if let Some(c) = line.strip_prefix("curve ") {
-            let (label, values) = parse_curve(c)
-                .ok_or_else(|| err("curve needs `name{v, v, …}`", line_no))?;
+            let (label, values) =
+                parse_curve(c).ok_or_else(|| err("curve needs `name{v, v, …}`", line_no))?;
             if curves.len() >= MAX_CURVES {
                 return Err(err("radar has too many curves", line_no));
             }
@@ -89,9 +125,28 @@ pub(crate) fn parse(source: &str) -> Result<Radar, ParseError> {
     }
     // Default max: the largest value across curves (or 1).
     let max = max.unwrap_or_else(|| {
-        curves.iter().flat_map(|c| &c.values).cloned().fold(1.0_f64, f64::max)
+        curves
+            .iter()
+            .flat_map(|c| &c.values)
+            .cloned()
+            .fold(1.0_f64, f64::max)
     });
-    Ok(Radar { title, axes, curves, max: max.max(1e-9) })
+    if max <= min || !(max - min).is_finite() {
+        return Err(err(
+            "radar max must exceed min with a finite range",
+            range_line,
+        ));
+    }
+    Ok(Radar {
+        title,
+        axes,
+        curves,
+        max,
+        min,
+        ticks,
+        circle,
+        show_legend,
+    })
 }
 
 /// `id["Label"]` → `Label`; bare token → itself.
@@ -111,32 +166,53 @@ fn label_of(s: &str) -> String {
 fn parse_curve(s: &str) -> Option<(String, Vec<f64>)> {
     let brace = s.find('{')?;
     let end = s.rfind('}')?;
+    if end <= brace || !s[end + 1..].trim().is_empty() {
+        return None;
+    }
     let label = label_of(s[..brace].trim());
     let values: Vec<f64> = s[brace + 1..end]
         .split(',')
         // Non-finite values ("1e999", "inf", "NaN") corrupt the v/max
         // scale into NaN polygon points — reject them like non-numerics.
-        .map(|v| v.trim().parse::<f64>().ok().filter(|v| v.is_finite()))
+        .map(crate::parse_number)
         .collect::<Option<_>>()?;
     Some((label, values))
 }
 
 fn err(message: impl Into<String>, line: usize) -> ParseError {
-    ParseError { message: message.into(), line: Some(line) }
+    ParseError {
+        message: message.into(),
+        line: Some(line),
+    }
 }
 
 pub(crate) fn render_svg(r: &Radar) -> String {
     let n = r.axes.len();
     // Horizontal room for the widest axis label sitting outside the ring, so
     // side labels ("Physics", "CompSci") aren't clipped at the canvas edge.
-    let label_w = r.axes.iter().map(|a| measure::text_size(a).0).fold(0.0_f64, f64::max);
+    let label_w = r
+        .axes
+        .iter()
+        .map(|a| measure::text_size(a).0)
+        .fold(0.0_f64, f64::max);
     let side = RADIUS + LABEL_GAP + label_w;
     let title_h = if r.title.is_some() { TITLE_H } else { 0.0 };
     let top_label = LABEL_GAP + measure::LINE_H; // the top axis label above the ring
 
-    let cx = PAD + side;
+    let total_w = (2.0 * (PAD + side))
+        .max(r.title.as_ref().map_or(0.0, |t| {
+            measure::text_size(t).0 * 18.0 / measure::FONT_PX + 2.0 * PAD
+        }))
+        .max(if r.show_legend {
+            r.curves
+                .iter()
+                .map(|c| measure::text_size(&c.label).0 + PAD * 2.0 + 16.0)
+                .fold(0.0, f64::max)
+        } else {
+            0.0
+        });
+    let cx = total_w / 2.0;
     let cy = PAD + title_h + top_label + RADIUS;
-    let total_w = 2.0 * (PAD + side);
     let mut body = String::new();
 
     if let Some(title) = &r.title {
@@ -154,21 +230,33 @@ pub(crate) fn render_svg(r: &Radar) -> String {
     };
 
     // concentric grid rings (as polygons through the axis directions).
-    for ring in 1..=RINGS {
-        let frac = ring as f64 / RINGS as f64;
-        let pts: Vec<String> =
-            (0..n).map(|i| { let (x, y) = point(i, frac); format!("{x:.1},{y:.1}") }).collect();
-        body.push_str(&format!(
-            r#"<polygon points="{}" fill="none" stroke="currentColor" opacity="0.2"/>"#,
-            pts.join(" ")
-        ));
+    for ring in 1..=r.ticks {
+        let frac = ring as f64 / r.ticks as f64;
+        let pts: Vec<String> = (0..n)
+            .map(|i| {
+                let (x, y) = point(i, frac);
+                format!("{x:.1},{y:.1}")
+            })
+            .collect();
+        if r.circle {
+            body.push_str(&format!(r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{:.1}" fill="none" stroke="currentColor" opacity="0.2"/>"#, frac * RADIUS));
+        } else {
+            body.push_str(&format!(
+                r#"<polygon points="{}" fill="none" stroke="currentColor" opacity="0.2"/>"#,
+                pts.join(" ")
+            ));
+        }
     }
     // Ring value ticks: mermaid labels each ring with its axis value up the
     // first (top) spoke, so the concentric grid has a readable scale.
-    for ring in 1..=RINGS {
-        let frac = ring as f64 / RINGS as f64;
-        let v = r.max * frac;
-        let txt = if v.fract() == 0.0 { format!("{v:.0}") } else { format!("{v:.1}") };
+    for ring in 1..=r.ticks {
+        let frac = ring as f64 / r.ticks as f64;
+        let v = r.min + (r.max - r.min) * frac;
+        let txt = if v.fract() == 0.0 {
+            format!("{v:.0}")
+        } else {
+            format!("{v:.1}")
+        };
         body.push_str(&format!(
             r#"<text x="{:.1}" y="{:.1}" font-size="10" fill="currentColor" opacity="0.55">{txt}</text>"#,
             cx + 4.0,
@@ -182,7 +270,13 @@ pub(crate) fn render_svg(r: &Radar) -> String {
             r#"<line x1="{cx:.1}" y1="{cy:.1}" x2="{ex:.1}" y2="{ey:.1}" stroke="currentColor" opacity="0.3"/>"#
         ));
         let (lx, ly) = point(i, 1.0 + LABEL_GAP / RADIUS);
-        let anchor = if (lx - cx).abs() < 1.0 { "middle" } else if lx > cx { "start" } else { "end" };
+        let anchor = if (lx - cx).abs() < 1.0 {
+            "middle"
+        } else if lx > cx {
+            "start"
+        } else {
+            "end"
+        };
         body.push_str(&format!(
             r#"<text x="{lx:.1}" y="{:.1}" text-anchor="{anchor}" font-size="12" fill="currentColor">{}</text>"#,
             ly + 4.0,
@@ -195,7 +289,10 @@ pub(crate) fn render_svg(r: &Radar) -> String {
         let pts: Vec<String> = (0..n)
             .map(|i| {
                 let v = c.values.get(i).copied().unwrap_or(0.0);
-                let (x, y) = point(i, (v / r.max).clamp(0.0, 1.0));
+                let (x, y) = point(
+                    i,
+                    ((v.clamp(r.min, r.max) - r.min) / (r.max - r.min)).clamp(0.0, 1.0),
+                );
                 format!("{x:.1},{y:.1}")
             })
             .collect();
@@ -204,6 +301,9 @@ pub(crate) fn render_svg(r: &Radar) -> String {
             pts.join(" ")
         ));
         // legend entry, stacked below the bottom axis label.
+        if !r.show_legend {
+            continue;
+        }
         let ly = cy + RADIUS + top_label + LEGEND_ROW + ci as f64 * LEGEND_ROW;
         body.push_str(&format!(
             r#"<rect x="{:.1}" y="{:.1}" width="11" height="11" fill="{color}"/><text x="{:.1}" y="{ly:.1}" font-size="12" fill="currentColor">{}</text>"#,
@@ -214,8 +314,11 @@ pub(crate) fn render_svg(r: &Radar) -> String {
         ));
     }
 
-    let legend_h =
-        if r.curves.is_empty() { 0.0 } else { LEGEND_ROW + r.curves.len() as f64 * LEGEND_ROW };
+    let legend_h = if !r.show_legend || r.curves.is_empty() {
+        0.0
+    } else {
+        LEGEND_ROW + r.curves.len() as f64 * LEGEND_ROW
+    };
     let total_h = cy + RADIUS + top_label + legend_h + PAD;
     let mut out = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total_w:.0} {total_h:.0}" width="{total_w:.0}" height="{total_h:.0}" style="font-family:sans-serif;font-size:14px">"#
@@ -259,7 +362,9 @@ mod tests {
 
     #[test]
     fn renders_grid_axes_and_curve() {
-        let svg = render_svg(&parse("radar-beta\n title T\n axis A, B, C\n curve x[\"X\"]{1, 2, 3}").unwrap());
+        let svg = render_svg(
+            &parse("radar-beta\n title T\n axis A, B, C\n curve x[\"X\"]{1, 2, 3}").unwrap(),
+        );
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
         assert!(svg.contains(">T<") && svg.contains(">A<"));
         assert!(svg.matches("<polygon").count() > RINGS); // rings + curve
@@ -268,10 +373,14 @@ mod tests {
     #[test]
     fn rings_carry_value_tick_labels() {
         // With max 100 and 4 rings, the top spoke is labeled 25/50/75/100.
-        let svg =
-            render_svg(&parse("radar-beta\n axis A, B, C\n curve x{10, 20, 30}\n max 100").unwrap());
+        let svg = render_svg(
+            &parse("radar-beta\n axis A, B, C\n curve x{10, 20, 30}\n max 100").unwrap(),
+        );
         for v in ["25", "50", "75", "100"] {
-            assert!(svg.contains(&format!(">{v}</text>")), "missing ring tick {v}: {svg}");
+            assert!(
+                svg.contains(&format!(">{v}</text>")),
+                "missing ring tick {v}: {svg}"
+            );
         }
     }
 }

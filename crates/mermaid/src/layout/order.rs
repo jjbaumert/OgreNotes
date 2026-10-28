@@ -9,11 +9,34 @@ mod tests {
     use super::*;
 
     fn n() -> LNode {
-        LNode { width: 20.0, height: 10.0, cluster: None }
+        LNode {
+            width: 20.0,
+            height: 10.0,
+            cluster: None,
+        }
     }
 
     fn e(from: usize, to: usize) -> LEdge {
-        LEdge { from, to, label: None }
+        LEdge {
+            from,
+            to,
+            label: None,
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn inversion_counter_matches_pairwise_crossings(
+            mut segments in proptest::collection::vec((0usize..32,0usize..32),0..100)
+        ) {
+            let mut expected = 0;
+            for (index, &(a,b)) in segments.iter().enumerate() {
+                for &(c,d) in &segments[index+1..] {
+                    if (a < c && b > d) || (a > c && b < d) { expected += 1; }
+                }
+            }
+            proptest::prop_assert_eq!(segment_crossings(&mut segments,32),expected);
+        }
     }
 
     #[test]
@@ -46,7 +69,11 @@ mod tests {
         let edges = vec![
             e(0, 1),
             e(1, 2),
-            LEdge { from: 0, to: 2, label: Some((30.0, 12.0)) },
+            LEdge {
+                from: 0,
+                to: 2,
+                label: Some((30.0, 12.0)),
+            },
         ];
         let g = build_order_graph(&nodes, &edges, &[0, 1, 2]);
         let d = g.ranks[1]
@@ -150,7 +177,10 @@ mod tests {
 pub(crate) enum SlotKind {
     Real(usize),
     /// Dummy waypoint for `edge` (acyclic index) at `rank`.
-    Dummy { edge: usize, rank: usize },
+    Dummy {
+        edge: usize,
+        rank: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -223,11 +253,7 @@ const DUMMY_SIZE: (f64, f64) = (8.0, 8.0);
 /// here (this function is infallible by construction).
 pub(crate) const MAX_DUMMY_SLOTS: usize = 20_000;
 
-pub(crate) fn build_order_graph(
-    nodes: &[LNode],
-    edges: &[LEdge],
-    ranks: &[usize],
-) -> OrderGraph {
+pub(crate) fn build_order_graph(nodes: &[LNode], edges: &[LEdge], ranks: &[usize]) -> OrderGraph {
     let max_rank = ranks.iter().copied().max().unwrap_or(0);
     let mut rows: Vec<Vec<Slot>> = vec![Vec::new(); max_rank + 1];
     for (i, node) in nodes.iter().enumerate() {
@@ -258,15 +284,15 @@ pub(crate) fn build_order_graph(
         chains.push(chain);
     }
     let index = build_window_index(&rows, &chains);
-    OrderGraph { ranks: rows, chains, index }
+    OrderGraph {
+        ranks: rows,
+        chains,
+        index,
+    }
 }
 
 /// Positions of each slot's chain-neighbors on the adjacent rank.
-pub(crate) fn neighbor_positions(
-    g: &OrderGraph,
-    rank: usize,
-    upstream: bool,
-) -> Vec<Vec<usize>> {
+pub(crate) fn neighbor_positions(g: &OrderGraph, rank: usize, upstream: bool) -> Vec<Vec<usize>> {
     // For each slot on `rank`, collect current index positions of the
     // slots adjacent to it (previous rank if upstream, next if not)
     // along every edge chain that passes through it. Only the one bucket
@@ -275,16 +301,18 @@ pub(crate) fn neighbor_positions(
     // is built once by `build_order_graph` and cached on `g.index` (see
     // `OrderIndex`), so a call here costs O(bucket + slots_on_rank)
     // rather than O(total_windows + slots_on_rank) per call.
-    let adj_rank = if upstream { rank.wrapping_sub(1) } else { rank + 1 };
-    let mut pos_of: std::collections::HashMap<SlotKind, usize> =
-        std::collections::HashMap::new();
+    let adj_rank = if upstream {
+        rank.wrapping_sub(1)
+    } else {
+        rank + 1
+    };
+    let mut pos_of: std::collections::HashMap<SlotKind, usize> = std::collections::HashMap::new();
     if adj_rank < g.ranks.len() {
         for (i, s) in g.ranks[adj_rank].iter().enumerate() {
             pos_of.insert(s.kind, i);
         }
     }
-    let mut here_pos: std::collections::HashMap<SlotKind, usize> =
-        std::collections::HashMap::new();
+    let mut here_pos: std::collections::HashMap<SlotKind, usize> = std::collections::HashMap::new();
     for (i, s) in g.ranks[rank].iter().enumerate() {
         here_pos.insert(s.kind, i);
     }
@@ -310,14 +338,16 @@ pub(crate) fn count_crossings(g: &OrderGraph, _edges: &[LEdge]) -> usize {
     // For each adjacent rank pair, count inversions among edge segment
     // endpoint pairs. Windows are pre-bucketed by rank once by
     // `build_order_graph` and cached on `g.index` (O(total_windows), paid
-    // once per layout instead of once per call), so each rank pair only
-    // scans the segments that actually bridge it instead of rescanning
-    // every chain in the graph; the inversion count itself stays O(k^2) in
-    // the number of segments crossing that one rank pair, which is fine at
-    // our caps.
+    // once per layout instead of once per call). Count inversions with a
+    // Fenwick tree: quadratic pair scans dominated dummy-heavy graphs even
+    // with the bounded number of ordering sweeps.
     let buckets = &g.index.buckets;
     let mut total = 0;
-    for r in 0..g.ranks.len().saturating_sub(1) {
+    for (r, bucket) in buckets
+        .iter()
+        .enumerate()
+        .take(g.ranks.len().saturating_sub(1))
+    {
         let pos_hi: std::collections::HashMap<SlotKind, usize> = g.ranks[r]
             .iter()
             .enumerate()
@@ -329,22 +359,46 @@ pub(crate) fn count_crossings(g: &OrderGraph, _edges: &[LEdge]) -> usize {
             .map(|(i, s)| (s.kind, i))
             .collect();
         let mut segs: Vec<(usize, usize)> = Vec::new();
-        for &(a, b) in &buckets[r] {
+        for &(a, b) in bucket {
             if let (Some(&ai), Some(&bi)) = (pos_hi.get(&a), pos_lo.get(&b)) {
                 segs.push((ai, bi));
             }
         }
-        for i in 0..segs.len() {
-            for j in i + 1..segs.len() {
-                let (a1, b1) = segs[i];
-                let (a2, b2) = segs[j];
-                if (a1 < a2 && b1 > b2) || (a1 > a2 && b1 < b2) {
-                    total += 1;
-                }
-            }
-        }
+        total += segment_crossings(&mut segs, g.ranks[r + 1].len());
     }
     total
+}
+
+fn segment_crossings(segments: &mut [(usize, usize)], lower_slots: usize) -> usize {
+    segments.sort_unstable();
+    let mut counts = vec![0usize; lower_slots + 1];
+    let (mut crossings, mut inserted, mut start) = (0, 0, 0);
+    while start < segments.len() {
+        let mut end = start + 1;
+        while end < segments.len() && segments[end].0 == segments[start].0 {
+            end += 1;
+        }
+        // Segments sharing the upper endpoint do not cross each other.
+        // Query the entire group before inserting any of its endpoints.
+        for &(_, lower) in &segments[start..end] {
+            let (mut index, mut at_or_before) = (lower + 1, 0);
+            while index > 0 {
+                at_or_before += counts[index];
+                index &= index - 1;
+            }
+            crossings += inserted - at_or_before;
+        }
+        for &(_, lower) in &segments[start..end] {
+            let mut index = lower + 1;
+            while index < counts.len() {
+                counts[index] += 1;
+                index += index & index.wrapping_neg();
+            }
+            inserted += 1;
+        }
+        start = end;
+    }
+    crossings
 }
 
 const MAX_SWEEPS: usize = 8;
@@ -376,7 +430,9 @@ pub(crate) fn minimize_crossings(g: &mut OrderGraph, edges: &[LEdge]) {
                 })
                 .collect();
             keyed.sort_by(|a, b| {
-                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1))
+                a.0.partial_cmp(&b.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.1.cmp(&b.1))
             });
             g.ranks[r] = keyed.into_iter().map(|(_, _, s)| s).collect();
         }

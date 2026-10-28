@@ -788,17 +788,62 @@ const kinds = [
             "Names that fit retain their identifying text",
           );
         }
+        if (kind === "c4" || kind.startsWith("c4-")) {
+          const expectedNames = inputs.flatMap((input) =>
+            fs.readFileSync(path.join(root, input.replace(/\.svg$/, ".mmd")), "utf8")
+              .split("\n")
+              .flatMap((line) => {
+                const match = line.trim().match(/^(?:Person(?:_Ext)?|(?:System|Container|Component)(?:Db|Queue)?(?:_Ext)?)\s*\([^,]+,\s*"([^"]*)"/);
+                return match ? [match[1]] : [];
+              }),
+          );
+          const names = await page
+            .locator('svg text[font-weight="700"]:not([data-label-underlay])')
+            .allTextContents();
+          const compact = (text) => text.replace(/\s/g, "");
+          const expected = compact(expectedNames.join(""));
+          assert.equal(
+            names.map(compact).join(""), expected,
+            "Wrapped C4 names must retain every source character in order",
+          );
+          const boundaries = new Set([0]);
+          for (const item of new Intl.Segmenter("und", { granularity: "grapheme" }).segment(expected))
+            boundaries.add(item.index + item.segment.length);
+          let offset = 0;
+          for (const line of names) {
+            offset += compact(line).length;
+            assert(boundaries.has(offset), "C4 wrapping must preserve complete grapheme clusters");
+          }
+          const outside = await page.evaluate(() => {
+            const violations = [];
+            for (const text of document.querySelectorAll('svg text:is([font-weight="700"],[font-weight="400"]):not([data-label-underlay])')) {
+              const bounds = text.getBBox();
+              const x = +text.getAttribute("x"), y = +text.getAttribute("y");
+              const shapes = [...text.ownerSVGElement.querySelectorAll("rect,path,ellipse,circle")]
+                .filter((shape) => !shape.closest("defs") && shape.getAttribute("fill")?.startsWith("#"));
+              const fits = shapes.some((shape) => {
+                const box = shape.getBBox();
+                // Element captions share their shape's center line and their
+                // baseline lies inside it. Relationship masks and unrelated
+                // surfaces cannot count as an owning element.
+                const owns = Math.abs(x - (box.x + box.width / 2)) < 0.6 &&
+                  y >= box.y && y <= box.y + box.height;
+                return owns && bounds.x >= box.x - 2 && bounds.y >= box.y - 2 &&
+                  bounds.x + bounds.width <= box.x + box.width + 2 &&
+                  bounds.y + bounds.height <= box.y + box.height + 2;
+              });
+              if (!fits) violations.push({ text: text.textContent, x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height });
+            }
+            return violations;
+          });
+          assert.deepEqual(outside, [], "C4 glyph bounds must fit their element boxes");
+        }
         if (kind === "c4-greek-narrow") {
           const labels = await page
             .locator("svg text:not([data-label-underlay])")
             .allTextContents();
           assert(labels.includes("μμμμμμμμμμμμ"));
           assert(labels.includes("ι".repeat(24)));
-          assert(
-            labels.some(
-              (label) => label.startsWith("Ω") && label.endsWith("…"),
-            ),
-          );
         }
         if (kind === "c4-arabic") {
           const labels = await page
@@ -807,12 +852,6 @@ const kinds = [
           assert(
             labels.includes("السلام عليكم"),
             "Short Arabic names that fit remain complete",
-          );
-          assert(
-            labels.some(
-              (label) => label.startsWith("س") && label.endsWith("…"),
-            ),
-            "Overflowing wide Arabic names receive an ellipsis",
           );
         }
         if (kind.startsWith("treemap-fallback")) {
@@ -829,27 +868,12 @@ const kinds = [
             .locator("svg text:not([data-label-underlay])")
             .allTextContents();
           assert(labels.includes("क्‍ष"));
-          assert(
-            labels.some(
-              (label) => label.startsWith("क्‍ष") && label.endsWith("…"),
-            ),
-          );
         }
         if (kind === "c4-fallback") {
           const labels = await page
             .locator("svg text:not([data-label-underlay])")
             .allTextContents();
           assert(labels.includes("မြန်မာ") && labels.includes("ДΩ"));
-          assert(
-            labels.some(
-              (label) => label.startsWith("Д") && label.endsWith("…"),
-            ),
-          );
-          assert(
-            labels.some(
-              (label) => label.startsWith("Ω") && label.endsWith("…"),
-            ),
-          );
         }
         if (kind === "c4-hangul") {
           const labels = await page
@@ -858,10 +882,6 @@ const kinds = [
           assert(
             labels.includes("가가") && labels.includes("가가"),
             "Short composed and decomposed Hangul names must remain complete",
-          );
-          assert(
-            labels.some((t) => t.startsWith("가가가") && t.endsWith("…")),
-            "Long Hangul names must receive an ellipsis",
           );
         }
         if (kind === "c4-unicode") {
@@ -874,10 +894,6 @@ const kinds = [
               "Fitting Unicode labels must remain complete",
             );
           }
-          assert(
-            labels.some((label) => /^(?:é)+…$/.test(label)),
-            "Truncated Unicode labels must preserve entire grapheme clusters",
-          );
         }
         assert(samples.length > 0, `${kind} must contain labels`);
         failed ||= samples.some((s) => s.contrast < 4.5);

@@ -10,9 +10,9 @@ use crate::{escape_xml, measure, ParseError};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReqNode {
-    pub title: String,      // «type» / name compartment
-    pub subtitle: String,   // the node name
-    pub body: Vec<String>,  // field lines
+    pub title: String,     // «type» / name compartment
+    pub subtitle: String,  // the node name
+    pub body: Vec<String>, // field lines
 }
 
 #[derive(Debug, Clone)]
@@ -28,8 +28,15 @@ pub(crate) struct ReqGraph {
     pub relations: Vec<ReqRelation>,
 }
 
-const REL_KINDS: &[&str] =
-    &["contains", "copies", "derives", "satisfies", "verifies", "refines", "traces"];
+const REL_KINDS: &[&str] = &[
+    "contains",
+    "copies",
+    "derives",
+    "satisfies",
+    "verifies",
+    "refines",
+    "traces",
+];
 
 struct Parser {
     g: ReqGraph,
@@ -40,7 +47,10 @@ struct Parser {
 
 pub(crate) fn parse(source: &str) -> Result<ReqGraph, ParseError> {
     let mut p = Parser {
-        g: ReqGraph { nodes: Vec::new(), relations: Vec::new() },
+        g: ReqGraph {
+            nodes: Vec::new(),
+            relations: Vec::new(),
+        },
         ids: std::collections::HashMap::new(),
         line: 0,
         open: None,
@@ -80,7 +90,10 @@ pub(crate) fn parse(source: &str) -> Result<ReqGraph, ParseError> {
 
 impl Parser {
     fn err(&self, m: impl Into<String>) -> ParseError {
-        ParseError { message: m.into(), line: Some(self.line) }
+        ParseError {
+            message: m.into(),
+            line: Some(self.line),
+        }
     }
 
     fn ensure(&mut self, name: &str, title: String, subtitle: String) -> usize {
@@ -88,7 +101,11 @@ impl Parser {
             return i;
         }
         let i = self.g.nodes.len();
-        self.g.nodes.push(ReqNode { title, subtitle, body: Vec::new() });
+        self.g.nodes.push(ReqNode {
+            title,
+            subtitle,
+            body: Vec::new(),
+        });
         self.ids.insert(name.to_string(), i);
         i
     }
@@ -101,19 +118,32 @@ impl Parser {
         }
         // A `keyword Name {` block opener.
         let opener = line.strip_suffix('{').unwrap_or(line).trim();
-        let (kw, name) = opener.split_once(char::is_whitespace).unwrap_or((opener, ""));
+        let (kw, name) = opener
+            .split_once(char::is_whitespace)
+            .unwrap_or((opener, ""));
         let name = name.trim();
         if name.is_empty() || !line.trim_end().ends_with('{') {
             return Err(self.err(format!("unrecognized statement {line:?}")));
         }
         let (title, sub) = if kw == "element" {
             (String::new(), name.to_string())
-        } else if kw == "requirement" || kw.ends_with("Requirement") {
+        } else if matches!(
+            kw,
+            "requirement"
+                | "functionalRequirement"
+                | "interfaceRequirement"
+                | "performanceRequirement"
+                | "physicalRequirement"
+                | "designConstraint"
+        ) {
             (format!("«{}»", kw), name.to_string())
         } else {
             return Err(self.err(format!("unknown block keyword `{kw}`")));
         };
-        let idx = self.ensure(name, title, sub);
+        let idx = self.ensure(name, title.clone(), sub.clone());
+        // A prior relationship may have created a placeholder for this ID.
+        self.g.nodes[idx].title = title;
+        self.g.nodes[idx].subtitle = sub;
         self.open = Some(idx);
         Ok(())
     }
@@ -125,9 +155,28 @@ impl Parser {
         }
         // `key: value` field — stored verbatim as a body line.
         let idx = self.open.expect("block open");
-        if let Some((k, v)) = line.split_once(':') {
-            self.g.nodes[idx].body.push(format!("{}: {}", k.trim(), v.trim()));
+        let (key, value) = line
+            .split_once(':')
+            .ok_or_else(|| self.err("requirement field needs `key: value`"))?;
+        let (key, value) = (key.trim(), value.trim());
+        let token = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(value);
+        let valid = match key {
+            "id" | "text" | "type" | "docref" => true,
+            "risk" => ["low", "medium", "high"]
+                .iter()
+                .any(|v| token.eq_ignore_ascii_case(v)),
+            "verifymethod" => ["analysis", "inspection", "test", "demonstration"]
+                .iter()
+                .any(|v| token.eq_ignore_ascii_case(v)),
+            _ => false,
+        };
+        if !valid {
+            return Err(self.err(format!("invalid requirement field `{key}: {value}`")));
         }
+        self.g.nodes[idx].body.push(format!("{key}: {value}"));
         Ok(())
     }
 
@@ -156,7 +205,11 @@ impl Parser {
         let d = self.ensure(dst, String::new(), dst.to_string());
         // `<-` reverses the arrow direction (dst points at src).
         let (from, to) = if reverse { (d, s) } else { (s, d) };
-        Ok(Some(ReqRelation { from, to, kind: kind.to_string() }))
+        Ok(Some(ReqRelation {
+            from,
+            to,
+            kind: kind.to_string(),
+        }))
     }
 }
 
@@ -173,11 +226,19 @@ pub(crate) fn render_svg(g: &ReqGraph) -> Result<String, ParseError> {
             }
             lines.push(&n.subtitle);
             lines.extend(n.body.iter().map(String::as_str));
-            let w = lines.iter().map(|l| measure::text_size(l).0).fold(0.0_f64, f64::max) + 24.0;
+            let w = lines
+                .iter()
+                .map(|l| measure::text_size(l).0)
+                .fold(0.0_f64, f64::max)
+                + 24.0;
             let w = w.max(90.0);
             let h = lines.len() as f64 * line_h + 14.0;
             sizes.push((w, h));
-            crate::boxgraph::BoxNode { width: w, height: h, cluster: None }
+            crate::boxgraph::BoxNode {
+                width: w,
+                height: h,
+                cluster: None,
+            }
         })
         .collect();
     let edges: Vec<crate::boxgraph::BoxEdge> = g
@@ -185,7 +246,11 @@ pub(crate) fn render_svg(g: &ReqGraph) -> Result<String, ParseError> {
         .iter()
         .map(|r| {
             let (w, h) = measure::text_size(&r.kind);
-            crate::boxgraph::BoxEdge { from: r.from, to: r.to, label: Some((w + 8.0, h + 4.0)) }
+            crate::boxgraph::BoxEdge {
+                from: r.from,
+                to: r.to,
+                label: Some((w + 8.0, h + 4.0)),
+            }
         })
         .collect();
 
@@ -281,7 +346,9 @@ mod tests {
         let r = &g.nodes[0];
         assert_eq!(r.title, "«requirement»");
         assert_eq!(r.subtitle, "r1");
-        assert!(r.body.contains(&"id: 1".to_string()) && r.body.contains(&"risk: high".to_string()));
+        assert!(
+            r.body.contains(&"id: 1".to_string()) && r.body.contains(&"risk: high".to_string())
+        );
         assert_eq!(g.relations.len(), 1);
         assert_eq!(g.relations[0].kind, "satisfies");
     }
@@ -290,11 +357,16 @@ mod tests {
     fn reverse_arrow_and_bad_kind() {
         // `a <- traces - b` points from b to a. Nodes are created in first-
         // mention order: a=0, b=1.
-        let g = parse("requirementDiagram\n requirement a {\n }\n element b {\n }\n a <- traces - b").unwrap();
+        let g =
+            parse("requirementDiagram\n requirement a {\n }\n element b {\n }\n a <- traces - b")
+                .unwrap();
         assert_eq!(g.relations[0].kind, "traces");
         assert_eq!((g.relations[0].from, g.relations[0].to), (1, 0)); // b -> a
-        // an unknown relationship type errors.
-        assert!(parse("requirementDiagram\n requirement a {\n }\n element b {\n }\n a - bogus -> b").is_err());
+                                                                      // an unknown relationship type errors.
+        assert!(parse(
+            "requirementDiagram\n requirement a {\n }\n element b {\n }\n a - bogus -> b"
+        )
+        .is_err());
     }
 
     #[test]
@@ -332,6 +404,9 @@ mod tests {
             &parse("requirementDiagram\n requirement r1 {\n }\n element e1 {\n }\n e1 - satisfies -> r1").unwrap(),
         )
         .unwrap();
-        assert!(!no_fields.contains("<line x1="), "no divider without fields: {no_fields}");
+        assert!(
+            !no_fields.contains("<line x1="),
+            "no divider without fields: {no_fields}"
+        );
     }
 }

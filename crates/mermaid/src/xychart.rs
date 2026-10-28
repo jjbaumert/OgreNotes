@@ -17,8 +17,8 @@ const Y_AXIS_W: f64 = 56.0; // room for y ticks + label
 /// (`xyChart.plotColorPalette` in theme-default.js), in order. Series are
 /// colored by declaration order, cycling when there are more than ten.
 const PLOT_PALETTE: &[&str] = &[
-    "#ECECFF", "#8493A6", "#FFC3A0", "#DCDDE1", "#B8E994",
-    "#D1A36F", "#C3CDE6", "#FFB6C1", "#496078", "#F8F3E3",
+    "#ECECFF", "#8493A6", "#FFC3A0", "#DCDDE1", "#B8E994", "#D1A36F", "#C3CDE6", "#FFB6C1",
+    "#496078", "#F8F3E3",
 ];
 const X_AXIS_H: f64 = 28.0;
 const MAX_SERIES: usize = 16;
@@ -39,6 +39,7 @@ pub(crate) struct Series {
 #[derive(Debug, Clone)]
 pub(crate) struct XYChart {
     pub title: Option<String>,
+    horizontal: bool,
     pub x_categories: Vec<String>,
     pub x_label: Option<String>,
     pub x_range: Option<(f64, f64)>,
@@ -50,6 +51,7 @@ pub(crate) struct XYChart {
 pub(crate) fn parse(source: &str) -> Result<XYChart, ParseError> {
     let mut c = XYChart {
         title: None,
+        horizontal: false,
         x_categories: Vec::new(),
         x_label: None,
         x_range: None,
@@ -69,13 +71,17 @@ pub(crate) fn parse(source: &str) -> Result<XYChart, ParseError> {
         if !seen_header {
             if !matches!(
                 line.strip_suffix(';').unwrap_or(line).trim_end(),
-                "xychart-beta" | "xychart"
+                "xychart-beta" | "xychart" | "xychart-beta horizontal" | "xychart horizontal"
             ) {
                 return Err(err(
                     "xy chart must start with `xychart` or `xychart-beta`",
                     line_no,
                 ));
             }
+            c.horizontal = line
+                .trim_end_matches(';')
+                .trim_end()
+                .ends_with(" horizontal");
             seen_header = true;
             continue;
         }
@@ -143,9 +149,14 @@ pub(crate) fn parse(source: &str) -> Result<XYChart, ParseError> {
     Ok(c)
 }
 
-fn push_series(c: &mut XYChart, kind: SeriesKind, list: &str, line_no: usize) -> Result<(), ParseError> {
-    let values = parse_list_num(list)
-        .ok_or_else(|| err("series must be a `[num, num…]` list", line_no))?;
+fn push_series(
+    c: &mut XYChart,
+    kind: SeriesKind,
+    list: &str,
+    line_no: usize,
+) -> Result<(), ParseError> {
+    let values =
+        parse_list_num(list).ok_or_else(|| err("series must be a `[num, num…]` list", line_no))?;
     if c.series.len() >= MAX_SERIES || values.len() > MAX_POINTS {
         return Err(err("xy chart too large", line_no));
     }
@@ -154,7 +165,10 @@ fn push_series(c: &mut XYChart, kind: SeriesKind, list: &str, line_no: usize) ->
 }
 
 fn unquote(s: &str) -> String {
-    s.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(s).to_string()
+    s.strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .unwrap_or(s)
+        .to_string()
 }
 
 /// Categories may contain commas inside double quotes.
@@ -204,7 +218,7 @@ fn parse_list_num(s: &str) -> Option<Vec<f64>> {
         .split(',')
         // Non-finite values ("1e999", "inf", "NaN") turn the axis scale
         // into NaN coordinates — reject them like non-numerics.
-        .map(|x| x.trim().parse::<f64>().ok().filter(|v| v.is_finite()))
+        .map(crate::parse_number)
         .collect()
 }
 
@@ -234,16 +248,22 @@ fn parse_axis_range(s: &str) -> Option<Option<(f64, f64)>> {
         return Some(None);
     }
     let (lo, hi) = s.split_once("-->")?;
-    let lo: f64 = lo.trim().parse().ok()?;
-    let hi: f64 = hi.trim().parse().ok()?;
+    let lo = crate::parse_number(lo)?;
+    let hi = crate::parse_number(hi)?;
     (lo.is_finite() && hi.is_finite() && hi > lo && (hi - lo).is_finite()).then_some(Some((lo, hi)))
 }
 
 fn err(message: impl Into<String>, line: usize) -> ParseError {
-    ParseError { message: message.into(), line: Some(line) }
+    ParseError {
+        message: message.into(),
+        line: Some(line),
+    }
 }
 
 pub(crate) fn render_svg(c: &XYChart) -> String {
+    if c.horizontal {
+        return render_horizontal(c);
+    }
     let n = c
         .x_categories
         .len()
@@ -262,7 +282,9 @@ pub(crate) fn render_svg(c: &XYChart) -> String {
         (lo, hi)
     });
     let (ymin, ymax) = (ymin_raw, ymax_raw);
-    let span = (ymax - ymin).max(1e-9);
+    // Parsing guarantees a finite increasing range. A floor would compress
+    // valid tiny ranges instead of mapping their maximum to the axis endpoint.
+    let span = ymax - ymin;
     // Pin data to the axis range. Values far outside an explicit range
     // (e.g. 1e308 against `0 --> 100`) would otherwise overflow the pixel
     // scale to ±inf; clamped, they draw at the plot edge like any other
@@ -358,10 +380,18 @@ pub(crate) fn render_svg(c: &XYChart) -> String {
     // `bar` + `line` pair renders lavender bars with a slate line regardless
     // of which kind draws first.
     let series_color = |si: usize| PLOT_PALETTE[si % PLOT_PALETTE.len()];
-    let bar_series: Vec<(usize, &Series)> =
-        c.series.iter().enumerate().filter(|(_, s)| s.kind == SeriesKind::Bar).collect();
+    let bar_series: Vec<(usize, &Series)> = c
+        .series
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.kind == SeriesKind::Bar)
+        .collect();
     let group_w = PLOT_W / n as f64 * 0.7;
-    let bw = if bar_series.is_empty() { 0.0 } else { group_w / bar_series.len() as f64 };
+    let bw = if bar_series.is_empty() {
+        0.0
+    } else {
+        group_w / bar_series.len() as f64
+    };
     for (bi, (si, s)) in bar_series.iter().enumerate() {
         for (i, &v) in s.values.iter().enumerate() {
             let cx = vx(i as f64) - group_w / 2.0 + bi as f64 * bw;
@@ -375,9 +405,18 @@ pub(crate) fn render_svg(c: &XYChart) -> String {
             ));
         }
     }
-    for (si, s) in c.series.iter().enumerate().filter(|(_, s)| s.kind == SeriesKind::Line) {
-        let pts: Vec<String> =
-            s.values.iter().enumerate().map(|(i, &v)| format!("{:.1},{:.1}", vx(i as f64), vy(cv(v)))).collect();
+    for (si, s) in c
+        .series
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.kind == SeriesKind::Line)
+    {
+        let pts: Vec<String> = s
+            .values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| format!("{:.1},{:.1}", vx(i as f64), vy(cv(v))))
+            .collect();
         if !pts.is_empty() {
             body.push_str(&format!(
                 r#"<polyline points="{}" fill="none" stroke="{}" stroke-width="2"/>"#,
@@ -395,6 +434,154 @@ pub(crate) fn render_svg(c: &XYChart) -> String {
     out.push_str("</svg>");
     // touch measure so the import is always used (keeps parity with siblings)
     let _ = measure::LINE_H;
+    out
+}
+
+/// Horizontal charts exchange the data/category axes, while keeping captions
+/// upright. Rotating the vertical SVG would rotate the text as well.
+fn render_horizontal(c: &XYChart) -> String {
+    use std::fmt::Write;
+    let n = c
+        .x_categories
+        .len()
+        .max(c.series.iter().map(|s| s.values.len()).max().unwrap_or(0))
+        .max(1);
+    let (min, max) = c.y_range.unwrap_or_else(|| {
+        c.series
+            .iter()
+            .flat_map(|s| &s.values)
+            .fold((0.0_f64, 1.0_f64), |(lo, hi), &v| (lo.min(v), hi.max(v)))
+    });
+    // Preserve the validated positive span, including subnormal ranges.
+    let span = max - min;
+    let category_width = c
+        .x_categories
+        .iter()
+        .map(|s| measure::literal_overlap_width(s, 11.0))
+        .fold(Y_AXIS_W, f64::max);
+    let height = PLOT_H.max(n as f64 * 20.0);
+    let x_title_lines = c
+        .x_label
+        .as_ref()
+        .map(|label| measure::wrap_literal_to_width(label, height - 2.0 * PAD, 12.0, false));
+    let y_title_lines = c
+        .y_label
+        .as_ref()
+        .map(|label| measure::wrap_literal_to_width(label, PLOT_W - 2.0 * PAD, 12.0, false));
+    let x_title_width = x_title_lines
+        .as_ref()
+        .map_or(6.0, |lines| lines.len() as f64 * 16.0 + 8.0);
+    let min_tick_half = measure::literal_overlap_width(&fmt_num(min), 11.0) / 2.0;
+    let max_tick_half = measure::literal_overlap_width(&fmt_num(max), 11.0) / 2.0;
+    let left = (PAD + category_width + x_title_width).max(min_tick_half + PAD);
+    let title_lines = c
+        .title
+        .as_ref()
+        .map(|t| measure::wrap_to_width(t, PLOT_W * measure::FONT_PX / 18.0));
+    let title_height = title_lines
+        .as_ref()
+        .map_or(0.0, |t| measure::lines(t).len() as f64 * 24.0);
+    let top = PAD + title_height;
+    let bottom = top + height;
+    // Endpoint ticks are centered on the plot limits. Scientific notation
+    // needs more than the ordinary fixed padding beyond the final tick.
+    let right_margin = PAD.max(max_tick_half + 4.0);
+    let width = left + PLOT_W + right_margin;
+    let y_title_height = y_title_lines
+        .as_ref()
+        .map_or(0.0, |lines| lines.len() as f64 * 16.0 + 8.0);
+    let total_h = bottom + X_AXIS_H + y_title_height + PAD;
+    let x = |value: f64| left + (value.clamp(min, max) - min) / span * PLOT_W;
+    let line_axis = c.x_range.is_some() && c.series.iter().all(|s| s.kind == SeriesKind::Line);
+    let y = |index: f64| {
+        if line_axis && n > 1 {
+            top + index / (n - 1) as f64 * height
+        } else {
+            top + (index + 0.5) / n as f64 * height
+        }
+    };
+    let mut out = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width:.0} {total_h:.0}" width="{width:.0}" height="{total_h:.0}" style="font-family:sans-serif;font-size:14px">"#
+    );
+    if let Some(title) = title_lines {
+        for (i, line) in measure::lines(&title).iter().enumerate() {
+            write!(out, r#"<text xml:space="preserve" x="{:.1}" y="{:.1}" text-anchor="middle" font-weight="bold" font-size="18" fill="currentColor">{}</text>"#, left + PLOT_W / 2.0, PAD + 18.0 + i as f64 * 24.0, escape_xml(line)).unwrap();
+        }
+    }
+    write!(out, r#"<line x1="{left:.1}" y1="{top:.1}" x2="{left:.1}" y2="{bottom:.1}" stroke="currentColor"/><line x1="{left:.1}" y1="{bottom:.1}" x2="{:.1}" y2="{bottom:.1}" stroke="currentColor"/>"#, left + PLOT_W).unwrap();
+    for fraction in [0.0, 0.5, 1.0] {
+        let px = left + fraction * PLOT_W;
+        write!(out, r#"<text x="{px:.1}" y="{:.1}" text-anchor="middle" font-size="11" fill="currentColor">{}</text>"#, bottom + 16.0, fmt_num(axis_tick(min, max, fraction))).unwrap();
+        if fraction > 0.0 {
+            write!(out, r#"<line x1="{px:.1}" y1="{top:.1}" x2="{px:.1}" y2="{bottom:.1}" stroke="currentColor" opacity="0.2"/>"#).unwrap();
+        }
+    }
+    if let Some((lo, hi)) = c.x_range {
+        for fraction in [0.0, 0.5, 1.0] {
+            let py = if n == 1 {
+                top + fraction * height
+            } else {
+                y(fraction * (n - 1) as f64)
+            };
+            write!(out, r#"<text x="{:.1}" y="{:.1}" text-anchor="end" font-size="11" fill="currentColor">{}</text>"#, left - 6.0, py + 4.0, fmt_num(axis_tick(lo, hi, fraction))).unwrap();
+        }
+    }
+    for (i, label) in c.x_categories.iter().enumerate() {
+        write!(out, r#"<text xml:space="preserve" x="{:.1}" y="{:.1}" text-anchor="end" font-size="11" fill="currentColor">{}</text>"#, left - 6.0, y(i as f64) + 4.0, escape_xml(label)).unwrap();
+    }
+    if let Some(lines) = x_title_lines {
+        let ly = top + height / 2.0;
+        for (i, line) in lines.iter().enumerate() {
+            let lx = PAD + 12.0 + i as f64 * 16.0;
+            write!(out, r#"<text xml:space="preserve" x="{lx:.1}" y="{ly:.1}" text-anchor="middle" font-size="12" fill="currentColor" transform="rotate(-90 {lx:.1} {ly:.1})">{}</text>"#, escape_xml(line)).unwrap();
+        }
+    }
+    if let Some(lines) = y_title_lines {
+        for (i, line) in lines.iter().enumerate() {
+            write!(out, r#"<text xml:space="preserve" x="{:.1}" y="{:.1}" text-anchor="middle" font-size="12" fill="currentColor">{}</text>"#, left + PLOT_W / 2.0, bottom + 36.0 + i as f64 * 16.0, escape_xml(line)).unwrap();
+        }
+    }
+    let bars: Vec<_> = c
+        .series
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.kind == SeriesKind::Bar)
+        .collect();
+    let group_h = height / n as f64 * 0.7;
+    let bar_h = group_h / bars.len().max(1) as f64;
+    for (group, (index, series)) in bars.iter().enumerate() {
+        for (i, &value) in series.values.iter().enumerate() {
+            write!(
+                out,
+                r#"<rect x="{left:.1}" y="{:.1}" width="{:.1}" height="{bar_h:.1}" fill="{}"/>"#,
+                y(i as f64) - group_h / 2.0 + group as f64 * bar_h,
+                x(value) - left,
+                PLOT_PALETTE[index % PLOT_PALETTE.len()]
+            )
+            .unwrap();
+        }
+    }
+    for (index, series) in c
+        .series
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.kind == SeriesKind::Line)
+    {
+        let points: Vec<_> = series
+            .values
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| format!("{:.1},{:.1}", x(value), y(i as f64)))
+            .collect();
+        write!(
+            out,
+            r#"<polyline points="{}" fill="none" stroke="{}" stroke-width="2"/>"#,
+            points.join(" "),
+            PLOT_PALETTE[index % PLOT_PALETTE.len()]
+        )
+        .unwrap();
+    }
+    out.push_str("</svg>");
     out
 }
 
@@ -452,7 +639,7 @@ mod tests {
     fn y_range_optional_and_derived() {
         let c = parse("xychart-beta\n bar [3, 7, 5]").unwrap();
         assert_eq!(c.y_range, None); // no explicit range
-        // renders (range derived from data)
+                                     // renders (range derived from data)
         assert!(render_svg(&c).contains("<rect"));
     }
 
@@ -478,18 +665,26 @@ mod tests {
     fn series_take_palette_colors_by_declaration_order() {
         // Mermaid semantics: bar declared first → plotColorPalette[0]
         // (lavender, borderless), line second → plotColorPalette[1] (slate).
-        let svg = render_svg(
-            &parse("xychart-beta\n bar [2, 5]\n line [3, 6]").unwrap(),
+        let svg = render_svg(&parse("xychart-beta\n bar [2, 5]\n line [3, 6]").unwrap());
+        assert!(
+            svg.contains(r##"fill="#ECECFF"/>"##),
+            "bar takes palette[0], no border: {svg}"
         );
-        assert!(svg.contains(r##"fill="#ECECFF"/>"##), "bar takes palette[0], no border: {svg}");
-        assert!(svg.contains(r##"stroke="#8493A6""##), "line takes palette[1]: {svg}");
+        assert!(
+            svg.contains(r##"stroke="#8493A6""##),
+            "line takes palette[1]: {svg}"
+        );
 
         // Declaration order flipped → colors follow the declarations, not
         // the kind: the line is now lavender, the bars slate.
-        let svg = render_svg(
-            &parse("xychart-beta\n line [3, 6]\n bar [2, 5]").unwrap(),
+        let svg = render_svg(&parse("xychart-beta\n line [3, 6]\n bar [2, 5]").unwrap());
+        assert!(
+            svg.contains(r##"stroke="#ECECFF""##),
+            "first-declared line takes palette[0]: {svg}"
         );
-        assert!(svg.contains(r##"stroke="#ECECFF""##), "first-declared line takes palette[0]: {svg}");
-        assert!(svg.contains(r##"fill="#8493A6"/>"##), "second-declared bar takes palette[1]: {svg}");
+        assert!(
+            svg.contains(r##"fill="#8493A6"/>"##),
+            "second-declared bar takes palette[1]: {svg}"
+        );
     }
 }

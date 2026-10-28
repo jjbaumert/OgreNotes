@@ -8,7 +8,7 @@
 use std::fmt::Write;
 
 use crate::theme::{DATA_MUTED_TEXT, DATA_TEXT, LABEL_FONT};
-use crate::{ParseError, escape_xml, measure};
+use crate::{escape_xml, measure, ParseError};
 
 const PAD: f64 = 4.0;
 const WIDTH: f64 = 720.0;
@@ -23,8 +23,9 @@ const MAX_DEPTH: usize = 32;
 const MAX_LEAF_VALUE: f64 = 1e12;
 
 /// Depth-cycled fill palette (outer→inner tint by depth).
-const PALETTE: &[&str] =
-    &["#dbeafe", "#bfdbfe", "#c7d2fe", "#ddd6fe", "#fbcfe8", "#bbf7d0", "#fef3c7", "#fed7aa"];
+const PALETTE: &[&str] = &[
+    "#dbeafe", "#bfdbfe", "#c7d2fe", "#ddd6fe", "#fbcfe8", "#bbf7d0", "#fef3c7", "#fed7aa",
+];
 
 #[derive(Debug, Clone)]
 pub(crate) struct Node {
@@ -66,7 +67,10 @@ pub(crate) fn parse(source: &str) -> Result<Treemap, ParseError> {
         }
         if !seen_header {
             let h = raw.trim();
-            if h.strip_suffix(';').unwrap_or(h).trim_end() != "treemap-beta" {
+            if !matches!(
+                h.strip_suffix(';').unwrap_or(h).trim_end(),
+                "treemap-beta" | "treemap"
+            ) {
                 return Err(err("treemap must start with `treemap-beta`", line_no));
             }
             seen_header = true;
@@ -90,10 +94,17 @@ pub(crate) fn parse(source: &str) -> Result<Treemap, ParseError> {
         let (name, value) = parse_node(trimmed)
             .ok_or_else(|| err(format!("unrecognized treemap line {trimmed:?}"), line_no))?;
         if count >= MAX_NODES {
-            return Err(err(format!("treemap too large: >{MAX_NODES} nodes"), line_no));
+            return Err(err(
+                format!("treemap too large: >{MAX_NODES} nodes"),
+                line_no,
+            ));
         }
         count += 1;
-        let node = Node { name, value, children: Vec::new() };
+        let node = Node {
+            name,
+            value,
+            children: Vec::new(),
+        };
 
         // Pop deeper-or-equal entries so `stack.last()` is this node's parent.
         while stack.last().map(|(i, _)| *i >= indent).unwrap_or(false) {
@@ -130,47 +141,59 @@ pub(crate) fn parse(source: &str) -> Result<Treemap, ParseError> {
 }
 
 fn indent_of(raw: &str) -> usize {
-    raw.chars().take_while(|c| *c == ' ' || *c == '\t').map(|c| if c == '\t' { 2 } else { 1 }).sum()
+    raw.chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .map(|c| if c == '\t' { 2 } else { 1 })
+        .sum()
 }
 
 /// `"name": value`, `"name"`, `id["name"]: value`, or a bare token.
 fn parse_node(s: &str) -> Option<(String, Option<f64>)> {
-    let (head, value) = match s
-        .rsplit_once(':')
-        // Only treat the trailing `: n` as a value when `n` parses as a
-        // FINITE number (a colon inside a quoted name stays part of the
-        // name, and "1e999"/"inf"/"NaN" are treated like any other
-        // non-number). Cap the magnitude so `weight()` sums over siblings
-        // can never overflow to inf — two 1e308 leaves summed otherwise
-        // poison the squarify scale into NaN rectangles. Negative areas
-        // are meaningless in a treemap; floor at 0.
-        .and_then(|(h, v)| {
-            let v = v.trim().parse::<f64>().ok().filter(|v| v.is_finite())?;
-            Some((h, v.clamp(0.0, MAX_LEAF_VALUE)))
-        }) {
-        Some((h, v)) => (h.trim(), Some(v)),
-        None => (s, None),
+    let mut quoted = false;
+    let mut brackets = 0usize;
+    let mut separator = None;
+    for (index, ch) in s.char_indices() {
+        match ch {
+            '"' => quoted = !quoted,
+            '[' if !quoted => brackets += 1,
+            ']' if !quoted => brackets = brackets.checked_sub(1)?,
+            ':' if !quoted && brackets == 0 => {
+                separator = Some(index);
+                break;
+            }
+            _ => {}
+        }
+    }
+    if quoted || brackets != 0 {
+        return None;
+    }
+    let (head, value) = if let Some(index) = separator {
+        let value = crate::parse_number(&s[index + 1..])?;
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+        (s[..index].trim(), Some(value.min(MAX_LEAF_VALUE)))
+    } else {
+        (s.trim(), None)
     };
-    let name = extract_name(head);
+    let name = if let Some(quoted) = head.strip_prefix('"') {
+        quoted.strip_suffix('"')?.to_string()
+    } else if let Some((id, label)) = head.split_once('[') {
+        if id.trim().is_empty() {
+            return None;
+        }
+        let label = label.strip_suffix(']')?.trim();
+        crate::unquote_label(label).to_string()
+    } else {
+        if head.contains(['"', '[', ']']) {
+            return None;
+        }
+        head.to_string()
+    };
     if name.is_empty() {
         return None;
     }
     Some((name, value))
-}
-
-/// Pull a display name out of `"quoted"`, `id["quoted"]`, or a bare token.
-fn extract_name(s: &str) -> String {
-    let s = s.trim();
-    if let Some(start) = s.find('"') {
-        if let Some(end) = s[start + 1..].find('"') {
-            return s[start + 1..start + 1 + end].to_string();
-        }
-    }
-    // `id[...]` with no quotes, or a bare id.
-    if let Some(o) = s.find('[') {
-        return s[..o].trim().to_string();
-    }
-    s.to_string()
 }
 
 fn node_at_mut<'a>(roots: &'a mut [Node], path: &[usize]) -> &'a mut Node {
@@ -183,7 +206,10 @@ fn node_at_mut<'a>(roots: &'a mut [Node], path: &[usize]) -> &'a mut Node {
 }
 
 fn err(message: impl Into<String>, line: usize) -> ParseError {
-    ParseError { message: message.into(), line: Some(line) }
+    ParseError {
+        message: message.into(),
+        line: Some(line),
+    }
 }
 
 // ---- rendering -----------------------------------------------------------
@@ -212,7 +238,12 @@ pub(crate) fn render_svg(t: &Treemap) -> String {
         ).unwrap();
     }
     // Lay the roots out as one virtual level filling the canvas.
-    let area = Rect { x: PAD, y: PAD + title_h, w: WIDTH, h: HEIGHT };
+    let area = Rect {
+        x: PAD,
+        y: PAD + title_h,
+        w: WIDTH,
+        h: HEIGHT,
+    };
     // Paint every cell before captions, so child fills cannot cover a
     // parent caption whose fallback-font descenders cross the header edge.
     let mut labels = String::new();
@@ -242,7 +273,12 @@ fn layout_level(nodes: &[Node], rect: Rect, depth: usize, out: &mut String, labe
             // Branch: header strip with the name, children in the remainder.
             draw_header_label(node, r, fill, labels);
             if r.h > HEADER_H + 4.0 {
-                let inner = Rect { x: r.x, y: r.y + HEADER_H, w: r.w, h: r.h - HEADER_H };
+                let inner = Rect {
+                    x: r.x,
+                    y: r.y + HEADER_H,
+                    w: r.w,
+                    h: r.h - HEADER_H,
+                };
                 layout_level(&node.children, inner, depth + 1, out, labels);
             }
         }
@@ -306,7 +342,15 @@ fn squarify(weights: &[f64], rect: Rect) -> Vec<Rect> {
     let scale = (rect.w * rect.h) / total;
     let areas: Vec<f64> = weights.iter().map(|w| w * scale).collect();
 
-    let mut out = vec![Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; areas.len()];
+    let mut out = vec![
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0
+        };
+        areas.len()
+    ];
     let (mut x, mut y, mut w, mut h) = (rect.x, rect.y, rect.w, rect.h);
     let mut start = 0usize;
     while start < areas.len() {
@@ -330,7 +374,12 @@ fn squarify(weights: &[f64], rect: Rect) -> Vec<Rect> {
             let mut cy = y;
             for (k, &a) in row.iter().enumerate() {
                 let ch = if thick > 0.0 { a / thick } else { 0.0 };
-                out[start + k] = Rect { x, y: cy, w: thick, h: ch };
+                out[start + k] = Rect {
+                    x,
+                    y: cy,
+                    w: thick,
+                    h: ch,
+                };
                 cy += ch;
             }
             x += thick;
@@ -340,7 +389,12 @@ fn squarify(weights: &[f64], rect: Rect) -> Vec<Rect> {
             let mut cx = x;
             for (k, &a) in row.iter().enumerate() {
                 let cw = if thick > 0.0 { a / thick } else { 0.0 };
-                out[start + k] = Rect { x: cx, y, w: cw, h: thick };
+                out[start + k] = Rect {
+                    x: cx,
+                    y,
+                    w: cw,
+                    h: thick,
+                };
                 cx += cw;
             }
             y += thick;
@@ -402,7 +456,12 @@ mod tests {
 
     #[test]
     fn squarify_fills_and_preserves_order() {
-        let r = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let r = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
         let rects = squarify(&[6.0, 6.0, 4.0, 3.0, 2.0, 2.0, 1.0], r);
         assert_eq!(rects.len(), 7);
         // total area ≈ rect area.

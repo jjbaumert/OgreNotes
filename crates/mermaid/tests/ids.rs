@@ -40,7 +40,7 @@ fn defs_with_ids(svg: &str) -> Vec<(String, String)> {
         while let Some(lt) = defs[i..].find('<') {
             let abs = i + lt;
             let tag_end = defs[abs + 1..]
-                .find(|c: char| c == ' ' || c == '>' || c == '/')
+                .find([' ', '>', '/'])
                 .map(|n| abs + 1 + n)
                 .unwrap_or(defs.len());
             let tag = &defs[abs + 1..tag_end];
@@ -57,7 +57,10 @@ fn defs_with_ids(svg: &str) -> Vec<(String, String)> {
             let elem = &defs[abs..elem_end];
             if let Some(idpos) = elem.find(" id=\"") {
                 let id_start = idpos + 5;
-                let id_end = elem[id_start..].find('"').map(|n| id_start + n).unwrap_or(elem.len());
+                let id_end = elem[id_start..]
+                    .find('"')
+                    .map(|n| id_start + n)
+                    .unwrap_or(elem.len());
                 out.push((elem[id_start..id_end].to_string(), elem.to_string()));
             }
             i = elem_end.max(abs + 1);
@@ -78,17 +81,28 @@ fn definition_ids_are_unique_across_diagram_kinds() {
     let mut by_id: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (kind, src) in golden_sources() {
-        let svg = ogrenotes_mermaid::render(&src).svg.unwrap_or_else(|| panic!("{kind} renders"));
+        let svg = ogrenotes_mermaid::render(&src)
+            .svg
+            .unwrap_or_else(|| panic!("{kind} renders"));
         for (id, def) in defs_with_ids(&svg) {
             by_id.entry(id.clone()).or_default().insert(def);
             owners.entry(id).or_default().insert(kind.clone());
         }
     }
-    assert!(!by_id.is_empty(), "at least the arrow markers must be found");
+    assert!(
+        !by_id.is_empty(),
+        "at least the arrow markers must be found"
+    );
     let conflicts: Vec<String> = by_id
         .iter()
         .filter(|(id, defs)| defs.len() > 1 && !KNOWN_COLLISIONS.contains(&id.as_str()))
-        .map(|(id, defs)| format!("id {id:?} has {} different definitions across {:?}", defs.len(), owners[id]))
+        .map(|(id, defs)| {
+            format!(
+                "id {id:?} has {} different definitions across {:?}",
+                defs.len(),
+                owners[id]
+            )
+        })
         .collect();
     assert!(conflicts.is_empty(), "{}", conflicts.join("\n"));
     for known in KNOWN_COLLISIONS {
@@ -103,21 +117,32 @@ fn definition_ids_are_unique_across_diagram_kinds() {
 /// share ids between two different diagrams either.
 #[test]
 fn instance_specific_ids_differ_between_two_sankeys() {
-    let a = ogrenotes_mermaid::render("sankey-beta\n    a,b,5\n    b,c,2\n").svg.unwrap();
-    let b = ogrenotes_mermaid::render("sankey-beta\n    x,y,7\n").svg.unwrap();
+    let a = ogrenotes_mermaid::render("sankey-beta\n    a,b,5\n    b,c,2\n")
+        .svg
+        .unwrap();
+    let b = ogrenotes_mermaid::render("sankey-beta\n    x,y,7\n")
+        .svg
+        .unwrap();
     let ids_a: BTreeSet<String> = defs_with_ids(&a).into_iter().map(|(id, _)| id).collect();
     let ids_b: BTreeSet<String> = defs_with_ids(&b).into_iter().map(|(id, _)| id).collect();
     assert!(!ids_a.is_empty(), "sankey defines gradients: {a}");
     let shared: Vec<_> = ids_a.intersection(&ids_b).collect();
-    assert!(shared.is_empty(), "gradient ids shared between two sankeys: {shared:?}");
+    assert!(
+        shared.is_empty(),
+        "gradient ids shared between two sankeys: {shared:?}"
+    );
 }
 
 /// And the sequence arrow marker no longer shares an id (at a different
 /// size) with flowchart's.
 #[test]
 fn sequence_arrow_marker_has_its_own_id() {
-    let seq = ogrenotes_mermaid::render("sequenceDiagram\n    A->>B: hi\n").svg.unwrap();
-    let flow = ogrenotes_mermaid::render("flowchart TD\n    A --> B\n").svg.unwrap();
+    let seq = ogrenotes_mermaid::render("sequenceDiagram\n    A->>B: hi\n")
+        .svg
+        .unwrap();
+    let flow = ogrenotes_mermaid::render("flowchart TD\n    A --> B\n")
+        .svg
+        .unwrap();
     assert!(seq.contains(r#"<marker id="mmd-seq-arrow""#), "{seq}");
     assert!(seq.contains("url(#mmd-seq-arrow)"), "{seq}");
     assert!(!seq.contains(r#"<marker id="mmd-arrow""#), "{seq}");

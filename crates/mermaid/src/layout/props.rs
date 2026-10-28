@@ -9,7 +9,11 @@ fn arb_input() -> impl Strategy<Value = LayoutInput> {
     // shaped enough to hit cycles, self-loops, fan-in/out, clusters.
     (1usize..12).prop_flat_map(|n| {
         let nodes = proptest::collection::vec(
-            ((10.0f64..120.0), (10.0f64..40.0), proptest::option::of(0usize..3)),
+            (
+                (10.0f64..120.0),
+                (10.0f64..40.0),
+                proptest::option::of(0usize..3),
+            ),
             n,
         );
         let edges = proptest::collection::vec((0usize..n, 0usize..n), 0..20);
@@ -23,14 +27,26 @@ fn arb_input() -> impl Strategy<Value = LayoutInput> {
             LayoutInput {
                 nodes: nodes
                     .into_iter()
-                    .map(|(w, h, c)| LNode { width: w, height: h, cluster: c })
+                    .map(|(w, h, c)| LNode {
+                        width: w,
+                        height: h,
+                        cluster: c,
+                    })
                     .collect(),
                 edges: edges
                     .into_iter()
-                    .map(|(f, t)| LEdge { from: f, to: t, label: None })
+                    .map(|(f, t)| LEdge {
+                        from: f,
+                        to: t,
+                        label: None,
+                    })
                     .collect(),
                 clusters: (0..cluster_count)
-                    .map(|_| LCluster { parent: None, title: (30.0, 14.0), direction: None })
+                    .map(|_| LCluster {
+                        parent: None,
+                        title: (30.0, 14.0),
+                        direction: None,
+                    })
                     .collect(),
                 direction: match dir {
                     0 => Direction::TB,
@@ -139,8 +155,9 @@ fn arb_nested_input() -> impl Strategy<Value = LayoutInput> {
         let parents = proptest::collection::vec(any::<u16>(), n);
         let dirs = proptest::collection::vec(0u8..5, n);
         (Just(input), parents, dirs).prop_map(|(mut input, parents, dirs)| {
-            for i in 1..input.clusters.len() {
-                input.clusters[i].parent = Some(parents[i] as usize % i);
+            for (i, (cluster, parent)) in input.clusters.iter_mut().zip(parents).enumerate().skip(1)
+            {
+                cluster.parent = Some(parent as usize % i);
             }
             for (c, d) in input.clusters.iter_mut().zip(dirs) {
                 c.direction = match d {
@@ -183,10 +200,8 @@ proptest! {
 fn arb_labeled_input() -> impl Strategy<Value = LayoutInput> {
     arb_input().prop_flat_map(|input| {
         let n = input.edges.len();
-        let labels = proptest::collection::vec(
-            proptest::option::of(((10.0f64..200.0), (14.0f64..90.0))),
-            n,
-        );
+        let labels =
+            proptest::collection::vec(proptest::option::of(((10.0f64..200.0), (14.0f64..90.0))), n);
         (Just(input), labels).prop_map(|(mut input, labels)| {
             for (e, l) in input.edges.iter_mut().zip(labels) {
                 e.label = l;
@@ -202,7 +217,11 @@ fn overlap(a: ((f64, f64), (f64, f64)), b: ((f64, f64), (f64, f64))) -> f64 {
     let ((bx, by), (bw, bh)) = b;
     let w = (ax + aw / 2.0).min(bx + bw / 2.0) - (ax - aw / 2.0).max(bx - bw / 2.0);
     let h = (ay + ah / 2.0).min(by + bh / 2.0) - (ay - ah / 2.0).max(by - bh / 2.0);
-    if w > 1e-6 && h > 1e-6 { w * h } else { 0.0 }
+    if w > 1e-6 && h > 1e-6 {
+        w * h
+    } else {
+        0.0
+    }
 }
 
 /// Edge-label boxes in final (post-direction) coordinates.
@@ -282,14 +301,23 @@ fn segment_node_hits(input: &LayoutInput, l: &Layout, inset: f64) -> Vec<String>
         }
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
         let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
-        for (p, q) in [(-dx, a.0 - (c.0 - hx)), (dx, (c.0 + hx) - a.0), (-dy, a.1 - (c.1 - hy)), (dy, (c.1 + hy) - a.1)] {
+        for (p, q) in [
+            (-dx, a.0 - (c.0 - hx)),
+            (dx, (c.0 + hx) - a.0),
+            (-dy, a.1 - (c.1 - hy)),
+            (dy, (c.1 + hy) - a.1),
+        ] {
             if p.abs() < 1e-12 {
                 if q < 0.0 {
                     return false;
                 }
             } else {
                 let r = q / p;
-                if p < 0.0 { t0 = t0.max(r) } else { t1 = t1.min(r) }
+                if p < 0.0 {
+                    t0 = t0.max(r)
+                } else {
+                    t1 = t1.min(r)
+                }
                 if t0 > t1 {
                     return false;
                 }
@@ -305,7 +333,13 @@ fn segment_node_hits(input: &LayoutInput, l: &Layout, inset: f64) -> Vec<String>
                 if v == e.from || v == e.to {
                     continue;
                 }
-                if hits(w[0], w[1], l.node_centers[v], n.width / 2.0 - inset, n.height / 2.0 - inset) {
+                if hits(
+                    w[0],
+                    w[1],
+                    l.node_centers[v],
+                    n.width / 2.0 - inset,
+                    n.height / 2.0 - inset,
+                ) {
                     out.push(format!("edge {} segment {:?} crosses node {v}", ep.edge, w));
                 }
             }
