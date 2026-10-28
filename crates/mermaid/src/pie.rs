@@ -1,7 +1,7 @@
 //! Mermaid `pie` diagram: parser + SVG renderer.
 
 use crate::theme::{DATA_STROKE, DATA_TEXT};
-use crate::{ParseError, escape_xml};
+use crate::{escape_xml, ParseError};
 
 #[derive(Debug)]
 pub(crate) struct Pie {
@@ -91,7 +91,11 @@ pub(crate) fn parse(source: &str) -> Result<Pie, ParseError> {
             line: None,
         });
     }
-    Ok(Pie { title, show_data, slices })
+    Ok(Pie {
+        title,
+        show_data,
+        slices,
+    })
 }
 
 /// mermaid.js's pie number grammar: digits with an optional fraction
@@ -99,12 +103,14 @@ pub(crate) fn parse(source: &str) -> Result<Pie, ParseError> {
 fn parse_value(s: &str) -> Option<f64> {
     let (int, frac) = s.split_once('.').unwrap_or((s, ""));
     let digits = |p: &str| p.bytes().all(|b| b.is_ascii_digit());
-    let well_formed = digits(int) && digits(frac) && (!int.is_empty() || !frac.is_empty())
+    let well_formed = digits(int)
+        && digits(frac)
+        && (!int.is_empty() || !frac.is_empty())
         && !(s.contains('.') && frac.is_empty());
     if !well_formed {
         return None;
     }
-    s.parse::<f64>().ok().filter(|v| v.is_finite())
+    crate::parse_number(s)
 }
 
 /// Mermaid's default-theme pie section palette (`pie1`..`pie12`), in order.
@@ -141,12 +147,23 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
     // A wedge is only drawn when it's at least 1% of the total; kept wedges
     // re-normalize to fill the circle. The legend still lists every slice.
     let shown = |v: f64| total > 0.0 && v >= total * 0.01;
-    let shown_total: f64 = pie.slices.iter().map(|&(_, v)| v).filter(|&v| shown(v)).sum();
+    let shown_total: f64 = pie
+        .slices
+        .iter()
+        .map(|&(_, v)| v)
+        .filter(|&v| shown(v))
+        .sum();
     let n = pie.slices.len();
     let legend_texts: Vec<String> = pie
         .slices
         .iter()
-        .map(|(label, value)| if pie.show_data { format!("{label} ({})", trim_num(*value)) } else { label.clone() })
+        .map(|(label, value)| {
+            if pie.show_data {
+                format!("{label} ({})", trim_num(*value))
+            } else {
+                label.clone()
+            }
+        })
         .collect();
     // mermaid.js widens the viewport by the longest legend entry:
     // pieWidth + MARGIN + legendRectSize + legendSpacing + longest.
@@ -184,7 +201,10 @@ pub(crate) fn render_svg(pie: &Pie) -> String {
     // source order — the two can legitimately disagree.
     let mut order: Vec<usize> = (0..n).filter(|&i| shown(pie.slices[i].1)).collect();
     order.sort_by(|&a, &b| {
-        pie.slices[b].1.partial_cmp(&pie.slices[a].1).unwrap_or(std::cmp::Ordering::Equal)
+        pie.slices[b]
+            .1
+            .partial_cmp(&pie.slices[a].1)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     let mut backings = String::new();
@@ -298,7 +318,10 @@ mod tests {
         let p = parse("pie title Pets\n\"Dogs\" : 50\n\"Cats\" : 30").unwrap();
         assert_eq!(p.title.as_deref(), Some("Pets"));
         assert!(!p.show_data);
-        assert_eq!(p.slices, vec![("Dogs".to_string(), 50.0), ("Cats".to_string(), 30.0)]);
+        assert_eq!(
+            p.slices,
+            vec![("Dogs".to_string(), 50.0), ("Cats".to_string(), 30.0)]
+        );
     }
 
     #[test]
@@ -310,7 +333,10 @@ mod tests {
     #[test]
     fn parses_bare_unquoted_labels() {
         let p = parse("pie\nDogs : 2\nCats : 3").unwrap();
-        assert_eq!(p.slices, vec![("Dogs".to_string(), 2.0), ("Cats".to_string(), 3.0)]);
+        assert_eq!(
+            p.slices,
+            vec![("Dogs".to_string(), 2.0), ("Cats".to_string(), 3.0)]
+        );
     }
 
     #[test]
@@ -322,7 +348,10 @@ mod tests {
     #[test]
     fn empty_data_is_error() {
         let err = parse("pie").unwrap_err();
-        assert!(err.message.to_lowercase().contains("no data") || err.message.to_lowercase().contains("empty"));
+        assert!(
+            err.message.to_lowercase().contains("no data")
+                || err.message.to_lowercase().contains("empty")
+        );
     }
 
     #[test]
@@ -361,7 +390,11 @@ mod tests {
         assert!(svg.contains(">25%<"), "quarter slices labeled 25%: {svg}");
         assert!(svg.contains(">50%<"), "half slice labeled 50%: {svg}");
         // Count label endings (`hsl(...)` fills also contain `%`).
-        assert_eq!(svg.matches("%</text>").count(), 3, "one percentage label per drawn wedge");
+        assert_eq!(
+            svg.matches("%</text>").count(),
+            3,
+            "one percentage label per drawn wedge"
+        );
     }
 
     #[test]
@@ -372,12 +405,21 @@ mod tests {
             .unwrap();
         let svg = render_svg(&p);
         // Slices drawn largest→smallest: 79% (Large) then 17% (Medium) then 3% (Small).
-        let (p79, p17, p3) =
-            (svg.find(">79%<").unwrap(), svg.find(">17%<").unwrap(), svg.find(">3%<").unwrap());
-        assert!(p79 < p17 && p17 < p3, "slices not in descending value order");
+        let (p79, p17, p3) = (
+            svg.find(">79%<").unwrap(),
+            svg.find(">17%<").unwrap(),
+            svg.find(">3%<").unwrap(),
+        );
+        assert!(
+            p79 < p17 && p17 < p3,
+            "slices not in descending value order"
+        );
         // Legend in SOURCE order: Small, Large, Medium.
-        let (sm, lg, md) =
-            (svg.find(">Small<").unwrap(), svg.find(">Large<").unwrap(), svg.find(">Medium<").unwrap());
+        let (sm, lg, md) = (
+            svg.find(">Small<").unwrap(),
+            svg.find(">Large<").unwrap(),
+            svg.find(">Medium<").unwrap(),
+        );
         assert!(sm < lg && lg < md, "legend not in source order");
     }
 
@@ -433,14 +475,20 @@ mod tests {
         let svg = render_svg(&p);
         // A single 100% slice must render as a visible full disc, not a
         // degenerate zero-length arc.
-        assert!(svg.contains("<circle"), "expected a full-disc <circle>, got: {svg}");
+        assert!(
+            svg.contains("<circle"),
+            "expected a full-disc <circle>, got: {svg}"
+        );
     }
 
     #[test]
     fn full_slice_among_zeros_renders_disc() {
         let p = parse("pie\n\"A\" : 5\n\"B\" : 0\n\"C\" : 0").unwrap();
         let svg = render_svg(&p);
-        assert!(svg.contains("<circle"), "expected a full-disc <circle>, got: {svg}");
+        assert!(
+            svg.contains("<circle"),
+            "expected a full-disc <circle>, got: {svg}"
+        );
         // Legend still lists all three slices even though only one has a
         // visible wedge.
         assert_eq!(svg.matches("<text x=\"463\"").count(), 3);
@@ -450,8 +498,14 @@ mod tests {
     fn all_zero_pie_renders_outlined_circle() {
         let p = parse("pie\n\"A\" : 0\n\"B\" : 0").unwrap();
         let svg = render_svg(&p);
-        assert!(svg.contains("<circle"), "expected an outlined empty circle, got: {svg}");
-        assert!(svg.contains("fill=\"none\""), "zero-total circle must be unfilled, got: {svg}");
+        assert!(
+            svg.contains("<circle"),
+            "expected an outlined empty circle, got: {svg}"
+        );
+        assert!(
+            svg.contains("fill=\"none\""),
+            "zero-total circle must be unfilled, got: {svg}"
+        );
     }
 
     #[test]
@@ -460,8 +514,16 @@ mod tests {
         // it still gets a legend row.
         let p = parse("pie\n\"A\" : 60\n\"B\" : 39.5\n\"C\" : 0.5").unwrap();
         let svg = render_svg(&p);
-        assert_eq!(svg.matches("<path").count(), 2, "sub-1% slice C gets no wedge");
-        assert_eq!(svg.matches("<text x=\"463\"").count(), 3, "all three slices in the legend");
+        assert_eq!(
+            svg.matches("<path").count(),
+            2,
+            "sub-1% slice C gets no wedge"
+        );
+        assert_eq!(
+            svg.matches("<text x=\"463\"").count(),
+            3,
+            "all three slices in the legend"
+        );
     }
 
     #[test]
@@ -469,7 +531,11 @@ mod tests {
         // `(value / total) * 100 >= 1` keeps a slice at exactly 1%.
         let p = parse("pie\n\"A\" : 99\n\"B\" : 1").unwrap();
         let svg = render_svg(&p);
-        assert_eq!(svg.matches("<path").count(), 2, "exactly-1% slice B is kept as a wedge");
+        assert_eq!(
+            svg.matches("<path").count(),
+            2,
+            "exactly-1% slice B is kept as a wedge"
+        );
     }
 
     #[test]
@@ -479,9 +545,20 @@ mod tests {
         // disc (frac == 1.0), rendered as a <circle>, not a partial arc.
         let p = parse("pie\n\"Big\" : 199\n\"Tiny\" : 1").unwrap();
         let svg = render_svg(&p);
-        assert!(svg.contains("<circle"), "Big re-normalizes to a full disc: {svg}");
-        assert_eq!(svg.matches("<path").count(), 0, "no partial arc when one wedge fills the circle");
-        assert_eq!(svg.matches("<text x=\"463\"").count(), 2, "both slices still in the legend");
+        assert!(
+            svg.contains("<circle"),
+            "Big re-normalizes to a full disc: {svg}"
+        );
+        assert_eq!(
+            svg.matches("<path").count(),
+            0,
+            "no partial arc when one wedge fills the circle"
+        );
+        assert_eq!(
+            svg.matches("<text x=\"463\"").count(),
+            2,
+            "both slices still in the legend"
+        );
     }
 
     #[test]
@@ -501,9 +578,16 @@ mod tests {
     fn duplicate_labels_keep_the_first_value() {
         // mermaid.js parity (#280): a repeated label doesn't add a slice.
         let p = parse("pie\n\"A\" : 1\n\"B\" : 3\n\"A\" : 2").unwrap();
-        assert_eq!(p.slices, vec![("A".to_string(), 1.0), ("B".to_string(), 3.0)]);
+        assert_eq!(
+            p.slices,
+            vec![("A".to_string(), 1.0), ("B".to_string(), 3.0)]
+        );
         let svg = render_svg(&p);
-        assert_eq!(svg.matches("<text x=\"463\"").count(), 2, "one legend row per distinct label");
+        assert_eq!(
+            svg.matches("<text x=\"463\"").count(),
+            2,
+            "one legend row per distinct label"
+        );
     }
 
     #[test]
@@ -511,7 +595,9 @@ mod tests {
         for ok in ["42", "4.2", ".5", "0", "007"] {
             assert!(parse(&format!("pie\n\"A\" : {ok}")).is_ok(), "{ok}");
         }
-        for bad in ["1e3", "+5", "5.", ".", "1.2.3", "0x10", "inf", "NaN", "-3", "1_000", "٣"] {
+        for bad in [
+            "1e3", "+5", "5.", ".", "1.2.3", "0x10", "inf", "NaN", "-3", "1_000", "٣",
+        ] {
             let err = parse(&format!("pie\n\"A\" : {bad}")).unwrap_err();
             assert_eq!(err.line, Some(2), "{bad}");
         }
@@ -537,7 +623,11 @@ mod tests {
             .join("\n");
         let svg = render_svg(&parse(&src).unwrap());
         crate::extent::assert_inside(&svg);
-        assert!(svg.contains(r#"viewBox="0 -"#), "grown both ways around the pie: {}", &svg[..120]);
+        assert!(
+            svg.contains(r#"viewBox="0 -"#),
+            "grown both ways around the pie: {}",
+            &svg[..120]
+        );
     }
 
     #[test]
@@ -545,7 +635,10 @@ mod tests {
         let p = parse("pie title Tiere 🐾\n\"🐶 Hünde\" : 3\n\"猫\" : 1").unwrap();
         assert_eq!(p.slices[0].0, "🐶 Hünde");
         let svg = render_svg(&p);
-        assert!(svg.contains("🐶 Hünde"), "unicode label must pass through unmangled");
+        assert!(
+            svg.contains("🐶 Hünde"),
+            "unicode label must pass through unmangled"
+        );
         assert!(svg.contains("猫"));
         assert!(svg.contains("Tiere 🐾"));
     }
@@ -563,7 +656,11 @@ mod tests {
     #[test]
     fn error_line_numbers_count_skipped_blank_and_comment_lines() {
         let err = parse("pie\n\n%% a comment\n\"A\" : notanumber").unwrap_err();
-        assert_eq!(err.line, Some(4), "line numbers must be physical, not logical");
+        assert_eq!(
+            err.line,
+            Some(4),
+            "line numbers must be physical, not logical"
+        );
     }
 
     #[test]
@@ -576,7 +673,10 @@ mod tests {
     fn svg_escapes_title_markup() {
         let p = parse("pie title <img src=x onerror=alert(1)>\n\"A\" : 1").unwrap();
         let svg = render_svg(&p);
-        assert!(!svg.contains("<img"), "raw title markup must not reach the SVG: {svg}");
+        assert!(
+            !svg.contains("<img"),
+            "raw title markup must not reach the SVG: {svg}"
+        );
         assert!(svg.contains("&lt;img"));
     }
 
@@ -613,8 +713,14 @@ mod tests {
     fn show_data_legend_shows_label_with_value() {
         let p = parse("pie showData\n\"A\" : 1.5\n\"B\" : 2").unwrap();
         let svg = render_svg(&p);
-        assert!(svg.contains("A (1.5)"), "fractional value kept as-is: {svg}");
-        assert!(svg.contains("B (2)"), "whole value loses trailing .0: {svg}");
+        assert!(
+            svg.contains("A (1.5)"),
+            "fractional value kept as-is: {svg}"
+        );
+        assert!(
+            svg.contains("B (2)"),
+            "whole value loses trailing .0: {svg}"
+        );
     }
 
     #[test]
@@ -627,7 +733,11 @@ mod tests {
             .join("\n");
         let p = parse(&src).unwrap();
         let svg = render_svg(&p);
-        assert_eq!(svg.matches("<text x=\"463\"").count(), n, "one legend row per slice");
+        assert_eq!(
+            svg.matches("<text x=\"463\"").count(),
+            n,
+            "one legend row per slice"
+        );
         // Slice `PALETTE.len()` wraps around to the first palette color, so
         // palette[0] is used by two slices (wedge, label backing, and legend).
         assert_eq!(

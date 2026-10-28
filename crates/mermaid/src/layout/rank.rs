@@ -4,53 +4,6 @@
 
 use super::LEdge;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn e(from: usize, to: usize) -> LEdge {
-        LEdge { from, to, label: None }
-    }
-
-    #[test]
-    fn chain_ranks_increase() {
-        let ranks = assign_ranks(3, &[e(0, 1), e(1, 2)]);
-        assert_eq!(ranks, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn diamond_takes_longest_path() {
-        // 0 -> 1 -> 3, 0 -> 2 -> 3 plus 0 -> 3 direct: 3 must sit at rank 2.
-        let ranks = assign_ranks(4, &[e(0, 1), e(0, 2), e(1, 3), e(2, 3), e(0, 3)]);
-        assert_eq!(ranks[0], 0);
-        assert_eq!(ranks[3], 2);
-        assert!(ranks[1] == 1 && ranks[2] == 1);
-    }
-
-    #[test]
-    fn every_edge_is_monotone() {
-        let edges = vec![e(0, 2), e(1, 2), e(2, 3), e(1, 3)];
-        let ranks = assign_ranks(4, &edges);
-        for ed in &edges {
-            assert!(ranks[ed.to] > ranks[ed.from]);
-        }
-    }
-
-    #[test]
-    fn source_tightened_to_children() {
-        // 0->1->2->3 is the long chain; 4->3 is a lone source into the sink.
-        // Without tightening 4 sits at rank 0; tightened it sits at rank 2.
-        let ranks = assign_ranks(5, &[e(0, 1), e(1, 2), e(2, 3), e(4, 3)]);
-        assert_eq!(ranks[4], ranks[3] - 1);
-    }
-
-    #[test]
-    fn isolated_node_rank_zero() {
-        let ranks = assign_ranks(2, &[]);
-        assert_eq!(ranks, vec![0, 0]);
-    }
-}
-
 /// Longest-path ranks via Kahn topological order, then one tightening
 /// pass: any node with NO incoming edges moves down to
 /// `min(rank of successors) - 1`.
@@ -90,4 +43,55 @@ pub(crate) fn assign_ranks(node_count: usize, edges: &[LEdge]) -> Vec<usize> {
         }
     }
     ranks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn e(from: usize, to: usize) -> LEdge {
+        LEdge {
+            from,
+            to,
+            label: None,
+        }
+    }
+
+    #[test]
+    fn chain_ranks_increase() {
+        let ranks = assign_ranks(3, &[e(0, 1), e(1, 2)]);
+        assert_eq!(ranks, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn diamond_takes_longest_path() {
+        // 0 -> 1 -> 3, 0 -> 2 -> 3 plus 0 -> 3 direct: 3 must sit at rank 2.
+        let ranks = assign_ranks(4, &[e(0, 1), e(0, 2), e(1, 3), e(2, 3), e(0, 3)]);
+        assert_eq!(ranks[0], 0);
+        assert_eq!(ranks[3], 2);
+        assert!(ranks[1] == 1 && ranks[2] == 1);
+    }
+
+    #[test]
+    fn every_edge_is_monotone() {
+        let edges = vec![e(0, 2), e(1, 2), e(2, 3), e(1, 3)];
+        let ranks = assign_ranks(4, &edges);
+        for ed in &edges {
+            assert!(ranks[ed.to] > ranks[ed.from]);
+        }
+    }
+
+    #[test]
+    fn source_tightened_to_children() {
+        // 0->1->2->3 is the long chain; 4->3 is a lone source into the sink.
+        // Without tightening 4 sits at rank 0; tightened it sits at rank 2.
+        let ranks = assign_ranks(5, &[e(0, 1), e(1, 2), e(2, 3), e(4, 3)]);
+        assert_eq!(ranks[4], ranks[3] - 1);
+    }
+
+    #[test]
+    fn isolated_node_rank_zero() {
+        let ranks = assign_ranks(2, &[]);
+        assert_eq!(ranks, vec![0, 0]);
+    }
 }

@@ -31,12 +31,14 @@ pub(crate) struct Link {
     pub from: usize,
     pub to: usize,
     pub value: f64,
+    line: usize,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Sankey {
     pub nodes: Vec<String>,
     pub links: Vec<Link>,
+    layers: Vec<usize>,
 }
 
 pub(crate) fn parse(source: &str) -> Result<Sankey, ParseError> {
@@ -69,33 +71,46 @@ pub(crate) fn parse(source: &str) -> Result<Sankey, ParseError> {
             seen_header = true;
             continue;
         }
-        let fields = split_csv(line);
-        if fields.len() < 3 {
-            return Err(err(format!("sankey row needs `source,target,value`, got {line:?}"), line_no));
+        let fields = split_csv(line).ok_or_else(|| err("unclosed CSV quote", line_no))?;
+        if fields.len() != 3 {
+            return Err(err(
+                format!("sankey row needs `source,target,value`, got {line:?}"),
+                line_no,
+            ));
         }
         let (src, tgt) = (fields[0].trim(), fields[1].trim());
         // Non-finite parses ("1e999", "inf", "NaN") take the same error as
         // non-numerics; the cap keeps per-node throughput sums finite (two
         // 1e308 links on one node would otherwise sum to inf and turn the
         // band scale into NaN).
-        let value: f64 = fields[2]
-            .trim()
-            .parse()
-            .ok()
-            .filter(|v: &f64| v.is_finite())
+        let value = crate::parse_number(&fields[2])
             .map(|v: f64| v.min(MAX_LINK_VALUE))
             .ok_or_else(|| {
-                err(format!("sankey value must be numeric, got {:?}", fields[2].trim()), line_no)
+                err(
+                    format!("sankey value must be numeric, got {:?}", fields[2].trim()),
+                    line_no,
+                )
             })?;
+        if value < 0.0 {
+            return Err(err("sankey value must be non-negative", line_no));
+        }
         if src.is_empty() || tgt.is_empty() {
             return Err(err("sankey row has an empty source or target", line_no));
         }
         if links.len() >= MAX_LINKS {
-            return Err(err(format!("sankey too large: >{MAX_LINKS} links"), line_no));
+            return Err(err(
+                format!("sankey too large: >{MAX_LINKS} links"),
+                line_no,
+            ));
         }
         let from = intern(src, &mut nodes);
         let to = intern(tgt, &mut nodes);
-        links.push(Link { from, to, value: value.max(0.0) });
+        links.push(Link {
+            from,
+            to,
+            value,
+            line: line_no,
+        });
     }
     if !seen_header {
         return Err(ParseError {
@@ -106,12 +121,82 @@ pub(crate) fn parse(source: &str) -> Result<Sankey, ParseError> {
     if links.is_empty() {
         return Err(err("sankey diagram has no flows", 1));
     }
-    Ok(Sankey { nodes, links })
+    // Kahn's traversal both rejects cycles and computes longest-path layers in
+    // O(nodes + links), rather than repeatedly relaxing every edge.
+    let mut outgoing = vec![Vec::new(); nodes.len()];
+    let mut incoming = vec![0usize; nodes.len()];
+    for (index, link) in links.iter().enumerate() {
+        outgoing[link.from].push(index);
+        incoming[link.to] += 1;
+    }
+    let mut ready: std::collections::VecDeque<_> = incoming
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &count)| (count == 0).then_some(i))
+        .collect();
+    let mut layers = vec![0usize; nodes.len()];
+    let mut visited = 0;
+    while let Some(from) = ready.pop_front() {
+        visited += 1;
+        for &edge in &outgoing[from] {
+            let to = links[edge].to;
+            layers[to] = layers[to].max(layers[from] + 1);
+            incoming[to] -= 1;
+            if incoming[to] == 0 {
+                ready.push_back(to);
+            }
+        }
+    }
+    if visited != nodes.len() {
+        return Err(ParseError {
+            message: "sankey flows must not contain cycles".into(),
+            line: cycle_line(&links, &outgoing),
+        });
+    }
+    Ok(Sankey {
+        nodes,
+        links,
+        layers,
+    })
+}
+
+/// Locate a back-edge to a gray ancestor. Kahn's residual graph also
+/// contains acyclic descendants of a cycle; reporting its first remaining
+/// edge could blame a valid downstream flow. Iterative DFS identifies an
+/// actual cycle edge without recursion proportional to source size.
+fn cycle_line(links: &[Link], outgoing: &[Vec<usize>]) -> Option<usize> {
+    let mut color = vec![0u8; outgoing.len()];
+    for start in 0..outgoing.len() {
+        if color[start] != 0 {
+            continue;
+        }
+        color[start] = 1;
+        let mut stack = vec![(start, 0usize)];
+        while let Some((from, next)) = stack.last_mut() {
+            let from = *from;
+            let Some(&edge) = outgoing[from].get(*next) else {
+                color[from] = 2;
+                stack.pop();
+                continue;
+            };
+            *next += 1;
+            let target = links[edge].to;
+            match color[target] {
+                1 => return Some(links[edge].line),
+                0 => {
+                    color[target] = 1;
+                    stack.push((target, 0));
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 /// Split one CSV line, honoring `"double quoted"` fields (which may contain
 /// commas). Quotes are stripped from the returned fields.
-fn split_csv(line: &str) -> Vec<String> {
+fn split_csv(line: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_q = false;
@@ -128,11 +213,14 @@ fn split_csv(line: &str) -> Vec<String> {
         }
     }
     out.push(cur);
-    out
+    (!in_q).then_some(out)
 }
 
 fn err(message: impl Into<String>, line: usize) -> ParseError {
-    ParseError { message: message.into(), line: Some(line) }
+    ParseError {
+        message: message.into(),
+        line: Some(line),
+    }
 }
 
 // ---- rendering -----------------------------------------------------------
@@ -170,21 +258,7 @@ fn gradient_tag(s: &Sankey) -> String {
 
 pub(crate) fn render_svg(s: &Sankey) -> String {
     let n = s.nodes.len();
-    // Longest-path layer per node (Bellman-Ford-style relaxation, capped so a
-    // cycle can't loop forever).
-    let mut layer = vec![0usize; n];
-    for _ in 0..n {
-        let mut changed = false;
-        for l in &s.links {
-            if layer[l.to] < layer[l.from] + 1 {
-                layer[l.to] = layer[l.from] + 1;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    let layer = &s.layers;
     let n_layers = layer.iter().copied().max().unwrap_or(0) + 1;
 
     // Node throughput = max(inflow, outflow).
@@ -194,13 +268,41 @@ pub(crate) fn render_svg(s: &Sankey) -> String {
         outflow[l.from] += l.value;
         inflow[l.to] += l.value;
     }
-    let throughput: Vec<f64> =
-        (0..n).map(|i| inflow[i].max(outflow[i]).max(1e-9)).collect();
+    let throughput: Vec<f64> = (0..n)
+        .map(|i| inflow[i].max(outflow[i]).max(1e-9))
+        .collect();
 
     // Group node indices by layer.
     let mut cols: Vec<Vec<usize>> = vec![Vec::new(); n_layers];
     for i in 0..n {
         cols[layer[i]].push(i);
+    }
+
+    // Final-column captions face left; the preceding column's captions
+    // face right into the same gap. Reserve both complete captions there,
+    // including the numeric totals, instead of merely widening the canvas.
+    let caption_width: Vec<f64> = cols
+        .iter()
+        .map(|column| {
+            column
+                .iter()
+                .map(|&i| {
+                    let name = measure::literal_overlap_width(&s.nodes[i], 13.0);
+                    let value = format!("{}", throughput[i].round() as i64);
+                    name.max(measure::literal_overlap_width(&value, 11.0))
+                })
+                .fold(0.0, f64::max)
+        })
+        .collect();
+    let mut column_x = vec![PAD; n_layers];
+    for column in 1..n_layers {
+        let opposing = if column + 1 == n_layers {
+            caption_width[column]
+        } else {
+            0.0
+        };
+        let gap = COL_GAP.max(caption_width[column - 1] + opposing + 20.0);
+        column_x[column] = column_x[column - 1] + NODE_W + gap;
     }
 
     // Vertical scale: size the busiest column to fit HEIGHT.
@@ -218,13 +320,36 @@ pub(crate) fn render_svg(s: &Sankey) -> String {
 
     // Place nodes: x by layer, y stacked (column centered vertically).
     let mut placed: Vec<Placed> = (0..n)
-        .map(|i| Placed { x: 0.0, y: 0.0, h: (throughput[i] * scale).max(MIN_LINK_H), layer: layer[i] })
+        .map(|i| Placed {
+            x: 0.0,
+            y: 0.0,
+            h: (throughput[i] * scale).max(36.0),
+            layer: layer[i],
+        })
         .collect();
+    // A node must accommodate each ribbon's minimum visible thickness too.
+    let mut incoming_h = vec![0.0_f64; n];
+    let mut outgoing_h = vec![0.0_f64; n];
+    for link in &s.links {
+        let h = (link.value * scale).max(MIN_LINK_H);
+        outgoing_h[link.from] += h;
+        incoming_h[link.to] += h;
+    }
+    for (i, p) in placed.iter_mut().enumerate() {
+        p.h = p.h.max(incoming_h[i]).max(outgoing_h[i]);
+    }
+    let height = cols
+        .iter()
+        .map(|column| {
+            column.iter().map(|&i| placed[i].h).sum::<f64>()
+                + column.len().saturating_sub(1) as f64 * V_GAP
+        })
+        .fold(HEIGHT, f64::max);
     for (li, c) in cols.iter().enumerate() {
-        let col_h: f64 =
-            c.iter().map(|&i| placed[i].h).sum::<f64>() + (c.len() as f64 - 1.0).max(0.0) * V_GAP;
-        let mut y = PAD + (HEIGHT - col_h) / 2.0;
-        let x = PAD + li as f64 * (NODE_W + COL_GAP);
+        let col_h =
+            c.iter().map(|&i| placed[i].h).sum::<f64>() + c.len().saturating_sub(1) as f64 * V_GAP;
+        let mut y = PAD + (height - col_h) / 2.0;
+        let x = column_x[li];
         for &i in c {
             placed[i].x = x;
             placed[i].y = y;
@@ -265,8 +390,8 @@ pub(crate) fn render_svg(s: &Sankey) -> String {
         }
     }
 
-    let total_w = PAD + (n_layers as f64) * (NODE_W + COL_GAP) - COL_GAP + PAD + max_label_w(s);
-    let total_h = HEIGHT + 2.0 * PAD;
+    let total_w = column_x[n_layers - 1] + NODE_W + PAD + max_label_w(s);
+    let total_h = height + 2.0 * PAD;
     let mut out = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total_w:.0} {total_h:.0}" width="{total_w:.0}" height="{total_h:.0}" style="font-family:sans-serif;font-size:13px">"#
     );
@@ -323,8 +448,11 @@ pub(crate) fn render_svg(s: &Sankey) -> String {
         // Label: to the right for the last layer, otherwise to the right of the
         // bar too — but flip to the left when the node is in the final column.
         let last = p.layer + 1 == n_layers;
-        let (lx, anchor) =
-            if last { (p.x - 5.0, "end") } else { (p.x + NODE_W + 5.0, "start") };
+        let (lx, anchor) = if last {
+            (p.x - 5.0, "end")
+        } else {
+            (p.x + NODE_W + 5.0, "start")
+        };
         let cy = p.y + p.h / 2.0;
         // Name on top, value beneath (Mermaid labels each node with its total).
         out.push_str(&format!(
@@ -344,7 +472,11 @@ pub(crate) fn render_svg(s: &Sankey) -> String {
 }
 
 fn max_label_w(s: &Sankey) -> f64 {
-    s.nodes.iter().map(|nm| measure::text_size(nm).0).fold(0.0_f64, f64::max) + 10.0
+    s.nodes
+        .iter()
+        .map(|name| measure::literal_overlap_width(name, 13.0))
+        .fold(0.0_f64, f64::max)
+        + 10.0
 }
 
 #[cfg(test)]
@@ -356,7 +488,10 @@ mod tests {
         let s = parse("sankey-beta\n A,B,5\n A,C,3\n B,C,2").unwrap();
         assert_eq!(s.nodes, vec!["A", "B", "C"]);
         assert_eq!(s.links.len(), 3);
-        assert_eq!((s.links[0].from, s.links[0].to, s.links[0].value), (0, 1, 5.0));
+        assert_eq!(
+            (s.links[0].from, s.links[0].to, s.links[0].value),
+            (0, 1, 5.0)
+        );
         assert_eq!((s.links[2].from, s.links[2].to), (1, 2));
     }
 
@@ -395,8 +530,14 @@ mod tests {
         let def_start = svg.find(r#"<linearGradient id="sk"#).expect("gradient def");
         let id_start = def_start + r#"<linearGradient id=""#.len();
         let id = &svg[id_start..id_start + svg[id_start..].find('"').unwrap()];
-        assert!(id.ends_with("-0") && id.len() == "sk".len() + 6 + 2, "gradient id shape: {id}");
-        assert!(svg.contains(&format!(r#"fill="url(#{id})""#)), "ribbon gradient fill: {svg}");
+        assert!(
+            id.ends_with("-0") && id.len() == "sk".len() + 6 + 2,
+            "gradient id shape: {id}"
+        );
+        assert!(
+            svg.contains(&format!(r#"fill="url(#{id})""#)),
+            "ribbon gradient fill: {svg}"
+        );
         // Each node is labeled with its value (Coal outflow 25).
         assert!(svg.contains(">25<"), "node value label: {svg}");
     }
@@ -408,5 +549,75 @@ mod tests {
         let svg = render_svg(&s);
         // Three distinct x columns → node A leftmost, C rightmost.
         assert!(svg.contains("<svg"));
+    }
+
+    #[test]
+    fn opposing_captions_reserve_combined_width_and_remain_inside() {
+        let wide_source = "W".repeat(40);
+        let wide_target = "M".repeat(40);
+        for source in [
+            format!("sankey-beta\n{wide_source},{wide_target},1"),
+            "sankey-beta\nA,B,1000000000000".to_string(),
+            format!("sankey-beta\n{wide_source},Middle,1\nMiddle,{wide_target},1"),
+        ] {
+            let svg = crate::render(&source).svg.expect("valid Sankey renders");
+            crate::extent::assert_inside(&svg);
+            let (_, drawn) = crate::extent::scan(&svg);
+            let labels: Vec<_> = drawn.iter().filter(|item| item.tag == "text").collect();
+            for (index, left) in labels.iter().enumerate() {
+                for right in labels.iter().skip(index + 1) {
+                    assert!(
+                        left.bbox.overlap(&right.bbox) <= 0.1,
+                        "captions overlap: {:?} and {:?} for {source}",
+                        left,
+                        right
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn literal_break_spellings_and_fallback_names_fit_opposing_caption_space() {
+        let mut cases: Vec<(String, String)> = ["<br/>", "<br>", "<br />"]
+            .into_iter()
+            .map(|spelling| {
+                (
+                    ("W".to_string() + spelling).repeat(20),
+                    ("M".to_string() + spelling).repeat(20),
+                )
+            })
+            .collect();
+        cases.push(("ДΩé가क्‍ष".repeat(20), "မြန်မာ가".repeat(20)));
+        for (source_name, target_name) in cases {
+            let source = format!("sankey-beta\n{source_name},{target_name},1");
+            let svg = crate::render(&source)
+                .svg
+                .expect("literal Sankey names render");
+            let (view, drawn) = crate::extent::scan(&svg);
+            let source = drawn
+                .iter()
+                .find(|item| item.tag == "text" && item.text == source_name)
+                .expect("complete literal source name");
+            let target = drawn
+                .iter()
+                .find(|item| item.tag == "text" && item.text == target_name)
+                .expect("complete literal target name");
+            // The generic SVG checker splits HTML-style breaks when measuring
+            // text. Here both names are escaped literal text: derive each
+            // complete caption's width at its actual emitted font size.
+            let source_left = source.bbox.x0;
+            let source_right = source_left + measure::literal_overlap_width(&source_name, 13.0);
+            let target_right = target.bbox.x1;
+            let target_left = target_right - measure::literal_overlap_width(&target_name, 13.0);
+            assert!(
+                source_right < target_left,
+                "literal captions overlap: {source_name} and {target_name}"
+            );
+            assert!(
+                source_left >= view.x0 && target_right <= view.x1,
+                "literal captions leave the canvas"
+            );
+        }
     }
 }

@@ -42,7 +42,11 @@ const VARS: &[(&str, &str, &str)] = &[
     ("var(--mermaid-gantt-active, #bfc7ff)", "#bfc7ff", "#8F99E6"),
     ("var(--mermaid-gantt-done, #b8b8b8)", "#b8b8b8", "#5A5A5A"),
     ("var(--mermaid-gantt-crit, #ff6b6b)", "#ff6b6b", "#C95A5A"),
-    ("var(--mermaid-gantt-band, #00000010)", "#00000010", "#ffffff10"),
+    (
+        "var(--mermaid-gantt-band, #00000010)",
+        "#00000010",
+        "#ffffff10",
+    ),
     // Edge/relationship-label mask (ER, flowchart). Dark mirrors --surface
     // in tokens-dark.css so labels stay legible on the dark canvas.
     ("var(--surface, #fff)", "#ffffff", "#2A2A2A"),
@@ -70,7 +74,11 @@ fn main() {
             }
             "-o" | "--out" => {
                 i += 1;
-                out = Some(args.get(i).cloned().unwrap_or_else(|| die("--out needs a path")));
+                out = Some(
+                    args.get(i)
+                        .cloned()
+                        .unwrap_or_else(|| die("--out needs a path")),
+                );
             }
             "-t" | "--theme" => {
                 i += 1;
@@ -82,7 +90,11 @@ fn main() {
             }
             "--bg" => {
                 i += 1;
-                bg = Some(args.get(i).cloned().unwrap_or_else(|| die("--bg needs a color")));
+                bg = Some(
+                    args.get(i)
+                        .cloned()
+                        .unwrap_or_else(|| die("--bg needs a color")),
+                );
             }
             other if other.starts_with('-') && other != "-" => {
                 die(&format!("unknown option: {other}"));
@@ -109,7 +121,13 @@ fn main() {
             .unwrap_or_else(|e| die(&format!("failed to read {path}: {e}"))),
     };
 
-    let bg = bg.unwrap_or_else(|| if dark { BG_DARK.into() } else { BG_LIGHT.into() });
+    let bg = bg.unwrap_or_else(|| {
+        if dark {
+            BG_DARK.into()
+        } else {
+            BG_LIGHT.into()
+        }
+    });
 
     let rendered = ogrenotes_mermaid::render(&source);
     // Faithful to the app: a successful render themes the SVG; a parse error
@@ -126,7 +144,10 @@ fn main() {
                 },
                 None => "renderer produced no SVG".to_string(),
             };
-            (error_card(rendered.kind.label(), &msg, &source, dark, &bg), Some(msg))
+            (
+                error_card(rendered.kind.label(), &msg, &source, dark, &bg),
+                Some(msg),
+            )
         }
     };
 
@@ -212,13 +233,30 @@ fn theme(svg: &str, dark: bool, bg: &str) -> String {
                     .unwrap();
                 if root && bg != "none" {
                     let mut rect = BytesStart::new("rect");
-                    rect.extend_attributes([
-                        ("x", "0"),
-                        ("y", "0"),
-                        ("width", "100%"),
-                        ("height", "100%"),
-                        ("fill", bg),
-                    ]);
+                    // Some renderers expand their viewBox into negative
+                    // coordinates for titles or long labels. Cover that
+                    // actual canvas rather than a rectangle starting at 0.
+                    let bounds = tag
+                        .attributes()
+                        .map(Result::unwrap)
+                        .find(|attribute| attribute.key.as_ref() == b"viewBox")
+                        .and_then(|attribute| {
+                            attribute.unescape_value().ok().map(|v| v.into_owned())
+                        })
+                        .map(|value| {
+                            value
+                                .split_whitespace()
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|values| values.len() == 4)
+                        .unwrap_or_else(|| {
+                            vec!["0".into(), "0".into(), "100%".into(), "100%".into()]
+                        });
+                    for (name, value) in ["x", "y", "width", "height"].iter().zip(&bounds) {
+                        rect.push_attribute((*name, value.as_str()));
+                    }
+                    rect.push_attribute(("fill", bg));
                     writer.write_event(Event::Empty(rect)).unwrap();
                 }
                 root = false;
@@ -255,7 +293,9 @@ fn error_card(kind: &str, message: &str, source: &str, dark: bool, bg: &str) -> 
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:14px">"#
     );
     if bg != "none" {
-        out.push_str(&format!(r#"<rect x="0" y="0" width="100%" height="100%" fill="{bg}"/>"#));
+        out.push_str(&format!(
+            r#"<rect x="0" y="0" width="100%" height="100%" fill="{bg}"/>"#
+        ));
     }
     let mut y = pad + 14.0;
     out.push_str(&format!(
@@ -280,7 +320,10 @@ fn error_card(kind: &str, message: &str, source: &str, dark: bool, bg: &str) -> 
 }
 
 fn escape_xml(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// Prefer librsvg. Preserve ImageMagick installations whose SVG delegate
@@ -437,3 +480,16 @@ OPTIONS:
     PNG uses rsvg-convert (Debian/Ubuntu: librsvg2-bin), or ImageMagick\n\
 with an SVG delegate supporting clipping, masks and paint order.
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::theme;
+
+    #[test]
+    fn background_covers_the_actual_negative_origin_canvas() {
+        let svg = r#"<svg viewBox="-30 -40 200 100" width="200" height="100"><text x="0" y="0">Title</text></svg>"#;
+        let image = theme(svg, false, "#fff");
+        assert!(image.contains(r##"<rect x="-30" y="-40" width="200" height="100" fill="#fff"/>"##));
+        assert!(!theme(svg, false, "none").contains("<rect"));
+    }
+}

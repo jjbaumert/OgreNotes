@@ -7,6 +7,96 @@
 
 use std::time::{Duration, Instant};
 
+#[test]
+fn deeply_nested_generic_members_remain_bounded() {
+    let member = format!("{}int{} value", "List~".repeat(700), "~".repeat(700));
+    let source = format!("classDiagram\nclass A {{\n+{member}\n}}");
+    let start = Instant::now();
+    let output = ogrenotes_mermaid::render(&source);
+    assert!(output.svg.is_some(), "{:?}", output.error);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "generic parsing took {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn sankey_and_dense_class_diagrams_finish_within_budget() {
+    let mut sankey = String::from("sankey-beta\n");
+    for source in 0..40 {
+        for target in 0..20 {
+            sankey.push_str(&format!("s{source},t{target},1\n"));
+        }
+    }
+    let mut class = String::from("classDiagram\n");
+    for index in 0..60 {
+        class.push_str(&format!("class C{index}\n"));
+    }
+    let mut edges = 0;
+    for distance in 1..60 {
+        for from in 0..60 - distance {
+            if edges == 989 {
+                break;
+            }
+            class.push_str(&format!("C{from} --> C{}\n", from + distance));
+            edges += 1;
+        }
+    }
+    assert_eq!(edges, 989);
+    for source in [sankey, class] {
+        assert!(source.chars().count() <= ogrenotes_mermaid::MAX_SOURCE_LEN);
+        let start = Instant::now();
+        let output = ogrenotes_mermaid::render(&source);
+        assert!(output.svg.is_some(), "{:?}", output.error);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "render took {:?}",
+            start.elapsed()
+        );
+    }
+}
+
+#[test]
+fn at_cap_chain_with_return_edges_has_a_bounded_scaled_waypoint_budget() {
+    let mut source = String::from("flowchart TD\n");
+    for index in 0..399 {
+        source.push_str(&format!("n{index} --> n{}\n", index + 1));
+    }
+    for index in 1..400 {
+        source.push_str(&format!("n{index} --> n0\n"));
+    }
+    for labeled in [false, true] {
+        let candidate = if labeled {
+            source.replacen("n0 --> n1", "n0 -->|label| n1", 1)
+        } else {
+            source.clone()
+        };
+        let start = Instant::now();
+        let output = ogrenotes_mermaid::render(&candidate);
+        if labeled {
+            // Doubling every rank would materialize 159,600 waypoints and
+            // exceed the independent 8 MB SVG backstop. Reject that resource
+            // case before allocation; input caps do not waive output caps.
+            assert!(
+                output
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.message.contains("edge waypoints")),
+                "{:?}",
+                output.error
+            );
+        } else {
+            assert!(output.svg.is_some(), "{:?}", output.error);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "labeled={labeled} render took {:?}",
+            start.elapsed()
+        );
+    }
+}
+
 /// 400 nodes / ~600 edges: the layout caps (`layout/mod.rs`). A
 /// superlinear regression inside the caps shows up here long before it
 /// shows up as a hung request.
@@ -28,7 +118,11 @@ fn at_cap_flowchart_renders_under_budget() {
     let started = Instant::now();
     let out = ogrenotes_mermaid::render(&src);
     let elapsed = started.elapsed();
-    assert!(out.svg.is_some(), "at-cap flowchart must render: {:?}", out.error);
+    assert!(
+        out.svg.is_some(),
+        "at-cap flowchart must render: {:?}",
+        out.error
+    );
     assert!(
         elapsed < Duration::from_secs(5),
         "at-cap flowchart took {elapsed:?} (budget 5s, loose for CI)"
@@ -50,7 +144,10 @@ fn deeply_nested_c4_boundaries_return_instead_of_overflowing() {
     for _ in 0..depth {
         src.push_str("}\n");
     }
-    assert!(src.len() < ogrenotes_mermaid::MAX_SOURCE_LEN, "fixture must be under the source cap");
+    assert!(
+        src.len() < ogrenotes_mermaid::MAX_SOURCE_LEN,
+        "fixture must be under the source cap"
+    );
     let out = ogrenotes_mermaid::render(&src);
     assert!(out.error.unwrap().message.contains("nested too deeply"));
 }
@@ -122,7 +219,8 @@ fn tiny_sources_render_in_bounded_time_and_size() {
         assert!(started.elapsed() < Duration::from_secs(2), "{src}");
     }
     // Durations beyond the four-digit calendar are refused outright.
-    let out = ogrenotes_mermaid::render("gantt\nsection s\nt :a1, 2024-01-01, 99999999999999999999d\n");
+    let out =
+        ogrenotes_mermaid::render("gantt\nsection s\nt :a1, 2024-01-01, 99999999999999999999d\n");
     assert!(out.error.is_some());
 }
 
@@ -137,5 +235,9 @@ fn at_cap_output_is_well_under_the_svg_backstop() {
         src.push_str(&format!("    n{i} --> n{}\n", i + 1));
     }
     let svg = ogrenotes_mermaid::render(&src).svg.unwrap();
-    assert!(svg.len() < ogrenotes_mermaid::MAX_SVG_BYTES / 8, "{} bytes", svg.len());
+    assert!(
+        svg.len() < ogrenotes_mermaid::MAX_SVG_BYTES / 8,
+        "{} bytes",
+        svg.len()
+    );
 }

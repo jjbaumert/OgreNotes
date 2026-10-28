@@ -648,7 +648,7 @@ impl Parser {
                 let mut best: Option<(usize, &str, ShapeKind)> = None;
                 for (closer, shape) in *closers {
                     if let Some(i) = body_start.find(closer) {
-                        if best.map_or(true, |(bi, _, _)| i < bi) {
+                        if best.is_none_or(|(bi, _, _)| i < bi) {
                             best = Some((i, closer, *shape));
                         }
                     }

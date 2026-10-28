@@ -42,7 +42,10 @@ pub(crate) fn parse(source: &str) -> Result<Packet, ParseError> {
         if !seen_header {
             let h = line.strip_suffix(';').unwrap_or(line).trim_end();
             if h != "packet-beta" && h != "packet" {
-                return Err(err("packet diagram must start with `packet` or `packet-beta`", line_no));
+                return Err(err(
+                    "packet diagram must start with `packet` or `packet-beta`",
+                    line_no,
+                ));
             }
             seen_header = true;
             continue;
@@ -56,10 +59,11 @@ pub(crate) fn parse(source: &str) -> Result<Packet, ParseError> {
         };
         let range = range.trim();
         let (start, end) = if let Some(length) = range.strip_prefix('+') {
-            let length: usize =
-                length.parse().ok().filter(|n| *n > 0).ok_or_else(|| {
-                    err("relative packet length must be a positive integer", line_no)
-                })?;
+            let length: usize = length
+                .parse()
+                .ok()
+                .filter(|n| *n > 0 && length.bytes().all(|b| b.is_ascii_digit()))
+                .ok_or_else(|| err("relative packet length must be a positive integer", line_no))?;
             let start = fields.last().map_or(0, |field| field.end + 1);
             let end = start
                 .checked_add(length - 1)
@@ -77,7 +81,10 @@ pub(crate) fn parse(source: &str) -> Result<Packet, ParseError> {
             return Err(err("packet field start bit must be <= end bit", line_no));
         }
         if end >= MAX_BITS {
-            return Err(err(format!("packet too large: bit {end} >= {MAX_BITS}"), line_no));
+            return Err(err(
+                format!("packet too large: bit {end} >= {MAX_BITS}"),
+                line_no,
+            ));
         }
         if fields
             .iter()
@@ -85,9 +92,23 @@ pub(crate) fn parse(source: &str) -> Result<Packet, ParseError> {
         {
             return Err(err("packet fields must not overlap", line_no));
         }
+        let expected = fields.last().map_or(0, |field| field.end + 1);
+        if start != expected {
+            return Err(err(
+                format!("packet fields must be contiguous: expected bit {expected}"),
+                line_no,
+            ));
+        }
         let label = label.trim();
-        let label = label.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(label);
-        fields.push(Field { start, end, label: label.to_string() });
+        let label = label
+            .strip_prefix('"')
+            .and_then(|x| x.strip_suffix('"'))
+            .unwrap_or(label);
+        fields.push(Field {
+            start,
+            end,
+            label: label.to_string(),
+        });
     }
     if !seen_header {
         return Err(ParseError {
@@ -100,17 +121,26 @@ pub(crate) fn parse(source: &str) -> Result<Packet, ParseError> {
 
 /// `start-end` or a single `bit`.
 fn parse_range(s: &str) -> Option<(usize, usize)> {
+    let bit = |token: &str| {
+        let token = token.trim();
+        (!token.is_empty() && token.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| token.parse::<usize>().ok())
+            .flatten()
+    };
     match s.split_once('-') {
-        Some((a, b)) => Some((a.trim().parse().ok()?, b.trim().parse().ok()?)),
+        Some((a, b)) => Some((bit(a)?, bit(b)?)),
         None => {
-            let b: usize = s.parse().ok()?;
+            let b = bit(s)?;
             Some((b, b))
         }
     }
 }
 
 fn err(message: impl Into<String>, line: usize) -> ParseError {
-    ParseError { message: message.into(), line: Some(line) }
+    ParseError {
+        message: message.into(),
+        line: Some(line),
+    }
 }
 
 pub(crate) fn render_svg(p: &Packet) -> String {
@@ -135,7 +165,10 @@ pub(crate) fn render_svg(p: &Packet) -> String {
     let bit_xy = |bit: usize| {
         let r = bit / BITS_PER_ROW;
         let col = bit % BITS_PER_ROW;
-        (PAD + col as f64 * BIT_W, top + ROW_GAP + r as f64 * row_pitch)
+        (
+            PAD + col as f64 * BIT_W,
+            top + ROW_GAP + r as f64 * row_pitch,
+        )
     };
 
     for f in &p.fields {
@@ -215,9 +248,25 @@ mod tests {
     fn field_crossing_a_row_boundary_splits() {
         // A field spanning bits 30..33 crosses the 32-bit row boundary → two
         // rects (one per row).
-        let svg = render_svg(&parse("packet\n 30-33: \"Split\"").unwrap());
-        assert!(svg.matches("<rect").count() >= 2, "field must split across rows: {svg}");
-        assert!(svg.contains(">Split<"));
+        let svg = render_svg(&parse("packet\n 0-29: \"Prefix\"\n 30-33: \"Split\"").unwrap());
+        assert_eq!(
+            svg.matches("<rect").count(),
+            3,
+            "prefix plus two row segments"
+        );
+        for (x, y) in [(800.0, 36.0), (20.0, 92.0)] {
+            assert!(
+                svg.contains(&format!(
+                    r#"<rect x="{x:.1}" y="{y:.1}" width="52.0" height="40.0""#
+                )),
+                "missing two-bit row segment: {svg}"
+            );
+        }
+        assert_eq!(
+            svg.matches(">Split</text>").count(),
+            1,
+            "the field caption is painted once"
+        );
     }
 
     #[test]
