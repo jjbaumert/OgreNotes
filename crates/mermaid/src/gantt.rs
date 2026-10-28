@@ -3,10 +3,10 @@
 //! Dates use the default `YYYY-MM-DD` format. Unsupported date/calendar
 //! directives are rejected explicitly. Dates become integer day numbers via
 //! the civil-calendar algorithm. Task starts may be a date or `after
-//! <id>...`; ends may be a date or a `<n>d|w|h` duration. The time axis is
+//! <id>...`; ends may be a date, `until <id>...`, or a duration. The time axis is
 //! scaled to a fixed chart width so any date range fits a bounded canvas.
 
-use crate::{escape_xml, ParseError};
+use crate::{escape_xml, measure, ParseError};
 use std::collections::HashMap;
 
 const MAX_TASKS: usize = 200;
@@ -30,6 +30,7 @@ pub(crate) struct Task {
     pub end: f64,
     pub status: Status,
     pub milestone: bool,
+    pub critical: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -89,7 +90,13 @@ fn parse_date(s: &str) -> Option<f64> {
     // is rejected instead of silently normalising into March.
     let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
     let max_day = match m {
-        2 => if leap { 29 } else { 28 },
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
         4 | 6 | 9 | 11 => 30,
         _ => 31,
     };
@@ -99,27 +106,190 @@ fn parse_date(s: &str) -> Option<f64> {
     Some(days_from_civil(y, m, d) as f64)
 }
 
-/// `<n>d|w|h` (or a bare `<n>`, treated as days) -> length in days.
+/// Fixed-length durations in days. Calendar months/years are resolved against
+/// the actual task start below. Day/week decimals follow dayjs rounding.
 fn parse_duration(s: &str) -> Option<f64> {
-    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let split = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
     let (num, unit) = s.split_at(split);
-    let n: f64 = num.parse().ok()?;
+    if num.is_empty() || num.starts_with('.') || num.ends_with('.') {
+        return None;
+    }
+    let n = crate::parse_number(num)?;
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
     match unit {
-        "" | "d" => Some(n),
-        "w" => Some(n * 7.0),
+        "" | "d" => Some(n.round()),
+        "w" => Some((n * 7.0).round()),
         "h" => Some(n / 24.0),
+        "m" => Some(n / 1440.0),
+        "s" => Some(n / 86400.0),
+        "ms" => Some(n / 86400000.0),
         _ => None,
     }
 }
 
+fn duration_end(s: &str, start: f64) -> Option<f64> {
+    if let Some(days) = parse_duration(s) {
+        return Some(start + days);
+    }
+    let (unit, multiplier) = if s.ends_with('M') {
+        ('M', 1.0)
+    } else if s.ends_with('y') {
+        ('y', 12.0)
+    } else {
+        return None;
+    };
+    let number = s.strip_suffix(unit)?;
+    if number.is_empty()
+        || number.starts_with('.')
+        || number.ends_with('.')
+        || !number.chars().all(|c| c.is_ascii_digit() || c == '.')
+    {
+        return None;
+    }
+    let n = crate::parse_number(number)?;
+    if !(0.0..=120000.0).contains(&n) {
+        return None;
+    }
+    let (y, m, d) = civil_from_days(start.floor() as i64);
+    let months = y * 12 + m - 1 + n.trunc() as i64 * multiplier as i64;
+    let (ny, nm) = (months.div_euclid(12), months.rem_euclid(12) + 1);
+    if !(0..=9999).contains(&ny) {
+        return None;
+    }
+    let next_month = if nm == 12 {
+        days_from_civil(ny + 1, 1, 1)
+    } else {
+        days_from_civil(ny, nm + 1, 1)
+    };
+    let max_day = next_month - days_from_civil(ny, nm, 1);
+    Some(days_from_civil(ny, nm, d.min(max_day)) as f64 + (start - start.floor()))
+}
+
+#[derive(Clone)]
+struct PendingTask {
+    name: String,
+    section: usize,
+    start: Option<String>,
+    end: Option<String>,
+    status: Status,
+    critical: bool,
+    milestone: bool,
+    line: usize,
+}
+
+#[derive(Clone, Copy)]
+enum DatePart {
+    Start = 0,
+    End = 1,
+}
+
+/// A start and an end are separate dependency values: `until b` needs only
+/// b's start, whereas `after b` needs its end. Caching whole tasks invents
+/// cycles between otherwise independent dates.
+struct DateResolver<'a> {
+    tasks: &'a [PendingTask],
+    ids: &'a HashMap<String, usize>,
+    dates: Vec<[Option<f64>; 2]>,
+    visiting: Vec<[bool; 2]>,
+}
+
+impl<'a> DateResolver<'a> {
+    fn new(tasks: &'a [PendingTask], ids: &'a HashMap<String, usize>) -> Self {
+        Self {
+            tasks,
+            ids,
+            dates: vec![[None; 2]; tasks.len()],
+            visiting: vec![[false; 2]; tasks.len()],
+        }
+    }
+
+    fn reference_dates(
+        &mut self,
+        references: &str,
+        part: DatePart,
+        line: usize,
+    ) -> Result<f64, ParseError> {
+        let mut result: Option<f64> = None;
+        for id in references.split_whitespace() {
+            let &other = self
+                .ids
+                .get(id)
+                .ok_or_else(|| err(format!("unknown task `{id}` in Gantt dependency"), line))?;
+            let date = self.resolve(other, part)?;
+            result = Some(result.map_or(date, |value| match part {
+                DatePart::Start => value.min(date),
+                DatePart::End => value.max(date),
+            }));
+        }
+        result.ok_or_else(|| err("Gantt dependency needs a task id", line))
+    }
+
+    fn resolve(&mut self, index: usize, part: DatePart) -> Result<f64, ParseError> {
+        let slot = part as usize;
+        if let Some(date) = self.dates[index][slot] {
+            return Ok(date);
+        }
+        let line = self.tasks[index].line;
+        if self.visiting[index][slot] {
+            return Err(err("cyclic Gantt task dependency", line));
+        }
+        self.visiting[index][slot] = true;
+        let spec = match part {
+            DatePart::Start => self.tasks[index].start.clone(),
+            DatePart::End => self.tasks[index].end.clone(),
+        };
+        let date = match (part, spec.as_deref()) {
+            (DatePart::Start, Some(spec)) if spec.starts_with("after ") => {
+                self.reference_dates(&spec[6..], DatePart::End, line)?
+            }
+            (DatePart::Start, Some(spec)) => {
+                parse_date(spec).ok_or_else(|| err(format!("invalid start date {spec:?}"), line))?
+            }
+            (DatePart::Start, None) if index > 0 => self.resolve(index - 1, DatePart::End)?,
+            (DatePart::Start, None) => {
+                return Err(err(
+                    "a task with no start date must follow another task",
+                    line,
+                ))
+            }
+            (DatePart::End, None) => self.resolve(index, DatePart::Start)?,
+            (DatePart::End, Some(spec)) if spec.starts_with("until ") => {
+                self.reference_dates(&spec[6..], DatePart::Start, line)?
+            }
+            (DatePart::End, Some(spec)) => match parse_date(spec) {
+                Some(date) => date,
+                None => {
+                    let start = self.resolve(index, DatePart::Start)?;
+                    duration_end(spec, start).ok_or_else(|| {
+                        err(format!("invalid end date or duration {spec:?}"), line)
+                    })?
+                }
+            },
+        };
+        if !date.is_finite() || date > days_from_civil(9999, 12, 31) as f64 {
+            return Err(err("task ends after the year 9999", line));
+        }
+        self.visiting[index][slot] = false;
+        self.dates[index][slot] = Some(date);
+        Ok(date)
+    }
+}
+
 fn err(message: impl Into<String>, line: usize) -> ParseError {
-    ParseError { message: message.into(), line: Some(line) }
+    ParseError {
+        message: message.into(),
+        line: Some(line),
+    }
 }
 
 pub(crate) fn parse(source: &str) -> Result<Gantt, ParseError> {
     let mut title = None;
     let mut sections: Vec<String> = Vec::new();
-    let mut tasks: Vec<Task> = Vec::new();
+    let mut pending: Vec<PendingTask> = Vec::new();
     let mut ids: HashMap<String, usize> = HashMap::new();
     let mut cur_section: Option<usize> = None;
     let mut seen_header = false;
@@ -161,9 +331,15 @@ pub(crate) fn parse(source: &str) -> Result<Gantt, ParseError> {
 
         // Task line: `Name : metadata`.
         let Some((name, meta)) = line.split_once(':') else {
-            return Err(err(format!("expected `Task : metadata`, found {line:?}"), line_no));
+            return Err(err(
+                format!("expected `Task : metadata`, found {line:?}"),
+                line_no,
+            ));
         };
         let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(err("Gantt task needs a name", line_no));
+        }
         let section = match cur_section {
             Some(s) => s,
             None => {
@@ -177,15 +353,19 @@ pub(crate) fn parse(source: &str) -> Result<Gantt, ParseError> {
         let mut i = 0;
         let mut status = Status::Normal;
         let mut milestone = false;
+        let mut critical = false;
         while i < toks.len() {
             match toks[i] {
                 "done" => status = Status::Done,
                 "active" => status = Status::Active,
-                "crit" => status = Status::Crit,
+                "crit" => critical = true,
                 "milestone" => milestone = true,
                 _ => break,
             }
             i += 1;
+        }
+        if critical && status == Status::Normal {
+            status = Status::Crit;
         }
         let rest = &toks[i..];
         if rest.is_empty() || rest[0].is_empty() {
@@ -211,55 +391,33 @@ pub(crate) fn parse(source: &str) -> Result<Gantt, ParseError> {
                 (None, None, Some(rest[0]))
             };
 
-        let start = match start_spec {
-            Some(s) if s.starts_with("after ") => {
-                let after = s.strip_prefix("after ").unwrap();
-                let mut acc: Option<f64> = None;
-                for rid in after.split_whitespace() {
-                    let &ti = ids.get(rid).ok_or_else(|| {
-                        err(format!("`after` references unknown task `{rid}`"), line_no)
-                    })?;
-                    let e = tasks[ti].end;
-                    acc = Some(acc.map_or(e, |x| x.max(e)));
-                }
-                acc.ok_or_else(|| err("`after` needs a task id", line_no))?
-            }
-            Some(s) => {
-                parse_date(s).ok_or_else(|| err(format!("invalid start date {s:?}"), line_no))?
-            }
-            // Start omitted → begin when the previous task ends (Mermaid rule).
-            None => tasks.last().map(|t| t.end).ok_or_else(|| {
-                err("a task with no start date must follow another task", line_no)
-            })?,
-        };
-
-        let end = match end_spec {
-            None => start, // a point (milestone-like)
-            Some(e) => {
-                if let Some(date) = parse_date(e) {
-                    date
-                } else if let Some(dur) = parse_duration(e) {
-                    start + dur
-                } else {
-                    return Err(err(format!("invalid end date or duration {e:?}"), line_no));
-                }
-            }
-        };
-
-        if tasks.len() >= MAX_TASKS {
-            return Err(err(format!("gantt too large: more than {MAX_TASKS} tasks"), line_no));
+        let expected = usize::from(id.is_some())
+            + usize::from(start_spec.is_some())
+            + usize::from(end_spec.is_some());
+        if rest.len() != expected {
+            return Err(err("too many Gantt task metadata fields", line_no));
         }
-        let ti = tasks.len();
+        if pending.len() >= MAX_TASKS {
+            return Err(err(
+                format!("gantt too large: more than {MAX_TASKS} tasks"),
+                line_no,
+            ));
+        }
         if let Some(id) = id {
-            ids.insert(id.to_string(), ti);
+            if ids.insert(id.to_string(), pending.len()).is_some() {
+                return Err(err(format!("duplicate Gantt task id `{id}`"), line_no));
+            }
         }
-        // Dates are four-digit years; a duration running past 9999-12-31 is
-        // a typo (or an attempt to make the axis enormous), and a non-finite
-        // one (hundreds of digits parse to infinity) can't be drawn at all.
-        if !end.is_finite() || end > days_from_civil(9999, 12, 31) as f64 {
-            return Err(err("task ends after the year 9999", line_no));
-        }
-        tasks.push(Task { name, section, start, end: end.max(start), status, milestone });
+        pending.push(PendingTask {
+            name,
+            section,
+            start: start_spec.map(str::to_string),
+            end: end_spec.map(str::to_string),
+            status,
+            critical,
+            milestone,
+            line: line_no,
+        });
     }
 
     if !seen_header {
@@ -268,13 +426,38 @@ pub(crate) fn parse(source: &str) -> Result<Gantt, ParseError> {
             line: None,
         });
     }
-    if tasks.is_empty() {
-        return Err(ParseError { message: "gantt has no tasks".into(), line: None });
+    if pending.is_empty() {
+        return Err(ParseError {
+            message: "gantt has no tasks".into(),
+            line: None,
+        });
     }
-    Ok(Gantt { title, sections, tasks })
+    let mut dates = DateResolver::new(&pending, &ids);
+    let mut tasks = Vec::with_capacity(pending.len());
+    for (index, task) in pending.iter().enumerate() {
+        let start = dates.resolve(index, DatePart::Start)?;
+        let end = dates.resolve(index, DatePart::End)?;
+        if end < start {
+            return Err(err("task ends before it starts", task.line));
+        }
+        tasks.push(Task {
+            name: task.name.clone(),
+            section: task.section,
+            start,
+            end,
+            status: task.status,
+            critical: task.critical,
+            milestone: task.milestone,
+        });
+    }
+    Ok(Gantt {
+        title,
+        sections,
+        tasks,
+    })
 }
 
-const LEFT: f64 = 80.0; // left margin: section labels only (task names are in-bar)
+const LEFT: f64 = 80.0; // minimum left margin; section captions can widen it
 const CHART_W: f64 = 620.0;
 const ROW_H: f64 = 28.0;
 const BAR_H: f64 = 18.0;
@@ -291,26 +474,76 @@ fn status_fill(s: Status) -> &'static str {
 }
 
 pub(crate) fn render_svg(g: &Gantt) -> String {
-    let min = g.tasks.iter().map(|t| t.start).fold(f64::INFINITY, f64::min);
-    let max = g.tasks.iter().map(|t| t.end).fold(f64::NEG_INFINITY, f64::max);
+    let min = g
+        .tasks
+        .iter()
+        .map(|t| t.start)
+        .fold(f64::INFINITY, f64::min);
+    let max = g
+        .tasks
+        .iter()
+        .map(|t| t.end)
+        .fold(f64::NEG_INFINITY, f64::max);
     let span = (max - min).max(1.0);
     let px = CHART_W / span;
-    let x_of = |day: f64| LEFT + (day - min) * px;
+    let section_width = g
+        .sections
+        .iter()
+        .filter(|label| !label.is_empty())
+        .map(|label| measure::literal_overlap_width(label, 12.0) * 1.04)
+        .fold(0.0, f64::max);
+    // Section captions occupy their own gutter. Task names can overhang short
+    // bars too, so reserve their left overhang whenever a section is present.
+    let left = if section_width > 0.0 {
+        let overhang = g
+            .tasks
+            .iter()
+            .map(|task| {
+                let center = ((task.start + task.end) / 2.0 - min) * px;
+                (measure::literal_overlap_width(&task.name, 12.0) / 2.0 + 2.0 - center).max(0.0)
+            })
+            .fold(0.0, f64::max);
+        LEFT.max(8.0 + section_width + 12.0 + overhang)
+    } else {
+        LEFT
+    };
+    let x_of = |day: f64| left + (day - min) * px;
 
     let n = g.tasks.len();
     // Rows start below the title; the date axis sits BELOW the chart (Mermaid).
     let top = TOP;
     let chart_bottom = top + n as f64 * ROW_H;
-    let w = LEFT + CHART_W + 24.0;
+    let w = left + CHART_W + 24.0;
+    // These labels are XML-escaped and rendered as one literal text run.
+    // Measuring Mermaid <br> lines would underestimate their actual width.
+    let mut min_x = 0.0_f64;
+    let mut max_x =
+        w.max(x_of(max) + measure::literal_overlap_width(&fmt_axis_date(max), 11.0) / 2.0 + 12.0);
+    for section in &g.sections {
+        max_x = max_x.max(measure::literal_overlap_width(section, 12.0) * 1.04 + 20.0);
+    }
+    for task in &g.tasks {
+        let center = x_of((task.start + task.end) / 2.0);
+        let half = measure::literal_overlap_width(&task.name, 12.0) / 2.0 + 12.0;
+        min_x = min_x.min(center - half);
+        max_x = max_x.max(center + half);
+    }
+    if let Some(title) = &g.title {
+        let half = measure::literal_overlap_width(title, 15.0) * 1.04 / 2.0 + 12.0;
+        let center = (min_x + max_x) / 2.0;
+        min_x = min_x.min(center - half);
+        max_x = max_x.max(center + half);
+    }
+    let canvas_w = max_x - min_x;
     let h = chart_bottom + AXIS_H + 12.0;
     let mut svg = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" style="font-family:sans-serif;font-size:12px">"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{min_x:.1} 0 {canvas_w:.1} {h:.0}" width="{canvas_w:.1}" height="{h:.0}" style="font-family:sans-serif;font-size:12px">"#
     );
 
     if let Some(title) = &g.title {
         svg.push_str(&format!(
-            r#"<text x="{:.0}" y="24" text-anchor="middle" fill="currentColor" style="font-size:15px;font-weight:600">{}</text>"#,
-            w / 2.0,
+            r#"<text x="{:.1}" y="24" text-anchor="middle" fill="currentColor" style="font-size:15px;font-weight:600">{}</text>"#,
+            min_x + canvas_w / 2.0,
             escape_xml(title),
         ));
     }
@@ -328,7 +561,7 @@ pub(crate) fn render_svg(g: &Gantt) -> String {
         let band_h = (end_row - row + 1) as f64 * ROW_H;
         if sec.is_multiple_of(2) {
             svg.push_str(&format!(
-                r#"<rect x="0" y="{band_y:.1}" width="{w:.0}" height="{band_h:.1}" fill="var(--mermaid-gantt-section, rgba(102,102,255,0.14))"/>"#
+                r#"<rect x="{min_x:.1}" y="{band_y:.1}" width="{canvas_w:.1}" height="{band_h:.1}" fill="var(--mermaid-gantt-section, rgba(102,102,255,0.14))"/>"#
             ));
         }
         if let Some(name) = g.sections.get(sec) {
@@ -366,12 +599,22 @@ pub(crate) fn render_svg(g: &Gantt) -> String {
     for (i, t) in g.tasks.iter().enumerate() {
         let y = top + i as f64 * ROW_H;
         let cy = y + ROW_H / 2.0;
-        let bx = x_of(t.start);
+        let bx = x_of(if t.milestone {
+            (t.start + t.end) / 2.0
+        } else {
+            t.start
+        });
+        let stroke = if t.critical {
+            "var(--mermaid-gantt-crit, #ff6b6b)"
+        } else {
+            "currentColor"
+        };
+        let stroke_width = if t.critical { 2.0 } else { 0.5 };
         let fill = status_fill(t.status);
         let name_x = if t.milestone {
             let r = BAR_H / 2.0;
             svg.push_str(&format!(
-                r#"<path d="M {bx:.1} {:.1} L {:.1} {cy:.1} L {bx:.1} {:.1} L {:.1} {cy:.1} Z" fill="{fill}" stroke="currentColor"/>"#,
+                r#"<path d="M {bx:.1} {:.1} L {:.1} {cy:.1} L {bx:.1} {:.1} L {:.1} {cy:.1} Z" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}"/>"#,
                 cy - r,
                 bx + r,
                 cy + r,
@@ -381,7 +624,7 @@ pub(crate) fn render_svg(g: &Gantt) -> String {
         } else {
             let bw = ((t.end - t.start) * px).max(2.0);
             svg.push_str(&format!(
-                r#"<rect x="{bx:.1}" y="{:.1}" width="{bw:.1}" height="{BAR_H}" rx="3" fill="{fill}" stroke="currentColor" stroke-width="0.5"/>"#,
+                r#"<rect x="{bx:.1}" y="{:.1}" width="{bw:.1}" height="{BAR_H}" rx="3" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}"/>"#,
                 y + (ROW_H - BAR_H) / 2.0,
             ));
             bx + bw / 2.0
@@ -406,9 +649,108 @@ mod tests {
         parse(src).expect("parse ok")
     }
 
+    #[test]
+    fn section_captions_do_not_overlap_task_bars_or_overhanging_names() {
+        let section = "M".repeat(80);
+        for task in ["Task".to_string(), "W".repeat(160)] {
+            let chart = p(&format!("gantt\nsection {section}\n{task} :2024-01-01, 1d"));
+            let output = render_svg(&chart);
+            let (_, drawn) = crate::extent::scan(&output);
+            let caption = &drawn.iter().find(|item| item.text == section).unwrap().bbox;
+            let task_name = &drawn.iter().find(|item| item.text == task).unwrap().bbox;
+            assert_eq!(
+                caption.overlap(task_name),
+                0.0,
+                "section and task captions overlap"
+            );
+            for bar in drawn.iter().filter(|item| {
+                item.tag == "rect" && (item.bbox.y1 - item.bbox.y0 - BAR_H).abs() < 0.1
+            }) {
+                assert_eq!(
+                    caption.overlap(&bar.bbox),
+                    0.0,
+                    "task bar covers section caption"
+                );
+            }
+        }
+    }
 
+    #[test]
+    fn duration_units_resolve_to_expected_calendar_dates_and_times() {
+        // Expected days/times are independent of the duration parser. Fractions
+        // exercise sub-day precision; dates cover leap and calendar clamping.
+        for (start, duration, end, fraction) in [
+            ("2024-01-01", "1ms", "2024-01-01", 1.0 / 86_400_000.0),
+            ("2024-01-01", "500ms", "2024-01-01", 500.0 / 86_400_000.0),
+            ("2024-01-01", "30s", "2024-01-01", 30.0 / 86_400.0),
+            ("2024-01-01", "1.5s", "2024-01-01", 1.5 / 86_400.0),
+            ("2024-01-01", "90m", "2024-01-01", 90.0 / 1_440.0),
+            ("2024-01-01", "1.5h", "2024-01-01", 1.5 / 24.0),
+            ("2024-02-28", "24h", "2024-02-29", 0.0),
+            ("2024-01-01", "1d", "2024-01-02", 0.0),
+            ("2024-01-01", "1.4d", "2024-01-02", 0.0),
+            ("2024-01-01", "1.5d", "2024-01-03", 0.0),
+            ("2024-01-01", "0.49d", "2024-01-01", 0.0),
+            ("2024-01-01", "0.5d", "2024-01-02", 0.0),
+            ("2024-01-01", "1w", "2024-01-08", 0.0),
+            ("2024-01-01", "0.5w", "2024-01-05", 0.0),
+            ("2024-01-01", "1.5w", "2024-01-12", 0.0),
+            ("2024-01-31", "1M", "2024-02-29", 0.0),
+            ("2023-01-31", "1M", "2023-02-28", 0.0),
+            ("2023-12-31", "2M", "2024-02-29", 0.0),
+            ("2024-01-31", "1.5M", "2024-02-29", 0.0),
+            ("2024-02-29", "1y", "2025-02-28", 0.0),
+            ("2024-02-29", "4y", "2028-02-29", 0.0),
+            ("2024-02-29", "1.5y", "2025-02-28", 0.0),
+            ("2024-02-28", "1d", "2024-02-29", 0.0),
+            ("2023-02-28", "1d", "2023-03-01", 0.0),
+            ("2024-12-31", "1d", "2025-01-01", 0.0),
+        ] {
+            let chart = p(&format!("gantt\nTask :{start}, {duration}"));
+            assert_eq!(
+                chart.tasks[0].start,
+                parse_date(start).unwrap(),
+                "{start} + {duration}"
+            );
+            let expected = parse_date(end).unwrap() + fraction;
+            assert!(
+                (chart.tasks[0].end - expected).abs() < 1e-9,
+                "{start} + {duration}: expected {expected}, got {}",
+                chart.tasks[0].end
+            );
+        }
+    }
 
+    #[test]
+    fn until_multiple_references_uses_the_earliest_start_in_any_order() {
+        for references in ["late early", "early late"] {
+            let chart = p(&format!("gantt\nA :a, 2024-01-01, until {references}\nLate :late, 2024-01-10, 20d\nEarly :early, 2024-01-03, 30d"));
+            assert_eq!(chart.tasks[0].end, parse_date("2024-01-03").unwrap());
+        }
+    }
 
+    #[test]
+    fn calendar_durations_preserve_time_before_the_epoch() {
+        let chart = p("gantt\nStart :start, 1969-01-01, 12h\nMonth :month, after start, 1M\nZero :zero, after start, 0M");
+        let noon = parse_date("1969-01-01").unwrap() + 0.5;
+        assert_eq!(chart.tasks[1].start, noon);
+        assert_eq!(chart.tasks[1].end, parse_date("1969-02-01").unwrap() + 0.5);
+        assert_eq!((chart.tasks[2].start, chart.tasks[2].end), (noon, noon));
+    }
+
+    #[test]
+    fn until_only_requires_the_referenced_start_date() {
+        let chart =
+            p("gantt\nA :a, 2024-01-01, until b\nB :b, 2024-01-03, until c\nC :c, after a, 1d");
+        let jan_1 = parse_date("2024-01-01").unwrap();
+        let jan_3 = parse_date("2024-01-03").unwrap();
+        assert_eq!((chart.tasks[0].start, chart.tasks[0].end), (jan_1, jan_3));
+        assert_eq!((chart.tasks[1].start, chart.tasks[1].end), (jan_3, jan_3));
+        assert_eq!(
+            (chart.tasks[2].start, chart.tasks[2].end),
+            (jan_3, jan_3 + 1.0)
+        );
+    }
 
     #[test]
     fn header_required() {
@@ -424,13 +766,19 @@ mod tests {
         // The span start is labeled (full YYYY-MM-DD) with a vertical gridline.
         assert!(svg.contains(">2024-01-01<"), "axis start date label: {svg}");
         assert!(svg.contains("<line"), "axis gridlines drawn: {svg}");
-        assert_eq!(fmt_axis_date(days_from_civil(2024, 2, 15) as f64), "2024-02-15");
+        assert_eq!(
+            fmt_axis_date(days_from_civil(2024, 2, 15) as f64),
+            "2024-02-15"
+        );
     }
 
     #[test]
     fn date_math() {
         // 2024-01-01 -> 2024-01-08 is 7 days.
-        assert_eq!(parse_date("2024-01-08").unwrap() - parse_date("2024-01-01").unwrap(), 7.0);
+        assert_eq!(
+            parse_date("2024-01-08").unwrap() - parse_date("2024-01-01").unwrap(),
+            7.0
+        );
         // Leap day exists in 2024 but not 2023; impossible days rejected.
         assert!(parse_date("2024-02-29").is_some());
         assert!(parse_date("2023-02-29").is_none());
@@ -543,7 +891,10 @@ mod tests {
         let g = p("gantt\nsection S\nA :a1, 0001-01-01, 9999-12-31\n");
         let svg = render_svg(&g);
         let ticks = svg.matches("opacity=\"0.15\"").count();
-        assert!((2..=MAX_TICKS as usize + 1).contains(&ticks), "{ticks} ticks");
+        assert!(
+            (2..=MAX_TICKS as usize + 1).contains(&ticks),
+            "{ticks} ticks"
+        );
         // A short chart keeps weekly ticks.
         let g = p("gantt\nsection S\nA :a1, 2024-01-01, 21d\n");
         assert_eq!(render_svg(&g).matches("opacity=\"0.15\"").count(), 4);

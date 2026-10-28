@@ -62,6 +62,7 @@ pub(crate) fn lines(s: &str) -> Vec<&str> {
 /// `s` cut down with a trailing ellipsis so it measures at most `max_w`
 /// (unchanged if it already fits). Measure the full label and fitting
 /// prefix together, without repeatedly scanning progressively shorter strings.
+#[cfg(test)]
 pub(crate) fn truncate_to_width(s: &str, max_w: f64) -> String {
     if text_size(s).0 <= max_w {
         return s.to_string();

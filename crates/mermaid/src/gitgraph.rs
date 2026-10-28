@@ -3,7 +3,8 @@
 //! Commits advance a global left-to-right sequence; each branch is a
 //! horizontal lane. `commit` / `branch` / `checkout`(`switch`) / `merge`
 //! are supported, with `id:` / `tag:` / `type:` options. Rendering is
-//! always left-to-right (the most common orientation).
+//! always left-to-right (the most common orientation). Merge commits support
+//! only the NORMAL type; other types are rejected rather than silently ignored.
 
 use crate::{escape_xml, ParseError};
 use std::collections::HashMap;
@@ -36,34 +37,84 @@ pub(crate) struct GitGraph {
 }
 
 fn err(message: impl Into<String>, line: usize) -> ParseError {
-    ParseError { message: message.into(), line: Some(line) }
+    ParseError {
+        message: message.into(),
+        line: Some(line),
+    }
 }
 
-/// Pulls `key: value` (value may be `"quoted"` or a bare token) out of an
-/// option string, returning the value. The key must appear at a word
-/// boundary (start or after whitespace) and be followed by `:`, so a key
-/// substring *inside* a quoted value (e.g. `tag: "id: 5"`) can't match.
-/// Case-sensitive keys.
-fn option(opts: &str, key: &str) -> Option<String> {
-    let mut from = 0;
-    while let Some(rel) = opts[from..].find(key) {
-        let at = from + rel;
-        from = at + key.len();
-        if at != 0 && !opts[..at].ends_with(char::is_whitespace) {
-            continue; // not a word boundary — inside another token/value
-        }
-        let after = opts[at + key.len()..].trim_start();
-        let Some(value) = after.strip_prefix(':') else {
-            continue; // `key` not used as an option key here
-        };
-        let value = value.trim_start();
-        return Some(if let Some(rest) = value.strip_prefix('"') {
-            rest.split('"').next().unwrap_or("").to_string()
-        } else {
-            value.split_whitespace().next().unwrap_or("").to_string()
-        });
+/// Read one quoted or bare value and retain all remaining input for validation.
+fn take_value(source: &str, line: usize) -> Result<(String, &str), ParseError> {
+    let source = source.trim_start();
+    if source.is_empty() {
+        return Err(err("expected a git graph value", line));
     }
-    None
+    if let Some(quoted) = source.strip_prefix('"') {
+        // Keep the established literal-value grammar: a backslash is text,
+        // including immediately before the closing quote (Windows paths).
+        let end = quoted
+            .find('"')
+            .ok_or_else(|| err("unclosed quoted git graph value", line))?;
+        let rest = &quoted[end + 1..];
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            return Err(err(
+                "expected whitespace after quoted git graph value",
+                line,
+            ));
+        }
+        return Ok((quoted[..end].to_string(), rest.trim_start()));
+    }
+    let end = source.find(char::is_whitespace).unwrap_or(source.len());
+    Ok((source[..end].to_string(), source[end..].trim_start()))
+}
+
+#[derive(Default)]
+struct Options {
+    id: Option<String>,
+    tag: Option<String>,
+    ctype: Option<CommitType>,
+}
+
+/// Consume every argument, so unknown, duplicate and malformed options cannot
+/// disappear while a recognized option elsewhere still produces a diagram.
+fn options(mut source: &str, line: usize) -> Result<Options, ParseError> {
+    let mut out = Options::default();
+    while !source.trim().is_empty() {
+        let (key, rest) = source
+            .split_once(':')
+            .ok_or_else(|| err("expected git graph option `key: value`", line))?;
+        let key = key.trim();
+        if !matches!(key, "id" | "tag" | "type") {
+            return Err(err(format!("unsupported git graph option `{key}`"), line));
+        }
+        let (value, remaining) = take_value(rest, line)?;
+        source = remaining;
+        match key {
+            "id" => {
+                if out.id.replace(value).is_some() {
+                    return Err(err("duplicate git graph id option", line));
+                }
+            }
+            "tag" => {
+                if out.tag.replace(value).is_some() {
+                    return Err(err("duplicate git graph tag option", line));
+                }
+            }
+            "type" => {
+                let ctype = match value.as_str() {
+                    "NORMAL" => CommitType::Normal,
+                    "REVERSE" => CommitType::Reverse,
+                    "HIGHLIGHT" => CommitType::Highlight,
+                    other => return Err(err(format!("unknown commit type `{other}`"), line)),
+                };
+                if out.ctype.replace(ctype).is_some() {
+                    return Err(err("duplicate git graph type option", line));
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn parse(source: &str) -> Result<GitGraph, ParseError> {
@@ -87,6 +138,13 @@ pub(crate) fn parse(source: &str) -> Result<GitGraph, ParseError> {
             if head.trim_end_matches(':') != "gitGraph" {
                 return Err(err("git graph must start with `gitGraph`", line_no));
             }
+            let suffix = line[head.len()..].trim();
+            if !matches!(suffix, "" | "LR" | "LR:") {
+                return Err(err(
+                    "only left-to-right gitGraph orientation is supported",
+                    line_no,
+                ));
+            }
             seen_header = true;
             continue;
         }
@@ -98,36 +156,45 @@ pub(crate) fn parse(source: &str) -> Result<GitGraph, ParseError> {
         match kw {
             "commit" => {
                 let parents: Vec<usize> = tip[&current].into_iter().collect();
-                let ctype = match option(args, "type").as_deref() {
-                    Some("REVERSE") => CommitType::Reverse,
-                    Some("HIGHLIGHT") => CommitType::Highlight,
-                    _ => CommitType::Normal,
-                };
+                let options = options(args, line_no)?;
+                let ctype = options.ctype.unwrap_or(CommitType::Normal);
                 if commits.len() >= MAX_COMMITS {
-                    return Err(err(format!("git graph too large: more than {MAX_COMMITS} commits"), line_no));
+                    return Err(err(
+                        format!("git graph too large: more than {MAX_COMMITS} commits"),
+                        line_no,
+                    ));
                 }
                 let ci = commits.len();
                 commits.push(Commit {
-                    id: option(args, "id"),
+                    id: options.id,
                     lane: lane_of[&current],
                     seq,
                     parents,
-                    tag: option(args, "tag"),
+                    tag: options.tag,
                     ctype,
                 });
                 seq += 1;
                 tip.insert(current.clone(), Some(ci));
             }
             "branch" => {
-                let name = args.split_whitespace().next().unwrap_or("").to_string();
+                let (name, remaining) = take_value(args, line_no)?;
                 if name.is_empty() {
                     return Err(err("branch needs a name", line_no));
+                }
+                if !remaining.is_empty() {
+                    return Err(err(
+                        "branch options, including `order:`, are not supported",
+                        line_no,
+                    ));
                 }
                 if lane_of.contains_key(&name) {
                     return Err(err(format!("branch `{name}` already exists"), line_no));
                 }
                 if branches.len() >= MAX_BRANCHES {
-                    return Err(err(format!("git graph too large: more than {MAX_BRANCHES} branches"), line_no));
+                    return Err(err(
+                        format!("git graph too large: more than {MAX_BRANCHES} branches"),
+                        line_no,
+                    ));
                 }
                 let lane = branches.len();
                 branches.push(name.clone());
@@ -137,47 +204,73 @@ pub(crate) fn parse(source: &str) -> Result<GitGraph, ParseError> {
                 current = name;
             }
             "checkout" | "switch" => {
-                let name = args.split_whitespace().next().unwrap_or("");
-                if !lane_of.contains_key(name) {
+                let (name, remaining) = take_value(args, line_no)?;
+                if !remaining.is_empty() {
+                    return Err(err("unsupported text after checkout branch", line_no));
+                }
+                if !lane_of.contains_key(&name) {
                     return Err(err(format!("checkout of unknown branch `{name}`"), line_no));
                 }
                 current = name.to_string();
             }
             "merge" => {
-                let name = args.split_whitespace().next().unwrap_or("");
-                let Some(&_lane) = lane_of.get(name) else {
+                let (name, remaining) = take_value(args, line_no)?;
+                let Some(&_lane) = lane_of.get(&name) else {
                     return Err(err(format!("merge of unknown branch `{name}`"), line_no));
                 };
                 if name == current {
                     return Err(err("cannot merge a branch into itself", line_no));
                 }
+                if tip[&name].is_none() {
+                    return Err(err("cannot merge a branch without commits", line_no));
+                }
+                if tip[&current].is_none() {
+                    return Err(err("cannot merge into a branch without commits", line_no));
+                }
+                if tip[&current] == tip[&name] {
+                    return Err(err(
+                        "cannot merge branches with the same head commit",
+                        line_no,
+                    ));
+                }
                 let mut parents: Vec<usize> = Vec::new();
                 parents.extend(tip[&current]);
-                parents.extend(tip[name]);
+                parents.extend(tip[&name]);
                 if commits.len() >= MAX_COMMITS {
-                    return Err(err(format!("git graph too large: more than {MAX_COMMITS} commits"), line_no));
+                    return Err(err(
+                        format!("git graph too large: more than {MAX_COMMITS} commits"),
+                        line_no,
+                    ));
                 }
-                let ctype = match option(args, "type").as_deref() {
-                    Some("REVERSE") => CommitType::Reverse,
-                    Some("HIGHLIGHT") => CommitType::Highlight,
-                    _ => CommitType::Normal,
-                };
+                let options = options(remaining, line_no)?;
+                let ctype = options.ctype.unwrap_or(CommitType::Normal);
+                if ctype != CommitType::Normal {
+                    return Err(err("merge commits support only type: NORMAL", line_no));
+                }
                 let ci = commits.len();
                 commits.push(Commit {
-                    id: option(args, "id"),
+                    id: options.id,
                     lane: lane_of[&current],
                     seq,
                     parents,
-                    tag: option(args, "tag"),
+                    tag: options.tag,
                     ctype,
                 });
                 seq += 1;
                 tip.insert(current.clone(), Some(ci));
             }
             "cherry-pick" => {
-                let pick = option(args, "id")
+                let options = options(args, line_no)?;
+                if options.ctype.is_some() {
+                    return Err(err("cherry-pick type options are not supported", line_no));
+                }
+                let pick = options
+                    .id
                     .ok_or_else(|| err("`cherry-pick` needs an `id:`", line_no))?;
-                if !commits.iter().any(|c| c.id.as_deref() == Some(pick.as_str())) {
+                if !commits
+                    .iter()
+                    .any(|c| c.id.as_deref() == Some(pick.as_str()))
+                {
                     return Err(err(
                         format!("cherry-pick references unknown commit `{pick}`"),
                         line_no,
@@ -196,23 +289,32 @@ pub(crate) fn parse(source: &str) -> Result<GitGraph, ParseError> {
                     lane: lane_of[&current],
                     seq,
                     parents,
-                    tag: option(args, "tag"),
+                    tag: options.tag,
                     ctype: CommitType::CherryPick,
                 });
                 seq += 1;
                 tip.insert(current.clone(), Some(ci));
             }
             other => {
-                return Err(err(format!("unsupported git graph statement {other:?}"), line_no));
+                return Err(err(
+                    format!("unsupported git graph statement {other:?}"),
+                    line_no,
+                ));
             }
         }
     }
 
     if !seen_header {
-        return Err(ParseError { message: "git graph must start with `gitGraph`".into(), line: None });
+        return Err(ParseError {
+            message: "git graph must start with `gitGraph`".into(),
+            line: None,
+        });
     }
     if commits.is_empty() {
-        return Err(ParseError { message: "git graph has no commits".into(), line: None });
+        return Err(ParseError {
+            message: "git graph has no commits".into(),
+            line: None,
+        });
     }
     Ok(GitGraph { commits, branches })
 }
@@ -242,8 +344,9 @@ const GIT_COLORS: &[&str] = &[
     "hsl(0, 100%, 71.27%)",   // git7 (h+120)
 ];
 /// `gitBranchLabel0`..`7`: `invert(#333)=#ccc` for lanes 0 and 3, else `#333`.
-const GIT_LABEL_COLORS: &[&str] =
-    &["#ccc", "#333", "#333", "#ccc", "#333", "#333", "#333", "#333"];
+const GIT_LABEL_COLORS: &[&str] = &[
+    "#ccc", "#333", "#333", "#ccc", "#333", "#333", "#333", "#333",
+];
 /// Dashed per-branch rule color (mermaid `lineColor`).
 const LINE_COLOR: &str = "#999999";
 
@@ -257,7 +360,9 @@ fn git_label_color(lane: usize) -> &'static str {
 /// Deterministic 7-hex-char hash for a commit's generated id (the crate forbids
 /// nondeterministic output; mermaid uses a random 7-char suffix).
 fn hash7(seq: usize) -> String {
-    let mut h = (seq as u64).wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut h = (seq as u64)
+        .wrapping_add(1)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
     h ^= h >> 29;
     h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
     format!("{:07x}", h & 0xFFF_FFFF)
@@ -265,7 +370,8 @@ fn hash7(seq: usize) -> String {
 
 /// D4: a generated commit id is `seq-hash`; an explicit `id:` wins.
 fn commit_id(c: &Commit) -> String {
-    c.id.clone().unwrap_or_else(|| format!("{}-{}", c.seq, hash7(c.seq)))
+    c.id.clone()
+        .unwrap_or_else(|| format!("{}-{}", c.seq, hash7(c.seq)))
 }
 
 /// D8: an orthogonal rounded path between two commits on different lanes.
@@ -296,18 +402,85 @@ fn ortho_path(px: f64, py: f64, cx: f64, cy: f64, fork: bool) -> String {
 pub(crate) fn render_svg(g: &GitGraph) -> String {
     let max_seq = g.commits.iter().map(|c| c.seq).max().unwrap_or(0);
     let n_lanes = g.branches.len();
-    let x_of = |seq: usize| LABEL_W + 20.0 + seq as f64 * COMMIT_GAP;
-    let y_of = |lane: usize| TOP + lane as f64 * LANE_GAP;
-    let w = x_of(max_seq) + 60.0;
+    let branch_widths: Vec<f64> = g
+        .branches
+        .iter()
+        .map(|name| {
+            crate::measure::text_size(name)
+                .0
+                .max(crate::measure::literal_overlap_width(name, 12.0) * 1.04)
+        })
+        .collect();
+    let branch_width = branch_widths
+        .iter()
+        .map(|width| width + 24.0)
+        .fold(LABEL_W, f64::max);
+    let id_widths: Vec<f64> = g
+        .commits
+        .iter()
+        .map(|commit| {
+            let label = commit_id(commit);
+            (crate::measure::text_size(&label).0 * 11.0 / crate::measure::FONT_PX)
+                .max(crate::measure::literal_overlap_width(&label, 11.0))
+        })
+        .collect();
+    let label_width = id_widths.iter().copied().fold(0.0, f64::max) / std::f64::consts::SQRT_2;
+    let tag_widths: Vec<f64> = g
+        .commits
+        .iter()
+        .map(|commit| {
+            commit.tag.as_deref().map_or(0.0, |tag| {
+                // Tags are literal, bold 12px text. Preserve existing conservative
+                // footprints when they are wider, including all short goldens.
+                crate::measure::text_size(tag)
+                    .0
+                    .max(crate::measure::literal_overlap_width(tag, 12.0) * 1.04)
+            })
+        })
+        .collect();
+    let tag_width = tag_widths.iter().copied().fold(0.0, f64::max);
+    let label_gutter = branch_width.max(label_width + 12.0).max(tag_width / 2.0);
+    let mut positions = vec![0.0; max_seq + 1];
+    let mut last_tag_right = vec![f64::NEG_INFINITY; n_lanes];
+    let mut next = label_gutter + 20.0;
+    for (commit, &width) in g.commits.iter().zip(&tag_widths) {
+        let x = if width > 0.0 {
+            next.max(last_tag_right[commit.lane] + 12.0 + width / 2.0)
+        } else {
+            next
+        };
+        positions[commit.seq] = x;
+        if width > 0.0 {
+            last_tag_right[commit.lane] = x + width / 2.0;
+        }
+        next = x + COMMIT_GAP;
+    }
+    let x_of = |seq: usize| positions[seq];
+    // IDs are end-anchored 20px below their dot and rotate down-left by 45°.
+    // Their lower bound is offset + (literal width + font descent) / sqrt(2).
+    // Tags extend above the next lane, while branch backings occupy ±10px.
+    let mut lane_drop = vec![DOT_R; n_lanes];
+    let mut lane_rise = vec![DOT_R; n_lanes];
+    for ((commit, &id_width), &tag_width) in g.commits.iter().zip(&id_widths).zip(&tag_widths) {
+        if commit.parents.len() < 2 || commit.id.is_some() {
+            lane_drop[commit.lane] = lane_drop[commit.lane]
+                .max(DOT_R + 10.0 + (id_width + 3.3) / std::f64::consts::SQRT_2);
+        }
+        if tag_width > 0.0 {
+            lane_rise[commit.lane] = DOT_R + 6.0 + 14.0;
+        }
+    }
+    let mut lane_positions = vec![TOP; n_lanes];
+    for lane in 1..n_lanes {
+        lane_positions[lane] =
+            lane_positions[lane - 1] + LANE_GAP.max(lane_drop[lane - 1] + lane_rise[lane] + 2.0);
+    }
+    let y_of = |lane: usize| lane_positions[lane];
+    let w = x_of(max_seq) + 60.0_f64.max(tag_width / 2.0 + 12.0);
     // Bottom margin must fit the rotated id labels, which are END-anchored
     // just below their dot and trail down-left at 45° — the vertical drop is
     // label_width/√2 (plus glyph extent), measured at the 11px label size.
-    let label_drop = g
-        .commits
-        .iter()
-        .map(|c| crate::measure::text_size(&commit_id(c)).0 * (11.0 / crate::measure::FONT_PX))
-        .fold(0.0, f64::max)
-        / std::f64::consts::SQRT_2;
+    let label_drop = label_width;
     let h = y_of(n_lanes.saturating_sub(1)) + DOT_R + 10.0 + label_drop + 14.0;
 
     let mut svg = format!(
@@ -333,7 +506,11 @@ pub(crate) fn render_svg(g: &GitGraph) -> String {
             let (px, py) = (x_of(pc.seq), y_of(pc.lane));
             // D8 color rule: the child's branch, except a merge's non-first
             // parent edge takes the merged (parent) branch's color.
-            let color = if is_merge && k != 0 { git_color(pc.lane) } else { git_color(c.lane) };
+            let color = if is_merge && k != 0 {
+                git_color(pc.lane)
+            } else {
+                git_color(c.lane)
+            };
             let d = if pc.lane == c.lane {
                 format!("M {px:.1} {py:.1} L {cx:.1} {cy:.1}")
             } else {
@@ -348,10 +525,10 @@ pub(crate) fn render_svg(g: &GitGraph) -> String {
     // D6: branch labels — a rounded rect filled with the branch color, text in
     // the matching gitBranchLabel color, right-aligned in the left gutter.
     for (lane, name) in g.branches.iter().enumerate() {
-        let (tw, _) = crate::measure::text_size(name);
+        let tw = branch_widths[lane];
         let by = y_of(lane);
         let rw = tw + 12.0;
-        let rx = LABEL_W - rw;
+        let rx = label_gutter - rw;
         svg.push_str(&format!(
             r#"<rect x="{rx:.1}" y="{:.1}" width="{rw:.1}" height="20" rx="4" ry="4" fill="{}"/>"#,
             by - 10.0,
@@ -436,9 +613,44 @@ mod tests {
         parse(src).expect("parse ok")
     }
 
+    #[test]
+    fn rotated_ids_clear_all_lower_lane_caption_bands() {
+        let id = "M".repeat(80);
+        let branch = "M".repeat(20);
+        for last_commit in ["commit", "commit tag: \"Lower tag\""] {
+            let graph = p(&format!(
+                "gitGraph\ncommit id: \"{id}\"\nbranch \"{branch}\"\n{last_commit}"
+            ));
+            let output = render_svg(&graph);
+            let (_, drawn) = crate::extent::scan(&output);
+            let caption = &drawn.iter().find(|item| item.text == id).unwrap().bbox;
+            for other in drawn
+                .iter()
+                .filter(|item| item.text == branch || item.text == "Lower tag")
+            {
+                assert!(
+                    caption.y1 + 1.0 <= other.bbox.y0,
+                    "rotated ID overlaps a lower caption band: {caption:?}, {:?}",
+                    other.bbox
+                );
+            }
+        }
+    }
 
-
-
+    #[test]
+    fn long_tags_on_the_same_lane_do_not_overlap_across_other_commits() {
+        let first = "M".repeat(80);
+        let second = "W".repeat(80);
+        let graph = p(&format!("gitGraph\ncommit tag: \"{first}\"\ncommit\nbranch dev\ncommit tag: other\ncheckout main\ncommit tag: \"{second}\""));
+        let svg = render_svg(&graph);
+        let (_, drawn) = crate::extent::scan(&svg);
+        let a = &drawn.iter().find(|item| item.text == first).unwrap().bbox;
+        let b = &drawn.iter().find(|item| item.text == second).unwrap().bbox;
+        assert!(
+            a.x1 + 1.0 <= b.x0,
+            "rendered tag bounds overlap: {a:?}, {b:?}"
+        );
+    }
 
     #[test]
     fn header_required() {
@@ -464,16 +676,28 @@ mod tests {
     fn commit_ids_seq_prefixed_and_merge_unlabeled_and_ringed() {
         // D4: generated ids are `seq-hash`; both plain commits are labeled.
         let plain = render_svg(&p("gitGraph\ncommit\ncommit"));
-        assert!(plain.contains(">0-") && plain.contains(">1-"), "seq-prefixed ids: {plain}");
+        assert!(
+            plain.contains(">0-") && plain.contains(">1-"),
+            "seq-prefixed ids: {plain}"
+        );
         assert_ne!(hash7(0), hash7(1));
         // The reference topology: seq 4 is the merge (unlabeled), last is seq 5.
         let merged = render_svg(&p(
             "gitGraph\ncommit\ncommit\nbranch develop\ncheckout develop\ncommit\ncommit\ncheckout main\nmerge develop\ncommit",
         ));
-        assert!(merged.contains(">5-"), "last commit is seq 5 (merge consumed 4): {merged}");
-        assert!(!merged.contains(">4-"), "D5: merge (seq 4) is unlabeled: {merged}");
+        assert!(
+            merged.contains(">5-"),
+            "last commit is seq 5 (merge consumed 4): {merged}"
+        );
+        assert!(
+            !merged.contains(">4-"),
+            "D5: merge (seq 4) is unlabeled: {merged}"
+        );
         // D2: merge = outer r9 + inner r6.
-        assert!(merged.contains(r#"r="9""#) && merged.contains(r#"r="6""#), "merge ring: {merged}");
+        assert!(
+            merged.contains(r#"r="9""#) && merged.contains(r#"r="6""#),
+            "merge ring: {merged}"
+        );
     }
 
     #[test]
@@ -481,13 +705,19 @@ mod tests {
         let svg = render_svg(&p(
             "gitGraph\ncommit\nbranch develop\ncheckout develop\ncommit\ncheckout main\nmerge develop",
         ));
-        assert!(svg.contains(r#"stroke-width="8" stroke-linecap="round""#), "D1: {svg}");
+        assert!(
+            svg.contains(r#"stroke-width="8" stroke-linecap="round""#),
+            "D1: {svg}"
+        );
         // D9: git0 blue / git1 yellow, resolved from mermaid theme-default.
         assert!(svg.contains("hsl(240, 100%, 71.27%)"), "D9 git0: {svg}");
         assert!(svg.contains("hsl(60, 100%, 68.53%)"), "D9 git1: {svg}");
         assert!(svg.contains(r#"rx="4" ry="4""#), "D6 label rect: {svg}");
         assert!(svg.contains(" Q "), "D8 rounded corner: {svg}");
-        assert!(svg.contains(r#"stroke-dasharray="2""#), "D7 branch rule: {svg}");
+        assert!(
+            svg.contains(r#"stroke-dasharray="2""#),
+            "D7 branch rule: {svg}"
+        );
         assert!(svg.contains("rotate(-45"), "D3 rotated label: {svg}");
     }
 
@@ -532,7 +762,7 @@ mod tests {
         assert_eq!(cp.ctype, CommitType::CherryPick);
         assert_eq!(cp.id.as_deref(), Some("B")); // labeled with the picked id
         assert_eq!(cp.lane, 0); // lands on the current branch (main)
-        // renders without error
+                                // renders without error
         assert!(crate::render(
             "gitGraph\ncommit id: \"A\"\nbranch dev\ncommit id: \"B\"\ncheckout main\ncherry-pick id: \"B\""
         )
@@ -545,16 +775,31 @@ mod tests {
 
     #[test]
     fn error_paths() {
-        assert!(parse("gitGraph").unwrap_err().message.contains("no commits"));
-        assert!(parse("gitGraph\ncheckout ghost").unwrap_err().message.contains("unknown branch"));
-        assert!(parse("gitGraph\ncommit\nmerge ghost").unwrap_err().message.contains("unknown branch"));
-        assert!(parse("gitGraph\ncommit\nbranch main").unwrap_err().message.contains("already exists"));
-        assert!(parse("gitGraph\ncherry-pick id: \"x\"").unwrap_err().message.contains("cherry-pick"));
+        assert!(parse("gitGraph")
+            .unwrap_err()
+            .message
+            .contains("no commits"));
+        assert!(parse("gitGraph\ncheckout ghost")
+            .unwrap_err()
+            .message
+            .contains("unknown branch"));
+        assert!(parse("gitGraph\ncommit\nmerge ghost")
+            .unwrap_err()
+            .message
+            .contains("unknown branch"));
+        assert!(parse("gitGraph\ncommit\nbranch main")
+            .unwrap_err()
+            .message
+            .contains("already exists"));
+        assert!(parse("gitGraph\ncherry-pick id: \"x\"")
+            .unwrap_err()
+            .message
+            .contains("cherry-pick"));
     }
 
     #[test]
     fn renders_dots_edges_branches() {
-        let g = p("gitGraph\ncommit id: \"a\"\nbranch dev\ncommit tag: \"t\"\ncheckout main\ncommit\nmerge dev type: HIGHLIGHT");
+        let g = p("gitGraph\ncommit id: \"a\"\nbranch dev\ncommit tag: \"t\"\ncheckout main\ncommit\nmerge dev type: NORMAL");
         let svg = render_svg(&g);
         assert!(svg.starts_with("<svg") && svg.contains("</svg>"));
         assert!(svg.contains("<circle"), "commit dots");
@@ -583,8 +828,14 @@ mod tests {
             .split("<text")
             .find(|t| t.contains("abc"))
             .expect("id label present");
-        assert!(label.contains(r#"text-anchor="end""#), "label must be end-anchored: {label}");
-        assert!(label.contains("rotate(-45"), "label must stay rotated: {label}");
+        assert!(
+            label.contains(r#"text-anchor="end""#),
+            "label must be end-anchored: {label}"
+        );
+        assert!(
+            label.contains("rotate(-45"),
+            "label must stay rotated: {label}"
+        );
     }
 
     #[test]

@@ -20,3 +20,4 @@ unicode-normalization = "0.1"
 proptest = { workspace = true }
 # Well-formedness check in the fuzz net: every rendered SVG must parse.
 quick-xml = { workspace = true }
+kurbo = "0.13.1"
