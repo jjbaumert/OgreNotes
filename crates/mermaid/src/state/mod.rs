@@ -2,12 +2,19 @@
 //! slice) and the SVG renderer (Task 3).
 
 pub(crate) mod parse;
-pub(crate) mod svg;
 #[cfg(test)]
 mod props;
+pub(crate) mod svg;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StateKind { Normal, Start, End, Choice, ForkJoin }
+pub(crate) enum StateKind {
+    Normal,
+    Start,
+    End,
+    Choice,
+    ForkJoin,
+    CompositePort,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct StateNode {
@@ -33,6 +40,9 @@ pub(crate) struct Transition {
     pub to: usize,
     pub label: Option<String>,
     pub style: Option<String>, // sanitized `linkStyle` override
+    pub from_cluster: Option<usize>,
+    pub to_cluster: Option<usize>,
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +94,7 @@ pub(crate) fn render_state(source: &str) -> Result<String, crate::ParseError> {
                 crate::flowchart::shapes::size_for(crate::flowchart::ShapeKind::Diamond, tw, th)
             }
             StateKind::ForkJoin => (44.0, 10.0),
+            StateKind::CompositePort => (0.0, 0.0),
         };
         sizes.push(size);
         nodes.push(crate::boxgraph::BoxNode {
@@ -99,10 +110,16 @@ pub(crate) fn render_state(source: &str) -> Result<String, crate::ParseError> {
         .map(|t| crate::boxgraph::BoxEdge {
             from: t.from,
             to: t.to,
-            label: t.label.as_deref().map(|l| {
-                let (w, h) = crate::measure::text_size(l);
-                (w + 8.0, h + 4.0)
-            }),
+            // Composite self-loop labels occupy the reserved outer envelope,
+            // rather than redundant label boxes inside the composite.
+            label: t
+                .label
+                .as_deref()
+                .filter(|_| t.from_cluster.is_none() || t.from_cluster != t.to_cluster)
+                .map(|l| {
+                    let (w, h) = crate::measure::text_size(l);
+                    (w + 8.0, h + 4.0)
+                }),
         })
         .collect();
 
@@ -115,10 +132,12 @@ pub(crate) fn render_state(source: &str) -> Result<String, crate::ParseError> {
         })
         .collect();
 
-    let layout = crate::boxgraph::layout_boxgraph(
+    let margins = svg::composite_loop_margins(&g);
+    let layout = crate::boxgraph::layout_boxgraph_with_cluster_margins(
         &nodes,
         &edges,
         &clusters,
+        &margins,
         crate::layout::Direction::TB,
     )?;
     Ok(svg::emit(&g, &layout, &sizes))

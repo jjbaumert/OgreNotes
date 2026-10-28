@@ -198,6 +198,14 @@ pub(crate) fn apply_direction(layout: &mut Layout, dir: Direction) {
     }
 }
 
+/// Shared aggregate allowance for routing waypoints, excluding each edge's
+/// fixed endpoint/port stubs. Cluster decoration joins use the same bound.
+pub(crate) fn waypoint_budget(node_count: usize) -> usize {
+    order::MAX_DUMMY_SLOTS
+        .max(node_count.saturating_mul(node_count.saturating_sub(1)) / 2)
+        .min(80_000)
+}
+
 /// Full pipeline: flat graphs go straight through `run_flat`; graphs with
 /// clusters are dispatched to the recursive collapse-expand driver.
 pub(crate) fn run(input: &LayoutInput) -> Result<Layout, String> {
@@ -309,15 +317,7 @@ pub(crate) fn layout_tb(input: &LayoutInput) -> Result<Layout, String> {
     // One waypoint per unordered node pair accommodates a chain with one
     // return edge per node. Keep the existing floor for small diagrams and
     // a fixed upper bound so dense repeated long edges still reject early.
-    let waypoint_limit = order::MAX_DUMMY_SLOTS
-        .max(
-            input
-                .nodes
-                .len()
-                .saturating_mul(input.nodes.len().saturating_sub(1))
-                / 2,
-        )
-        .min(80_000);
+    let waypoint_limit = waypoint_budget(input.nodes.len());
     if dummy_slots > waypoint_limit {
         return Err(format!(
             "diagram too large: {dummy_slots} edge waypoints (max {})",

@@ -5,15 +5,16 @@
 //! inline so work is bounded before layout.
 
 use crate::sequence::{
-    Event, FragmentKind, Head, LineStyle, NotePlacement, Participant, SeqDiagram,
-    MAX_EVENTS, MAX_FRAGMENT_DEPTH, MAX_PARTICIPANTS,
+    Event, FragmentKind, Head, LineStyle, NotePlacement, Participant, SeqDiagram, MAX_EVENTS,
+    MAX_FRAGMENT_DEPTH, MAX_PARTICIPANTS,
 };
 use crate::ParseError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 struct Parser {
     g: SeqDiagram,
     ids: HashMap<String, usize>,
+    declared_participants: HashSet<String>,
     active_depth: Vec<usize>,
     frags: Vec<(FragmentKind, usize)>,
     line: usize,
@@ -21,8 +22,13 @@ struct Parser {
 
 pub(crate) fn parse(source: &str) -> Result<SeqDiagram, ParseError> {
     let mut p = Parser {
-        g: SeqDiagram { participants: vec![], events: vec![] },
+        g: SeqDiagram {
+            title: None,
+            participants: vec![],
+            events: vec![],
+        },
         ids: HashMap::new(),
+        declared_participants: HashSet::new(),
         active_depth: vec![],
         frags: vec![],
         line: 0,
@@ -97,7 +103,10 @@ fn split_statements(line: &str) -> Vec<&str> {
 
 impl Parser {
     fn err(&self, msg: impl Into<String>) -> ParseError {
-        ParseError { message: msg.into(), line: Some(self.line) }
+        ParseError {
+            message: msg.into(),
+            line: Some(self.line),
+        }
     }
 
     /// Same id charset `parse_participant` enforces on explicit
@@ -114,9 +123,7 @@ impl Parser {
 
     fn push_event(&mut self, e: Event) -> Result<(), ParseError> {
         if self.g.events.len() >= MAX_EVENTS {
-            return Err(self.err(format!(
-                "diagram too large: more than {MAX_EVENTS} events"
-            )));
+            return Err(self.err(format!("diagram too large: more than {MAX_EVENTS} events")));
         }
         self.g.events.push(e);
         Ok(())
@@ -131,6 +138,9 @@ impl Parser {
         is_actor: bool,
         explicit: bool,
     ) -> Result<usize, ParseError> {
+        if explicit {
+            self.declared_participants.insert(id.to_string());
+        }
         if let Some(&i) = self.ids.get(id) {
             // Explicit declaration after implicit use upgrades
             // display/is_actor — even a bare `actor A` with no alias.
@@ -160,23 +170,91 @@ impl Parser {
 
     fn parse_statement(&mut self, stmt: &str) -> Result<(), ParseError> {
         let first = stmt.split_whitespace().next().unwrap_or("");
+        let lower = first.to_ascii_lowercase();
+        let keyword = matches!(
+            lower.as_str(),
+            "participant"
+                | "actor"
+                | "autonumber"
+                | "activate"
+                | "deactivate"
+                | "loop"
+                | "alt"
+                | "opt"
+                | "par"
+                | "critical"
+                | "break"
+                | "rect"
+                | "else"
+                | "and"
+                | "option"
+                | "end"
+                | "title"
+                | "title:"
+                | "note"
+                | "box"
+                | "create"
+                | "destroy"
+                | "links"
+                | "link"
+                | "properties"
+        );
+        // Free-text structural labels may begin with arrows. Other keyword
+        // forms cannot claim source-arrow-target syntax, so implicit sources
+        // such as `end ->> B` remain valid. An explicit declaration resolves
+        // the genuinely ambiguous free-text forms in favor of a message.
+        let structural_label = matches!(
+            lower.as_str(),
+            "loop"
+                | "alt"
+                | "opt"
+                | "par"
+                | "critical"
+                | "break"
+                | "else"
+                | "and"
+                | "option"
+                | "title"
+                | "title:"
+        );
+        if (!structural_label || self.declared_participants.contains(first))
+            && self.try_parse_message(stmt)?
+        {
+            return Ok(());
+        }
+        // Normalize only statement syntax. Do not recursively redispatch a
+        // changed participant id through the message-precedence decision.
+        let normalized =
+            (first != lower && keyword).then(|| format!("{lower}{}", &stmt[first.len()..]));
+        let stmt = normalized.as_deref().unwrap_or(stmt);
+        let first = stmt.split_whitespace().next().unwrap_or("");
         match first {
+            "title" | "title:" => {
+                let body = stmt[first.len()..].trim();
+                let title = if first == "title:" || body.starts_with("::") {
+                    body
+                } else {
+                    body.strip_prefix(':').unwrap_or(body).trim_start()
+                };
+                if title.is_empty() {
+                    return Err(self.err("title needs text"));
+                }
+                self.g.title = Some(title.to_string());
+                return Ok(());
+            }
             "participant" | "actor" => return self.parse_participant(stmt, first == "actor"),
             "autonumber" => return self.parse_autonumber(stmt),
             "activate" | "deactivate" => return self.parse_activation(stmt, first == "activate"),
-            "loop" | "alt" | "opt" | "par" | "critical" | "break" => {
+            "loop" | "alt" | "opt" | "par" | "critical" | "break" | "rect" => {
                 return self.parse_fragment_open(stmt, first)
             }
             "else" | "and" | "option" => return self.parse_divider(stmt, first),
             "end" if stmt == "end" => return self.parse_fragment_close(),
-            "box" | "create" | "destroy" | "rect" | "links" | "link" | "properties" => {
+            "box" | "create" | "destroy" | "links" | "link" | "properties" => {
                 return Err(self.err(format!("`{first}` statements are not supported")));
             }
             _ if first.eq_ignore_ascii_case("note") => return self.parse_note(stmt),
             _ => {}
-        }
-        if self.try_parse_message(stmt)? {
-            return Ok(());
         }
         // Best-effort recognition of known-unsupported arrow families so
         // the error names the construct. Runs only after every supported
@@ -188,7 +266,10 @@ impl Parser {
             // target-side form errors inside try_parse_message).
             return Err(self.err("central connections (`()`) are not supported"));
         }
-        if ["-|", "|-", "-\\", "\\-", "-/", "/-"].iter().any(|t| compact.contains(t)) {
+        if ["-|", "|-", "-\\", "\\-", "-/", "/-"]
+            .iter()
+            .any(|t| compact.contains(t))
+        {
             return Err(self.err("half arrows are not supported"));
         }
         Err(self.err(format!("unsupported statement: {first:?}")))
@@ -270,12 +351,44 @@ impl Parser {
             "par" => FragmentKind::Par,
             "critical" => FragmentKind::Critical,
             "break" => FragmentKind::Break,
+            "rect" => FragmentKind::Rect,
             _ => unreachable!("caller only dispatches fragment keywords"),
         };
-        let label = stmt
+        let mut label = stmt
             .split_once(char::is_whitespace)
             .map(|(_, r)| r.trim().to_string())
             .unwrap_or_default();
+        if kind == FragmentKind::Rect {
+            let values = label
+                .strip_prefix("rgb(")
+                .or_else(|| label.strip_prefix("rgba("))
+                .and_then(|s| s.strip_suffix(')'))
+                .ok_or_else(|| self.err("rect needs an rgb(...) or rgba(...) color"))?;
+            let components: Vec<f64> = values
+                .split(',')
+                .map(|v| v.trim().parse::<f64>())
+                .collect::<Result<_, _>>()
+                .map_err(|_| self.err("rect color components are outside their valid range"))?;
+            let expected = if label.starts_with("rgba(") { 4 } else { 3 };
+            if components.len() != expected
+                || components.iter().enumerate().any(|(i, n)| {
+                    !n.is_finite() || *n < 0.0 || *n > if i == 3 { 1.0 } else { 255.0 }
+                })
+            {
+                return Err(self.err("rect color components are outside their valid range"));
+            }
+            // Rust accepts spellings such as `1.` which are not CSS
+            // numbers. Emit the validated values, rather than raw input.
+            let function = if expected == 4 { "rgba" } else { "rgb" };
+            label = format!(
+                "{function}({})",
+                components
+                    .iter()
+                    .map(f64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
         self.frags.push((kind, self.line));
         self.push_event(Event::FragmentOpen { kind, label })
     }
@@ -400,9 +513,17 @@ impl Parser {
         if rest.starts_with('{') {
             return Err(self.err("JSON participant types (`participant {...}`) are not supported"));
         }
-        let (id, display) = match rest.split_once(" as ") {
-            Some((id, d)) => (id.trim(), Some(d.trim().to_string())),
-            None => (rest, None),
+        let (id, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let tail = tail.trim_start();
+        let keyword_end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        let display = if tail[..keyword_end].eq_ignore_ascii_case("as") {
+            Some(tail[keyword_end..].trim().to_string())
+        } else if tail.is_empty() {
+            None
+        } else {
+            return Err(self.err(format!(
+                "expected participant alias keyword `as`, found {tail:?}"
+            )));
         };
         self.validate_id(id)?;
         if matches!(&display, Some(d) if d.is_empty()) {
@@ -473,11 +594,7 @@ impl Parser {
         let text = match tail.strip_prefix(':') {
             Some(t) => t.trim().to_string(),
             None if tail.is_empty() => String::new(),
-            None => {
-                return Err(self.err(format!(
-                    "unexpected text after message target: {tail:?}"
-                )))
-            }
+            None => return Err(self.err(format!("unexpected text after message target: {tail:?}"))),
         };
         let from = self.intern(from_id, None, false, false)?;
         let to = self.intern(to_id, None, false, false)?;
@@ -507,6 +624,74 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keyword_named_participants_keep_case_and_message_events() {
+        for id in [
+            "PARTICIPANT",
+            "ACTOR",
+            "AUTONUMBER",
+            "ACTIVATE",
+            "DEACTIVATE",
+            "LOOP",
+            "ALT",
+            "OPT",
+            "PAR",
+            "CRITICAL",
+            "BREAK",
+            "RECT",
+            "ELSE",
+            "AND",
+            "OPTION",
+            "END",
+            "TITLE",
+            "NOTE",
+        ] {
+            let diagram = p(&format!(
+                "sequenceDiagram\nparticipant {id}\nparticipant B\n{id} ->> B: hello"
+            ));
+            assert_eq!(
+                diagram.participants.len(),
+                2,
+                "phantom participant for {id}"
+            );
+            assert_eq!(diagram.participants[0].id, id);
+            assert_eq!(diagram.events.len(), 1);
+            assert!(
+                matches!(&diagram.events[0], Event::Message { from: 0, to: 1, text, .. } if text == "hello")
+            );
+            assert!(diagram.title.is_none(), "message from {id} became a title");
+        }
+    }
+
+    #[test]
+    fn arrow_prefixed_structural_labels_are_not_implicit_keyword_messages() {
+        let diagram = p("sequenceDiagram\nloop ->> retry\nA->>B: work\nend");
+        assert_eq!(diagram.participants.len(), 2);
+        assert!(
+            matches!(&diagram.events[0], Event::FragmentOpen { kind: FragmentKind::Loop, label } if label == "->> retry")
+        );
+        assert_eq!(
+            diagram
+                .events
+                .iter()
+                .filter(|event| matches!(event, Event::Message { .. }))
+                .count(),
+            1
+        );
+        let diagram = p("sequenceDiagram\ntitle ->> retry\nA->>B: work");
+        assert_eq!(diagram.title.as_deref(), Some("->> retry"));
+        assert_eq!(diagram.participants.len(), 2);
+        let diagram = p("sequenceDiagram\nparticipant loop\nLoop ->> retry\nA->>B: work\nend");
+        assert!(matches!(&diagram.events[0], Event::FragmentOpen { .. }));
+        assert_eq!(
+            diagram
+                .events
+                .iter()
+                .filter(|event| matches!(event, Event::Message { .. }))
+                .count(),
+            1
+        );
+    }
     use super::*;
     use crate::sequence::{Event, Head, LineStyle};
 
@@ -516,7 +701,14 @@ mod tests {
 
     fn msg(e: &Event) -> (usize, usize, LineStyle, Head, &str) {
         match e {
-            Event::Message { from, to, line, head, text, .. } => (*from, *to, *line, *head, text.as_str()),
+            Event::Message {
+                from,
+                to,
+                line,
+                head,
+                text,
+                ..
+            } => (*from, *to, *line, *head, text.as_str()),
             other => panic!("expected message, got {other:?}"),
         }
     }
@@ -549,7 +741,11 @@ mod tests {
         ] {
             let e = parse(&format!("sequenceDiagram\n{src}")).unwrap_err();
             assert_eq!(e.line, Some(2), "for {src}");
-            assert!(e.message.contains("JSON participant"), "for {src}, got: {}", e.message);
+            assert!(
+                e.message.contains("JSON participant"),
+                "for {src}, got: {}",
+                e.message
+            );
         }
     }
 
@@ -590,7 +786,13 @@ mod tests {
         ] {
             let g = p(&format!("sequenceDiagram\n{src}"));
             match &g.events[0] {
-                Event::Message { line, head, from_head, text, .. } => {
+                Event::Message {
+                    line,
+                    head,
+                    from_head,
+                    text,
+                    ..
+                } => {
                     assert_eq!(*line, want_line, "for {src}");
                     assert_eq!(*head, Head::Arrow, "for {src}");
                     assert_eq!(*from_head, Head::Arrow, "for {src}");
@@ -627,13 +829,21 @@ mod tests {
     fn activation_shorthand() {
         let g = p("sequenceDiagram\nA->>+B: go\nB-->>-A: done");
         match &g.events[0] {
-            Event::Message { activate_target, deactivate_source, .. } => {
+            Event::Message {
+                activate_target,
+                deactivate_source,
+                ..
+            } => {
                 assert!(*activate_target && !*deactivate_source);
             }
             _ => unreachable!(),
         }
         match &g.events[1] {
-            Event::Message { activate_target, deactivate_source, .. } => {
+            Event::Message {
+                activate_target,
+                deactivate_source,
+                ..
+            } => {
                 assert!(!*activate_target && *deactivate_source);
             }
             _ => unreachable!(),
@@ -650,7 +860,10 @@ mod tests {
     #[test]
     fn autonumber_event() {
         let g = p("sequenceDiagram\nautonumber\nA->>B: hi");
-        assert!(matches!(g.events[0], Event::Autonumber { start: 1, step: 1 }));
+        assert!(matches!(
+            g.events[0],
+            Event::Autonumber { start: 1, step: 1 }
+        ));
     }
 
     #[test]
@@ -658,9 +871,15 @@ mod tests {
         // `autonumber <start>` (step defaults to 1) and
         // `autonumber <start> <step>` are both supported.
         let g = p("sequenceDiagram\nautonumber 10\nA->>B: x");
-        assert!(matches!(g.events[0], Event::Autonumber { start: 10, step: 1 }));
+        assert!(matches!(
+            g.events[0],
+            Event::Autonumber { start: 10, step: 1 }
+        ));
         let g = p("sequenceDiagram\nautonumber 10 5\nA->>B: x");
-        assert!(matches!(g.events[0], Event::Autonumber { start: 10, step: 5 }));
+        assert!(matches!(
+            g.events[0],
+            Event::Autonumber { start: 10, step: 5 }
+        ));
     }
 
     #[test]
@@ -674,10 +893,19 @@ mod tests {
     fn autonumber_non_integer_or_extra_args_error() {
         // Decimals (mentioned by the docs but not modeled here) and
         // surplus tokens fail loudly rather than misparse.
-        for bad in ["autonumber 1.5", "autonumber 10 0.5", "autonumber 1 2 3", "autonumber x"] {
+        for bad in [
+            "autonumber 1.5",
+            "autonumber 10 0.5",
+            "autonumber 1 2 3",
+            "autonumber x",
+        ] {
             let e = parse(&format!("sequenceDiagram\n{bad}")).unwrap_err();
             assert_eq!(e.line, Some(2), "for {bad}");
-            assert!(e.message.contains("autonumber"), "for {bad}, got: {}", e.message);
+            assert!(
+                e.message.contains("autonumber"),
+                "for {bad}, got: {}",
+                e.message
+            );
         }
     }
 
@@ -715,16 +943,32 @@ mod tests {
 
     #[test]
     fn half_arrows_error_naming_the_construct() {
-        for src in ["A-|\\B: t", "A-|/B: t", "A/|-B: t", "A-\\\\B: t", "A--//B: t", "A\\-B: t", "A/-B: t"] {
+        for src in [
+            "A-|\\B: t",
+            "A-|/B: t",
+            "A/|-B: t",
+            "A-\\\\B: t",
+            "A--//B: t",
+            "A\\-B: t",
+            "A/-B: t",
+        ] {
             let e = parse(&format!("sequenceDiagram\n{src}")).unwrap_err();
             assert_eq!(e.line, Some(2), "for {src}");
-            assert!(e.message.contains("half arrow"), "for {src}, got: {}", e.message);
+            assert!(
+                e.message.contains("half arrow"),
+                "for {src}, got: {}",
+                e.message
+            );
         }
     }
 
     #[test]
     fn central_connections_error_naming_the_construct() {
-        for src in ["Alice->>()John: x", "Alice()->>John: x", "John()->>()Alice: x"] {
+        for src in [
+            "Alice->>()John: x",
+            "Alice()->>John: x",
+            "John()->>()Alice: x",
+        ] {
             let e = parse(&format!("sequenceDiagram\n{src}")).unwrap_err();
             assert_eq!(e.line, Some(2), "for {src}");
             assert!(
@@ -774,10 +1018,34 @@ mod tests {
     fn note_placements() {
         use crate::sequence::NotePlacement;
         let g = p("sequenceDiagram\nA->>B: x\nNote left of A: la\nnote right of B: rb\nNote over A: oa\nNote over A,B: ab");
-        assert!(matches!(&g.events[1], Event::Note { placement: NotePlacement::LeftOf(0), .. }));
-        assert!(matches!(&g.events[2], Event::Note { placement: NotePlacement::RightOf(1), .. }));
-        assert!(matches!(&g.events[3], Event::Note { placement: NotePlacement::Over(0, None), .. }));
-        assert!(matches!(&g.events[4], Event::Note { placement: NotePlacement::Over(0, Some(1)), .. }));
+        assert!(matches!(
+            &g.events[1],
+            Event::Note {
+                placement: NotePlacement::LeftOf(0),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &g.events[2],
+            Event::Note {
+                placement: NotePlacement::RightOf(1),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &g.events[3],
+            Event::Note {
+                placement: NotePlacement::Over(0, None),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &g.events[4],
+            Event::Note {
+                placement: NotePlacement::Over(0, Some(1)),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -815,7 +1083,11 @@ mod tests {
         // `parse_participant` enforces.
         let e = parse("sequenceDiagram\nNote over A B: t").unwrap_err();
         assert_eq!(e.line, Some(2));
-        assert!(e.message.contains("invalid participant id"), "got: {}", e.message);
+        assert!(
+            e.message.contains("invalid participant id"),
+            "got: {}",
+            e.message
+        );
     }
 
     #[test]
@@ -826,8 +1098,13 @@ mod tests {
         // dropped — filed on #32, fixed here.)
         let g = p("sequenceDiagram\nA->>B: x\nB->>C: y\nNote over C,A,B: all");
         assert_eq!(g.participants.len(), 3);
-        assert!(matches!(&g.events[2],
-            Event::Note { placement: NotePlacement::Over(0, Some(2)), .. }));
+        assert!(matches!(
+            &g.events[2],
+            Event::Note {
+                placement: NotePlacement::Over(0, Some(2)),
+                ..
+            }
+        ));
         // Note-first form creates all three lifelines.
         let g = p("sequenceDiagram\nNote over X,Y,Z: trio");
         assert_eq!(g.participants.len(), 3);
@@ -845,20 +1122,39 @@ mod tests {
     fn activate_multi_word_id_errors() {
         let e = parse("sequenceDiagram\nactivate A B").unwrap_err();
         assert_eq!(e.line, Some(2));
-        assert!(e.message.contains("invalid participant id"), "got: {}", e.message);
+        assert!(
+            e.message.contains("invalid participant id"),
+            "got: {}",
+            e.message
+        );
     }
 
     #[test]
     fn fragments_all_kinds_and_nesting() {
         use crate::sequence::FragmentKind;
         let g = p("sequenceDiagram\nloop every day\nA->>B: hi\nalt ok\nB-->>A: yes\nelse bad\nB--xA: no\nend\nend");
-        assert!(matches!(&g.events[0], Event::FragmentOpen { kind: FragmentKind::Loop, .. }));
-        assert!(matches!(&g.events[2], Event::FragmentOpen { kind: FragmentKind::Alt, .. }));
+        assert!(matches!(
+            &g.events[0],
+            Event::FragmentOpen {
+                kind: FragmentKind::Loop,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &g.events[2],
+            Event::FragmentOpen {
+                kind: FragmentKind::Alt,
+                ..
+            }
+        ));
         assert!(matches!(&g.events[4], Event::FragmentDivider { .. }));
         assert!(matches!(&g.events[6], Event::FragmentClose));
         assert!(matches!(&g.events[7], Event::FragmentClose));
         for kw in ["opt", "par", "critical", "break"] {
-            assert!(parse(&format!("sequenceDiagram\n{kw} l\nA->>B: x\nend")).is_ok(), "{kw}");
+            assert!(
+                parse(&format!("sequenceDiagram\n{kw} l\nA->>B: x\nend")).is_ok(),
+                "{kw}"
+            );
         }
     }
 
@@ -878,8 +1174,12 @@ mod tests {
     #[test]
     fn critical_uses_option_divider() {
         let g = p("sequenceDiagram\ncritical connect\nA-->B: c\noption Network timeout\nA-->A: log\noption Credentials rejected\nA-->A: log2\nend");
-        assert!(matches!(&g.events[2], Event::FragmentDivider { label } if label == "Network timeout"));
-        assert!(matches!(&g.events[4], Event::FragmentDivider { label } if label == "Credentials rejected"));
+        assert!(
+            matches!(&g.events[2], Event::FragmentDivider { label } if label == "Network timeout")
+        );
+        assert!(
+            matches!(&g.events[4], Event::FragmentDivider { label } if label == "Credentials rejected")
+        );
     }
 
     #[test]
@@ -916,8 +1216,14 @@ mod tests {
 
     #[test]
     fn out_of_scope_statements_error_named() {
-        for stmt in ["box Purple", "create participant X", "destroy A",
-                     "rect rgb(0,0,0)", "links A: {}", "link A: x", "properties A: {}"] {
+        for stmt in [
+            "box Purple",
+            "create participant X",
+            "destroy A",
+            "links A: {}",
+            "link A: x",
+            "properties A: {}",
+        ] {
             let src = format!("sequenceDiagram\nA->>B: x\n{stmt}");
             let e = parse(&src).unwrap_err();
             assert_eq!(e.line, Some(3), "for {stmt}");
@@ -994,11 +1300,15 @@ mod tests {
         // spaces: `Alice ->>+ John: ...` / `John -->>- Alice: ...`.
         let g = p("sequenceDiagram\nAlice ->>+ John: hi\nJohn -->>- Alice: yo");
         match &g.events[0] {
-            Event::Message { activate_target, .. } => assert!(*activate_target),
+            Event::Message {
+                activate_target, ..
+            } => assert!(*activate_target),
             other => panic!("expected message, got {other:?}"),
         }
         match &g.events[1] {
-            Event::Message { deactivate_source, .. } => assert!(*deactivate_source),
+            Event::Message {
+                deactivate_source, ..
+            } => assert!(*deactivate_source),
             other => panic!("expected message, got {other:?}"),
         }
     }

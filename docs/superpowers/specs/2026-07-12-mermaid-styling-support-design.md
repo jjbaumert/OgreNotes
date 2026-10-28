@@ -50,8 +50,10 @@ Owns the styling vocabulary and the security boundary — lifted from
   `prop:value;…`. Unknown props/values are dropped silently (never errored).
 - `ClassDef { name: String, style: String }` — a named, pre-sanitized style set.
 - `resolve(classes: &[String], inline: Option<&str>, defs: &[ClassDef]) -> String`
-  — merge order: each assigned class's style in assignment order, then the
-  node's inline style last (inline wins). Returns a sanitized `prop:value;…`
+  Merge order: assigned `default` properties, then the first explicit
+  assigned class with a nonempty style, then the node's inline style.
+  Explicit and inline properties override matching defaults without
+  discarding other inherited properties. Returns a sanitized `prop:value;…`
   string (already injection-safe from its inputs).
 - `auto_contrast(fill: &str) -> Option<&'static str>` — parse a `#rgb`/`#rrggbb`
   fill, compute relative luminance, return `"#000"` (light fill) or `"#fff"`
@@ -75,8 +77,9 @@ Each diagram gains, mirroring flowchart:
 - Edge: `style: Option<String>` (for `linkStyle`).
 - Parser: route `classDef` / `class` / `cssClass` / `style` / `linkStyle`
   statements and the `:::className` node suffix to shared helpers instead of
-  returning "not supported". The `default` classDef auto-applies to unclassed
-  nodes, as in flowchart.
+  returning "not supported". Flowchart assigns `default` before explicit
+  classes on every node; other families use the shared property merge when
+  `default` is assigned explicitly.
 
 ## SVG application
 
@@ -155,3 +158,10 @@ unchanged.
 3. State: model + parser routing + SVG application + tests.
 4. ER: model + parser routing + SVG application + tests.
 5. Full-suite run + a styled example per type through `mermaid_cli` (light+dark).
+
+### Declaration comment boundary
+
+Class lookup keys are opaque tokens and may contain literal `%%`. Put whitespace
+before a trailing `%%` comment on `classDef`, `class`, `style`, or `linkStyle`
+declarations. Inline `:::class` suffixes use their existing ASCII-name grammar,
+so an immediate `%%` starts a comment there; ordinary edges also allow it.

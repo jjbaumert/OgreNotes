@@ -19,8 +19,10 @@
 
 use crate::escape_xml;
 use crate::measure;
-use crate::sequence::layout::{SeqLayout, ACTOR_EXTRA_H, ACT_OFFSET, ACT_W, PAD, SELF_EXTRA, SELF_STUB};
-use crate::sequence::{Event, Head, LineStyle, SeqDiagram};
+use crate::sequence::layout::{
+    SeqLayout, ACTOR_EXTRA_H, ACT_OFFSET, ACT_W, PAD, SELF_EXTRA, SELF_STUB,
+};
+use crate::sequence::{Event, FragmentKind, Head, LineStyle, SeqDiagram};
 
 /// `Head::None` has no marker — a test asserts zero `marker-end`
 /// occurrences when every message on the diagram is headless.
@@ -127,6 +129,17 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
     for i in frame_order {
         let f = &l.frames[i];
         let r = &f.rect;
+        if f.kind == FragmentKind::Rect {
+            out.push_str(&format!(
+                r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="{}"/>"#,
+                r.x,
+                r.y,
+                r.w,
+                r.h,
+                escape_xml(&f.label)
+            ));
+            continue;
+        }
         out.push_str(&format!(
             r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" fill="none" stroke="currentColor" stroke-width="1" rx="3"/>"#,
             r.x, r.y, r.w, r.h
@@ -191,7 +204,16 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
 
     // 6. messages: line/path + text + autonumber prefix.
     for m in &l.messages {
-        let Some(Event::Message { from, to, line, head, from_head, text, .. }) = d.events.get(m.event) else {
+        let Some(Event::Message {
+            from,
+            to,
+            line,
+            head,
+            from_head,
+            text,
+            ..
+        }) = d.events.get(m.event)
+        else {
             continue;
         };
         let self_msg = from == to;
@@ -205,7 +227,11 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
             Some(id) => format!(r#" marker-start="url(#{id})""#),
             None => String::new(),
         };
-        let dash_attr = if *line == LineStyle::Dotted { r#" stroke-dasharray="4 3""# } else { "" };
+        let dash_attr = if *line == LineStyle::Dotted {
+            r#" stroke-dasharray="4 3""#
+        } else {
+            ""
+        };
         if self_msg {
             // A rounded loop off the lifeline: cubic Bézier from the upper
             // point out to the right and back to the lower point, so the
@@ -237,7 +263,11 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
         for (idx, line_text) in lines.iter().enumerate() {
             // The anchor is the LAST line's baseline (layout keeps the
             // whole label above the arrow / self-message loop).
-            let dy = if idx == 0 { -(n_lines as f64 - 1.0) * measure::LINE_H } else { measure::LINE_H };
+            let dy = if idx == 0 {
+                -(n_lines as f64 - 1.0) * measure::LINE_H
+            } else {
+                measure::LINE_H
+            };
             let escaped = escape_xml(line_text);
             let content = if idx == 0 {
                 match m.number {
@@ -247,7 +277,10 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
             } else {
                 escaped
             };
-            out.push_str(&format!(r#"<tspan x="{:.1}" dy="{dy:.1}">{content}</tspan>"#, m.text_anchor.0));
+            out.push_str(&format!(
+                r#"<tspan x="{:.1}" dy="{dy:.1}">{content}</tspan>"#,
+                m.text_anchor.0
+            ));
         }
         out.push_str("</text>");
     }
@@ -270,8 +303,15 @@ pub(crate) fn emit(d: &SeqDiagram, l: &SeqLayout) -> String {
             r#"<text x="{cx:.1}" y="{cy:.1}" text-anchor="middle" fill="var(--mermaid-note-text, #333)">"#
         ));
         for (idx, line_text) in lines.iter().enumerate() {
-            let dy = if idx == 0 { -((n_lines as f64 - 1.0) / 2.0) * measure::LINE_H + 4.0 } else { measure::LINE_H };
-            out.push_str(&format!(r#"<tspan x="{cx:.1}" dy="{dy:.1}">{}</tspan>"#, escape_xml(line_text)));
+            let dy = if idx == 0 {
+                -((n_lines as f64 - 1.0) / 2.0) * measure::LINE_H + 4.0
+            } else {
+                measure::LINE_H
+            };
+            out.push_str(&format!(
+                r#"<tspan x="{cx:.1}" dy="{dy:.1}">{}</tspan>"#,
+                escape_xml(line_text)
+            ));
         }
         out.push_str("</text>");
     }
@@ -312,6 +352,44 @@ mod tests {
     use crate::sequence::render_sequence;
 
     #[test]
+    fn body_title_uses_the_shared_title_and_accessible_name() {
+        for accessibility in ["", "accTitle: Explicit accessible name\n"] {
+            let source = format!("---\ntitle: Front matter title\n---\nsequenceDiagram\n{accessibility}Title: Body :: Mixed CASE\nA->>B: work");
+            let svg = crate::render(&source).svg.expect("renders");
+            let name = if accessibility.is_empty() {
+                "Body :: Mixed CASE"
+            } else {
+                "Explicit accessible name"
+            };
+            assert!(svg.contains(&format!("aria-label=\"{name}\"")), "{svg}");
+            assert!(svg.contains(">Body :: Mixed CASE</text>"), "{svg}");
+            assert!(!svg.contains("Front matter title"), "{svg}");
+            assert_eq!(svg.matches(">Body :: Mixed CASE</text>").count(), 1);
+        }
+    }
+
+    #[test]
+    fn long_body_title_wraps_without_expanding_the_sequence_body() {
+        let title = "W".repeat(160);
+        let svg = crate::render(&format!("sequenceDiagram\ntitle {title}\nA->>B: work"))
+            .svg
+            .expect("renders");
+        assert!(svg.contains(&format!("aria-label=\"{title}\"")));
+        assert!(!svg.contains(&format!(">{title}</text>")));
+        let body = crate::render("sequenceDiagram\nA->>B: work").svg.unwrap();
+        let (bounds, drawn) = crate::extent::scan(&svg);
+        let (body_bounds, _) = crate::extent::scan(&body);
+        assert_eq!(bounds.x1 - bounds.x0, body_bounds.x1 - body_bounds.x0);
+        let heading_length: usize = drawn
+            .iter()
+            .filter(|element| !element.text.is_empty() && element.text.chars().all(|ch| ch == 'W'))
+            .map(|element| element.text.len())
+            .sum();
+        assert_eq!(heading_length, title.len());
+        crate::extent::assert_inside(&svg);
+    }
+
+    #[test]
     fn self_message_renders_as_a_curved_loop() {
         let svg = render_sequence("sequenceDiagram\nA->>A: think").unwrap();
         // The self-message is a cubic Bézier loop (`C`), not a square
@@ -321,18 +399,16 @@ mod tests {
         assert!(svg.contains("marker-end"), "{svg}");
     }
 
-
-
-
-
     #[test]
     fn basic_exchange_renders() {
-        let svg = render_sequence("sequenceDiagram\nparticipant A as Alice\nA->>B: Hello\nB-->>A: Hi").unwrap();
+        let svg =
+            render_sequence("sequenceDiagram\nparticipant A as Alice\nA->>B: Hello\nB-->>A: Hi")
+                .unwrap();
         assert!(svg.starts_with("<svg"));
         assert!(svg.contains("Alice") && svg.contains("Hello"));
         assert!(svg.contains("mmd-seq-arrow"));
         assert!(svg.contains("stroke-dasharray=\"3 3\"")); // lifelines
-        // top + bottom participant boxes: each display appears twice
+                                                           // top + bottom participant boxes: each display appears twice
         assert!(svg.matches(">Alice<").count() >= 2);
     }
 
@@ -353,8 +429,14 @@ mod tests {
     #[test]
     fn bidirectional_message_has_markers_both_ends() {
         let svg = render_sequence("sequenceDiagram\nA<<->>B: both").unwrap();
-        assert!(svg.contains(r##"marker-start="url(#mmd-seq-arrow)""##), "{svg}");
-        assert!(svg.contains(r##"marker-end="url(#mmd-seq-arrow)""##), "{svg}");
+        assert!(
+            svg.contains(r##"marker-start="url(#mmd-seq-arrow)""##),
+            "{svg}"
+        );
+        assert!(
+            svg.contains(r##"marker-end="url(#mmd-seq-arrow)""##),
+            "{svg}"
+        );
     }
 
     #[test]
@@ -365,17 +447,16 @@ mod tests {
 
     #[test]
     fn note_renders_with_note_fill() {
-        let svg = render_sequence("sequenceDiagram\nA->>B: x\nNote over A,B: spanning note").unwrap();
+        let svg =
+            render_sequence("sequenceDiagram\nA->>B: x\nNote over A,B: spanning note").unwrap();
         assert!(svg.contains("--mermaid-note-fill"));
         assert!(svg.contains("spanning note"));
     }
 
     #[test]
     fn note_over_three_spans_outer_lifelines() {
-        let svg = render_sequence(
-            "sequenceDiagram\nA->>B: x\nB->>C: y\nNote over A,C: wide",
-        )
-        .unwrap();
+        let svg =
+            render_sequence("sequenceDiagram\nA->>B: x\nB->>C: y\nNote over A,C: wide").unwrap();
         // Lifelines are the dasharray-"3 3" <line> elements; the note
         // rect (note-fill) must span at least from the first to the
         // last lifeline x.
@@ -409,7 +490,8 @@ mod tests {
 
     #[test]
     fn fragment_frame_and_divider() {
-        let svg = render_sequence("sequenceDiagram\nalt good\nA->>B: y\nelse bad\nA-xB: n\nend").unwrap();
+        let svg =
+            render_sequence("sequenceDiagram\nalt good\nA->>B: y\nelse bad\nA-xB: n\nend").unwrap();
         assert!(svg.contains(">alt<") || svg.contains(">alt</"));
         assert!(svg.contains("[good]"));
         assert!(svg.contains("[bad]"));
@@ -424,14 +506,18 @@ mod tests {
 
     #[test]
     fn autonumber_prefixes() {
-        let svg = render_sequence("sequenceDiagram\nautonumber\nA->>B: first\nB->>A: second").unwrap();
+        let svg =
+            render_sequence("sequenceDiagram\nautonumber\nA->>B: first\nB->>A: second").unwrap();
         assert!(svg.contains("1. first") || svg.contains(">1. "));
         assert!(svg.contains("2. second") || svg.contains(">2. "));
     }
 
     #[test]
     fn user_strings_escaped() {
-        let svg = render_sequence("sequenceDiagram\nparticipant A as <b>Bad</b>\nA->>B: <script>x</script>").unwrap();
+        let svg = render_sequence(
+            "sequenceDiagram\nparticipant A as <b>Bad</b>\nA->>B: <script>x</script>",
+        )
+        .unwrap();
         assert!(!svg.contains("<script>"));
         assert!(!svg.contains("<b>"));
         assert!(svg.contains("&lt;script&gt;"));

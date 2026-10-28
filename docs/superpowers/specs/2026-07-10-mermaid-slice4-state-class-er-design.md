@@ -20,10 +20,12 @@ existing pipeline: no schema, frontend, or export changes.
 - Simple states (`s1`, `state "Long name" as s1`), display labels.
 - Labeled transitions `s1 --> s2: event`.
 - `[*]` start/end pseudo-states (synthetic nodes: filled circle for
-  start, ring for end; a fresh synthetic node per `[*]` occurrence in
-  the role it appears — start when source, end when target).
+  start, ring for end; one node per role within each composite scope,
+  matching Mermaid semantics rather than duplicating each occurrence).
 - Composite states `state X { … }`, nested — mapped onto the layout
   engine's CLUSTER machinery (collapse-expand, proven at depth).
+  Quoted composite names and forward references are supported; incoming,
+  outgoing and self-loop transitions attach to the composite border.
 - `<<choice>>` (diamond) and `<<fork>>`/`<<join>>` (bars) stereotypes
   on `state` declarations.
 - `note left of X: text` / `note right of X: text` (rendered as note
@@ -41,8 +43,9 @@ existing pipeline: no schema, frontend, or export changes.
 - Three-compartment box rendering: name (+ optional `<<annotation>>`
   line), attributes, methods — split by mermaid's rule (entries with
   `(` are methods).
-- Visibility markers `+ - # ~` rendered verbatim; generics `~T~`
-  rendered literally as typed (no font styling in v1).
+- Visibility markers `+ - # ~` rendered verbatim; nested generics `~T~`
+  render as angle brackets. Static `$` members are underlined, abstract `*`
+  members are italic, and method return types use a ` : ` separator.
 - All six relationship kinds with distinct markers/line styles:
   - `<|--` inheritance (hollow triangle, solid), `<|..` realization
     (hollow triangle, dashed)
@@ -52,8 +55,8 @@ existing pipeline: no schema, frontend, or export changes.
     dependency (open arrow, dashed)
 - Multiplicities (`"1" -- "many"`) and relationship labels (`: label`).
 - Out of scope (per-line error): namespaces, `<<static>>`/abstract
-  member markers (the annotation form on the CLASS is in scope; member
-  modifiers `$`/`*` render verbatim rather than styled), two-way link
+  member stereotypes (the annotation form on the CLASS is in scope; use
+  the supported member suffixes `$`/`*` instead), two-way link
   syntax, `style`/`cssClass`/`callback`/`click`/`note for`.
 
 ### ER diagrams (`erDiagram`)
@@ -160,3 +163,10 @@ Flipping the last three kinds empties the "not yet supported" arm to
   the three sanctioned retirements/switches listed above.
 - Branch: worktree `worktree-mermaid-state-class-er` off post-slice-3
   main (created).
+
+### Composite-loop layout reservation
+
+Composite self-loops reserve their outer path and label envelope before sibling
+placement. Painted borders retain their original bounds; nested loop envelopes
+stay inside ancestor containers. Connector joins follow the reserved envelope
+boundary, and the aggregate waypoint limit includes expanded joins.

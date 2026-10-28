@@ -2,18 +2,29 @@
 //! Bespoke layout (participant columns + event rows) — the layered
 //! graph engine in `crate::layout` is deliberately not involved.
 
-pub(crate) mod parse;
 pub(crate) mod layout;
-pub(crate) mod svg;
+pub(crate) mod parse;
 #[cfg(test)]
 mod props;
+pub(crate) mod svg;
 
-/// Render mermaid sequence-diagram `source` to a self-contained `<svg>`
-/// string: parse → lifeline layout → SVG assembly.
-pub(crate) fn render_sequence(source: &str) -> Result<String, crate::ParseError> {
+/// Render the sequence body and retain its parsed title for the shared
+/// title/accessibility pipeline.
+pub(crate) fn render_sequence_with_title(
+    source: &str,
+) -> Result<(String, Option<String>), crate::ParseError> {
     let d = parse::parse(source)?;
     let l = layout::run(&d);
-    Ok(svg::emit(&d, &l))
+    Ok((svg::emit(&d, &l), d.title))
+}
+
+#[cfg(test)]
+pub(crate) fn render_sequence(source: &str) -> Result<String, crate::ParseError> {
+    let (svg, title) = render_sequence_with_title(source)?;
+    Ok(match title {
+        Some(title) => crate::source::with_title(svg, &title),
+        None => svg,
+    })
 }
 
 /// Caps enforced during parse — sequence rendering runs server-side on
@@ -25,18 +36,34 @@ pub(crate) const MAX_FRAGMENT_DEPTH: usize = 16;
 #[derive(Debug, Clone)]
 pub(crate) struct Participant {
     pub id: String,
-    pub display: String,   // raw; escaped only at SVG emission
+    pub display: String, // raw; escaped only at SVG emission
     pub is_actor: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LineStyle { Solid, Dotted }
+pub(crate) enum LineStyle {
+    Solid,
+    Dotted,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Head { None, Arrow, Cross, Async }
+pub(crate) enum Head {
+    None,
+    Arrow,
+    Cross,
+    Async,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FragmentKind { Loop, Alt, Opt, Par, Critical, Break }
+pub(crate) enum FragmentKind {
+    Loop,
+    Alt,
+    Opt,
+    Par,
+    Critical,
+    Break,
+    Rect,
+}
 
 impl FragmentKind {
     pub(crate) fn keyword(self) -> &'static str {
@@ -47,6 +74,7 @@ impl FragmentKind {
             FragmentKind::Par => "par",
             FragmentKind::Critical => "critical",
             FragmentKind::Break => "break",
+            FragmentKind::Rect => "rect",
         }
     }
 }
@@ -75,22 +103,38 @@ pub(crate) enum Event {
         /// `-->>-B` (minus before target): deactivate the SOURCE.
         deactivate_source: bool,
     },
-    Note { placement: NotePlacement, text: String },
-    FragmentOpen { kind: FragmentKind, label: String },
+    Note {
+        placement: NotePlacement,
+        text: String,
+    },
+    FragmentOpen {
+        kind: FragmentKind,
+        label: String,
+    },
     /// `else` (in alt) or `and` (in par).
-    FragmentDivider { label: String },
+    FragmentDivider {
+        label: String,
+    },
     FragmentClose,
-    Activate { p: usize },
-    Deactivate { p: usize },
+    Activate {
+        p: usize,
+    },
+    Deactivate {
+        p: usize,
+    },
     /// `autonumber` (start=1, step=1), `autonumber <start>` (step=1), or
     /// `autonumber <start> <step>`.
-    Autonumber { start: u32, step: u32 },
+    Autonumber {
+        start: u32,
+        step: u32,
+    },
     /// `autonumber off` — stop numbering subsequent messages.
     AutonumberOff,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct SeqDiagram {
+    pub title: Option<String>,
     pub participants: Vec<Participant>,
     pub events: Vec<Event>,
 }

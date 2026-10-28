@@ -25,6 +25,11 @@ fn arb_source() -> impl Strategy<Value = String> {
         Just("autonumber off".to_string()),
         Just("participant {\"database\":\"DB\"}".to_string()),
         Just("participant Z as Zed".to_string()),
+        Just("actor User as Reader".to_string()),
+        Just("A--xB: cross".to_string()),
+        Just("A--)B: async".to_string()),
+        Just("rect rgba(10,20,30,0.4)".to_string()),
+        Just("title A diagram title".to_string()),
         Just("A->>B: hi; B-->>A: yo".to_string()),
         Just("A->>B: x#59;y".to_string()),
         Just("A<<->>B: both".to_string()),
@@ -35,9 +40,8 @@ fn arb_source() -> impl Strategy<Value = String> {
         Just("participant M as Multi<br/>Line".to_string()),
         "[a-zA-Z<>:\\-x)+;#/|() ]{0,24}",
     ];
-    proptest::collection::vec(stmt, 0..40).prop_map(|v| {
-        format!("sequenceDiagram\n{}", v.join("\n"))
-    })
+    proptest::collection::vec(stmt, 0..40)
+        .prop_map(|v| format!("sequenceDiagram\n{}", v.join("\n")))
 }
 
 proptest! {

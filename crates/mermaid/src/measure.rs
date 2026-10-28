@@ -258,10 +258,14 @@ pub(crate) fn wrap_literal_to_width(
 /// Conservative literal glyph bounds for overlap detection, without HTML breaks.
 /// The allowance covers fallback fonts; it changes marker presentation, not layout.
 pub(crate) fn literal_overlap_width(text: &str, font_size: f64) -> f64 {
+    literal_text_width(text, font_size, false) * 1.3
+}
+
+/// Literal SVG text advances at the emitted font size, without marker padding.
+pub(crate) fn literal_text_width(text: &str, font_size: f64, bold: bool) -> f64 {
     text.graphemes(true)
-        .map(|g| literal_advance(g, font_size, false))
-        .sum::<f64>()
-        * 1.3
+        .map(|grapheme| literal_advance(grapheme, font_size, bold))
+        .sum()
 }
 
 /// Fit literal SVG text at its rendered font size, preserving grapheme clusters.

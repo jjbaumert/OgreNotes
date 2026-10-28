@@ -37,13 +37,27 @@ read-only link-share) picks it up.
   fragments (error at the opening line) are per-line errors.
 - **`autonumber`**: prefixes messages with 1., 2., … from that point on.
 - **Comments** `%%`, blank lines, and the `sequenceDiagram` header line.
+- **Region backgrounds**: `rect rgb(...)` / `rect rgba(...)`, closed by
+  `end`; validated numeric components are emitted as canonical CSS colors.
+- **Titles**: `title text` / `title: text` uses the shared wrapping and
+  accessible-name path. Body titles override front-matter titles; `accTitle`
+  overrides the accessible name only.
+
+Statement keywords and the standalone alias keyword `as` are case-insensitive;
+participant IDs and display names retain their spelling. Free-text structural
+labels keep precedence: `loop ->> retry` opens a fragment. Declare such a
+keyword-named source explicitly to resolve the ambiguity: `participant LOOP`,
+then `LOOP ->> B: text`. Keywords whose statement grammar cannot accept an
+arrow-prefixed argument remain valid implicit sources, including `end ->> B`,
+`Actor ->> B`, and `Box ->> B`. Glued messages such as `LOOP->>B` remain
+unambiguous.
 
 `<br/>`-multiline display names, message text, and note text are all IN
 scope (the shared `measure` module already handles line splitting).
 
 Explicitly out of scope (clear per-line parse error, never silent partial
-render): `box`/`end` participant grouping, `create`/`destroy`, `rect`
-background highlighting, `links`/`link`/`properties`, `par over`; any
+render): `box`/`end` participant grouping, `create`/`destroy`,
+`links`/`link`/`properties`, `par over`; any
 other unknown statement errors with its keyword named.
 
 ## Architecture — `crates/mermaid/src/sequence/`
@@ -67,14 +81,14 @@ pub(crate) enum Event {
     Message { from: usize, to: usize, line: LineStyle, head: Head,
               text: String, activate_target: bool, deactivate_source: bool },
     Note { placement: NotePlacement, text: String },       // LeftOf(p) | RightOf(p) | Over(a, Option<b>)
-    FragmentOpen { kind: FragmentKind, label: String },    // Loop|Alt|Opt|Par|Critical|Break
+    FragmentOpen { kind: FragmentKind, label: String },    // Loop|Alt|Opt|Par|Critical|Break|Rect
     FragmentDivider { label: String },                     // else / and
     FragmentClose,
     Activate { p: usize },
     Deactivate { p: usize },
     Autonumber,
 }
-pub(crate) struct SeqDiagram { pub participants: Vec<Participant>, pub events: Vec<Event> }
+pub(crate) struct SeqDiagram { pub title: Option<String>, pub participants: Vec<Participant>, pub events: Vec<Event> }
 ```
 
 ### `sequence/layout.rs`
