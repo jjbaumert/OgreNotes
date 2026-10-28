@@ -182,6 +182,9 @@ pub fn to_html_with_comments(doc: &Doc, comments: &[ExportComment]) -> String {
         render_fragment_html(&txn, &fragment, &mut html);
     }
     render_comments_html(comments, &mut html);
+    if html.contains("class=\"mermaid-block\"") {
+        html.insert_str(0, "<style>@media print{.mermaid-block{max-width:100%;break-inside:avoid}.mermaid-block svg{max-width:100%;height:auto}}</style>");
+    }
     html
 }
 
@@ -239,19 +242,29 @@ pub fn to_csv(doc: &Doc) -> String {
     let mut csv = String::new();
     let len = fragment.len(&txn);
     for i in 0..len {
-        let Some(XmlOut::Element(el)) = fragment.get(&txn, i) else { continue };
-        if el.tag().as_ref() != "table" { continue; }
+        let Some(XmlOut::Element(el)) = fragment.get(&txn, i) else {
+            continue;
+        };
+        if el.tag().as_ref() != "table" {
+            continue;
+        }
 
         // Found a table — iterate rows
         let row_count = el.len(&txn);
         for ri in 0..row_count {
-            let Some(XmlOut::Element(row_el)) = el.get(&txn, ri) else { continue };
+            let Some(XmlOut::Element(row_el)) = el.get(&txn, ri) else {
+                continue;
+            };
             let tag = row_el.tag();
-            if tag.as_ref() != "table_row" { continue; }
+            if tag.as_ref() != "table_row" {
+                continue;
+            }
 
             let col_count = row_el.len(&txn);
             for ci in 0..col_count {
-                if ci > 0 { csv.push(','); }
+                if ci > 0 {
+                    csv.push(',');
+                }
                 let cell_text = if let Some(XmlOut::Element(cell_el)) = row_el.get(&txn, ci) {
                     extract_text(&txn, &cell_el)
                 } else {
@@ -366,7 +379,7 @@ const XLSX_MAX_COLS: u32 = 16_384;
 /// Returns the raw bytes of the .xlsx file.
 #[cfg(feature = "xlsx")]
 pub fn to_xlsx(doc: &Doc) -> Vec<u8> {
-    use rust_xlsxwriter::{Workbook, Format};
+    use rust_xlsxwriter::{Format, Workbook};
 
     let txn = doc.transact();
     let Some(fragment) = txn.get_xml_fragment("content") else {
@@ -378,11 +391,16 @@ pub fn to_xlsx(doc: &Doc) -> Vec<u8> {
     let mut sheet_idx = 0u32;
 
     for i in 0..len {
-        let Some(yrs::types::xml::XmlOut::Element(el)) = fragment.get(&txn, i) else { continue };
-        if el.tag().as_ref() != "table" { continue; }
+        let Some(yrs::types::xml::XmlOut::Element(el)) = fragment.get(&txn, i) else {
+            continue;
+        };
+        if el.tag().as_ref() != "table" {
+            continue;
+        }
 
         // Get sheet name from attribute
-        let sheet_name = el.get_attribute(&txn, ATTR_SHEET_NAME)
+        let sheet_name = el
+            .get_attribute(&txn, ATTR_SHEET_NAME)
             .unwrap_or_else(|| format!("Sheet{}", sheet_idx + 1));
 
         let worksheet = workbook.add_worksheet();
@@ -396,8 +414,12 @@ pub fn to_xlsx(doc: &Doc) -> Vec<u8> {
             if ri >= XLSX_MAX_ROWS {
                 break;
             }
-            let Some(yrs::types::xml::XmlOut::Element(row_el)) = el.get(&txn, ri) else { continue };
-            if row_el.tag().as_ref() != "table_row" { continue; }
+            let Some(yrs::types::xml::XmlOut::Element(row_el)) = el.get(&txn, ri) else {
+                continue;
+            };
+            if row_el.tag().as_ref() != "table_row" {
+                continue;
+            }
 
             let col_count = row_el.len(&txn);
             for ci in 0..col_count {
@@ -422,7 +444,6 @@ pub fn to_xlsx(doc: &Doc) -> Vec<u8> {
                     } else if !text.is_empty() {
                         let _ = worksheet.write_string_with_format(ri, ci as u16, &text, &fmt);
                     }
-
                 }
             }
         }
@@ -498,7 +519,8 @@ pub fn to_docx_with_comments(doc: &Doc, comments: &[ExportComment]) -> Vec<u8> {
             // one line per source line, rather than an empty paragraph.
             NodeType::Mermaid => {
                 let source = el.get_attribute(&txn, "source").unwrap_or_default();
-                let mut run = Run::new().fonts(RunFonts::new().ascii("Courier New").hi_ansi("Courier New"));
+                let mut run =
+                    Run::new().fonts(RunFonts::new().ascii("Courier New").hi_ansi("Courier New"));
                 for (i, line) in source.lines().enumerate() {
                     if i > 0 {
                         run = run.add_break(BreakType::TextWrapping);
@@ -585,8 +607,7 @@ fn build_docx_table<T: ReadTxn>(txn: &T, table_el: &yrs::XmlElementRef) -> docx_
             }
             let text = extract_text(txn, &cell_el);
             cells.push(
-                TableCell::new()
-                    .add_paragraph(Paragraph::new().add_run(Run::new().add_text(text))),
+                TableCell::new().add_paragraph(Paragraph::new().add_run(Run::new().add_text(text))),
             );
         }
         rows.push(TableRow::new(cells));
@@ -684,7 +705,9 @@ pub fn to_pdf_with_comments(doc: &Doc, comments: &[ExportComment]) -> Vec<u8> {
             font: font.clone(),
             size: Pt(FONT_SIZE_PT),
         });
-        ops.push(Op::SetLineHeight { lh: Pt(LINE_HEIGHT_PT) });
+        ops.push(Op::SetLineHeight {
+            lh: Pt(LINE_HEIGHT_PT),
+        });
         ops.push(Op::SetTextCursor {
             pos: Point {
                 x: Pt(left_x),
@@ -701,7 +724,11 @@ pub fn to_pdf_with_comments(doc: &Doc, comments: &[ExportComment]) -> Vec<u8> {
     for line in &lines {
         if y < bottom_y {
             ops.push(Op::EndTextSection);
-            pages.push(PdfPage::new(Mm(PAGE_W_MM), Mm(PAGE_H_MM), std::mem::take(&mut ops)));
+            pages.push(PdfPage::new(
+                Mm(PAGE_W_MM),
+                Mm(PAGE_H_MM),
+                std::mem::take(&mut ops),
+            ));
             open_page(&mut ops, &font);
             y = top_y;
         }
@@ -758,7 +785,10 @@ fn collect_block_text(doc: &Doc) -> Vec<String> {
 /// single word longer than the limit.
 #[cfg(feature = "pdf")]
 fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
-    debug_assert!(max_chars > 0, "max_chars must be positive (hard-split would loop forever)");
+    debug_assert!(
+        max_chars > 0,
+        "max_chars must be positive (hard-split would loop forever)"
+    );
     let mut out = Vec::new();
     for raw in text.split('\n') {
         let mut cur = String::new();
@@ -800,7 +830,9 @@ fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
 #[cfg(feature = "pdf")]
 fn is_deck(doc: &Doc) -> bool {
     let txn = doc.transact();
-    let Some(fragment) = txn.get_xml_fragment("content") else { return false };
+    let Some(fragment) = txn.get_xml_fragment("content") else {
+        return false;
+    };
     (0..fragment.len(&txn)).any(|i| {
         matches!(fragment.get(&txn, i), Some(XmlOut::Element(el))
             if NodeType::from_tag(el.tag().as_ref()) == Some(NodeType::Slide))
@@ -841,16 +873,22 @@ fn doc_attr(doc: &Doc, name: &str) -> Option<String> {
 #[cfg(feature = "pdf")]
 fn collect_slides(doc: &Doc) -> Vec<Vec<PdfFrame>> {
     let txn = doc.transact();
-    let Some(fragment) = txn.get_xml_fragment("content") else { return Vec::new() };
+    let Some(fragment) = txn.get_xml_fragment("content") else {
+        return Vec::new();
+    };
     let mut slides = Vec::new();
     for i in 0..fragment.len(&txn) {
-        let Some(XmlOut::Element(slide_el)) = fragment.get(&txn, i) else { continue };
+        let Some(XmlOut::Element(slide_el)) = fragment.get(&txn, i) else {
+            continue;
+        };
         if NodeType::from_tag(slide_el.tag().as_ref()) != Some(NodeType::Slide) {
             continue;
         }
         let mut frames = Vec::new();
         for idx in slide_child_order(&txn, &slide_el) {
-            let Some(XmlOut::Element(frame_el)) = slide_el.get(&txn, idx) else { continue };
+            let Some(XmlOut::Element(frame_el)) = slide_el.get(&txn, idx) else {
+                continue;
+            };
             if NodeType::from_tag(frame_el.tag().as_ref()) != Some(NodeType::Frame) {
                 continue;
             }
@@ -938,12 +976,24 @@ fn to_pdf_slides(doc: &Doc) -> Vec<u8> {
         // `PaintMode::Fill`, and `DrawPolygon` honors that mode, so a
         // filled rect must go through `DrawPolygon`.
         let bg_rect = Rect::from_xywh(Pt(0.0), Pt(0.0), Pt(page_w_pt), Pt(page_h_pt));
-        ops.push(Op::SetFillColor { col: Color::Rgb(Rgb::new(bg_r, bg_g, bg_b, None)) });
-        ops.push(Op::DrawPolygon { polygon: bg_rect.to_polygon() });
+        ops.push(Op::SetFillColor {
+            col: Color::Rgb(Rgb::new(bg_r, bg_g, bg_b, None)),
+        });
+        ops.push(Op::DrawPolygon {
+            polygon: bg_rect.to_polygon(),
+        });
 
         for frame in &frames {
-            let size = if frame.is_heading { HEADING_PT } else { BODY_PT };
-            let (fr, fg, fb) = if frame.is_heading { (h_r, h_g, h_b) } else { (t_r, t_g, t_b) };
+            let size = if frame.is_heading {
+                HEADING_PT
+            } else {
+                BODY_PT
+            };
+            let (fr, fg, fb) = if frame.is_heading {
+                (h_r, h_g, h_b)
+            } else {
+                (t_r, t_g, t_b)
+            };
             let max_chars = ((FULL_WIDTH_CHARS * frame.w as f32) as usize).max(8);
             let lines = wrap_text(&frame.text, max_chars);
 
@@ -958,14 +1008,28 @@ fn to_pdf_slides(doc: &Doc) -> Vec<u8> {
             let fit = lines_that_fit(top_pt, bottom_pt, size, size * LINE_RATIO);
             let lines = lines.into_iter().take(fit);
 
-            ops.push(Op::SetFillColor { col: Color::Rgb(Rgb::new(fr, fg, fb, None)) });
+            ops.push(Op::SetFillColor {
+                col: Color::Rgb(Rgb::new(fr, fg, fb, None)),
+            });
             ops.push(Op::StartTextSection);
-            ops.push(Op::SetFont { font: font.clone(), size: Pt(size) });
-            ops.push(Op::SetLineHeight { lh: Pt(size * LINE_RATIO) });
-            ops.push(Op::SetTextCursor { pos: Point { x: Pt(x_pt), y: Pt(top_pt - size) } });
+            ops.push(Op::SetFont {
+                font: font.clone(),
+                size: Pt(size),
+            });
+            ops.push(Op::SetLineHeight {
+                lh: Pt(size * LINE_RATIO),
+            });
+            ops.push(Op::SetTextCursor {
+                pos: Point {
+                    x: Pt(x_pt),
+                    y: Pt(top_pt - size),
+                },
+            });
             for line in lines {
                 if !line.is_empty() {
-                    ops.push(Op::ShowText { items: vec![TextItem::Text(line)] });
+                    ops.push(Op::ShowText {
+                        items: vec![TextItem::Text(line)],
+                    });
                 }
                 ops.push(Op::AddLineBreak);
             }
@@ -1181,7 +1245,7 @@ fn render_node_html_with_context<T: ReadTxn>(
     match node {
         XmlOut::Element(el) => {
             let tag = el.tag();
-            let Some(node_type) = NodeType::from_tag(&tag) else {
+            let Some(node_type) = NodeType::from_tag(tag) else {
                 return;
             };
 
@@ -1270,9 +1334,7 @@ fn render_node_html_with_context<T: ReadTxn>(
                             // SVG is generated by our own renderer (no
                             // user HTML passes through); the source is
                             // XML-escaped inside the renderer.
-                            out.push_str(&format!(
-                                "<div class=\"mermaid-block\">{svg}</div>"
-                            ));
+                            out.push_str(&format!("<div class=\"mermaid-block\">{svg}</div>"));
                         }
                         None => {
                             let msg = out_render
@@ -1397,7 +1459,7 @@ fn render_node_markdown<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String, de
     match node {
         XmlOut::Element(el) => {
             let tag = el.tag();
-            let Some(node_type) = NodeType::from_tag(&tag) else {
+            let Some(node_type) = NodeType::from_tag(tag) else {
                 return;
             };
 
@@ -1541,11 +1603,7 @@ fn render_node_markdown<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String, de
                 NodeType::KanbanColumn => {
                     out.push_str(&crate::blocks::kanban::markdown_placeholder(
                         NodeType::KanbanColumn,
-                        &collect_named_attrs(
-                            txn,
-                            el,
-                            crate::blocks::kanban::COLUMN_ATTR_NAMES,
-                        ),
+                        &collect_named_attrs(txn, el, crate::blocks::kanban::COLUMN_ATTR_NAMES),
                     ));
                     render_children_markdown(txn, el, out, depth);
                     out.push('\n');
@@ -1553,11 +1611,7 @@ fn render_node_markdown<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String, de
                 NodeType::KanbanCard => {
                     out.push_str(&crate::blocks::kanban::markdown_placeholder(
                         NodeType::KanbanCard,
-                        &collect_named_attrs(
-                            txn,
-                            el,
-                            crate::blocks::kanban::CARD_ATTR_NAMES,
-                        ),
+                        &collect_named_attrs(txn, el, crate::blocks::kanban::CARD_ATTR_NAMES),
                     ));
                 }
                 NodeType::Mention => {
@@ -1658,7 +1712,7 @@ fn render_table_markdown<T: ReadTxn>(
                 continue;
             };
             if matches!(
-                NodeType::from_tag(&cell.tag()),
+                NodeType::from_tag(cell.tag()),
                 Some(NodeType::TableCell | NodeType::TableHeader)
             ) {
                 cells.push(cell);
@@ -1808,7 +1862,7 @@ fn table_cell_needs_html<T: ReadTxn>(txn: &T, node: &XmlOut) -> bool {
     };
     match node {
         XmlOut::Element(el) => {
-            NodeType::from_tag(&el.tag()).is_some_and(|kind| {
+            NodeType::from_tag(el.tag()).is_some_and(|kind| {
                 (kind.is_inline() && kind != NodeType::HardBreak)
                     || kind.is_block()
                         && !matches!(
@@ -1929,9 +1983,7 @@ fn node_type_to_html_tag(nt: NodeType) -> &'static str {
         // #136 live-app blocks — Calendar/CalendarEvent tag lookup
         // delegates to the plugin module. See
         // design/live-app-blocks.md.
-        NodeType::Calendar | NodeType::CalendarEvent => {
-            crate::blocks::calendar::html_tag(nt)
-        }
+        NodeType::Calendar | NodeType::CalendarEvent => crate::blocks::calendar::html_tag(nt),
         // #137 live-app blocks — Kanban tree tag lookup.
         NodeType::Kanban | NodeType::KanbanColumn | NodeType::KanbanCard => {
             crate::blocks::kanban::html_tag(nt)
@@ -2038,11 +2090,7 @@ fn render_code_block_highlighted<T: ReadTxn>(
     true
 }
 
-fn render_html_attrs<T: ReadTxn>(
-    txn: &T,
-    el: &yrs::XmlElementRef,
-    node_type: NodeType,
-) -> String {
+fn render_html_attrs<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef, node_type: NodeType) -> String {
     let mut attrs = String::new();
 
     match node_type {
@@ -2055,10 +2103,10 @@ fn render_html_attrs<T: ReadTxn>(
             }
         }
         NodeType::Image => {
-            if let Some(src) = el.get_attribute(txn, "src") {
-                if is_safe_url(&src) {
-                    attrs.push_str(&format!(" src=\"{}\"", html_escape_attr(&src)));
-                }
+            if let Some(src) = el.get_attribute(txn, "src")
+                && is_safe_url(&src)
+            {
+                attrs.push_str(&format!(" src=\"{}\"", html_escape_attr(&src)));
             }
             if let Some(alt) = el.get_attribute(txn, "alt") {
                 attrs.push_str(&format!(" alt=\"{}\"", html_escape_attr(&alt)));
@@ -2075,7 +2123,9 @@ fn render_html_attrs<T: ReadTxn>(
                 .get_attribute(txn, "checked")
                 .map(|v| v == "true")
                 .unwrap_or(false);
-            attrs.push_str(&format!(" data-type=\"taskItem\" data-checked=\"{checked}\""));
+            attrs.push_str(&format!(
+                " data-type=\"taskItem\" data-checked=\"{checked}\""
+            ));
         }
         NodeType::Embed => {
             // M-P6 piece C — HTML export emits the same sandboxed
@@ -2084,10 +2134,10 @@ fn render_html_attrs<T: ReadTxn>(
             // at insert time, so no extra validation here beyond
             // the scheme check). `height` clamped [200, 1200] so a
             // corrupted attribute can't break the rendered page.
-            if let Some(url) = el.get_attribute(txn, "url") {
-                if is_safe_url(&url) {
-                    attrs.push_str(&format!(" src=\"{}\"", html_escape_attr(&url)));
-                }
+            if let Some(url) = el.get_attribute(txn, "url")
+                && is_safe_url(&url)
+            {
+                attrs.push_str(&format!(" src=\"{}\"", html_escape_attr(&url)));
             }
             if let Some(title) = el.get_attribute(txn, "title") {
                 attrs.push_str(&format!(" title=\"{}\"", html_escape_attr(&title)));
@@ -2148,23 +2198,20 @@ fn render_html_attrs<T: ReadTxn>(
             // round-trip and existing stylesheets keep working.
             attrs.push_str(" class=\"mention\"");
             if let Some(uid) = el.get_attribute(txn, "user_id") {
-                attrs.push_str(&format!(
-                    " data-user-id=\"{}\"",
-                    html_escape_attr(&uid),
-                ));
+                attrs.push_str(&format!(" data-user-id=\"{}\"", html_escape_attr(&uid),));
             }
         }
         NodeType::DocMention => {
             attrs.push_str(" class=\"doc-mention\"");
             if let Some(doc_id) = el.get_attribute(txn, "doc_id") {
-                attrs.push_str(&format!(
-                    " data-doc-id=\"{}\"",
-                    html_escape_attr(&doc_id),
-                ));
+                attrs.push_str(&format!(" data-doc-id=\"{}\"", html_escape_attr(&doc_id),));
             }
             // Omit data-block-id when the mention targets the whole
             // document (empty target_block_id).
-            if let Some(block_id) = el.get_attribute(txn, "target_block_id").filter(|b| !b.is_empty()) {
+            if let Some(block_id) = el
+                .get_attribute(txn, "target_block_id")
+                .filter(|b| !b.is_empty())
+            {
                 attrs.push_str(&format!(
                     " data-block-id=\"{}\"",
                     html_escape_attr(&block_id),
@@ -2187,7 +2234,9 @@ fn render_html_attrs<T: ReadTxn>(
                 crate::blocks::presentation::FRAME_ATTR_NAMES
             };
             let collected = collect_named_attrs(txn, el, names);
-            attrs.push_str(&crate::blocks::presentation::html_attrs(node_type, &collected));
+            attrs.push_str(&crate::blocks::presentation::html_attrs(
+                node_type, &collected,
+            ));
         }
         _ => {}
     }
@@ -2274,8 +2323,15 @@ fn push_md_fenced(out: &mut String, info: &str, body: &str) {
         longest = longest.max(run);
     }
     let fence = "`".repeat((longest + 1).max(3));
-    let info: String = info.chars().filter(|c| !matches!(c, '`' | '\n' | '\r')).collect();
-    out.push_str(&format!("{fence}{info}\n{body}\n{fence}\n\n"));
+    let info: String = info
+        .chars()
+        .filter(|c| !matches!(c, '`' | '\n' | '\r'))
+        .collect();
+    out.push_str(&format!("{fence}{info}\n{body}"));
+    if !body.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("{fence}\n\n"));
 }
 
 /// `$…$` (GitHub, GitLab, Pandoc) for an inline equation. A source the
@@ -2348,8 +2404,11 @@ fn escape_markdown_text(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::document::OgreDoc;
-    use yrs::{Transact, WriteTxn, types::xml::{XmlElementPrelim, XmlTextPrelim}};
     use crate::schema::NodeType;
+    use yrs::{
+        Transact, WriteTxn,
+        types::xml::{XmlElementPrelim, XmlTextPrelim},
+    };
 
     // ── Helpers ────────────────────────────────────────────────────
 
@@ -2399,10 +2458,7 @@ mod tests {
             html_escape_attr("value \"with\" quotes"),
             "value &quot;with&quot; quotes"
         );
-        assert_eq!(
-            html_escape_attr("it's here"),
-            "it&#x27;s here"
-        );
+        assert_eq!(html_escape_attr("it's here"), "it&#x27;s here");
     }
 
     #[test]
@@ -2442,7 +2498,10 @@ mod tests {
         assert_eq!(escape_markdown_text("Normal text"), "Normal text");
         // Backslash must go before the structural char, not before leading whitespace
         assert_eq!(escape_markdown_text("  # indented"), "  \\# indented");
-        assert_eq!(escape_markdown_text("   - indented list"), "   \\- indented list");
+        assert_eq!(
+            escape_markdown_text("   - indented list"),
+            "   \\- indented list"
+        );
     }
 
     // ── HTML rendering tests ───────────────────────────────────────
@@ -2450,7 +2509,11 @@ mod tests {
     #[test]
     fn html_paragraph_with_text() {
         let doc = doc_with(|txn, frag| {
-            let para = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let para = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &para, "Hello world");
         });
         let html = to_html(&doc);
@@ -2461,7 +2524,11 @@ mod tests {
     fn html_heading_levels() {
         for level in 1..=6u8 {
             let doc = doc_with(|txn, frag| {
-                let h = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Heading.tag_name()));
+                let h = frag.insert(
+                    txn,
+                    0,
+                    XmlElementPrelim::empty(NodeType::Heading.tag_name()),
+                );
                 h.insert_attribute(txn, "level", level.to_string());
                 insert_text(txn, &h, "Title");
             });
@@ -2474,7 +2541,11 @@ mod tests {
     #[test]
     fn html_heading_defaults_to_h1() {
         let doc = doc_with(|txn, frag| {
-            let h = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Heading.tag_name()));
+            let h = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Heading.tag_name()),
+            );
             // No "level" attribute set
             insert_text(txn, &h, "No level");
         });
@@ -2485,9 +2556,21 @@ mod tests {
     #[test]
     fn html_bullet_list() {
         let doc = doc_with(|txn, frag| {
-            let ul = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::BulletList.tag_name()));
-            let li = ul.insert(txn, 0, XmlElementPrelim::empty(NodeType::ListItem.tag_name()));
-            let p = li.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let ul = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::BulletList.tag_name()),
+            );
+            let li = ul.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::ListItem.tag_name()),
+            );
+            let p = li.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Item 1");
         });
         let html = to_html(&doc);
@@ -2501,9 +2584,21 @@ mod tests {
     #[test]
     fn html_ordered_list() {
         let doc = doc_with(|txn, frag| {
-            let ol = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::OrderedList.tag_name()));
-            let li = ol.insert(txn, 0, XmlElementPrelim::empty(NodeType::ListItem.tag_name()));
-            let p = li.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let ol = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::OrderedList.tag_name()),
+            );
+            let li = ol.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::ListItem.tag_name()),
+            );
+            let p = li.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Step 1");
         });
         let html = to_html(&doc);
@@ -2514,8 +2609,16 @@ mod tests {
     #[test]
     fn html_blockquote() {
         let doc = doc_with(|txn, frag| {
-            let bq = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Blockquote.tag_name()));
-            let p = bq.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let bq = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Blockquote.tag_name()),
+            );
+            let p = bq.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Quoted text");
         });
         let html = to_html(&doc);
@@ -2528,7 +2631,11 @@ mod tests {
     #[test]
     fn html_code_block_with_language() {
         let doc = doc_with(|txn, frag| {
-            let cb = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()));
+            let cb = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()),
+            );
             cb.insert_attribute(txn, "language", "rust");
             insert_text(txn, &cb, "fn main() {}");
         });
@@ -2540,7 +2647,11 @@ mod tests {
     #[test]
     fn html_horizontal_rule() {
         let doc = doc_with(|txn, frag| {
-            frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::HorizontalRule.tag_name()));
+            frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::HorizontalRule.tag_name()),
+            );
         });
         let html = to_html(&doc);
         assert!(html.contains("<hr"), "got: {html}");
@@ -2555,7 +2666,10 @@ mod tests {
             img.insert_attribute(txn, "title", "Photo title");
         });
         let html = to_html(&doc);
-        assert!(html.contains("src=\"https://example.com/photo.jpg\""), "got: {html}");
+        assert!(
+            html.contains("src=\"https://example.com/photo.jpg\""),
+            "got: {html}"
+        );
         assert!(html.contains("alt=\"A photo\""), "got: {html}");
         assert!(html.contains("title=\"Photo title\""), "got: {html}");
     }
@@ -2568,7 +2682,10 @@ mod tests {
             img.insert_attribute(txn, "alt", "bad");
         });
         let html = to_html(&doc);
-        assert!(!html.contains("javascript:"), "unsafe src in output: {html}");
+        assert!(
+            !html.contains("javascript:"),
+            "unsafe src in output: {html}"
+        );
     }
 
     #[test]
@@ -2582,12 +2699,18 @@ mod tests {
         });
         let html = to_html(&doc);
         assert!(html.contains("<iframe"), "got: {html}");
-        assert!(html.contains("src=\"https://www.youtube.com/embed/dQw4w9WgXcQ\""), "got: {html}");
+        assert!(
+            html.contains("src=\"https://www.youtube.com/embed/dQw4w9WgXcQ\""),
+            "got: {html}"
+        );
         assert!(
             html.contains("sandbox=\"allow-scripts allow-same-origin\""),
             "got: {html}"
         );
-        assert!(html.contains("referrerpolicy=\"no-referrer\""), "got: {html}");
+        assert!(
+            html.contains("referrerpolicy=\"no-referrer\""),
+            "got: {html}"
+        );
         assert!(html.contains("loading=\"lazy\""), "got: {html}");
         assert!(html.contains("title=\"Demo video\""), "got: {html}");
         assert!(html.contains("height=\"315\""), "got: {html}");
@@ -2613,7 +2736,11 @@ mod tests {
         // ride between the span tags — not self-close and lose
         // the title.
         let doc = doc_with(|txn, frag| {
-            let cal = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Calendar.tag_name()));
+            let cal = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Calendar.tag_name()),
+            );
             cal.insert_attribute(txn, "view", "month");
             cal.insert_attribute(txn, "timezone", "UTC");
             let ev = cal.insert(
@@ -2643,7 +2770,11 @@ mod tests {
         // Regression guard: content is HTML-escaped so a rogue
         // event title cannot inject markup into the export.
         let doc = doc_with(|txn, frag| {
-            let cal = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Calendar.tag_name()));
+            let cal = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Calendar.tag_name()),
+            );
             let ev = cal.insert(
                 txn,
                 0,
@@ -2655,7 +2786,10 @@ mod tests {
             ev.insert_attribute(txn, "content", "<script>alert(1)</script>");
         });
         let html = to_html(&doc);
-        assert!(!html.contains("<script>"), "unescaped script tag; got: {html}");
+        assert!(
+            !html.contains("<script>"),
+            "unescaped script tag; got: {html}"
+        );
         assert!(
             html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
             "expected escaped content; got: {html}"
@@ -2679,8 +2813,16 @@ mod tests {
     #[test]
     fn html_doc_mention_renders_anchor_with_data_attrs() {
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
-            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
+            let dm = p.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::DocMention.tag_name()),
+            );
             dm.insert_attribute(txn, "url", "/d/abc123");
             dm.insert_attribute(txn, "doc_id", "abc123");
             dm.insert_attribute(txn, "target_block_id", "blk-1");
@@ -2698,8 +2840,16 @@ mod tests {
     #[test]
     fn html_doc_mention_omits_data_block_id_when_target_empty() {
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
-            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
+            let dm = p.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::DocMention.tag_name()),
+            );
             dm.insert_attribute(txn, "url", "/d/abc123");
             dm.insert_attribute(txn, "doc_id", "abc123");
             dm.insert_attribute(txn, "title", "Target Doc");
@@ -2707,7 +2857,9 @@ mod tests {
         let html = to_html(&doc);
         assert!(!html.contains("data-block-id"), "got: {html}");
         assert!(
-            html.contains(r#"<a class="doc-mention" data-doc-id="abc123" href="/d/abc123">Target Doc</a>"#),
+            html.contains(
+                r#"<a class="doc-mention" data-doc-id="abc123" href="/d/abc123">Target Doc</a>"#
+            ),
             "got: {html}"
         );
     }
@@ -2715,8 +2867,16 @@ mod tests {
     #[test]
     fn html_doc_mention_falls_back_to_url_when_no_title() {
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
-            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
+            let dm = p.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::DocMention.tag_name()),
+            );
             dm.insert_attribute(txn, "url", "/d/abc123");
         });
         let html = to_html(&doc);
@@ -2726,8 +2886,16 @@ mod tests {
     #[test]
     fn doc_mention_javascript_url_stripped_from_html() {
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
-            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
+            let dm = p.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::DocMention.tag_name()),
+            );
             dm.insert_attribute(txn, "url", "javascript:alert(1)");
             dm.insert_attribute(txn, "doc_id", "abc123");
             dm.insert_attribute(txn, "title", "Target Doc");
@@ -2744,10 +2912,22 @@ mod tests {
     #[test]
     fn html_task_list() {
         let doc = doc_with(|txn, frag| {
-            let tl = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::TaskList.tag_name()));
-            let ti = tl.insert(txn, 0, XmlElementPrelim::empty(NodeType::TaskItem.tag_name()));
+            let tl = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TaskList.tag_name()),
+            );
+            let ti = tl.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TaskItem.tag_name()),
+            );
             ti.insert_attribute(txn, "checked", "true");
-            let p = ti.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = ti.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Done task");
         });
         let html = to_html(&doc);
@@ -2760,9 +2940,21 @@ mod tests {
     fn html_table() {
         let doc = doc_with(|txn, frag| {
             let table = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Table.tag_name()));
-            let row = table.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableRow.tag_name()));
-            let cell = row.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableCell.tag_name()));
-            let p = cell.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let row = table.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableRow.tag_name()),
+            );
+            let cell = row.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableCell.tag_name()),
+            );
+            let p = cell.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Cell 1");
         });
         let html = to_html(&doc);
@@ -2776,9 +2968,21 @@ mod tests {
     fn html_table_header() {
         let doc = doc_with(|txn, frag| {
             let table = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Table.tag_name()));
-            let row = table.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableRow.tag_name()));
-            let th = row.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableHeader.tag_name()));
-            let p = th.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let row = table.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableRow.tag_name()),
+            );
+            let th = row.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableHeader.tag_name()),
+            );
+            let p = th.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Header");
         });
         let html = to_html(&doc);
@@ -2789,7 +2993,11 @@ mod tests {
     #[test]
     fn html_escapes_text_content() {
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "a < b & c > d");
         });
         let html = to_html(&doc);
@@ -2801,12 +3009,19 @@ mod tests {
     #[test]
     fn markdown_paragraph() {
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Simple paragraph");
         });
         let md = to_markdown(&doc);
         assert!(md.contains("Simple paragraph"), "got: {md}");
-        assert!(md.contains("\n\n"), "paragraph should end with double newline, got: {md}");
+        assert!(
+            md.contains("\n\n"),
+            "paragraph should end with double newline, got: {md}"
+        );
     }
 
     fn markdown_table_doc(rows: &[&[&str]], header: bool) -> Doc {
@@ -3431,22 +3646,41 @@ mod tests {
     fn markdown_heading_levels() {
         for level in 1..=3u8 {
             let doc = doc_with(|txn, frag| {
-                let h = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Heading.tag_name()));
+                let h = frag.insert(
+                    txn,
+                    0,
+                    XmlElementPrelim::empty(NodeType::Heading.tag_name()),
+                );
                 h.insert_attribute(txn, "level", level.to_string());
                 insert_text(txn, &h, "Title");
             });
             let md = to_markdown(&doc);
             let prefix = "#".repeat(level as usize);
-            assert!(md.contains(&format!("{prefix} Title")), "level {level}: got {md}");
+            assert!(
+                md.contains(&format!("{prefix} Title")),
+                "level {level}: got {md}"
+            );
         }
     }
 
     #[test]
     fn markdown_bullet_list() {
         let doc = doc_with(|txn, frag| {
-            let ul = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::BulletList.tag_name()));
-            let li = ul.insert(txn, 0, XmlElementPrelim::empty(NodeType::ListItem.tag_name()));
-            let p = li.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let ul = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::BulletList.tag_name()),
+            );
+            let li = ul.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::ListItem.tag_name()),
+            );
+            let p = li.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Bullet");
         });
         let md = to_markdown(&doc);
@@ -3457,9 +3691,21 @@ mod tests {
     #[test]
     fn markdown_ordered_list() {
         let doc = doc_with(|txn, frag| {
-            let ol = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::OrderedList.tag_name()));
-            let li = ol.insert(txn, 0, XmlElementPrelim::empty(NodeType::ListItem.tag_name()));
-            let p = li.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let ol = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::OrderedList.tag_name()),
+            );
+            let li = ol.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::ListItem.tag_name()),
+            );
+            let p = li.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Step");
         });
         let md = to_markdown(&doc);
@@ -3470,8 +3716,16 @@ mod tests {
     #[test]
     fn markdown_blockquote() {
         let doc = doc_with(|txn, frag| {
-            let bq = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Blockquote.tag_name()));
-            let p = bq.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let bq = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Blockquote.tag_name()),
+            );
+            let p = bq.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Quoted");
         });
         let md = to_markdown(&doc);
@@ -3482,7 +3736,11 @@ mod tests {
     #[test]
     fn markdown_code_block() {
         let doc = doc_with(|txn, frag| {
-            let cb = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()));
+            let cb = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()),
+            );
             cb.insert_attribute(txn, "language", "python");
             insert_text(txn, &cb, "print('hi')");
         });
@@ -3495,7 +3753,11 @@ mod tests {
     #[test]
     fn markdown_code_block_no_language() {
         let doc = doc_with(|txn, frag| {
-            let cb = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()));
+            let cb = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()),
+            );
             insert_text(txn, &cb, "code");
         });
         let md = to_markdown(&doc);
@@ -3505,7 +3767,11 @@ mod tests {
     #[test]
     fn markdown_horizontal_rule() {
         let doc = doc_with(|txn, frag| {
-            frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::HorizontalRule.tag_name()));
+            frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::HorizontalRule.tag_name()),
+            );
         });
         let md = to_markdown(&doc);
         assert!(md.contains("---"), "got: {md}");
@@ -3514,12 +3780,23 @@ mod tests {
     #[test]
     fn markdown_hard_break() {
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Line one");
-            p.insert(txn, 1, XmlElementPrelim::empty(NodeType::HardBreak.tag_name()));
+            p.insert(
+                txn,
+                1,
+                XmlElementPrelim::empty(NodeType::HardBreak.tag_name()),
+            );
         });
         let md = to_markdown(&doc);
-        assert!(md.contains("  \n"), "hard break should produce trailing spaces, got: {md}");
+        assert!(
+            md.contains("  \n"),
+            "hard break should produce trailing spaces, got: {md}"
+        );
     }
 
     #[test]
@@ -3530,7 +3807,10 @@ mod tests {
             img.insert_attribute(txn, "alt", "Photo");
         });
         let md = to_markdown(&doc);
-        assert!(md.contains("![Photo](https://example.com/img.png)"), "got: {md}");
+        assert!(
+            md.contains("![Photo](https://example.com/img.png)"),
+            "got: {md}"
+        );
     }
 
     #[test]
@@ -3589,8 +3869,16 @@ mod tests {
     #[test]
     fn markdown_doc_mention_emits_link() {
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
-            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
+            let dm = p.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::DocMention.tag_name()),
+            );
             dm.insert_attribute(txn, "url", "/d/abc123");
             dm.insert_attribute(txn, "title", "Target Doc");
         });
@@ -3601,8 +3889,16 @@ mod tests {
     #[test]
     fn markdown_doc_mention_falls_back_to_url_when_no_title() {
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
-            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
+            let dm = p.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::DocMention.tag_name()),
+            );
             dm.insert_attribute(txn, "url", "/d/abc123");
         });
         let md = to_markdown(&doc);
@@ -3612,8 +3908,16 @@ mod tests {
     #[test]
     fn doc_mention_javascript_url_stripped_from_markdown() {
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
-            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
+            let dm = p.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::DocMention.tag_name()),
+            );
             dm.insert_attribute(txn, "url", "javascript:alert(1)");
             dm.insert_attribute(txn, "title", "Target Doc");
         });
@@ -3629,12 +3933,32 @@ mod tests {
     fn csv_simple_table() {
         let doc = doc_with(|txn, frag| {
             let table = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Table.tag_name()));
-            let row = table.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableRow.tag_name()));
-            let c1 = row.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableCell.tag_name()));
-            let p1 = c1.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let row = table.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableRow.tag_name()),
+            );
+            let c1 = row.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableCell.tag_name()),
+            );
+            let p1 = c1.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p1, "A");
-            let c2 = row.insert(txn, 1, XmlElementPrelim::empty(NodeType::TableCell.tag_name()));
-            let p2 = c2.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let c2 = row.insert(
+                txn,
+                1,
+                XmlElementPrelim::empty(NodeType::TableCell.tag_name()),
+            );
+            let p2 = c2.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p2, "B");
         });
         let csv = to_csv(&doc);
@@ -3645,9 +3969,21 @@ mod tests {
     fn csv_quotes_commas() {
         let doc = doc_with(|txn, frag| {
             let table = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Table.tag_name()));
-            let row = table.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableRow.tag_name()));
-            let c1 = row.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableCell.tag_name()));
-            let p1 = c1.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let row = table.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableRow.tag_name()),
+            );
+            let c1 = row.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableCell.tag_name()),
+            );
+            let p1 = c1.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p1, "hello, world");
         });
         let csv = to_csv(&doc);
@@ -3659,9 +3995,21 @@ mod tests {
         let doc = doc_with(|txn, frag| {
             let table = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Table.tag_name()));
             for val in &["R1", "R2"] {
-                let row = table.insert(txn, table.len(txn), XmlElementPrelim::empty(NodeType::TableRow.tag_name()));
-                let c = row.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableCell.tag_name()));
-                let p = c.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+                let row = table.insert(
+                    txn,
+                    table.len(txn),
+                    XmlElementPrelim::empty(NodeType::TableRow.tag_name()),
+                );
+                let c = row.insert(
+                    txn,
+                    0,
+                    XmlElementPrelim::empty(NodeType::TableCell.tag_name()),
+                );
+                let p = c.insert(
+                    txn,
+                    0,
+                    XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+                );
                 insert_text(txn, &p, val);
             }
         });
@@ -3675,7 +4023,11 @@ mod tests {
     #[test]
     fn csv_no_table_returns_empty() {
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "No table here");
         });
         let csv = to_csv(&doc);
@@ -3687,15 +4039,39 @@ mod tests {
         let doc = doc_with(|txn, frag| {
             // Table 1
             let t1 = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Table.tag_name()));
-            let r1 = t1.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableRow.tag_name()));
-            let c1 = r1.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableCell.tag_name()));
-            let p1 = c1.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let r1 = t1.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableRow.tag_name()),
+            );
+            let c1 = r1.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableCell.tag_name()),
+            );
+            let p1 = c1.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p1, "First");
             // Table 2
             let t2 = frag.insert(txn, 1, XmlElementPrelim::empty(NodeType::Table.tag_name()));
-            let r2 = t2.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableRow.tag_name()));
-            let c2 = r2.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableCell.tag_name()));
-            let p2 = c2.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let r2 = t2.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableRow.tag_name()),
+            );
+            let c2 = r2.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableCell.tag_name()),
+            );
+            let p2 = c2.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p2, "Second");
         });
         let csv = to_csv(&doc);
@@ -3709,8 +4085,16 @@ mod tests {
     fn extract_text_nested() {
         // Build a table cell containing a paragraph with text
         let doc = doc_with(|txn, frag| {
-            let cell = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableCell.tag_name()));
-            let p = cell.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let cell = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableCell.tag_name()),
+            );
+            let p = cell.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "nested text");
         });
 
@@ -3749,19 +4133,33 @@ mod tests {
     fn html_unknown_tag_skipped() {
         let doc = doc_with(|txn, frag| {
             frag.insert(txn, 0, XmlElementPrelim::empty("unknown_widget"));
-            let p = frag.insert(txn, 1, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frag.insert(
+                txn,
+                1,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "visible");
         });
         let html = to_html(&doc);
-        assert!(!html.contains("unknown_widget"), "unknown tag should be skipped: {html}");
-        assert!(html.contains("visible"), "known content should render: {html}");
+        assert!(
+            !html.contains("unknown_widget"),
+            "unknown tag should be skipped: {html}"
+        );
+        assert!(
+            html.contains("visible"),
+            "known content should render: {html}"
+        );
     }
 
     #[test]
     fn markdown_unknown_tag_skipped() {
         let doc = doc_with(|txn, frag| {
             frag.insert(txn, 0, XmlElementPrelim::empty("unknown_widget"));
-            let p = frag.insert(txn, 1, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frag.insert(
+                txn,
+                1,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "visible");
         });
         let md = to_markdown(&doc);
@@ -3774,9 +4172,21 @@ mod tests {
     fn markdown_table_renders_cell_text() {
         let doc = doc_with(|txn, frag| {
             let table = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Table.tag_name()));
-            let row = table.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableRow.tag_name()));
-            let cell = row.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableCell.tag_name()));
-            let p = cell.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let row = table.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableRow.tag_name()),
+            );
+            let cell = row.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableCell.tag_name()),
+            );
+            let p = cell.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Cell content");
         });
         let md = to_markdown(&doc);
@@ -3789,13 +4199,24 @@ mod tests {
     #[test]
     fn html_hard_break() {
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Before");
-            p.insert(txn, 1, XmlElementPrelim::empty(NodeType::HardBreak.tag_name()));
+            p.insert(
+                txn,
+                1,
+                XmlElementPrelim::empty(NodeType::HardBreak.tag_name()),
+            );
             p.insert(txn, 2, XmlTextPrelim::new("After"));
         });
         let html = to_html(&doc);
-        assert!(html.contains("<br"), "hard break should render as <br: {html}");
+        assert!(
+            html.contains("<br"),
+            "hard break should render as <br: {html}"
+        );
     }
 
     // ── HTML: code block without language ───────────────────────────
@@ -3803,34 +4224,55 @@ mod tests {
     #[test]
     fn html_code_block_no_language() {
         let doc = doc_with(|txn, frag| {
-            let cb = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()));
+            let cb = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()),
+            );
             insert_text(txn, &cb, "plain code");
         });
         let html = to_html(&doc);
         assert!(html.contains("<pre>"), "got: {html}");
-        assert!(!html.contains("class="), "no language class without attr: {html}");
+        assert!(
+            !html.contains("class="),
+            "no language class without attr: {html}"
+        );
         assert!(html.contains("plain code"), "got: {html}");
     }
 
     #[test]
     fn html_code_block_known_language_empty_content_uses_new_shape() {
         let doc = doc_with(|txn, frag| {
-            let cb = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()));
+            let cb = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()),
+            );
             cb.insert_attribute(txn, "language", "rust");
         });
         let html = to_html(&doc);
-        assert!(html.contains("<pre><code class=\"language-rust\"></code></pre>"), "got: {html}");
+        assert!(
+            html.contains("<pre><code class=\"language-rust\"></code></pre>"),
+            "got: {html}"
+        );
     }
 
     #[test]
     fn html_code_block_highlights_supported_language() {
         let doc = doc_with(|txn, frag| {
-            let cb = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()));
+            let cb = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()),
+            );
             cb.insert_attribute(txn, "language", "rust");
             insert_text(txn, &cb, "fn main() {}");
         });
         let html = to_html(&doc);
-        assert!(html.contains("<pre><code class=\"language-rust\">"), "got: {html}");
+        assert!(
+            html.contains("<pre><code class=\"language-rust\">"),
+            "got: {html}"
+        );
         // `fn` is a keyword token with the light-palette keyword color.
         assert!(
             html.contains("<span style=\"color:#cf222e\">fn</span>"),
@@ -3844,25 +4286,39 @@ mod tests {
     #[test]
     fn html_code_block_escapes_hostile_content_per_token() {
         let doc = doc_with(|txn, frag| {
-            let cb = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()));
+            let cb = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()),
+            );
             cb.insert_attribute(txn, "language", "rust");
             insert_text(txn, &cb, "let x = \"</code><script>alert(1)</script>\";");
         });
         let html = to_html(&doc);
-        assert!(!html.contains("<script>"), "raw script must never appear: {html}");
+        assert!(
+            !html.contains("<script>"),
+            "raw script must never appear: {html}"
+        );
         assert!(html.contains("&lt;script&gt;"), "got: {html}");
     }
 
     #[test]
     fn html_code_block_unknown_language_keeps_legacy_shape() {
         let doc = doc_with(|txn, frag| {
-            let cb = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()));
+            let cb = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()),
+            );
             cb.insert_attribute(txn, "language", "mermaid");
             insert_text(txn, &cb, "pie title x");
         });
         let html = to_html(&doc);
         // Exactly today's output: class on <pre>, no <code>, no spans.
-        assert!(html.contains("<pre class=\"language-mermaid\">"), "got: {html}");
+        assert!(
+            html.contains("<pre class=\"language-mermaid\">"),
+            "got: {html}"
+        );
         assert!(!html.contains("<code"), "got: {html}");
         assert!(!html.contains("tok-"), "got: {html}");
     }
@@ -3871,13 +4327,23 @@ mod tests {
     fn html_code_block_oversized_renders_unhighlighted() {
         let big = "x".repeat(ogrenotes_highlight::MAX_HIGHLIGHT_CHARS + 1);
         let doc = doc_with(|txn, frag| {
-            let cb = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()));
+            let cb = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::CodeBlock.tag_name()),
+            );
             cb.insert_attribute(txn, "language", "rust");
             insert_text(txn, &cb, &big);
         });
         let html = to_html(&doc);
-        assert!(html.contains("<pre><code class=\"language-rust\">"), "got: {html}");
-        assert!(!html.contains("<span"), "no spans over the size cap: {html}");
+        assert!(
+            html.contains("<pre><code class=\"language-rust\">"),
+            "got: {html}"
+        );
+        assert!(
+            !html.contains("<span"),
+            "no spans over the size cap: {html}"
+        );
     }
 
     // ── HTML: task item unchecked ───────────────────────────────────
@@ -3885,10 +4351,22 @@ mod tests {
     #[test]
     fn html_task_item_unchecked() {
         let doc = doc_with(|txn, frag| {
-            let tl = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::TaskList.tag_name()));
-            let ti = tl.insert(txn, 0, XmlElementPrelim::empty(NodeType::TaskItem.tag_name()));
+            let tl = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TaskList.tag_name()),
+            );
+            let ti = tl.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TaskItem.tag_name()),
+            );
             // No "checked" attribute set → defaults to false
-            let p = ti.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = ti.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Pending");
         });
         let html = to_html(&doc);
@@ -3907,7 +4385,10 @@ mod tests {
         let html = to_html(&doc);
         assert!(html.contains("src="), "got: {html}");
         assert!(!html.contains("alt="), "no alt attr when missing: {html}");
-        assert!(!html.contains("title="), "no title attr when missing: {html}");
+        assert!(
+            !html.contains("title="),
+            "no title attr when missing: {html}"
+        );
     }
 
     // ── CSV: cell with embedded quotes ─────────────────────────────
@@ -3916,9 +4397,21 @@ mod tests {
     fn csv_quotes_in_cell() {
         let doc = doc_with(|txn, frag| {
             let table = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Table.tag_name()));
-            let row = table.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableRow.tag_name()));
-            let c = row.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableCell.tag_name()));
-            let p = c.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let row = table.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableRow.tag_name()),
+            );
+            let c = row.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableCell.tag_name()),
+            );
+            let p = c.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "say \"hello\"");
         });
         let csv = to_csv(&doc);
@@ -3975,13 +4468,28 @@ mod tests {
         // into the CSV output as an executable formula.
         let doc = doc_with(|txn, frag| {
             let table = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Table.tag_name()));
-            let row = table.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableRow.tag_name()));
-            let c = row.insert(txn, 0, XmlElementPrelim::empty(NodeType::TableCell.tag_name()));
-            let p = c.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let row = table.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableRow.tag_name()),
+            );
+            let c = row.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::TableCell.tag_name()),
+            );
+            let p = c.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "=1+1");
         });
         let csv = to_csv(&doc);
-        assert!(csv.starts_with("'="), "formula prefix must be guarded: {csv:?}");
+        assert!(
+            csv.starts_with("'="),
+            "formula prefix must be guarded: {csv:?}"
+        );
     }
 
     // ── node_type_to_html_tag: Doc node ────────────────────────────
@@ -3999,7 +4507,11 @@ mod tests {
     #[test]
     fn html_paragraph_has_no_special_attrs() {
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Just text");
         });
         let html = to_html(&doc);
@@ -4012,14 +4524,38 @@ mod tests {
     #[test]
     fn markdown_nested_list() {
         let doc = doc_with(|txn, frag| {
-            let ul = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::BulletList.tag_name()));
-            let li = ul.insert(txn, 0, XmlElementPrelim::empty(NodeType::ListItem.tag_name()));
-            let p = li.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let ul = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::BulletList.tag_name()),
+            );
+            let li = ul.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::ListItem.tag_name()),
+            );
+            let p = li.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "Parent");
             // Nested list
-            let inner_ul = li.insert(txn, 1, XmlElementPrelim::empty(NodeType::BulletList.tag_name()));
-            let inner_li = inner_ul.insert(txn, 0, XmlElementPrelim::empty(NodeType::ListItem.tag_name()));
-            let inner_p = inner_li.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let inner_ul = li.insert(
+                txn,
+                1,
+                XmlElementPrelim::empty(NodeType::BulletList.tag_name()),
+            );
+            let inner_li = inner_ul.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::ListItem.tag_name()),
+            );
+            let inner_p = inner_li.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &inner_p, "Child");
         });
         let md = to_markdown(&doc);
@@ -4056,21 +4592,42 @@ mod tests {
         // traversal must return (no panic) and never reach the marker.
         let depth = MAX_EXPORT_DEPTH + 50;
         let doc = doc_with(|txn, frag| {
-            let mut current =
-                frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Blockquote.tag_name()));
+            let mut current = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Blockquote.tag_name()),
+            );
             for _ in 0..depth {
-                current = current
-                    .insert(txn, 0, XmlElementPrelim::empty(NodeType::Blockquote.tag_name()));
+                current = current.insert(
+                    txn,
+                    0,
+                    XmlElementPrelim::empty(NodeType::Blockquote.tag_name()),
+                );
             }
-            let p = current.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = current.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "DEEP_MARKER");
         });
         let html = to_html(&doc);
         let md = to_markdown(&doc);
         let plain = to_plain_text(&doc);
-        assert!(!html.contains("DEEP_MARKER"), "html must cap recursion: {}", html.len());
-        assert!(!md.contains("DEEP_MARKER"), "markdown must cap recursion: {}", md.len());
-        assert!(!plain.contains("DEEP_MARKER"), "plain-text (extract_text) must cap recursion");
+        assert!(
+            !html.contains("DEEP_MARKER"),
+            "html must cap recursion: {}",
+            html.len()
+        );
+        assert!(
+            !md.contains("DEEP_MARKER"),
+            "markdown must cap recursion: {}",
+            md.len()
+        );
+        assert!(
+            !plain.contains("DEEP_MARKER"),
+            "plain-text (extract_text) must cap recursion"
+        );
     }
 
     #[test]
@@ -4080,7 +4637,11 @@ mod tests {
         // fixed by the renderer, so the output is deterministic.
         use std::sync::Arc;
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             let t = p.insert(txn, 0, XmlTextPrelim::new("hi"));
             let mut attrs = Attrs::new();
             attrs.insert(Arc::from("bold"), Any::Bool(true));
@@ -4092,7 +4653,11 @@ mod tests {
             "html: {}",
             to_html(&doc)
         );
-        assert!(to_markdown(&doc).contains("_**hi**_"), "md: {}", to_markdown(&doc));
+        assert!(
+            to_markdown(&doc).contains("_**hi**_"),
+            "md: {}",
+            to_markdown(&doc)
+        );
     }
 
     #[test]
@@ -4101,7 +4666,11 @@ mod tests {
         // scheme-checked and attribute-escaped.
         use std::sync::Arc;
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             let t = p.insert(txn, 0, XmlTextPrelim::new("click"));
             let mut attrs = Attrs::new();
             attrs.insert(
@@ -4132,7 +4701,11 @@ mod tests {
         // dropped the mark and only the plain display name survived.
         use std::sync::Arc;
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             let t = p.insert(txn, 0, XmlTextPrelim::new("Alice"));
             let mut attrs = Attrs::new();
             attrs.insert(
@@ -4163,8 +4736,16 @@ mod tests {
         // migration; downstream stylesheets and tests keyed to the
         // exact tag shape don't need to change.
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
-            let m = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::Mention.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
+            let m = p.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Mention.tag_name()),
+            );
             m.insert_attribute(txn, "user_id", "u-42");
             m.insert_attribute(txn, "display", "Alice");
         });
@@ -4186,9 +4767,17 @@ mod tests {
         // Mention node's `display` attr rather than an empty
         // gap. Matches the frontend `Node::text_content` behavior.
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             let _ = p.insert(txn, 0, XmlTextPrelim::new("Hi "));
-            let m = p.insert(txn, 1, XmlElementPrelim::empty(NodeType::Mention.tag_name()));
+            let m = p.insert(
+                txn,
+                1,
+                XmlElementPrelim::empty(NodeType::Mention.tag_name()),
+            );
             m.insert_attribute(txn, "user_id", "u-1");
             m.insert_attribute(txn, "display", "@alice");
         });
@@ -4211,8 +4800,16 @@ mod tests {
         // arm a mention-only doc is invisible to search indexing and
         // the LLM prompt embed path (`to_plain_text`/`extract_text`).
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
-            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
+            let dm = p.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::DocMention.tag_name()),
+            );
             dm.insert_attribute(txn, "url", "/d/abc123");
             dm.insert_attribute(txn, "title", "Target Doc");
         });
@@ -4220,12 +4817,23 @@ mod tests {
         assert!(plain.contains("Target Doc"), "got: {plain}");
 
         let doc_no_title = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
-            let dm = p.insert(txn, 0, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
+            let dm = p.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::DocMention.tag_name()),
+            );
             dm.insert_attribute(txn, "url", "/d/abc123");
         });
         let plain_no_title = to_plain_text(&doc_no_title);
-        assert!(plain_no_title.contains("/d/abc123"), "got: {plain_no_title}");
+        assert!(
+            plain_no_title.contains("/d/abc123"),
+            "got: {plain_no_title}"
+        );
     }
 
     #[test]
@@ -4237,7 +4845,11 @@ mod tests {
         // be applied (and then doubled by escape_md_link_text).
         use std::sync::Arc;
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             let t = p.insert(txn, 0, XmlTextPrelim::new("# heading"));
             let mut attrs = Attrs::new();
             attrs.insert(
@@ -4248,7 +4860,10 @@ mod tests {
         });
         let md = to_markdown(&doc);
         assert!(md.contains("[# heading]"), "label must not escape #: {md}");
-        assert!(!md.contains(r"[\# heading]"), "label must not double-escape: {md}");
+        assert!(
+            !md.contains(r"[\# heading]"),
+            "label must not double-escape: {md}"
+        );
     }
 
     #[test]
@@ -4257,7 +4872,11 @@ mod tests {
         // href must never reach the <a> tag (just render the text).
         use std::sync::Arc;
         let doc = doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             let t = p.insert(txn, 0, XmlTextPrelim::new("x"));
             let mut attrs = Attrs::new();
             attrs.insert(
@@ -4291,7 +4910,11 @@ mod tests {
     /// and export it to HTML.
     fn to_html_of_single_mermaid(source: &str) -> String {
         let doc = doc_with(|txn, frag| {
-            let m = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Mermaid.tag_name()));
+            let m = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Mermaid.tag_name()),
+            );
             m.insert_attribute(txn, "source", source);
         });
         to_html(&doc)
@@ -4300,7 +4923,11 @@ mod tests {
     /// Same as above, exported to Markdown.
     fn to_markdown_of_single_mermaid(source: &str) -> String {
         let doc = doc_with(|txn, frag| {
-            let m = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Mermaid.tag_name()));
+            let m = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Mermaid.tag_name()),
+            );
             m.insert_attribute(txn, "source", source);
         });
         to_markdown(&doc)
@@ -4353,7 +4980,11 @@ mod tests {
 
     fn doc_with_math(source: &str) -> Doc {
         doc_with(|txn, frag| {
-            let m = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::MathBlock.tag_name()));
+            let m = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::MathBlock.tag_name()),
+            );
             m.insert_attribute(txn, "source", source);
         })
     }
@@ -4362,7 +4993,10 @@ mod tests {
     fn math_block_html_inlines_mathml() {
         let html = to_html(&doc_with_math("\\frac{a}{b}"));
         assert!(html.contains("<div class=\"math-block\"><math "), "{html}");
-        assert!(html.contains("<mfrac><mi>a</mi><mi>b</mi></mfrac>"), "{html}");
+        assert!(
+            html.contains("<mfrac><mi>a</mi><mi>b</mi></mfrac>"),
+            "{html}"
+        );
     }
 
     #[test]
@@ -4376,9 +5010,17 @@ mod tests {
 
     fn doc_with_inline_math(source: &str) -> Doc {
         doc_with(|txn, frag| {
-            let p = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             p.insert(txn, 0, XmlTextPrelim::new("area "));
-            let m = p.insert(txn, 1, XmlElementPrelim::empty(NodeType::MathInline.tag_name()));
+            let m = p.insert(
+                txn,
+                1,
+                XmlElementPrelim::empty(NodeType::MathInline.tag_name()),
+            );
             m.insert_attribute(txn, "source", source);
         })
     }
@@ -4387,11 +5029,21 @@ mod tests {
     fn inline_math_exports() {
         let doc = doc_with_inline_math("\\pi r^2");
         let html = to_html(&doc);
-        assert!(html.contains("<p>area <span class=\"math-inline\"><math "), "{html}");
+        assert!(
+            html.contains("<p>area <span class=\"math-inline\"><math "),
+            "{html}"
+        );
         assert!(html.contains(r#"display="inline""#), "{html}");
-        assert!(to_markdown(&doc).starts_with("area $\\pi r^2$"), "{}", to_markdown(&doc));
+        assert!(
+            to_markdown(&doc).starts_with("area $\\pi r^2$"),
+            "{}",
+            to_markdown(&doc)
+        );
         let bad = to_html(&doc_with_inline_math("\\foo<"));
-        assert!(bad.contains("<code class=\"math-error\" title=\"unknown command"), "{bad}");
+        assert!(
+            bad.contains("<code class=\"math-error\" title=\"unknown command"),
+            "{bad}"
+        );
         assert!(bad.contains(">\\foo&lt;</code>"), "{bad}");
     }
 
@@ -4400,7 +5052,9 @@ mod tests {
         let doc = doc_with_inline_math("x^2");
         let txn = doc.transact();
         let frag = txn.get_xml_fragment("content").unwrap();
-        let Some(XmlOut::Element(p)) = frag.get(&txn, 0) else { panic!() };
+        let Some(XmlOut::Element(p)) = frag.get(&txn, 0) else {
+            panic!()
+        };
         assert_eq!(extract_text(&txn, &p), "area x^2");
     }
 
@@ -4422,17 +5076,27 @@ mod tests {
     #[cfg(feature = "pdf")]
     #[test]
     fn math_block_pdf_text_is_its_source() {
-        assert_eq!(collect_block_text(&doc_with_math("E=mc^2")), vec!["E=mc^2".to_string()]);
+        assert_eq!(
+            collect_block_text(&doc_with_math("E=mc^2")),
+            vec!["E=mc^2".to_string()]
+        );
     }
 
     #[cfg(feature = "pdf")]
     #[test]
     fn mermaid_pdf_text_is_its_source() {
         let doc = doc_with(|txn, frag| {
-            let m = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Mermaid.tag_name()));
+            let m = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Mermaid.tag_name()),
+            );
             m.insert_attribute(txn, "source", "graph TD\nA-->B");
         });
-        assert_eq!(collect_block_text(&doc), vec!["graph TD\nA-->B".to_string()]);
+        assert_eq!(
+            collect_block_text(&doc),
+            vec!["graph TD\nA-->B".to_string()]
+        );
         // One wrapped line per source line.
         assert_eq!(wrap_text("graph TD\nA-->B", 90), vec!["graph TD", "A-->B"]);
     }
@@ -4442,13 +5106,20 @@ mod tests {
     fn mermaid_docx_keeps_the_source() {
         use std::io::Read;
         let doc = doc_with(|txn, frag| {
-            let m = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Mermaid.tag_name()));
+            let m = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Mermaid.tag_name()),
+            );
             m.insert_attribute(txn, "source", "graph TD\nA-->B");
         });
         let bytes = to_docx(&doc);
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         let mut xml = String::new();
-        zip.by_name("word/document.xml").unwrap().read_to_string(&mut xml).unwrap();
+        zip.by_name("word/document.xml")
+            .unwrap()
+            .read_to_string(&mut xml)
+            .unwrap();
         assert!(xml.contains(">graph TD</w:t>"), "{xml}");
         assert!(xml.contains(">A--&gt;B</w:t>"), "{xml}");
         assert!(xml.contains("Courier New"), "{xml}");
@@ -4506,7 +5177,11 @@ mod tests {
 
     fn one_para_doc() -> Doc {
         doc_with(|txn, frag| {
-            let para = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let para = frag.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &para, "Body text");
         })
     }
@@ -4524,12 +5199,27 @@ mod tests {
     fn html_export_renders_comment_section() {
         let doc = one_para_doc();
         let html = to_html_with_comments(&doc, &sample_comments());
-        assert!(html.contains("Body text"), "document body still present: {html}");
-        assert!(html.contains("<h2>Comments</h2>"), "comments section: {html}");
-        assert!(html.contains("Comment on block blk7"), "inline anchor: {html}");
-        assert!(html.contains("Document comment (resolved)"), "doc-level + resolved: {html}");
+        assert!(
+            html.contains("Body text"),
+            "document body still present: {html}"
+        );
+        assert!(
+            html.contains("<h2>Comments</h2>"),
+            "comments section: {html}"
+        );
+        assert!(
+            html.contains("Comment on block blk7"),
+            "inline anchor: {html}"
+        );
+        assert!(
+            html.contains("Document comment (resolved)"),
+            "doc-level + resolved: {html}"
+        );
         assert!(html.contains("Alice") && html.contains("Needs a citation here."));
-        assert!(html.contains("2026-07-13 14:22 UTC"), "timestamp rendered: {html}");
+        assert!(
+            html.contains("2026-07-13 14:22 UTC"),
+            "timestamp rendered: {html}"
+        );
     }
 
     #[test]
@@ -4545,8 +5235,14 @@ mod tests {
             }],
         }];
         let html = to_html_with_comments(&doc, &comments);
-        assert!(!html.contains("<script>alert(1)</script>"), "must escape body: {html}");
-        assert!(html.contains("&lt;script&gt;"), "escaped body present: {html}");
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "must escape body: {html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "escaped body present: {html}"
+        );
         assert!(!html.contains("<b>evil</b>"), "must escape author: {html}");
     }
 
@@ -4555,9 +5251,18 @@ mod tests {
         let doc = one_para_doc();
         let md = to_markdown_with_comments(&doc, &sample_comments());
         assert!(md.contains("## Comments"), "section header: {md}");
-        assert!(md.contains("### Comment on block blk7"), "inline anchor heading: {md}");
-        assert!(md.contains("### Document comment (resolved)"), "doc-level heading: {md}");
-        assert!(md.contains("- **Alice** _2026-07-13 14:22 UTC_: Needs a citation here."), "got: {md}");
+        assert!(
+            md.contains("### Comment on block blk7"),
+            "inline anchor heading: {md}"
+        );
+        assert!(
+            md.contains("### Document comment (resolved)"),
+            "doc-level heading: {md}"
+        );
+        assert!(
+            md.contains("- **Alice** _2026-07-13 14:22 UTC_: Needs a citation here."),
+            "got: {md}"
+        );
         // A message with no timestamp omits the italic date.
         assert!(md.contains("- **Carol**: Overall looks good."), "got: {md}");
     }
@@ -4584,7 +5289,10 @@ mod tests {
         assert_eq!(&with[..5], b"%PDF-", "valid PDF header");
 
         let with_text = pdf_extract::extract_text_from_mem(&with).expect("extract commented PDF");
-        assert!(with_text.contains("Body text"), "document body: {with_text}");
+        assert!(
+            with_text.contains("Body text"),
+            "document body: {with_text}"
+        );
         let comment_text = [
             "Comments",
             "Comment on block blk7",
@@ -4594,12 +5302,18 @@ mod tests {
             "Carol: Overall looks good.",
         ];
         for expected in comment_text {
-            assert!(with_text.contains(expected), "missing {expected:?}: {with_text}");
+            assert!(
+                with_text.contains(expected),
+                "missing {expected:?}: {with_text}"
+            );
         }
 
         let without_text = pdf_extract::extract_text_from_mem(&to_pdf(&doc))
             .expect("extract PDF without comments");
-        assert!(without_text.contains("Body text"), "document body: {without_text}");
+        assert!(
+            without_text.contains("Body text"),
+            "document body: {without_text}"
+        );
         for omitted in [
             "Comments",
             "Comment on block blk7",
@@ -4613,7 +5327,10 @@ mod tests {
             "Carol",
             "Overall looks good.",
         ] {
-            assert!(!without_text.contains(omitted), "unexpected {omitted:?}: {without_text}");
+            assert!(
+                !without_text.contains(omitted),
+                "unexpected {omitted:?}: {without_text}"
+            );
         }
     }
 
@@ -4624,17 +5341,28 @@ mod tests {
     fn fixture_deck_three_slides() -> Doc {
         doc_with(|txn, frag| {
             for i in 0..3 {
-                let slide = frag.insert(txn, i, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
-                let heading = slide.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+                let slide =
+                    frag.insert(txn, i, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
+                let heading =
+                    slide.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
                 heading.insert_attribute(txn, "y", "0.0");
                 heading.insert_attribute(txn, "h", "0.2");
-                let h_el = heading.insert(txn, 0, XmlElementPrelim::empty(NodeType::Heading.tag_name()));
+                let h_el = heading.insert(
+                    txn,
+                    0,
+                    XmlElementPrelim::empty(NodeType::Heading.tag_name()),
+                );
                 insert_text(txn, &h_el, &format!("Slide {i} heading"));
 
-                let body = slide.insert(txn, 1, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
+                let body =
+                    slide.insert(txn, 1, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
                 body.insert_attribute(txn, "y", "0.3");
                 body.insert_attribute(txn, "h", "0.6");
-                let b_el = body.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+                let b_el = body.insert(
+                    txn,
+                    0,
+                    XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+                );
                 insert_text(txn, &b_el, &format!("Slide {i} body"));
             }
         })
@@ -4647,12 +5375,20 @@ mod tests {
         doc_with(|txn, frag| {
             let slide1 = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
             let p1 = slide1.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
-            let t1 = p1.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let t1 = p1.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &t1, "ALPHA");
 
             let slide2 = frag.insert(txn, 1, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
             let p2 = slide2.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
-            let t2 = p2.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let t2 = p2.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &t2, "BETA");
         })
     }
@@ -4669,7 +5405,11 @@ mod tests {
             frame.insert_attribute(txn, "x", "garbage");
             frame.insert_attribute(txn, "w", "99");
             frame.insert_attribute(txn, "h", "");
-            let p = frame.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frame.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "bad-geometry-text");
         })
     }
@@ -4687,7 +5427,8 @@ mod tests {
         let doc = fixture_deck_three_slides();
         let bytes = to_pdf(&doc);
         assert!(bytes.starts_with(b"%PDF-"));
-        let parsed = lopdf::Document::load_mem(&bytes).expect("printpdf output must be a valid PDF");
+        let parsed =
+            lopdf::Document::load_mem(&bytes).expect("printpdf output must be a valid PDF");
         let pages = parsed.get_pages();
         assert_eq!(pages.len(), 3, "one page per slide");
         // Landscape 16:9 — MediaBox width must exceed height on every page.
@@ -4697,8 +5438,12 @@ mod tests {
                 .get(b"MediaBox")
                 .and_then(|o| o.as_array())
                 .expect("page must carry a MediaBox");
-            let w = media_box[2].as_float().unwrap_or_else(|_| media_box[2].as_i64().unwrap() as f32);
-            let h = media_box[3].as_float().unwrap_or_else(|_| media_box[3].as_i64().unwrap() as f32);
+            let w = media_box[2]
+                .as_float()
+                .unwrap_or_else(|_| media_box[2].as_i64().unwrap() as f32);
+            let h = media_box[3]
+                .as_float()
+                .unwrap_or_else(|_| media_box[3].as_i64().unwrap() as f32);
             assert!(w > h, "slide page must be landscape, got {w}x{h}");
         }
     }
@@ -4724,12 +5469,20 @@ mod tests {
 
             let content = slide.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
             content.insert_attribute(txn, "role", "content");
-            let c_p = content.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let c_p = content.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &c_p, "VISIBLE-CONTENT");
 
             let notes = slide.insert(txn, 1, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
             notes.insert_attribute(txn, "role", "notes");
-            let n_p = notes.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let n_p = notes.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &n_p, "SECRET-NOTES");
         })
     }
@@ -4740,8 +5493,14 @@ mod tests {
         let doc = fixture_deck_with_notes();
         let bytes = to_pdf(&doc);
         let text = String::from_utf8_lossy(&bytes);
-        assert!(text.contains("VISIBLE-CONTENT"), "content frame text must render");
-        assert!(!text.contains("SECRET-NOTES"), "notes frame text must never reach the PDF");
+        assert!(
+            text.contains("VISIBLE-CONTENT"),
+            "content frame text must render"
+        );
+        assert!(
+            !text.contains("SECRET-NOTES"),
+            "notes frame text must never reach the PDF"
+        );
     }
 
     /// One slide, two content frames whose TREE order is the opposite
@@ -4758,13 +5517,21 @@ mod tests {
             // z=0 frame, i.e. its text appears LATER in the content stream.
             let high = slide.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
             high.insert_attribute(txn, "z", "1");
-            let high_p = high.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let high_p = high.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &high_p, "Z-HIGH-TEXT");
 
             // Tree position 1, but z=0 — must paint BEFORE the z=1 frame.
             let low = slide.insert(txn, 1, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
             low.insert_attribute(txn, "z", "0");
-            let low_p = low.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let low_p = low.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &low_p, "Z-LOW-TEXT");
         })
     }
@@ -4791,7 +5558,8 @@ mod tests {
         let doc = one_para_doc();
         let bytes = to_pdf(&doc);
         assert!(bytes.starts_with(b"%PDF-"));
-        let parsed = lopdf::Document::load_mem(&bytes).expect("printpdf output must be a valid PDF");
+        let parsed =
+            lopdf::Document::load_mem(&bytes).expect("printpdf output must be a valid PDF");
         let pages = parsed.get_pages();
         assert_eq!(pages.len(), 1, "short plain doc stays a single A4 page");
         let (_, id) = pages.into_iter().next().unwrap();
@@ -4800,8 +5568,12 @@ mod tests {
             .get(b"MediaBox")
             .and_then(|o| o.as_array())
             .expect("page must carry a MediaBox");
-        let w = media_box[2].as_float().unwrap_or_else(|_| media_box[2].as_i64().unwrap() as f32);
-        let h = media_box[3].as_float().unwrap_or_else(|_| media_box[3].as_i64().unwrap() as f32);
+        let w = media_box[2]
+            .as_float()
+            .unwrap_or_else(|_| media_box[2].as_i64().unwrap() as f32);
+        let h = media_box[3]
+            .as_float()
+            .unwrap_or_else(|_| media_box[3].as_i64().unwrap() as f32);
         assert!(h > w, "non-deck page must stay A4 portrait, got {w}x{h}");
     }
 
@@ -4817,10 +5589,26 @@ mod tests {
     #[test]
     fn lines_that_fit_counts_baselines_inside_the_box() {
         // First baseline at 100 - 10 = 90, then 78, 66, 54, …
-        assert_eq!(lines_that_fit(100.0, 60.0, 10.0, 12.0), 3, "90, 78, 66 fit; 54 does not");
-        assert_eq!(lines_that_fit(100.0, 66.0, 10.0, 12.0), 3, "a baseline on the edge is kept");
-        assert_eq!(lines_that_fit(100.0, 95.0, 10.0, 12.0), 0, "box shorter than one line");
-        assert_eq!(lines_that_fit(100.0, 60.0, 10.0, 0.0), 0, "degenerate leading never loops");
+        assert_eq!(
+            lines_that_fit(100.0, 60.0, 10.0, 12.0),
+            3,
+            "90, 78, 66 fit; 54 does not"
+        );
+        assert_eq!(
+            lines_that_fit(100.0, 66.0, 10.0, 12.0),
+            3,
+            "a baseline on the edge is kept"
+        );
+        assert_eq!(
+            lines_that_fit(100.0, 95.0, 10.0, 12.0),
+            0,
+            "box shorter than one line"
+        );
+        assert_eq!(
+            lines_that_fit(100.0, 60.0, 10.0, 0.0),
+            0,
+            "degenerate leading never loops"
+        );
     }
 
     /// One slide, one body frame of height `h` holding 120 distinct
@@ -4834,7 +5622,11 @@ mod tests {
             let frame = slide.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
             frame.insert_attribute(txn, "y", "0.0");
             frame.insert_attribute(txn, "h", h);
-            let p = frame.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frame.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, &text);
         })
     }
@@ -4844,13 +5636,21 @@ mod tests {
     #[cfg(feature = "pdf")]
     #[test]
     fn deck_pdf_clips_frame_text_to_the_frame_height() {
-        let short = String::from_utf8_lossy(&to_pdf(&fixture_deck_overflowing_frame("0.1"))).into_owned();
+        let short =
+            String::from_utf8_lossy(&to_pdf(&fixture_deck_overflowing_frame("0.1"))).into_owned();
         assert!(short.contains("W000"), "the first line must still render");
-        assert!(!short.contains("W119"), "text past the frame's bottom must be clipped");
+        assert!(
+            !short.contains("W119"),
+            "text past the frame's bottom must be clipped"
+        );
 
         // Control: the same text in a full-height frame is not clipped.
-        let tall = String::from_utf8_lossy(&to_pdf(&fixture_deck_overflowing_frame("1.0"))).into_owned();
-        assert!(tall.contains("W119"), "a frame tall enough keeps every line");
+        let tall =
+            String::from_utf8_lossy(&to_pdf(&fixture_deck_overflowing_frame("1.0"))).into_owned();
+        assert!(
+            tall.contains("W119"),
+            "a frame tall enough keeps every line"
+        );
     }
 
     #[cfg(feature = "pdf")]
@@ -4862,7 +5662,10 @@ mod tests {
         // the renderer, same module so private items are reachable.
         let doc = doc_with(|_txn, _frag| {});
         let bytes = to_pdf_slides(&doc);
-        assert!(bytes.starts_with(b"%PDF-"), "empty deck must still be a valid single-page PDF");
+        assert!(
+            bytes.starts_with(b"%PDF-"),
+            "empty deck must still be a valid single-page PDF"
+        );
     }
 
     // ── Presentation deck export (Task 4) ──────────────────────────
@@ -4882,14 +5685,22 @@ mod tests {
             let high = slide1.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
             high.insert_attribute(txn, "z", "1");
             high.insert_attribute(txn, "y", "0.1");
-            let high_p = high.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let high_p = high.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &high_p, "high-z-text");
 
             // Tree position 1, but z=0 — must render BEFORE the z=1 frame.
             let low = slide1.insert(txn, 1, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
             low.insert_attribute(txn, "z", "0");
             low.insert_attribute(txn, "y", "0.5");
-            let low_p = low.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let low_p = low.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &low_p, "low-z-text");
 
             let slide2 = frag.insert(txn, 1, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
@@ -4907,7 +5718,11 @@ mod tests {
             let slide = frag.insert(txn, 0, XmlElementPrelim::empty(NodeType::Slide.tag_name()));
             let frame = slide.insert(txn, 0, XmlElementPrelim::empty(NodeType::Frame.tag_name()));
             frame.insert_attribute(txn, "x", "garbage");
-            let p = frame.insert(txn, 0, XmlElementPrelim::empty(NodeType::Paragraph.tag_name()));
+            let p = frame.insert(
+                txn,
+                0,
+                XmlElementPrelim::empty(NodeType::Paragraph.tag_name()),
+            );
             insert_text(txn, &p, "bad-geometry-text");
         })
     }

@@ -73,10 +73,7 @@ impl LiveAppBlock for CalendarBlock {
             other => Err(BlockValidationError {
                 node_type: other,
                 field: std::borrow::Cow::Borrowed("node_type"),
-                reason: format!(
-                    "CalendarBlock cannot validate {}",
-                    other.tag_name()
-                ),
+                reason: format!("CalendarBlock cannot validate {}", other.tag_name()),
             }),
         }
     }
@@ -104,9 +101,13 @@ fn validate_calendar_attrs(
     // Empty cursor is allowed; the client fills in today at render time.
     if let Some(cursor) = attrs.get("cursor").filter(|s| !s.is_empty()) {
         let ok = if view == "month" {
-            parse_ymd_prefix(cursor).is_some_and(|(y, m, d)| d.is_none() && (1..=12).contains(&m) && (1970..=9999).contains(&y))
+            parse_ymd_prefix(cursor).is_some_and(|(y, m, d)| {
+                d.is_none() && (1..=12).contains(&m) && (1970..=9999).contains(&y)
+            })
         } else {
-            parse_ymd_prefix(cursor).is_some_and(|(y, m, d)| d.is_some() && (1..=12).contains(&m) && (1970..=9999).contains(&y))
+            parse_ymd_prefix(cursor).is_some_and(|(y, m, d)| {
+                d.is_some() && (1..=12).contains(&m) && (1970..=9999).contains(&y)
+            })
         };
         if !ok {
             return Err(BlockValidationError {
@@ -114,7 +115,11 @@ fn validate_calendar_attrs(
                 field: std::borrow::Cow::Borrowed("cursor"),
                 reason: format!(
                     "expected {} for view={view}, got {cursor:?}",
-                    if view == "month" { "YYYY-MM" } else { "YYYY-MM-DD" }
+                    if view == "month" {
+                        "YYYY-MM"
+                    } else {
+                        "YYYY-MM-DD"
+                    }
                 ),
             });
         }
@@ -179,14 +184,18 @@ fn validate_event_attrs(
     out.insert("allDay".into(), all_day_raw);
 
     if all_day {
-        let start = attrs.get("startDate").cloned().ok_or_else(|| {
-            BlockValidationError {
+        let start = attrs
+            .get("startDate")
+            .cloned()
+            .ok_or_else(|| BlockValidationError {
                 node_type: NodeType::CalendarEvent,
                 field: std::borrow::Cow::Borrowed("startDate"),
                 reason: "required when allDay=true".into(),
-            }
-        })?;
-        let end = attrs.get("endDate").cloned().unwrap_or_else(|| start.clone());
+            })?;
+        let end = attrs
+            .get("endDate")
+            .cloned()
+            .unwrap_or_else(|| start.clone());
         if !is_ymd(&start) {
             return Err(BlockValidationError {
                 node_type: NodeType::CalendarEvent,
@@ -211,13 +220,14 @@ fn validate_event_attrs(
         out.insert("startDate".into(), start);
         out.insert("endDate".into(), end);
     } else {
-        let start = attrs.get("startAt").cloned().ok_or_else(|| {
-            BlockValidationError {
+        let start = attrs
+            .get("startAt")
+            .cloned()
+            .ok_or_else(|| BlockValidationError {
                 node_type: NodeType::CalendarEvent,
                 field: std::borrow::Cow::Borrowed("startAt"),
                 reason: "required when allDay=false".into(),
-            }
-        })?;
+            })?;
         let end = attrs.get("endAt").cloned().unwrap_or_else(|| start.clone());
         if !is_rfc3339_utc(&start) {
             return Err(BlockValidationError {
@@ -398,7 +408,7 @@ fn days_in_month(year: u32, month: u32) -> u32 {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
         2 => {
-            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+            if (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400) {
                 29
             } else {
                 28
@@ -467,7 +477,8 @@ fn looks_like_iana_tz(s: &str) -> bool {
     if s.is_empty() || s.len() > 64 {
         return false;
     }
-    s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+'))
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+'))
         && !s.starts_with('/')
         && !s.ends_with('/')
 }
@@ -477,7 +488,10 @@ mod tests {
     use super::*;
 
     fn attrs(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect()
     }
 
     #[test]
@@ -506,8 +520,7 @@ mod tests {
         );
         // Week/day cursor must be YYYY-MM-DD.
         assert!(
-            validate_calendar_attrs(&attrs(&[("view", "week"), ("cursor", "2026-07-01")]))
-                .is_ok()
+            validate_calendar_attrs(&attrs(&[("view", "week"), ("cursor", "2026-07-01")])).is_ok()
         );
         assert!(
             validate_calendar_attrs(&attrs(&[("view", "week"), ("cursor", "2026-07")])).is_err()
@@ -552,10 +565,7 @@ mod tests {
 
     #[test]
     fn event_timed_defaults_end_to_start_when_absent() {
-        let a = attrs(&[
-            ("allDay", "false"),
-            ("startAt", "2026-07-15T14:30:00Z"),
-        ]);
+        let a = attrs(&[("allDay", "false"), ("startAt", "2026-07-15T14:30:00Z")]);
         let out = validate_event_attrs(&a).unwrap();
         assert_eq!(
             out.get("endAt").map(String::as_str),
@@ -597,10 +607,7 @@ mod tests {
 
     #[test]
     fn event_accepts_rfc3339_with_fractional_seconds() {
-        let a = attrs(&[
-            ("allDay", "false"),
-            ("startAt", "2026-07-15T14:30:45.123Z"),
-        ]);
+        let a = attrs(&[("allDay", "false"), ("startAt", "2026-07-15T14:30:45.123Z")]);
         assert!(validate_event_attrs(&a).is_ok());
     }
 
@@ -608,11 +615,14 @@ mod tests {
     fn event_rejects_impossible_calendar_dates() {
         // Regression: is_ymd used to accept any day 1..=31 regardless
         // of month. Feb 31 / Apr 31 / Feb 30 must all be rejected.
-        for bad in ["2026-02-30", "2026-02-31", "2026-04-31", "2026-06-31", "2026-11-31"] {
-            let a = attrs(&[
-                ("allDay", "true"),
-                ("startDate", bad),
-            ]);
+        for bad in [
+            "2026-02-30",
+            "2026-02-31",
+            "2026-04-31",
+            "2026-06-31",
+            "2026-11-31",
+        ] {
+            let a = attrs(&[("allDay", "true"), ("startDate", bad)]);
             assert!(
                 validate_event_attrs(&a).is_err(),
                 "validator must reject {bad}"
@@ -623,20 +633,14 @@ mod tests {
     #[test]
     fn event_rejects_feb_29_in_non_leap_year() {
         // 2025 is NOT a leap year.
-        let a = attrs(&[
-            ("allDay", "true"),
-            ("startDate", "2025-02-29"),
-        ]);
+        let a = attrs(&[("allDay", "true"), ("startDate", "2025-02-29")]);
         assert!(validate_event_attrs(&a).is_err());
     }
 
     #[test]
     fn event_accepts_feb_29_in_leap_year() {
         // 2024 IS a leap year.
-        let a = attrs(&[
-            ("allDay", "true"),
-            ("startDate", "2024-02-29"),
-        ]);
+        let a = attrs(&[("allDay", "true"), ("startDate", "2024-02-29")]);
         assert!(validate_event_attrs(&a).is_ok());
     }
 
@@ -644,10 +648,7 @@ mod tests {
     fn event_rejects_impossible_date_in_rfc3339() {
         // is_rfc3339_utc calls is_ymd on the date prefix — the
         // tightening must flow through to timed events too.
-        let a = attrs(&[
-            ("allDay", "false"),
-            ("startAt", "2026-02-31T14:30:00Z"),
-        ]);
+        let a = attrs(&[("allDay", "false"), ("startAt", "2026-02-31T14:30:00Z")]);
         assert!(validate_event_attrs(&a).is_err());
     }
 
@@ -655,20 +656,14 @@ mod tests {
     fn event_rejects_non_numeric_fractional_seconds() {
         // Regression: before the tightening, `.abc` slipped past
         // because we only checked the `SS` prefix.
-        let a = attrs(&[
-            ("allDay", "false"),
-            ("startAt", "2026-07-15T14:30:45.abcZ"),
-        ]);
+        let a = attrs(&[("allDay", "false"), ("startAt", "2026-07-15T14:30:45.abcZ")]);
         assert!(validate_event_attrs(&a).is_err());
     }
 
     #[test]
     fn event_rejects_empty_fractional_seconds() {
         // A trailing dot with no digits after it should also fail.
-        let a = attrs(&[
-            ("allDay", "false"),
-            ("startAt", "2026-07-15T14:30:45.Z"),
-        ]);
+        let a = attrs(&[("allDay", "false"), ("startAt", "2026-07-15T14:30:45.Z")]);
         assert!(validate_event_attrs(&a).is_err());
     }
 

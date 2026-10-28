@@ -352,7 +352,10 @@ pub(crate) struct Span {
 
 impl Span {
     fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into(), ..Self::default() }
+        Self {
+            text: text.into(),
+            ..Self::default()
+        }
     }
 }
 
@@ -451,7 +454,10 @@ impl QuipBlock {
 }
 
 fn empty_para() -> QuipBlock {
-    QuipBlock::Para { section_id: None, spans: Vec::new() }
+    QuipBlock::Para {
+        section_id: None,
+        spans: Vec::new(),
+    }
 }
 
 // ─── stage 1: sanitize ───────────────────────────────────────────
@@ -465,14 +471,31 @@ fn empty_para() -> QuipBlock {
 /// `object`, `embed`.
 fn allowed_tags() -> HashSet<&'static str> {
     [
-        "html", "head", "body", //
-        "p", "div", "span", "section", "article", //
-        "h1", "h2", "h3", "h4", "h5", "h6", //
-        "ul", "ol", "li", //
+        "html",
+        "head",
+        "body", //
+        "p",
+        "div",
+        "span",
+        "section",
+        "article", //
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6", //
+        "ul",
+        "ol",
+        "li",         //
         "blockquote", //
-        "pre", "code", //
-        "hr", "br", //
-        "a", "img", "input", //
+        "pre",
+        "code", //
+        "hr",
+        "br", //
+        "a",
+        "img",
+        "input", //
         // Quip's wrapper around a client-rendered entity. It MUST survive
         // the sanitizer: ammonia strips an unlisted tag but keeps its
         // children, so a stripped `<control><a href="quip.com/…">Joel</a>`
@@ -480,8 +503,24 @@ fn allowed_tags() -> HashSet<&'static str> {
         // becomes a "Missing document" chip. The wrapper is the only signal
         // that separates a person from a document. See `walk_control`.
         "control", //
-        "table", "thead", "tbody", "tfoot", "tr", "th", "td", //
-        "strong", "em", "b", "i", "u", "s", "del", "strike", "sub", "sup", "mark",
+        "table",
+        "thead",
+        "tbody",
+        "tfoot",
+        "tr",
+        "th",
+        "td", //
+        "strong",
+        "em",
+        "b",
+        "i",
+        "u",
+        "s",
+        "del",
+        "strike",
+        "sub",
+        "sup",
+        "mark",
     ]
     .into_iter()
     .collect()
@@ -518,9 +557,23 @@ fn allowed_tags() -> HashSet<&'static str> {
 /// through [`image_dimension`], which keeps nothing but a bounded integer.
 fn allowed_attributes() -> HashSet<&'static str> {
     [
-        "id", "href", "src", "alt", "title", "type", "checked", "value",
-        "colspan", "rowspan", "class", "start", "align", "formula",
-        "width", "height", ANNOTATION_ATTR,
+        "id",
+        "href",
+        "src",
+        "alt",
+        "title",
+        "type",
+        "checked",
+        "value",
+        "colspan",
+        "rowspan",
+        "class",
+        "start",
+        "align",
+        "formula",
+        "width",
+        "height",
+        ANNOTATION_ATTR,
     ]
     .into_iter()
     .collect()
@@ -609,6 +662,7 @@ pub const ANNOTATION_ATTR: &str = "annotationid";
 
 /// Parse Quip HTML into the intermediate block model. Pure: no yrs
 /// transaction is live while the DOM is walked.
+#[cfg(test)]
 pub(crate) fn parse_quip(html: &str) -> Vec<QuipBlock> {
     parse_quip_counting_losses(html).0
 }
@@ -643,10 +697,11 @@ pub(crate) fn parse_quip_counting_losses(
     use markup5ever_rcdom::RcDom;
 
     let safe = sanitize(html);
-    let dom: RcDom = html5ever::parse_document(RcDom::default(), html5ever::driver::ParseOpts::default())
-        .from_utf8()
-        .read_from(&mut safe.as_bytes())
-        .expect("html5ever parse is infallible on bytes");
+    let dom: RcDom =
+        html5ever::parse_document(RcDom::default(), html5ever::driver::ParseOpts::default())
+            .from_utf8()
+            .read_from(&mut safe.as_bytes())
+            .expect("html5ever parse is infallible on bytes");
 
     // Count what this walker is about to not carry, on the tree as Quip
     // wrote it. Before `flatten_below_depth` on purpose: that pass replaces
@@ -737,7 +792,11 @@ fn collect_comment_anchors(document: &markup5ever_rcdom::Handle) -> Vec<CommentA
             }
         }
         stack.extend(
-            node.children.borrow().iter().rev().map(|c| (c.clone(), inner.clone())),
+            node.children
+                .borrow()
+                .iter()
+                .rev()
+                .map(|c| (c.clone(), inner.clone())),
         );
     }
     found
@@ -763,7 +822,10 @@ fn resolve_comment_anchors(sections: &mut Vec<(String, String)>, anchors: &[Comm
     let mut by_section: HashMap<&str, Vec<&str>> = HashMap::new();
     for (annotation, enclosing) in anchors {
         if known.insert(annotation.as_str()) {
-            by_section.entry(enclosing.as_str()).or_default().push(annotation.as_str());
+            by_section
+                .entry(enclosing.as_str())
+                .or_default()
+                .push(annotation.as_str());
         }
     }
     let mut out = Vec::with_capacity(sections.len() + anchors.len());
@@ -1035,7 +1097,9 @@ fn merge_numbered_sections(container: &markup5ever_rcdom::Handle) {
             // A continuation: its items join the open list and the now
             // empty section disappears.
             (Some(acc), Some(SECTION_STYLE_ORDERED), _)
-                if classes(&child).iter().any(|c| c == NUMBERING_CONTINUES_CLASS) =>
+                if classes(&child)
+                    .iter()
+                    .any(|c| c == NUMBERING_CONTINUES_CLASS) =>
             {
                 move_items_into(&child, acc);
                 !section_still_has_content(&child)
@@ -1073,7 +1137,9 @@ fn absorb_into_last_item(
     acc: &markup5ever_rcdom::Handle,
     section: &markup5ever_rcdom::Handle,
 ) -> bool {
-    let Some(item) = last_item_of(acc) else { return false };
+    let Some(item) = last_item_of(acc) else {
+        return false;
+    };
     append_child(&item, section.clone());
     true
 }
@@ -1082,7 +1148,9 @@ fn absorb_into_last_item(
 /// `acc`. Nested lists ride along as siblings and are nested into their
 /// own item by [`nest_sibling_lists`] when the traversal reaches `acc`.
 fn move_items_into(section: &markup5ever_rcdom::Handle, acc: &markup5ever_rcdom::Handle) {
-    let Some(list) = items_list_of(section) else { return };
+    let Some(list) = items_list_of(section) else {
+        return;
+    };
     for child in std::mem::take(&mut *list.children.borrow_mut()) {
         append_child(acc, child);
     }
@@ -1094,7 +1162,11 @@ fn items_list_of(handle: &markup5ever_rcdom::Handle) -> Option<markup5ever_rcdom
     let mut stack = vec![handle.clone()];
     while let Some(node) = stack.pop() {
         if matches!(tag_of(&node).as_deref(), Some("ul" | "ol"))
-            && node.children.borrow().iter().any(|c| tag_of(c).as_deref() == Some("li"))
+            && node
+                .children
+                .borrow()
+                .iter()
+                .any(|c| tag_of(c).as_deref() == Some("li"))
         {
             return Some(node);
         }
@@ -1107,7 +1179,12 @@ fn items_list_of(handle: &markup5ever_rcdom::Handle) -> Option<markup5ever_rcdom
 
 /// The last `<li>` child of a list.
 fn last_item_of(list: &markup5ever_rcdom::Handle) -> Option<markup5ever_rcdom::Handle> {
-    list.children.borrow().iter().rev().find(|c| tag_of(c).as_deref() == Some("li")).cloned()
+    list.children
+        .borrow()
+        .iter()
+        .rev()
+        .find(|c| tag_of(c).as_deref() == Some("li"))
+        .cloned()
 }
 
 /// Whether a section's outermost list is Quip's bare indent wrapper —
@@ -1118,7 +1195,11 @@ fn is_indent_wrapper(section: &markup5ever_rcdom::Handle) -> bool {
     let mut stack = vec![section.clone()];
     while let Some(node) = stack.pop() {
         if matches!(tag_of(&node).as_deref(), Some("ul" | "ol")) {
-            return !node.children.borrow().iter().any(|c| tag_of(c).as_deref() == Some("li"));
+            return !node
+                .children
+                .borrow()
+                .iter()
+                .any(|c| tag_of(c).as_deref() == Some("li"));
         }
         for child in node.children.borrow().iter().rev() {
             stack.push(child.clone());
@@ -1297,7 +1378,11 @@ impl InlineBuf {
             {
                 last.text.push_str(s)
             }
-            _ => self.spans.push(Span { text: s.to_string(), marks: marks.clone(), ..Span::default() }),
+            _ => self.spans.push(Span {
+                text: s.to_string(),
+                marks: marks.clone(),
+                ..Span::default()
+            }),
         }
     }
 
@@ -1308,19 +1393,30 @@ impl InlineBuf {
     /// which `materialize_block` turns into two distinct `HardBreak`
     /// elements — matching the real DOM's `<br><br>`.
     fn push_break(&mut self) {
-        self.spans.push(Span { hard_break_before: true, ..Span::default() });
+        self.spans.push(Span {
+            hard_break_before: true,
+            ..Span::default()
+        });
     }
 
     /// Record an intra-Quip link as its own run. `label` is the
     /// anchor's text, which becomes the placeholder's `title`.
     fn push_mention(&mut self, mention: QuipMention, label: String) {
-        self.spans.push(Span { text: label, mention: Some(mention), ..Span::default() });
+        self.spans.push(Span {
+            text: label,
+            mention: Some(mention),
+            ..Span::default()
+        });
     }
 
     /// Record a Quip person mention as its own run. `label` is the anchor's
     /// text and becomes the chip's `display`.
     fn push_person(&mut self, person: QuipPerson, label: String) {
-        self.spans.push(Span { text: label, person: Some(person), ..Span::default() });
+        self.spans.push(Span {
+            text: label,
+            person: Some(person),
+            ..Span::default()
+        });
     }
 
     /// Emit the buffer as a paragraph (dropping it when it holds only
@@ -1335,7 +1431,10 @@ impl InlineBuf {
         {
             return;
         }
-        out.push(QuipBlock::Para { section_id, spans: trim_spans(spans) });
+        out.push(QuipBlock::Para {
+            section_id,
+            spans: trim_spans(spans),
+        });
     }
 }
 
@@ -1460,7 +1559,10 @@ fn walk_element(
             // empty one that only wrapped a block (`<p><img></p>`) is
             // not, or every image would trail a ghost paragraph.
             if !spans.is_empty() || rest.is_empty() {
-                out.push(QuipBlock::Para { section_id: section_id(handle), spans });
+                out.push(QuipBlock::Para {
+                    section_id: section_id(handle),
+                    spans,
+                });
             }
             out.extend(rest);
         }
@@ -1468,7 +1570,11 @@ fn walk_element(
             pending.flush(out, None);
             let level = tag.as_bytes()[1] - b'0';
             let (spans, rest) = walk_text_container(handle);
-            out.push(QuipBlock::Heading { level, section_id: section_id(handle), spans });
+            out.push(QuipBlock::Heading {
+                level,
+                section_id: section_id(handle),
+                spans,
+            });
             out.extend(rest);
         }
         "ul" | "ol" => {
@@ -1494,7 +1600,10 @@ fn walk_element(
             let mut buf = InlineBuf::default();
             walk_children(handle, &mut inner, &Marks::default(), &mut buf);
             buf.flush(&mut inner, None);
-            out.push(QuipBlock::Quote { section_id: section_id(handle), blocks: inner });
+            out.push(QuipBlock::Quote {
+                section_id: section_id(handle),
+                blocks: inner,
+            });
         }
         "pre" => {
             pending.flush(out, None);
@@ -1506,7 +1615,9 @@ fn walk_element(
         }
         "hr" => {
             pending.flush(out, None);
-            out.push(QuipBlock::Rule { section_id: section_id(handle) });
+            out.push(QuipBlock::Rule {
+                section_id: section_id(handle),
+            });
         }
         "table" => {
             pending.flush(out, None);
@@ -1735,7 +1846,12 @@ fn parse_list(handle: &markup5ever_rcdom::Handle, tag_is_ol: bool) -> QuipBlock 
         }
     }
 
-    QuipBlock::List { ordered, task, section_id: section_id(handle), items }
+    QuipBlock::List {
+        ordered,
+        task,
+        section_id: section_id(handle),
+        items,
+    }
 }
 
 /// Gather the `<li>` children of a list, descending through wrapper
@@ -1744,7 +1860,9 @@ fn parse_list(handle: &markup5ever_rcdom::Handle, tag_is_ol: bool) -> QuipBlock 
 fn collect_items(handle: &markup5ever_rcdom::Handle, items: &mut Vec<QuipItem>) {
     use markup5ever_rcdom::NodeData;
     for child in handle.children.borrow().iter() {
-        let NodeData::Element { name, .. } = &child.data else { continue };
+        let NodeData::Element { name, .. } = &child.data else {
+            continue;
+        };
         let tag = name.local.as_ref().to_ascii_lowercase();
         match tag.as_str() {
             "li" => items.push(parse_item(child)),
@@ -1766,19 +1884,28 @@ fn parse_item(handle: &markup5ever_rcdom::Handle) -> QuipItem {
     // text is appended last and document order is preserved: an item
     // reading `a <ul>…</ul> b` keeps `b` after the nested list.
     buf.flush(&mut blocks, None);
-    QuipItem { checked: checked_state(handle), section_id: section_id(handle), blocks }
+    QuipItem {
+        checked: checked_state(handle),
+        section_id: section_id(handle),
+        blocks,
+    }
 }
 
 fn parse_table(handle: &markup5ever_rcdom::Handle) -> QuipBlock {
     let mut rows = Vec::new();
     collect_rows(handle, &mut rows);
-    QuipBlock::Table { section_id: section_id(handle), rows }
+    QuipBlock::Table {
+        section_id: section_id(handle),
+        rows,
+    }
 }
 
 fn collect_rows(handle: &markup5ever_rcdom::Handle, rows: &mut Vec<QuipRow>) {
     use markup5ever_rcdom::NodeData;
     for child in handle.children.borrow().iter() {
-        let NodeData::Element { name, .. } = &child.data else { continue };
+        let NodeData::Element { name, .. } = &child.data else {
+            continue;
+        };
         let tag = name.local.as_ref().to_ascii_lowercase();
         match tag.as_str() {
             "tr" => rows.push(parse_row(child)),
@@ -1793,7 +1920,9 @@ fn parse_row(handle: &markup5ever_rcdom::Handle) -> QuipRow {
     use markup5ever_rcdom::NodeData;
     let mut cells = Vec::new();
     for child in handle.children.borrow().iter() {
-        let NodeData::Element { name, .. } = &child.data else { continue };
+        let NodeData::Element { name, .. } = &child.data else {
+            continue;
+        };
         let tag = name.local.as_ref().to_ascii_lowercase();
         if tag != "td" && tag != "th" {
             continue;
@@ -1807,9 +1936,16 @@ fn parse_row(handle: &markup5ever_rcdom::Handle) -> QuipRow {
             // collapsed grid slot in the editor.
             blocks.push(empty_para());
         }
-        cells.push(QuipCell { header: tag == "th", section_id: section_id(child), blocks });
+        cells.push(QuipCell {
+            header: tag == "th",
+            section_id: section_id(child),
+            blocks,
+        });
     }
-    QuipRow { section_id: section_id(handle), cells }
+    QuipRow {
+        section_id: section_id(handle),
+        cells,
+    }
 }
 
 // ─── UNVERIFIED-MARKUP readers ───────────────────────────────────
@@ -1847,7 +1983,10 @@ fn parse_row(handle: &markup5ever_rcdom::Handle) -> QuipRow {
 /// item.
 fn checked_state(li: &markup5ever_rcdom::Handle) -> Option<bool> {
     if let Some(v) = attr(li, "data-checked") {
-        return Some(!matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | ""));
+        return Some(!matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | ""
+        ));
     }
     for class in classes(li) {
         match class.as_str() {
@@ -1870,7 +2009,9 @@ fn checked_state(li: &markup5ever_rcdom::Handle) -> Option<bool> {
 fn find_checkbox(handle: &markup5ever_rcdom::Handle) -> Option<markup5ever_rcdom::Handle> {
     use markup5ever_rcdom::NodeData;
     for child in handle.children.borrow().iter() {
-        let NodeData::Element { name, .. } = &child.data else { continue };
+        let NodeData::Element { name, .. } = &child.data else {
+            continue;
+        };
         let tag = name.local.as_ref().to_ascii_lowercase();
         match tag.as_str() {
             "input" => {
@@ -1985,7 +2126,10 @@ fn list_is_task(list: &markup5ever_rcdom::Handle, section: Option<&str>) -> bool
         return true;
     }
     classes(list).iter().any(|c| {
-        matches!(c.as_str(), "checklist" | "task-list" | "tasklist" | "task_list" | "todo" | "todo-list")
+        matches!(
+            c.as_str(),
+            "checklist" | "task-list" | "tasklist" | "task_list" | "todo" | "todo-list"
+        )
     })
 }
 
@@ -2167,7 +2311,11 @@ fn quip_thread_from_url(href: &str) -> Option<QuipMention> {
     }
     let thread_id = url.path_segments()?.find(|s| !s.is_empty())?.to_string();
     let section_id = url.fragment().filter(|f| !f.is_empty()).map(str::to_string);
-    Some(QuipMention { thread_id, section_id, url: url.to_string() })
+    Some(QuipMention {
+        thread_id,
+        section_id,
+        url: url.to_string(),
+    })
 }
 
 /// The Quip **person** id in a mention anchor's href.
@@ -2192,7 +2340,10 @@ fn quip_person_from_url(href: &str) -> Option<QuipPerson> {
         return None;
     }
     let quip_user_id = url.path_segments()?.find(|s| !s.is_empty())?.to_string();
-    Some(QuipPerson { quip_user_id, url: url.to_string() })
+    Some(QuipPerson {
+        quip_user_id,
+        url: url.to_string(),
+    })
 }
 
 /// The base a *relative* href in a Quip thread body is relative to.
@@ -2275,7 +2426,11 @@ fn attr(handle: &markup5ever_rcdom::Handle, name: &str) -> Option<String> {
 
 fn classes(handle: &markup5ever_rcdom::Handle) -> Vec<String> {
     attr(handle, "class")
-        .map(|c| c.split_whitespace().map(|t| t.to_ascii_lowercase()).collect())
+        .map(|c| {
+            c.split_whitespace()
+                .map(|t| t.to_ascii_lowercase())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -2380,15 +2535,21 @@ fn flatten(block: QuipBlock) -> Vec<QuipBlock> {
     match block {
         QuipBlock::Quote { section_id, blocks } => {
             let (kept, escaped) = split_for(blocks, NodeType::Blockquote);
-            let mut out = vec![QuipBlock::Quote { section_id, blocks: kept }];
+            let mut out = vec![QuipBlock::Quote {
+                section_id,
+                blocks: kept,
+            }];
             // A blockquote can't be split without changing what reads
             // as quoted, so escapees follow the quote.
             out.extend(escaped);
             out
         }
-        QuipBlock::List { ordered, task, section_id, items } => {
-            flatten_list(ordered, task, section_id, items)
-        }
+        QuipBlock::List {
+            ordered,
+            task,
+            section_id,
+            items,
+        } => flatten_list(ordered, task, section_id, items),
         QuipBlock::Table { section_id, rows } => flatten_table(section_id, rows),
         other => vec![other],
     }
@@ -2409,19 +2570,31 @@ fn flatten_list(
     mut section_id: Option<String>,
     items: Vec<QuipItem>,
 ) -> Vec<QuipBlock> {
-    let item_ctx = if task { NodeType::TaskItem } else { NodeType::ListItem };
+    let item_ctx = if task {
+        NodeType::TaskItem
+    } else {
+        NodeType::ListItem
+    };
     let mut out = Vec::new();
     let mut run: Vec<QuipItem> = Vec::new();
 
     for item in items {
-        let QuipItem { checked, section_id: item_section_id, blocks } = item;
+        let QuipItem {
+            checked,
+            section_id: item_section_id,
+            blocks,
+        } = item;
         let (mut kept, escaped) = split_for(blocks, item_ctx);
         if kept.is_empty() {
             // An item whose entire content was hoisted still needs a
             // body — an empty item is legal but renders as a ghost.
             kept.push(empty_para());
         }
-        run.push(QuipItem { checked, section_id: item_section_id, blocks: kept });
+        run.push(QuipItem {
+            checked,
+            section_id: item_section_id,
+            blocks: kept,
+        });
         if !escaped.is_empty() {
             out.push(QuipBlock::List {
                 ordered,
@@ -2434,7 +2607,12 @@ fn flatten_list(
     }
 
     if !run.is_empty() {
-        out.push(QuipBlock::List { ordered, task, section_id: section_id.take(), items: run });
+        out.push(QuipBlock::List {
+            ordered,
+            task,
+            section_id: section_id.take(),
+            items: run,
+        });
     }
     out
 }
@@ -2448,17 +2626,31 @@ fn flatten_table(section_id: Option<String>, rows: Vec<QuipRow>) -> Vec<QuipBloc
     for row in rows {
         let mut cells = Vec::new();
         for cell in row.cells {
-            let ctx = if cell.header { NodeType::TableHeader } else { NodeType::TableCell };
+            let ctx = if cell.header {
+                NodeType::TableHeader
+            } else {
+                NodeType::TableCell
+            };
             let (mut kept, escaped) = split_for(cell.blocks, ctx);
             if kept.is_empty() {
                 kept.push(empty_para());
             }
             after.extend(escaped);
-            cells.push(QuipCell { header: cell.header, section_id: cell.section_id, blocks: kept });
+            cells.push(QuipCell {
+                header: cell.header,
+                section_id: cell.section_id,
+                blocks: kept,
+            });
         }
-        clean_rows.push(QuipRow { section_id: row.section_id, cells });
+        clean_rows.push(QuipRow {
+            section_id: row.section_id,
+            cells,
+        });
     }
-    let mut out = vec![QuipBlock::Table { section_id, rows: clean_rows }];
+    let mut out = vec![QuipBlock::Table {
+        section_id,
+        rows: clean_rows,
+    }];
     out.extend(after);
     out
 }
@@ -2567,7 +2759,9 @@ fn strip_grid_chrome(blocks: &mut [QuipBlock], kind: QuipThreadKind) {
 /// against the only real markup this repository holds. Width and
 /// anchorlessness survive scrubbing; the digits' values do not.
 fn has_grid_chrome(rows: &[QuipRow]) -> bool {
-    let [header, body @ ..] = rows else { return false };
+    let [header, body @ ..] = rows else {
+        return false;
+    };
     if body.is_empty() || header.cells.len() < 2 || !header.cells.iter().all(|c| c.header) {
         return false;
     }
@@ -2690,7 +2884,10 @@ fn apply_marks(txn: &mut yrs::TransactionMut<'_>, text: &XmlTextRef, marks: &Mar
     }
     if let Some(href) = &marks.link {
         let payload = serde_json::json!({ "href": href }).to_string();
-        attrs.insert(std::sync::Arc::from(MarkType::Link.attr_name()), Any::String(payload.into()));
+        attrs.insert(
+            std::sync::Arc::from(MarkType::Link.attr_name()),
+            Any::String(payload.into()),
+        );
     }
     if attrs.is_empty() {
         return;
@@ -2919,7 +3116,10 @@ pub fn resolve_person_mentions(
         // target really is a still-pending `Mention` before writing a user id
         // onto it, which an index alone cannot.
         let Some((index, el)) = find_pending_mention(&txn, &found.parent, &found.block_id) else {
-            debug_assert!(false, "a collected pending mention vanished before it was decided");
+            debug_assert!(
+                false,
+                "a collected pending mention vanished before it was decided"
+            );
             continue;
         };
         match resolved.get(&found.quip_user_id) {
@@ -2933,9 +3133,11 @@ pub fn resolve_person_mentions(
             // the same href, so Phase 2b can still back-patch it.
             Some(PersonOutcome::NotAPerson) => {
                 found.parent.remove_range(&mut txn, index, 1);
-                let doc_el = found
-                    .parent
-                    .insert(&mut txn, index, XmlElementPrelim::empty(NodeType::DocMention.tag_name()));
+                let doc_el = found.parent.insert(
+                    &mut txn,
+                    index,
+                    XmlElementPrelim::empty(NodeType::DocMention.tag_name()),
+                );
                 // The blockId is carried over rather than re-minted: it is
                 // the handle the pending-link record points at, and reusing
                 // it keeps the node's identity stable across the rewrite.
@@ -3064,7 +3266,9 @@ fn collect_person_mentions<T: ReadTxn>(
                     block_id: child.get_attribute(txn, "blockId").unwrap_or_default(),
                     quip_user_id,
                     display: child.get_attribute(txn, "display").unwrap_or_default(),
-                    url: child.get_attribute(txn, PENDING_QUIP_URL_ATTR).unwrap_or_default(),
+                    url: child
+                        .get_attribute(txn, PENDING_QUIP_URL_ATTR)
+                        .unwrap_or_default(),
                 });
             }
             // A `Mention` is a leaf atom — nothing to descend into.
@@ -3114,19 +3318,37 @@ fn materialize_block(
             side.record_section(&*txn, &el, section_id.as_ref());
             insert_spans(txn, &el, NodeType::Paragraph, spans, side);
         }
-        QuipBlock::Heading { level, spans, section_id } => {
+        QuipBlock::Heading {
+            level,
+            spans,
+            section_id,
+        } => {
             let el = insert_block(txn, parent, parent_type, NodeType::Heading);
             el.insert_attribute(txn, "level", (*level).clamp(1, 6).to_string());
             side.record_section(&*txn, &el, section_id.as_ref());
             insert_spans(txn, &el, NodeType::Heading, spans, side);
         }
-        QuipBlock::List { task, items, section_id, .. } => {
+        QuipBlock::List {
+            task,
+            items,
+            section_id,
+            ..
+        } => {
             let list_type = block.node_type();
-            let item_type = if *task { NodeType::TaskItem } else { NodeType::ListItem };
+            let item_type = if *task {
+                NodeType::TaskItem
+            } else {
+                NodeType::ListItem
+            };
             let list = insert_block(txn, parent, parent_type, list_type);
             side.record_section(&*txn, &list, section_id.as_ref());
             for item in items {
-                let li = insert_block(txn, &XmlOpenable::Element(list.clone()), list_type, item_type);
+                let li = insert_block(
+                    txn,
+                    &XmlOpenable::Element(list.clone()),
+                    list_type,
+                    item_type,
+                );
                 if item_type == NodeType::TaskItem {
                     li.insert_attribute(txn, "checked", item.checked.unwrap_or(false).to_string());
                 }
@@ -3145,7 +3367,11 @@ fn materialize_block(
                 materialize_block(txn, &scope, NodeType::Blockquote, child, side);
             }
         }
-        QuipBlock::Code { language, section_id, text } => {
+        QuipBlock::Code {
+            language,
+            section_id,
+            text,
+        } => {
             let el = insert_block(txn, parent, parent_type, NodeType::CodeBlock);
             if !language.is_empty() {
                 el.insert_attribute(txn, "language", language.clone());
@@ -3171,8 +3397,11 @@ fn materialize_block(
                 );
                 side.record_section(&*txn, &row_el, row.section_id.as_ref());
                 for cell in &row.cells {
-                    let cell_type =
-                        if cell.header { NodeType::TableHeader } else { NodeType::TableCell };
+                    let cell_type = if cell.header {
+                        NodeType::TableHeader
+                    } else {
+                        NodeType::TableCell
+                    };
                     let cell_el = insert_block(
                         txn,
                         &XmlOpenable::Element(row_el.clone()),
@@ -3187,7 +3416,13 @@ fn materialize_block(
                 }
             }
         }
-        QuipBlock::Image { src, alt, width, height, section_id } => {
+        QuipBlock::Image {
+            src,
+            alt,
+            width,
+            height,
+            section_id,
+        } => {
             let el = insert_block(txn, parent, parent_type, NodeType::Image);
             // Left as the raw Quip value on purpose — the blob
             // side-load pass rewrites it to a durable blob reference,
@@ -3232,8 +3467,9 @@ mod tests {
 
     /// Tags that must never be admitted: script execution, framing, and
     /// external-resource loading.
-    const NEVER_ALLOWED_TAGS: &[&str] =
-        &["script", "iframe", "object", "embed", "style", "form", "link", "base", "meta"];
+    const NEVER_ALLOWED_TAGS: &[&str] = &[
+        "script", "iframe", "object", "embed", "style", "form", "link", "base", "meta",
+    ];
 
     /// The allowlist sets themselves — the sharpest possible failure, naming
     /// the exact entry someone added.
@@ -3252,7 +3488,11 @@ mod tests {
                 !attr.to_ascii_lowercase().starts_with("on"),
                 "{attr:?} is an event-handler attribute and must not be allowlisted",
             );
-            assert_ne!(attr.to_ascii_lowercase(), "style", "inline style is a payload vector");
+            assert_ne!(
+                attr.to_ascii_lowercase(),
+                "style",
+                "inline style is a payload vector"
+            );
         }
     }
 
@@ -3268,7 +3508,10 @@ mod tests {
                 !out.contains(&format!("<{tag}")),
                 "sanitize admitted <{tag}>: {out:?}",
             );
-            assert!(out.contains("keep"), "sanitize must keep ordinary content: {out:?}");
+            assert!(
+                out.contains("keep"),
+                "sanitize must keep ordinary content: {out:?}"
+            );
         }
 
         // Event handlers, on both an allowed tag and an allowed-with-content
@@ -3280,7 +3523,10 @@ mod tests {
         )
         .to_ascii_lowercase();
         for handler in ["onerror", "onclick", "onmouseover"] {
-            assert!(!out.contains(handler), "sanitize admitted {handler}: {out:?}");
+            assert!(
+                !out.contains(handler),
+                "sanitize admitted {handler}: {out:?}"
+            );
         }
 
         // Script-bearing URL schemes on the tags that carry URLs.
@@ -3288,13 +3534,25 @@ mod tests {
             "<a href=\"javascript:steal()\">x</a><img src=\"javascript:steal()\">             <a href=\"data:text/html;base64,PHNjcmlwdD4=\">y</a>",
         )
         .to_ascii_lowercase();
-        assert!(!out.contains("javascript:"), "sanitize admitted a javascript: URL: {out:?}");
-        assert!(!out.contains("data:text/html"), "sanitize admitted a data: HTML URL: {out:?}");
+        assert!(
+            !out.contains("javascript:"),
+            "sanitize admitted a javascript: URL: {out:?}"
+        );
+        assert!(
+            !out.contains("data:text/html"),
+            "sanitize admitted a data: HTML URL: {out:?}"
+        );
 
         // The `data-` prefix allowance must not become an `on*` allowance.
         let out = sanitize("<p data-section-id=s1 onfocus='steal()'>t</p>").to_ascii_lowercase();
-        assert!(out.contains("data-section-id"), "data-* hints must survive: {out:?}");
-        assert!(!out.contains("onfocus"), "the data- prefix must not admit handlers: {out:?}");
+        assert!(
+            out.contains("data-section-id"),
+            "data-* hints must survive: {out:?}"
+        );
+        assert!(
+            !out.contains("onfocus"),
+            "the data- prefix must not admit handlers: {out:?}"
+        );
     }
 
     use yrs::types::GetString;
@@ -3324,12 +3582,19 @@ mod tests {
 
     /// A table's cells as `(is_header, text)`, row-major.
     fn table_grid(block: &QuipBlock) -> Vec<Vec<(bool, String)>> {
-        let QuipBlock::Table { rows, .. } = block else { panic!("expected a table: {block:?}") };
+        let QuipBlock::Table { rows, .. } = block else {
+            panic!("expected a table: {block:?}")
+        };
         rows.iter()
             .map(|r| {
                 r.cells
                     .iter()
-                    .map(|c| (c.header, single_para_text(c).unwrap_or_else(|| "<multi>".into())))
+                    .map(|c| {
+                        (
+                            c.header,
+                            single_para_text(c).unwrap_or_else(|| "<multi>".into()),
+                        )
+                    })
                     .collect()
             })
             .collect()
@@ -3374,10 +3639,22 @@ mod tests {
     fn a_formula_never_reaches_the_document_only_the_value_quip_cached_does() {
         let quip = from_quip_html(REAL_FORMULA_CELLS);
         let xml = doc_xml(&quip);
-        assert!(!xml.contains("=D8*D9"), "the formula string must not become content: {xml}");
-        assert!(!xml.contains("SUM("), "the formula string must not become content: {xml}");
-        assert!(!xml.contains("formula"), "no `formula` attribute reaches a yrs node: {xml}");
-        assert!(xml.contains('3') && xml.contains('4'), "the cached values survive: {xml}");
+        assert!(
+            !xml.contains("=D8*D9"),
+            "the formula string must not become content: {xml}"
+        );
+        assert!(
+            !xml.contains("SUM("),
+            "the formula string must not become content: {xml}"
+        );
+        assert!(
+            !xml.contains("formula"),
+            "no `formula` attribute reaches a yrs node: {xml}"
+        );
+        assert!(
+            xml.contains('3') && xml.contains('4'),
+            "the cached values survive: {xml}"
+        );
     }
 
     /// `formula` has to clear the sanitizer or the count above is always
@@ -3385,7 +3662,10 @@ mod tests {
     #[test]
     fn the_sanitizer_admits_formula_so_the_loss_can_be_counted() {
         let out = sanitize("<td><span formula='=D8*D9'>3</span></td>");
-        assert!(out.contains("formula="), "sanitize must keep `formula`: {out:?}");
+        assert!(
+            out.contains("formula="),
+            "sanitize must keep `formula`: {out:?}"
+        );
         assert_eq!(
             from_quip_html("<td><span formula='=D8*D9'>3</span></td>").formulas_dropped,
             1,
@@ -3408,12 +3688,18 @@ mod tests {
             "<div data-live-app-id='kanban' data-live-app-payload='{\"cards\":[]}'>\
              <table><tr><th>To do</th><th>Done</th></tr></table></div>",
         );
-        assert_eq!(quip.live_apps_dropped, 1, "one block, not one per attribute");
+        assert_eq!(
+            quip.live_apps_dropped, 1,
+            "one block, not one per attribute"
+        );
         assert_eq!(quip.formulas_dropped, 0);
         // The block's rendered scaffolding still imports; the count says
         // what rode in the payload did not.
         let xml = doc_xml(&quip);
-        assert!(xml.contains("<table"), "the headings Quip rendered still import: {xml}");
+        assert!(
+            xml.contains("<table"),
+            "the headings Quip rendered still import: {xml}"
+        );
     }
 
     #[test]
@@ -3451,7 +3737,13 @@ mod tests {
         // — `data-emoji-` is 11 bytes and `data-live-ap` is 12, so the emoji
         // spans it either way — and the rest are shorter than the prefix or
         // diverge before it. Every one of these panicked before the fix.
-        for name in ["data-emoji-🙂", "data-live-ap🙂", "data-liv🙂-app-payload", "🙂", "data-🙂"] {
+        for name in [
+            "data-emoji-🙂",
+            "data-live-ap🙂",
+            "data-liv🙂-app-payload",
+            "🙂",
+            "data-🙂",
+        ] {
             let html = format!("<div {name}='x'>hi</div>");
             let quip = from_quip_html(&html);
             assert_eq!(
@@ -3467,7 +3759,11 @@ mod tests {
         // match is what this detector promises. What it is followed by,
         // multi-byte or not, is the same "sibling spelling" case as
         // `data-live-app-id`.
-        for name in ["data-live-app🙂", "data-live-app-payload", "DATA-LIVE-APP-PAYLOAD"] {
+        for name in [
+            "data-live-app🙂",
+            "data-live-app-payload",
+            "DATA-LIVE-APP-PAYLOAD",
+        ] {
             let html = format!("<div {name}='🙂'>hi</div>");
             let quip = from_quip_html(&html);
             assert_eq!(quip.live_apps_dropped, 1, "{name:?} carries the prefix");
@@ -3500,8 +3796,14 @@ mod tests {
             "</div>".repeat(MAX_NESTING_DEPTH + 20),
         );
         let quip = from_quip_html(&deep);
-        assert!(quip.deep_nesting_truncated > 0, "the fixture must actually exceed the bound");
-        assert_eq!(quip.formulas_dropped, 1, "the census must precede the flattening");
+        assert!(
+            quip.deep_nesting_truncated > 0,
+            "the fixture must actually exceed the bound"
+        );
+        assert_eq!(
+            quip.formulas_dropped, 1,
+            "the census must precede the flattening"
+        );
     }
 
     // ─── blockId ─────────────────────────────────────────────
@@ -3511,7 +3813,10 @@ mod tests {
         let a = new_block_id();
         let b = new_block_id();
         assert_eq!(a.len(), 10, "blockId must be 10 chars: {a}");
-        assert!(a.chars().all(|c| c.is_ascii_alphanumeric()), "alphanumeric only: {a}");
+        assert!(
+            a.chars().all(|c| c.is_ascii_alphanumeric()),
+            "alphanumeric only: {a}"
+        );
         assert_ne!(a, b, "ids must differ");
     }
 
@@ -3524,17 +3829,35 @@ mod tests {
              <pre data-language=\"rust\">fn x(){}</pre><hr>",
         );
         assert!(matches!(b[0], QuipBlock::Heading { level: 2, .. }), "{b:?}");
-        assert!(matches!(b[1], QuipBlock::List { ordered: false, .. }), "{b:?}");
-        assert!(matches!(b[2], QuipBlock::Code { ref language, .. } if language == "rust"), "{b:?}");
+        assert!(
+            matches!(b[1], QuipBlock::List { ordered: false, .. }),
+            "{b:?}"
+        );
+        assert!(
+            matches!(b[2], QuipBlock::Code { ref language, .. } if language == "rust"),
+            "{b:?}"
+        );
         assert!(matches!(b[3], QuipBlock::Rule { .. }), "{b:?}");
     }
 
     #[test]
     fn paragraph_and_ordered_list_parse() {
         let b = blocks("<p>hello</p><ol><li>first</li></ol>");
-        let QuipBlock::Para { spans, .. } = &b[0] else { panic!("expected para: {b:?}") };
+        let QuipBlock::Para { spans, .. } = &b[0] else {
+            panic!("expected para: {b:?}")
+        };
         assert_eq!(spans_text(spans), "hello");
-        assert!(matches!(b[1], QuipBlock::List { ordered: true, task: false, .. }), "{b:?}");
+        assert!(
+            matches!(
+                b[1],
+                QuipBlock::List {
+                    ordered: true,
+                    task: false,
+                    ..
+                }
+            ),
+            "{b:?}"
+        );
     }
 
     #[test]
@@ -3543,29 +3866,39 @@ mod tests {
         // keeps its content instead of vanishing.
         let b = blocks("<div class=\"quip-section\"><section><p>inside</p></section></div>");
         assert_eq!(b.len(), 1, "{b:?}");
-        let QuipBlock::Para { spans, .. } = &b[0] else { panic!("expected para: {b:?}") };
+        let QuipBlock::Para { spans, .. } = &b[0] else {
+            panic!("expected para: {b:?}")
+        };
         assert_eq!(spans_text(spans), "inside");
     }
 
     #[test]
     fn bare_text_becomes_a_paragraph() {
         let b = blocks("loose text");
-        let QuipBlock::Para { spans, .. } = &b[0] else { panic!("expected para: {b:?}") };
+        let QuipBlock::Para { spans, .. } = &b[0] else {
+            panic!("expected para: {b:?}")
+        };
         assert_eq!(spans_text(spans), "loose text");
     }
 
     #[test]
     fn script_and_style_never_reach_the_walker() {
-        let b = blocks("<p>ok</p><script>alert(1)</script><style>p{}</style><iframe src=\"x\"></iframe>");
+        let b = blocks(
+            "<p>ok</p><script>alert(1)</script><style>p{}</style><iframe src=\"x\"></iframe>",
+        );
         assert_eq!(b.len(), 1, "only the paragraph survives: {b:?}");
-        let QuipBlock::Para { spans, .. } = &b[0] else { panic!("expected para: {b:?}") };
+        let QuipBlock::Para { spans, .. } = &b[0] else {
+            panic!("expected para: {b:?}")
+        };
         assert_eq!(spans_text(spans), "ok");
     }
 
     #[test]
     fn blockquote_wraps_its_children() {
         let b = blocks("<blockquote><p>quoted</p></blockquote>");
-        let QuipBlock::Quote { blocks: inner, .. } = &b[0] else { panic!("expected quote: {b:?}") };
+        let QuipBlock::Quote { blocks: inner, .. } = &b[0] else {
+            panic!("expected quote: {b:?}")
+        };
         assert!(matches!(inner[0], QuipBlock::Para { .. }), "{inner:?}");
     }
 
@@ -3578,8 +3911,14 @@ mod tests {
         // that shape is covered by
         // `a_sibling_nested_list_lands_inside_the_item_that_owns_it`.
         let b = blocks("<ul><li>outer<ul><li>inner</li></ul></li></ul>");
-        let QuipBlock::List { items, .. } = &b[0] else { panic!("expected list: {b:?}") };
-        assert_eq!(items.len(), 1, "the inner list is not a sibling item: {items:?}");
+        let QuipBlock::List { items, .. } = &b[0] else {
+            panic!("expected list: {b:?}")
+        };
+        assert_eq!(
+            items.len(),
+            1,
+            "the inner list is not a sibling item: {items:?}"
+        );
         assert!(matches!(items[0].blocks[0], QuipBlock::Para { .. }));
         assert!(matches!(items[0].blocks[1], QuipBlock::List { .. }));
     }
@@ -3589,28 +3928,48 @@ mod tests {
         // Regression: the trailing text of an item used to land in
         // front of the block it followed.
         let b = blocks("<ul><li>a<ul><li>x</li></ul>b</li></ul>");
-        let QuipBlock::List { items, .. } = &b[0] else { panic!("expected list: {b:?}") };
+        let QuipBlock::List { items, .. } = &b[0] else {
+            panic!("expected list: {b:?}")
+        };
         let kinds: Vec<_> = items[0].blocks.iter().map(|x| x.node_type()).collect();
         assert_eq!(
             kinds,
-            vec![NodeType::Paragraph, NodeType::BulletList, NodeType::Paragraph],
+            vec![
+                NodeType::Paragraph,
+                NodeType::BulletList,
+                NodeType::Paragraph
+            ],
             "{:?}",
             items[0].blocks
         );
-        let QuipBlock::Para { spans, .. } = &items[0].blocks[0] else { panic!() };
+        let QuipBlock::Para { spans, .. } = &items[0].blocks[0] else {
+            panic!()
+        };
         assert_eq!(spans_text(spans), "a");
-        let QuipBlock::Para { spans, .. } = &items[0].blocks[2] else { panic!() };
+        let QuipBlock::Para { spans, .. } = &items[0].blocks[2] else {
+            panic!()
+        };
         assert_eq!(spans_text(spans), "b");
     }
 
     #[test]
     fn a_table_cell_keeps_its_blocks_in_order() {
         let b = blocks("<table><tr><td>a<pre>code</pre>b</td></tr></table>");
-        let QuipBlock::Table { rows, .. } = &b[0] else { panic!("expected table: {b:?}") };
-        let kinds: Vec<_> = rows[0].cells[0].blocks.iter().map(|x| x.node_type()).collect();
+        let QuipBlock::Table { rows, .. } = &b[0] else {
+            panic!("expected table: {b:?}")
+        };
+        let kinds: Vec<_> = rows[0].cells[0]
+            .blocks
+            .iter()
+            .map(|x| x.node_type())
+            .collect();
         assert_eq!(
             kinds,
-            vec![NodeType::Paragraph, NodeType::CodeBlock, NodeType::Paragraph],
+            vec![
+                NodeType::Paragraph,
+                NodeType::CodeBlock,
+                NodeType::Paragraph
+            ],
             "{:?}",
             rows[0].cells[0].blocks
         );
@@ -3623,7 +3982,9 @@ mod tests {
         let b = blocks("<p>before<img src=\"http://x/i.png\">after</p>");
         let kinds: Vec<_> = b.iter().map(|x| x.node_type()).collect();
         assert_eq!(kinds, vec![NodeType::Paragraph, NodeType::Image], "{b:?}");
-        let QuipBlock::Para { spans, .. } = &b[0] else { panic!() };
+        let QuipBlock::Para { spans, .. } = &b[0] else {
+            panic!()
+        };
         assert_eq!(spans_text(spans), "before after");
     }
 
@@ -3638,14 +3999,18 @@ mod tests {
     fn an_empty_paragraph_is_kept_as_a_spacer() {
         let b = blocks("<p>a</p><p></p><p>b</p>");
         assert_eq!(b.len(), 3, "{b:?}");
-        let QuipBlock::Para { spans, .. } = &b[1] else { panic!("expected para: {b:?}") };
+        let QuipBlock::Para { spans, .. } = &b[1] else {
+            panic!("expected para: {b:?}")
+        };
         assert!(spans.is_empty());
     }
 
     #[test]
     fn inline_marks_keep_their_text_and_spacing() {
         let b = blocks("<p>a <b>bold</b> and <i>italic</i></p>");
-        let QuipBlock::Para { spans, .. } = &b[0] else { panic!("expected para: {b:?}") };
+        let QuipBlock::Para { spans, .. } = &b[0] else {
+            panic!("expected para: {b:?}")
+        };
         assert_eq!(spans_text(spans), "a bold and italic");
     }
 
@@ -3658,7 +4023,15 @@ mod tests {
             "<ul><li><input type=\"checkbox\" checked>done</li>\
              <li><input type=\"checkbox\">todo</li></ul>",
         );
-        let QuipBlock::List { ordered: _, task, items, .. } = &b[0] else { panic!("expected list") };
+        let QuipBlock::List {
+            ordered: _,
+            task,
+            items,
+            ..
+        } = &b[0]
+        else {
+            panic!("expected list")
+        };
         assert!(*task, "a list whose items carry checkboxes is a task list");
         assert_eq!(items[0].checked, Some(true));
         assert_eq!(items[1].checked, Some(false));
@@ -3668,7 +4041,9 @@ mod tests {
     fn checklist_state_from_item_classes() {
         // Spelling 2: class markers on the `<li>`.
         let b = blocks("<ul><li class=\"checked\">done</li><li class=\"unchecked\">todo</li></ul>");
-        let QuipBlock::List { task, items, .. } = &b[0] else { panic!("expected list") };
+        let QuipBlock::List { task, items, .. } = &b[0] else {
+            panic!("expected list")
+        };
         assert!(*task);
         assert_eq!(items[0].checked, Some(true));
         assert_eq!(items[1].checked, Some(false));
@@ -3677,8 +4052,11 @@ mod tests {
     #[test]
     fn checklist_state_from_data_checked() {
         // Spelling 3: a data attribute.
-        let b = blocks("<ul><li data-checked=\"true\">a</li><li data-checked=\"false\">b</li></ul>");
-        let QuipBlock::List { task, items, .. } = &b[0] else { panic!("expected list") };
+        let b =
+            blocks("<ul><li data-checked=\"true\">a</li><li data-checked=\"false\">b</li></ul>");
+        let QuipBlock::List { task, items, .. } = &b[0] else {
+            panic!("expected list")
+        };
         assert!(*task);
         assert_eq!(items[0].checked, Some(true));
         assert_eq!(items[1].checked, Some(false));
@@ -3692,7 +4070,9 @@ mod tests {
             "<ul data-type=\"taskList\"><li>a</li></ul>",
         ] {
             let b = blocks(html);
-            let QuipBlock::List { task, items, .. } = &b[0] else { panic!("expected list: {html}") };
+            let QuipBlock::List { task, items, .. } = &b[0] else {
+                panic!("expected list: {html}")
+            };
             assert!(*task, "{html}");
             assert_eq!(items[0].checked, Some(false), "{html}");
         }
@@ -3701,7 +4081,9 @@ mod tests {
     #[test]
     fn a_plain_bullet_list_is_not_a_task_list() {
         let b = blocks("<ul><li>a</li></ul>");
-        let QuipBlock::List { task, items, .. } = &b[0] else { panic!("expected list") };
+        let QuipBlock::List { task, items, .. } = &b[0] else {
+            panic!("expected list")
+        };
         assert!(!*task);
         assert_eq!(items[0].checked, None);
     }
@@ -3762,8 +4144,7 @@ mod tests {
     /// The same numbered style, but with the extra `<ul>` Quip interposes
     /// for an indent level — which puts two hops between the parsed list
     /// and the section wrapper.
-    const REAL_ORDERED_SECTION_6_INDENTED: &str =
-        "<div data-section-style='6' class=\"\" style=\"\">\
+    const REAL_ORDERED_SECTION_6_INDENTED: &str = "<div data-section-style='6' class=\"\" style=\"\">\
          <ul id='temp:C:AAMba25b35f15e54908801e80b9f'><ul>\
          <li id='temp:C:AAM7cc8c0e0f47640129a85c85ab' class='' style='' value='1'>\
          <span id='temp:C:AAM7cc8c0e0f47640129a85c85ab'>Client connects with JWT in query \
@@ -3774,11 +4155,20 @@ mod tests {
     #[test]
     fn a_real_quip_checklist_section_is_a_task_list() {
         let b = blocks(REAL_CHECKLIST_SECTION);
-        let QuipBlock::List { ordered, task, items, .. } = &b[0] else {
+        let QuipBlock::List {
+            ordered,
+            task,
+            items,
+            ..
+        } = &b[0]
+        else {
             panic!("expected a list, got {b:?}")
         };
         assert!(!*ordered);
-        assert!(*task, "data-section-style='7' on the wrapping div means checklist: {b:?}");
+        assert!(
+            *task,
+            "data-section-style='7' on the wrapping div means checklist: {b:?}"
+        );
         assert_eq!(items.len(), 2, "{b:?}");
         // Checked state stays uniformly false: no sample of a *checked*
         // Quip item exists, so `checked_state` finds nothing and
@@ -3792,7 +4182,13 @@ mod tests {
         // The regression that matters: widening list detection must not
         // sweep in the 565 `5` sections that share the shape.
         let b = blocks(REAL_BULLET_SECTION_5);
-        let QuipBlock::List { ordered, task, items, .. } = &b[0] else {
+        let QuipBlock::List {
+            ordered,
+            task,
+            items,
+            ..
+        } = &b[0]
+        else {
             panic!("expected a list, got {b:?}")
         };
         assert!(!*ordered, "data-section-style='5' is a bullet list: {b:?}");
@@ -3807,10 +4203,19 @@ mod tests {
             ("indented", REAL_ORDERED_SECTION_6_INDENTED),
         ] {
             let b = blocks(html);
-            let QuipBlock::List { ordered, task, items, .. } = &b[0] else {
+            let QuipBlock::List {
+                ordered,
+                task,
+                items,
+                ..
+            } = &b[0]
+            else {
                 panic!("expected a list for {label}, got {b:?}")
             };
-            assert!(*ordered, "{label}: data-section-style='6' means numbered: {b:?}");
+            assert!(
+                *ordered,
+                "{label}: data-section-style='6' means numbered: {b:?}"
+            );
             assert!(!*task, "{label}: a numbered list is not a checklist: {b:?}");
             assert!(items.iter().all(|i| i.checked.is_none()), "{label}: {b:?}");
         }
@@ -3821,7 +4226,9 @@ mod tests {
         // The tag is still authoritative when it says `<ol>`; the
         // section style only ever *adds* orderedness.
         let b = blocks("<div data-section-style='5'><ol><li>a</li></ol></div>");
-        let QuipBlock::List { ordered, .. } = &b[0] else { panic!("expected list: {b:?}") };
+        let QuipBlock::List { ordered, .. } = &b[0] else {
+            panic!("expected list: {b:?}")
+        };
         assert!(*ordered, "{b:?}");
     }
 
@@ -3838,12 +4245,19 @@ mod tests {
             panic!("expected outer list, got {b:?}")
         };
         assert!(*task, "the outer list is inside the '7' section: {b:?}");
-        let Some(QuipBlock::List { task: inner_task, .. }) =
-            items[0].blocks.iter().find(|blk| matches!(blk, QuipBlock::List { .. }))
+        let Some(QuipBlock::List {
+            task: inner_task, ..
+        }) = items[0]
+            .blocks
+            .iter()
+            .find(|blk| matches!(blk, QuipBlock::List { .. }))
         else {
             panic!("expected a nested list inside the item: {b:?}")
         };
-        assert!(!*inner_task, "the nested '5' section is a bullet list: {b:?}");
+        assert!(
+            !*inner_task,
+            "the nested '5' section is a bullet list: {b:?}"
+        );
     }
 
     #[test]
@@ -3872,8 +4286,13 @@ mod tests {
                 panic!("expected outer list for {label}, got {b:?}")
             };
             assert_eq!(*ordered, outer_ordered, "{label} outer: {b:?}");
-            let Some(QuipBlock::List { ordered: inner_ordered, .. }) =
-                items[0].blocks.iter().find(|blk| matches!(blk, QuipBlock::List { .. }))
+            let Some(QuipBlock::List {
+                ordered: inner_ordered,
+                ..
+            }) = items[0]
+                .blocks
+                .iter()
+                .find(|blk| matches!(blk, QuipBlock::List { .. }))
             else {
                 panic!("expected a nested list inside the item for {label}: {b:?}")
             };
@@ -3906,13 +4325,23 @@ mod tests {
     fn a_sibling_nested_list_lands_inside_the_item_that_owns_it() {
         let b = blocks(REAL_NESTED_LIST_SECTION);
         assert_eq!(b.len(), 1, "one list, not a list plus a hoisted one: {b:?}");
-        let QuipBlock::List { ordered, task, items, .. } = &b[0] else {
+        let QuipBlock::List {
+            ordered,
+            task,
+            items,
+            ..
+        } = &b[0]
+        else {
             panic!("expected a list, got {b:?}")
         };
         assert!(!*ordered && !*task, "a '5' section is plain bullets: {b:?}");
         // Before the fix this was 2: `collect_items` hoisted the nested
         // item up to sit beside `Queue` instead of under it.
-        assert_eq!(items.len(), 1, "the nested list is not a sibling item: {items:?}");
+        assert_eq!(
+            items.len(),
+            1,
+            "the nested list is not a sibling item: {items:?}"
+        );
 
         let QuipBlock::Para { spans, .. } = &items[0].blocks[0] else {
             panic!("expected the item's own text first: {:?}", items[0].blocks)
@@ -3920,7 +4349,10 @@ mod tests {
         assert_eq!(spans_text(spans), "Queue");
 
         let QuipBlock::List { items: inner, .. } = &items[0].blocks[1] else {
-            panic!("expected the nested list inside the item: {:?}", items[0].blocks)
+            panic!(
+                "expected the nested list inside the item: {:?}",
+                items[0].blocks
+            )
         };
         assert_eq!(inner.len(), 1, "{inner:?}");
     }
@@ -3944,8 +4376,14 @@ mod tests {
         );
         let outer = xml.find("<bullet_list").expect("a bullet list");
         let item = xml.find("<list_item").expect("a list item");
-        assert!(outer < item, "the nested list sits inside an item, not beside one: {xml}");
-        assert_eq!(doc.deep_nesting_truncated, 0, "real nesting must not trip the depth bound");
+        assert!(
+            outer < item,
+            "the nested list sits inside an item, not beside one: {xml}"
+        );
+        assert_eq!(
+            doc.deep_nesting_truncated, 0,
+            "real nesting must not trip the depth bound"
+        );
     }
 
     // ─── #188: numbered sequences split across sections ──────
@@ -4046,8 +4484,18 @@ mod tests {
         let b = blocks(REAL_NUMBERED_RUN);
         // Before the fix: seven separate `ordered_list` blocks, each
         // holding one item — so the reader saw "1." seven times.
-        assert_eq!(b.len(), 1, "the seven sections must merge into one list: {b:?}");
-        let QuipBlock::List { ordered, task, items, .. } = &b[0] else {
+        assert_eq!(
+            b.len(),
+            1,
+            "the seven sections must merge into one list: {b:?}"
+        );
+        let QuipBlock::List {
+            ordered,
+            task,
+            items,
+            ..
+        } = &b[0]
+        else {
             panic!("expected a list, got {b:?}")
         };
         assert!(*ordered, "a '6' run is numbered: {b:?}");
@@ -4070,7 +4518,11 @@ mod tests {
     #[test]
     fn an_interleaved_bullet_section_is_the_previous_items_sub_content() {
         let b = blocks(REAL_NUMBERED_RUN_WITH_SUBCONTENT);
-        assert_eq!(b.len(), 1, "the '5' section must not terminate the run: {b:?}");
+        assert_eq!(
+            b.len(),
+            1,
+            "the '5' section must not terminate the run: {b:?}"
+        );
         let QuipBlock::List { ordered, items, .. } = &b[0] else {
             panic!("expected a list, got {b:?}")
         };
@@ -4093,16 +4545,31 @@ mod tests {
             "item 1 keeps its text and gains the '5' section: {:?}",
             items[0].blocks
         );
-        let QuipBlock::List { ordered: sub_ordered, task: sub_task, items: sub, .. } =
-            &items[0].blocks[1]
+        let QuipBlock::List {
+            ordered: sub_ordered,
+            task: sub_task,
+            items: sub,
+            ..
+        } = &items[0].blocks[1]
         else {
-            panic!("expected the '5' section nested under item 1: {:?}", items[0].blocks)
+            panic!(
+                "expected the '5' section nested under item 1: {:?}",
+                items[0].blocks
+            )
         };
-        assert!(!*sub_ordered, "sub-content of a numbered item is bullets: {sub:?}");
+        assert!(
+            !*sub_ordered,
+            "sub-content of a numbered item is bullets: {sub:?}"
+        );
         assert!(!*sub_task, "{sub:?}");
         assert_eq!(sub.len(), 4, "{sub:?}");
         assert!(item_texts(sub)[0].starts_with("Path Param"), "{sub:?}");
-        assert_eq!(items[1].blocks.len(), 1, "item 2 has no sub-content here: {:?}", items[1]);
+        assert_eq!(
+            items[1].blocks.len(),
+            1,
+            "item 2 has no sub-content here: {:?}",
+            items[1]
+        );
     }
 
     #[test]
@@ -4112,9 +4579,15 @@ mod tests {
         // 5-component list would merge into one list of twelve.
         let html = format!("{REAL_NUMBERED_RUN}{REAL_NUMBERED_RUN}");
         let b = blocks(&html);
-        assert_eq!(b.len(), 2, "a run without the continues-class opens a new list: {b:?}");
+        assert_eq!(
+            b.len(),
+            2,
+            "a run without the continues-class opens a new list: {b:?}"
+        );
         for block in &b {
-            let QuipBlock::List { ordered, items, .. } = block else { panic!("{b:?}") };
+            let QuipBlock::List { ordered, items, .. } = block else {
+                panic!("{b:?}")
+            };
             assert!(*ordered);
             assert_eq!(items.len(), 7, "{b:?}");
         }
@@ -4153,7 +4626,11 @@ mod tests {
         // Without the `<pre>` arm the code block closes the sequence and
         // this is three blocks — list, code, list — and the corpus's
         // 5-item "Key Components" run splits into 2 + 3.
-        assert_eq!(b.len(), 1, "a `<pre>` inside a numbered run is not a terminator: {b:?}");
+        assert_eq!(
+            b.len(),
+            1,
+            "a `<pre>` inside a numbered run is not a terminator: {b:?}"
+        );
         let QuipBlock::List { ordered, items, .. } = &b[0] else {
             panic!("expected one list, got {b:?}")
         };
@@ -4175,8 +4652,16 @@ mod tests {
         let QuipBlock::Code { text, .. } = &items[0].blocks[1] else {
             panic!("expected a code block inside item 1: {:?}", items[0].blocks)
         };
-        assert!(text.contains("pub fn GameDetail"), "code text survives verbatim: {text:?}");
-        assert_eq!(items[1].blocks.len(), 1, "item 2 gains nothing: {:?}", items[1].blocks);
+        assert!(
+            text.contains("pub fn GameDetail"),
+            "code text survives verbatim: {text:?}"
+        );
+        assert_eq!(
+            items[1].blocks.len(),
+            1,
+            "item 2 gains nothing: {:?}",
+            items[1].blocks
+        );
     }
 
     /// Verbatim, contiguous `AAMAAAUv1cp`: a numbered section followed
@@ -4188,8 +4673,7 @@ mod tests {
     /// The wrapper is the whole discriminator: without it a `'5'` section
     /// is a bullet list standing on its own, and swallowing it into the
     /// numbered item above would be a content-structure regression.
-    const REAL_FLAT_BULLET_SECTION_AFTER_A_NUMBERED_ONE: &str =
-        "<div data-section-style='6' class=\"\" style=\"\">\
+    const REAL_FLAT_BULLET_SECTION_AFTER_A_NUMBERED_ONE: &str = "<div data-section-style='6' class=\"\" style=\"\">\
          <ul id='temp:C:AAMba25b35f15e54908801e80b9f'><ul>\
          <li id='temp:C:AAM7cc8c0e0f47640129a85c85ab' class='' style='' value='1'>\
          <span id='temp:C:AAM7cc8c0e0f47640129a85c85ab'>Client connects with JWT in query \
@@ -4225,22 +4709,47 @@ mod tests {
         let b = blocks(REAL_FLAT_BULLET_SECTION_AFTER_A_NUMBERED_ONE);
         // Without the `is_indent_wrapper` gate this is one block: the
         // bullet list is swallowed into the numbered list's last item.
-        assert_eq!(b.len(), 2, "an unwrapped '5' section stands on its own: {b:?}");
+        assert_eq!(
+            b.len(),
+            2,
+            "an unwrapped '5' section stands on its own: {b:?}"
+        );
 
-        let QuipBlock::List { ordered, items, .. } = &b[0] else { panic!("{b:?}") };
+        let QuipBlock::List { ordered, items, .. } = &b[0] else {
+            panic!("{b:?}")
+        };
         assert!(*ordered, "{b:?}");
-        assert_eq!(items.len(), 4, "the numbered section keeps its four items: {items:?}");
+        assert_eq!(
+            items.len(),
+            4,
+            "the numbered section keeps its four items: {items:?}"
+        );
         assert!(
             items.iter().all(|i| i.blocks.len() == 1),
             "no numbered item gains the bullet section: {items:?}"
         );
 
-        let QuipBlock::List { ordered: o, task, items: bullets, .. } = &b[1] else { panic!("{b:?}") };
+        let QuipBlock::List {
+            ordered: o,
+            task,
+            items: bullets,
+            ..
+        } = &b[1]
+        else {
+            panic!("{b:?}")
+        };
         assert!(!*o && !*task, "a '5' section is bullets: {b:?}");
-        assert_eq!(item_texts(bullets), vec!["Message types (JSON):"], "{bullets:?}");
+        assert_eq!(
+            item_texts(bullets),
+            vec!["Message types (JSON):"],
+            "{bullets:?}"
+        );
         // Its own `class='parent'` nesting still applies inside it.
         let QuipBlock::List { items: sub, .. } = &bullets[0].blocks[1] else {
-            panic!("expected the nested list inside it: {:?}", bullets[0].blocks)
+            panic!(
+                "expected the nested list inside it: {:?}",
+                bullets[0].blocks
+            )
         };
         assert_eq!(sub.len(), 3, "{sub:?}");
     }
@@ -4255,7 +4764,15 @@ mod tests {
         let b = blocks(&html);
         assert_eq!(b.len(), 2, "bullet sections must not merge: {b:?}");
         for block in &b {
-            let QuipBlock::List { ordered, task, items, .. } = block else { panic!("{b:?}") };
+            let QuipBlock::List {
+                ordered,
+                task,
+                items,
+                ..
+            } = block
+            else {
+                panic!("{b:?}")
+            };
             assert!(!*ordered && !*task, "{b:?}");
             assert_eq!(items.len(), 2, "{b:?}");
             assert!(
@@ -4272,7 +4789,15 @@ mod tests {
         let html = format!("{REAL_NUMBERED_RUN}{REAL_CHECKLIST_SECTION}");
         let b = blocks(&html);
         assert_eq!(b.len(), 2, "{b:?}");
-        let QuipBlock::List { ordered, task, items, .. } = &b[1] else { panic!("{b:?}") };
+        let QuipBlock::List {
+            ordered,
+            task,
+            items,
+            ..
+        } = &b[1]
+        else {
+            panic!("{b:?}")
+        };
         assert!(*task, "the '7' section is still a checklist: {b:?}");
         assert!(!*ordered, "{b:?}");
         assert_eq!(items.len(), 2, "{b:?}");
@@ -4286,11 +4811,20 @@ mod tests {
         // rewrite applies to it exactly as it does to `<ul>`.
         let b = blocks("<ol><li>a</li><ol><li>b</li></ol></ol>");
         assert_eq!(b.len(), 1, "{b:?}");
-        let QuipBlock::List { ordered, items, .. } = &b[0] else { panic!("{b:?}") };
+        let QuipBlock::List { ordered, items, .. } = &b[0] else {
+            panic!("{b:?}")
+        };
         assert!(*ordered, "{b:?}");
         assert_eq!(items.len(), 1, "{b:?}");
-        let QuipBlock::List { ordered: inner_ordered, .. } = &items[0].blocks[1] else {
-            panic!("expected the nested ol inside the item: {:?}", items[0].blocks)
+        let QuipBlock::List {
+            ordered: inner_ordered,
+            ..
+        } = &items[0].blocks[1]
+        else {
+            panic!(
+                "expected the nested ol inside the item: {:?}",
+                items[0].blocks
+            )
         };
         assert!(*inner_ordered, "{b:?}");
     }
@@ -4303,10 +4837,19 @@ mod tests {
         // than gaining an invented empty parent bullet.
         let b = blocks(REAL_ORDERED_SECTION_6_INDENTED);
         assert_eq!(b.len(), 1, "{b:?}");
-        let QuipBlock::List { ordered, items, .. } = &b[0] else { panic!("{b:?}") };
+        let QuipBlock::List { ordered, items, .. } = &b[0] else {
+            panic!("{b:?}")
+        };
         assert!(*ordered, "{b:?}");
-        assert_eq!(items.len(), 1, "the wrapper contributes no empty item: {items:?}");
-        assert!(matches!(items[0].blocks[0], QuipBlock::Para { .. }), "{items:?}");
+        assert_eq!(
+            items.len(),
+            1,
+            "the wrapper contributes no empty item: {items:?}"
+        );
+        assert!(
+            matches!(items[0].blocks[0], QuipBlock::Para { .. }),
+            "{items:?}"
+        );
     }
 
     #[test]
@@ -4320,7 +4863,9 @@ mod tests {
         ];
         for (html, want) in cases {
             let b = blocks(html);
-            let QuipBlock::Code { language, .. } = &b[0] else { panic!("expected code: {html}") };
+            let QuipBlock::Code { language, .. } = &b[0] else {
+                panic!("expected code: {html}")
+            };
             assert_eq!(language, want, "{html}");
         }
     }
@@ -4328,7 +4873,9 @@ mod tests {
     #[test]
     fn code_block_keeps_its_text_verbatim() {
         let b = blocks("<pre><code>let a = 1;\nlet b = 2;</code></pre>");
-        let QuipBlock::Code { text, .. } = &b[0] else { panic!("expected code") };
+        let QuipBlock::Code { text, .. } = &b[0] else {
+            panic!("expected code")
+        };
         assert_eq!(text, "let a = 1;\nlet b = 2;");
     }
 
@@ -4366,7 +4913,9 @@ mod tests {
             \u{a0}\u{a0} \u{a0}pub timestamp: u64,<br>\
             }</pre>";
         let b = blocks(html);
-        let QuipBlock::Code { text, .. } = &b[0] else { panic!("expected code: {b:?}") };
+        let QuipBlock::Code { text, .. } = &b[0] else {
+            panic!("expected code: {b:?}")
+        };
         assert_eq!(
             text,
             "#[derive(Serialize, Deserialize, Clone)]\n\
@@ -4409,7 +4958,9 @@ mod tests {
             GAME # game-name -&gt; { game-id }<br>\
             game-id # STATUS # game-status -&gt; { change-log... }<br></pre>";
         let b = blocks(html);
-        let QuipBlock::Code { text, .. } = &b[0] else { panic!("expected code: {b:?}") };
+        let QuipBlock::Code { text, .. } = &b[0] else {
+            panic!("expected code: {b:?}")
+        };
         assert_eq!(
             text,
             "GAME # game-name -> { game-id }\n\
@@ -4421,9 +4972,13 @@ mod tests {
     fn section_ids_are_captured_verbatim() {
         // Quip section ids are opaque; no charset assumptions.
         let b = blocks("<p id=\"XYZ:abc-123\">a</p><h1 data-section-id=\"S2\">b</h1>");
-        let QuipBlock::Para { section_id, .. } = &b[0] else { panic!("expected para: {b:?}") };
+        let QuipBlock::Para { section_id, .. } = &b[0] else {
+            panic!("expected para: {b:?}")
+        };
         assert_eq!(section_id.as_deref(), Some("XYZ:abc-123"));
-        let QuipBlock::Heading { section_id, .. } = &b[1] else { panic!("expected heading: {b:?}") };
+        let QuipBlock::Heading { section_id, .. } = &b[1] else {
+            panic!("expected heading: {b:?}")
+        };
         assert_eq!(section_id.as_deref(), Some("S2"));
     }
 
@@ -4449,7 +5004,10 @@ mod tests {
     fn a_list_and_each_of_its_items_record_their_own_anchor() {
         let html = "<div data-section-style='5' class=\"\" style=\"\"><ul id='temp:C:CVL73809743db7745b7a64a37dc1'><li id='temp:C:CVLdf56cde36a9d40d6b910f0d53' class='' style='' value='1'><span id='temp:C:CVLdf56cde36a9d40d6b910f0d53'><b>Dozen-Turadipi</b>: Stand his ingelitse is ipisci-long dozen drop in Iusmodte.</span>\n\n<br/></li><li id='temp:C:CVL6a4f566a19aa4607b8dbe64a9' class='' style=''><span id='temp:C:CVL6a4f566a19aa4607b8dbe64a9'>Uradipis uradipiscinge, adipisci, man noon adipiscing.</span>\n\n<br/></li></ul></div>";
         let b = blocks(html);
-        let QuipBlock::List { section_id, items, .. } = &b[0] else {
+        let QuipBlock::List {
+            section_id, items, ..
+        } = &b[0]
+        else {
             panic!("expected list: {b:?}")
         };
         assert_eq!(
@@ -4459,7 +5017,10 @@ mod tests {
         );
         assert_eq!(items.len(), 2);
         assert_eq!(
-            items.iter().map(|i| i.section_id.as_deref()).collect::<Vec<_>>(),
+            items
+                .iter()
+                .map(|i| i.section_id.as_deref())
+                .collect::<Vec<_>>(),
             vec![
                 Some("temp:C:CVLdf56cde36a9d40d6b910f0d53"),
                 Some("temp:C:CVL6a4f566a19aa4607b8dbe64a9"),
@@ -4476,13 +5037,22 @@ mod tests {
     fn a_checklist_item_records_its_anchor_like_any_other_item() {
         let html = "<div data-section-style='7' class=\"\" style=\"\"><ul id='SSfACAKV4zR'><li id='SSfACA046uk' class='' style='' value='1'><span id='SSfACA046uk'>Prize did round night in kind porloremips read is any do.</span>\n\n<br/></li><li id='SSfACASS8II' class='' style=''><span id='SSfACASS8II'>White go kind like man hold white go for ctetura wait he you scingeli.</span>\n\n<br/></li></ul></div>";
         let b = blocks(html);
-        let QuipBlock::List { task, section_id, items, .. } = &b[0] else {
+        let QuipBlock::List {
+            task,
+            section_id,
+            items,
+            ..
+        } = &b[0]
+        else {
             panic!("expected list: {b:?}")
         };
         assert!(*task, "data-section-style='7' is a checklist");
         assert_eq!(section_id.as_deref(), Some("SSfACAKV4zR"));
         assert_eq!(
-            items.iter().map(|i| i.section_id.as_deref()).collect::<Vec<_>>(),
+            items
+                .iter()
+                .map(|i| i.section_id.as_deref())
+                .collect::<Vec<_>>(),
             vec![Some("SSfACA046uk"), Some("SSfACASS8II")],
         );
     }
@@ -4494,8 +5064,13 @@ mod tests {
     fn a_table_its_rows_and_its_cells_each_record_their_own_anchor() {
         let html = "<div data-section-style='13'><table id='temp:C:AeOfdbce4eabb6e41df873200fa6' title='Iusmod' style='width: 39.0667em'><tbody><tr id='temp:C:AeO2f2ceb0afd0a41419a2e9fae8'><td id='temp:s:temp:C:AeO2f2ceb0afd0a41419a2e9fae8_temp:C:AeO641271c1e4ec417fa93c8d029' style='text-align: left;vertical-align: middle;' class='bold'><span id='temp:s:temp:C:AeO2f2ceb0afd0a41419a2e9fae8_temp:C:AeO641271c1e4ec417fa93c8d029'>Eiusmod</span>\n\n<br/></td></tr></tbody></table></div>";
         let b = blocks(html);
-        let QuipBlock::Table { section_id, rows } = &b[0] else { panic!("expected table: {b:?}") };
-        assert_eq!(section_id.as_deref(), Some("temp:C:AeOfdbce4eabb6e41df873200fa6"));
+        let QuipBlock::Table { section_id, rows } = &b[0] else {
+            panic!("expected table: {b:?}")
+        };
+        assert_eq!(
+            section_id.as_deref(),
+            Some("temp:C:AeOfdbce4eabb6e41df873200fa6")
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].section_id.as_deref(),
@@ -4504,9 +5079,7 @@ mod tests {
         );
         assert_eq!(
             rows[0].cells[0].section_id.as_deref(),
-            Some(
-                "temp:s:temp:C:AeO2f2ceb0afd0a41419a2e9fae8_temp:C:AeO641271c1e4ec417fa93c8d029"
-            ),
+            Some("temp:s:temp:C:AeO2f2ceb0afd0a41419a2e9fae8_temp:C:AeO641271c1e4ec417fa93c8d029"),
             "the <td>'s composite anchor, byte for byte"
         );
     }
@@ -4519,13 +5092,28 @@ mod tests {
     fn header_cells_record_their_anchor_and_an_id_less_one_records_none() {
         let html = "<table id='temp:C:QGYcfc9c8f7c7714f4a9955e1b7f'><thead><tr><th class='empty' style='width: 2em'/><th id='temp:C:QGY04be7f796bf1483e87f847ed3' class='empty' style='width: 6em'>A<br/></th></tr></thead></table>";
         let b = blocks(html);
-        let QuipBlock::Table { section_id, rows } = &b[0] else { panic!("expected table: {b:?}") };
-        assert_eq!(section_id.as_deref(), Some("temp:C:QGYcfc9c8f7c7714f4a9955e1b7f"));
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].section_id, None, "this <tr> has no id and must not invent one");
-        assert!(rows[0].cells.iter().all(|c| c.header), "both cells are <th>");
+        let QuipBlock::Table { section_id, rows } = &b[0] else {
+            panic!("expected table: {b:?}")
+        };
         assert_eq!(
-            rows[0].cells.iter().map(|c| c.section_id.as_deref()).collect::<Vec<_>>(),
+            section_id.as_deref(),
+            Some("temp:C:QGYcfc9c8f7c7714f4a9955e1b7f")
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].section_id, None,
+            "this <tr> has no id and must not invent one"
+        );
+        assert!(
+            rows[0].cells.iter().all(|c| c.header),
+            "both cells are <th>"
+        );
+        assert_eq!(
+            rows[0]
+                .cells
+                .iter()
+                .map(|c| c.section_id.as_deref())
+                .collect::<Vec<_>>(),
             vec![None, Some("temp:C:QGY04be7f796bf1483e87f847ed3")],
         );
     }
@@ -4538,14 +5126,17 @@ mod tests {
     fn a_cell_without_an_id_records_no_anchor() {
         let html = "<table><tbody><tr id='temp:C:QGYe66f22cd7b834833a7ee9dc58'><td style='background-color:#f0f0f0'>1</td><td id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d' style=''><span id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d'>as</span>\n\n<br/></td></tr></tbody></table>";
         let b = blocks(html);
-        let QuipBlock::Table { section_id, rows } = &b[0] else { panic!("expected table: {b:?}") };
+        let QuipBlock::Table { section_id, rows } = &b[0] else {
+            panic!("expected table: {b:?}")
+        };
         assert_eq!(section_id, &None, "this <table> has no id");
-        assert_eq!(rows[0].cells[0].section_id, None, "the row-number cell has no id");
+        assert_eq!(
+            rows[0].cells[0].section_id, None,
+            "the row-number cell has no id"
+        );
         assert_eq!(
             rows[0].cells[1].section_id.as_deref(),
-            Some(
-                "temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d"
-            ),
+            Some("temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d"),
         );
     }
 
@@ -4557,11 +5148,21 @@ mod tests {
     fn a_code_block_records_its_anchor() {
         let html = "<pre id='temp:C:CVLab76d47d4f6b483da9a484729' class='prettyprint'>#[cingel(Itseddoei, Porloremips, Drain)]<br>can rsitam Note {<br>\u{a0}\u{a0} \u{a0}can note_if: Tempor,<br>}</pre>";
         let b = blocks(html);
-        let QuipBlock::Code { section_id, text, .. } = &b[0] else {
+        let QuipBlock::Code {
+            section_id, text, ..
+        } = &b[0]
+        else {
             panic!("expected code: {b:?}")
         };
-        assert_eq!(section_id.as_deref(), Some("temp:C:CVLab76d47d4f6b483da9a484729"));
-        assert_eq!(text.lines().count(), 4, "the <br> separators still make lines: {text:?}");
+        assert_eq!(
+            section_id.as_deref(),
+            Some("temp:C:CVLab76d47d4f6b483da9a484729")
+        );
+        assert_eq!(
+            text.lines().count(),
+            4,
+            "the <br> separators still make lines: {text:?}"
+        );
     }
 
     /// `ZaNAAAU4ELc`, the corpus's one image section, verbatim. Quip
@@ -4571,11 +5172,20 @@ mod tests {
     fn an_image_records_its_anchor() {
         let html = "<div data-section-style='11' style='max-width:100%' class='tall'><img src='https://quip.com/blob/ZaNAAAU4ELc/jG4ISoLLsz9JZ2nahGsoSg' id='temp:C:ZaNb6a7b9e7bd634c549b899bae4' alt=\"2555949508.had\"></img></div>";
         let b = blocks(html);
-        let QuipBlock::Image { section_id, src, .. } = &b[0] else {
+        let QuipBlock::Image {
+            section_id, src, ..
+        } = &b[0]
+        else {
             panic!("expected image: {b:?}")
         };
-        assert_eq!(section_id.as_deref(), Some("temp:C:ZaNb6a7b9e7bd634c549b899bae4"));
-        assert_eq!(src, "https://quip.com/blob/ZaNAAAU4ELc/jG4ISoLLsz9JZ2nahGsoSg");
+        assert_eq!(
+            section_id.as_deref(),
+            Some("temp:C:ZaNb6a7b9e7bd634c549b899bae4")
+        );
+        assert_eq!(
+            src,
+            "https://quip.com/blob/ZaNAAAU4ELc/jG4ISoLLsz9JZ2nahGsoSg"
+        );
     }
 
     /// `ZaNAAAU4ELc`, the corpus's one blockquote, verbatim.
@@ -4583,10 +5193,17 @@ mod tests {
     fn a_blockquote_records_its_anchor() {
         let html = "<blockquote id='temp:C:ZaN2ba9bae380d64c8392cc6ae88'>A ounce full a room in Split Cloud are beach stood if pull man let a alike.</blockquote>";
         let b = blocks(html);
-        let QuipBlock::Quote { section_id, blocks: inner } = &b[0] else {
+        let QuipBlock::Quote {
+            section_id,
+            blocks: inner,
+        } = &b[0]
+        else {
             panic!("expected quote: {b:?}")
         };
-        assert_eq!(section_id.as_deref(), Some("temp:C:ZaN2ba9bae380d64c8392cc6ae88"));
+        assert_eq!(
+            section_id.as_deref(),
+            Some("temp:C:ZaN2ba9bae380d64c8392cc6ae88")
+        );
         assert_eq!(inner.len(), 1, "the quoted paragraph survives");
     }
 
@@ -4600,10 +5217,19 @@ mod tests {
     #[test]
     fn a_horizontal_rule_records_its_anchor() {
         let b = blocks("<hr id='temp:C:ZaN0b3778496abe4a69842e91aff'>");
-        let QuipBlock::Rule { section_id } = &b[0] else { panic!("expected rule: {b:?}") };
-        assert_eq!(section_id.as_deref(), Some("temp:C:ZaN0b3778496abe4a69842e91aff"));
+        let QuipBlock::Rule { section_id } = &b[0] else {
+            panic!("expected rule: {b:?}")
+        };
+        assert_eq!(
+            section_id.as_deref(),
+            Some("temp:C:ZaN0b3778496abe4a69842e91aff")
+        );
         let b = blocks("<hr>");
-        assert_eq!(b, vec![QuipBlock::Rule { section_id: None }], "no id, no anchor");
+        assert_eq!(
+            b,
+            vec![QuipBlock::Rule { section_id: None }],
+            "no id, no anchor"
+        );
     }
 
     /// An **empty** id is not an anchor. Quip writes empty attribute
@@ -4629,7 +5255,12 @@ mod tests {
              <img src='s' id=''><hr id=''>",
         );
         assert!(!b.is_empty(), "the content itself still parses");
-        assert_eq!(out.sections, Vec::new(), "an empty id records no anchor: {:?}", out.sections);
+        assert_eq!(
+            out.sections,
+            Vec::new(),
+            "an empty id records no anchor: {:?}",
+            out.sections
+        );
     }
 
     /// A padded id is trimmed down to the string an anchor can actually
@@ -4646,13 +5277,17 @@ mod tests {
             "<p id='  temp:C:ZaN06198313ef4a4ffc9068829e0\n  '>a</p>\
              <p id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d'>b</p>",
         );
-        let QuipBlock::Para { section_id, .. } = &b[0] else { panic!("expected para: {b:?}") };
+        let QuipBlock::Para { section_id, .. } = &b[0] else {
+            panic!("expected para: {b:?}")
+        };
         assert_eq!(
             section_id.as_deref(),
             Some("temp:C:ZaN06198313ef4a4ffc9068829e0"),
             "padding is stripped, so the key equals what a `#…` fragment carries"
         );
-        let QuipBlock::Para { section_id, .. } = &b[1] else { panic!("expected para: {b:?}") };
+        let QuipBlock::Para { section_id, .. } = &b[1] else {
+            panic!("expected para: {b:?}")
+        };
         assert_eq!(
             section_id.as_deref(),
             Some("temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d"),
@@ -4695,8 +5330,12 @@ mod tests {
 
         let out = from_quip_html(html);
         let ul = "temp:C:CVL73809743db7745b7a64a37dc1";
-        let landed: Vec<&str> =
-            out.sections.iter().filter(|(q, _)| q == ul).map(|(_, b)| b.as_str()).collect();
+        let landed: Vec<&str> = out
+            .sections
+            .iter()
+            .filter(|(q, _)| q == ul)
+            .map(|(_, b)| b.as_str())
+            .collect();
         assert_eq!(
             landed.len(),
             1,
@@ -4707,7 +5346,10 @@ mod tests {
         // Stated in full so the *whole* map is pinned, not just the count:
         // both items keep their own anchors, and the split adds nothing.
         assert_eq!(
-            out.sections.iter().map(|(q, _)| q.as_str()).collect::<Vec<_>>(),
+            out.sections
+                .iter()
+                .map(|(q, _)| q.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 ul,
                 "temp:C:CVLdf56cde36a9d40d6b910f0d53",
@@ -4724,7 +5366,10 @@ mod tests {
             Some(XmlOut::Element(el)) => el.get_attribute(&txn, "blockId").unwrap_or_default(),
             other => panic!("expected a list first: {other:?}"),
         };
-        assert_eq!(landed[0], first_list, "the anchor stayed on the first fragment");
+        assert_eq!(
+            landed[0], first_list,
+            "the anchor stayed on the first fragment"
+        );
     }
 
     /// The parse-stage tests above stop at `QuipBlock`; this one runs
@@ -4808,7 +5453,9 @@ mod tests {
     #[test]
     fn table_rows_and_header_cells_parse() {
         let b = blocks("<table><tr><th>H</th></tr><tr><td>C</td></tr></table>");
-        let QuipBlock::Table { rows, .. } = &b[0] else { panic!("expected table") };
+        let QuipBlock::Table { rows, .. } = &b[0] else {
+            panic!("expected table")
+        };
         assert_eq!(rows.len(), 2);
         assert!(rows[0].cells[0].header, "th -> header cell");
         assert!(!rows[1].cells[0].header);
@@ -4820,7 +5467,9 @@ mod tests {
             "<table><thead><tr><th>H</th></tr></thead>\
              <tbody><tr><td>C</td></tr></tbody></table>",
         );
-        let QuipBlock::Table { rows, .. } = &b[0] else { panic!("expected table") };
+        let QuipBlock::Table { rows, .. } = &b[0] else {
+            panic!("expected table")
+        };
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].cells[0].header);
     }
@@ -4870,7 +5519,10 @@ mod tests {
         // heading's position in a prose table — is what is left.
         assert_eq!(
             table_grid(&doc_blocks(&html)[0]),
-            vec![vec![(true, "A".to_string())], vec![(false, "as".to_string())]],
+            vec![
+                vec![(true, "A".to_string())],
+                vec![(false, "as".to_string())]
+            ],
             "the ruler goes, the heading stays",
         );
 
@@ -4895,8 +5547,16 @@ mod tests {
         // `from_quip_html_as` is where the thread kind is read and a strip
         // that ran only for spreadsheets would look identical above.
         let xml = doc_xml(&from_quip_html(&html));
-        assert_eq!(xml.matches("<table_header").count(), 1, "the heading, not the corner: {xml}");
-        assert_eq!(xml.matches("<table_cell").count(), 1, "the data cell, not the ruler: {xml}");
+        assert_eq!(
+            xml.matches("<table_header").count(),
+            1,
+            "the heading, not the corner: {xml}"
+        );
+        assert_eq!(
+            xml.matches("<table_cell").count(),
+            1,
+            "the data cell, not the ruler: {xml}"
+        );
         let sheet_xml = doc_xml(&from_quip_html_as(&html, QuipThreadKind::Spreadsheet));
         assert_eq!(sheet_xml.matches("<table_header").count(), 0, "{sheet_xml}");
         assert_eq!(sheet_xml.matches("<table_cell").count(), 1, "{sheet_xml}");
@@ -4922,16 +5582,32 @@ mod tests {
             ],
             "the shape under test — a numeric leading column beneath a real <thead>",
         );
-        assert_eq!(table_grid(&doc_blocks(&html)[0]), source, "the document path takes nothing");
-        assert_eq!(table_grid(&sheet_blocks(&html)[0]), source, "nor does the spreadsheet path");
+        assert_eq!(
+            table_grid(&doc_blocks(&html)[0]),
+            source,
+            "the document path takes nothing"
+        );
+        assert_eq!(
+            table_grid(&sheet_blocks(&html)[0]),
+            source,
+            "nor does the spreadsheet path"
+        );
 
         // And through the public entry point, for the same reason as above.
         for xml in [
             doc_xml(&from_quip_html(&html)),
             doc_xml(&from_quip_html_as(&html, QuipThreadKind::Spreadsheet)),
         ] {
-            assert_eq!(xml.matches("<table_header").count(), 2, "both <th> stay: {xml}");
-            assert_eq!(xml.matches("<table_cell").count(), 2, "both <td> stay: {xml}");
+            assert_eq!(
+                xml.matches("<table_header").count(),
+                2,
+                "both <th> stay: {xml}"
+            );
+            assert_eq!(
+                xml.matches("<table_cell").count(),
+                2,
+                "both <td> stay: {xml}"
+            );
         }
     }
 
@@ -4978,7 +5654,11 @@ mod tests {
     fn a_numeric_leading_column_with_no_header_row_is_not_a_grid() {
         let html = "<table><tbody><tr id='temp:C:QGYe66f22cd7b834833a7ee9dc58'><td style='background-color:#f0f0f0'>1</td><td id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d' style=''><span id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGY4a3392935297410e89f835d1d'>as</span>\n\n<br/></td></tr></tbody></table>";
         let grid = table_grid(&sheet_blocks(html)[0]);
-        assert_eq!(grid, vec![vec![(false, "1".into()), (false, "as".into())]], "{grid:?}");
+        assert_eq!(
+            grid,
+            vec![vec![(false, "1".into()), (false, "as".into())]],
+            "{grid:?}"
+        );
     }
 
     // ─── image dimensions (#194 F-11) ─────────────────────────
@@ -5004,7 +5684,17 @@ mod tests {
         assert_eq!(image_dimension("320"), Some(320));
         assert_eq!(image_dimension(" 320px "), Some(320));
         assert_eq!(image_dimension("20000"), Some(20_000));
-        for bad in ["", "0", "50%", "12.5", "-4", "20001", "1e3", "px", "99999999999"] {
+        for bad in [
+            "",
+            "0",
+            "50%",
+            "12.5",
+            "-4",
+            "20001",
+            "1e3",
+            "px",
+            "99999999999",
+        ] {
             assert_eq!(image_dimension(bad), None, "{bad:?}");
         }
     }
@@ -5019,20 +5709,29 @@ mod tests {
         assert_valid_tree(&out.doc);
         let xml = crate::export::to_html(&out.doc);
         assert!(xml.contains("<ul"), "list survives: {xml}");
-        assert!(!xml.contains("<li><img"), "image must not be a direct list-item child: {xml}");
+        assert!(
+            !xml.contains("<li><img"),
+            "image must not be a direct list-item child: {xml}"
+        );
         assert!(xml.contains("<img"), "image content is preserved: {xml}");
     }
 
     #[test]
     fn hoisting_splits_the_list_and_preserves_document_order() {
-        let b = blocks(
-            "<ul><li>a</li><li>b<img src=\"i.png\"></li><li>c</li></ul>",
-        );
+        let b = blocks("<ul><li>a</li><li>b<img src=\"i.png\"></li><li>c</li></ul>");
         assert_eq!(b.len(), 3, "list / image / list: {b:?}");
-        let QuipBlock::List { items, .. } = &b[0] else { panic!("expected list: {b:?}") };
-        assert_eq!(items.len(), 2, "items up to and including the offender: {items:?}");
+        let QuipBlock::List { items, .. } = &b[0] else {
+            panic!("expected list: {b:?}")
+        };
+        assert_eq!(
+            items.len(),
+            2,
+            "items up to and including the offender: {items:?}"
+        );
         assert!(matches!(b[1], QuipBlock::Image { .. }), "{b:?}");
-        let QuipBlock::List { items, .. } = &b[2] else { panic!("expected list: {b:?}") };
+        let QuipBlock::List { items, .. } = &b[2] else {
+            panic!("expected list: {b:?}")
+        };
         assert_eq!(items.len(), 1);
     }
 
@@ -5042,7 +5741,11 @@ mod tests {
         let kinds: Vec<_> = b.iter().map(|x| x.node_type()).collect();
         assert_eq!(
             kinds,
-            vec![NodeType::BulletList, NodeType::Table, NodeType::HorizontalRule],
+            vec![
+                NodeType::BulletList,
+                NodeType::Table,
+                NodeType::HorizontalRule
+            ],
             "{b:?}"
         );
     }
@@ -5067,7 +5770,9 @@ mod tests {
     #[test]
     fn an_item_emptied_by_hoisting_still_has_a_paragraph() {
         let b = blocks("<ul><li><img src=\"i.png\"></li></ul>");
-        let QuipBlock::List { items, .. } = &b[0] else { panic!("expected list: {b:?}") };
+        let QuipBlock::List { items, .. } = &b[0] else {
+            panic!("expected list: {b:?}")
+        };
         assert_eq!(items[0].blocks, vec![empty_para()], "{items:?}");
     }
 
@@ -5130,21 +5835,33 @@ mod tests {
         let txn = out.doc.transact();
         let frag = crate::document::get_content_fragment(&txn).expect("content fragment");
         assert_eq!(frag.len(&txn), 1, "one paragraph");
-        let Some(XmlOut::Element(para)) = frag.get(&txn, 0) else { panic!("expected an element") };
-        assert_eq!(NodeType::from_tag(para.tag().as_ref()), Some(NodeType::Paragraph));
+        let Some(XmlOut::Element(para)) = frag.get(&txn, 0) else {
+            panic!("expected an element")
+        };
+        assert_eq!(
+            NodeType::from_tag(para.tag().as_ref()),
+            Some(NodeType::Paragraph)
+        );
 
         let mut seen = Vec::new();
         for i in 0..para.len(&txn) {
             match para.get(&txn, i) {
                 Some(XmlOut::Text(t)) => {
                     let s = t.get_string(&txn);
-                    assert!(!s.contains('\n'), "text run carries a literal newline: {s:?}");
+                    assert!(
+                        !s.contains('\n'),
+                        "text run carries a literal newline: {s:?}"
+                    );
                     seen.push(format!("text:{s}"));
                 }
                 Some(XmlOut::Element(el)) => {
-                    assert_eq!(NodeType::from_tag(el.tag().as_ref()), Some(NodeType::HardBreak));
+                    assert_eq!(
+                        NodeType::from_tag(el.tag().as_ref()),
+                        Some(NodeType::HardBreak)
+                    );
                     assert!(
-                        el.get_attribute(&txn, "blockId").is_some_and(|id| id.len() == 10),
+                        el.get_attribute(&txn, "blockId")
+                            .is_some_and(|id| id.len() == 10),
                         "HardBreak gets a blockId like any other element"
                     );
                     seen.push("hard_break".to_string());
@@ -5178,7 +5895,13 @@ mod tests {
     fn spans_shape(spans: &[Span]) -> String {
         spans
             .iter()
-            .map(|s| if s.hard_break_before { format!("⏎{}", s.text) } else { s.text.clone() })
+            .map(|s| {
+                if s.hard_break_before {
+                    format!("⏎{}", s.text)
+                } else {
+                    s.text.clone()
+                }
+            })
             .collect()
     }
 
@@ -5225,8 +5948,12 @@ mod tests {
              style=''><span id='temp:s:temp:C:QGYe66f22cd7b834833a7ee9dc58_temp:C:QGYf52ff49275694bfe880cf8613'>\
              no</span>\n\n<br/></td></tr></tbody></table>";
         let parsed = blocks(html);
-        let [QuipBlock::Table { rows, .. }] = parsed.as_slice() else { panic!("expected a table") };
-        let [row] = rows.as_slice() else { panic!("expected one row") };
+        let [QuipBlock::Table { rows, .. }] = parsed.as_slice() else {
+            panic!("expected a table")
+        };
+        let [row] = rows.as_slice() else {
+            panic!("expected one row")
+        };
         let shapes: Vec<String> = row
             .cells
             .iter()
@@ -5235,7 +5962,11 @@ mod tests {
                 other => panic!("expected one paragraph per cell, got {other:?}"),
             })
             .collect();
-        assert_eq!(shapes, vec!["1", "as", "no"], "three cells, no break in any of them");
+        assert_eq!(
+            shapes,
+            vec!["1", "as", "no"],
+            "three cells, no break in any of them"
+        );
     }
 
     /// `QGYAAAjicgG`, a `<thead>` column header, verbatim. A `<th>` spells
@@ -5248,8 +5979,12 @@ mod tests {
              <th id='temp:C:QGY04be7f796bf1483e87f847ed3' class='empty' style='width: 6em'>A<br/>\
              </th></tr></thead></table>";
         let parsed = blocks(html);
-        let [QuipBlock::Table { rows, .. }] = parsed.as_slice() else { panic!("expected a table") };
-        let [row] = rows.as_slice() else { panic!("expected one row") };
+        let [QuipBlock::Table { rows, .. }] = parsed.as_slice() else {
+            panic!("expected a table")
+        };
+        let [row] = rows.as_slice() else {
+            panic!("expected one row")
+        };
         assert!(row.cells.iter().all(|c| c.header), "both cells are <th>");
         let shapes: Vec<String> = row
             .cells
@@ -5259,7 +5994,11 @@ mod tests {
                 other => panic!("expected one paragraph per cell, got {other:?}"),
             })
             .collect();
-        assert_eq!(shapes, vec!["", "A"], "the self-closing <th> stays empty; 'A' keeps no break");
+        assert_eq!(
+            shapes,
+            vec!["", "A"],
+            "the self-closing <th> stays empty; 'A' keeps no break"
+        );
     }
 
     /// **The load-bearing one.** Same verbatim `SSfAAALs7fy` item as
@@ -5347,7 +6086,11 @@ mod tests {
             panic!("expected one list, got {parsed:?}")
         };
         assert_eq!(items.len(), 1, "the empty bullet is still a bullet");
-        assert_eq!(items[0].blocks, vec![empty_para()], "with an empty body, not a hard break");
+        assert_eq!(
+            items[0].blocks,
+            vec![empty_para()],
+            "with an empty body, not a hard break"
+        );
     }
 
     /// `AeOAAAcV1hg`'s whole bullet section, verbatim — the shape that makes
@@ -5374,15 +6117,31 @@ mod tests {
         let [QuipBlock::List { items, .. }] = parsed.as_slice() else {
             panic!("expected one list, got {parsed:?}")
         };
-        let [outer] = items.as_slice() else { panic!("expected one outer item, got {items:?}") };
-        let [QuipBlock::Para { spans, .. }, QuipBlock::List { items: inner, .. }] =
-            outer.blocks.as_slice()
+        let [outer] = items.as_slice() else {
+            panic!("expected one outer item, got {items:?}")
+        };
+        let [
+            QuipBlock::Para { spans, .. },
+            QuipBlock::List { items: inner, .. },
+        ] = outer.blocks.as_slice()
         else {
             panic!("expected text then a nested list, got {:?}", outer.blocks)
         };
-        assert_eq!(spans_shape(spans), "Broad", "the parent item's terminator is gone");
-        let [QuipBlock::Para { spans: inner_spans, .. }] = inner[0].blocks.as_slice() else {
-            panic!("expected a nested item paragraph, got {:?}", inner[0].blocks)
+        assert_eq!(
+            spans_shape(spans),
+            "Broad",
+            "the parent item's terminator is gone"
+        );
+        let [
+            QuipBlock::Para {
+                spans: inner_spans, ..
+            },
+        ] = inner[0].blocks.as_slice()
+        else {
+            panic!(
+                "expected a nested item paragraph, got {:?}",
+                inner[0].blocks
+            )
         };
         assert_eq!(
             spans_shape(inner_spans),
@@ -5402,7 +6161,10 @@ mod tests {
         let [QuipBlock::Code { text, .. }] = parsed.as_slice() else {
             panic!("expected a code block, got {parsed:?}")
         };
-        assert_eq!(text, "#[component]\npub fn GameDetail() {\n}", "every <br> here is a newline");
+        assert_eq!(
+            text, "#[component]\npub fn GameDetail() {\n}",
+            "every <br> here is a newline"
+        );
     }
 
     /// And the same boundary with the `<pre>` inside a table cell, which is
@@ -5431,15 +6193,26 @@ mod tests {
             })
             .collect();
         assert_eq!(code.len(), 1, "one code block, got {blocks:?}");
-        assert_eq!(code[0].lines().count(), 3, "all three lines survive: {:?}", code[0]);
+        assert_eq!(
+            code[0].lines().count(),
+            3,
+            "all three lines survive: {:?}",
+            code[0]
+        );
     }
 
     #[test]
     fn br_exports_as_a_real_br_tag_not_a_newline() {
         let out = from_quip_html("<p>a<br>b</p>");
         let html = crate::export::to_html(&out.doc);
-        assert!(html.contains("<br"), "HardBreak must export as <br>: {html}");
-        assert!(!html.contains("a\nb"), "no literal newline leaked into the exported text: {html}");
+        assert!(
+            html.contains("<br"),
+            "HardBreak must export as <br>: {html}"
+        );
+        assert!(
+            !html.contains("a\nb"),
+            "no literal newline leaked into the exported text: {html}"
+        );
     }
 
     /// #169, pinned as a pure unit test: the *extracted* Quip HTML parses to
@@ -5468,7 +6241,11 @@ mod tests {
         let good = from_quip_html(inner_html);
         let good_txn = good.doc.transact();
         let good_frag = crate::document::get_content_fragment(&good_txn).expect("fragment");
-        assert_eq!(good_frag.len(&good_txn), 2, "heading + paragraph are two real blocks");
+        assert_eq!(
+            good_frag.len(&good_txn),
+            2,
+            "heading + paragraph are two real blocks"
+        );
         let good_html = crate::export::to_html(&good.doc);
         assert!(
             !good_html.contains("response_metadata") && !good_html.contains("next_cursor"),
@@ -5494,10 +6271,16 @@ mod tests {
         for_each_element(&txn, &frag, &mut |txn, el| {
             let id = el.get_attribute(txn, "blockId").unwrap_or_default();
             assert_eq!(id.len(), 10, "blockId on <{}>: {id:?}", el.tag());
-            assert!(id.chars().all(|c| c.is_ascii_alphanumeric()), "blockId charset: {id}");
+            assert!(
+                id.chars().all(|c| c.is_ascii_alphanumeric()),
+                "blockId charset: {id}"
+            );
             assert!(seen.insert(id.clone()), "blockId {id} reused");
         });
-        assert!(seen.len() >= 5, "paragraph + heading + list + item + item paragraph");
+        assert!(
+            seen.len() >= 5,
+            "paragraph + heading + list + item + item paragraph"
+        );
     }
 
     #[test]
@@ -5512,7 +6295,10 @@ mod tests {
         assert!(xml.contains("language-rust"), "{xml}");
         assert!(xml.contains("data-checked=\"true\""), "{xml}");
         assert!(xml.contains("alt=\"pic\""), "{xml}");
-        assert!(xml.contains("src=\"http://x/i.png\""), "raw src is preserved: {xml}");
+        assert!(
+            xml.contains("src=\"http://x/i.png\""),
+            "raw src is preserved: {xml}"
+        );
     }
 
     #[test]
@@ -5532,10 +6318,19 @@ mod tests {
              <a href=\"https://ok.example/x\">link</a></p>",
         );
         let html = crate::export::to_html(&out.doc);
-        assert!(html.contains("<strong>bold</strong>") || html.contains("<b>bold</b>"), "{html}");
-        assert!(html.contains("<em>it</em>") || html.contains("<i>it</i>"), "{html}");
+        assert!(
+            html.contains("<strong>bold</strong>") || html.contains("<b>bold</b>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<em>it</em>") || html.contains("<i>it</i>"),
+            "{html}"
+        );
         assert!(html.contains("<code>c</code>"), "{html}");
-        assert!(html.contains("https://ok.example/x"), "link href preserved: {html}");
+        assert!(
+            html.contains("https://ok.example/x"),
+            "link href preserved: {html}"
+        );
     }
 
     // ─── side tables ─────────────────────────────────────────
@@ -5561,8 +6356,7 @@ mod tests {
     /// Note the highlight starts **mid-word** — `my` | `dipisc` — which is
     /// what a comment anchor really looks like and why no block can be minted
     /// for the range.
-    const REAL_COMMENT_ANNOTATION: &str =
-        "<p id='temp:C:ffb3d38c909e3d64493943c51b07' class='line'>Oeiusmodt rloremipsu \
+    const REAL_COMMENT_ANNOTATION: &str = "<p id='temp:C:ffb3d38c909e3d64493943c51b07' class='line'>Oeiusmodt rloremipsu \
          eturadipis elitsedd head him mporloremipsu seddoei stare. Scingeli his \
          <b>cingelit umdolorsitame</b> ectetura he my\
          <span annotationid=\"temp:C:ffbc97475333a3d4bafaeed9f717\" class=\"c9 h2\" \
@@ -5574,8 +6368,7 @@ mod tests {
     /// two of them inside a single paragraph, which the committed corpus
     /// cannot show. Markup byte-exact, prose truncated after the second
     /// highlight closes.
-    const REAL_TWO_ANNOTATIONS_ONE_PARAGRAPH: &str =
-        "<p id='temp:C:GDX14131f9a1b1f426f8eff01cc4' class='line'><b>Multi-Layer \
+    const REAL_TWO_ANNOTATIONS_ONE_PARAGRAPH: &str = "<p id='temp:C:GDX14131f9a1b1f426f8eff01cc4' class='line'><b>Multi-Layer \
          Strategic/Tactical System</b>\
          <span annotationid=\"temp:C:GDX2c3e642d6fdc46d8922064007\" class=\"c9 h2\" \
          id=\"temp:C:GDX2c3e642d6fdc46d8922064007\"><b>s</b> – The game operates on more \
@@ -5591,7 +6384,10 @@ mod tests {
     #[test]
     fn the_sanitizer_admits_annotationid_so_the_anchor_can_be_captured() {
         let out = sanitize(REAL_COMMENT_ANNOTATION);
-        assert!(out.contains("annotationid="), "sanitize must keep `annotationid`: {out:?}");
+        assert!(
+            out.contains("annotationid="),
+            "sanitize must keep `annotationid`: {out:?}"
+        );
         assert_eq!(
             from_quip_html(REAL_COMMENT_ANNOTATION).sections.len(),
             2,
@@ -5607,8 +6403,11 @@ mod tests {
     #[test]
     fn a_comment_annotation_resolves_to_the_paragraph_that_contains_it() {
         let out = from_quip_html(REAL_COMMENT_ANNOTATION);
-        let by_id: HashMap<&str, &str> =
-            out.sections.iter().map(|(s, b)| (s.as_str(), b.as_str())).collect();
+        let by_id: HashMap<&str, &str> = out
+            .sections
+            .iter()
+            .map(|(s, b)| (s.as_str(), b.as_str()))
+            .collect();
         let para = by_id["temp:C:ffb3d38c909e3d64493943c51b07"];
         assert_eq!(
             by_id.get("temp:C:ffbc97475333a3d4bafaeed9f717"),
@@ -5646,12 +6445,26 @@ mod tests {
     #[test]
     fn two_annotations_in_one_paragraph_both_name_that_paragraphs_block() {
         let out = from_quip_html(REAL_TWO_ANNOTATIONS_ONE_PARAGRAPH);
-        let by_id: HashMap<&str, &str> =
-            out.sections.iter().map(|(s, b)| (s.as_str(), b.as_str())).collect();
+        let by_id: HashMap<&str, &str> = out
+            .sections
+            .iter()
+            .map(|(s, b)| (s.as_str(), b.as_str()))
+            .collect();
         let para = by_id["temp:C:GDX14131f9a1b1f426f8eff01cc4"];
-        assert_eq!(by_id.get("temp:C:GDX2c3e642d6fdc46d8922064007"), Some(&para));
-        assert_eq!(by_id.get("temp:C:GDXec185fd3ce4643808781c75da"), Some(&para));
-        assert_eq!(out.sections.len(), 3, "one paragraph, two anchors: {:?}", out.sections);
+        assert_eq!(
+            by_id.get("temp:C:GDX2c3e642d6fdc46d8922064007"),
+            Some(&para)
+        );
+        assert_eq!(
+            by_id.get("temp:C:GDXec185fd3ce4643808781c75da"),
+            Some(&para)
+        );
+        assert_eq!(
+            out.sections.len(),
+            3,
+            "one paragraph, two anchors: {:?}",
+            out.sections
+        );
     }
 
     /// The annotated `<span>` alone, with the enclosing `<p id='…'>` cut
@@ -5672,7 +6485,10 @@ mod tests {
             out.sections
         );
         let xml = doc_xml(&out);
-        assert!(xml.contains("dipisc modtemp"), "the highlighted text still imports: {xml}");
+        assert!(
+            xml.contains("dipisc modtemp"),
+            "the highlighted text still imports: {xml}"
+        );
     }
 
     /// An annotation id that already keys the map is dropped, not appended.
@@ -5731,9 +6547,18 @@ mod tests {
     #[test]
     fn an_annotation_id_reaches_the_section_map_and_no_yrs_node() {
         let xml = doc_xml(&from_quip_html(REAL_COMMENT_ANNOTATION));
-        assert!(!xml.contains("annotationid"), "no `annotationid` attribute on a node: {xml}");
-        assert!(!xml.contains("ffbc9747"), "the anchor value is not content: {xml}");
-        assert!(xml.contains("dipisc modtemp"), "the highlighted text is: {xml}");
+        assert!(
+            !xml.contains("annotationid"),
+            "no `annotationid` attribute on a node: {xml}"
+        );
+        assert!(
+            !xml.contains("ffbc9747"),
+            "the anchor value is not content: {xml}"
+        );
+        assert!(
+            xml.contains("dipisc modtemp"),
+            "the highlighted text is: {xml}"
+        );
     }
 
     #[test]
@@ -5755,15 +6580,20 @@ mod tests {
         assert_eq!(out.pending_links[0].target_quip_thread_id, "AbCd1234");
         assert!(out.pending_links[0].target_quip_section_id.is_none());
         let html = crate::export::to_html(&out.doc);
-        assert!(html.contains("elsewhere.example/page"), "external link passes through: {html}");
+        assert!(
+            html.contains("elsewhere.example/page"),
+            "external link passes through: {html}"
+        );
     }
 
     #[test]
     fn intra_quip_link_with_fragment_records_the_section() {
-        let out = from_quip_html(
-            "<p><a href=\"https://example.quip.com/AbCd1234/Doc#sec-77\">x</a></p>",
+        let out =
+            from_quip_html("<p><a href=\"https://example.quip.com/AbCd1234/Doc#sec-77\">x</a></p>");
+        assert_eq!(
+            out.pending_links[0].target_quip_section_id.as_deref(),
+            Some("sec-77")
         );
-        assert_eq!(out.pending_links[0].target_quip_section_id.as_deref(), Some("sec-77"));
     }
 
     #[test]
@@ -5810,7 +6640,10 @@ mod tests {
         let out = from_quip_html("<p>a<br><a href=\"https://ok.example/y\">b</a></p>");
         let html = crate::export::to_html(&out.doc);
         assert!(html.contains("<br"), "{html}");
-        assert!(html.contains("<a href=\"https://ok.example/y\">b</a>"), "{html}");
+        assert!(
+            html.contains("<a href=\"https://ok.example/y\">b</a>"),
+            "{html}"
+        );
     }
 
     #[test]
@@ -5822,16 +6655,33 @@ mod tests {
         assert_valid_tree(&out.doc);
         let txn = out.doc.transact();
         let frag = crate::document::get_content_fragment(&txn).expect("content fragment");
-        let Some(XmlOut::Element(para)) = frag.get(&txn, 0) else { panic!("expected an element") };
+        let Some(XmlOut::Element(para)) = frag.get(&txn, 0) else {
+            panic!("expected an element")
+        };
         let mut found = false;
         for i in 0..para.len(&txn) {
-            let Some(XmlOut::Element(el)) = para.get(&txn, i) else { continue };
-            assert_eq!(NodeType::from_tag(el.tag().as_ref()), Some(NodeType::DocMention));
+            let Some(XmlOut::Element(el)) = para.get(&txn, i) else {
+                continue;
+            };
+            assert_eq!(
+                NodeType::from_tag(el.tag().as_ref()),
+                Some(NodeType::DocMention)
+            );
             found = true;
-            assert_eq!(el.get_attribute(&txn, "doc_id").as_deref(), Some(""), "unresolved");
+            assert_eq!(
+                el.get_attribute(&txn, "doc_id").as_deref(),
+                Some(""),
+                "unresolved"
+            );
             assert_eq!(el.get_attribute(&txn, "title").as_deref(), Some("Doc"));
-            assert_eq!(el.get_attribute(&txn, "pending_quip_thread").as_deref(), Some("T1"));
-            assert_eq!(el.get_attribute(&txn, "pending_quip_section").as_deref(), Some("s9"));
+            assert_eq!(
+                el.get_attribute(&txn, "pending_quip_thread").as_deref(),
+                Some("T1")
+            );
+            assert_eq!(
+                el.get_attribute(&txn, "pending_quip_section").as_deref(),
+                Some("s9")
+            );
             assert_eq!(
                 el.get_attribute(&txn, "blockId").as_deref(),
                 Some(out.pending_links[0].source_block_id.as_str()),
@@ -5906,9 +6756,15 @@ mod tests {
         let txn = doc.transact();
         let frag = crate::document::get_content_fragment(&txn).expect("content fragment");
         let mut out = Vec::new();
-        fn walk<T: ReadTxn>(txn: &T, el: &XmlElementRef, out: &mut Vec<(String, String, Option<String>)>) {
+        fn walk<T: ReadTxn>(
+            txn: &T,
+            el: &XmlElementRef,
+            out: &mut Vec<(String, String, Option<String>)>,
+        ) {
             for i in 0..el.len(txn) {
-                let Some(XmlOut::Element(child)) = el.get(txn, i) else { continue };
+                let Some(XmlOut::Element(child)) = el.get(txn, i) else {
+                    continue;
+                };
                 if child.tag().as_ref() == NodeType::Mention.tag_name() {
                     out.push((
                         child.get_attribute(txn, "user_id").unwrap_or_default(),
@@ -5945,21 +6801,34 @@ mod tests {
         assert!(
             out.pending_links.is_empty(),
             "a person is not a document: no pending doc link may be recorded — {:?}",
-            out.pending_links.iter().map(|l| &l.target_quip_thread_id).collect::<Vec<_>>(),
+            out.pending_links
+                .iter()
+                .map(|l| &l.target_quip_thread_id)
+                .collect::<Vec<_>>(),
         );
 
         // The leaf is a real `Mention`, still awaiting an identity.
         assert_eq!(
             mention_leaves(&out.doc),
-            vec![(String::new(), "Joel".to_string(), Some("XYJAEA0Sgev".to_string()))],
+            vec![(
+                String::new(),
+                "Joel".to_string(),
+                Some("XYJAEA0Sgev".to_string())
+            )],
         );
         assert_valid_tree(&out.doc);
 
         // The surrounding prose is untouched, and the chip did not swallow
         // the sentence-ending period that follows it.
         let html = crate::export::to_html(&out.doc);
-        assert!(html.contains("Assign tasks by mentioning someone:"), "{html}");
-        assert!(!html.contains("doc-mention"), "no DocMention may be emitted: {html}");
+        assert!(
+            html.contains("Assign tasks by mentioning someone:"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("doc-mention"),
+            "no DocMention may be emitted: {html}"
+        );
     }
 
     /// The contrast case, from the same source document: a **bare** anchor at
@@ -5969,13 +6838,19 @@ mod tests {
     fn a_bare_quip_anchor_is_still_a_document_link_not_a_person() {
         let out = from_quip_html(REAL_FOLDER_LINK);
 
-        assert!(out.person_mentions.is_empty(), "a bare anchor is not a person mention");
+        assert!(
+            out.person_mentions.is_empty(),
+            "a bare anchor is not a person mention"
+        );
         assert_eq!(out.pending_links.len(), 1);
         assert_eq!(out.pending_links[0].target_quip_thread_id, "JAdAOAxYGcQ");
         assert!(mention_leaves(&out.doc).is_empty(), "no person chip");
 
         let html = crate::export::to_html(&out.doc);
-        assert!(html.contains("doc-mention"), "the DocMention placeholder survives: {html}");
+        assert!(
+            html.contains("doc-mention"),
+            "the DocMention placeholder survives: {html}"
+        );
     }
 
     /// An empty `<control>` (a Quip date — the client renders it, so the
@@ -5990,16 +6865,29 @@ mod tests {
         assert!(mention_leaves(&out.doc).is_empty());
 
         let html = crate::export::to_html(&out.doc);
-        assert!(html.contains("Complete by ."), "surrounding text is intact: {html}");
+        assert!(
+            html.contains("Complete by ."),
+            "surrounding text is intact: {html}"
+        );
     }
 
     /// All three shapes in one body — the way they actually arrive.
     #[test]
     fn the_three_control_shapes_coexist_in_one_document() {
-        let html = format!("<p>{REAL_PERSON_MENTION}</p><p>{REAL_FOLDER_LINK}</p><p>{REAL_EMPTY_CONTROL}</p>");
+        let html = format!(
+            "<p>{REAL_PERSON_MENTION}</p><p>{REAL_FOLDER_LINK}</p><p>{REAL_EMPTY_CONTROL}</p>"
+        );
         let out = from_quip_html(&html);
-        assert_eq!(out.person_mentions.len(), 1, "only the wrapped anchor is a person");
-        assert_eq!(out.pending_links.len(), 1, "only the bare anchor is a doc link");
+        assert_eq!(
+            out.person_mentions.len(),
+            1,
+            "only the wrapped anchor is a person"
+        );
+        assert_eq!(
+            out.pending_links.len(),
+            1,
+            "only the bare anchor is a doc link"
+        );
         assert_valid_tree(&out.doc);
     }
 
@@ -6010,7 +6898,11 @@ mod tests {
     fn resolve_person_mentions_finishes_a_matched_chip() {
         let out = from_quip_html(REAL_PERSON_MENTION);
         let resolved = matched([("XYJAEA0Sgev", "ogre-user-7")]);
-        assert_eq!(resolve_person_mentions(&out.doc, &resolved).degraded, 0, "nothing degraded");
+        assert_eq!(
+            resolve_person_mentions(&out.doc, &resolved).degraded,
+            0,
+            "nothing degraded"
+        );
 
         assert_eq!(
             mention_leaves(&out.doc),
@@ -6020,8 +6912,14 @@ mod tests {
         assert_valid_tree(&out.doc);
 
         let exported = crate::export::to_html(&out.doc);
-        assert!(exported.contains("data-user-id=\"ogre-user-7\""), "{exported}");
-        assert!(!exported.contains("XYJAEA0Sgev"), "the Quip id must not survive: {exported}");
+        assert!(
+            exported.contains("data-user-id=\"ogre-user-7\""),
+            "{exported}"
+        );
+        assert!(
+            !exported.contains("XYJAEA0Sgev"),
+            "the Quip id must not survive: {exported}"
+        );
 
         // At BYTE level, not just in the export. `render_html_attrs` is a
         // per-node-type allowlist, so an attribute the schema does not know
@@ -6062,7 +6960,10 @@ mod tests {
             "one degraded",
         );
 
-        assert!(mention_leaves(&out.doc).is_empty(), "no empty-user_id chip may remain");
+        assert!(
+            mention_leaves(&out.doc).is_empty(),
+            "no empty-user_id chip may remain"
+        );
         assert_valid_tree(&out.doc);
 
         let html = crate::export::to_html(&out.doc);
@@ -6072,7 +6973,10 @@ mod tests {
             html.contains("Assign tasks by mentioning someone: @Joel."),
             "the degraded mention must read as ordinary prose: {html}",
         );
-        assert!(!html.contains("doc-mention"), "never a missing-document chip: {html}");
+        assert!(
+            !html.contains("doc-mention"),
+            "never a missing-document chip: {html}"
+        );
         assert!(!html.contains("XYJAEA0Sgev"), "{html}");
     }
 
@@ -6096,7 +7000,10 @@ mod tests {
             vec![("ogre-bea".to_string(), "Bea".to_string(), None)],
         );
         let html = crate::export::to_html(&out.doc);
-        assert!(html.contains("@Joel") && html.contains("a ") && html.contains(" b"), "{html}");
+        assert!(
+            html.contains("@Joel") && html.contains("a ") && html.contains(" b"),
+            "{html}"
+        );
     }
 
     /// A `<control>`-wrapped chip that Quip does not know as a person is a
@@ -6120,32 +7027,59 @@ mod tests {
     fn a_control_wrapped_non_person_becomes_a_back_patchable_document_link() {
         let out = from_quip_html(REAL_CONTROL_FOLDER_LINK);
         // The walker cannot tell: it emits a provisional person mention.
-        assert_eq!(out.person_mentions.len(), 1, "provisional, decided by the worker");
-        assert!(out.pending_links.is_empty(), "the walker records nothing yet");
+        assert_eq!(
+            out.person_mentions.len(),
+            1,
+            "provisional, decided by the worker"
+        );
+        assert!(
+            out.pending_links.is_empty(),
+            "the walker records nothing yet"
+        );
 
-        let resolved =
-            HashMap::from([("JAdAOAxYGcQ".to_string(), PersonOutcome::NotAPerson)]);
+        let resolved = HashMap::from([("JAdAOAxYGcQ".to_string(), PersonOutcome::NotAPerson)]);
         let rewritten = resolve_person_mentions(&out.doc, &resolved);
-        assert_eq!(rewritten.degraded, 0, "a document link is not a degraded mention");
+        assert_eq!(
+            rewritten.degraded, 0,
+            "a document link is not a degraded mention"
+        );
 
         // The back-patch record Phase 2b needs.
-        assert_eq!(rewritten.doc_links.len(), 1, "the pending link is handed to the caller");
+        assert_eq!(
+            rewritten.doc_links.len(),
+            1,
+            "the pending link is handed to the caller"
+        );
         assert_eq!(rewritten.doc_links[0].target_quip_thread_id, "JAdAOAxYGcQ");
         assert_eq!(rewritten.doc_links[0].target_quip_section_id, None);
 
-        assert!(mention_leaves(&out.doc).is_empty(), "no person chip remains");
+        assert!(
+            mention_leaves(&out.doc).is_empty(),
+            "no person chip remains"
+        );
         assert_valid_tree(&out.doc);
 
         // The node itself, and that it points at its own pending link.
         let txn = out.doc.transact();
         let frag = crate::document::get_content_fragment(&txn).expect("content fragment");
-        let Some(XmlOut::Element(para)) = frag.get(&txn, 0) else { panic!("expected an element") };
+        let Some(XmlOut::Element(para)) = frag.get(&txn, 0) else {
+            panic!("expected an element")
+        };
         let mut found = false;
         for i in 0..para.len(&txn) {
-            let Some(XmlOut::Element(el)) = para.get(&txn, i) else { continue };
-            assert_eq!(NodeType::from_tag(el.tag().as_ref()), Some(NodeType::DocMention));
+            let Some(XmlOut::Element(el)) = para.get(&txn, i) else {
+                continue;
+            };
+            assert_eq!(
+                NodeType::from_tag(el.tag().as_ref()),
+                Some(NodeType::DocMention)
+            );
             found = true;
-            assert_eq!(el.get_attribute(&txn, "doc_id").as_deref(), Some(""), "unresolved");
+            assert_eq!(
+                el.get_attribute(&txn, "doc_id").as_deref(),
+                Some(""),
+                "unresolved"
+            );
             assert_eq!(el.get_attribute(&txn, "title").as_deref(), Some("Family"));
             assert_eq!(
                 el.get_attribute(&txn, "pending_quip_thread").as_deref(),
@@ -6168,8 +7102,14 @@ mod tests {
         drop(txn);
 
         let html = crate::export::to_html(&out.doc);
-        assert!(html.contains("doc-mention"), "the back-patchable chip survives: {html}");
-        assert!(!html.contains("@Family"), "it must not degrade to text: {html}");
+        assert!(
+            html.contains("doc-mention"),
+            "the back-patchable chip survives: {html}"
+        );
+        assert!(
+            !html.contains("@Family"),
+            "it must not degrade to text: {html}"
+        );
     }
 
     /// The contrast, on **identical** markup: a chip Quip confirms IS a
@@ -6185,13 +7125,22 @@ mod tests {
         let rewritten = resolve_person_mentions(&out.doc, &resolved);
 
         assert_eq!(rewritten.degraded, 1, "degraded to a name");
-        assert!(rewritten.doc_links.is_empty(), "a person is never a document link");
-        assert!(mention_leaves(&out.doc).is_empty(), "no empty-user_id chip may remain");
+        assert!(
+            rewritten.doc_links.is_empty(),
+            "a person is never a document link"
+        );
+        assert!(
+            mention_leaves(&out.doc).is_empty(),
+            "no empty-user_id chip may remain"
+        );
         assert_valid_tree(&out.doc);
 
         let html = crate::export::to_html(&out.doc);
         assert!(html.contains("@Joel"), "the name survives as prose: {html}");
-        assert!(!html.contains("doc-mention"), "never a missing-document chip: {html}");
+        assert!(
+            !html.contains("doc-mention"),
+            "never a missing-document chip: {html}"
+        );
         assert!(!html.contains("XYJAEA0Sgev"), "{html}");
     }
 
@@ -6219,20 +7168,35 @@ mod tests {
         // Both unmatched.
         let out = from_quip_html(BODY);
         assert_eq!(out.person_mentions.len(), 2, "both chips are collected");
-        assert_eq!(out.person_mentions[0].label, "", "the empty label is retained");
+        assert_eq!(
+            out.person_mentions[0].label, "",
+            "the empty label is retained"
+        );
         assert_eq!(
             resolve_person_mentions(&out.doc, &HashMap::new()).degraded,
             2,
             "both decided",
         );
-        assert!(mention_leaves(&out.doc).is_empty(), "no empty-user_id chip may remain");
+        assert!(
+            mention_leaves(&out.doc).is_empty(),
+            "no empty-user_id chip may remain"
+        );
         assert_valid_tree(&out.doc);
 
         let html = crate::export::to_html(&out.doc);
-        assert!(html.contains("@Bob"), "the labelled chip degrades to its name: {html}");
+        assert!(
+            html.contains("@Bob"),
+            "the labelled chip degrades to its name: {html}"
+        );
         assert_eq!(html.matches("@Bob").count(), 1, "and exactly once: {html}");
-        assert!(html.contains(" C"), "adjacent text must not be destroyed: {html}");
-        assert!(!html.contains("EMPTYONE") && !html.contains("SECOND"), "{html}");
+        assert!(
+            html.contains(" C"),
+            "adjacent text must not be destroyed: {html}"
+        );
+        assert!(
+            !html.contains("EMPTYONE") && !html.contains("SECOND"),
+            "{html}"
+        );
         let bytes = crate::snapshot::doc_to_bytes(&out.doc);
         let raw = String::from_utf8_lossy(&bytes);
         assert!(
@@ -6263,8 +7227,14 @@ mod tests {
             "the matched chip carries the OgreNotes id and no Quip id",
         );
         let html = crate::export::to_html(&out.doc);
-        assert!(html.contains(" C"), "adjacent text must not be destroyed: {html}");
-        assert!(!html.contains("SECOND"), "the Quip id must not survive: {html}");
+        assert!(
+            html.contains(" C"),
+            "adjacent text must not be destroyed: {html}"
+        );
+        assert!(
+            !html.contains("SECOND"),
+            "the Quip id must not survive: {html}"
+        );
     }
 
     /// A `<control>`-wrapped anchor carrying a **section fragment** is a
@@ -6281,9 +7251,16 @@ mod tests {
         assert!(
             out.person_mentions.is_empty(),
             "a section anchor is a document link however it is wrapped: {:?}",
-            out.person_mentions.iter().map(|m| &m.quip_user_id).collect::<Vec<_>>(),
+            out.person_mentions
+                .iter()
+                .map(|m| &m.quip_user_id)
+                .collect::<Vec<_>>(),
         );
-        assert_eq!(out.pending_links.len(), 1, "the back-patchable link survives");
+        assert_eq!(
+            out.pending_links.len(),
+            1,
+            "the back-patchable link survives"
+        );
         assert_eq!(out.pending_links[0].target_quip_thread_id, "81aBAkO87SsN");
         assert_eq!(
             out.pending_links[0].target_quip_section_id.as_deref(),
@@ -6292,7 +7269,10 @@ mod tests {
         assert!(mention_leaves(&out.doc).is_empty(), "no person chip");
 
         let html = crate::export::to_html(&out.doc);
-        assert!(html.contains("doc-mention"), "the DocMention placeholder survives: {html}");
+        assert!(
+            html.contains("doc-mention"),
+            "the DocMention placeholder survives: {html}"
+        );
     }
 
     /// A person mention inside a table cell / list item is reached too — the
@@ -6302,7 +7282,11 @@ mod tests {
         let out = from_quip_html(&format!(
             "<table><tr><td><p>{REAL_PERSON_MENTION}</p></td></tr></table>",
         ));
-        assert_eq!(out.person_mentions.len(), 1, "the nested mention is collected");
+        assert_eq!(
+            out.person_mentions.len(),
+            1,
+            "the nested mention is collected"
+        );
         assert_eq!(
             resolve_person_mentions(&out.doc, &HashMap::new()).degraded,
             1,
@@ -6323,7 +7307,10 @@ mod tests {
             let out = from_quip_html(html);
             assert!(out.person_mentions.is_empty(), "{html}");
             let exported = crate::export::to_html(&out.doc);
-            assert!(exported.contains('x') && exported.contains('y'), "{html} -> {exported}");
+            assert!(
+                exported.contains('x') && exported.contains('y'),
+                "{html} -> {exported}"
+            );
         }
     }
 
@@ -6332,10 +7319,22 @@ mod tests {
         // (href, expected thread id — None means "not intra-Quip",
         //  expected section anchor)
         let cases = [
-            ("https://example.quip.com/AbCd1234/Some-Doc", Some("AbCd1234"), None),
+            (
+                "https://example.quip.com/AbCd1234/Some-Doc",
+                Some("AbCd1234"),
+                None,
+            ),
             ("https://quip.com/AbCd1234", Some("AbCd1234"), None),
-            ("https://example.quip.com/AbCd1234/Doc#sec-77", Some("AbCd1234"), Some("sec-77")),
-            ("https://EXAMPLE.QUIP.COM./AbCd1234/Doc", Some("AbCd1234"), None),
+            (
+                "https://example.quip.com/AbCd1234/Doc#sec-77",
+                Some("AbCd1234"),
+                Some("sec-77"),
+            ),
+            (
+                "https://EXAMPLE.QUIP.COM./AbCd1234/Doc",
+                Some("AbCd1234"),
+                None,
+            ),
             // Relative hrefs resolve against the Quip base: the input is
             // a thread body fetched from Quip, so it can't be relative
             // to anything else.
@@ -6356,15 +7355,26 @@ mod tests {
         ];
         for (href, thread, section) in cases {
             let got = quip_thread_from_url(href);
-            assert_eq!(got.as_ref().map(|m| m.thread_id.as_str()), thread, "thread: {href}");
-            assert_eq!(got.as_ref().and_then(|m| m.section_id.as_deref()), section, "sec: {href}");
+            assert_eq!(
+                got.as_ref().map(|m| m.thread_id.as_str()),
+                thread,
+                "thread: {href}"
+            );
+            assert_eq!(
+                got.as_ref().and_then(|m| m.section_id.as_deref()),
+                section,
+                "sec: {href}"
+            );
         }
     }
 
     #[test]
     fn an_external_link_never_becomes_a_pending_link() {
         let out = from_quip_html("<p><a href=\"https://notquip.com/AbCd1234/x\">n</a></p>");
-        assert!(out.pending_links.is_empty(), "lookalike host must stay an ordinary link");
+        assert!(
+            out.pending_links.is_empty(),
+            "lookalike host must stay an ordinary link"
+        );
         let html = crate::export::to_html(&out.doc);
         assert!(html.contains("https://notquip.com/AbCd1234/x"), "{html}");
     }
@@ -6372,14 +7382,24 @@ mod tests {
     #[test]
     fn a_relative_quip_href_is_stored_resolved_not_same_origin() {
         let out = from_quip_html("<p><a href=\"/AbCd1234/Some-Doc\">rel</a></p>");
-        assert_eq!(out.pending_links.len(), 1, "a relative Quip href is still intra-Quip");
+        assert_eq!(
+            out.pending_links.len(),
+            1,
+            "a relative Quip href is still intra-Quip"
+        );
         assert_eq!(out.pending_links[0].target_quip_thread_id, "AbCd1234");
         let html = crate::export::to_html(&out.doc);
         // `export::is_safe_url` accepts a leading `/`, so storing the
         // href unresolved would export a *live same-origin link that
         // 404s* — not an inert one. The stored url must be absolute.
-        assert!(html.contains("href=\"https://quip.com/AbCd1234/Some-Doc\""), "{html}");
-        assert!(!html.contains("href=\"/AbCd1234/Some-Doc\""), "same-origin href leaked: {html}");
+        assert!(
+            html.contains("href=\"https://quip.com/AbCd1234/Some-Doc\""),
+            "{html}"
+        );
+        assert!(
+            !html.contains("href=\"/AbCd1234/Some-Doc\""),
+            "same-origin href leaked: {html}"
+        );
     }
 
     #[test]
@@ -6388,18 +7408,25 @@ mod tests {
         // it and the text that follows, exactly as a bare `<img>` does.
         // Wrapping in `<p>` hides this (`walk_text_container`
         // re-partitions), so the repro is a transparent `<div>`.
-        let b = blocks(
-            "<div>a <a href=\"https://x.quip.com/T/D\">lbl<img src=\"i.png\"></a> b</div>",
-        );
+        let b =
+            blocks("<div>a <a href=\"https://x.quip.com/T/D\">lbl<img src=\"i.png\"></a> b</div>");
         let kinds: Vec<_> = b.iter().map(|x| x.node_type()).collect();
         assert_eq!(
             kinds,
             vec![NodeType::Paragraph, NodeType::Image, NodeType::Paragraph],
             "{b:?}"
         );
-        let QuipBlock::Para { spans, .. } = &b[0] else { panic!("expected para: {b:?}") };
-        assert_eq!(spans_text(spans), "a lbl", "the chip stays with the text before it");
-        let QuipBlock::Para { spans, .. } = &b[2] else { panic!("expected para: {b:?}") };
+        let QuipBlock::Para { spans, .. } = &b[0] else {
+            panic!("expected para: {b:?}")
+        };
+        assert_eq!(
+            spans_text(spans),
+            "a lbl",
+            "the chip stays with the text before it"
+        );
+        let QuipBlock::Para { spans, .. } = &b[2] else {
+            panic!("expected para: {b:?}")
+        };
         assert_eq!(spans_text(spans), "b");
     }
 
@@ -6432,21 +7459,26 @@ mod tests {
 
     #[test]
     fn an_image_inside_a_quip_link_is_hoisted_not_dropped() {
-        let out = from_quip_html(
-            "<p><a href=\"https://x.quip.com/T2/D\">lbl<img src=\"i.png\"></a></p>",
-        );
+        let out =
+            from_quip_html("<p><a href=\"https://x.quip.com/T2/D\">lbl<img src=\"i.png\"></a></p>");
         assert_valid_tree(&out.doc);
-        assert_eq!(out.images.len(), 1, "the image survives the mention rewrite");
+        assert_eq!(
+            out.images.len(),
+            1,
+            "the image survives the mention rewrite"
+        );
         assert_eq!(out.pending_links.len(), 1);
     }
 
     #[test]
     fn every_section_id_maps_to_an_element_that_really_exists() {
-        let out = from_quip_html(
-            "<h1 id=\"a\">T</h1><p id=\"b\">x</p><p data-section-id=\"c\">y</p>",
-        );
+        let out =
+            from_quip_html("<h1 id=\"a\">T</h1><p id=\"b\">x</p><p data-section-id=\"c\">y</p>");
         assert_eq!(
-            out.sections.iter().map(|(q, _)| q.as_str()).collect::<Vec<_>>(),
+            out.sections
+                .iter()
+                .map(|(q, _)| q.as_str())
+                .collect::<Vec<_>>(),
             vec!["a", "b", "c"],
             "document order"
         );
@@ -6457,7 +7489,10 @@ mod tests {
             ids.insert(el.get_attribute(txn, "blockId").unwrap_or_default());
         });
         for (section, block_id) in &out.sections {
-            assert!(ids.contains(block_id), "section {section} points at a live blockId");
+            assert!(
+                ids.contains(block_id),
+                "section {section} points at a live blockId"
+            );
         }
     }
 
@@ -6476,7 +7511,11 @@ mod tests {
             if path.extension().and_then(|e| e.to_str()) != Some("html") {
                 continue;
             }
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
             let html = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
             let out = from_quip_html(&html);
             assert_valid_tree(&out.doc);
@@ -6549,7 +7588,9 @@ mod tests {
         let txn = doc.transact();
         let frag = crate::document::get_content_fragment(&txn).expect("content fragment");
         for i in 0..frag.len(&txn) {
-            let Some(XmlOut::Element(el)) = frag.get(&txn, i) else { continue };
+            let Some(XmlOut::Element(el)) = frag.get(&txn, i) else {
+                continue;
+            };
             check_subtree(&txn, &el, NodeType::Doc);
         }
     }
@@ -6568,7 +7609,8 @@ mod tests {
             "{nt:?} is not a legal child of {parent:?}"
         );
         assert!(
-            el.get_attribute(txn, "blockId").is_some_and(|id| id.len() == 10),
+            el.get_attribute(txn, "blockId")
+                .is_some_and(|id| id.len() == 10),
             "missing blockId on <{tag}>"
         );
         for i in 0..el.len(txn) {

@@ -25,6 +25,7 @@
 //!   - bullet list / ordered list / list item
 //!   - blockquote
 //!   - code block with `language` attribute (when fenced ``` lang)
+//!   - Mermaid fences as live diagram leaves where the schema permits them
 //!   - horizontal rule
 //!   - hard break
 //!
@@ -32,9 +33,8 @@
 
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 use yrs::{
-    Doc, Transact, WriteTxn, Xml,
+    Doc, Transact, WriteTxn, Xml, XmlElementRef,
     types::xml::{XmlElementPrelim, XmlFragment, XmlTextPrelim},
-    XmlElementRef,
 };
 
 use crate::schema::NodeType;
@@ -72,11 +72,7 @@ pub fn from_markdown(md: &str) -> Doc {
                 Event::Start(tag) => match tag {
                     Tag::Paragraph => {
                         let parent = current_parent(&fragment, &stack, &txn);
-                        let el = insert_at_end(
-                            &mut txn,
-                            &parent,
-                            NodeType::Paragraph,
-                        );
+                        let el = insert_at_end(&mut txn, &parent, NodeType::Paragraph);
                         stack.push(el);
                     }
                     Tag::Heading { level, .. } => {
@@ -86,7 +82,10 @@ pub fn from_markdown(md: &str) -> Doc {
                         // not a legal child of a list item (or a table
                         // cell). Keep the text as a paragraph there rather
                         // than emit an orphan the editor can't reach.
-                        if parent_type(&parent).valid_children().contains(&NodeType::Heading) {
+                        if parent_type(&parent)
+                            .valid_children()
+                            .contains(&NodeType::Heading)
+                        {
                             let el = insert_at_end(&mut txn, &parent, NodeType::Heading);
                             stack.push(el);
                             current_heading_level = Some(heading_level_to_u8(level));
@@ -97,21 +96,10 @@ pub fn from_markdown(md: &str) -> Doc {
                     }
                     Tag::BlockQuote(_) => {
                         let parent = current_parent(&fragment, &stack, &txn);
-                        let el = insert_at_end(
-                            &mut txn,
-                            &parent,
-                            NodeType::Blockquote,
-                        );
+                        let el = insert_at_end(&mut txn, &parent, NodeType::Blockquote);
                         stack.push(el);
                     }
                     Tag::CodeBlock(kind) => {
-                        let parent = current_parent(&fragment, &stack, &txn);
-                        let el = insert_at_end(
-                            &mut txn,
-                            &parent,
-                            NodeType::CodeBlock,
-                        );
-                        stack.push(el);
                         in_code_block = true;
                         current_code_language = code_block_language(kind);
                     }
@@ -127,11 +115,7 @@ pub fn from_markdown(md: &str) -> Doc {
                     }
                     Tag::Item => {
                         let parent = current_parent(&fragment, &stack, &txn);
-                        let el = insert_at_end(
-                            &mut txn,
-                            &parent,
-                            NodeType::ListItem,
-                        );
+                        let el = insert_at_end(&mut txn, &parent, NodeType::ListItem);
                         stack.push(el);
                     }
                     // Inline markers — v1 ignores the start/end markers
@@ -142,47 +126,66 @@ pub fn from_markdown(md: &str) -> Doc {
                     Tag::Link { .. } | Tag::Image { .. } => {}
                     _ => {}
                 },
-                Event::End(end) => {
-                    match end {
-                        TagEnd::Paragraph
-                        | TagEnd::Heading(_)
-                        | TagEnd::CodeBlock => {
-                            if let Some(el) = stack.pop() {
-                                flush_text(
-                                    &mut txn,
-                                    &el,
-                                    &mut text_buf,
-                                    in_code_block,
-                                );
-                                if let Some(level) = current_heading_level.take() {
-                                    el.insert_attribute(
-                                        &mut txn,
-                                        "level",
-                                        level.to_string(),
-                                    );
-                                }
-                                if matches!(end, TagEnd::CodeBlock) {
-                                    if let Some(lang) = current_code_language.take() {
-                                        if !lang.is_empty() {
-                                            el.insert_attribute(
-                                                &mut txn,
-                                                "language",
-                                                lang,
-                                            );
-                                        }
-                                    }
-                                    in_code_block = false;
-                                }
+                Event::End(end) => match end {
+                    TagEnd::CodeBlock => {
+                        let parent = current_parent(&fragment, &stack, &txn);
+                        let language = current_code_language.take();
+                        let mermaid_candidate = language.as_deref() == Some("mermaid")
+                            && !text_buf.trim().is_empty()
+                            && parent_type(&parent)
+                                .valid_children()
+                                .contains(&NodeType::Mermaid);
+                        let mut source_len = text_buf
+                            .chars()
+                            .take(ogrenotes_mermaid::MAX_SOURCE_LEN + 2)
+                            .count();
+                        // CommonMark requires a final line terminator in fenced
+                        // bodies. At the exact source cap, exclude only that
+                        // formatting terminator so a native source can roundtrip.
+                        if mermaid_candidate
+                            && source_len == ogrenotes_mermaid::MAX_SOURCE_LEN + 1
+                            && text_buf.ends_with('\n')
+                        {
+                            text_buf.pop();
+                            source_len -= 1;
+                        }
+                        let mermaid =
+                            mermaid_candidate && source_len <= ogrenotes_mermaid::MAX_SOURCE_LEN;
+                        let node_type = if mermaid {
+                            NodeType::Mermaid
+                        } else {
+                            NodeType::CodeBlock
+                        };
+                        let el = insert_at_end(&mut txn, &parent, node_type);
+                        if mermaid {
+                            el.insert_attribute(&mut txn, "source", std::mem::take(&mut text_buf));
+                            el.insert_attribute(
+                                &mut txn,
+                                "blockId",
+                                crate::import_quip::new_block_id(),
+                            );
+                        } else {
+                            flush_text(&mut txn, &el, &mut text_buf, true);
+                            if let Some(language) = language.filter(|language| !language.is_empty())
+                            {
+                                el.insert_attribute(&mut txn, "language", language);
                             }
                         }
-                        TagEnd::BlockQuote(_)
-                        | TagEnd::List(_)
-                        | TagEnd::Item => {
-                            stack.pop();
-                        }
-                        _ => {}
+                        in_code_block = false;
                     }
-                }
+                    TagEnd::Paragraph | TagEnd::Heading(_) => {
+                        if let Some(el) = stack.pop() {
+                            flush_text(&mut txn, &el, &mut text_buf, in_code_block);
+                            if let Some(level) = current_heading_level.take() {
+                                el.insert_attribute(&mut txn, "level", level.to_string());
+                            }
+                        }
+                    }
+                    TagEnd::BlockQuote(_) | TagEnd::List(_) | TagEnd::Item => {
+                        stack.pop();
+                    }
+                    _ => {}
+                },
                 Event::Text(t) => {
                     text_buf.push_str(t.as_ref());
                 }
@@ -217,7 +220,10 @@ pub fn from_markdown(md: &str) -> Doc {
                     let parent = current_parent(&fragment, &stack, &txn);
                     // A rule is decorative; where the parent can't hold
                     // one (a list item), dropping it beats an orphan.
-                    if parent_type(&parent).valid_children().contains(&NodeType::HorizontalRule) {
+                    if parent_type(&parent)
+                        .valid_children()
+                        .contains(&NodeType::HorizontalRule)
+                    {
                         insert_at_end(&mut txn, &parent, NodeType::HorizontalRule);
                     }
                 }
@@ -345,13 +351,11 @@ pub fn from_html(html: &str) -> Doc {
     let safe = sanitize(html);
 
     // Stage 2: parse to DOM.
-    let dom: RcDom = html5ever::parse_document(
-        RcDom::default(),
-        html5ever::driver::ParseOpts::default(),
-    )
-    .from_utf8()
-    .read_from(&mut safe.as_bytes())
-    .expect("html5ever parse is infallible on bytes");
+    let dom: RcDom =
+        html5ever::parse_document(RcDom::default(), html5ever::driver::ParseOpts::default())
+            .from_utf8()
+            .read_from(&mut safe.as_bytes())
+            .expect("html5ever parse is infallible on bytes");
 
     // Stage 2b: bound the tree BEFORE the recursive walk, rather than
     // threading a depth counter through `walk_html`'s four recursion
@@ -527,15 +531,34 @@ fn collect_text(roots: &[markup5ever_rcdom::Handle]) -> String {
 /// the way through but want the text inside to survive).
 fn allowed_html_tags() -> std::collections::HashSet<&'static str> {
     [
-        "html", "head", "body",
-        "p", "div", "span",
-        "h1", "h2", "h3", "h4", "h5", "h6",
-        "ul", "ol", "li",
+        "html",
+        "head",
+        "body",
+        "p",
+        "div",
+        "span",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "ul",
+        "ol",
+        "li",
         "blockquote",
-        "pre", "code",
-        "hr", "br",
+        "pre",
+        "code",
+        "hr",
+        "br",
         "a",
-        "strong", "em", "b", "i", "u", "s", "del",
+        "strong",
+        "em",
+        "b",
+        "i",
+        "u",
+        "s",
+        "del",
     ]
     .into_iter()
     .collect()
@@ -564,7 +587,10 @@ fn is_textblock(nt: NodeType) -> bool {
 }
 
 fn is_list_container(nt: NodeType) -> bool {
-    matches!(nt, NodeType::BulletList | NodeType::OrderedList | NodeType::TaskList)
+    matches!(
+        nt,
+        NodeType::BulletList | NodeType::OrderedList | NodeType::TaskList
+    )
 }
 
 /// The paragraph stray inline content under `parent` should land in,
@@ -678,10 +704,10 @@ fn walk_html<'a>(
             // Heading carries a level attribute on its element,
             // not just on the tag. Recover it from the original
             // tag name.
-            if nt == NodeType::Heading {
-                if let Some(level) = heading_level_from_tag(tag) {
-                    el.insert_attribute(txn, "level", level.to_string());
-                }
+            if nt == NodeType::Heading
+                && let Some(level) = heading_level_from_tag(tag)
+            {
+                el.insert_attribute(txn, "level", level.to_string());
             }
             let scope = XmlOpenable::Element(el);
             let mut inner = InlineSink::default();
@@ -732,7 +758,9 @@ fn walk_html<'a>(
                 }
             }
         }
-        NodeData::Comment { .. } | NodeData::Doctype { .. } | NodeData::ProcessingInstruction { .. } => {
+        NodeData::Comment { .. }
+        | NodeData::Doctype { .. }
+        | NodeData::ProcessingInstruction { .. } => {
             // Dropped silently.
         }
     }
@@ -777,7 +805,9 @@ mod tests {
         let txn = doc.transact();
         let fragment = txn.get_xml_fragment("content")?;
         let child = fragment.get(&txn, 0)?;
-        let XmlOut::Element(el) = child else { return None };
+        let XmlOut::Element(el) = child else {
+            return None;
+        };
         Some(el.tag().to_string())
     }
 
@@ -940,9 +970,7 @@ mod tests {
     fn html_strips_script_and_iframe() {
         // ammonia drops both before html5ever sees them. The
         // surviving paragraph is the only top-level block.
-        let doc = from_html(
-            "<p>safe</p><script>alert('x')</script><iframe src='evil'></iframe>",
-        );
+        let doc = from_html("<p>safe</p><script>alert('x')</script><iframe src='evil'></iframe>");
         let txn = doc.transact();
         let fragment = txn.get_xml_fragment("content").unwrap();
         assert_eq!(fragment.len(&txn), 1);
@@ -1076,7 +1104,10 @@ mod tests {
         );
         let lower = out.to_ascii_lowercase();
         for handler in ["onclick", "onmouseover", "onerror"] {
-            assert!(!lower.contains(handler), "{handler} survived sanitize: {out:?}");
+            assert!(
+                !lower.contains(handler),
+                "{handler} survived sanitize: {out:?}"
+            );
         }
         // Positive controls: the elements and their legitimate
         // attribute survived, so the handlers were stripped rather
@@ -1103,7 +1134,10 @@ mod tests {
             !out.contains("data-anything"),
             "no attribute prefix is allowed on this path; a prefix allowlist was added: {out:?}",
         );
-        assert!(!out.to_ascii_lowercase().contains("onbeforeinput"), "{out:?}");
+        assert!(
+            !out.to_ascii_lowercase().contains("onbeforeinput"),
+            "{out:?}"
+        );
         assert!(out.contains("text"), "positive control: {out:?}");
     }
 

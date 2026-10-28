@@ -7,16 +7,16 @@
 //! The RoomRegistry is a thread-safe map of active rooms.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 
-use ogrenotes_common::metrics::{counter, MetricKey};
+use ogrenotes_common::metrics::{MetricKey, counter};
 
 use super::document::OgreDoc;
-use super::protocol::{encode_message, MessageType};
+use super::protocol::{MessageType, encode_message};
 
 // LiveApp validation mode moved to `super::blocks` so the block
 // crate owns the enum and the shared emit-and-reject helper.
@@ -180,8 +180,16 @@ impl Room {
     }
 
     /// Add a client to the room.
-    pub async fn add_client(&self, client_id: u64, user_id: String, sender: mpsc::UnboundedSender<Vec<u8>>) {
-        self.clients.write().await.insert(client_id, ClientHandle { user_id, sender });
+    pub async fn add_client(
+        &self,
+        client_id: u64,
+        user_id: String,
+        sender: mpsc::UnboundedSender<Vec<u8>>,
+    ) {
+        self.clients
+            .write()
+            .await
+            .insert(client_id, ClientHandle { user_id, sender });
     }
 
     /// Remove a client from the room. Returns true if the room is now empty.
@@ -216,7 +224,10 @@ impl Room {
     }
 
     /// Compute a diff from a remote state vector (sync step 2).
-    pub async fn encode_diff(&self, remote_sv: &[u8]) -> Result<Vec<u8>, super::document::DocError> {
+    pub async fn encode_diff(
+        &self,
+        remote_sv: &[u8],
+    ) -> Result<Vec<u8>, super::document::DocError> {
         self.doc.read().await.encode_diff(remote_sv)
     }
 
@@ -236,9 +247,7 @@ impl Room {
     /// (WS peers watching this room's update stream) see it as
     /// one delta and their local docs converge to the repaired
     /// state via normal CRDT sync.
-    pub async fn repair_liveapp_attrs(
-        &self,
-    ) -> super::blocks::RepairReport {
+    pub async fn repair_liveapp_attrs(&self) -> super::blocks::RepairReport {
         let doc = self.doc.write().await;
         let report = super::blocks::repair_liveapp_attrs(doc.inner());
         if report.nodes_touched > 0 {
@@ -271,8 +280,8 @@ impl Room {
         scope: super::blocks::WalkScope,
     ) -> Result<GatedApplyReport, super::document::DocError> {
         use super::blocks::{
-            collect_liveapp_index, diff_liveapp_deletions,
-            emit_violations_and_should_reject, validate_liveapp_writes_scoped,
+            collect_liveapp_index, diff_liveapp_deletions, emit_violations_and_should_reject,
+            validate_liveapp_writes_scoped,
         };
         // Hold the write lock for the whole check-then-apply so
         // no concurrent update can slip in between validation and
@@ -286,22 +295,23 @@ impl Room {
         // operator can verify the config knob is landing.
         counter::inc(MetricKey::new(
             "liveapp.gate_walk_scope",
-            &[("scope", match scope {
-                super::blocks::WalkScope::Full => "full",
-                super::blocks::WalkScope::Changed => "changed",
-                super::blocks::WalkScope::Canary => "canary",
-            })],
+            &[(
+                "scope",
+                match scope {
+                    super::blocks::WalkScope::Full => "full",
+                    super::blocks::WalkScope::Changed => "changed",
+                    super::blocks::WalkScope::Canary => "canary",
+                },
+            )],
         ));
         let mut doc = self.doc.write().await;
         if mode != LiveAppValidationMode::Off {
             let violations = validate_liveapp_writes_scoped(&doc, update_bytes, scope)
                 .err()
                 .unwrap_or_default();
-            if let Some(first) = emit_violations_and_should_reject(
-                &violations,
-                mode,
-                &[("path", "ws")],
-            ) {
+            if let Some(first) =
+                emit_violations_and_should_reject(&violations, mode, &[("path", "ws")])
+            {
                 // Distinct DocError variant so the WS handler can
                 // send an `MessageType::Error` frame with a
                 // `liveapp-rejected:` payload back to the offending
@@ -357,13 +367,11 @@ impl Room {
     pub async fn broadcast(&self, exclude_client: u64, data: Vec<u8>) {
         let clients = self.clients.read().await;
         for (id, handle) in clients.iter() {
-            if *id != exclude_client {
-                if handle.sender.send(data.clone()).is_err() {
-                    counter::inc(MetricKey::new(
-                        "ws.send_errors_total",
-                        &[("side", "primary")],
-                    ));
-                }
+            if *id != exclude_client && handle.sender.send(data.clone()).is_err() {
+                counter::inc(MetricKey::new(
+                    "ws.send_errors_total",
+                    &[("side", "primary")],
+                ));
             }
         }
     }
@@ -413,13 +421,10 @@ impl Room {
         let sv = self.state_vector().await;
         let msg = encode_message(MessageType::SyncStep1, &sv);
         let clients = self.clients.read().await;
-        if let Some(handle) = clients.get(&client_id) {
-            if handle.sender.send(msg).is_err() {
-                counter::inc(MetricKey::new(
-                    "ws.send_errors_total",
-                    &[("side", "sync")],
-                ));
-            }
+        if let Some(handle) = clients.get(&client_id)
+            && handle.sender.send(msg).is_err()
+        {
+            counter::inc(MetricKey::new("ws.send_errors_total", &[("side", "sync")]));
         }
     }
 
@@ -456,10 +461,13 @@ impl Room {
     /// fanout: the owning connection lives on another instance, so no
     /// local connection may forget it via `forget_awareness_owned_by`.
     pub async fn store_awareness(&self, session_id: &str, payload: Vec<u8>) {
-        self.awareness
-            .write()
-            .await
-            .insert(session_id.to_string(), AwarenessEntry { payload, owner: None });
+        self.awareness.write().await.insert(
+            session_id.to_string(),
+            AwarenessEntry {
+                payload,
+                owner: None,
+            },
+        );
     }
 
     /// Store an entry on behalf of a specific local connection, tagging
@@ -475,7 +483,10 @@ impl Room {
     ) {
         self.awareness.write().await.insert(
             session_id.to_string(),
-            AwarenessEntry { payload, owner: Some(owner) },
+            AwarenessEntry {
+                payload,
+                owner: Some(owner),
+            },
         );
     }
 
@@ -551,7 +562,8 @@ impl Room {
             .read()
             .await
             .iter()
-            .filter_map(|(sid, entry)| (sid != exclude_session).then(|| entry.payload.clone()))
+            .filter(|&(sid, _)| sid != exclude_session)
+            .map(|(_, entry)| entry.payload.clone())
             .collect()
     }
 
@@ -698,7 +710,7 @@ impl RoomRegistry {
     /// relayed so local clients drop the stale cursor. Other types
     /// (SyncStep1/2, Ping, etc.) are ignored.
     pub async fn apply_remote_update(&self, doc_id: &str, wire_bytes: &[u8]) {
-        use super::protocol::{decode_message, MessageType};
+        use super::protocol::{MessageType, decode_message};
         let Some(room) = self.get(doc_id) else { return };
         let Some((msg_type, payload)) = decode_message(wire_bytes) else {
             tracing::warn!(doc_id, "remote update: malformed wire frame");
@@ -815,9 +827,9 @@ impl Default for RoomRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::blocks::WalkScope;
     use super::super::protocol::decode_message;
+    use super::*;
     use yrs::{ReadTxn, Transact, WriteTxn};
 
     #[tokio::test]
@@ -860,8 +872,10 @@ mod tests {
         let room = Room::new_empty("doc-1".to_string());
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        room.add_client(room.next_client_id(), "u1".to_string(), tx1).await;
-        room.add_client(room.next_client_id(), "u2".to_string(), tx2).await;
+        room.add_client(room.next_client_id(), "u1".to_string(), tx1)
+            .await;
+        room.add_client(room.next_client_id(), "u2".to_string(), tx2)
+            .await;
 
         let sent = room.resync_all_clients().await;
         assert_eq!(sent, 2, "both clients should be re-synced");
@@ -886,8 +900,12 @@ mod tests {
         let room_b = registry.get_or_insert("doc-b", OgreDoc::new());
         let (tx_a, mut rx_a) = mpsc::unbounded_channel();
         let (tx_b, mut rx_b) = mpsc::unbounded_channel();
-        room_a.add_client(room_a.next_client_id(), "ua".to_string(), tx_a).await;
-        room_b.add_client(room_b.next_client_id(), "ub".to_string(), tx_b).await;
+        room_a
+            .add_client(room_a.next_client_id(), "ua".to_string(), tx_a)
+            .await;
+        room_b
+            .add_client(room_b.next_client_id(), "ub".to_string(), tx_b)
+            .await;
 
         let rooms_resynced = registry.resync_all_rooms().await;
         assert_eq!(rooms_resynced, 2);
@@ -904,7 +922,8 @@ mod tests {
         let registry = RoomRegistry::new();
         let room = registry.get_or_insert("doc-a", OgreDoc::new());
         let (tx, mut rx) = mpsc::unbounded_channel();
-        room.add_client(room.next_client_id(), "u".to_string(), tx).await;
+        room.add_client(room.next_client_id(), "u".to_string(), tx)
+            .await;
 
         // First call re-syncs the one client.
         assert_eq!(registry.resync_all_rooms().await, 1);
@@ -912,7 +931,10 @@ mod tests {
 
         // Second call is debounced: no rooms reported, no frame sent.
         assert_eq!(registry.resync_all_rooms().await, 0);
-        assert!(rx.try_recv().is_err(), "debounced resync must not send a frame");
+        assert!(
+            rx.try_recv().is_err(),
+            "debounced resync must not send a frame"
+        );
     }
 
     #[tokio::test]
@@ -1029,7 +1051,10 @@ mod tests {
         // Verify it's a SyncStep1 message
         let (msg_type, payload) = decode_message(&msg).unwrap();
         assert_eq!(msg_type, MessageType::SyncStep1);
-        assert!(!payload.is_empty(), "state vector payload should not be empty");
+        assert!(
+            !payload.is_empty(),
+            "state vector payload should not be empty"
+        );
     }
 
     #[tokio::test]
@@ -1038,7 +1063,10 @@ mod tests {
         let room = reg.get_or_insert("d1", OgreDoc::new());
         room.mark_unsaved();
         assert_eq!(reg.unsaved_rooms(), vec!["d1".to_string()]);
-        assert!(!reg.remove_if_empty("d1").await, "its memory is the only copy");
+        assert!(
+            !reg.remove_if_empty("d1").await,
+            "its memory is the only copy"
+        );
         assert!(reg.get("d1").is_some());
         assert!(room.take_unsaved());
         assert!(!room.is_unsaved());
@@ -1060,7 +1088,10 @@ mod tests {
         // Create a valid update by making a change in a separate doc
         let doc1 = OgreDoc::new();
         {
-            use yrs::{Transact, WriteTxn, types::xml::{XmlFragment, XmlTextPrelim, XmlOut}};
+            use yrs::{
+                Transact, WriteTxn,
+                types::xml::{XmlFragment, XmlOut, XmlTextPrelim},
+            };
             let mut txn = doc1.inner().transact_mut();
             let frag = txn.get_or_insert_xml_fragment("content");
             if let Some(XmlOut::Element(para)) = frag.get(&txn, 0) {
@@ -1189,8 +1220,10 @@ mod tests {
         // the cache stays meaningful across API instances AND across a
         // single user's multiple open windows.
         let room = Room::new_empty("doc-1".to_string());
-        room.store_awareness("sess-alice-1", b"alice-state".to_vec()).await;
-        room.store_awareness("sess-bob-1", b"bob-state".to_vec()).await;
+        room.store_awareness("sess-alice-1", b"alice-state".to_vec())
+            .await;
+        room.store_awareness("sess-bob-1", b"bob-state".to_vec())
+            .await;
 
         // Snapshot excluding alice's session returns bob only.
         let snap = room.awareness_snapshot("sess-alice-1").await;
@@ -1223,7 +1256,8 @@ mod tests {
     #[tokio::test]
     async fn awareness_forget_removes() {
         let room = Room::new_empty("doc-1".to_string());
-        room.store_awareness("sess-alice-1", b"alice".to_vec()).await;
+        room.store_awareness("sess-alice-1", b"alice".to_vec())
+            .await;
         room.store_awareness("sess-bob-1", b"bob".to_vec()).await;
         room.forget_awareness("sess-alice-1").await;
         let snap = room.awareness_snapshot("nobody").await;
@@ -1243,8 +1277,10 @@ mod tests {
     #[tokio::test]
     async fn awareness_two_sessions_same_user_are_independent() {
         let room = Room::new_empty("doc-1".to_string());
-        room.store_awareness("sess-projector", b"projector-state".to_vec()).await;
-        room.store_awareness("sess-control", b"control-state".to_vec()).await;
+        room.store_awareness("sess-projector", b"projector-state".to_vec())
+            .await;
+        room.store_awareness("sess-control", b"control-state".to_vec())
+            .await;
 
         // Both of this user's sessions appear to a third party.
         let mut snap = room.awareness_snapshot("nobody").await;
@@ -1270,7 +1306,7 @@ mod tests {
         // session_id, see `apply_remote_update`): a single user_id must
         // remove every session belonging to that user, leaving others
         // untouched.
-        use super::super::awareness::{encode_awareness, AwarenessState};
+        use super::super::awareness::{AwarenessState, encode_awareness};
 
         let room = Room::new_empty("doc-1".to_string());
         let mk = |user_id: &str, session_id: &str| {
@@ -1292,9 +1328,12 @@ mod tests {
                 session_id: Some(session_id.to_string()),
             })
         };
-        room.store_awareness("sess-alice-1", mk("alice", "sess-alice-1")).await;
-        room.store_awareness("sess-alice-2", mk("alice", "sess-alice-2")).await;
-        room.store_awareness("sess-bob-1", mk("bob", "sess-bob-1")).await;
+        room.store_awareness("sess-alice-1", mk("alice", "sess-alice-1"))
+            .await;
+        room.store_awareness("sess-alice-2", mk("alice", "sess-alice-2"))
+            .await;
+        room.store_awareness("sess-bob-1", mk("bob", "sess-bob-1"))
+            .await;
 
         room.forget_awareness_by_user("alice").await;
 
@@ -1313,13 +1352,21 @@ mod tests {
     #[tokio::test]
     async fn awareness_reconnect_under_same_session_id_transfers_ownership() {
         let room = Room::new_empty("doc-1".to_string());
-        let conn_a = AwarenessOwner { instance_id: 7, client_id: 1 };
-        let conn_b = AwarenessOwner { instance_id: 7, client_id: 2 };
+        let conn_a = AwarenessOwner {
+            instance_id: 7,
+            client_id: 1,
+        };
+        let conn_b = AwarenessOwner {
+            instance_id: 7,
+            client_id: 2,
+        };
 
         // Connection A announces, then the browser reconnects as
         // connection B reusing session S and re-announces.
-        room.store_awareness_owned("sess-S", b"a-state".to_vec(), conn_a).await;
-        room.store_awareness_owned("sess-S", b"b-state".to_vec(), conn_b).await;
+        room.store_awareness_owned("sess-S", b"a-state".to_vec(), conn_a)
+            .await;
+        room.store_awareness_owned("sess-S", b"b-state".to_vec(), conn_b)
+            .await;
 
         // The ALB reaps A's half-open socket ~60s later. Its cleanup
         // must be a no-op — and must report that it owns nothing, so the
@@ -1353,12 +1400,17 @@ mod tests {
     #[tokio::test]
     async fn awareness_remote_fanout_store_revokes_local_ownership() {
         let room = Room::new_empty("doc-1".to_string());
-        let conn_a = AwarenessOwner { instance_id: 7, client_id: 1 };
+        let conn_a = AwarenessOwner {
+            instance_id: 7,
+            client_id: 1,
+        };
 
-        room.store_awareness_owned("sess-S", b"a-state".to_vec(), conn_a).await;
+        room.store_awareness_owned("sess-S", b"a-state".to_vec(), conn_a)
+            .await;
         // The reconnect landed on instance 8; its Awareness frame fanned
         // out to us and overwrote the entry.
-        room.store_awareness("sess-S", b"remote-state".to_vec()).await;
+        room.store_awareness("sess-S", b"remote-state".to_vec())
+            .await;
 
         let ownership = room.forget_awareness_owned_by("sess-S", conn_a).await;
         assert_eq!(
@@ -1377,9 +1429,13 @@ mod tests {
         // A connection that never sent an awareness frame has nothing to
         // announce a leave for.
         let room = Room::new_empty("doc-1".to_string());
-        let owner = AwarenessOwner { instance_id: 7, client_id: 1 };
+        let owner = AwarenessOwner {
+            instance_id: 7,
+            client_id: 1,
+        };
         assert_eq!(
-            room.forget_awareness_owned_by("sess-never-announced", owner).await,
+            room.forget_awareness_owned_by("sess-never-announced", owner)
+                .await,
             SessionOwnership::TakenOver,
         );
     }
@@ -1390,16 +1446,25 @@ mod tests {
         // so two instances' client 1 must not be able to forget each
         // other's entries.
         let room = Room::new_empty("doc-1".to_string());
-        let on_instance_7 = AwarenessOwner { instance_id: 7, client_id: 1 };
-        let on_instance_8 = AwarenessOwner { instance_id: 8, client_id: 1 };
+        let on_instance_7 = AwarenessOwner {
+            instance_id: 7,
+            client_id: 1,
+        };
+        let on_instance_8 = AwarenessOwner {
+            instance_id: 8,
+            client_id: 1,
+        };
 
-        room.store_awareness_owned("sess-S", b"state".to_vec(), on_instance_7).await;
+        room.store_awareness_owned("sess-S", b"state".to_vec(), on_instance_7)
+            .await;
         assert_eq!(
-            room.forget_awareness_owned_by("sess-S", on_instance_8).await,
+            room.forget_awareness_owned_by("sess-S", on_instance_8)
+                .await,
             SessionOwnership::TakenOver,
         );
         assert_eq!(
-            room.forget_awareness_owned_by("sess-S", on_instance_7).await,
+            room.forget_awareness_owned_by("sess-S", on_instance_7)
+                .await,
             SessionOwnership::StillOurs,
         );
     }
@@ -1465,7 +1530,7 @@ mod tests {
         // session_id so a *future* local joiner is primed via
         // `awareness_snapshot` without waiting for the remote user to
         // move again.
-        use super::super::awareness::{encode_awareness, AwarenessState};
+        use super::super::awareness::{AwarenessState, encode_awareness};
         use super::super::protocol::encode_message;
 
         let registry = RoomRegistry::new();
@@ -1496,7 +1561,9 @@ mod tests {
         registry.apply_remote_update("doc-1", &frame).await;
 
         // Local broadcast reached alice.
-        let recv1 = rx1.try_recv().expect("alice should get the remote Awareness frame");
+        let recv1 = rx1
+            .try_recv()
+            .expect("alice should get the remote Awareness frame");
         assert_eq!(recv1, frame);
 
         // And the snapshot cache is primed under "sess-remote-bob-1" — a
@@ -1513,7 +1580,7 @@ mod tests {
     /// `apply_remote_update` doc on the `Awareness` arm.
     #[tokio::test]
     async fn apply_remote_update_awareness_missing_session_id_falls_back() {
-        use super::super::awareness::{encode_awareness, AwarenessState};
+        use super::super::awareness::{AwarenessState, encode_awareness};
         use super::super::protocol::encode_message;
 
         let registry = RoomRegistry::new();
@@ -1543,9 +1610,14 @@ mod tests {
 
         registry.apply_remote_update("doc-1", &frame).await;
 
-        rx1.try_recv().expect("alice should still get the frame despite the missing session_id");
+        rx1.try_recv()
+            .expect("alice should still get the frame despite the missing session_id");
         let snap = room.awareness_snapshot("someone-elses-session").await;
-        assert_eq!(snap, vec![payload], "frame must be cached under the synthesized fallback key");
+        assert_eq!(
+            snap,
+            vec![payload],
+            "frame must be cached under the synthesized fallback key"
+        );
     }
 
     /// The `Awareness` arm's other early return: a payload that
@@ -1588,21 +1660,30 @@ mod tests {
 
         let registry = RoomRegistry::new();
         let room = registry.get_or_insert("doc-1", OgreDoc::new());
-        room.store_awareness("sess-remote-bob-1", b"stale-cursor-state".to_vec()).await;
+        room.store_awareness("sess-remote-bob-1", b"stale-cursor-state".to_vec())
+            .await;
 
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         room.add_client(1, "alice".into(), tx1).await;
 
-        let frame = encode_message(MessageType::AwarenessLeave, b"sess-remote-bob-1\0remote-bob");
+        let frame = encode_message(
+            MessageType::AwarenessLeave,
+            b"sess-remote-bob-1\0remote-bob",
+        );
         registry.apply_remote_update("doc-1", &frame).await;
 
-        let recv1 = rx1.try_recv().expect("alice should get the remote AwarenessLeave frame");
+        let recv1 = rx1
+            .try_recv()
+            .expect("alice should get the remote AwarenessLeave frame");
         assert_eq!(recv1, frame);
 
         // The stale entry is gone — a joiner arriving now gets no
         // snapshot entry for that session.
         let snap = room.awareness_snapshot("someone-elses-session").await;
-        assert!(snap.is_empty(), "forgotten session must not appear in the snapshot");
+        assert!(
+            snap.is_empty(),
+            "forgotten session must not appear in the snapshot"
+        );
     }
 
     /// #212 legacy fallback: an `AwarenessLeave` frame with the OLD
@@ -1612,7 +1693,7 @@ mod tests {
     /// scan path via the wire-level entry point.
     #[tokio::test]
     async fn apply_remote_update_awareness_leave_legacy_format_falls_back_to_forget_by_user() {
-        use super::super::awareness::{encode_awareness, AwarenessState};
+        use super::super::awareness::{AwarenessState, encode_awareness};
         use super::super::protocol::encode_message;
 
         let registry = RoomRegistry::new();
@@ -1643,9 +1724,13 @@ mod tests {
         let frame = encode_message(MessageType::AwarenessLeave, b"remote-bob");
         registry.apply_remote_update("doc-1", &frame).await;
 
-        rx1.try_recv().expect("alice should still get the legacy-format leave frame");
+        rx1.try_recv()
+            .expect("alice should still get the legacy-format leave frame");
         let snap = room.awareness_snapshot("someone-elses-session").await;
-        assert!(snap.is_empty(), "legacy user_id-only leave must forget the user's cached session");
+        assert!(
+            snap.is_empty(),
+            "legacy user_id-only leave must forget the user's cached session"
+        );
     }
 
     // ── Phase 2a — LiveApp pre-apply gate ────────────────────────
@@ -1683,10 +1768,9 @@ mod tests {
     /// and one red-color card. Returns the room and a peer doc
     /// initialized from the same baseline so callers can craft
     /// updates that reference the same block IDs.
-    async fn kanban_room_and_peer(
-    ) -> (Arc<Room>, OgreDoc) {
-        use yrs::types::xml::{Xml, XmlElementPrelim, XmlFragment};
+    async fn kanban_room_and_peer() -> (Arc<Room>, OgreDoc) {
         use crate::schema::NodeType;
+        use yrs::types::xml::{Xml, XmlElementPrelim, XmlFragment};
 
         let doc = OgreDoc::new();
         {
@@ -1731,9 +1815,15 @@ mod tests {
         {
             let mut txn = peer.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             card.insert_attribute(&mut txn, "color", "javascript:");
         }
         let sv = room.state_vector().await;
@@ -1754,9 +1844,15 @@ mod tests {
         {
             let mut txn = peer.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             card.insert_attribute(&mut txn, "color", "javascript:");
         }
         let sv = room.state_vector().await;
@@ -1780,9 +1876,15 @@ mod tests {
         {
             let mut txn = peer.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             card.insert_attribute(&mut txn, "color", "javascript:");
         }
         let sv = room.state_vector().await;
@@ -1819,9 +1921,15 @@ mod tests {
         {
             let mut txn = peer.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             card.insert_attribute(&mut txn, "title", too_long.as_str());
         }
         let sv = room.state_vector().await;
@@ -1836,7 +1944,10 @@ mod tests {
             "unexpected error message: {err}"
         );
         let state_after = room.to_state_bytes().await;
-        assert_eq!(state_before, state_after, "state must not advance on reject");
+        assert_eq!(
+            state_before, state_after,
+            "state must not advance on reject"
+        );
     }
 
     #[tokio::test]
@@ -1848,8 +1959,12 @@ mod tests {
         {
             let mut txn = peer.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             col.insert_attribute(&mut txn, "title", "Doing");
         }
         let sv = room.state_vector().await;
@@ -1877,17 +1992,27 @@ mod tests {
         let card_block_id = {
             let txn = peer.inner().transact();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             card.get_attribute(&txn, "blockId").unwrap_or_default()
         };
 
         {
             let mut txn = peer.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             col.remove_range(&mut txn, 0, 1);
         }
         let sv = room.state_vector().await;

@@ -347,8 +347,8 @@ can obscure part of an overlapping marker. Caption overlaps receive a masked
 palette-colored ring so a fully covered dot retains a visible indicator.
 Point and ring masks also protect axis labels. Overlap bounds measure literal
 text, so a displayed `<br>` cannot hide an overlapping point.
-Long names receive ellipses; C4 and
-treemap use an explicit Arial/Helvetica family for consistent viewer metrics.
+C4 names and descriptions wrap without losing source text or splitting graphemes;
+treemap names receive ellipses. Both use an explicit Arial/Helvetica family for consistent viewer metrics.
 
 Supported non-ASCII advances use measurements of the Arial-compatible
 Liberation Sans regular, bold and italic faces. Regenerate the checked-in bounds
@@ -439,17 +439,31 @@ viewport stability and restoration of the host's anchoring settings.
 ### Mermaid semantics and accessibility
 
 Run `node scripts/frontend-doctor/test-mermaid-semantics.cjs --base-url http://localhost:3000`
-against a local DEV_MODE stack. It creates and purges a generated document,
+against a local DEV_MODE stack. It creates and purges generated documents,
 checks the source modal and saved SVG, and opens the edit button with Enter
 and Space. It verifies browser accessibility-tree names/descriptions, focus
 restoration and the absence of edit controls for a read-only member. The
-Playwright workflow runs it. `--observe` records defects on an unpatched build.
+Playwright workflow runs it. It also imports a Markdown Mermaid fence, edits its live diagram,
+checks persistence through reload, and verifies that wide HTML exports scale for print
+without distorting their aspect ratio. Markdown fences require a final line ending:
+export/reimport adds it once when absent and retains existing trailing newlines.
+At the source limit, the importer excludes that formatting terminator if needed
+to keep the diagram live. `--observe` records defects on an unpatched build.
 
 Gantt supports `YYYY-MM-DD`, its default date axis, and `todayMarker off`.
 Other date formats, calendar directives and unsupported display directives
 report an explicit source-line error. XY charts support quoted/bare axis titles, quoted categories and finite
 increasing numeric ranges. Quadrant coordinates must be finite and within
-0..1. Packet `+length` fields follow the previous field; overlaps are errors.
+0..1. Packet `+length` fields follow the previous field; gaps and overlaps are errors.
+Numeric chart inputs reject non-finite values and a leading `+`; relative packet
+lengths remain supported. XY charts also support horizontal orientation.
+Shared layout checks run in the regular Mermaid library CI tests over all golden
+diagram sources and deterministic generated flowcharts. They check canvas bounds,
+foreign-label and node separation, and the emitted edge curves. Large class,
+Sankey, and return-edge flowcharts have bounded-time regressions.
+Single-line YAML front-matter titles render above the diagram, with quoted scalars
+and escapes decoded. Configuration comments retain their existing ignored-theme
+behavior and preserve source line numbers. Flowchart declaration lookup keys are opaque tokens: put whitespace before `%%` comments on `classDef`, `class`, `style`, and `linkStyle` declarations. Edges and inline `:::class` suffixes also accept immediate comments.
 Shared `accTitle:` and `accDescr:` statements (including description blocks)
 set the SVG image name and description. Without a title, the image is named
 by diagram kind and visible rendered labels become its description, bounded
