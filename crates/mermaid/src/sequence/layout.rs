@@ -232,7 +232,11 @@ const FRAME_PAD: f64 = 10.0;
 /// tab; each `[divider]` label centered on the frame.
 fn frame_label_w(keyword: &str, label: &str, dividers: &[(f64, String)]) -> f64 {
     let tab_w = text_size(keyword).0 + 16.0;
-    let header = if label.is_empty() { tab_w } else { tab_w + 8.0 + text_size(&format!("[{label}]")).0 + 8.0 };
+    let header = if label.is_empty() {
+        tab_w
+    } else {
+        tab_w + 8.0 + text_size(&format!("[{label}]")).0 + 8.0
+    };
     dividers
         .iter()
         .map(|(_, l)| text_size(&format!("[{l}]")).0 + 16.0)
@@ -247,7 +251,13 @@ fn pass2_rows(
     col_x: &[f64],
     box_w: &[f64],
     body_top: f64,
-) -> (Vec<MsgLayout>, Vec<NoteLayout>, Vec<ActRect>, Vec<FrameRect>, f64) {
+) -> (
+    Vec<MsgLayout>,
+    Vec<NoteLayout>,
+    Vec<ActRect>,
+    Vec<FrameRect>,
+    f64,
+) {
     let mut cursor = body_top;
     // `autonum` is the next number to assign (None = numbering disabled);
     // `autonum_step` is the increment applied after each numbered message.
@@ -271,9 +281,20 @@ fn pass2_rows(
             Event::AutonumberOff => {
                 autonum = None;
             }
-            Event::Message { from, to, text, activate_target, deactivate_source, .. } => {
+            Event::Message {
+                from,
+                to,
+                text,
+                activate_target,
+                deactivate_source,
+                ..
+            } => {
                 let self_msg = from == to;
-                let text_h = if text.is_empty() { 0.0 } else { text_size(text).1 };
+                let text_h = if text.is_empty() {
+                    0.0
+                } else {
+                    text_size(text).1
+                };
                 // Base footprint (arrow + label). Self-messages additionally
                 // reserve SELF_EXTRA of vertical room below the line for the
                 // loop-back stub; that extra room is spent AFTER the line
@@ -292,7 +313,11 @@ fn pass2_rows(
                     let fx = col_x.get(*from).copied().unwrap_or(0.0);
                     let loop_top = cursor + if text.is_empty() { 0.0 } else { text_h + 4.0 };
                     let line_y = loop_top + SELF_EXTRA / 2.0;
-                    (line_y + SELF_EXTRA / 2.0 + 6.0 - cursor, line_y, (fx, loop_top - 6.0))
+                    (
+                        line_y + SELF_EXTRA / 2.0 + 6.0 - cursor,
+                        line_y,
+                        (fx, loop_top - 6.0),
+                    )
                 } else {
                     let base_row_h = MSG_MIN_H.max(text_h + 14.0);
                     let line_y = cursor + base_row_h - 6.0;
@@ -304,10 +329,19 @@ fn pass2_rows(
                 if let Some(n) = autonum {
                     autonum = Some(n.saturating_add(autonum_step));
                 }
-                messages.push(MsgLayout { event: idx, y: line_y, text_anchor, number });
+                messages.push(MsgLayout {
+                    event: idx,
+                    y: line_y,
+                    text_anchor,
+                    number,
+                });
 
                 // Grow any enclosing fragment to include this message.
-                let tw = if text.is_empty() { 0.0 } else { text_size(text).0 };
+                let tw = if text.is_empty() {
+                    0.0
+                } else {
+                    text_size(text).0
+                };
                 let fx = col_x.get(*from).copied().unwrap_or(0.0);
                 if self_msg {
                     // Symmetric footprint around the lifeline: the centered
@@ -319,7 +353,11 @@ fn pass2_rows(
                 } else {
                     let tx = col_x.get(*to).copied().unwrap_or(fx);
                     let mid = (fx + tx) / 2.0;
-                    extend_frame(&mut frame_stack, fx.min(tx).min(mid - tw / 2.0), fx.max(tx).max(mid + tw / 2.0));
+                    extend_frame(
+                        &mut frame_stack,
+                        fx.min(tx).min(mid - tw / 2.0),
+                        fx.max(tx).max(mid + tw / 2.0),
+                    );
                 }
 
                 if *activate_target {
@@ -331,7 +369,12 @@ fn pass2_rows(
                 if *deactivate_source {
                     if let Some(stack) = act_stacks.get_mut(*from) {
                         if let Some((depth, y0)) = stack.pop() {
-                            activations.push(ActRect { p: *from, depth, y0, y1: line_y });
+                            activations.push(ActRect {
+                                p: *from,
+                                depth,
+                                y0,
+                                y1: line_y,
+                            });
                         }
                     }
                 }
@@ -367,7 +410,12 @@ fn pass2_rows(
                 };
                 notes.push(NoteLayout {
                     event: idx,
-                    rect: crate::layout::Rect { x, y: cursor, w, h: note_h },
+                    rect: crate::layout::Rect {
+                        x,
+                        y: cursor,
+                        w,
+                        h: note_h,
+                    },
                 });
                 extend_frame(&mut frame_stack, x, x + w);
                 cursor += note_h + ROW_GAP;
@@ -402,7 +450,11 @@ fn pass2_rows(
                         xmin = PAD;
                         xmax = PAD + FRAME_MIN_W;
                     }
-                    let label_w = frame_label_w(fr.kind.keyword(), &fr.label, &fr.dividers);
+                    let label_w = if fr.kind == FragmentKind::Rect {
+                        0.0
+                    } else {
+                        frame_label_w(fr.kind.keyword(), &fr.label, &fr.dividers)
+                    };
                     let left = xmin - FRAME_PAD;
                     let right = (xmax + FRAME_PAD).max(left + label_w);
                     let rect = crate::layout::Rect {
@@ -435,7 +487,12 @@ fn pass2_rows(
             Event::Deactivate { p } => {
                 if let Some(stack) = act_stacks.get_mut(*p) {
                     if let Some((depth, y0)) = stack.pop() {
-                        activations.push(ActRect { p: *p, depth, y0, y1: cursor });
+                        activations.push(ActRect {
+                            p: *p,
+                            depth,
+                            y0,
+                            y1: cursor,
+                        });
                     }
                 }
             }
@@ -447,7 +504,12 @@ fn pass2_rows(
     // `activate`/`+` with no matching close) at the body bottom.
     for (p, stack) in act_stacks.iter_mut().enumerate() {
         for (depth, y0) in stack.drain(..) {
-            activations.push(ActRect { p, depth, y0, y1: body_bottom });
+            activations.push(ActRect {
+                p,
+                depth,
+                y0,
+                y1: body_bottom,
+            });
         }
     }
 
@@ -467,8 +529,13 @@ fn content_x_extent(d: &SeqDiagram, l: &SeqLayout) -> (f64, f64) {
         take(x - w / 2.0, x + w / 2.0);
     }
     for m in &l.messages {
-        let Some(Event::Message { from, to, text, .. }) = d.events.get(m.event) else { continue };
-        let prefix = m.number.map(|n| text_size(&format!("{n}. ")).0).unwrap_or(0.0);
+        let Some(Event::Message { from, to, text, .. }) = d.events.get(m.event) else {
+            continue;
+        };
+        let prefix = m
+            .number
+            .map(|n| text_size(&format!("{n}. ")).0)
+            .unwrap_or(0.0);
         let half = (text_size(text).0 + prefix) / 2.0;
         take(m.text_anchor.0 - half, m.text_anchor.0 + half);
         if from == to {
@@ -486,7 +553,11 @@ fn content_x_extent(d: &SeqDiagram, l: &SeqLayout) -> (f64, f64) {
         let x = l.col_x.get(a.p).copied().unwrap_or(0.0) + a.depth as f64 * ACT_OFFSET;
         take(x - ACT_W / 2.0, x + ACT_W / 2.0);
     }
-    if lo > hi { (PAD, PAD) } else { (lo, hi) }
+    if lo > hi {
+        (PAD, PAD)
+    } else {
+        (lo, hi)
+    }
 }
 
 /// Move everything right by `dx`.
@@ -564,7 +635,11 @@ mod tests {
             l.size.0
         );
         // Its left edge sits right of A and B (which aren't in the loop).
-        assert!(f.rect.x > l.col_x[1], "frame reaches back past B: {:?}", f.rect.x);
+        assert!(
+            f.rect.x > l.col_x[1],
+            "frame reaches back past B: {:?}",
+            f.rect.x
+        );
     }
 
     #[test]
@@ -587,14 +662,20 @@ mod tests {
     #[test]
     fn spanning_note_widens() {
         let base = lay("sequenceDiagram\nA->>B: x");
-        let noted = lay(&format!("sequenceDiagram\nA->>B: x\nNote over A,B: {}", "n".repeat(60)));
+        let noted = lay(&format!(
+            "sequenceDiagram\nA->>B: x\nNote over A,B: {}",
+            "n".repeat(60)
+        ));
         assert!(noted.col_x[1] - noted.col_x[0] > base.col_x[1] - base.col_x[0]);
     }
 
     #[test]
     fn left_note_extends_left_margin() {
         let base = lay("sequenceDiagram\nA->>B: x");
-        let noted = lay(&format!("sequenceDiagram\nA->>B: x\nNote left of A: {}", "n".repeat(40)));
+        let noted = lay(&format!(
+            "sequenceDiagram\nA->>B: x\nNote left of A: {}",
+            "n".repeat(40)
+        ));
         assert!(noted.col_x[0] > base.col_x[0]);
     }
 
@@ -640,7 +721,10 @@ mod tests {
         let f = &l.frames[0];
         let left = bx - f.rect.x;
         let right = (f.rect.x + f.rect.w) - bx;
-        assert!(left > 0.0 && right > 0.0, "frame does not straddle lifeline: L {left} R {right}");
+        assert!(
+            left > 0.0 && right > 0.0,
+            "frame does not straddle lifeline: L {left} R {right}"
+        );
         assert!(
             (left - right).abs() < 25.0,
             "loop frame not centered on lifeline: L {left} R {right}"
@@ -672,7 +756,11 @@ mod tests {
         let (inner, outer) = {
             let a = &l.frames[0];
             let b = &l.frames[1];
-            if a.depth > b.depth { (a, b) } else { (b, a) }
+            if a.depth > b.depth {
+                (a, b)
+            } else {
+                (b, a)
+            }
         };
         assert!(inner.rect.x > outer.rect.x);
         assert!(inner.rect.y > outer.rect.y);
@@ -695,7 +783,8 @@ mod tests {
     #[test]
     fn autonumber_start_step_and_off() {
         // start=10 step=5, then `off` stops numbering the last message.
-        let l = lay("sequenceDiagram\nautonumber 10 5\nA->>B: a\nA->>B: b\nautonumber off\nA->>B: c");
+        let l =
+            lay("sequenceDiagram\nautonumber 10 5\nA->>B: a\nA->>B: b\nautonumber off\nA->>B: c");
         assert_eq!(l.messages[0].number, Some(10));
         assert_eq!(l.messages[1].number, Some(15));
         assert_eq!(l.messages[2].number, None);
@@ -717,7 +806,11 @@ mod tests {
         let l = lay("sequenceDiagram\nloop a\nloop b\nloop c\nend\nend\nend");
         assert_eq!(l.frames.len(), 3);
         for f in &l.frames {
-            assert!(f.rect.w >= FRAME_MIN_W, "frame width {} below floor", f.rect.w);
+            assert!(
+                f.rect.w >= FRAME_MIN_W,
+                "frame width {} below floor",
+                f.rect.w
+            );
             assert!(f.rect.w.is_finite() && f.rect.h.is_finite());
         }
         assert!(l.size.0.is_finite() && l.size.1.is_finite());
@@ -729,7 +822,11 @@ mod tests {
 
     #[test]
     fn issue_277_repros_stay_inside_the_canvas() {
-        let nested_opt = format!("sequenceDiagram\n{}A->>B: deep\n{}", "opt o\n".repeat(8), "end\n".repeat(8));
+        let nested_opt = format!(
+            "sequenceDiagram\n{}A->>B: deep\n{}",
+            "opt o\n".repeat(8),
+            "end\n".repeat(8)
+        );
         for src in [
             "sequenceDiagram\nA->>A: this is a quite long self message label that is wide\nA->>B: hi",
             "sequenceDiagram\nNote over A: a very long note over a single participant here yes\nA->>B: x",
@@ -748,18 +845,40 @@ mod tests {
 
     #[test]
     fn divider_label_sits_below_its_line_clear_of_the_arrows() {
-        let svg = svg("sequenceDiagram\nalt ok\nA->>B: y\nelse other\nNote over A: n\nB->>A: z\nend");
+        let svg =
+            svg("sequenceDiagram\nalt ok\nA->>B: y\nelse other\nNote over A: n\nB->>A: z\nend");
         let (_, drawn) = crate::extent::scan(&svg);
-        let label = drawn.iter().find(|d| d.text == "[other]").expect("divider label").bbox;
-        let divider = drawn.iter().find(|d| d.tag == "line" && d.bbox.y0 == d.bbox.y1 && d.bbox.x0 < label.x0).unwrap().bbox;
-        assert!(label.y0 >= divider.y0, "label {label:?} above its divider {divider:?}");
+        let label = drawn
+            .iter()
+            .find(|d| d.text == "[other]")
+            .expect("divider label")
+            .bbox;
+        let divider = drawn
+            .iter()
+            .find(|d| d.tag == "line" && d.bbox.y0 == d.bbox.y1 && d.bbox.x0 < label.x0)
+            .unwrap()
+            .bbox;
+        assert!(
+            label.y0 >= divider.y0,
+            "label {label:?} above its divider {divider:?}"
+        );
         for d in &drawn {
             if d.text != "[other]" && d.tag != "line" && d.tag != "rect" {
-                assert!(d.bbox.overlap(&label) == 0.0, "{d:?} overlaps the divider label {label:?}");
+                assert!(
+                    d.bbox.overlap(&label) == 0.0,
+                    "{d:?} overlaps the divider label {label:?}"
+                );
             }
         }
-        let note = drawn.iter().find(|d| d.tag == "rect" && d.bbox.y0 > divider.y0 && d.bbox.x1 - d.bbox.x0 < 100.0).unwrap();
-        assert!(note.bbox.y0 >= label.y1, "note {:?} overlaps divider label {label:?}", note.bbox);
+        let note = drawn
+            .iter()
+            .find(|d| d.tag == "rect" && d.bbox.y0 > divider.y0 && d.bbox.x1 - d.bbox.x0 < 100.0)
+            .unwrap();
+        assert!(
+            note.bbox.y0 >= label.y1,
+            "note {:?} overlaps divider label {label:?}",
+            note.bbox
+        );
     }
 
     #[test]
@@ -767,35 +886,72 @@ mod tests {
         let l = lay("sequenceDiagram\nalt ok\nA->>B: y\nelse a very long else label that is much wider than the rest\nB->>A: z\nend");
         let f = &l.frames[0];
         let need = text_size("[a very long else label that is much wider than the rest]").0;
-        assert!(f.rect.w >= need + 16.0, "frame {} narrower than its divider label {need}", f.rect.w);
+        assert!(
+            f.rect.w >= need + 16.0,
+            "frame {} narrower than its divider label {need}",
+            f.rect.w
+        );
     }
 
     /// Text boxes (from the rendered SVG) of a message label vs its arrow.
     fn label_and_arrow(src: &str) -> (crate::extent::Box2, f64) {
         let svg = svg(src);
         let (_, drawn) = crate::extent::scan(&svg);
-        let label = drawn.iter().find(|d| d.tag == "text" && d.text.starts_with("one")).expect("label").bbox;
-        let arrow = drawn.iter().find(|d| d.tag == "line" && d.bbox.y0 == d.bbox.y1 && d.bbox.x1 > d.bbox.x0 + 1.0).expect("arrow");
+        let label = drawn
+            .iter()
+            .find(|d| d.tag == "text" && d.text.starts_with("one"))
+            .expect("label")
+            .bbox;
+        let arrow = drawn
+            .iter()
+            .find(|d| d.tag == "line" && d.bbox.y0 == d.bbox.y1 && d.bbox.x1 > d.bbox.x0 + 1.0)
+            .expect("arrow");
         (label, arrow.bbox.y0)
     }
 
     #[test]
     fn multi_line_labels_sit_above_their_arrow() {
-        for src in ["sequenceDiagram\nA->>B: one<br/>two<br/>three", "sequenceDiagram\nA->>B: one"] {
+        for src in [
+            "sequenceDiagram\nA->>B: one<br/>two<br/>three",
+            "sequenceDiagram\nA->>B: one",
+        ] {
             let (label, arrow_y) = label_and_arrow(src);
-            assert!(label.y1 <= arrow_y, "{src}: label bottom {} crosses arrow at {arrow_y}", label.y1);
+            assert!(
+                label.y1 <= arrow_y,
+                "{src}: label bottom {} crosses arrow at {arrow_y}",
+                label.y1
+            );
             crate::extent::assert_inside(&svg(src));
         }
     }
 
     #[test]
     fn self_message_label_clears_its_loop() {
-        for src in ["sequenceDiagram\nA->>A: thinking hard", "sequenceDiagram\nA->>A: one<br/>two", "sequenceDiagram\nA->>A: one\nA->>B: x"] {
+        for src in [
+            "sequenceDiagram\nA->>A: thinking hard",
+            "sequenceDiagram\nA->>A: one<br/>two",
+            "sequenceDiagram\nA->>A: one\nA->>B: x",
+        ] {
             let svg = svg(src);
             let (_, drawn) = crate::extent::scan(&svg);
-            let label = drawn.iter().find(|d| d.tag == "text" && d.text.starts_with("one") || d.text.starts_with("thinking")).unwrap();
-            let lp = drawn.iter().find(|d| d.tag == "path" && d.bbox.x1 > d.bbox.x0 + 20.0 && d.bbox.y1 - d.bbox.y0 > 20.0).expect("loop");
-            assert!(label.bbox.y1 <= lp.bbox.y0, "{src}: label {:?} touches loop {:?}", label.bbox, lp.bbox);
+            let label = drawn
+                .iter()
+                .find(|d| {
+                    d.tag == "text" && d.text.starts_with("one") || d.text.starts_with("thinking")
+                })
+                .unwrap();
+            let lp = drawn
+                .iter()
+                .find(|d| {
+                    d.tag == "path" && d.bbox.x1 > d.bbox.x0 + 20.0 && d.bbox.y1 - d.bbox.y0 > 20.0
+                })
+                .expect("loop");
+            assert!(
+                label.bbox.y1 <= lp.bbox.y0,
+                "{src}: label {:?} touches loop {:?}",
+                label.bbox,
+                lp.bbox
+            );
         }
     }
 

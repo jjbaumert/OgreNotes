@@ -41,7 +41,10 @@ fn split_ws_quoted(s: &str) -> Result<Vec<Tok>, ()> {
     while let Some(c) = chars.next() {
         if c == '"' {
             if in_bare {
-                toks.push(Tok { text: std::mem::take(&mut cur), quoted: false });
+                toks.push(Tok {
+                    text: std::mem::take(&mut cur),
+                    quoted: false,
+                });
                 in_bare = false;
             }
             let mut q = String::new();
@@ -56,10 +59,16 @@ fn split_ws_quoted(s: &str) -> Result<Vec<Tok>, ()> {
             if !closed {
                 return Err(());
             }
-            toks.push(Tok { text: q, quoted: true });
+            toks.push(Tok {
+                text: q,
+                quoted: true,
+            });
         } else if c.is_whitespace() {
             if in_bare {
-                toks.push(Tok { text: std::mem::take(&mut cur), quoted: false });
+                toks.push(Tok {
+                    text: std::mem::take(&mut cur),
+                    quoted: false,
+                });
                 in_bare = false;
             }
         } else {
@@ -68,7 +77,10 @@ fn split_ws_quoted(s: &str) -> Result<Vec<Tok>, ()> {
         }
     }
     if in_bare {
-        toks.push(Tok { text: cur, quoted: false });
+        toks.push(Tok {
+            text: cur,
+            quoted: false,
+        });
     }
     Ok(toks)
 }
@@ -147,7 +159,11 @@ struct Parser {
 
 pub(crate) fn parse(source: &str) -> Result<ErGraph, ParseError> {
     let mut p = Parser {
-        g: ErGraph { entities: vec![], relations: vec![], class_defs: vec![] },
+        g: ErGraph {
+            entities: vec![],
+            relations: vec![],
+            class_defs: vec![],
+        },
         ids: HashMap::new(),
         line: 0,
         block: None,
@@ -190,7 +206,10 @@ pub(crate) fn parse(source: &str) -> Result<ErGraph, ParseError> {
 
 impl Parser {
     fn err(&self, msg: impl Into<String>) -> ParseError {
-        ParseError { message: msg.into(), line: Some(self.line) }
+        ParseError {
+            message: msg.into(),
+            line: Some(self.line),
+        }
     }
 
     /// Peels a leading entity name — `"quoted"` (any inner text) or bare
@@ -248,7 +267,9 @@ impl Parser {
         if let Some((id, cls)) = stmt.split_once(":::") {
             let id = id.trim();
             let cls = cls.trim();
-            if !id.is_empty() && !cls.is_empty() && !cls.contains(char::is_whitespace)
+            if !id.is_empty()
+                && !cls.is_empty()
+                && !cls.contains(char::is_whitespace)
                 && cls.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             {
                 self.validate_id(id)?;
@@ -387,8 +408,8 @@ impl Parser {
     /// after `:` is required by the grammar.
     fn parse_relationship(&mut self, stmt: &str) -> Result<(), ParseError> {
         let (before, after) = split_label_colon(stmt);
-        let toks = split_ws_quoted(before)
-            .map_err(|()| self.err("unterminated quoted entity name"))?;
+        let toks =
+            split_ws_quoted(before).map_err(|()| self.err("unterminated quoted entity name"))?;
         if toks.len() < 3 {
             return Err(self.err(format!("expected `A <cardinality> B`, found {before:?}")));
         }
@@ -397,7 +418,7 @@ impl Parser {
         let middle: Vec<&Tok> = toks[1..toks.len() - 1].iter().collect();
         let (card_from, identifying, card_to) = self.parse_cardinality_spec(&middle)?;
         let label = match after.map(str::trim) {
-            Some(l) if !l.is_empty() => l.to_string(),
+            Some(l) if !l.is_empty() => crate::unquote_label(l).to_string(),
             _ => return Err(self.err("relationship needs a `: label`")),
         };
         self.validate_entity_token(left)?;
@@ -433,7 +454,11 @@ impl Parser {
         if middle.is_empty() || middle.iter().any(|t| t.quoted) {
             return Err(self.err("invalid relationship cardinality"));
         }
-        let phrase = middle.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+        let phrase = middle
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         let (identifying, lp, rp) = if let Some((l, r)) = phrase.split_once(" optionally to ") {
             (false, l, r)
         } else if let Some((l, r)) = phrase.split_once(" to ") {
@@ -456,7 +481,9 @@ impl Parser {
             return Ok(());
         }
         let attr = self.parse_attribute_row(line)?;
-        let (idx, _) = self.block.expect("handle_block_line only called while a block is open");
+        let (idx, _) = self
+            .block
+            .expect("handle_block_line only called while a block is open");
         self.g.entities[idx].attributes.push(attr);
         Ok(())
     }
@@ -476,9 +503,9 @@ impl Parser {
                     Some(e) => {
                         let after = inner[e + 1..].trim();
                         if !after.is_empty() {
-                            return Err(
-                                self.err(format!("unexpected text after attribute comment: {after:?}"))
-                            );
+                            return Err(self.err(format!(
+                                "unexpected text after attribute comment: {after:?}"
+                            )));
                         }
                         (line[..q].trim_end(), Some(inner[..e].to_string()))
                     }
@@ -490,7 +517,9 @@ impl Parser {
 
         let mut tokens = main.split_whitespace();
         let (Some(ty), Some(name)) = (tokens.next(), tokens.next()) else {
-            return Err(self.err(format!("expected `type name` attribute row, found {line:?}")));
+            return Err(self.err(format!(
+                "expected `type name` attribute row, found {line:?}"
+            )));
         };
 
         let key_str = tokens.collect::<Vec<_>>().join(" ");
@@ -509,12 +538,19 @@ impl Parser {
                 }
             }
         }
-        Ok(ErAttribute { ty: ty.to_string(), name: name.to_string(), keys, comment })
+        Ok(ErAttribute {
+            ty: ty.to_string(),
+            name: name.to_string(),
+            keys,
+            comment,
+        })
     }
 
     fn validate_id(&self, id: &str) -> Result<(), ParseError> {
         if id.is_empty()
-            || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         {
             return Err(self.err(format!("invalid entity id {id:?}")));
         }
@@ -602,11 +638,31 @@ mod tests {
     #[test]
     fn all_cardinality_symbols() {
         let cases = [
-            ("A ||--|| B : r", Cardinality::ExactlyOne, Cardinality::ExactlyOne),
-            ("A |o--o| B : r", Cardinality::ZeroOrOne, Cardinality::ZeroOrOne),
-            ("A }|--|{ B : r", Cardinality::OneOrMore, Cardinality::OneOrMore),
-            ("A }o--o{ B : r", Cardinality::ZeroOrMore, Cardinality::ZeroOrMore),
-            ("A ||--o{ B : r", Cardinality::ExactlyOne, Cardinality::ZeroOrMore),
+            (
+                "A ||--|| B : r",
+                Cardinality::ExactlyOne,
+                Cardinality::ExactlyOne,
+            ),
+            (
+                "A |o--o| B : r",
+                Cardinality::ZeroOrOne,
+                Cardinality::ZeroOrOne,
+            ),
+            (
+                "A }|--|{ B : r",
+                Cardinality::OneOrMore,
+                Cardinality::OneOrMore,
+            ),
+            (
+                "A }o--o{ B : r",
+                Cardinality::ZeroOrMore,
+                Cardinality::ZeroOrMore,
+            ),
+            (
+                "A ||--o{ B : r",
+                Cardinality::ExactlyOne,
+                Cardinality::ZeroOrMore,
+            ),
         ];
         for (src, want_from, want_to) in cases {
             let g = p(&format!("erDiagram\n{src}"));
@@ -711,10 +767,16 @@ mod tests {
     #[test]
     fn attribute_comment_kept() {
         let g = p("erDiagram\nA {\nstring name \"the display name\"\nint id PK \"primary\"\n}");
-        assert_eq!(g.entities[0].attributes[0].comment.as_deref(), Some("the display name"));
+        assert_eq!(
+            g.entities[0].attributes[0].comment.as_deref(),
+            Some("the display name")
+        );
         assert_eq!(g.entities[0].attributes[0].name, "name");
         assert_eq!(g.entities[0].attributes[1].keys, vec!["PK"]);
-        assert_eq!(g.entities[0].attributes[1].comment.as_deref(), Some("primary"));
+        assert_eq!(
+            g.entities[0].attributes[1].comment.as_deref(),
+            Some("primary")
+        );
     }
 
     #[test]
@@ -731,11 +793,19 @@ mod tests {
 
     #[test]
     fn er_styling_parses() {
-        let g = parse("erDiagram\nclassDef warm fill:#f80\nCAR\nCAR:::warm\nstyle CAR fill:#333").unwrap();
+        let g = parse("erDiagram\nclassDef warm fill:#f80\nCAR\nCAR:::warm\nstyle CAR fill:#333")
+            .unwrap();
         let car = g.entities.iter().find(|e| e.id == "CAR").unwrap();
         assert_eq!(car.classes, vec!["warm".to_string()]);
         assert_eq!(car.style.as_deref(), Some("fill:#333"));
-        assert_eq!(g.class_defs.iter().find(|d| d.name == "warm").unwrap().style, "fill:#f80");
+        assert_eq!(
+            g.class_defs
+                .iter()
+                .find(|d| d.name == "warm")
+                .unwrap()
+                .style,
+            "fill:#f80"
+        );
     }
 
     #[test]

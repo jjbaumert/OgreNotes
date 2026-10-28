@@ -21,7 +21,7 @@ const DIAMOND_PORT_SPREAD: f64 = 14.0;
 /// Remove the portion of an edge inside its source cluster. The layout path
 /// starts at a member representative and crosses the cluster boundary; only
 /// the portion from that boundary onward is visible for a cluster endpoint.
-fn clip_start_to_cluster(points: &mut Vec<(f64, f64)>, rect: &Rect) {
+pub(crate) fn clip_start_to_cluster(points: &mut Vec<(f64, f64)>, rect: &Rect) {
     let inside = |p: (f64, f64)| {
         p.0 >= rect.x - 1e-6
             && p.0 <= rect.x + rect.w + 1e-6
@@ -66,20 +66,164 @@ fn clip_start_to_cluster(points: &mut Vec<(f64, f64)>, rect: &Rect) {
 /// A curve between two endpoints bowed off its midpoint (perpendicular to the
 /// flow axis) so parallel edges between the same node pair separate.
 fn bowed_path(points: &[(f64, f64)], off: f64, vertical: bool) -> String {
-    if points.len() < 2 || off == 0.0 {
+    if points.len() != 2 || off == 0.0 {
         return crate::curved_path(points, vertical);
     }
-    let start = points[0];
-    let end = *points.last().unwrap();
-    let mx = (start.0 + end.0) / 2.0;
-    let my = (start.1 + end.1) / 2.0;
-    // In top-down flow bow horizontally; in left-right flow bow vertically.
-    let mid = if vertical {
-        (mx + off, my)
+    let (start, end) = (points[0], points[1]);
+    let mut mid = ((start.0 + end.0) / 2.0, (start.1 + end.1) / 2.0);
+    if vertical {
+        mid.0 += off;
     } else {
-        (mx, my + off)
-    };
+        mid.1 += off;
+    }
     crate::curved_path(&[start, mid, end], vertical)
+}
+
+type NodeGeometry = (f64, f64, f64, f64, crate::flowchart::ShapeKind);
+
+type Cubic = [(f64, f64); 4];
+
+/// Exact de Casteljau subdivision preserves the original route at both ends.
+fn split_cubic(curve: Cubic, t: f64) -> (Cubic, Cubic) {
+    let mix = |a: (f64, f64), b: (f64, f64)| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+    let (a, b, c) = (
+        mix(curve[0], curve[1]),
+        mix(curve[1], curve[2]),
+        mix(curve[2], curve[3]),
+    );
+    let (d, e) = (mix(a, b), mix(b, c));
+    let middle = mix(d, e);
+    ([curve[0], a, d, middle], [middle, e, c, curve[3]])
+}
+
+/// Only actual ancestor containers may contain a route legitimately. An
+/// explicitly referenced cluster border stays an obstacle even if one of its
+/// hidden ports belongs to that same cluster.
+pub(crate) fn route_cluster_obstacles(
+    rects: &[Rect],
+    parents: &[Option<usize>],
+    memberships: (Option<usize>, Option<usize>),
+    endpoints: (Option<usize>, Option<usize>),
+) -> Vec<Rect> {
+    let mut allowed = vec![false; rects.len()];
+    for mut ancestor in [memberships.0, memberships.1] {
+        while let Some(index) = ancestor {
+            allowed[index] = true;
+            ancestor = parents[index];
+        }
+    }
+    rects
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            !allowed[*index] || Some(*index) == endpoints.0 || Some(*index) == endpoints.1
+        })
+        .map(|(_, rect)| rect.clone())
+        .collect()
+}
+
+/// Fan only an obstacle-free middle section of an existing curve. Its exact
+/// end sections, route waypoints and port stubs stay unchanged. Translated
+/// middle handles retain the original tangent at every subdivision join.
+pub(crate) fn routed_parallel_path(
+    points: &[(f64, f64)],
+    position: usize,
+    count: usize,
+    vertical: bool,
+    nodes: &[Rect],
+    clusters: &[Rect],
+    canvas: (f64, f64),
+) -> Option<String> {
+    let axes = |p: (f64, f64)| if vertical { (p.0, p.1) } else { (p.1, p.0) };
+    let curves: Vec<Cubic> = points
+        .windows(2)
+        .map(|pair| {
+            let (start, end) = (pair[0], pair[1]);
+            let controls = if vertical {
+                let y = (start.1 + end.1) / 2.0;
+                [(start.0, y), (end.0, y)]
+            } else {
+                let x = (start.0 + end.0) / 2.0;
+                [(x, start.1), (x, end.1)]
+            };
+            [start, controls[0], controls[1], end]
+        })
+        .collect();
+    for (index, original) in curves.iter().copied().enumerate() {
+        // Short exit/entry stubs must remain exactly as supplied by routing.
+        if (axes(original[3]).1 - axes(original[0]).1).abs() <= 8.0 {
+            continue;
+        }
+        let (before, rest) = split_cubic(original, 0.25);
+        let (middle, after) = split_cubic(rest, 2.0 / 3.0);
+        let (mut along_min, mut along_max, mut across_min, mut across_max) = (
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for point in middle {
+            let (across, along) = axes(point);
+            along_min = along_min.min(along);
+            along_max = along_max.max(along);
+            across_min = across_min.min(across);
+            across_max = across_max.max(across);
+        }
+        let (mut lower, mut upper) = (0.0_f64, if vertical { canvas.0 } else { canvas.1 });
+        let mut blocked = false;
+        for rect in nodes.iter().chain(clusters) {
+            let (center, half) = (
+                axes((rect.x + rect.w / 2.0, rect.y + rect.h / 2.0)),
+                axes((rect.w / 2.0, rect.h / 2.0)),
+            );
+            if along_min >= center.1 + half.1 - 1e-6
+                || along_max <= center.1 - half.1 + 1e-6
+                || half.0 == 0.0
+                || half.1 == 0.0
+            {
+                continue;
+            }
+            let (left, right) = (center.0 - half.0, center.0 + half.0);
+            if right <= across_min + 1e-6 {
+                lower = lower.max(right);
+            } else if left >= across_max - 1e-6 {
+                upper = upper.min(left);
+            } else {
+                blocked = true;
+                break;
+            }
+        }
+        if blocked {
+            continue;
+        }
+        let (mut left, mut right) = split_cubic(middle, 0.5);
+        let movable = [axes(left[2]).0, axes(left[3]).0, axes(right[1]).0];
+        let amount = (count as f64 - 1.0) / 2.0 * PARALLEL_BOW;
+        let low = (-amount).max(lower + 0.5 - movable.into_iter().fold(f64::INFINITY, f64::min));
+        let high = amount.min(upper - 0.5 - movable.into_iter().fold(f64::NEG_INFINITY, f64::max));
+        if high - low < 1.0 {
+            continue;
+        }
+        let offset = low + (high - low) * position as f64 / (count - 1) as f64;
+        for point in left[2..].iter_mut().chain(right[..2].iter_mut()) {
+            if vertical {
+                point.0 += offset;
+            } else {
+                point.1 += offset;
+            }
+        }
+        let mut fanned = curves.clone();
+        fanned.splice(index..=index, [before, left, right, after]);
+        let mut path = format!("M {:.1} {:.1}", points[0].0, points[0].1);
+        for curve in fanned {
+            path.push_str(&format!(
+                " C {:.1} {:.1} {:.1} {:.1} {:.1} {:.1}",
+                curve[1].0, curve[1].1, curve[2].0, curve[2].1, curve[3].0, curve[3].1
+            ));
+        }
+        return Some(path);
+    }
+    None
 }
 
 pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
@@ -142,7 +286,7 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
     // anchoring. The layout clips edges to each node's bounding BOX; for a
     // diamond that snaps branch/return edges to the bottom vertex, so we
     // re-anchor diamond endpoints to the appropriate face midpoint instead.
-    let geom: Vec<(f64, f64, f64, f64, crate::flowchart::ShapeKind)> = g
+    let geom: Vec<NodeGeometry> = g
         .nodes
         .iter()
         .enumerate()
@@ -153,6 +297,18 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
             (cx, cy, nw / 2.0, nh / 2.0, n.shape)
         })
         .collect();
+    let node_obstacles: Vec<Rect> = geom
+        .iter()
+        .zip(&g.nodes)
+        .filter(|(_, node)| !node.hidden)
+        .map(|(&(cx, cy, hw, hh, _), _)| Rect {
+            x: cx - hw,
+            y: cy - hh,
+            w: 2.0 * hw,
+            h: 2.0 * hh,
+        })
+        .collect();
+    let cluster_parents: Vec<_> = g.subgraphs.iter().map(|cluster| cluster.parent).collect();
     // Intersection of the ray from a diamond's center toward `(tx, ty)` with
     // its rhombus outline (|x|/hw + |y|/hh = 1). A near-vertical edge lands on
     // the top/bottom vertex; a diagonal branch lands on a lower face — matching
@@ -232,14 +388,51 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
                 pts.reverse();
             }
         }
-        // Bow apart only genuine multi-edges between the same pair, and only
-        // when the routing is simple (<= 3 points) — long routed edges keep
-        // their waypoints untouched to avoid regressing complex layouts.
+        // Preserve all routing waypoints, especially short exit/entry stubs.
+        // Bow only a direct gap between facing node borders. Its control
+        // points then remain in the gap, outside both endpoint boxes.
+        let facing_borders = if pts.len() == 2 && e.from_cluster.is_none() && e.to_cluster.is_none()
+        {
+            let coordinate = |p: (f64, f64)| if vertical { p.1 } else { p.0 };
+            let side = |node: usize, p: (f64, f64)| {
+                let g = geom[node];
+                let center = if vertical { g.1 } else { g.0 };
+                let half = if vertical { g.3 } else { g.2 };
+                let delta = coordinate(p) - center;
+                ((delta.abs() - half).abs() < 1e-6).then_some(delta.signum())
+            };
+            let delta = coordinate(pts[1]) - coordinate(pts[0]);
+            matches!((side(e.from, pts[0]), side(e.to, pts[1])), (Some(a), Some(b)) if a * delta > 0.0 && b * delta < 0.0)
+        } else {
+            false
+        };
         let d = match multi.get(&(e.from.min(e.to), e.from.max(e.to))) {
-            Some(grp) if grp.len() > 1 && pts.len() <= 3 => {
+            Some(grp) if grp.len() > 1 && facing_borders => {
                 let pos = grp.iter().position(|&x| x == i).unwrap_or(0);
                 let off = (pos as f64 - (grp.len() as f64 - 1.0) / 2.0) * PARALLEL_BOW;
                 bowed_path(&pts, off, vertical)
+            }
+            Some(group)
+                if group.len() > 1
+                    && (e.from_cluster.is_none() || e.from_cluster != e.to_cluster) =>
+            {
+                let position = group.iter().position(|&edge| edge == i).unwrap_or(0);
+                let cluster_obstacles = route_cluster_obstacles(
+                    &l.cluster_rects,
+                    &cluster_parents,
+                    (g.nodes[e.from].subgraph, g.nodes[e.to].subgraph),
+                    (e.from_cluster, e.to_cluster),
+                );
+                routed_parallel_path(
+                    &pts,
+                    position,
+                    group.len(),
+                    vertical,
+                    &node_obstacles,
+                    &cluster_obstacles,
+                    l.size,
+                )
+                .unwrap_or_else(|| crate::curved_path(&pts, vertical))
             }
             _ => crate::curved_path(&pts, vertical),
         };
@@ -321,6 +514,94 @@ pub(crate) fn emit(g: &FlowGraph, l: &Layout) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parallel_source_ports_preserve_exit_stubs_in_emitted_curves() {
+        let source = include_str!("../../tests/fixtures/parallel-source-port.mmd");
+        let svg = crate::render(source).svg.expect("parallel fixture renders");
+        let (_, drawn) = crate::extent::scan(&svg);
+        let boxes: Vec<_> = drawn
+            .iter()
+            .filter(|item| item.tag == "rect")
+            .map(|item| item.bbox)
+            .collect();
+        assert_eq!(
+            boxes.len(),
+            10,
+            "all fixture node rectangles must be checked"
+        );
+        let paths: Vec<_> = svg
+            .split("</defs>")
+            .nth(1)
+            .unwrap()
+            .split("<path d=\"")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap())
+            .collect();
+        assert_eq!(paths.len(), 12, "all fixture edges must be checked");
+        let distinct: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(distinct.len(), 12, "parallel routes must remain distinct");
+        // All three repeated edges keep the same unmodified four-pixel
+        // source exit stub before fanning in the free gap below the node.
+        let first_segments: Vec<_> = paths[9..]
+            .iter()
+            .map(|path| path.split(" C ").take(2).collect::<Vec<_>>())
+            .collect();
+        assert!(first_segments.windows(2).all(|pair| pair[0] == pair[1]));
+        let midpoints: Vec<f64> = paths[9..]
+            .iter()
+            .map(|path| {
+                path.split(" C ")
+                    .nth(3)
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(4)
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            (midpoints[2] - midpoints[0]).abs() >= 20.0,
+            "parallel curves must separate visibly: {midpoints:?}"
+        );
+        for path in paths {
+            let mut tokens = path.split_whitespace();
+            let point = |tokens: &mut std::str::SplitWhitespace<'_>| -> [f64; 2] {
+                [
+                    tokens.next().unwrap().parse().unwrap(),
+                    tokens.next().unwrap().parse().unwrap(),
+                ]
+            };
+            assert_eq!(tokens.next(), Some("M"));
+            let mut from = point(&mut tokens);
+            while let Some(command) = tokens.next() {
+                assert_eq!(command, "C");
+                let a = point(&mut tokens);
+                let b = point(&mut tokens);
+                let to = point(&mut tokens);
+                for step in 0..=128 {
+                    let t = step as f64 / 128.0;
+                    let u = 1.0 - t;
+                    let [x, y] = std::array::from_fn(|axis| {
+                        u * u * u * from[axis]
+                            + 3.0 * u * u * t * a[axis]
+                            + 3.0 * u * t * t * b[axis]
+                            + t * t * t * to[axis]
+                    });
+                    for rect in &boxes {
+                        assert!(
+                            !(x > rect.x0 + 0.15
+                                && x < rect.x1 - 0.15
+                                && y > rect.y0 + 0.15
+                                && y < rect.y1 - 0.15),
+                            "curve enters endpoint/node interior at {x},{y}: {path}"
+                        );
+                    }
+                }
+                from = to;
+            }
+        }
+    }
     use crate::flowchart::render_flowchart;
 
     #[test]

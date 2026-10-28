@@ -82,10 +82,14 @@ to `match`; half-arrows and central connections keep `error` notes now
 naming their construct. The `mermaid-seq-gap` analysis worktree is
 removed after the file is copied.
 
+Rectangular background regions now support validated `rgb(...)` and
+`rgba(...)` colors, including nested fragments. Other color syntax errors
+with its original source line.
+
 ## Out of scope (stays on issue #45's honest-error list)
 
 `@{ type: … }` participant stereotypes; `create`/`destroy`; `box`
-grouping (incl. colors/transparent); `rect` background highlighting;
+grouping (incl. colors/transparent);
 `autonumber <start> <increment>` / `autonumber off` (deliberate);
 actor `link`/`links` menus; entity-code decoding; mermaid's boxed
 autonumber rendering (ours stays an inline label prefix); the 4px

@@ -43,6 +43,57 @@ const OPERATORS: &[(&str, bool, RelKind, bool, bool)] = &[
     ("..", false, RelKind::DashedLink, false, false),
 ];
 
+const LEFT_RELATION_HEADS: &[&str] = &["<|", "<", "*", "o", "()", ""];
+const RIGHT_RELATION_HEADS: &[&str] = &["|>", ">", "*", "o", "()", ""];
+
+fn is_relation_operator(token: &str) -> bool {
+    ["--", ".."].into_iter().any(|line| {
+        token.split_once(line).is_some_and(|(left, right)| {
+            LEFT_RELATION_HEADS.contains(&left) && RIGHT_RELATION_HEADS.contains(&right)
+        })
+    })
+}
+
+fn unsupported_operator_at(sub: &str, separate_left_endpoint: bool) -> Option<&str> {
+    let mut longest: Option<&str> = None;
+    for &left in LEFT_RELATION_HEADS {
+        let Some(after_left) = sub.strip_prefix(left) else {
+            continue;
+        };
+        if left == "o" && !separate_left_endpoint {
+            continue;
+        }
+        for line in ["--", ".."] {
+            let Some(after_line) = after_left.strip_prefix(line) else {
+                continue;
+            };
+            for &right in RIGHT_RELATION_HEADS {
+                let Some(suffix) = after_line.strip_prefix(right) else {
+                    continue;
+                };
+                let operator = &sub[..sub.len() - suffix.len()];
+                if lookup_operator(operator).is_some() {
+                    continue;
+                }
+                // A trailing o may instead begin an endpoint such as order,
+                // o_target, or the entire id o at the end of the statement.
+                if right == "o"
+                    && (suffix.starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
+                        || !suffix.trim_start().starts_with(|ch: char| {
+                            ch.is_ascii_alphanumeric() || ch == '_' || ch == '"'
+                        }))
+                {
+                    continue;
+                }
+                if longest.is_none_or(|previous| operator.len() > previous.len()) {
+                    longest = Some(operator);
+                }
+            }
+        }
+    }
+    longest
+}
+
 fn lookup_operator(tok: &str) -> Option<(bool, RelKind, bool, bool)> {
     OPERATORS
         .iter()
@@ -88,7 +139,10 @@ fn tokenize_rel(s: &str) -> Vec<String> {
             if !cur.is_empty() {
                 toks.push(std::mem::take(&mut cur));
             }
-        } else if let Some(op) = match_operator_at(&s[idx..]) {
+        } else if let Some(op) =
+            unsupported_operator_at(&s[idx..], cur.is_empty() && !toks.is_empty())
+                .or_else(|| match_operator_at(&s[idx..]))
+        {
             if !cur.is_empty() {
                 toks.push(std::mem::take(&mut cur));
             }
@@ -106,6 +160,18 @@ fn tokenize_rel(s: &str) -> Vec<String> {
     toks
 }
 
+fn split_label_colon(statement: &str) -> (&str, Option<&str>) {
+    let mut quoted = false;
+    for (index, character) in statement.char_indices() {
+        if character == '"' {
+            quoted = !quoted;
+        } else if character == ':' && !quoted {
+            return (&statement[..index], Some(&statement[index + 1..]));
+        }
+    }
+    (statement, None)
+}
+
 struct Parser {
     g: ClassGraph,
     ids: HashMap<String, usize>,
@@ -119,6 +185,62 @@ struct Parser {
     cur_ns: Option<(usize, usize)>,
 }
 
+/// Pair type parameter/subscript groups once per member. The former helper
+/// re-lexed the remaining suffix for each group, allocating in proportion to
+/// the suffix length. These direct lookups keep repeated groups linear.
+fn generic_type_group_ends(text: &str) -> Vec<Option<usize>> {
+    let mut ends = vec![None; text.len() + 1];
+    let mut groups = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut generic_depth = 0usize;
+    for (index, ch) in text.char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        // A group's contents need quote/lifetime handling. Text before that
+        // group is not validated as a particular language's type expression.
+        if !groups.is_empty() {
+            if ch == '\'' && super::lifetime_quote(text, index, generic_depth > 0) {
+                continue;
+            }
+            match ch {
+                '"' | '\'' => {
+                    quote = Some(ch);
+                    continue;
+                }
+                '<' => generic_depth += 1,
+                '>' if !text[..index].ends_with(['-', '=']) => {
+                    generic_depth = generic_depth.saturating_sub(1)
+                }
+                _ => {}
+            }
+        }
+        match ch {
+            '(' | '[' => groups.push((index, ch)),
+            ')' | ']' => {
+                let expected = if ch == ')' { '(' } else { '[' };
+                if groups.last().is_some_and(|&(_, open)| open == expected) {
+                    let (open, _) = groups.pop().unwrap();
+                    ends[open] = Some(index + 1);
+                    if groups.is_empty() {
+                        generic_depth = 0;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    ends
+}
+
 /// Rewrite Mermaid generic syntax `~Type~` to `<Type>` in a member string.
 /// A single leading visibility marker (`+ - # ~`) is peeled off first so its
 /// `~` is never mistaken for a generic opener (`~List~int~ x` → `~List<int> x`).
@@ -127,22 +249,85 @@ fn generics_to_angle(s: &str) -> String {
         Some(c @ ('+' | '-' | '#' | '~')) => (&s[..c.len_utf8()], &s[c.len_utf8()..]),
         _ => ("", s),
     };
-    let mut out = String::from(vis);
-    let mut cur = rest;
-    while let Some(open) = cur.find('~') {
-        match cur[open + 1..].find('~') {
-            Some(rel) => {
-                let close = open + 1 + rel;
-                out.push_str(&cur[..open]);
-                out.push('<');
-                out.push_str(&cur[open + 1..close]);
-                out.push('>');
-                cur = &cur[close + 1..];
+    // Match a generic argument list from right to left. A tilde after a
+    // type name starts a nested list only when that list has a grammatical
+    // end; otherwise it closes the enclosing list before an adjacent name.
+    // This distinguishes List~List~int~~ from List~int~ids without guessing
+    // from the next character or recursively backtracking over member text.
+    let groups = generic_type_group_ends(rest);
+    let mut ends = vec![None; rest.len() + 1];
+    for (open, ch) in rest.char_indices().rev() {
+        if ch != '~' {
+            continue;
+        }
+        let mut cursor = open + 1;
+        loop {
+            cursor += rest[cursor..].len() - rest[cursor..].trim_start().len();
+            let start = cursor;
+            for ch in rest[cursor..].chars() {
+                // Type arguments are display text, not a Rust/C++ validator.
+                // Preserve multiword qualifiers, wildcards, operators, and
+                // existing angle-bracket syntax; only structural boundaries
+                // stop an atom.
+                if !ch.is_whitespace()
+                    && !matches!(ch, '~' | ',' | '(' | ')' | '[' | ']' | '{' | '}')
+                {
+                    cursor += ch.len_utf8();
+                } else {
+                    break;
+                }
             }
-            None => break,
+            if cursor == start {
+                if let Some(end) = groups[cursor] {
+                    cursor = end;
+                } else {
+                    break;
+                }
+            }
+            if let Some(end) = ends[cursor] {
+                cursor = end;
+            }
+            while rest[cursor..].starts_with(['[', '(']) {
+                let Some(end) = groups[cursor] else {
+                    break;
+                };
+                cursor = end;
+            }
+            cursor += rest[cursor..].len() - rest[cursor..].trim_start().len();
+            if rest[cursor..].starts_with('~') {
+                ends[open] = Some(cursor + 1);
+                break;
+            }
+            if rest[cursor..].starts_with(',') {
+                cursor += 1;
+            } else if !rest[cursor..].is_empty()
+                && !rest[cursor..].starts_with([')', ']', '{', '}'])
+            {
+                // Another word/group in the same language-neutral type, such
+                // as `unsigned int`, `? extends Foo`, or `const T * &`.
+                continue;
+            } else {
+                break;
+            }
         }
     }
-    out.push_str(cur);
+    let mut out = String::from(vis);
+    let mut closes = Vec::new();
+    for (i, ch) in rest.char_indices() {
+        if closes.last() == Some(&i) {
+            closes.pop();
+            out.push('>');
+        } else if ch == '~' {
+            if let Some(end) = ends[i] {
+                out.push('<');
+                closes.push(end - 1);
+            } else {
+                out.push(ch);
+            }
+        } else {
+            out.push(ch);
+        }
+    }
     out
 }
 
@@ -205,7 +390,10 @@ pub(crate) fn parse(source: &str) -> Result<ClassGraph, ParseError> {
 
 impl Parser {
     fn err(&self, msg: impl Into<String>) -> ParseError {
-        ParseError { message: msg.into(), line: Some(self.line) }
+        ParseError {
+            message: msg.into(),
+            line: Some(self.line),
+        }
     }
 
     fn parse_statement(&mut self, stmt: &str) -> Result<(), ParseError> {
@@ -380,7 +568,11 @@ impl Parser {
     /// `class A,B styleName` / `cssClass "A,B" styleName`. Returns `None`
     /// when `stmt` is instead a `class Foo`/`class Foo {` declaration.
     fn try_class_assign(&mut self, stmt: &str) -> Option<Result<(), ParseError>> {
-        let kw = if stmt.starts_with("cssClass") { "cssClass" } else { "class" };
+        let kw = if stmt.starts_with("cssClass") {
+            "cssClass"
+        } else {
+            "class"
+        };
         let rest = stmt.strip_prefix(kw).unwrap().trim();
         // A `["Label"]` declaration can contain whitespace inside the
         // quoted label (`class A["Nice Label"]`), which would otherwise
@@ -428,7 +620,10 @@ impl Parser {
         // ASCII id scan: char count == byte length only because the
         // predicate is ASCII-only; do not relax without a byte-position
         // scan.
-        let id_len = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+        let id_len = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
         if id_len == 0 {
             return Err(self.err("expected a class id after `class`"));
         }
@@ -437,7 +632,10 @@ impl Parser {
         let mut after = rest[id_len..].trim_start();
         // `class A:::styleName` — attach a style class to the node.
         if let Some(colon) = after.strip_prefix(":::") {
-            let n = colon.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+            let n = colon
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count();
             if n == 0 {
                 return Err(self.err("expected a class name after `:::`"));
             }
@@ -493,8 +691,10 @@ impl Parser {
         match inner.find(']') {
             Some(end) => {
                 let raw = inner[..end].trim();
-                let unquoted =
-                    raw.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(raw);
+                let unquoted = raw
+                    .strip_prefix('"')
+                    .and_then(|x| x.strip_suffix('"'))
+                    .unwrap_or(raw);
                 let label = unquoted
                     .strip_prefix('`')
                     .and_then(|x| x.strip_suffix('`'))
@@ -519,7 +719,9 @@ impl Parser {
         if line.contains('{') {
             return Err(self.err("nested `{` in a class member block is not supported"));
         }
-        let (idx, _) = self.block.expect("handle_block_line only called while a block is open");
+        let (idx, _) = self
+            .block
+            .expect("handle_block_line only called while a block is open");
         Self::apply_member(&mut self.g.classes[idx], line);
         Ok(())
     }
@@ -534,7 +736,9 @@ impl Parser {
         if let Some((id, cls)) = stmt.split_once(":::") {
             let id = id.trim();
             let cls = cls.trim();
-            if !id.is_empty() && !cls.is_empty() && !cls.contains(char::is_whitespace)
+            if !id.is_empty()
+                && !cls.is_empty()
+                && !cls.contains(char::is_whitespace)
                 && cls.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             {
                 self.validate_id(id)?;
@@ -546,12 +750,15 @@ impl Parser {
         // Split the label FIRST, on the ORIGINAL statement, so a label's
         // text can never be mistaken for an operator token during the
         // scan below.
-        let (before, after) = match stmt.split_once(':') {
-            Some((b, a)) => (b, Some(a)),
-            None => (stmt, None),
-        };
+        let (before, after) = split_label_colon(stmt);
         let owned = tokenize_rel(before);
         let tokens: Vec<&str> = owned.iter().map(String::as_str).collect();
+        if let Some(operator) = tokens
+            .iter()
+            .find(|token| lookup_operator(token).is_none() && is_relation_operator(token))
+        {
+            return Err(self.err(format!("class relation `{operator}` is not supported")));
+        }
         if let Some(op_pos) = tokens.iter().position(|t| lookup_operator(t).is_some()) {
             let label = after.map(|s| s.trim().to_string());
             return self.parse_relationship(&tokens, op_pos, label);
@@ -581,7 +788,10 @@ impl Parser {
             return Err(self.err("unexpected tokens around relationship operator"));
         }
         let raw_left_mult = left_extra.first().map(|t| self.parse_mult(t)).transpose()?;
-        let raw_right_mult = right_extra.first().map(|t| self.parse_mult(t)).transpose()?;
+        let raw_right_mult = right_extra
+            .first()
+            .map(|t| self.parse_mult(t))
+            .transpose()?;
         let raw_left_id = tokens[0];
         let raw_right_id = tokens[tokens.len() - 1];
         self.validate_id(raw_left_id)?;
@@ -751,6 +961,54 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_relationship_markers_are_named_in_both_directions() {
+        for left in LEFT_RELATION_HEADS {
+            for line in ["--", ".."] {
+                for right in RIGHT_RELATION_HEADS {
+                    let operator = format!("{left}{line}{right}");
+                    if lookup_operator(&operator).is_some() {
+                        continue;
+                    }
+                    let error = parse(&format!("classDiagram\nA {operator} B")).unwrap_err();
+                    assert_eq!(error.line, Some(2));
+                    assert_eq!(
+                        error.message,
+                        format!("class relation `{operator}` is not supported")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_relation_detection_preserves_endpoint_names_and_members() {
+        for statement in [
+            "Foo..>Bar",
+            "o..>Bar",
+            "A *--order",
+            "A*--oBar",
+            "A *--o_target",
+            "A*--o",
+            "A o--order",
+            "A o--o_target",
+            "A o--o",
+            "order--o_target",
+            "Foo\"o..: literal\"-->\"*..\"Bar",
+        ] {
+            assert_eq!(
+                p(&format!("classDiagram\n{statement}")).relations.len(),
+                1,
+                "{statement}"
+            );
+        }
+        let graph = p("classDiagram\nclass A {\n+List~o--o~ values\n}\nA : +List~*--*~ values");
+        assert_eq!(
+            graph.classes[0].attributes,
+            ["+List<o--o> values", "+List<*--*> values"]
+        );
+    }
+
+    #[test]
     fn plain_association_has_no_arrow() {
         let g = p("classDiagram\nA -- B");
         assert!(!g.relations[0].arrow);
@@ -781,7 +1039,10 @@ mod tests {
         let svg = crate::render("classDiagram\nClass08 <--> C2: Cool label")
             .svg
             .expect("intro class example renders");
-        assert!(svg.contains("marker-start"), "back arrowhead missing: {svg}");
+        assert!(
+            svg.contains("marker-start"),
+            "back arrowhead missing: {svg}"
+        );
     }
 
     #[test]
@@ -825,14 +1086,20 @@ mod tests {
 
     #[test]
     fn namespace_groups_its_classes() {
-        let g = p("classDiagram\nnamespace Shapes {\n  class Circle\n  class Square\n}\nclass Loose");
+        let g =
+            p("classDiagram\nnamespace Shapes {\n  class Circle\n  class Square\n}\nclass Loose");
         assert_eq!(g.namespaces, vec!["Shapes".to_string()]);
         let ns = |id: &str| g.classes.iter().find(|c| c.id == id).unwrap().namespace;
         assert_eq!(ns("Circle"), Some(0));
         assert_eq!(ns("Square"), Some(0));
         assert_eq!(ns("Loose"), None); // declared outside the block
-        // a member block nested inside a namespace closes correctly
-        assert!(p("classDiagram\nnamespace N {\n class A {\n +int x\n }\n}").namespaces.len() == 1);
+                                       // a member block nested inside a namespace closes correctly
+        assert!(
+            p("classDiagram\nnamespace N {\n class A {\n +int x\n }\n}")
+                .namespaces
+                .len()
+                == 1
+        );
         // an unclosed namespace is a loud error
         assert!(parse("classDiagram\nnamespace N {\n class A").is_err());
         // nested namespaces are rejected
@@ -867,7 +1134,10 @@ mod tests {
 
     #[test]
     fn direction_sets_layout_direction() {
-        assert_eq!(p("classDiagram\nclass A").direction, crate::layout::Direction::TB);
+        assert_eq!(
+            p("classDiagram\nclass A").direction,
+            crate::layout::Direction::TB
+        );
         assert_eq!(
             p("classDiagram\ndirection LR\nA --> B").direction,
             crate::layout::Direction::LR
@@ -935,7 +1205,10 @@ mod tests {
             let g = p(src);
             assert_eq!(g.classes.len(), 1, "{src}");
             assert_eq!(g.classes[0].id, "A");
-            assert!(g.classes[0].classes.is_empty(), "no style class from the braces: {src}");
+            assert!(
+                g.classes[0].classes.is_empty(),
+                "no style class from the braces: {src}"
+            );
             assert!(g.classes[0].attributes.is_empty() && g.classes[0].methods.is_empty());
         }
         let g = p("classDiagram\nclass A { +x int }\nA --> B");
@@ -970,6 +1243,72 @@ mod tests {
     }
 
     #[test]
+    fn multiword_and_language_neutral_generic_arguments_keep_their_text() {
+        for (source, expected) in [
+            ("+List~unsigned int~ values", "+List<unsigned int> values"),
+            (
+                "+List~List~unsigned int~~ values",
+                "+List<List<unsigned int>> values",
+            ),
+            (
+                "+Map~unsigned int, const char *~ values",
+                "+Map<unsigned int, const char *> values",
+            ),
+            ("+List~? extends Foo~ values", "+List<? extends Foo> values"),
+            (
+                "+List~const unsigned long *&~ values",
+                "+List<const unsigned long *&> values",
+            ),
+            ("+List~&'a const T~ values", "+List<&'a const T> values"),
+            ("+List~int[4]~ values", "+List<int[4]> values"),
+            (
+                "+List~int[2 * (3 + 1)][]~ values",
+                "+List<int[2 * (3 + 1)][]> values",
+            ),
+            ("+List~char[']']~ values", "+List<char[']']> values"),
+            (
+                "+List~void (*)(unsigned int)~ values",
+                "+List<void (*)(unsigned int)> values",
+            ),
+            (
+                "+List~std::array<unsigned int, 4>~ values",
+                "+List<std::array<unsigned int, 4>> values",
+            ),
+            (
+                "+method(List~unsigned int~ids) bool",
+                "+method(List<unsigned int>ids) bool",
+            ),
+            (
+                "+method(List~List~unsigned int~~ids) bool",
+                "+method(List<List<unsigned int>>ids) bool",
+            ),
+        ] {
+            let graph = p(&format!("classDiagram\nclass A {{\n{source}\n}}"));
+            let class = &graph.classes[0];
+            let stored = class
+                .attributes
+                .first()
+                .or_else(|| class.methods.first())
+                .unwrap();
+            assert_eq!(stored, expected, "type argument conversion: {source}");
+        }
+    }
+
+    #[test]
+    fn repeated_type_groups_stay_fast_at_the_source_cap() {
+        let member = format!("+{}", "~()".repeat(6600));
+        let source = format!("classDiagram\nclass A {{\n{member}\n}}");
+        assert!(source.len() < crate::MAX_SOURCE_LEN);
+        let started = std::time::Instant::now();
+        let graph = p(&source);
+        assert_eq!(graph.classes[0].methods[0].len(), member.len());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "repeated-group parsing must not rescan every remaining suffix"
+        );
+    }
+
+    #[test]
     fn standalone_annotation_sets_class_annotation() {
         // `<<enumeration>> Color` (annotation as its own statement, outside a
         // class block) must set the class annotation, same as the inline form.
@@ -988,12 +1327,17 @@ mod tests {
 
     #[test]
     fn class_styling_parses_and_resolves() {
-        let g = p("classDiagram\nclassDef hot fill:#f00\nclass A\nA:::hot\nclass B\nstyle B fill:#0f0");
+        let g = p(
+            "classDiagram\nclassDef hot fill:#f00\nclass A\nA:::hot\nclass B\nstyle B fill:#0f0",
+        );
         let a = g.classes.iter().find(|c| c.id == "A").unwrap();
         assert_eq!(a.classes, vec!["hot".to_string()]);
         let b = g.classes.iter().find(|c| c.id == "B").unwrap();
         assert_eq!(b.style.as_deref(), Some("fill:#0f0"));
-        assert_eq!(g.class_defs.iter().find(|d| d.name == "hot").unwrap().style, "fill:#f00");
+        assert_eq!(
+            g.class_defs.iter().find(|d| d.name == "hot").unwrap().style,
+            "fill:#f00"
+        );
     }
 
     #[test]

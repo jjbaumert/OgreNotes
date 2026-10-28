@@ -79,9 +79,10 @@ statement parsing.
   (offset preserved). Unterminated front matter is a loud error.
   Applies to every diagram kind, since it precedes kind detection.
 - **`classDef default`**: after parsing, the `default` class's style
-  (if defined) applies to every node with no explicit class
-  assignment, matching mermaid. Explicitly-classed nodes are
-  unaffected. Same style allowlist as every classDef.
+  (if defined) supplies default properties to every flowchart node,
+  including explicitly classed nodes. Explicit class properties override
+  matching defaults; unspecified properties continue to inherit. Inline
+  styles override both. Same style allowlist as every classDef.
 - **Subroutine shape `A[[text]]`**: 14th flowchart shape — rectangle
   plus two inner vertical lines inset from the left/right edges.
   Bracket matcher tries `[[` before `[` (the existing longest-first
@@ -124,7 +125,8 @@ reasoning applies at each slice site (commented per convention).
 - Front matter: skipped for each kind, error-line offset preserved,
   unterminated block errors, `---` mid-document NOT treated as front
   matter.
-- `classDef default` applied to unclassed nodes only.
+- `classDef default` applied to unclassed nodes and inherited by explicitly
+  classed nodes, with per-property explicit and inline overrides.
 - Subroutine shape: SVG structure (rect + two inner lines), bracket
   precedence vs `[` and `[(`.
 - SVG structural: `marker-start` present for reversed/bidirectional

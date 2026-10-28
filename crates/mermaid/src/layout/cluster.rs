@@ -64,6 +64,9 @@ struct SubBuild {
     /// `(layout.size.0, layout.size.1 + title.1 + CLUSTER_PAD)`. Unused
     /// (left zeroed) for the top level, which has no parent.
     placeholder_size: (f64, f64),
+    /// Outside decoration space included in the placeholder footprint, but
+    /// excluded from the painted cluster rectangle.
+    external_margin: (f64, f64),
 }
 
 /// Walks a node's cluster-ancestor chain to find its representative entity
@@ -96,7 +99,12 @@ fn representative_of(input: &LayoutInput, v: usize, target: Option<usize>) -> Op
 /// a member linked outside it ignores its own `direction` and inherits
 /// (mermaid.js: "if any of a subgraph's nodes are linked to the outside,
 /// subgraph direction will be ignored").
-fn effective_dir(clusters: &[super::LCluster], links_out: &[bool], c: usize, graph_dir: Direction) -> Direction {
+fn effective_dir(
+    clusters: &[super::LCluster],
+    links_out: &[bool],
+    c: usize,
+    graph_dir: Direction,
+) -> Direction {
     let mut cur = Some(c);
     let mut guard = 0usize;
     while let Some(ci) = cur {
@@ -216,7 +224,9 @@ fn build_level(
     // Boundary-crossing edges: a leg from the inside member to this
     // cluster's exit port (or from its entry port to the member).
     if let Some(c) = target {
-        let port_of = |exit: bool, entities: &mut Vec<Entity>, idx: &mut std::collections::HashMap<Entity, usize>| {
+        let port_of = |exit: bool,
+                       entities: &mut Vec<Entity>,
+                       idx: &mut std::collections::HashMap<Entity, usize>| {
             *idx.entry(Entity::Port(exit)).or_insert_with(|| {
                 entities.push(Entity::Port(exit));
                 entities.len() - 1
@@ -228,11 +238,21 @@ fn build_level(
                 continue;
             }
             let inner = if from_in { edge.from } else { edge.to };
-            let Some(rep) = representative_of(input, inner, target) else { continue };
+            let Some(rep) = representative_of(input, inner, target) else {
+                continue;
+            };
             let member = entity_index[&rep];
             let port = port_of(from_in, &mut entities, &mut entity_index);
-            let (from, to) = if from_in { (member, port) } else { (port, member) };
-            local_edges.push(LEdge { from, to, label: None });
+            let (from, to) = if from_in {
+                (member, port)
+            } else {
+                (port, member)
+            };
+            local_edges.push(LEdge {
+                from,
+                to,
+                label: None,
+            });
             local_edge_orig.push(LocalRole::Leg(ei));
         }
         // Pin the exit port below every sink and the entry port above every
@@ -254,13 +274,21 @@ fn build_level(
             }
             if let Some(&p) = entity_index.get(&Entity::Port(true)) {
                 if !has_out[i] {
-                    local_edges.push(LEdge { from: i, to: p, label: None });
+                    local_edges.push(LEdge {
+                        from: i,
+                        to: p,
+                        label: None,
+                    });
                     local_edge_orig.push(LocalRole::Pin);
                 }
             }
             if let Some(&p) = entity_index.get(&Entity::Port(false)) {
                 if !has_in[i] {
-                    local_edges.push(LEdge { from: p, to: i, label: None });
+                    local_edges.push(LEdge {
+                        from: p,
+                        to: i,
+                        label: None,
+                    });
                     local_edge_orig.push(LocalRole::Pin);
                 }
             }
@@ -283,17 +311,29 @@ fn build_level(
         match *e {
             Entity::Node(v) => {
                 let n = &input.nodes[v];
-                local_nodes.push(LNode { width: n.width, height: n.height, cluster: None });
+                local_nodes.push(LNode {
+                    width: n.width,
+                    height: n.height,
+                    cluster: None,
+                });
             }
             Entity::Cluster(c) => {
                 let (w, h) = sub_builds[c]
                     .as_ref()
                     .expect("child clusters are built before their parent")
                     .placeholder_size;
-                local_nodes.push(LNode { width: w, height: h, cluster: None });
+                local_nodes.push(LNode {
+                    width: w,
+                    height: h,
+                    cluster: None,
+                });
             }
             Entity::Port(_) => {
-                local_nodes.push(LNode { width: PORT_SIZE, height: PORT_SIZE, cluster: None });
+                local_nodes.push(LNode {
+                    width: PORT_SIZE,
+                    height: PORT_SIZE,
+                    cluster: None,
+                });
             }
         }
     }
@@ -312,6 +352,7 @@ fn build_level(
         local_edge_orig,
         layout,
         placeholder_size: (0.0, 0.0),
+        external_margin: (0.0, 0.0),
     })
 }
 
@@ -343,10 +384,14 @@ fn expand_level(
                 let child = sub_builds[c]
                     .as_ref()
                     .expect("child clusters are built before their parent");
-                let (w, h) = child.placeholder_size;
+                let (full_w, full_h) = child.placeholder_size;
+                let (w, h) = (
+                    full_w - child.external_margin.0,
+                    full_h - child.external_margin.1,
+                );
                 let rect = Rect {
-                    x: abs_center.0 - w / 2.0,
-                    y: abs_center.1 - h / 2.0,
+                    x: abs_center.0 - full_w / 2.0,
+                    y: abs_center.1 - full_h / 2.0,
                     w,
                     h,
                 };
@@ -385,7 +430,12 @@ fn expand_level(
             }
             LocalRole::Real(orig) => {
                 let label_at = ep.label_at.map(|p| (p.0 + translate.0, p.1 + translate.1));
-                edges_out.push(EdgePath { edge: orig, points: pts, label_at, reversed: ep.reversed });
+                edges_out.push(EdgePath {
+                    edge: orig,
+                    points: pts,
+                    label_at,
+                    reversed: ep.reversed,
+                });
             }
         }
     }
@@ -404,7 +454,21 @@ fn stitch_legs(
     legs: &mut std::collections::HashMap<(usize, usize), Vec<(f64, f64)>>,
     cluster_rects: &[Option<Rect>],
     node_centers: &[(f64, f64)],
-) {
+    margins: &[(f64, f64)],
+) -> Result<(), String> {
+    let limit = margins
+        .iter()
+        .any(|&(right, bottom)| right > 0.0 || bottom > 0.0)
+        .then(|| {
+            super::waypoint_budget(input.nodes.len())
+                .saturating_add(input.edges.len().saturating_mul(6))
+        });
+    let mut point_count: usize = edges.iter().map(|edge| edge.points.len()).sum();
+    if let Some(limit) = limit {
+        if point_count > limit {
+            return Err(format!("diagram too large: {point_count} edge waypoints after cluster routing (max {limit})"));
+        }
+    }
     for ep in edges.iter_mut() {
         let e = &input.edges[ep.edge];
         if e.from == e.to {
@@ -420,50 +484,92 @@ fn stitch_legs(
             input.nodes.iter().enumerate().any(|(v, n)| {
                 v != e.from
                     && v != e.to
-                    && segment_hits_box(a, b, node_centers[v], (n.width / 2.0 - 1.0, n.height / 2.0 - 1.0))
+                    && segment_hits_box(
+                        a,
+                        b,
+                        node_centers[v],
+                        (n.width / 2.0 - 1.0, n.height / 2.0 - 1.0),
+                    )
             })
         };
         let mut pts: Vec<(f64, f64)> = Vec::new();
-        let join = |pts: &mut Vec<(f64, f64)>, next: (f64, f64), ring: Option<&Rect>| {
-            if let (Some(&last), Some(r)) = (pts.last(), ring) {
-                if blocked(last, next) {
+        let join = |pts: &mut Vec<(f64, f64)>,
+                    next: (f64, f64),
+                    cluster: Option<usize>,
+                    outgoing: bool| {
+            if let (Some(&last), Some(cluster)) = (pts.last(), cluster) {
+                let Some(r) = &cluster_rects[cluster] else {
+                    return;
+                };
+                let margin = margins.get(cluster).copied().unwrap_or((0.0, 0.0));
+                if margin.0 > 0.0 || margin.1 > 0.0 {
+                    // Parent routes meet the full decoration footprint.
+                    // Join via its perimeter rather than cutting diagonally
+                    // across labels between the painted box and that border.
+                    let full = Rect {
+                        x: r.x,
+                        y: r.y,
+                        w: r.w + margin.0,
+                        h: r.h + margin.1,
+                    };
+                    if outgoing {
+                        let bottom = (last.0, full.y + full.h);
+                        pts.push(bottom);
+                        pts.extend(ring_route_at(&full, bottom, next, 0.0));
+                    } else {
+                        let top = (next.0, full.y);
+                        pts.extend(ring_route_at(&full, last, top, 0.0));
+                        pts.push(top);
+                    }
+                } else if blocked(last, next) {
                     pts.extend(ring_route(r, last, next));
                 }
             }
         };
         let push_all = |pts: &mut Vec<(f64, f64)>, seg: &[(f64, f64)]| {
             for &p in seg {
-                if pts.last().is_none_or(|q: &(f64, f64)| (q.0 - p.0).abs() > 1e-6 || (q.1 - p.1).abs() > 1e-6) {
+                if pts.last().is_none_or(|q: &(f64, f64)| {
+                    (q.0 - p.0).abs() > 1e-6 || (q.1 - p.1).abs() > 1e-6
+                }) {
                     pts.push(p);
                 }
             }
         };
-        let mut ring: Option<&Rect> = None;
+        let mut ring: Option<usize> = None;
         for c in &src {
             if let Some(seg) = legs.remove(&(ep.edge, *c)) {
                 if let Some(&first) = seg.first() {
-                    join(&mut pts, first, ring);
+                    join(&mut pts, first, ring, true);
                 }
                 push_all(&mut pts, &seg);
-                ring = cluster_rects[*c].as_ref();
+                ring = Some(*c);
             }
         }
         if let Some(&first) = ep.points.first() {
-            join(&mut pts, first, ring);
+            join(&mut pts, first, ring, true);
         }
         push_all(&mut pts, &ep.points);
         for c in dst.iter().rev() {
             if let Some(seg) = legs.remove(&(ep.edge, *c)) {
                 if let Some(&first) = seg.first() {
-                    join(&mut pts, first, cluster_rects[*c].as_ref());
+                    join(&mut pts, first, Some(*c), false);
                 }
                 push_all(&mut pts, &seg);
             }
         }
         if pts.len() >= 2 {
+            point_count = point_count
+                .saturating_sub(ep.points.len())
+                .saturating_add(pts.len());
+            if let Some(limit) = limit {
+                if point_count > limit {
+                    return Err(format!("diagram too large: {point_count} edge waypoints after cluster routing (max {limit})"));
+                }
+            }
             ep.points = pts;
         }
     }
+    Ok(())
 }
 
 /// Does segment a→b pass through the box centered at `c` with half-extents
@@ -475,7 +581,12 @@ fn segment_hits_box(a: (f64, f64), b: (f64, f64), c: (f64, f64), half: (f64, f64
     }
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
-    for (p, q) in [(-dx, a.0 - (c.0 - hx)), (dx, (c.0 + hx) - a.0), (-dy, a.1 - (c.1 - hy)), (dy, (c.1 + hy) - a.1)] {
+    for (p, q) in [
+        (-dx, a.0 - (c.0 - hx)),
+        (dx, (c.0 + hx) - a.0),
+        (-dy, a.1 - (c.1 - hy)),
+        (dy, (c.1 + hy) - a.1),
+    ] {
         if p.abs() < 1e-12 {
             if q < 0.0 {
                 return false;
@@ -500,6 +611,10 @@ fn segment_hits_box(a: (f64, f64), b: (f64, f64), c: (f64, f64), half: (f64, f64
 /// nodes — taking the shorter way round.
 fn ring_route(r: &Rect, from: (f64, f64), to: (f64, f64)) -> Vec<(f64, f64)> {
     let d = (CLUSTER_PAD / 2.0).min(r.w / 4.0).min(r.h / 4.0);
+    ring_route_at(r, from, to, d)
+}
+
+fn ring_route_at(r: &Rect, from: (f64, f64), to: (f64, f64), d: f64) -> Vec<(f64, f64)> {
     let (x0, y0, x1, y1) = (r.x + d, r.y + d, r.x + r.w - d, r.y + r.h - d);
     // Perimeter coordinate of the nearest track point, clockwise from the
     // top-left corner.
@@ -507,8 +622,19 @@ fn ring_route(r: &Rect, from: (f64, f64), to: (f64, f64)) -> Vec<(f64, f64)> {
     let perim = 2.0 * (w + h);
     let project = |p: (f64, f64)| -> ((f64, f64), f64) {
         let (px, py) = (p.0.clamp(x0, x1), p.1.clamp(y0, y1));
-        let dists = [(py - y0).abs(), (x1 - px).abs(), (y1 - py).abs(), (px - x0).abs()];
-        let side = (0..4).min_by(|&a, &b| dists[a].partial_cmp(&dists[b]).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(0);
+        let dists = [
+            (py - y0).abs(),
+            (x1 - px).abs(),
+            (y1 - py).abs(),
+            (px - x0).abs(),
+        ];
+        let side = (0..4)
+            .min_by(|&a, &b| {
+                dists[a]
+                    .partial_cmp(&dists[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(0);
         match side {
             0 => ((px, y0), px - x0),
             1 => ((x1, py), w + (py - y0)),
@@ -518,19 +644,30 @@ fn ring_route(r: &Rect, from: (f64, f64), to: (f64, f64)) -> Vec<(f64, f64)> {
     };
     let (pa, sa) = project(from);
     let (pb, sb) = project(to);
-    let corners = [(0.0, (x0, y0)), (w, (x1, y0)), (w + h, (x1, y1)), (2.0 * w + h, (x0, y1))];
+    let corners = [
+        (0.0, (x0, y0)),
+        (w, (x1, y0)),
+        (w + h, (x1, y1)),
+        (2.0 * w + h, (x0, y1)),
+    ];
     let cw = (sb - sa).rem_euclid(perim);
     let mut out = vec![pa];
     if cw <= perim - cw {
         // Clockwise: corners with coordinate in (sa, sa + cw).
-        let mut cs: Vec<(f64, (f64, f64))> =
-            corners.iter().map(|&(t, c)| ((t - sa).rem_euclid(perim), c)).filter(|&(t, _)| t > 1e-9 && t < cw).collect();
+        let mut cs: Vec<(f64, (f64, f64))> = corners
+            .iter()
+            .map(|&(t, c)| ((t - sa).rem_euclid(perim), c))
+            .filter(|&(t, _)| t > 1e-9 && t < cw)
+            .collect();
         cs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         out.extend(cs.into_iter().map(|(_, c)| c));
     } else {
         let ccw = perim - cw;
-        let mut cs: Vec<(f64, (f64, f64))> =
-            corners.iter().map(|&(t, c)| ((sa - t).rem_euclid(perim), c)).filter(|&(t, _)| t > 1e-9 && t < ccw).collect();
+        let mut cs: Vec<(f64, (f64, f64))> = corners
+            .iter()
+            .map(|&(t, c)| ((sa - t).rem_euclid(perim), c))
+            .filter(|&(t, _)| t > 1e-9 && t < ccw)
+            .collect();
         cs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         out.extend(cs.into_iter().map(|(_, c)| c));
     }
@@ -541,16 +678,40 @@ fn ring_route(r: &Rect, from: (f64, f64), to: (f64, f64)) -> Vec<(f64, f64)> {
 /// Lays out a graph whose `clusters` are non-empty via recursive
 /// collapse-expand: see the module doc for the algorithm.
 pub(crate) fn run_clustered(input: &LayoutInput) -> Result<Layout, String> {
-    validate(input)?;
+    run_clustered_with_margins(input, &[])
+}
 
-    let depths: Vec<usize> =
-        (0..input.clusters.len()).map(|c| cluster_depth(&input.clusters, c)).collect();
+/// Reserve right/bottom decoration margins while placing cluster siblings.
+/// The margins are external to each painted rectangle, and nested margins
+/// remain part of their ancestor's content footprint.
+pub(crate) fn run_clustered_with_margins(
+    input: &LayoutInput,
+    margins: &[(f64, f64)],
+) -> Result<Layout, String> {
+    validate(input)?;
+    if !margins.is_empty()
+        && (margins.len() != input.clusters.len()
+            || margins.iter().any(|&(right, bottom)| {
+                !right.is_finite() || !bottom.is_finite() || right < 0.0 || bottom < 0.0
+            }))
+    {
+        return Err("invalid cluster decoration margins".into());
+    }
+
+    let depths: Vec<usize> = (0..input.clusters.len())
+        .map(|c| cluster_depth(&input.clusters, c))
+        .collect();
     let mut order: Vec<usize> = (0..input.clusters.len()).collect();
     // Stable sort: deepest first, ties broken by ascending cluster index.
     order.sort_by_key(|&c| std::cmp::Reverse(depths[c]));
 
     let links_out: Vec<bool> = (0..input.clusters.len())
-        .map(|c| input.edges.iter().any(|e| under(input, e.from, c) != under(input, e.to, c)))
+        .map(|c| {
+            input
+                .edges
+                .iter()
+                .any(|e| under(input, e.from, c) != under(input, e.to, c))
+        })
         .collect();
     let mut sub_builds: Vec<Option<SubBuild>> = (0..input.clusters.len()).map(|_| None).collect();
     for c in order {
@@ -559,11 +720,16 @@ pub(crate) fn run_clustered(input: &LayoutInput) -> Result<Layout, String> {
         let (title_w, title_h) = input.clusters[c].title;
         // At least as wide as its title (#274); `expand_level` centers the
         // content in any extra width.
+        let external_margin = margins.get(c).copied().unwrap_or((0.0, 0.0));
         let placeholder_size = (
-            build.layout.size.0.max(title_w + 2.0 * CLUSTER_PAD),
-            build.layout.size.1 + title_h + CLUSTER_PAD,
+            build.layout.size.0.max(title_w + 2.0 * CLUSTER_PAD) + external_margin.0,
+            build.layout.size.1 + title_h + CLUSTER_PAD + external_margin.1,
         );
-        sub_builds[c] = Some(SubBuild { placeholder_size, ..build });
+        sub_builds[c] = Some(SubBuild {
+            placeholder_size,
+            external_margin,
+            ..build
+        });
     }
 
     let top = build_level(input, None, input.direction, &sub_builds)?;
@@ -583,7 +749,14 @@ pub(crate) fn run_clustered(input: &LayoutInput) -> Result<Layout, String> {
         &mut edges_out,
         &mut legs,
     );
-    stitch_legs(input, &mut edges_out, &mut legs, &cluster_rects, &node_centers);
+    stitch_legs(
+        input,
+        &mut edges_out,
+        &mut legs,
+        &cluster_rects,
+        &node_centers,
+        margins,
+    )?;
     edges_out.sort_by_key(|p| p.edge);
 
     let cluster_rects: Vec<Rect> = cluster_rects
@@ -596,7 +769,12 @@ pub(crate) fn run_clustered(input: &LayoutInput) -> Result<Layout, String> {
                 // `expand_level` always visits it. Kept as a hard fallback
                 // rather than a panic.
                 let (w, h) = input.clusters[i].title;
-                Rect { x: 0.0, y: 0.0, w: w.max(1.0), h: h.max(1.0) }
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: w.max(1.0),
+                    h: h.max(1.0),
+                }
             })
         })
         .collect();
@@ -605,8 +783,12 @@ pub(crate) fn run_clustered(input: &LayoutInput) -> Result<Layout, String> {
     // already oriented inside `build_level`, so the assembled whole is in
     // final coordinates. This is what lets a subgraph flow in a different
     // direction than its parent.
-    let layout =
-        Layout { node_centers, edge_paths: edges_out, cluster_rects, size: top.layout.size };
+    let layout = Layout {
+        node_centers,
+        edge_paths: edges_out,
+        cluster_rects,
+        size: top.layout.size,
+    };
     Ok(layout)
 }
 
@@ -616,19 +798,36 @@ mod tests {
     use crate::layout::{Direction, LCluster, LEdge, LNode, LayoutInput};
 
     fn node_in(c: Option<usize>) -> LNode {
-        LNode { width: 60.0, height: 24.0, cluster: c }
+        LNode {
+            width: 60.0,
+            height: 24.0,
+            cluster: c,
+        }
     }
 
     fn e(from: usize, to: usize) -> LEdge {
-        LEdge { from, to, label: None }
+        LEdge {
+            from,
+            to,
+            label: None,
+        }
     }
 
     fn input_one_cluster() -> LayoutInput {
         // 0 top-level -> 1 (in cluster) -> 2 (in cluster) -> 3 top-level
         LayoutInput {
-            nodes: vec![node_in(None), node_in(Some(0)), node_in(Some(0)), node_in(None)],
+            nodes: vec![
+                node_in(None),
+                node_in(Some(0)),
+                node_in(Some(0)),
+                node_in(None),
+            ],
             edges: vec![e(0, 1), e(1, 2), e(2, 3)],
-            clusters: vec![LCluster { parent: None, title: (50.0, 16.0), direction: None }],
+            clusters: vec![LCluster {
+                parent: None,
+                title: (50.0, 16.0),
+                direction: None,
+            }],
             direction: Direction::TB,
         }
     }
@@ -664,8 +863,16 @@ mod tests {
             nodes: vec![node_in(Some(0)), node_in(Some(1))],
             edges: vec![e(0, 1)],
             clusters: vec![
-                LCluster { parent: None, title: (40.0, 16.0), direction: None },
-                LCluster { parent: Some(0), title: (40.0, 16.0), direction: None },
+                LCluster {
+                    parent: None,
+                    title: (40.0, 16.0),
+                    direction: None,
+                },
+                LCluster {
+                    parent: Some(0),
+                    title: (40.0, 16.0),
+                    direction: None,
+                },
             ],
             direction: Direction::TB,
         };
@@ -748,7 +955,13 @@ mod tests {
 
     /// Does the segment a→b pass through the box (shrunk by `inset` so
     /// grazing a corner doesn't count)?
-    fn segment_hits_box(a: (f64, f64), b: (f64, f64), c: (f64, f64), half: (f64, f64), inset: f64) -> bool {
+    fn segment_hits_box(
+        a: (f64, f64),
+        b: (f64, f64),
+        c: (f64, f64),
+        half: (f64, f64),
+        inset: f64,
+    ) -> bool {
         let (hx, hy) = (half.0 - inset, half.1 - inset);
         if hx <= 0.0 || hy <= 0.0 {
             return false;
@@ -756,14 +969,23 @@ mod tests {
         // Liang–Barsky clip against the box.
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
         let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
-        for (p, q) in [(-dx, a.0 - (c.0 - hx)), (dx, (c.0 + hx) - a.0), (-dy, a.1 - (c.1 - hy)), (dy, (c.1 + hy) - a.1)] {
+        for (p, q) in [
+            (-dx, a.0 - (c.0 - hx)),
+            (dx, (c.0 + hx) - a.0),
+            (-dy, a.1 - (c.1 - hy)),
+            (dy, (c.1 + hy) - a.1),
+        ] {
             if p.abs() < 1e-12 {
                 if q < 0.0 {
                     return false;
                 }
             } else {
                 let r = q / p;
-                if p < 0.0 { t0 = t0.max(r) } else { t1 = t1.min(r) }
+                if p < 0.0 {
+                    t0 = t0.max(r)
+                } else {
+                    t1 = t1.min(r)
+                }
                 if t0 > t1 {
                     return false;
                 }
@@ -778,7 +1000,11 @@ mod tests {
         let input = LayoutInput {
             nodes: vec![node_in(Some(0)), node_in(Some(0)), node_in(None)],
             edges: vec![e(0, 1), e(0, 2)],
-            clusters: vec![LCluster { parent: None, title: (30.0, 16.0), direction: None }],
+            clusters: vec![LCluster {
+                parent: None,
+                title: (30.0, 16.0),
+                direction: None,
+            }],
             direction: Direction::TB,
         };
         let l = run_clustered(&input).unwrap();
@@ -792,8 +1018,14 @@ mod tests {
         }
         // Still runs from A's border to C's border.
         let (start, end) = (p[0], *p.last().unwrap());
-        assert!((start.0 - l.node_centers[0].0).abs() <= 30.0 + 1e-6 && (start.1 - l.node_centers[0].1).abs() <= 12.0 + 1e-6);
-        assert!((end.0 - l.node_centers[2].0).abs() <= 30.0 + 1e-6 && (end.1 - l.node_centers[2].1).abs() <= 12.0 + 1e-6);
+        assert!(
+            (start.0 - l.node_centers[0].0).abs() <= 30.0 + 1e-6
+                && (start.1 - l.node_centers[0].1).abs() <= 12.0 + 1e-6
+        );
+        assert!(
+            (end.0 - l.node_centers[2].0).abs() <= 30.0 + 1e-6
+                && (end.1 - l.node_centers[2].1).abs() <= 12.0 + 1e-6
+        );
     }
 
     #[test]
@@ -803,7 +1035,11 @@ mod tests {
         let input = LayoutInput {
             nodes: vec![node_in(None), node_in(Some(0)), node_in(Some(0))],
             edges: vec![e(0, 1), e(1, 2)],
-            clusters: vec![LCluster { parent: None, title: (50.0, 16.0), direction: None }],
+            clusters: vec![LCluster {
+                parent: None,
+                title: (50.0, 16.0),
+                direction: None,
+            }],
             direction: Direction::TB,
         };
         let l = run_clustered(&input).unwrap();
@@ -818,7 +1054,11 @@ mod tests {
         let input = LayoutInput {
             nodes: vec![node_in(None)],
             edges: vec![],
-            clusters: vec![LCluster { parent: None, title: (40.0, 16.0), direction: None }],
+            clusters: vec![LCluster {
+                parent: None,
+                title: (40.0, 16.0),
+                direction: None,
+            }],
             direction: Direction::TB,
         };
         let l = run_clustered(&input).unwrap();
@@ -833,7 +1073,11 @@ mod tests {
         let input = LayoutInput {
             nodes: vec![node_in(None), node_in(Some(0))],
             edges: vec![e(0, 1), e(1, 1)],
-            clusters: vec![LCluster { parent: None, title: (50.0, 16.0), direction: None }],
+            clusters: vec![LCluster {
+                parent: None,
+                title: (50.0, 16.0),
+                direction: None,
+            }],
             direction: Direction::TB,
         };
         let l = run_clustered(&input).unwrap();
@@ -852,8 +1096,16 @@ mod tests {
             nodes: vec![node_in(None), node_in(Some(1))],
             edges: vec![e(0, 1), e(1, 1)],
             clusters: vec![
-                LCluster { parent: None, title: (50.0, 16.0), direction: None },
-                LCluster { parent: Some(0), title: (50.0, 16.0), direction: None },
+                LCluster {
+                    parent: None,
+                    title: (50.0, 16.0),
+                    direction: None,
+                },
+                LCluster {
+                    parent: Some(0),
+                    title: (50.0, 16.0),
+                    direction: None,
+                },
             ],
             direction: Direction::TB,
         };
@@ -876,12 +1128,28 @@ mod tests {
         // final axis and overlapped.
         let input = LayoutInput {
             nodes: vec![
-                LNode { width: 60.0, height: 24.0, cluster: None },
-                LNode { width: 120.0, height: 20.0, cluster: Some(0) },
-                LNode { width: 120.0, height: 20.0, cluster: Some(0) },
+                LNode {
+                    width: 60.0,
+                    height: 24.0,
+                    cluster: None,
+                },
+                LNode {
+                    width: 120.0,
+                    height: 20.0,
+                    cluster: Some(0),
+                },
+                LNode {
+                    width: 120.0,
+                    height: 20.0,
+                    cluster: Some(0),
+                },
             ],
             edges: vec![e(0, 1), e(1, 2)],
-            clusters: vec![LCluster { parent: None, title: (50.0, 16.0), direction: None }],
+            clusters: vec![LCluster {
+                parent: None,
+                title: (50.0, 16.0),
+                direction: None,
+            }],
             direction: Direction::LR,
         };
         let l = run_clustered(&input).unwrap();

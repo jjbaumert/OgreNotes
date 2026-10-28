@@ -9,6 +9,33 @@ use crate::layout::Direction;
 use crate::ParseError;
 use std::collections::{HashMap, HashSet};
 
+const SHAPES: &[(&str, &[(&str, ShapeKind)])] = &[
+    ("(((", &[(")))", ShapeKind::DoubleCircle)]),
+    ("((", &[("))", ShapeKind::Circle)]),
+    ("([", &[("])", ShapeKind::Stadium)]),
+    ("[[", &[("]]", ShapeKind::Subroutine)]),
+    ("[(", &[(")]", ShapeKind::Cylinder)]),
+    (
+        "[/",
+        &[
+            ("/]", ShapeKind::Parallelogram),
+            ("\\]", ShapeKind::Trapezoid),
+        ],
+    ),
+    (
+        "[\\",
+        &[
+            ("\\]", ShapeKind::ParallelogramRev),
+            ("/]", ShapeKind::TrapezoidRev),
+        ],
+    ),
+    ("{{", &[("}}", ShapeKind::Hexagon)]),
+    ("{", &[("}", ShapeKind::Diamond)]),
+    ("[", &[("]", ShapeKind::Rect)]),
+    ("(", &[(")", ShapeKind::Rounded)]),
+    (">", &[("]", ShapeKind::Flag)]),
+];
+
 /// A fully-resolved edge operator, including any inline label.
 struct EdgeOp {
     kind: EdgeKind,
@@ -36,22 +63,294 @@ struct Parser {
 /// and `"` are ASCII, and char_indices yields char-start byte offsets,
 /// so every slice below lands on a char boundary regardless of
 /// multi-byte content.
+fn statement_delimiters(line: &str) -> impl Iterator<Item = usize> + '_ {
+    let mut in_quotes = false;
+    line.char_indices().filter_map(move |(index, character)| {
+        match character {
+            '"' => in_quotes = !in_quotes,
+            ';' if !in_quotes => return Some(index),
+            _ => {}
+        }
+        None
+    })
+}
+
+fn first_statement(line: &str) -> &str {
+    &line[..statement_delimiters(line).next().unwrap_or(line.len())]
+}
+
 fn split_statements(line: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0;
-    let mut in_quotes = false;
-    for (i, c) in line.char_indices() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            ';' if !in_quotes => {
-                out.push(&line[start..i]);
-                start = i + 1;
+    for index in statement_delimiters(line) {
+        out.push(&line[start..index]);
+        start = index + 1;
+    }
+    out.push(&line[start..]);
+    out
+}
+
+fn inline_edge_context(statement: &str) -> bool {
+    let first = statement
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .next()
+        .unwrap_or("");
+    !matches!(
+        first,
+        "classDef"
+            | "class"
+            | "style"
+            | "linkStyle"
+            | "direction"
+            | "subgraph"
+            | "end"
+            | "graph"
+            | "flowchart"
+            | "click"
+    )
+}
+
+/// Names in declarations are opaque lookup keys. Their punctuation is not
+/// edge syntax or a quoted node label; only the later style/comment body is.
+fn declaration_key_span(statement: &str) -> Option<(usize, usize)> {
+    let trimmed = statement.trim_start();
+    let leading = statement.len() - trimmed.len();
+    let keyword_end = trimmed
+        .find(|c: char| c.is_whitespace() || c == ';')
+        .unwrap_or(trimmed.len());
+    let keyword = &trimmed[..keyword_end];
+    if !matches!(keyword, "classDef" | "class" | "style" | "linkStyle") {
+        return None;
+    }
+    let mut cursor = leading + keyword_end;
+    let skip_space =
+        |cursor: usize| cursor + statement[cursor..].len() - statement[cursor..].trim_start().len();
+    cursor = skip_space(cursor);
+    if keyword == "class" {
+        loop {
+            let id_start = cursor;
+            cursor += statement[cursor..]
+                .bytes()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                .count();
+            if cursor == id_start {
+                return None;
+            }
+            cursor = skip_space(cursor);
+            if statement[cursor..].starts_with(',') {
+                cursor = skip_space(cursor + 1);
+            } else {
+                break;
+            }
+        }
+    }
+    let start = cursor;
+    let mut quoted = false;
+    for (index, ch) in statement[start..].char_indices() {
+        if ch == '"' {
+            quoted = !quoted;
+        }
+        if ch.is_whitespace() || ch == ';' && !quoted {
+            return (index > 0).then_some((start, start + index));
+        }
+    }
+    (cursor < statement.len()).then_some((start, statement.len()))
+}
+
+/// Quotes opt into delimiter protection only at the beginning of a label.
+/// Interior quotes in plain text, such as an inch mark, remain literal.
+fn edge_label_end(label: &str, delimiter: &str) -> Option<usize> {
+    if !label.trim_start().starts_with('"') {
+        return label.find(delimiter);
+    }
+    let mut quoted = false;
+    label.char_indices().find_map(|(index, ch)| {
+        if ch == '"' {
+            quoted = !quoted;
+        }
+        (!quoted && label[index..].starts_with(delimiter)).then_some(index)
+    })
+}
+
+/// Locate the same unquoted title bracket used by subgraph parsing. Bare
+/// title text keeps its existing quote/bracket interpretation.
+fn subgraph_title_bracket(title: &str) -> Option<usize> {
+    let title = first_statement(title);
+    let mut quoted = false;
+    title.char_indices().find_map(|(index, character)| {
+        if character == '"' {
+            quoted = !quoted;
+        }
+        (character == '[' && !quoted).then_some(index)
+    })
+}
+
+/// Find the last title closer before an outside comment. Nested brackets
+/// protect literal percent pairs, while unmatched literal inner brackets
+/// retain the parser's legacy final-`]` behavior.
+fn subgraph_title_end(title: &str) -> Option<usize> {
+    let title = first_statement(title);
+    let body = title.strip_prefix('[')?;
+    let start = if let Some(quoted) = body.trim_start().strip_prefix('"') {
+        title.len() - quoted.len() + quoted.find('"')? + 1
+    } else {
+        1
+    };
+    let mut depth = 1usize;
+    let mut last = None;
+    let mut unmatched_comment = None;
+    for (offset, ch) in title[start..].char_indices() {
+        let index = start + offset;
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.saturating_sub(1);
+                last = Some(index + 1);
+                if depth == 0 {
+                    unmatched_comment = None;
+                }
+            }
+            '%' if title[index..].starts_with("%%") => {
+                if depth == 0 {
+                    break;
+                }
+                // If unmatched literal `[` characters never close, retain
+                // the legacy final closer before its trailing comment.
+                if unmatched_comment.is_none() {
+                    unmatched_comment = last;
+                }
             }
             _ => {}
         }
     }
-    out.push(&line[start..]);
-    out
+    if depth > 0 {
+        unmatched_comment.or(last)
+    } else {
+        last
+    }
+}
+
+fn strip_trailing_comment<'a>(line: &'a str, parser: &Parser) -> &'a str {
+    let mut quoted = false;
+    let mut edge_context = inline_edge_context(line);
+    let subgraph = |statement: &str| {
+        let rest = statement.trim_start().strip_prefix("subgraph")?;
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) && !rest.starts_with(';') {
+            return None;
+        }
+        let body = rest.trim_start();
+        let start = statement.len() - body.len();
+        Some((
+            start,
+            subgraph_title_bracket(body).map(|index| start + index),
+        ))
+    };
+    let mut subgraph_context = subgraph(line);
+    let mut key_span = declaration_key_span(line);
+    let mut i = 0;
+    while i < line.len() {
+        if let Some((start, end)) = key_span {
+            if i == start {
+                i = end;
+                continue;
+            }
+        }
+        let tail = &line[i..];
+        let ch = tail.chars().next().expect("nonempty suffix");
+        if ch == '"' {
+            // Whole bare titles may be quoted. A quote inside ordinary title
+            // text is literal (for example an inch mark), not a comment guard.
+            if subgraph_context.is_none()
+                || quoted
+                || subgraph_context.is_some_and(|(start, _)| start == i)
+            {
+                quoted = !quoted;
+            }
+        } else if !quoted {
+            if ch == ';' {
+                edge_context = inline_edge_context(&line[i + 1..]);
+                let offset = i + 1;
+                subgraph_context = subgraph(&line[offset..])
+                    .map(|(start, bracket)| (start + offset, bracket.map(|index| index + offset)));
+                key_span =
+                    declaration_key_span(&line[i + 1..]).map(|(a, b)| (i + 1 + a, i + 1 + b));
+            }
+            if tail.starts_with("%%") {
+                return &line[..i];
+            }
+            if edge_context && tail.starts_with(":::") {
+                // Match the existing ASCII suffix grammar. Unsupported key
+                // punctuation must not open a pipe/quote/shape lexer state.
+                let length = tail[3..]
+                    .bytes()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                    .count();
+                i += 3 + length;
+                if line[i..].starts_with("%%") {
+                    return &line[..i];
+                }
+                if let Some(next) = line[i..].chars().next() {
+                    if !next.is_whitespace()
+                        && !matches!(next, ';' | '&' | '-' | '=' | '~' | '<' | 'o' | 'x')
+                    {
+                        return line;
+                    }
+                }
+                continue;
+            }
+            // Reuse the actual shape grammar rather than separately tracking
+            // its quote, bracket and literal-percent rules in this scanner.
+            if subgraph_context.is_some_and(|(_, bracket)| bracket == Some(i)) {
+                // Bare subgraph titles may contain `>`, `(` or `{`; those
+                // characters do not open node shapes in this grammar.
+                if let Some(end) = subgraph_title_end(tail) {
+                    i += end;
+                    continue;
+                }
+                return line; // actual subgraph parsing reports the error
+            }
+            if edge_context {
+                let mut rest = tail;
+                match parser.try_parse_bracket(&mut rest) {
+                    Ok(Some(_)) => {
+                        i += tail.len() - rest.len();
+                        continue;
+                    }
+                    // The actual node/subgraph parse reports the unclosed
+                    // shape. Retrying every suffix would scan quadratically.
+                    Err(_) => return line,
+                    _ => {}
+                }
+            }
+            if edge_context {
+                let bytes = tail.as_bytes();
+                let operator = matches!(ch, '-' | '=' | '~')
+                    || matches!(ch, '<' | 'o' | 'x') && matches!(bytes.get(1), Some(b'-' | b'='));
+                if operator {
+                    // This consumes both pipe and inline labels using the
+                    // renderer's own operator parser, including their text.
+                    let mut rest = tail;
+                    match parser.parse_edge_op(&mut rest) {
+                        Ok(_) => {
+                            i += tail.len() - rest.len();
+                            continue;
+                        }
+                        Err(_) => return line, // the real parse reports it
+                    }
+                }
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    i += tail
+                        .bytes()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                        .count();
+                    continue;
+                }
+            }
+        }
+        i += ch.len_utf8();
+    }
+    line
 }
 
 pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
@@ -73,7 +372,7 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
     let mut seen_header = false;
     for (idx, raw) in source.lines().enumerate() {
         p.line = idx + 1;
-        let line = raw.trim();
+        let line = strip_trailing_comment(raw, &p).trim();
         if line.is_empty() || line.starts_with("%%") {
             continue;
         }
@@ -118,14 +417,11 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
         });
     }
     resolve_subgraph_edges(&mut p.g, &p.edge_scopes, &p.explicit_nodes)?;
-    // mermaid auto-applies the class named `default` to every node with
-    // no explicit class assignment (explicitly-classed nodes keep their
-    // own resolution order untouched).
+    // Default properties apply first, then explicit classes override each
+    // property independently rather than replacing the default wholesale.
     if p.g.class_defs.iter().any(|d| d.name == "default") {
         for n in &mut p.g.nodes {
-            if n.classes.is_empty() {
-                n.classes.push("default".to_string());
-            }
+            n.classes.insert(0, "default".to_string());
         }
     }
     Ok(p.g)
@@ -135,7 +431,7 @@ pub(crate) fn parse(source: &str) -> Result<FlowGraph, ParseError> {
 /// referenced cluster gets a hidden entry or exit port as a direct member.
 /// Invisible pin edges place those ports before sources and after sinks, while
 /// visible edges terminate at the cluster border during SVG emission.
-fn resolve_subgraph_edges(
+pub(crate) fn resolve_subgraph_edges(
     g: &mut FlowGraph,
     scopes: &[Option<usize>],
     explicit: &HashSet<usize>,
@@ -409,20 +705,21 @@ impl Parser {
 
     fn parse_subgraph_open(&mut self, stmt: &str) -> Result<(), ParseError> {
         let rest = stmt.strip_prefix("subgraph").unwrap().trim();
-        let (id, title) = if let Some(bracket_pos) = rest.find('[') {
+        let bracket = subgraph_title_bracket(rest);
+        let (id, title) = if let Some(bracket_pos) = bracket {
             let id = rest[..bracket_pos].trim().to_string();
-            let after = rest[bracket_pos + 1..].trim_end();
-            let Some(body) = after.strip_suffix(']') else {
-                return Err(self.err("unclosed `[` in subgraph title"));
-            };
-            let title = body.trim();
+            let bracketed = &rest[bracket_pos..];
+            let end = subgraph_title_end(bracketed)
+                .filter(|end| bracketed[*end..].trim().is_empty())
+                .ok_or_else(|| self.err("unclosed `[` in subgraph title"))?;
+            let title = bracketed[1..end - 1].trim();
             let title = title
                 .strip_prefix('"')
                 .and_then(|s| s.strip_suffix('"'))
                 .unwrap_or(title);
             (id, title.to_string())
         } else {
-            let whole = rest.trim().to_string();
+            let whole = crate::unquote_label(rest.trim()).to_string();
             if whole.is_empty() {
                 return Err(self.err("subgraph needs an id or title"));
             }
@@ -538,6 +835,9 @@ impl Parser {
             return Err(self.err(format!("expected a node id, found {r:?}")));
         }
         let id: String = r[..id_len].to_string();
+        if id == "end" {
+            return Err(self.err("`end` is reserved for closing a subgraph"));
+        }
         let mut after = &r[id_len..];
         let shape_label = self.try_parse_bracket(&mut after)?;
 
@@ -595,33 +895,8 @@ impl Parser {
         rest: &mut &str,
     ) -> Result<Option<(ShapeKind, String)>, ParseError> {
         // (opener, &[(closer, shape)]) — closers tried longest-first.
-        const TABLE: &[(&str, &[(&str, ShapeKind)])] = &[
-            ("(((", &[(")))", ShapeKind::DoubleCircle)]),
-            ("((", &[("))", ShapeKind::Circle)]),
-            ("([", &[("])", ShapeKind::Stadium)]),
-            ("[[", &[("]]", ShapeKind::Subroutine)]),
-            ("[(", &[(")]", ShapeKind::Cylinder)]),
-            (
-                "[/",
-                &[
-                    ("/]", ShapeKind::Parallelogram),
-                    ("\\]", ShapeKind::Trapezoid),
-                ],
-            ),
-            (
-                "[\\",
-                &[
-                    ("\\]", ShapeKind::ParallelogramRev),
-                    ("/]", ShapeKind::TrapezoidRev),
-                ],
-            ),
-            ("{{", &[("}}", ShapeKind::Hexagon)]),
-            ("{", &[("}", ShapeKind::Diamond)]),
-            ("[", &[("]", ShapeKind::Rect)]),
-            ("(", &[(")", ShapeKind::Rounded)]),
-            (">", &[("]", ShapeKind::Flag)]),
-        ];
-        for (opener, closers) in TABLE {
+
+        for (opener, closers) in SHAPES {
             if let Some(body_start) = rest.strip_prefix(opener) {
                 // Quoted label: `"..."` may contain characters that look
                 // like closers (e.g. `A["has [brackets] inside"]`), so the
@@ -685,7 +960,7 @@ impl Parser {
     /// runs collapse to the base kind (rank-span hint not honored — a
     /// documented cosmetic divergence). All operator characters are
     /// ASCII, so the byte indexing below always lands on char boundaries.
-    fn parse_edge_op(&mut self, rest: &mut &str) -> Result<EdgeOp, ParseError> {
+    fn parse_edge_op(&self, rest: &mut &str) -> Result<EdgeOp, ParseError> {
         let r = rest.trim_start();
         let b = r.as_bytes();
         // Diagnostics use the pre-strip string: if a reverse head gets
@@ -769,8 +1044,8 @@ impl Parser {
             && to_head == Head::None
             && matches!(family, EdgeKind::Arrow | EdgeKind::Thick)
         {
-            if from_head == Head::None {
-                return self.parse_inline_label(
+            return self
+                .parse_inline_label(
                     rest,
                     r,
                     from_head,
@@ -779,9 +1054,13 @@ impl Parser {
                     } else {
                         EdgeKind::Arrow
                     },
-                );
-            }
-            return Err(self.err(expected()));
+                )
+                .map_err(|mut error| {
+                    if from_head != Head::None {
+                        error.message.push_str(&format!(" in {r_orig:?}"));
+                    }
+                    error
+                });
         }
         let kind = match family {
             EdgeKind::Arrow => {
@@ -798,10 +1077,11 @@ impl Parser {
         let label = {
             let r2 = rest2.trim_start();
             if let Some(after_pipe) = r2.strip_prefix('|') {
-                let Some(i) = after_pipe.find('|') else {
+                let end = edge_label_end(after_pipe, "|");
+                let Some(i) = end else {
                     return Err(self.err("unclosed `|` edge label"));
                 };
-                let l = after_pipe[..i].trim().to_string();
+                let l = crate::unquote_label(after_pipe[..i].trim()).to_string();
                 rest2 = &after_pipe[i + 1..];
                 Some(l)
             } else {
@@ -821,7 +1101,7 @@ impl Parser {
     /// `-.`). Spaced forms (`A-- text -->B`) work as before; Task 2
     /// extends this to the docs' no-space spellings.
     fn parse_inline_label<'a>(
-        &mut self,
+        &self,
         rest: &mut &'a str,
         r: &'a str,
         from_head: Head,
@@ -835,10 +1115,11 @@ impl Parser {
         let Some(after_open) = r.strip_prefix(open) else {
             return Err(self.err(format!("expected an edge (e.g. `-->`), found {r:?}")));
         };
-        let Some(i) = after_open.find(close) else {
+        let closing = edge_label_end(after_open, close);
+        let Some(i) = closing else {
             return Err(self.err(format!("unclosed inline edge label (missing `{close}`)")));
         };
-        let label = after_open[..i].trim().to_string();
+        let label = crate::unquote_label(after_open[..i].trim()).to_string();
         let after_close = &after_open[i + close.len()..];
         // Closer run may be longer (`---`), then an optional terminator.
         let extra = after_close
@@ -877,10 +1158,17 @@ impl Parser {
         let Some((name, styles)) = rest.split_once(char::is_whitespace) else {
             return Err(self.err("classDef needs a name and styles"));
         };
-        self.g.class_defs.push(crate::style::ClassDef {
-            name: name.to_string(),
-            style: crate::style::sanitize_style(styles),
-        });
+        for name in name.split(',') {
+            // Class names are lookup keys, never emitted into SVG markup.
+            // Keep legacy hyphenated/Unicode names accepted by `class`.
+            if name.is_empty() {
+                return Err(self.err("classDef needs valid comma-separated class names"));
+            }
+            self.g.class_defs.push(crate::style::ClassDef {
+                name: name.to_string(),
+                style: crate::style::sanitize_style(styles),
+            });
+        }
         Ok(())
     }
 
@@ -1657,10 +1945,10 @@ mod tests {
     }
 
     #[test]
-    fn class_def_default_applies_to_unclassed_nodes_only() {
+    fn class_def_default_precedes_explicit_property_overrides() {
         let g = p("graph TD\nclassDef default fill:#f9f\nclassDef hot fill:#f00\nA --> B:::hot");
         assert_eq!(g.nodes[0].classes, vec!["default"]); // A: auto
-        assert_eq!(g.nodes[1].classes, vec!["hot"]); // B: explicit wins
+        assert_eq!(g.nodes[1].classes, vec!["default", "hot"]); // B: explicit properties win
     }
 
     #[test]

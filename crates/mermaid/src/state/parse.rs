@@ -8,7 +8,7 @@
 use crate::acc_directive_keyword;
 use crate::state::{Composite, StateGraph, StateKind, StateNode, StateNote, Transition};
 use crate::ParseError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Which side of a transition an endpoint was parsed from — decides
 /// whether a bare `[*]` materializes a `Start` or an `End` node.
@@ -44,6 +44,9 @@ struct Parser {
     line: usize, // 1-based, for errors
     start_count: usize,
     end_count: usize,
+    explicit_nodes: HashSet<usize>,
+    transition_scopes: Vec<Option<usize>>,
+    style_targets: Vec<(String, usize, &'static str)>,
 }
 
 /// Truncate a line at the first `%%` that begins the line or follows
@@ -113,6 +116,9 @@ pub(crate) fn parse(source: &str) -> Result<StateGraph, ParseError> {
         line: 0,
         start_count: 0,
         end_count: 0,
+        explicit_nodes: HashSet::new(),
+        transition_scopes: Vec::new(),
+        style_targets: Vec::new(),
     };
     let mut seen_header = false;
     for (idx, raw) in source.lines().enumerate() {
@@ -126,13 +132,19 @@ pub(crate) fn parse(source: &str) -> Result<StateGraph, ParseError> {
             continue;
         }
         if !seen_header {
-            let header = line.strip_suffix(';').unwrap_or(line).trim_end();
+            let (header, tail) = line.split_once(';').unwrap_or((line, ""));
+            let header = header.trim_end();
             if header != "stateDiagram-v2" && header != "stateDiagram" {
-                return Err(p.err(
-                    "state diagram must start with `stateDiagram` or `stateDiagram-v2`",
-                ));
+                return Err(
+                    p.err("state diagram must start with `stateDiagram` or `stateDiagram-v2`")
+                );
             }
             seen_header = true;
+            for stmt in split_statements(tail) {
+                if !stmt.trim().is_empty() {
+                    p.parse_statement(stmt.trim())?;
+                }
+            }
             continue;
         }
         // Inside a multi-line note block, every line is body text until
@@ -142,7 +154,11 @@ pub(crate) fn parse(source: &str) -> Result<StateGraph, ParseError> {
             if line == "end note" {
                 p.close_note_block();
             } else {
-                p.note_block.as_mut().expect("checked is_some").body.push(line.to_string());
+                p.note_block
+                    .as_mut()
+                    .expect("checked is_some")
+                    .body
+                    .push(line.to_string());
             }
             continue;
         }
@@ -172,12 +188,144 @@ pub(crate) fn parse(source: &str) -> Result<StateGraph, ParseError> {
             line: Some(opening_line),
         });
     }
+    for (id, line, kind) in &p.style_targets {
+        if p.composite_ids.contains_key(id) {
+            return Err(ParseError {
+                message: format!(
+                    "{kind} assignments on composite states are not supported: `{id}`"
+                ),
+                line: Some(*line),
+            });
+        }
+    }
+    resolve_composite_edges(&mut p.g, &p.transition_scopes, &p.explicit_nodes)?;
     Ok(p.g)
 }
 
+/// Use the same cluster-boundary ports as flowcharts. Only graph adaptation
+/// lives here; state shapes, pseudostates and notes retain their own model.
+fn resolve_composite_edges(
+    graph: &mut StateGraph,
+    scopes: &[Option<usize>],
+    explicit: &HashSet<usize>,
+) -> Result<(), ParseError> {
+    if graph.composites.is_empty() {
+        return Ok(());
+    }
+    use crate::flowchart::{
+        EdgeKind, FlowEdge, FlowGraph, FlowNode, FlowSubgraph, Head, ShapeKind,
+    };
+    let mut flow = FlowGraph {
+        direction: crate::layout::Direction::TB,
+        nodes: graph
+            .nodes
+            .iter()
+            .map(|n| FlowNode {
+                id: n.id.clone(),
+                label: n.display.clone(),
+                shape: ShapeKind::Rect,
+                classes: n.classes.clone(),
+                style: n.style.clone(),
+                subgraph: n.composite,
+                hidden: false,
+            })
+            .collect(),
+        edges: graph
+            .transitions
+            .iter()
+            .map(|t| FlowEdge {
+                from: t.from,
+                to: t.to,
+                label: t.label.clone(),
+                kind: EdgeKind::Arrow,
+                from_head: Head::None,
+                to_head: Head::Arrow,
+                style: t.style.clone(),
+                from_cluster: None,
+                to_cluster: None,
+            })
+            .collect(),
+        subgraphs: graph
+            .composites
+            .iter()
+            .map(|c| FlowSubgraph {
+                id: c.id.clone(),
+                title: c.display.clone(),
+                parent: c.parent,
+                direction: None,
+            })
+            .collect(),
+        class_defs: Vec::new(),
+        default_link_style: None,
+    };
+    crate::flowchart::parse::resolve_subgraph_edges(&mut flow, scopes, explicit)?;
+    let original: HashMap<_, _> = graph
+        .nodes
+        .iter()
+        .map(|n| (n.id.clone(), n.clone()))
+        .collect();
+    let new_indices: HashMap<_, _> = flow
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.clone(), i))
+        .collect();
+    for note in &mut graph.notes {
+        let id = &graph.nodes[note.state].id;
+        note.state = *new_indices.get(id).ok_or_else(|| ParseError {
+            message: format!("notes on composite states are not supported: `{id}`"),
+            line: None,
+        })?;
+    }
+    graph.nodes = flow
+        .nodes
+        .iter()
+        .map(|n| {
+            if let Some(old) = original.get(&n.id) {
+                old.clone()
+            } else {
+                StateNode {
+                    id: n.id.clone(),
+                    display: String::new(),
+                    kind: StateKind::CompositePort,
+                    composite: n.subgraph,
+                    classes: Vec::new(),
+                    style: None,
+                }
+            }
+        })
+        .collect();
+    graph.transitions = flow
+        .edges
+        .into_iter()
+        .map(|e| Transition {
+            from: e.from,
+            to: e.to,
+            label: e.label,
+            style: e.style,
+            from_cluster: e.from_cluster,
+            to_cluster: e.to_cluster,
+            hidden: e.kind == EdgeKind::Invisible,
+        })
+        .collect();
+    Ok(())
+}
+
 impl Parser {
+    fn record_style_target(&mut self, id: &str, kind: &'static str) -> Result<(), ParseError> {
+        if self.composite_ids.contains_key(id) {
+            return Err(self.err(format!(
+                "{kind} assignments on composite states are not supported: `{id}`"
+            )));
+        }
+        self.style_targets.push((id.to_string(), self.line, kind));
+        Ok(())
+    }
     fn err(&self, msg: impl Into<String>) -> ParseError {
-        ParseError { message: msg.into(), line: Some(self.line) }
+        ParseError {
+            message: msg.into(),
+            line: Some(self.line),
+        }
     }
 
     fn parse_statement(&mut self, stmt: &str) -> Result<(), ParseError> {
@@ -188,10 +336,13 @@ impl Parser {
         if let Some((id, cls)) = stmt.split_once(":::") {
             let id = id.trim();
             let cls = cls.trim();
-            if !id.is_empty() && !cls.is_empty() && !cls.contains(char::is_whitespace)
+            if !id.is_empty()
+                && !cls.is_empty()
+                && !cls.contains(char::is_whitespace)
                 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                 && cls.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             {
+                self.record_style_target(id, "class")?;
                 let idx = self.ensure_node(id)?;
                 self.g.nodes[idx].classes.push(cls.to_string());
                 return Ok(());
@@ -227,7 +378,10 @@ impl Parser {
         // ASCII id scan: char count == byte length only because the
         // predicate is ASCII-only; do not relax without a byte-position
         // scan.
-        let id_len = stmt.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+        let id_len = stmt
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
         if id_len == 0 {
             return Ok(false);
         }
@@ -255,6 +409,7 @@ impl Parser {
             )));
         }
         let idx = self.ensure_node(id)?;
+        self.explicit_nodes.insert(idx);
         if let Some(text) = description {
             // mermaid stacks repeated descriptions as extra lines; the
             // label emitter renders `<br/>`-separated lines already. A
@@ -290,8 +445,18 @@ impl Parser {
             return Err(self.err("class needs a state list and a class name"));
         };
         let name = name.trim();
+        // Style names are lookup keys, unlike the state ids below. Preserve
+        // legacy hyphenated/Unicode class names accepted by classDef.
+        if name.is_empty() {
+            return Err(self.err("class needs a valid class name"));
+        }
         for id in ids.trim().trim_matches('"').split(',') {
-            let idx = self.ensure_node(id.trim())?;
+            let id = id.trim();
+            if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return Err(self.err(format!("invalid state id {id:?} in class assignment")));
+            }
+            self.record_style_target(id, "class")?;
+            let idx = self.ensure_node(id)?;
             self.g.nodes[idx].classes.push(name.to_string());
         }
         Ok(())
@@ -307,6 +472,7 @@ impl Parser {
         if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(self.err("style refers to unknown/invalid id"));
         }
+        self.record_style_target(id, "style")?;
         let idx = self.ensure_node(id)?;
         let s = crate::style::sanitize_style(styles);
         if !s.is_empty() {
@@ -360,13 +526,21 @@ impl Parser {
             // ASCII id scan: char count == byte length only because the
             // predicate is ASCII-only; do not relax without a
             // byte-position scan.
-            let id_len =
-                id_part.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+            let id_len = id_part
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count();
             if id_len == 0 {
                 return Err(self.err("expected a state id after `as`"));
             }
             let id = &id_part[..id_len];
             let trailing = id_part[id_len..].trim();
+            if trailing == "{" {
+                self.open_composite(id.to_string())?;
+                let index = *self.composite_ids.get(id).expect("just inserted");
+                self.g.composites[index].display = display.to_string();
+                return Ok(());
+            }
             if !trailing.is_empty() {
                 return Err(self.err(format!("unexpected text after state id: {trailing:?}")));
             }
@@ -376,6 +550,7 @@ impl Parser {
                 )));
             }
             let idx = self.ensure_node(id)?;
+            self.explicit_nodes.insert(idx);
             self.g.nodes[idx].display = display.to_string();
             return Ok(());
         }
@@ -383,7 +558,10 @@ impl Parser {
         // ASCII id scan: char count == byte length only because the
         // predicate is ASCII-only; do not relax without a byte-position
         // scan.
-        let id_len = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+        let id_len = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
         if id_len == 0 {
             return Err(self.err("expected a state id after `state`"));
         }
@@ -401,7 +579,8 @@ impl Parser {
                     "`{id}` is a composite state; composites are not states"
                 )));
             }
-            self.ensure_node(&id)?;
+            let idx = self.ensure_node(&id)?;
+            self.explicit_nodes.insert(idx);
             return Ok(());
         }
         Err(self.err(format!("unexpected text after state id: {after_id:?}")))
@@ -424,20 +603,28 @@ impl Parser {
             other => return Err(self.err(format!("unknown stereotype `<<{other}>>`"))),
         };
         if self.composite_ids.contains_key(id) {
-            return Err(
-                self.err(format!("`{id}` is a composite state; composites are not states"))
-            );
+            return Err(self.err(format!(
+                "`{id}` is a composite state; composites are not states"
+            )));
         }
         let idx = self.ensure_node(id)?;
         self.g.nodes[idx].kind = kind;
+        self.explicit_nodes.insert(idx);
         Ok(())
     }
 
     /// `state ID {` — opens a composite; membership-on-creation like
     /// flowchart's subgraphs.
     fn open_composite(&mut self, id: String) -> Result<(), ParseError> {
-        if self.ids.contains_key(&id) {
+        if self
+            .ids
+            .get(&id)
+            .is_some_and(|i| self.explicit_nodes.contains(i))
+        {
             return Err(self.err(format!("`{id}` is already a state, not a composite")));
+        }
+        if id.starts_with("__") || self.composite_ids.contains_key(&id) {
+            return Err(self.err(format!("duplicate or reserved composite state id `{id}`")));
         }
         if self.stack.len() >= crate::MAX_NESTING {
             return Err(self.err(format!(
@@ -447,7 +634,11 @@ impl Parser {
         }
         let parent = self.stack.last().map(|&(i, _)| i);
         let idx = self.g.composites.len();
-        self.g.composites.push(Composite { id: id.clone(), display: id.clone(), parent });
+        self.g.composites.push(Composite {
+            id: id.clone(),
+            display: id.clone(),
+            parent,
+        });
         self.composite_ids.insert(id, idx);
         self.stack.push((idx, self.line));
         Ok(())
@@ -496,15 +687,23 @@ impl Parser {
             // Single-line form: `note left of X: text`.
             Some((id_part, text)) => {
                 let idx = self.resolve_note_target(id_part.trim())?;
-                self.g.notes.push(StateNote { state: idx, right, text: text.trim().to_string() });
+                self.g.notes.push(StateNote {
+                    state: idx,
+                    right,
+                    text: text.trim().to_string(),
+                });
                 Ok(())
             }
             // Block form: `note left of X` opens a note whose body runs on
             // the following lines until `end note`.
             None => {
                 let idx = self.resolve_note_target(after_placement.trim())?;
-                self.note_block =
-                    Some(NoteBlock { state: idx, right, body: Vec::new(), opening_line: self.line });
+                self.note_block = Some(NoteBlock {
+                    state: idx,
+                    right,
+                    body: Vec::new(),
+                    opening_line: self.line,
+                });
                 Ok(())
             }
         }
@@ -519,7 +718,14 @@ impl Parser {
         if id.starts_with("__") {
             return Err(self.err("cannot attach a note to a synthetic state id"));
         }
-        self.ensure_node(id)
+        if self.composite_ids.contains_key(id) {
+            return Err(self.err(format!(
+                "notes on composite states are not supported: `{id}`"
+            )));
+        }
+        let index = self.ensure_node(id)?;
+        self.explicit_nodes.insert(index);
+        Ok(index)
     }
 
     /// Closes an open note block, joining its body lines with `<br/>`
@@ -551,9 +757,7 @@ impl Parser {
             Some(t) => Some(t.trim().to_string()),
             None if tail.is_empty() => None,
             None => {
-                return Err(self.err(format!(
-                    "unexpected text after transition target: {tail:?}"
-                )))
+                return Err(self.err(format!("unexpected text after transition target: {tail:?}")))
             }
         };
         self.push_transition(from, to, label)
@@ -562,11 +766,7 @@ impl Parser {
     /// One transition endpoint: `[*]` (materializes a fresh Start/End
     /// node per `role`), a plain id, or one of the unsupported history
     /// pseudostates `[H]`/`[H*]` (error, named).
-    fn parse_endpoint(
-        &mut self,
-        rest: &mut &str,
-        role: EndpointRole,
-    ) -> Result<usize, ParseError> {
+    fn parse_endpoint(&mut self, rest: &mut &str, role: EndpointRole) -> Result<usize, ParseError> {
         let r = rest.trim_start();
         // `[*]` must be matched BEFORE the id scan below: it is not part
         // of the id charset.
@@ -583,15 +783,22 @@ impl Parser {
         // ASCII id scan: char count == byte length only because the
         // predicate is ASCII-only; do not relax without a byte-position
         // scan.
-        let id_len = r.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+        let id_len = r
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
         if id_len == 0 {
             return Err(self.err(format!("expected a state id, found {r:?}")));
         }
         let id = &r[..id_len];
         *rest = &r[id_len..];
-        if self.composite_ids.contains_key(id) {
+        if self
+            .composite_ids
+            .get(id)
+            .is_some_and(|c| self.stack.iter().any(|&(open, _)| open == *c))
+        {
             return Err(self.err(format!(
-                "transitions to composite states are not supported: `{id}`"
+                "transition to an enclosing composite must be declared outside its body: `{id}`"
             )));
         }
         self.ensure_node(id)
@@ -603,7 +810,12 @@ impl Parser {
     fn consume_class_suffix(&mut self, rest: &mut &str, node_idx: usize) -> Result<(), ParseError> {
         let r = rest.trim_start();
         if let Some(after) = r.strip_prefix(":::") {
-            let n = after.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+            let id = self.g.nodes[node_idx].id.clone();
+            self.record_style_target(&id, "class")?;
+            let n = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count();
             if n == 0 {
                 return Err(self.err("expected a class name after `:::`"));
             }
@@ -616,6 +828,19 @@ impl Parser {
     /// Fresh synthetic `Start`/`End` node for one `[*]` occurrence,
     /// scoped to the currently-open composite (if any).
     fn make_star_node(&mut self, role: EndpointRole) -> Result<usize, ParseError> {
+        let scope = self.stack.last().map(|&(i, _)| i);
+        let kind = match role {
+            EndpointRole::Source => StateKind::Start,
+            EndpointRole::Target => StateKind::End,
+        };
+        if let Some(index) = self
+            .g
+            .nodes
+            .iter()
+            .position(|node| node.kind == kind && node.composite == scope)
+        {
+            return Ok(index);
+        }
         let (kind, id) = match role {
             EndpointRole::Source => {
                 let n = self.start_count;
@@ -649,7 +874,12 @@ impl Parser {
         Ok(idx)
     }
 
-    fn push_node(&mut self, id: String, display: String, kind: StateKind) -> Result<usize, ParseError> {
+    fn push_node(
+        &mut self,
+        id: String,
+        display: String,
+        kind: StateKind,
+    ) -> Result<usize, ParseError> {
         let idx = self.g.nodes.len();
         self.g.nodes.push(StateNode {
             id,
@@ -674,7 +904,17 @@ impl Parser {
         to: usize,
         label: Option<String>,
     ) -> Result<(), ParseError> {
-        self.g.transitions.push(Transition { from, to, label, style: None });
+        self.g.transitions.push(Transition {
+            from,
+            to,
+            label,
+            style: None,
+            from_cluster: None,
+            to_cluster: None,
+            hidden: false,
+        });
+        self.transition_scopes
+            .push(self.stack.last().map(|&(i, _)| i));
         if self.g.transitions.len() > crate::layout::MAX_EDGES {
             return Err(self.err(format!(
                 "diagram too large: too many transitions (max {})",
@@ -688,7 +928,7 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{StateKind, StateGraph};
+    use crate::state::{StateGraph, StateKind};
 
     fn p(src: &str) -> StateGraph {
         parse(src).expect("parse ok")
@@ -718,11 +958,14 @@ mod tests {
         let kinds: Vec<StateKind> = g.nodes.iter().map(|n| n.kind).collect();
         assert!(kinds.contains(&StateKind::Start));
         assert!(kinds.contains(&StateKind::End));
-        // fresh node per occurrence
+        // Mermaid reuses one initial pseudostate within each composite scope.
         let g2 = p("stateDiagram-v2\n[*] --> A\n[*] --> B");
         assert_eq!(
-            g2.nodes.iter().filter(|n| n.kind == StateKind::Start).count(),
-            2
+            g2.nodes
+                .iter()
+                .filter(|n| n.kind == StateKind::Start)
+                .count(),
+            1
         );
     }
 
@@ -731,9 +974,18 @@ mod tests {
         let g = p("stateDiagram-v2\nstate \"Waiting for input\" as W\nstate C <<choice>>\nstate F <<fork>>\nstate J <<join>>\nW --> C");
         let w = g.nodes.iter().find(|n| n.id == "W").unwrap();
         assert_eq!(w.display, "Waiting for input");
-        assert_eq!(g.nodes.iter().find(|n| n.id == "C").unwrap().kind, StateKind::Choice);
-        assert_eq!(g.nodes.iter().find(|n| n.id == "F").unwrap().kind, StateKind::ForkJoin);
-        assert_eq!(g.nodes.iter().find(|n| n.id == "J").unwrap().kind, StateKind::ForkJoin);
+        assert_eq!(
+            g.nodes.iter().find(|n| n.id == "C").unwrap().kind,
+            StateKind::Choice
+        );
+        assert_eq!(
+            g.nodes.iter().find(|n| n.id == "F").unwrap().kind,
+            StateKind::ForkJoin
+        );
+        assert_eq!(
+            g.nodes.iter().find(|n| n.id == "J").unwrap().kind,
+            StateKind::ForkJoin
+        );
     }
 
     #[test]
@@ -762,10 +1014,10 @@ mod tests {
     }
 
     #[test]
-    fn transition_to_composite_id_errors() {
-        let e = parse("stateDiagram-v2\nstate X {\na --> b\n}\nc --> X").unwrap_err();
-        assert_eq!(e.line, Some(5));
-        assert!(e.message.contains("composite"));
+    fn transition_to_composite_id_uses_a_boundary_port() {
+        let graph = p("stateDiagram-v2\nstate X {\na --> b\n}\nc --> X");
+        assert!(graph.transitions.iter().any(|t| t.to_cluster == Some(0)));
+        assert!(!graph.nodes.iter().any(|n| n.id == "X"));
     }
 
     #[test]
@@ -784,7 +1036,9 @@ mod tests {
         assert!(!g.notes[0].right);
         assert_eq!(g.notes[0].text, "line one<br/>line two");
         // right-of block form + a single-line note still coexist.
-        let g = p("stateDiagram-v2\na --> b\nnote right of b\nonly line\nend note\nnote left of a: quick");
+        let g = p(
+            "stateDiagram-v2\na --> b\nnote right of b\nonly line\nend note\nnote left of a: quick",
+        );
         assert_eq!(g.notes.len(), 2);
         assert!(g.notes[0].right);
         assert_eq!(g.notes[0].text, "only line");
@@ -812,7 +1066,11 @@ mod tests {
 
     #[test]
     fn out_of_scope_statements_error_named() {
-        for (stmt, kw) in [("--", "--"), ("a --> [H]", "[H]"), ("direction LR", "direction")] {
+        for (stmt, kw) in [
+            ("--", "--"),
+            ("a --> [H]", "[H]"),
+            ("direction LR", "direction"),
+        ] {
             let src = format!("stateDiagram-v2\na --> b\n{stmt}");
             let e = parse(&src).unwrap_err();
             assert_eq!(e.line, Some(3), "for {stmt}");
@@ -868,7 +1126,10 @@ mod tests {
         assert_eq!(b.classes, vec!["c".to_string()]);
         // Standalone form still attaches.
         let g2 = p("stateDiagram-v2\n[*] --> S\nS:::hot");
-        assert_eq!(g2.nodes.iter().find(|n| n.id == "S").unwrap().classes, vec!["hot".to_string()]);
+        assert_eq!(
+            g2.nodes.iter().find(|n| n.id == "S").unwrap().classes,
+            vec!["hot".to_string()]
+        );
     }
 
     #[test]
@@ -1014,8 +1275,14 @@ mod tests {
     #[test]
     fn class_assign_applies_to_multiple_ids() {
         let g = p("stateDiagram-v2\na --> b\nclass a, b movement");
-        assert_eq!(g.nodes.iter().find(|n| n.id == "a").unwrap().classes, vec!["movement".to_string()]);
-        assert_eq!(g.nodes.iter().find(|n| n.id == "b").unwrap().classes, vec!["movement".to_string()]);
+        assert_eq!(
+            g.nodes.iter().find(|n| n.id == "a").unwrap().classes,
+            vec!["movement".to_string()]
+        );
+        assert_eq!(
+            g.nodes.iter().find(|n| n.id == "b").unwrap().classes,
+            vec!["movement".to_string()]
+        );
     }
 
     #[test]
@@ -1033,7 +1300,10 @@ mod tests {
         let still = g.nodes.iter().find(|n| n.id == "Still").unwrap();
         assert_eq!(still.classes, vec!["mov".to_string()]);
         assert_eq!(still.style.as_deref(), Some("fill:#00f"));
-        assert_eq!(g.class_defs.iter().find(|d| d.name == "mov").unwrap().style, "fill:#0f0");
+        assert_eq!(
+            g.class_defs.iter().find(|d| d.name == "mov").unwrap().style,
+            "fill:#0f0"
+        );
     }
 
     #[test]
@@ -1043,7 +1313,10 @@ mod tests {
         let g = p("stateDiagram-v2\nA:::c-->B");
         assert_eq!(g.nodes.len(), 2);
         assert_eq!(g.transitions.len(), 1);
-        assert_eq!(g.nodes.iter().find(|n| n.id == "A").unwrap().classes, vec!["c".to_string()]);
+        assert_eq!(
+            g.nodes.iter().find(|n| n.id == "A").unwrap().classes,
+            vec!["c".to_string()]
+        );
     }
 
     // ── #47 follow-ups: cross-parser misparse fixes ──────────────────
@@ -1069,7 +1342,11 @@ mod tests {
         // truncated `state "50 %% off" as s` mid-string. Text inside a
         // double-quoted display literal must survive verbatim.
         let g = p("stateDiagram-v2\nstate \"50 %% off\" as s");
-        let s = g.nodes.iter().find(|n| n.id == "s").expect("state s exists");
+        let s = g
+            .nodes
+            .iter()
+            .find(|n| n.id == "s")
+            .expect("state s exists");
         assert_eq!(s.display, "50 %% off");
     }
 

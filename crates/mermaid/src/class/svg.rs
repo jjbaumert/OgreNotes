@@ -49,7 +49,10 @@ fn mult_pos(points: &[(f64, f64)], at_start: bool) -> (f64, f64) {
     let (ex, ey) = if at_start { (ux, uy) } else { (-ux, -uy) };
     let (px, py) = (-ey, ex);
     let along = MULT_ALONG.min(len / 2.0);
-    (p0.0 + ux * along + px * MULT_ACROSS, p0.1 + uy * along + py * MULT_ACROSS)
+    (
+        p0.0 + ux * along + px * MULT_ACROSS,
+        p0.1 + uy * along + py * MULT_ACROSS,
+    )
 }
 
 /// How far a multiplicity label sits along the path from its endpoint.
@@ -60,7 +63,12 @@ const MULT_ACROSS: f64 = 10.0;
 /// Post-layout note-box geometry: an attached note sits to the right of its
 /// class; floating notes tile in a row below the diagram. Notes only extend
 /// the canvas right/down, so no coordinate re-homing is needed.
-fn note_rects(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)], base_h: f64) -> Vec<(f64, f64, f64, f64)> {
+fn note_rects(
+    g: &ClassGraph,
+    l: &Layout,
+    sizes: &[(f64, f64)],
+    base_h: f64,
+) -> Vec<(f64, f64, f64, f64)> {
     let mut float_x = 20.0;
     let mut out = Vec::with_capacity(g.notes.len());
     for note in &g.notes {
@@ -129,8 +137,10 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
         // the vertical flow axis.
         let d = crate::curved_path(&ep.points, true);
 
-        let dashed =
-            matches!(r.kind, RelKind::Realization | RelKind::Dependency | RelKind::DashedLink);
+        let dashed = matches!(
+            r.kind,
+            RelKind::Realization | RelKind::Dependency | RelKind::DashedLink
+        );
         let marker: Option<&str> = match r.kind {
             RelKind::Inheritance | RelKind::Realization => Some("mmd-tri-hollow"),
             RelKind::Composition => Some("mmd-diamond-filled"),
@@ -154,7 +164,11 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
             // reversed (parent first) so the parent out-ranks the child, so
             // the path runs parent -> child and the marker belongs at the
             // START (`auto-start-reverse` re-orients it into the parent).
-            let side = if r.kind.ranks_marker_end_on_top() { "marker-start" } else { "marker-end" };
+            let side = if r.kind.ranks_marker_end_on_top() {
+                "marker-start"
+            } else {
+                "marker-end"
+            };
             attrs.push_str(&format!(r#" {side}="url(#{m})""#));
         }
         // Bidirectional relations (`<-->`, `<..>`) carry a second open
@@ -245,12 +259,18 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
             ));
             y += 8.0;
             for a in &c.attributes {
+                let (text, attrs) = super::member_presentation(a);
+                let attrs = if attrs.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {attrs}")
+                };
                 y += row_h;
                 out.push_str(&format!(
-                    r#"<text x="{:.1}" y="{:.1}" fill="currentColor">{}</text>"#,
+                    r#"<text x="{:.1}" y="{:.1}" fill="currentColor"{attrs}>{}</text>"#,
                     box_left + 8.0,
                     y - 4.0,
-                    escape_xml(a)
+                    escape_xml(&text)
                 ));
             }
         }
@@ -266,12 +286,18 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
             ));
             y += 8.0;
             for m in &c.methods {
+                let (text, attrs) = super::member_presentation(m);
+                let attrs = if attrs.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {attrs}")
+                };
                 y += row_h;
                 out.push_str(&format!(
-                    r#"<text x="{:.1}" y="{:.1}" fill="currentColor">{}</text>"#,
+                    r#"<text x="{:.1}" y="{:.1}" fill="currentColor"{attrs}>{}</text>"#,
                     box_left + 8.0,
                     y - 4.0,
-                    escape_xml(m)
+                    escape_xml(&text)
                 ));
             }
         }
@@ -309,7 +335,10 @@ pub(crate) fn emit(g: &ClassGraph, l: &Layout, sizes: &[(f64, f64)]) -> String {
             } else {
                 measure::LINE_H
             };
-            out.push_str(&format!(r#"<tspan x="{ncx:.1}" dy="{dy:.1}">{}</tspan>"#, escape_xml(line)));
+            out.push_str(&format!(
+                r#"<tspan x="{ncx:.1}" dy="{dy:.1}">{}</tspan>"#,
+                escape_xml(line)
+            ));
         }
         out.push_str("</text>");
     }
@@ -356,18 +385,23 @@ mod tests {
 
     #[test]
     fn class_with_members_renders_compartments() {
-        let svg = render_class("classDiagram\nclass Animal {\n<<abstract>>\n+String name\n+speak() String\n}").unwrap();
+        let svg = render_class(
+            "classDiagram\nclass Animal {\n<<abstract>>\n+String name\n+speak() String\n}",
+        )
+        .unwrap();
         assert!(svg.starts_with("<svg"));
         assert!(svg.contains("Animal"));
         assert!(svg.contains("«abstract»"));
         assert!(svg.contains("+String name"));
-        assert!(svg.contains("+speak() String"));
+        assert!(svg.contains("+speak() : String"));
         assert!(svg.matches("<line").count() >= 2); // separators
     }
 
     #[test]
     fn marker_per_kind() {
-        let svg = render_class("classDiagram\nA <|-- B\nC <|.. D\nE *-- F\nG o-- H\nI --> J\nK ..> L").unwrap();
+        let svg =
+            render_class("classDiagram\nA <|-- B\nC <|.. D\nE *-- F\nG o-- H\nI --> J\nK ..> L")
+                .unwrap();
         assert!(svg.contains("url(#mmd-tri-hollow)"));
         assert!(svg.contains("url(#mmd-diamond-filled)"));
         assert!(svg.contains("url(#mmd-diamond-hollow)"));
@@ -408,7 +442,8 @@ mod tests {
 
     #[test]
     fn members_escaped() {
-        let svg = render_class("classDiagram\nclass X {\n+bad <script>alert(1)</script>\n}").unwrap();
+        let svg =
+            render_class("classDiagram\nclass X {\n+bad <script>alert(1)</script>\n}").unwrap();
         assert!(!svg.contains("<script>"));
         assert!(svg.contains("&lt;script&gt;"));
     }
@@ -435,17 +470,24 @@ mod tests {
 
     #[test]
     fn class_style_applied_to_box() {
-        let svg = crate::render("classDiagram\nclassDef hot fill:#f00\nclass A\nA:::hot").svg.unwrap();
+        let svg = crate::render("classDiagram\nclassDef hot fill:#f00\nclass A\nA:::hot")
+            .svg
+            .unwrap();
         // resolved style on the box rect + group wrapper for text color.
         assert!(svg.contains("fill:#f00;color:#fff"), "styled box: {svg}");
         // unstyled diagram unchanged: no stray style= on the rect.
         let plain = crate::render("classDiagram\nclass B").svg.unwrap();
-        assert!(!plain.contains("<g style="), "unstyled must not wrap: {plain}");
+        assert!(
+            !plain.contains("<g style="),
+            "unstyled must not wrap: {plain}"
+        );
     }
 
     #[test]
     fn linkstyle_colours_edge() {
-        let svg = crate::render("classDiagram\nA --> B\nlinkStyle 0 stroke:#f00").svg.unwrap();
+        let svg = crate::render("classDiagram\nA --> B\nlinkStyle 0 stroke:#f00")
+            .svg
+            .unwrap();
         assert!(svg.contains("stroke:#f00"), "edge style: {svg}");
     }
 

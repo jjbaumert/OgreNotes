@@ -121,7 +121,12 @@ impl DiagramKind {
 /// text, then the text — one `<tspan>` per `<br/>` line (a single line
 /// stays a bare `<text>`). Shared by the layered-layout renderers.
 pub(crate) fn edge_label_svg(label: &str, at: (f64, f64)) -> String {
-    let (tw, th) = measure::text_size(label);
+    edge_label_svg_sized(label, at, measure::text_size(label))
+}
+
+/// Use an explicitly reserved label footprint without changing the default
+/// edge-label measurement used by existing diagram families.
+pub(crate) fn edge_label_svg_sized(label: &str, at: (f64, f64), (tw, th): (f64, f64)) -> String {
     let (mw, mh) = (tw + 4.0, th + 4.0);
     let (lx, ly) = at;
     let mut out = format!(
@@ -518,6 +523,7 @@ pub fn render(source: &str) -> RenderOutput {
         }
     };
     let source = accessible_source.as_str();
+    let mut diagram_title = prepared.title;
     let out = match kind {
         DiagramKind::Pie => match pie::parse(source) {
             Ok(p) => RenderOutput {
@@ -543,12 +549,15 @@ pub fn render(source: &str) -> RenderOutput {
                 error: Some(e),
             },
         },
-        DiagramKind::Sequence => match sequence::render_sequence(source) {
-            Ok(svg) => RenderOutput {
-                kind,
-                svg: Some(svg),
-                error: None,
-            },
+        DiagramKind::Sequence => match sequence::render_sequence_with_title(source) {
+            Ok((svg, body_title)) => {
+                diagram_title = body_title.or(diagram_title);
+                RenderOutput {
+                    kind,
+                    svg: Some(svg),
+                    error: None,
+                }
+            }
             Err(e) => RenderOutput {
                 kind,
                 svg: None,
@@ -796,14 +805,14 @@ pub fn render(source: &str) -> RenderOutput {
     };
     let mut out = out;
     if let Some(svg) = out.svg.take() {
-        let svg = match prepared.title.as_deref() {
+        let svg = match diagram_title.as_deref() {
             Some(title) => source::with_title(svg, title),
             None => svg,
         };
         out.svg = Some(accessible_svg(
             svg,
             kind,
-            title.or(prepared.title),
+            title.or(diagram_title),
             description,
         ));
     }
