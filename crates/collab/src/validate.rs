@@ -7,7 +7,7 @@
 //! stranded outside any textblock is unreachable by `find_block_at` and
 //! surfaces as undeletable fragments (the orphan-container bug class).
 
-use yrs::types::xml::{Xml, XmlElementRef, XmlFragment, XmlOut};
+use yrs::types::xml::{XmlElementRef, XmlFragment, XmlOut};
 use yrs::{Doc, ReadTxn, Transact};
 
 use crate::schema::NodeType;
@@ -64,10 +64,8 @@ fn walk<T: ReadTxn>(
         let child_path = format!("{path}/{tag}[{i}]");
         match el.get(txn, i) {
             Some(XmlOut::Element(child)) => walk(txn, &child, nt, &child_path, out),
-            Some(XmlOut::Text(_)) => {
-                if !is_textblock(nt) {
-                    out.push(format!("{child_path}: raw text inside {nt:?}"));
-                }
+            Some(XmlOut::Text(_)) if !is_textblock(nt) => {
+                out.push(format!("{child_path}: raw text inside {nt:?}"));
             }
             _ => {}
         }
@@ -77,8 +75,8 @@ fn walk<T: ReadTxn>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yrs::types::xml::{XmlElementPrelim, XmlTextPrelim};
     use yrs::WriteTxn;
+    use yrs::types::xml::{XmlElementPrelim, XmlTextPrelim};
 
     fn doc_with(build: impl FnOnce(&mut yrs::TransactionMut, &yrs::XmlFragmentRef)) -> Doc {
         let doc = Doc::new();
@@ -118,7 +116,8 @@ mod tests {
         });
         let v = schema_violations(&doc);
         assert!(
-            v.iter().any(|s| s.contains("Paragraph is not a legal child of BulletList")),
+            v.iter()
+                .any(|s| s.contains("Paragraph is not a legal child of BulletList")),
             "{v:?}"
         );
     }
@@ -131,9 +130,13 @@ mod tests {
             hr.insert(txn, 0, XmlTextPrelim::new("x"));
         });
         let v = schema_violations(&doc);
-        assert!(v.iter().any(|s| s.contains("unknown tag <marquee>")), "{v:?}");
         assert!(
-            v.iter().any(|s| s.contains("leaf HorizontalRule has 1 children")),
+            v.iter().any(|s| s.contains("unknown tag <marquee>")),
+            "{v:?}"
+        );
+        assert!(
+            v.iter()
+                .any(|s| s.contains("leaf HorizontalRule has 1 children")),
             "{v:?}"
         );
     }

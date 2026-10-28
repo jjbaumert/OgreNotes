@@ -25,6 +25,8 @@ mod extent;
 pub(crate) mod flowchart;
 mod gantt;
 mod gitgraph;
+#[cfg(test)]
+mod invariants;
 mod journey;
 mod kanban;
 mod layout;

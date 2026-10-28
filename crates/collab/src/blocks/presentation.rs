@@ -2,9 +2,9 @@
 //! helpers. See design/presentations.md and blocks/calendar.rs (the
 //! reference implementation this mirrors).
 
-use std::collections::HashMap;
-use crate::schema::NodeType;
 use super::{BlockValidationError, LiveAppBlock};
+use crate::schema::NodeType;
+use std::collections::HashMap;
 
 pub struct PresentationBlock;
 pub static PRESENTATION: PresentationBlock = PresentationBlock;
@@ -33,7 +33,11 @@ impl LiveAppBlock for PresentationBlock {
 }
 
 fn err(node_type: NodeType, field: &'static str, reason: &str) -> BlockValidationError {
-    BlockValidationError { node_type, field: field.into(), reason: reason.into() }
+    BlockValidationError {
+        node_type,
+        field: field.into(),
+        reason: reason.into(),
+    }
 }
 
 /// Accept-verbatim-or-reject. NEVER rewrite a value: the write gate's
@@ -44,24 +48,33 @@ fn validate_frame_attrs(
 ) -> Result<HashMap<String, String>, BlockValidationError> {
     for key in ["x", "y", "w", "h"] {
         if let Some(v) = attrs.get(key) {
-            let f: f64 = v.parse().map_err(|_| err(NodeType::Frame, "geometry",
-                &format!("{key} is not a number: {v}")))?;
-            let ok = f.is_finite() && (0.0..=1.0).contains(&f)
+            let f: f64 = v.parse().map_err(|_| {
+                err(
+                    NodeType::Frame,
+                    "geometry",
+                    &format!("{key} is not a number: {v}"),
+                )
+            })?;
+            let ok = f.is_finite()
+                && (0.0..=1.0).contains(&f)
                 && !((key == "w" || key == "h") && f == 0.0);
             if !ok {
-                return Err(err(NodeType::Frame, "geometry",
-                    &format!("{key} out of range 0..=1: {v}")));
+                return Err(err(
+                    NodeType::Frame,
+                    "geometry",
+                    &format!("{key} out of range 0..=1: {v}"),
+                ));
             }
         }
     }
     if let Some(v) = attrs.get("z") {
-        v.parse::<i64>().map_err(|_| err(NodeType::Frame, "z",
-            &format!("z is not an integer: {v}")))?;
+        v.parse::<i64>()
+            .map_err(|_| err(NodeType::Frame, "z", &format!("z is not an integer: {v}")))?;
     }
-    if let Some(v) = attrs.get("role") {
-        if !ROLES.contains(&v.as_str()) {
-            return Err(err(NodeType::Frame, "role", &format!("unknown role: {v}")));
-        }
+    if let Some(v) = attrs.get("role")
+        && !ROLES.contains(&v.as_str())
+    {
+        return Err(err(NodeType::Frame, "role", &format!("unknown role: {v}")));
     }
     Ok(attrs.clone())
 }
@@ -69,15 +82,19 @@ fn validate_frame_attrs(
 fn validate_slide_attrs(
     attrs: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>, BlockValidationError> {
-    if let Some(v) = attrs.get("layout") {
-        if !LAYOUTS.contains(&v.as_str()) {
-            return Err(err(NodeType::Slide, "layout", &format!("unknown layout: {v}")));
-        }
+    if let Some(v) = attrs.get("layout")
+        && !LAYOUTS.contains(&v.as_str())
+    {
+        return Err(err(
+            NodeType::Slide,
+            "layout",
+            &format!("unknown layout: {v}"),
+        ));
     }
-    if let Some(v) = attrs.get("background") {
-        if v.len() > BACKGROUND_MAX_LEN {
-            return Err(err(NodeType::Slide, "background", "background too long"));
-        }
+    if let Some(v) = attrs.get("background")
+        && v.len() > BACKGROUND_MAX_LEN
+    {
+        return Err(err(NodeType::Slide, "background", "background too long"));
     }
     Ok(attrs.clone())
 }
@@ -128,46 +145,85 @@ mod tests {
     use super::*;
 
     fn attrs(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
     fn frame_accepts_valid_geometry_verbatim() {
-        let a = attrs(&[("x", "0.25"), ("y", "0"), ("w", "0.5"), ("h", "0.333"),
-                        ("z", "2"), ("role", "content")]);
+        let a = attrs(&[
+            ("x", "0.25"),
+            ("y", "0"),
+            ("w", "0.5"),
+            ("h", "0.333"),
+            ("z", "2"),
+            ("role", "content"),
+        ]);
         let out = PRESENTATION.validate_attrs(NodeType::Frame, &a).unwrap();
         assert_eq!(out, a); // byte-identical echo — never canonicalize
     }
 
     #[test]
     fn frame_rejects_out_of_range_geometry() {
-        for bad in [("x", "1.5"), ("x", "-0.1"), ("w", "0"), ("h", "nan"), ("x", "abc")] {
+        for bad in [
+            ("x", "1.5"),
+            ("x", "-0.1"),
+            ("w", "0"),
+            ("h", "nan"),
+            ("x", "abc"),
+        ] {
             let a = attrs(&[bad]);
-            assert!(PRESENTATION.validate_attrs(NodeType::Frame, &a).is_err(), "{bad:?}");
+            assert!(
+                PRESENTATION.validate_attrs(NodeType::Frame, &a).is_err(),
+                "{bad:?}"
+            );
         }
     }
 
     #[test]
     fn frame_rejects_bad_role_and_z() {
-        assert!(PRESENTATION.validate_attrs(NodeType::Frame, &attrs(&[("role", "banner")])).is_err());
-        assert!(PRESENTATION.validate_attrs(NodeType::Frame, &attrs(&[("z", "2.5")])).is_err());
+        assert!(
+            PRESENTATION
+                .validate_attrs(NodeType::Frame, &attrs(&[("role", "banner")]))
+                .is_err()
+        );
+        assert!(
+            PRESENTATION
+                .validate_attrs(NodeType::Frame, &attrs(&[("z", "2.5")]))
+                .is_err()
+        );
     }
 
     #[test]
     fn frame_accepts_absent_attrs() {
         // Absent attrs are fine — readers apply defaults (x=0,y=0,w=1,h=1,z=0,role=content).
-        assert!(PRESENTATION.validate_attrs(NodeType::Frame, &attrs(&[])).is_ok());
+        assert!(
+            PRESENTATION
+                .validate_attrs(NodeType::Frame, &attrs(&[]))
+                .is_ok()
+        );
     }
 
     #[test]
     fn slide_validates_layout_and_background() {
-        assert!(PRESENTATION.validate_attrs(NodeType::Slide,
-            &attrs(&[("layout", "two-column")])).is_ok());
-        assert!(PRESENTATION.validate_attrs(NodeType::Slide,
-            &attrs(&[("layout", "pyramid")])).is_err());
+        assert!(
+            PRESENTATION
+                .validate_attrs(NodeType::Slide, &attrs(&[("layout", "two-column")]))
+                .is_ok()
+        );
+        assert!(
+            PRESENTATION
+                .validate_attrs(NodeType::Slide, &attrs(&[("layout", "pyramid")]))
+                .is_err()
+        );
         let long = "x".repeat(300);
-        assert!(PRESENTATION.validate_attrs(NodeType::Slide,
-            &attrs(&[("background", &long)])).is_err()); // cap 200 chars
+        assert!(
+            PRESENTATION
+                .validate_attrs(NodeType::Slide, &attrs(&[("background", &long)]))
+                .is_err()
+        ); // cap 200 chars
     }
 
     #[test]
@@ -178,7 +234,13 @@ mod tests {
         let a = attrs(&[("background", "x\" onmouseover=\"alert(1)")]);
         let out = html_attrs(NodeType::Slide, &a);
         // The output must contain the escaped quote, not the raw injection sequence.
-        assert!(out.contains("&quot;"), "quote must be escaped in HTML output, got: {out}");
-        assert!(!out.contains("\" onmouseover="), "raw injection sequence must not appear in output, got: {out}");
+        assert!(
+            out.contains("&quot;"),
+            "quote must be escaped in HTML output, got: {out}"
+        );
+        assert!(
+            !out.contains("\" onmouseover="),
+            "raw injection sequence must not appear in output, got: {out}"
+        );
     }
 }

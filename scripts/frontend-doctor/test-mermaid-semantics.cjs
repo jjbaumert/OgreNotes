@@ -28,7 +28,7 @@ const cases = [
   const browser = await chromium.launch({ headless: true,
     ...(process.env.CHROME_BIN ? { executablePath: process.env.CHROME_BIN } : {}) });
   const context = await browser.newContext();
-  let id, token, viewerContext;
+  let id, importedId, token, viewerContext;
   const errors = [];
   async function api(method, route, data) {
     const response = await context.request.fetch(base + '/api/v1' + route, {
@@ -159,12 +159,56 @@ const cases = [
       } while (!exportHasError && Date.now() < deadline);
       check(exportHasError, 'HTML export keeps the original Mermaid error line');
     }
+    importedId = (await api('POST', '/documents/import', {
+      title: 'Imported Mermaid regression', format: 'markdown',
+      content: 'Before.\n\n```mermaid\nflowchart LR\nImported --> Editable\n```\n\nAfter.',
+    })).id;
+    const importedPage = await context.newPage();
+    importedPage.on('pageerror', error => errors.push(error.message));
+    await importedPage.goto(`${base}/d/${importedId}/regression`);
+    await importedPage.locator('.editor-content[data-editor-ready=true]').waitFor();
+    const importedBlock = importedPage.locator('.mermaid-block');
+    await importedBlock.locator('svg').waitFor();
+    check(Boolean(await importedBlock.getAttribute('data-block-id')), 'Imported diagram has a stable editing anchor');
+    await importedBlock.getByRole('button', { name: 'Edit Diagram', exact: true }).click();
+    const wideSource = 'flowchart LR\n' + Array.from({length: 12}, (_, index) =>
+      `n${index}["Updated imported diagram node ${index}"] --> n${index+1}`).join('\n');
+    await importedPage.locator('.mermaid-source').fill(wideSource);
+    await importedPage.locator('.mermaid-modal button.btn-primary').click();
+    await importedPage.locator('.mermaid-modal').waitFor({ state: 'detached' });
+    let importedHtml = '';
+    const importedDeadline = Date.now() + 8000;
+    do {
+      const response = await context.request.get(base + `/api/v1/documents/${importedId}/export/html`, {
+        headers: { Authorization: 'Bearer ' + token },
+      });
+      assert(response.ok());
+      importedHtml = await response.text();
+      if (!importedHtml.includes('Updated imported diagram node 11')) await importedPage.waitForTimeout(100);
+    } while (!importedHtml.includes('Updated imported diagram node 11') && Date.now() < importedDeadline);
+    check(importedHtml.includes('Updated imported diagram node 11'), 'Imported diagram edits persist through Yrs to server export');
+    await importedPage.reload();
+    await importedPage.locator('.mermaid-block svg').waitFor();
+    check((await importedPage.locator('.mermaid-block svg').textContent()).includes('Updated imported diagram node 11'), 'Imported live diagram survives reload');
+    const printPage = await context.newPage();
+    await printPage.setContent('<div style="width:700px">' + importedHtml + '</div>');
+    await printPage.emulateMedia({ media: 'print' });
+    const printed = await printPage.locator('.mermaid-block svg').evaluate(svg => ({
+      width: svg.getBoundingClientRect().width,
+      available: svg.parentElement.getBoundingClientRect().width,
+      ratio: svg.getBoundingClientRect().width / svg.getBoundingClientRect().height,
+      intrinsicRatio: Number(svg.getAttribute('width')) / Number(svg.getAttribute('height')),
+    }));
+    check(printed.width <= printed.available + 1 && Math.abs(printed.ratio / printed.intrinsicRatio - 1) < 0.02,
+      'Wide exported Mermaid scales to printed width without changing aspect ratio');
     assert.deepEqual(errors, [], 'Browser raised an error');
     if (observe) console.log(`Observed ${failures.length} reproduced defects`);
   } finally {
-    if (id && token) {
-      await api('DELETE', `/documents/${id}`);
-      await api('DELETE', `/documents/${id}/purge`);
+    for (const documentId of [id, importedId].filter(Boolean)) {
+      if (token) {
+        await api('DELETE', `/documents/${documentId}`);
+        await api('DELETE', `/documents/${documentId}/purge`);
+      }
     }
     if (viewerContext) await viewerContext.close();
     await context.close();

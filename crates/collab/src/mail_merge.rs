@@ -35,7 +35,9 @@
 use std::collections::BTreeSet;
 
 use serde_json::Value;
-use yrs::{Doc, GetString, ReadTxn, Text, Transact, WriteTxn, XmlFragment, XmlOut, XmlTextRef};
+#[cfg(test)]
+use yrs::WriteTxn;
+use yrs::{Doc, GetString, ReadTxn, Text, Transact, XmlFragment, XmlOut, XmlTextRef};
 
 // ─── String layer ──────────────────────────────────────────────
 
@@ -97,13 +99,14 @@ fn placeholder_spans(s: &str) -> Vec<Span> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i + 2 <= bytes.len() {
-        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
-            if let Some(span) = try_parse_placeholder(s, i) {
-                let end = span.byte_range.end;
-                spans.push(span);
-                i = end;
-                continue;
-            }
+        if bytes[i] == b'['
+            && bytes[i + 1] == b'['
+            && let Some(span) = try_parse_placeholder(s, i)
+        {
+            let end = span.byte_range.end;
+            spans.push(span);
+            i = end;
+            continue;
         }
         // Advance by one byte. UTF-8 continuation bytes are >= 0x80 so
         // we may land inside a codepoint here — that's fine, we're
@@ -188,10 +191,10 @@ fn resolve(p: &Placeholder, values: &Value) -> String {
 /// per placeholder keyed by the placeholder string); the nested form
 /// suits values that are already structured as an object tree. Both work.
 fn lookup<'a>(values: &'a Value, key: &str) -> Option<&'a Value> {
-    if let Some(obj) = values.as_object() {
-        if let Some(v) = obj.get(key) {
-            return Some(v);
-        }
+    if let Some(obj) = values.as_object()
+        && let Some(v) = obj.get(key)
+    {
+        return Some(v);
     }
     let mut cur = values;
     for segment in key.split('.') {
@@ -218,11 +221,7 @@ pub fn scan_ydoc(doc: &Doc) -> Vec<String> {
     keys.into_iter().collect()
 }
 
-fn scan_fragment<T: ReadTxn>(
-    txn: &T,
-    fragment: &yrs::XmlFragmentRef,
-    keys: &mut BTreeSet<String>,
-) {
+fn scan_fragment<T: ReadTxn>(txn: &T, fragment: &yrs::XmlFragmentRef, keys: &mut BTreeSet<String>) {
     for i in 0..fragment.len(txn) {
         let Some(child) = fragment.get(txn, i) else {
             continue;
@@ -409,10 +408,7 @@ mod tests {
         // A form UI that emits one field per placeholder keyed by the
         // placeholder string produces `{"team.name": "Vector"}`, not the
         // nested form. Both must resolve — the flat lookup wins first.
-        let out = substitute_str(
-            "Welcome to [[team.name]].",
-            &json!({"team.name": "Vector"}),
-        );
+        let out = substitute_str("Welcome to [[team.name]].", &json!({"team.name": "Vector"}));
         assert_eq!(out, "Welcome to Vector.");
     }
 
@@ -435,10 +431,7 @@ mod tests {
 
     #[test]
     fn substitute_prefers_value_over_fallback() {
-        let out = substitute_str(
-            "Owner: [[owner|Unassigned]]",
-            &json!({"owner": "Arnie"}),
-        );
+        let out = substitute_str("Owner: [[owner|Unassigned]]", &json!({"owner": "Arnie"}));
         assert_eq!(out, "Owner: Arnie");
     }
 
@@ -503,10 +496,7 @@ mod tests {
 
     #[test]
     fn scan_ydoc_returns_unique_sorted_keys() {
-        let doc = build_doc(&[
-            "Hi [[name]] and [[user.email]]",
-            "Welcome [[name]] again",
-        ]);
+        let doc = build_doc(&["Hi [[name]] and [[user.email]]", "Welcome [[name]] again"]);
         let keys = scan_ydoc(&doc);
         assert_eq!(keys, vec!["name".to_string(), "user.email".to_string()]);
     }
@@ -519,11 +509,7 @@ mod tests {
 
     #[test]
     fn substitute_ydoc_rewrites_matching_texts() {
-        let mut doc = build_doc(&[
-            "Hi [[name]]",
-            "Team: [[team|N/A]]",
-            "No placeholders here.",
-        ]);
+        let mut doc = build_doc(&["Hi [[name]]", "Team: [[team|N/A]]", "No placeholders here."]);
         substitute_ydoc(&mut doc, &json!({"name": "Arnie"}));
 
         let txn = doc.transact();
@@ -551,9 +537,13 @@ mod tests {
         // A no-op substitute must not churn the CRDT — a template with
         // no placeholders should copy as pure byte-passthrough.
         let mut doc = build_doc(&["Just plain text."]);
-        let before = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        let before = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
         substitute_ydoc(&mut doc, &json!({}));
-        let after = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        let after = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
         assert_eq!(before, after, "no-op substitute must not mutate the doc");
     }
 }

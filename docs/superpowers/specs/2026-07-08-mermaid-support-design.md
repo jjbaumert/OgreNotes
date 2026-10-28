@@ -215,8 +215,8 @@ raw source. Nothing is lost.
 
 ### Deferred / decided
 
-- Markdown **export** emits ` ```mermaid ` for round-trip fidelity. Markdown
-  **import** mapping ` ```mermaid ` fenced blocks → a `Mermaid` node is
-  **deferred** past slice 1 to keep scope tight (authoring is via the dedicated
-  block, not fenced blocks).
+- Markdown **export** emits ` ```mermaid ` for round-trip fidelity. Import,
+  deferred in slice 1, now creates live Mermaid leaves for nonempty fences
+  within the source cap wherever the existing schema permits them. Empty,
+  oversized, or disallowed nested fences remain code blocks.
 - Starter template is a small pie diagram.

@@ -50,16 +50,18 @@
 //! - Does NOT run on `room::apply_update` (compaction / snapshot
 //!   restore). Only interactive `documents.rs` / `ws.rs` paths.
 
-use ogrenotes_common::metrics::{counter, MetricKey};
-use yrs::{Doc, Out, ReadTxn, Transact, WriteTxn, Update};
-use yrs::types::xml::{Xml, XmlElementRef, XmlFragment, XmlOut};
-use yrs::types::DeepObservable;
-use yrs::updates::decoder::Decode;
+use ogrenotes_common::metrics::{MetricKey, counter};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use yrs::WriteTxn;
+use yrs::types::DeepObservable;
+use yrs::types::xml::{Xml, XmlElementRef, XmlFragment, XmlOut};
+use yrs::updates::decoder::Decode;
+use yrs::{Doc, Out, ReadTxn, Transact, Update};
 
-use super::{block_for, BlockValidationError};
+use super::{BlockValidationError, block_for};
 use crate::document::OgreDoc;
 use crate::schema::NodeType;
 
@@ -301,10 +303,7 @@ pub fn walk_changed(_doc: &Doc, touched: &[XmlElementRef]) -> Vec<LiveAppViolati
 /// Used by canary rollout mode to catch a silent divergence
 /// between `walk_doc` and `walk_changed` before flipping the
 /// default.
-fn violation_sets_equivalent(
-    a: &[LiveAppViolation],
-    b: &[LiveAppViolation],
-) -> bool {
+fn violation_sets_equivalent(a: &[LiveAppViolation], b: &[LiveAppViolation]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -313,11 +312,23 @@ fn violation_sets_equivalent(
     // comparison is negligible compared to the walk itself.
     let mut ka: Vec<(&'static str, String, String)> = a
         .iter()
-        .map(|v| (v.node_type.tag_name(), v.field.to_string(), v.reason.clone()))
+        .map(|v| {
+            (
+                v.node_type.tag_name(),
+                v.field.to_string(),
+                v.reason.clone(),
+            )
+        })
         .collect();
     let mut kb: Vec<(&'static str, String, String)> = b
         .iter()
-        .map(|v| (v.node_type.tag_name(), v.field.to_string(), v.reason.clone()))
+        .map(|v| {
+            (
+                v.node_type.tag_name(),
+                v.field.to_string(),
+                v.reason.clone(),
+            )
+        })
         .collect();
     ka.sort();
     kb.sort();
@@ -333,9 +344,7 @@ fn violation_diff<'a>(
     a.iter()
         .filter(|v| {
             !b.iter().any(|other| {
-                other.node_type == v.node_type
-                    && other.field == v.field
-                    && other.reason == v.reason
+                other.node_type == v.node_type && other.field == v.field && other.reason == v.reason
             })
         })
         .collect()
@@ -385,19 +394,15 @@ pub fn collect_liveapp_index(doc: &Doc) -> LiveAppIndex {
     out
 }
 
-fn walk_element_for_index<T: ReadTxn>(
-    txn: &T,
-    el: &yrs::XmlElementRef,
-    out: &mut LiveAppIndex,
-) {
-    if let Some(nt) = NodeType::from_tag(el.tag().as_ref()) {
-        if block_for(nt).is_some() {
-            let block_id = collect_attrs(txn, el)
-                .get("blockId")
-                .cloned()
-                .unwrap_or_default();
-            out.push((nt, block_id));
-        }
+fn walk_element_for_index<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef, out: &mut LiveAppIndex) {
+    if let Some(nt) = NodeType::from_tag(el.tag().as_ref())
+        && block_for(nt).is_some()
+    {
+        let block_id = collect_attrs(txn, el)
+            .get("blockId")
+            .cloned()
+            .unwrap_or_default();
+        out.push((nt, block_id));
     }
     let child_len = el.len(txn);
     for i in 0..child_len {
@@ -417,10 +422,7 @@ fn walk_element_for_index<T: ReadTxn>(
 /// both sides and only report deletions when the pre-count
 /// exceeds the post-count. That guards against a false positive
 /// when a duplicate-blockId cluster shrinks by one.
-pub fn diff_liveapp_deletions(
-    pre: &LiveAppIndex,
-    post: &LiveAppIndex,
-) -> Vec<LiveAppDeletion> {
+pub fn diff_liveapp_deletions(pre: &LiveAppIndex, post: &LiveAppIndex) -> Vec<LiveAppDeletion> {
     use std::collections::HashMap;
     let mut post_counts: HashMap<(NodeType, &str), usize> = HashMap::new();
     for (nt, bid) in post {
@@ -465,34 +467,28 @@ pub fn walk_doc(doc: &Doc) -> Vec<LiveAppViolation> {
     violations
 }
 
-fn walk_element<T: ReadTxn>(
-    txn: &T,
-    el: &yrs::XmlElementRef,
-    out: &mut Vec<LiveAppViolation>,
-) {
+fn walk_element<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef, out: &mut Vec<LiveAppViolation>) {
     let tag = el.tag();
-    if let Some(nt) = NodeType::from_tag(tag.as_ref()) {
-        if let Some(block) = block_for(nt) {
-            let attrs = collect_attrs(txn, el);
-            let block_id = attrs.get("blockId").cloned();
-            match block.validate_attrs(nt, &attrs) {
-                Err(e) => {
-                    out.push((e, block_id).into());
-                }
-                Ok(canonical) => {
-                    // Strict comparison: `validate_attrs` clamps
-                    // oversized values silently and returns Ok
-                    // (paste/import wants that friendly behavior).
-                    // For the interactive CRDT-write gate, though,
-                    // silent-clamp defeats the purpose — an
-                    // attacker's oversized attr would still land
-                    // in the doc. So we compare each input attr
-                    // against the canonical form and flag any
-                    // divergence (including unknown-key drops).
-                    surface_canonicalization_diff(
-                        nt, &attrs, &canonical, block_id, out,
-                    );
-                }
+    if let Some(nt) = NodeType::from_tag(tag.as_ref())
+        && let Some(block) = block_for(nt)
+    {
+        let attrs = collect_attrs(txn, el);
+        let block_id = attrs.get("blockId").cloned();
+        match block.validate_attrs(nt, &attrs) {
+            Err(e) => {
+                out.push((e, block_id).into());
+            }
+            Ok(canonical) => {
+                // Strict comparison: `validate_attrs` clamps
+                // oversized values silently and returns Ok
+                // (paste/import wants that friendly behavior).
+                // For the interactive CRDT-write gate, though,
+                // silent-clamp defeats the purpose — an
+                // attacker's oversized attr would still land
+                // in the doc. So we compare each input attr
+                // against the canonical form and flag any
+                // divergence (including unknown-key drops).
+                surface_canonicalization_diff(nt, &attrs, &canonical, block_id, out);
             }
         }
     }
@@ -538,27 +534,20 @@ fn surface_canonicalization_diff(
             Some(canon) => out.push(LiveAppViolation {
                 node_type,
                 field: Cow::Owned(key.clone()),
-                reason: format!(
-                    "value was canonicalized: input {value:?}, canonical {canon:?}"
-                ),
+                reason: format!("value was canonicalized: input {value:?}, canonical {canon:?}"),
                 block_id: block_id.clone(),
             }),
             None => out.push(LiveAppViolation {
                 node_type,
                 field: Cow::Owned(key.clone()),
-                reason: format!(
-                    "unknown attribute (input {value:?}) dropped by validator"
-                ),
+                reason: format!("unknown attribute (input {value:?}) dropped by validator"),
                 block_id: block_id.clone(),
             }),
         }
     }
 }
 
-fn collect_attrs<T: ReadTxn>(
-    txn: &T,
-    el: &yrs::XmlElementRef,
-) -> HashMap<String, String> {
+fn collect_attrs<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef) -> HashMap<String, String> {
     let mut out = HashMap::new();
     // `Attributes` iterator yields `(&str, String)` — yrs
     // already coerces every attribute value to its string
@@ -681,62 +670,58 @@ struct RepairPlan {
     removes: Vec<String>,
 }
 
-fn plan_element<T: ReadTxn>(
-    txn: &T,
-    el: &yrs::XmlElementRef,
-    out: &mut Vec<RepairPlan>,
-) {
+fn plan_element<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef, out: &mut Vec<RepairPlan>) {
     let tag = el.tag();
-    if let Some(nt) = NodeType::from_tag(tag.as_ref()) {
-        if let Some(block) = block_for(nt) {
-            let attrs = collect_attrs(txn, el);
-            let block_id = attrs.get("blockId").cloned();
-            let canonical = canonicalize_via_iteration(block, nt, &attrs);
-            // Which stored keys must be removed: any non-blockId
-            // input key that (a) validate_attrs canonically drops
-            // (canonical map has no such key) or (b) whose stored
-            // value differs from the canonical value AND the
-            // canonical value is empty (the block dropped it).
-            let mut removes: Vec<String> = Vec::new();
-            for (k, v) in &attrs {
-                if k == "blockId" {
-                    continue;
-                }
-                match canonical.get(k) {
-                    None => removes.push(k.clone()),
-                    Some(canon) if canon.is_empty() && !v.is_empty() => {
-                        // Canonical form has this attr as empty
-                        // (block signals "drop"); stored has a
-                        // non-empty value. Remove.
-                        removes.push(k.clone());
-                    }
-                    _ => {}
-                }
+    if let Some(nt) = NodeType::from_tag(tag.as_ref())
+        && let Some(block) = block_for(nt)
+    {
+        let attrs = collect_attrs(txn, el);
+        let block_id = attrs.get("blockId").cloned();
+        let canonical = canonicalize_via_iteration(block, nt, &attrs);
+        // Which stored keys must be removed: any non-blockId
+        // input key that (a) validate_attrs canonically drops
+        // (canonical map has no such key) or (b) whose stored
+        // value differs from the canonical value AND the
+        // canonical value is empty (the block dropped it).
+        let mut removes: Vec<String> = Vec::new();
+        for (k, v) in &attrs {
+            if k == "blockId" {
+                continue;
             }
-            // Compute which canonical values must be written.
-            // Skip canonical keys whose value is empty AND that
-            // aren't stored — matches strict-compare semantics
-            // where empty input keys are "no assertion made."
-            let needs_write = canonical.iter().any(|(k, v)| {
-                let stored = attrs.get(k).map(String::as_str);
-                if v.is_empty() {
-                    // The block canonicalized to an empty default.
-                    // Only relevant if stored had a non-empty value
-                    // (already covered by `removes`); ignore here.
-                    false
-                } else {
-                    stored != Some(v.as_str())
+            match canonical.get(k) {
+                None => removes.push(k.clone()),
+                Some(canon) if canon.is_empty() && !v.is_empty() => {
+                    // Canonical form has this attr as empty
+                    // (block signals "drop"); stored has a
+                    // non-empty value. Remove.
+                    removes.push(k.clone());
                 }
+                _ => {}
+            }
+        }
+        // Compute which canonical values must be written.
+        // Skip canonical keys whose value is empty AND that
+        // aren't stored — matches strict-compare semantics
+        // where empty input keys are "no assertion made."
+        let needs_write = canonical.iter().any(|(k, v)| {
+            let stored = attrs.get(k).map(String::as_str);
+            if v.is_empty() {
+                // The block canonicalized to an empty default.
+                // Only relevant if stored had a non-empty value
+                // (already covered by `removes`); ignore here.
+                false
+            } else {
+                stored != Some(v.as_str())
+            }
+        });
+        if needs_write || !removes.is_empty() {
+            out.push(RepairPlan {
+                el: el.clone(),
+                node_type: nt,
+                block_id,
+                canonical,
+                removes,
             });
-            if needs_write || !removes.is_empty() {
-                out.push(RepairPlan {
-                    el: el.clone(),
-                    node_type: nt,
-                    block_id,
-                    canonical,
-                    removes,
-                });
-            }
         }
     }
     let child_len = el.len(txn);
@@ -782,7 +767,6 @@ fn canonicalize_via_iteration(
     HashMap::new()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,10 +775,7 @@ mod tests {
 
     /// Build a doc with a single Kanban board containing one column
     /// and one card. Returns the doc and the state bytes.
-    fn kanban_doc_with_card(
-        card_title: &str,
-        card_color: &str,
-    ) -> (OgreDoc, Vec<u8>) {
+    fn kanban_doc_with_card(card_title: &str, card_color: &str) -> (OgreDoc, Vec<u8>) {
         let doc = OgreDoc::new();
         {
             let mut txn = doc.inner().transact_mut();
@@ -860,9 +841,7 @@ mod tests {
             card.insert_attribute(&mut txn, "color", "javascript:");
         }
         // Diff from baseline → the mutation update.
-        let mutation = peer
-            .encode_diff(&doc.state_vector())
-            .unwrap();
+        let mutation = peer.encode_diff(&doc.state_vector()).unwrap();
         let result = validate_liveapp_writes(&doc, &mutation);
         let violations = result.expect_err("should reject invalid color");
         assert_eq!(violations.len(), 1);
@@ -889,8 +868,8 @@ mod tests {
             card.insert_attribute(&mut txn, "dueAt", "not-a-date");
         }
         let mutation = peer.encode_diff(&doc.state_vector()).unwrap();
-        let violations = validate_liveapp_writes(&doc, &mutation)
-            .expect_err("should reject bad dueAt");
+        let violations =
+            validate_liveapp_writes(&doc, &mutation).expect_err("should reject bad dueAt");
         assert_eq!(violations[0].field, "dueAt");
     }
 
@@ -905,11 +884,7 @@ mod tests {
             let XmlOut::Element(para) = frag.get(&txn, 0).unwrap() else {
                 unreachable!()
             };
-            let text = para.insert(
-                &mut txn,
-                0,
-                yrs::types::xml::XmlTextPrelim::new(""),
-            );
+            let text = para.insert(&mut txn, 0, yrs::types::xml::XmlTextPrelim::new(""));
             let _ = text;
         }
         // Empty update on a paragraph-only doc validates.
@@ -942,14 +917,20 @@ mod tests {
         {
             let mut txn = peer.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             card.insert_attribute(&mut txn, "title", too_long.as_str());
         }
         let mutation = peer.encode_diff(&doc.state_vector()).unwrap();
-        let violations = validate_liveapp_writes(&doc, &mutation)
-            .expect_err("clamped title must surface");
+        let violations =
+            validate_liveapp_writes(&doc, &mutation).expect_err("clamped title must surface");
         assert!(
             violations.iter().any(|v| v.field == "title"),
             "expected a title violation, got {violations:?}"
@@ -968,9 +949,15 @@ mod tests {
         {
             let mut txn = peer.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             // Set optional attrs to empty — legitimate "clear the field".
             card.insert_attribute(&mut txn, "dueAt", "");
             card.insert_attribute(&mut txn, "labels", "");
@@ -990,14 +977,20 @@ mod tests {
         {
             let mut txn = peer.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             card.insert_attribute(&mut txn, "smuggledPayload", "arbitrary-content");
         }
         let mutation = peer.encode_diff(&doc.state_vector()).unwrap();
-        let violations = validate_liveapp_writes(&doc, &mutation)
-            .expect_err("unknown attribute must surface");
+        let violations =
+            validate_liveapp_writes(&doc, &mutation).expect_err("unknown attribute must surface");
         assert!(violations.iter().any(|v| v.field == "smuggledPayload"));
     }
 
@@ -1007,7 +1000,10 @@ mod tests {
     fn walk_scope_env_parse() {
         assert_eq!(WalkScope::from_env_value(Some("full")), WalkScope::Full);
         assert_eq!(WalkScope::from_env_value(Some("FULL")), WalkScope::Full);
-        assert_eq!(WalkScope::from_env_value(Some("changed")), WalkScope::Changed);
+        assert_eq!(
+            WalkScope::from_env_value(Some("changed")),
+            WalkScope::Changed
+        );
         assert_eq!(WalkScope::from_env_value(Some("canary")), WalkScope::Canary);
         assert_eq!(WalkScope::from_env_value(Some("garbage")), WalkScope::Full);
         assert_eq!(WalkScope::from_env_value(None), WalkScope::Full);
@@ -1029,9 +1025,15 @@ mod tests {
         {
             let mut txn = doc.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             card.insert_attribute(&mut txn, "color", "chartreuse");
         }
         let base_bytes = doc.to_state_bytes();
@@ -1044,11 +1046,7 @@ mod tests {
             let mut txn = peer.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
             let n = frag.len(&txn);
-            let para = frag.insert(
-                &mut txn,
-                n,
-                XmlElementPrelim::empty("paragraph"),
-            );
+            let para = frag.insert(&mut txn, n, XmlElementPrelim::empty("paragraph"));
             let text = para.insert(&mut txn, 0, XmlTextPrelim::new(""));
             let _ = text;
         }
@@ -1079,15 +1077,25 @@ mod tests {
         {
             let mut txn = peer.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             card.insert_attribute(&mut txn, "color", "javascript:");
         }
         let mutation = peer.encode_diff(&doc.state_vector()).unwrap();
         let violations = validate_liveapp_writes_scoped(&doc, &mutation, WalkScope::Changed)
             .expect_err("Changed mode must reject a write that lands an invalid attr");
-        assert!(violations.iter().any(|v| v.node_type == NodeType::KanbanCard));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.node_type == NodeType::KanbanCard)
+        );
     }
 
     /// A newly-inserted invalid card is caught: the deep observer
@@ -1101,8 +1109,12 @@ mod tests {
         {
             let mut txn = peer.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             // Insert a new card at position 0 (before the
             // existing valid one).
             let new_card = col.insert(&mut txn, 0, XmlElementPrelim::empty("kanban_card"));
@@ -1130,9 +1142,15 @@ mod tests {
         {
             let mut txn = doc.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             card.insert_attribute(&mut txn, "color", "chartreuse");
         }
         let base_bytes = doc.to_state_bytes();
@@ -1165,9 +1183,15 @@ mod tests {
         {
             let mut txn = doc.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(card) = col.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             // Structurally-invalid color.
             card.insert_attribute(&mut txn, "color", "chartreuse");
             // Labels with an empty segment — canonical form
@@ -1271,8 +1295,12 @@ mod tests {
         {
             let mut txn = peer.inner().transact_mut();
             let frag = txn.get_xml_fragment("content").unwrap();
-            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else { unreachable!() };
-            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else { unreachable!() };
+            let XmlOut::Element(board) = frag.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
+            let XmlOut::Element(col) = board.get(&txn, 0).unwrap() else {
+                unreachable!()
+            };
             col.insert_attribute(&mut txn, "title", "Doing");
         }
         let mutation = peer.encode_diff(&doc.state_vector()).unwrap();
@@ -1354,9 +1382,7 @@ mod proptests {
         for op in ops {
             match op {
                 CardOp::SetValidColor(c) => card.insert_attribute(&mut txn, "color", *c),
-                CardOp::SetInvalidColor(c) => {
-                    card.insert_attribute(&mut txn, "color", c.as_str())
-                }
+                CardOp::SetInvalidColor(c) => card.insert_attribute(&mut txn, "color", c.as_str()),
                 CardOp::SetShortTitle(t) => card.insert_attribute(&mut txn, "title", t.as_str()),
                 CardOp::SetOversizedTitle => {
                     let long = "z".repeat(500);
@@ -1364,9 +1390,7 @@ mod proptests {
                 }
                 CardOp::SetValidDueAt => card.insert_attribute(&mut txn, "dueAt", "2026-07-05"),
                 CardOp::SetInvalidDueAt => card.insert_attribute(&mut txn, "dueAt", "yesterday"),
-                CardOp::SmuggleUnknownAttr => {
-                    card.insert_attribute(&mut txn, "smuggle", "value")
-                }
+                CardOp::SmuggleUnknownAttr => card.insert_attribute(&mut txn, "smuggle", "value"),
             }
         }
     }
@@ -1527,7 +1551,10 @@ mod gap_tests {
         );
         drop(txn);
         let post = walk_doc(doc.inner());
-        assert!(post.is_empty(), "post-repair walk must be clean, got {post:?}");
+        assert!(
+            post.is_empty(),
+            "post-repair walk must be clean, got {post:?}"
+        );
     }
 
     /// Additions never masquerade as deletions: a post index that is
