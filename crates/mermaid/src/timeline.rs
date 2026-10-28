@@ -18,8 +18,9 @@ const MIN_COL_W: f64 = 90.0;
 const MAX_PERIODS: usize = 400;
 const AXIS_GAP: f64 = 24.0; // vertical room between the period row, axis, and events
 /// Per-period pastel palette (Mermaid tints each period and its events).
-const PERIOD_COLORS: &[&str] =
-    &["#8a8ae0", "#e8e85a", "#a8e05a", "#c99be0", "#5ad1e0", "#e0a85a", "#5ae0a8", "#e05ad1"];
+const PERIOD_COLORS: &[&str] = &[
+    "#8a8ae0", "#e8e85a", "#a8e05a", "#c99be0", "#5ad1e0", "#e0a85a", "#5ae0a8", "#e05ad1",
+];
 const DASH_COLOR: &str = "#999999"; // dashed dropline color
 
 fn period_color(i: usize) -> &'static str {
@@ -78,14 +79,37 @@ pub(crate) fn parse(source: &str) -> Result<Timeline, ParseError> {
         // events.
         let mut parts = line.split(':').map(str::trim);
         let time = parts.next().unwrap_or("").to_string();
+        let events: Vec<String> = parts
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect();
         if time.is_empty() {
-            return Err(err("timeline entry needs a time period", line_no));
+            let previous = periods
+                .last_mut()
+                .filter(|p| p.section == cur_section)
+                .ok_or_else(|| {
+                    err(
+                        "timeline continuation needs a preceding time period in this section",
+                        line_no,
+                    )
+                })?;
+            if events.is_empty() {
+                return Err(err("timeline continuation needs an event", line_no));
+            }
+            previous.events.extend(events);
+            continue;
         }
-        let events: Vec<String> = parts.filter(|e| !e.is_empty()).map(str::to_string).collect();
         if periods.len() >= MAX_PERIODS {
-            return Err(err(format!("timeline too large: more than {MAX_PERIODS} periods"), line_no));
+            return Err(err(
+                format!("timeline too large: more than {MAX_PERIODS} periods"),
+                line_no,
+            ));
         }
-        periods.push(Period { section: cur_section, time, events });
+        periods.push(Period {
+            section: cur_section,
+            time,
+            events,
+        });
     }
 
     if !seen_header {
@@ -94,24 +118,63 @@ pub(crate) fn parse(source: &str) -> Result<Timeline, ParseError> {
             line: Some(1),
         });
     }
-    Ok(Timeline { title, sections, periods })
+    Ok(Timeline {
+        title,
+        sections,
+        periods,
+    })
 }
 
 fn err(message: impl Into<String>, line: usize) -> ParseError {
-    ParseError { message: message.into(), line: Some(line) }
+    ParseError {
+        message: message.into(),
+        line: Some(line),
+    }
+}
+
+// Timeline captions are escaped literal text, not Mermaid <br> text runs.
+fn label_width(label: &str, font_size: f64) -> f64 {
+    (measure::text_size(label).0 * font_size / measure::FONT_PX)
+        .max(measure::literal_overlap_width(label, font_size))
 }
 
 pub(crate) fn render_svg(t: &Timeline) -> String {
     // Column widths: the wider of the period label and its widest event.
-    let col_w: Vec<f64> = t
+    let mut col_w: Vec<f64> = t
         .periods
         .iter()
         .map(|p| {
-            let time_w = measure::text_size(&p.time).0;
-            let ev_w = p.events.iter().map(|e| measure::text_size(e).0).fold(0.0_f64, f64::max);
+            let time_w = label_width(&p.time, 14.0) * 1.04;
+            let ev_w = p
+                .events
+                .iter()
+                .map(|e| label_width(e, 14.0))
+                .fold(0.0_f64, f64::max);
             (time_w.max(ev_w) + 2.0 * INNER_X).max(MIN_COL_W)
         })
         .collect();
+
+    // A section label spans its contiguous columns. Grow that span before
+    // computing positions so a long title cannot escape the first column.
+    let mut first = 0;
+    while first < t.periods.len() {
+        let section = t.periods[first].section;
+        let mut end = first + 1;
+        while end < t.periods.len() && t.periods[end].section == section {
+            end += 1;
+        }
+        if let Some(section) = section {
+            let needed = label_width(&t.sections[section], 14.0) * 1.04 + 2.0 * INNER_X;
+            let span = col_w[first..end].iter().sum::<f64>() + (end - first - 1) as f64 * GAP_X;
+            if needed > span {
+                let extra = (needed - span) / (end - first) as f64;
+                for width in &mut col_w[first..end] {
+                    *width += extra;
+                }
+            }
+        }
+        first = end;
+    }
 
     // Column left edges + centers.
     let mut lefts = Vec::with_capacity(col_w.len());
@@ -120,7 +183,20 @@ pub(crate) fn render_svg(t: &Timeline) -> String {
         lefts.push(x);
         x += w + GAP_X;
     }
-    let total_w = (x - GAP_X + PAD).max(2.0 * PAD + MIN_COL_W);
+    let title_w = t
+        .title
+        .as_deref()
+        .map(|title| label_width(title, 18.0) * 1.04)
+        .unwrap_or(0.0);
+    let section_w = t
+        .sections
+        .iter()
+        .map(|title| label_width(title, 14.0) * 1.04)
+        .fold(0.0, f64::max);
+    let total_w = (x - GAP_X + PAD)
+        .max(2.0 * PAD + MIN_COL_W)
+        .max(title_w + 2.0 * PAD)
+        .max(section_w + 2.0 * PAD);
     let center = |i: usize| lefts[i] + col_w[i] / 2.0;
 
     let mut y = PAD;
@@ -205,12 +281,26 @@ pub(crate) fn render_svg(t: &Timeline) -> String {
     ));
     // Period boxes (colored) on top of the droplines.
     for (i, p) in t.periods.iter().enumerate() {
-        colored_box(&mut body, (lefts[i], period_top, col_w[i], BOX_H), &p.time, period_color(i), 1.0, true);
+        colored_box(
+            &mut body,
+            (lefts[i], period_top, col_w[i], BOX_H),
+            &p.time,
+            period_color(i),
+            1.0,
+            true,
+        );
     }
     // Event boxes, tinted with their period's color.
     for (i, p) in t.periods.iter().enumerate() {
         for (ev, &top) in p.events.iter().zip(&ev_layout[i]) {
-            colored_box(&mut body, (lefts[i], top, col_w[i], BOX_H), ev, period_color(i), 0.5, false);
+            colored_box(
+                &mut body,
+                (lefts[i], top, col_w[i], BOX_H),
+                ev,
+                period_color(i),
+                0.5,
+                false,
+            );
         }
     }
 
@@ -225,7 +315,14 @@ pub(crate) fn render_svg(t: &Timeline) -> String {
 
 /// A rounded box `(left, top, w, h)` tinted `fill` at `opacity`, with centered
 /// (optionally bold) dark text.
-fn colored_box(out: &mut String, rect: (f64, f64, f64, f64), text: &str, fill: &str, opacity: f64, bold: bool) {
+fn colored_box(
+    out: &mut String,
+    rect: (f64, f64, f64, f64),
+    text: &str,
+    fill: &str,
+    opacity: f64,
+    bold: bool,
+) {
     let (left, top, w, h) = rect;
     let weight = if bold { r#" font-weight="600""# } else { "" };
     out.push_str(&format!(
@@ -254,7 +351,10 @@ mod tests {
         assert_eq!(t.periods.len(), 3);
         assert_eq!(t.periods[0].time, "2002");
         assert_eq!(t.periods[0].events, vec!["LinkedIn".to_string()]);
-        assert_eq!(t.periods[1].events, vec!["Facebook".to_string(), "Google".to_string()]);
+        assert_eq!(
+            t.periods[1].events,
+            vec!["Facebook".to_string(), "Google".to_string()]
+        );
         assert_eq!(t.periods[0].section, Some(0));
         assert_eq!(t.periods[2].section, Some(1));
     }
@@ -292,12 +392,24 @@ mod tests {
             &parse("timeline\n title T\n 2002 : LinkedIn\n 2004 : Facebook : Google").unwrap(),
         );
         // Section coloring: the two periods use distinct palette colors.
-        assert!(svg.contains(PERIOD_COLORS[0]) && svg.contains(PERIOD_COLORS[1]), "period colors: {svg}");
+        assert!(
+            svg.contains(PERIOD_COLORS[0]) && svg.contains(PERIOD_COLORS[1]),
+            "period colors: {svg}"
+        );
         // An event inherits its period's color at reduced opacity.
-        assert!(svg.contains(r#"fill-opacity="0.5""#), "tinted events: {svg}");
+        assert!(
+            svg.contains(r#"fill-opacity="0.5""#),
+            "tinted events: {svg}"
+        );
         // Time-axis arrow + dashed droplines.
-        assert!(svg.contains("marker-end=\"url(#tl-arrow)\""), "axis arrow: {svg}");
-        assert!(svg.contains(r#"stroke-dasharray="3 3""#), "droplines: {svg}");
+        assert!(
+            svg.contains("marker-end=\"url(#tl-arrow)\""),
+            "axis arrow: {svg}"
+        );
+        assert!(
+            svg.contains(r#"stroke-dasharray="3 3""#),
+            "droplines: {svg}"
+        );
     }
 
     #[test]

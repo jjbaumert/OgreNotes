@@ -1,20 +1,127 @@
-//! Mermaid `mindmap`: parser + left-to-right tidy-tree SVG renderer.
+//! Mermaid `mindmap`: indentation parser and radial SVG renderer.
 //!
-//! Hierarchy comes from indentation: a line is a child of the nearest
-//! previous line with less indentation. Node shapes reuse the flowchart
-//! shape geometry. Mermaid draws mindmaps radially; we render a horizontal
-//! tree (root at the left, children fanning right), which conveys the same
-//! structure and is easy to read.
+//! A line is a child of the nearest preceding less-indented node. Standard
+//! shapes reuse flowchart geometry; cloud and bang outlines are local to
+//! mindmaps. Every declared shape is retained at every depth.
 
 use crate::flowchart::{shapes, ShapeKind};
 use crate::{escape_xml, measure, ParseError};
 
 const MAX_NODES: usize = 300;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MindShape {
+    Flow(ShapeKind),
+    Cloud,
+    Bang,
+}
+
+impl MindShape {
+    fn size_for(self, text_w: f64, text_h: f64) -> (f64, f64) {
+        match self {
+            Self::Flow(shape) => shapes::size_for(shape, text_w, text_h),
+            Self::Cloud => (text_w + 40.0, text_h + 32.0),
+            Self::Bang => (text_w + 48.0, text_h + 32.0),
+        }
+    }
+
+    fn emit(self, x: f64, y: f64, w: f64, h: f64, color: &str) -> String {
+        let (left, top, right, bottom) = (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0);
+        match self {
+            Self::Flow(shape) => shapes::emit(
+                shape,
+                x,
+                y,
+                w,
+                h,
+                Some(&format!("fill:{color};stroke:{color}")),
+            ),
+            Self::Cloud => {
+                // Scallops surround a rectangular label interior. All control
+                // points stay in the measured box, including very long labels.
+                let mut path = format!("M {:.1} {:.1}", left + 8.0, top + 8.0);
+                for i in 0..4 {
+                    let a = left + 8.0 + (w - 16.0) * i as f64 / 4.0;
+                    let b = left + 8.0 + (w - 16.0) * (i + 1) as f64 / 4.0;
+                    path.push_str(&format!(
+                        " Q {:.1} {top:.1} {b:.1} {:.1}",
+                        (a + b) / 2.0,
+                        top + 8.0
+                    ));
+                }
+                for i in 0..2 {
+                    let a = top + 8.0 + (h - 16.0) * i as f64 / 2.0;
+                    let b = top + 8.0 + (h - 16.0) * (i + 1) as f64 / 2.0;
+                    path.push_str(&format!(
+                        " Q {right:.1} {:.1} {:.1} {b:.1}",
+                        (a + b) / 2.0,
+                        right - 8.0
+                    ));
+                }
+                for i in 0..4 {
+                    let a = right - 8.0 - (w - 16.0) * i as f64 / 4.0;
+                    let b = right - 8.0 - (w - 16.0) * (i + 1) as f64 / 4.0;
+                    path.push_str(&format!(
+                        " Q {:.1} {bottom:.1} {b:.1} {:.1}",
+                        (a + b) / 2.0,
+                        bottom - 8.0
+                    ));
+                }
+                for i in 0..2 {
+                    let a = bottom - 8.0 - (h - 16.0) * i as f64 / 2.0;
+                    let b = bottom - 8.0 - (h - 16.0) * (i + 1) as f64 / 2.0;
+                    path.push_str(&format!(
+                        " Q {left:.1} {:.1} {:.1} {b:.1}",
+                        (a + b) / 2.0,
+                        left + 8.0
+                    ));
+                }
+                format!(
+                    r#"<path data-mindmap-shape="cloud" d="{path} Z" fill="{color}" stroke="{color}"/>"#
+                )
+            }
+            Self::Bang => {
+                // A jagged outline reserves an inset rectangular label region,
+                // rather than shrinking long text into an elliptical star.
+                let mut points = vec![(left + 12.0, top + 8.0)];
+                for i in 0..4 {
+                    let a = left + 12.0 + (w - 24.0) * i as f64 / 4.0;
+                    let b = left + 12.0 + (w - 24.0) * (i + 1) as f64 / 4.0;
+                    points.extend([((a + b) / 2.0, top), (b, top + 8.0)]);
+                }
+                for i in 0..3 {
+                    let a = top + 8.0 + (h - 16.0) * i as f64 / 3.0;
+                    let b = top + 8.0 + (h - 16.0) * (i + 1) as f64 / 3.0;
+                    points.extend([(right, (a + b) / 2.0), (right - 12.0, b)]);
+                }
+                for i in 0..4 {
+                    let a = right - 12.0 - (w - 24.0) * i as f64 / 4.0;
+                    let b = right - 12.0 - (w - 24.0) * (i + 1) as f64 / 4.0;
+                    points.extend([((a + b) / 2.0, bottom), (b, bottom - 8.0)]);
+                }
+                for i in 0..3 {
+                    let a = bottom - 8.0 - (h - 16.0) * i as f64 / 3.0;
+                    let b = bottom - 8.0 - (h - 16.0) * (i + 1) as f64 / 3.0;
+                    points.extend([(left, (a + b) / 2.0), (left + 12.0, b)]);
+                }
+                let points = points
+                    .iter()
+                    .map(|(x, y)| format!("{x:.1},{y:.1}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!(
+                    r#"<polygon data-mindmap-shape="bang" points="{points}" fill="{color}" stroke="{color}"/>"#
+                )
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct MindNode {
     pub label: String,
-    pub shape: ShapeKind,
+    pub shape: MindShape,
+    pub explicit_shape: bool,
     pub depth: usize,
     pub children: Vec<usize>,
 }
@@ -24,35 +131,126 @@ pub(crate) struct Mindmap {
     pub nodes: Vec<MindNode>, // node 0 is the root
 }
 
-/// Classifies a node from its optional `id`-prefix + shape brackets,
-/// returning the shape and inner label. `root((Root))` -> circle "Root";
-/// `[square]` -> rect "square"; plain text (no bracket immediately after
-/// an id) is a rounded node labelled with the whole text.
-fn parse_node(s: &str) -> (ShapeKind, &str) {
-    // An id may precede a shape bracket (`root((x))`), like flowchart node
-    // ids. Only strip it when a bracket follows immediately — otherwise the
-    // text (e.g. `Long history`) is a plain label.
-    let id_len = s.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').count();
-    let after = &s[id_len..];
-    let body = if after.starts_with(['(', '[', '{', ')']) { after } else { s };
+const SHAPES: &[(&str, &str, MindShape)] = &[
+    ("((", "))", MindShape::Flow(ShapeKind::Circle)),
+    ("))", "((", MindShape::Bang),
+    ("{{", "}}", MindShape::Flow(ShapeKind::Hexagon)),
+    (")", "(", MindShape::Cloud),
+    ("(", ")", MindShape::Flow(ShapeKind::Rounded)),
+    ("[", "]", MindShape::Flow(ShapeKind::Rect)),
+];
 
-    let pairs: &[(&str, &str, ShapeKind)] = &[
-        ("((", "))", ShapeKind::Circle),
-        ("))", "((", ShapeKind::Rounded), // bang
-        ("{{", "}}", ShapeKind::Hexagon),
-        (")", "(", ShapeKind::Rounded), // cloud
-        ("(", ")", ShapeKind::Rounded),
-        ("[", "]", ShapeKind::Rect),
-    ];
-    for (open, close, shape) in pairs {
-        if body.len() > open.len() + close.len()
-            && body.starts_with(open)
-            && body.ends_with(close)
+fn node_body(source: &str) -> &str {
+    let id_len = source
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(*c, '_' | '-'))
+        .count();
+    let after = &source[id_len..];
+    if after.starts_with(['(', '[', '{', ')']) {
+        after
+    } else {
+        source
+    }
+}
+
+/// Classifies an optional id plus shape brackets. The label itself may carry
+/// literal punctuation, so decorators are checked separately outside its body.
+fn parse_node(source: &str) -> (MindShape, &str) {
+    let body = node_body(source);
+    for &(open, close, shape) in SHAPES {
+        if body.len() > open.len() + close.len() && body.starts_with(open) && body.ends_with(close)
         {
-            return (*shape, body[open.len()..body.len() - close.len()].trim());
+            return (shape, body[open.len()..body.len() - close.len()].trim());
         }
     }
-    (ShapeKind::Rounded, s)
+    (MindShape::Flow(ShapeKind::Rounded), source)
+}
+
+fn outer_single_quote_end(source: &str, close: Option<&str>) -> Option<usize> {
+    let mut escaped = false;
+    for (at, ch) in source.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch != '\'' {
+            continue;
+        }
+        let tail = source[at + 1..].trim_start();
+        if tail.is_empty()
+            || tail.starts_with(":::")
+            || tail.starts_with("::icon(")
+            || close.is_some_and(|end| tail.starts_with(end))
+        {
+            return Some(at);
+        }
+    }
+    None
+}
+
+fn has_decorator(source: &str) -> bool {
+    let body = node_body(source);
+    let mut label = SHAPES.iter().find(|entry| body.starts_with(entry.0));
+    let mut at = label.map_or(0, |(open, _, _)| open.len());
+    let quote_start = at;
+    let mut depth = 1usize;
+    let (mut quote, mut escaped) = (None, false);
+    let mut single_end = None;
+    while at < body.len() {
+        let rest = &body[at..];
+        let ch = rest.chars().next().unwrap();
+        if escaped {
+            escaped = false;
+            at += ch.len_utf8();
+            continue;
+        }
+        if quote.is_some() && ch == '\\' {
+            escaped = true;
+            at += ch.len_utf8();
+            continue;
+        }
+        if quote == Some(ch) && (ch != '\'' || single_end == Some(at)) {
+            quote = None;
+            at += ch.len_utf8();
+            continue;
+        }
+        if quote.is_none() {
+            if ch == '\'' && body[quote_start..at].trim().is_empty() {
+                single_end =
+                    outer_single_quote_end(rest, label.map(|entry| entry.1)).map(|end| at + end);
+            }
+            if ch == '"' || (ch == '\'' && single_end.is_some_and(|end| end > at)) {
+                quote = Some(ch);
+                at += ch.len_utf8();
+                continue;
+            }
+        }
+        if quote.is_none() {
+            if let Some(&(open, close, _)) = label {
+                if rest.starts_with(open) {
+                    depth += 1;
+                    at += open.len();
+                    continue;
+                }
+                if rest.starts_with(close) {
+                    depth -= 1;
+                    at += close.len();
+                    if depth == 0 {
+                        label = None;
+                    }
+                    continue;
+                }
+            } else if rest.starts_with(":::") || rest.starts_with("::icon(") {
+                return true;
+            }
+        }
+        at += ch.len_utf8();
+    }
+    false
 }
 
 /// Leading-whitespace width (tabs count as one), used only to compare
@@ -83,13 +281,23 @@ pub(crate) fn parse(source: &str) -> Result<Mindmap, ParseError> {
             seen_header = true;
             continue;
         }
-        // Decorators that annotate the previous node; ignored.
-        if trimmed.starts_with("::icon(") || trimmed.starts_with(":::") {
-            continue;
+        if has_decorator(trimmed) {
+            return Err(ParseError {
+                message: "mindmap icon and class decorators are not supported".into(),
+                line: Some(line_no),
+            });
         }
 
         let indent = indent_of(raw);
-        let (shape, label) = parse_node(trimmed);
+        let (shape, raw_label) = parse_node(trimmed);
+        let explicit_shape = raw_label != trimmed;
+        if raw_label.starts_with("\"`") && raw_label.ends_with("`\"") {
+            return Err(ParseError {
+                message: "mindmap markdown labels are not supported".into(),
+                line: Some(line_no),
+            });
+        }
+        let label = crate::unquote_label(raw_label);
         // Parent = nearest node on the stack with strictly smaller indent.
         while let Some(&(top_indent, _)) = stack.last() {
             if top_indent >= indent {
@@ -113,7 +321,13 @@ pub(crate) fn parse(source: &str) -> Result<Mindmap, ParseError> {
         }
         let depth = parent.map_or(0, |p| nodes[p].depth + 1);
         let ni = nodes.len();
-        nodes.push(MindNode { label: label.to_string(), shape, depth, children: Vec::new() });
+        nodes.push(MindNode {
+            label: label.to_string(),
+            shape,
+            explicit_shape,
+            depth,
+            children: Vec::new(),
+        });
         if let Some(p) = parent {
             nodes[p].children.push(ni);
         }
@@ -121,10 +335,16 @@ pub(crate) fn parse(source: &str) -> Result<Mindmap, ParseError> {
     }
 
     if !seen_header {
-        return Err(ParseError { message: "mindmap must start with `mindmap`".into(), line: None });
+        return Err(ParseError {
+            message: "mindmap must start with `mindmap`".into(),
+            line: None,
+        });
     }
     if nodes.is_empty() {
-        return Err(ParseError { message: "mindmap has no root node".into(), line: None });
+        return Err(ParseError {
+            message: "mindmap has no root node".into(),
+            line: None,
+        });
     }
     Ok(Mindmap { nodes })
 }
@@ -138,8 +358,9 @@ const ROOT_FILL: &str = "#2a2ad6";
 const TXT_WHITE: &str = "#fff";
 const TXT_DARK: &str = "#222";
 /// Per top-level-branch colors; the whole subtree inherits its branch's color.
-const BRANCH_COLORS: &[&str] =
-    &["#e6e64d", "#7ed321", "#9d6ef0", "#4dd0e1", "#ec4899", "#f5a623", "#4a90e2", "#b06ef0"];
+const BRANCH_COLORS: &[&str] = &[
+    "#e6e64d", "#7ed321", "#9d6ef0", "#4dd0e1", "#ec4899", "#f5a623", "#4a90e2", "#b06ef0",
+];
 
 /// Leaf count of the subtree at `node` (memoized), used for angular allocation.
 fn leaf_count(nodes: &[MindNode], node: usize, memo: &mut [f64]) -> f64 {
@@ -149,7 +370,11 @@ fn leaf_count(nodes: &[MindNode], node: usize, memo: &mut [f64]) -> f64 {
     let lc = if nodes[node].children.is_empty() {
         1.0
     } else {
-        nodes[node].children.iter().map(|&c| leaf_count(nodes, c, memo)).sum()
+        nodes[node]
+            .children
+            .iter()
+            .map(|&c| leaf_count(nodes, c, memo))
+            .sum()
     };
     memo[node] = lc;
     lc
@@ -170,13 +395,28 @@ fn assign_radial(
     let angle = (a0 + a1) / 2.0;
     let r = depth as f64 * RING;
     pos[node] = (r * angle.cos(), r * angle.sin());
-    let total: f64 = nodes[node].children.iter().map(|&c| leaf_count(nodes, c, memo)).sum();
+    let total: f64 = nodes[node]
+        .children
+        .iter()
+        .map(|&c| leaf_count(nodes, c, memo))
+        .sum();
     let mut cur = a0;
     for &c in &nodes[node].children {
         let span = (a1 - a0) * leaf_count(nodes, c, memo) / total.max(1.0);
         assign_radial(nodes, c, cur, cur + span, depth + 1, pos, memo);
         cur += span;
     }
+}
+
+// Every mindmap node emits a single escaped text run. Literal <br> tokens
+// neither shorten the measured line nor create phantom multiline height.
+fn label_size(label: &str) -> (f64, f64) {
+    (
+        measure::text_size(label)
+            .0
+            .max(measure::literal_overlap_width(label, 13.0) * 1.04),
+        measure::LINE_H,
+    )
 }
 
 pub(crate) fn render_svg(m: &Mindmap) -> String {
@@ -208,14 +448,42 @@ pub(crate) fn render_svg(m: &Mindmap) -> String {
         .iter()
         .enumerate()
         .map(|(i, node)| {
-            let (tw, th) = measure::text_size(&node.label);
-            if i == 0 {
+            let (tw, th) = label_size(&node.label);
+            if node.explicit_shape {
+                node.shape.size_for(tw, th)
+            } else if i == 0 {
                 shapes::size_for(ShapeKind::Circle, tw, th)
             } else {
-                (tw + 18.0, NODE_H)
+                (tw + 18.0, th.max(NODE_H))
             }
         })
         .collect();
+
+    // A fixed ring overlaps wide labels and crowded branches. Scale the radial
+    // positions by the smallest common factor that separates every pair of
+    // node boxes along at least one axis. The 300-node cap bounds this O(n²) pass.
+    let mut scale = 1.0_f64;
+    for i in 0..n {
+        for j in 0..i {
+            let dx = (pos[i].0 - pos[j].0).abs();
+            let dy = (pos[i].1 - pos[j].1).abs();
+            let sx = if dx > 1e-9 {
+                ((sizes[i].0 + sizes[j].0) / 2.0 + 12.0) / dx
+            } else {
+                f64::INFINITY
+            };
+            let sy = if dy > 1e-9 {
+                ((sizes[i].1 + sizes[j].1) / 2.0 + 12.0) / dy
+            } else {
+                f64::INFINITY
+            };
+            scale = scale.max(sx.min(sy));
+        }
+    }
+    for p in &mut pos {
+        p.0 *= scale;
+        p.1 *= scale;
+    }
 
     // Shift relative positions into a positive canvas with a margin.
     let (mut minx, mut miny, mut maxx, mut maxy) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
@@ -251,8 +519,16 @@ pub(crate) fn render_svg(m: &Mindmap) -> String {
     // leaves = text with a branch-colored underline.
     for (i, node) in m.nodes.iter().enumerate() {
         let (x, y) = at(i);
-        let (tw, _) = measure::text_size(&node.label);
-        if i == 0 {
+        let (tw, _) = label_size(&node.label);
+        if node.explicit_shape && !(i == 0 && node.shape == MindShape::Flow(ShapeKind::Circle)) {
+            svg.push_str(&node.shape.emit(x, y, sizes[i].0, sizes[i].1, color_of(i)));
+            svg.push_str(&format!(
+                r#"<text x="{x:.1}" y="{:.1}" text-anchor="middle" fill="{}">{}</text>"#,
+                y + 4.0,
+                if i == 0 { TXT_WHITE } else { TXT_DARK },
+                escape_xml(&node.label)
+            ));
+        } else if i == 0 {
             let r = sizes[i].0 / 2.0;
             svg.push_str(&format!(
                 r#"<circle cx="{x:.1}" cy="{y:.1}" r="{r:.1}" fill="{ROOT_FILL}" stroke="{ROOT_FILL}"/>"#
@@ -265,7 +541,11 @@ pub(crate) fn render_svg(m: &Mindmap) -> String {
         } else if node.depth == 1 {
             let (bw, bh) = (tw + 18.0, NODE_H);
             // Honor the declared shape's corner style (`[square]` = sharp).
-            let rx = if node.shape == ShapeKind::Rect { 1.0 } else { 6.0 };
+            let rx = if node.shape == MindShape::Flow(ShapeKind::Rect) {
+                1.0
+            } else {
+                6.0
+            };
             svg.push_str(&format!(
                 r#"<rect x="{:.1}" y="{:.1}" width="{bw:.1}" height="{bh:.1}" rx="{rx}" fill="{}"/>"#,
                 x - bw / 2.0,
@@ -307,10 +587,6 @@ mod tests {
         parse(src).expect("parse ok")
     }
 
-
-
-
-
     #[test]
     fn header_required() {
         assert!(parse("root").is_err());
@@ -321,14 +597,24 @@ mod tests {
     fn radial_layout_colors_branches_and_styles_nodes() {
         let svg = render_svg(&p("mindmap\n  root((r))\n    A\n      a1\n    B\n      b1"));
         // Root is a filled circle in ROOT_FILL.
-        assert!(svg.contains(&format!(r#"fill="{ROOT_FILL}""#)), "root fill: {svg}");
+        assert!(
+            svg.contains(&format!(r#"fill="{ROOT_FILL}""#)),
+            "root fill: {svg}"
+        );
         // The two top-level branches use distinct palette colors...
-        assert!(svg.contains(BRANCH_COLORS[0]) && svg.contains(BRANCH_COLORS[1]), "branch colors: {svg}");
+        assert!(
+            svg.contains(BRANCH_COLORS[0]) && svg.contains(BRANCH_COLORS[1]),
+            "branch colors: {svg}"
+        );
         // ...on thick edges, and leaves get an underline.
         assert!(svg.contains(r#"stroke-width="5""#), "thick edges: {svg}");
         assert!(svg.contains("<line"), "leaf underline: {svg}");
         // Radial: not every node shares one x (the old tree put a column per depth).
-        let xs: Vec<&str> = svg.split("<circle cx=\"").skip(1).map(|s| s.split('"').next().unwrap()).collect();
+        let xs: Vec<&str> = svg
+            .split("<circle cx=\"")
+            .skip(1)
+            .map(|s| s.split('"').next().unwrap())
+            .collect();
         assert!(!xs.is_empty());
     }
 
@@ -339,7 +625,7 @@ mod tests {
         let g = p("mindmap\n  root((Root))\n    Origins\n      Long history\n    Research\n    Tools\n      Pen\n      Mermaid");
         // root has 3 children: Origins, Research, Tools
         assert_eq!(g.nodes[0].label, "Root");
-        assert_eq!(g.nodes[0].shape, ShapeKind::Circle);
+        assert_eq!(g.nodes[0].shape, MindShape::Flow(ShapeKind::Circle));
         assert_eq!(g.nodes[0].children.len(), 3);
         // Origins has one child (Long history) at depth 2.
         let origins = g.nodes[0].children[0];
@@ -367,34 +653,58 @@ mod tests {
             .and_then(|s| s.trim_start_matches('"').split('"').next())
             .and_then(|s| s.parse().ok())
             .expect("a circle with a radius");
-        assert!(2.0 * r >= label_w, "circle diameter {} must cover label width {label_w}", 2.0 * r);
+        assert!(
+            2.0 * r >= label_w,
+            "circle diameter {} must cover label width {label_w}",
+            2.0 * r
+        );
+    }
+
+    #[test]
+    fn cloud_and_bang_outlines_fit_the_canvas_with_long_labels() {
+        let label = "Long mindmap label ".repeat(20);
+        for root in [format!("r){label}("), format!("r)){label}((")] {
+            let svg = render_svg(&p(&format!(
+                "mindmap\n{root}\n child[Child]\n  cloud)Cloud(\n  bang))Bang(("
+            )));
+            crate::extent::assert_inside(&svg);
+        }
     }
 
     #[test]
     fn shapes_parse() {
         let g = p("mindmap\n  r\n    [square]\n    (round)\n    ((circle))\n    {{hex}}\n    ))bang((\n    )cloud(");
-        let kids: Vec<(ShapeKind, &str)> =
-            g.nodes[0].children.iter().map(|&c| (g.nodes[c].shape, g.nodes[c].label.as_str())).collect();
-        assert_eq!(kids[0], (ShapeKind::Rect, "square"));
-        assert_eq!(kids[1], (ShapeKind::Rounded, "round"));
-        assert_eq!(kids[2], (ShapeKind::Circle, "circle"));
-        assert_eq!(kids[3], (ShapeKind::Hexagon, "hex"));
-        assert_eq!(kids[4].1, "bang");
-        assert_eq!(kids[5].1, "cloud");
+        let kids: Vec<(MindShape, &str)> = g.nodes[0]
+            .children
+            .iter()
+            .map(|&c| (g.nodes[c].shape, g.nodes[c].label.as_str()))
+            .collect();
+        assert_eq!(kids[0], (MindShape::Flow(ShapeKind::Rect), "square"));
+        assert_eq!(kids[1], (MindShape::Flow(ShapeKind::Rounded), "round"));
+        assert_eq!(kids[2], (MindShape::Flow(ShapeKind::Circle), "circle"));
+        assert_eq!(kids[3], (MindShape::Flow(ShapeKind::Hexagon), "hex"));
+        assert_eq!(kids[4], (MindShape::Bang, "bang"));
+        assert_eq!(kids[5], (MindShape::Cloud, "cloud"));
     }
 
     #[test]
-    fn icon_and_class_decorators_ignored() {
-        let g = p("mindmap\n  root\n    Origins\n    ::icon(fa fa-book)\n    :::urgent\n    Research");
-        // Only Origins + Research are real children; decorators skipped.
-        assert_eq!(g.nodes[0].children.len(), 2);
-        assert_eq!(g.nodes[g.nodes[0].children[1]].label, "Research");
+    fn icon_and_class_decorators_report_unsupported_syntax() {
+        for decorator in ["::icon(fa fa-book)", ":::urgent"] {
+            let error =
+                parse(&format!("mindmap\n  root\n    Origins\n    {decorator}")).unwrap_err();
+            assert_eq!(error.line, Some(4));
+            assert!(error.message.contains("not supported"));
+        }
     }
 
     #[test]
     fn two_roots_error() {
         let e = parse("mindmap\nroot1\nroot2").unwrap_err();
-        assert!(e.message.contains("more than one root"), "got: {}", e.message);
+        assert!(
+            e.message.contains("more than one root"),
+            "got: {}",
+            e.message
+        );
     }
 
     #[test]
@@ -416,14 +726,24 @@ mod tests {
     fn wide_shallow_node_widens_canvas() {
         let width = |src: &str| {
             let svg = render_svg(&p(src));
-            svg.split("width=\"").nth(1).unwrap().split('"').next().unwrap().parse::<f64>().unwrap()
+            svg.split("width=\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap()
         };
         // Same tree shape; only the ROOT (depth 0) label width differs.
         // Under the old "deepest column only" width these would be equal and
         // the wide root would clip.
         let narrow = width("mindmap\n  R\n    child");
         let wide = width("mindmap\n  ((A very very very long root label))\n    child");
-        assert!(wide > narrow, "wide root ({wide}) must widen the canvas vs narrow ({narrow})");
+        assert!(
+            wide > narrow,
+            "wide root ({wide}) must widen the canvas vs narrow ({narrow})"
+        );
     }
 
     #[test]

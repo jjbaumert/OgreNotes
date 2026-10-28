@@ -133,6 +133,16 @@ pub struct ParseError { pub message: String, pub line: Option<usize> }
   font family for consistent browser and standalone metrics. Short leaf names
   are centered vertically while retaining the complete glyph band.
 
+- **Architecture limits:** at most 500 nodes and 1,000 edges, within the shared
+  20,000-character source limit. Constraint propagation, group separation and
+  orthogonal routing share a 20,000,000-operation work allowance. Exhaustion
+  returns a source-line error with no SVG. Self-edges using the same node and
+  port are unsupported and return a source-line error; different-port self-edges
+  remain supported.
+
+- **GitGraph quoted values:** backslashes remain literal, including a trailing
+  backslash. Quoted values are not unescaped.
+
 ### B. Block model (both schemas, mirrored)
 
 - New `NodeType::Mermaid`: block-level **leaf** atom (mirrors `Embed`). Source
