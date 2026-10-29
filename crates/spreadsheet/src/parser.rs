@@ -64,7 +64,10 @@ pub fn col_to_letters(mut col: usize) -> String {
 pub fn letters_to_col(s: &str) -> usize {
     let mut result = 0usize;
     for b in s.bytes() {
-        result = result * 26 + (b - b'A') as usize + 1;
+        let Some(next) = result.checked_mul(26)
+            .and_then(|n| n.checked_add((b - b'A') as usize + 1))
+        else { return usize::MAX; };
+        result = next;
     }
     result - 1
 }
@@ -282,7 +285,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 if !more_alpha && !function_call {
                     // Genuine cell reference: letters + digits with no trailing alpha or '('.
                     let row_str: String = chars[row_start..i].iter().collect();
-                    let row: usize = row_str.parse::<usize>().unwrap_or(1).saturating_sub(1);
+                    let row: usize = row_str.parse::<usize>().unwrap_or(usize::MAX).saturating_sub(1);
                     let col = letters_to_col(&letters.to_uppercase());
                     tokens.push(Token::CellRef(CellRef { col, row, abs_col, abs_row }));
                 } else {
@@ -638,12 +641,11 @@ pub fn is_valid_named_range_name(s: &str) -> bool {
     }
     // Reject `LETTERS+DIGITS+` like `A1`, `AA10`.
     let split = bytes.iter().position(|b| b.is_ascii_digit());
-    if let Some(idx) = split {
-        if idx > 0 && bytes[..idx].iter().all(|b| b.is_ascii_alphabetic())
-            && bytes[idx..].iter().all(|b| b.is_ascii_digit())
-        {
-            return false;
-        }
+    if let Some(idx) = split
+        && idx > 0 && bytes[..idx].iter().all(|b| b.is_ascii_alphabetic())
+            && bytes[idx..].iter().all(|b| b.is_ascii_digit()) {
+        return false;
+
     }
     true
 }
@@ -669,6 +671,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::approx_constant)] // Decimal parsing must retain its literal test case.
     fn parse_number() {
         assert_eq!(parse_formula("42").unwrap(), Expr::Number(42.0));
         assert_eq!(parse_formula("3.14").unwrap(), Expr::Number(3.14));

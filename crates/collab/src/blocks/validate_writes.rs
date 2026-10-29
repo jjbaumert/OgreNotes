@@ -277,6 +277,17 @@ pub fn validate_liveapp_writes_scoped(
 /// (`WalkScope::Canary`) is the coverage check for this
 /// assumption.
 pub fn walk_changed(_doc: &Doc, touched: &[XmlElementRef]) -> Vec<LiveAppViolation> {
+    // Sparse-cell edits can violate limits on their parent workbook (sheet
+    // count, duplicate names, total stored cells). Attribute-only validation
+    // of the touched sheet cannot establish those invariants.
+    if touched.iter().any(|element| {
+        matches!(NodeType::from_tag(element.tag()), Some(NodeType::Spreadsheet | NodeType::SpreadsheetSheet))
+            || matches!(element.parent(), Some(XmlOut::Element(parent))
+                if matches!(NodeType::from_tag(parent.tag()), Some(NodeType::Spreadsheet | NodeType::SpreadsheetSheet)))
+    }) {
+        return walk_doc(_doc);
+    }
+
     let mut violations: Vec<LiveAppViolation> = Vec::new();
     // Use a read transaction for the doc lifetime of the walk;
     // XmlElementRefs are just BranchPtrs into the same store.
@@ -474,6 +485,11 @@ fn walk_element<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef, out: &mut Vec<Live
     {
         let attrs = collect_attrs(txn, el);
         let block_id = attrs.get("blockId").cloned();
+        if matches!(nt, NodeType::Spreadsheet | NodeType::SpreadsheetSheet)
+            && let Err(error) = super::spreadsheet::validate_shape(txn, el)
+        {
+            out.push((error, block_id.clone()).into());
+        }
         match block.validate_attrs(nt, &attrs) {
             Err(e) => {
                 out.push((e, block_id).into());

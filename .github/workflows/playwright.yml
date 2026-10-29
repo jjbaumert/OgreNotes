@@ -105,7 +105,7 @@ jobs:
       # xmlsec OpenSSL runtime is what the runtime binary
       # dlopens for the actual crypto backend.
       - name: Install xmlsec1 + clang (samael dependencies)
-        run: bash scripts/ci-install-native-deps.sh librsvg2-bin imagemagick
+        run: bash scripts/ci-install-native-deps.sh librsvg2-bin imagemagick poppler-utils
 
       # ─── Toolchain ────────────────────────────────────────────
       - name: Install Rust (stable + wasm32)
@@ -181,15 +181,14 @@ jobs:
       # the readiness-poll window. `cargo build` blocks until the binary
       # exists; `Start axum server` then just execs the already-compiled
       # artifact and backgrounds it.
-      # Strip the `pdf` feature from the playwright build — no scenario
-      # in doctor.js exercises PDF import/export, and `pdf-extract` +
-      # `printpdf` together pull in ~70 transitive crates (allsorts,
+      # Keep PDF out of the browser build: pdf-extract + printpdf
+      # pull in about 70 transitive crates (allsorts,
       # azul-*, ouroboros) that pushed the cold cargo build past the
       # 30-minute job budget and trapped the workflow in a doom loop
       # (cold build → 30m timeout → no cache save → cold build again).
-      # PDF correctness is verified by `crates/api/tests/test_import_pdf_e2e.rs`
-      # under the regular CI workflow, which runs with the api crate's
-      # default feature set (pdf on).
+      # The embedded spreadsheet browser scenario explicitly skips PDF here.
+      # PDF rendering remains covered by the shared-engine/collab tests and
+      # API tests in regular CI, whose default feature set includes PDF.
       - name: Build axum server (release)
         run: |
           cargo build --release --locked --bin ogrenotes-api \
@@ -828,6 +827,21 @@ jobs:
         if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
         working-directory: scripts/frontend-doctor
         run: node test-table-structure.cjs --base-url http://127.0.0.1:3000
+
+      - name: Run embedded spreadsheet undo removal regression
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: node test-embedded-spreadsheet.cjs --base-url http://127.0.0.1:3000 --edge-case undo-removal --out ../../artifacts/doctor/embedded-spreadsheet-undo
+
+      - name: Run embedded spreadsheet rejected draft regression
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: node test-embedded-spreadsheet.cjs --base-url http://127.0.0.1:3000 --edge-case rejected-navigation --out ../../artifacts/doctor/embedded-spreadsheet-rejected-draft
+
+      - name: Run embedded spreadsheet acceptance
+        if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')
+        working-directory: scripts/frontend-doctor
+        run: node test-embedded-spreadsheet.cjs --base-url http://127.0.0.1:3000 --out ../../artifacts/doctor/embedded-spreadsheet --skip-pdf
 
       - name: Run merged document table structure regression
         if: always() && (steps.trash-flow.outcome == 'success' || steps.trash-flow.outcome == 'failure')

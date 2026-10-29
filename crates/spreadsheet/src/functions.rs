@@ -484,7 +484,7 @@ fn eval_text(engine: &SpreadsheetEngine, expr: &Expr) -> String {
 }
 
 fn js_random() -> f64 {
-    js_sys::Math::random()
+    crate::runtime::random()
 }
 
 // ─── Math Functions ────────────────────────────────────────────
@@ -701,10 +701,9 @@ fn fn_sumif(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     let sum_vals = if args.len() > 2 { engine.collect_values(&args[2]) } else { range_vals.clone() };
     let mut sum = 0.0;
     for (i, val) in range_vals.iter().enumerate() {
-        if matches_criteria(val, &criteria) {
-            if let Some(sv) = sum_vals.get(i) {
-                if let Ok(n) = sv.as_number() { sum += n; }
-            }
+        if matches_criteria(val, &criteria)
+            && let Some(sv) = sum_vals.get(i)
+            && let Ok(n) = sv.as_number() { sum += n;
         }
     }
     CellValue::Number(sum)
@@ -734,10 +733,10 @@ fn matches_criteria(val: &CellValue, criteria: &str) -> bool {
         if let (Ok(vn), Ok(cn)) = (val.as_number(), rest.trim().parse::<f64>()) {
             return vn > cn;
         }
-    } else if let Some(rest) = criteria.strip_prefix('<') {
-        if let (Ok(vn), Ok(cn)) = (val.as_number(), rest.trim().parse::<f64>()) {
-            return vn < cn;
-        }
+    } else if let Some(rest) = criteria.strip_prefix('<')
+        && let (Ok(vn), Ok(cn)) = (val.as_number(), rest.trim().parse::<f64>())
+    {
+        return vn < cn;
     }
     // Exact match (case-insensitive for text)
     val.as_text().to_uppercase() == criteria.to_uppercase()
@@ -972,7 +971,7 @@ fn fn_date_time_part(args: &[Expr], engine: &SpreadsheetEngine, part: &str) -> C
 fn fn_weekday(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     if args.is_empty() { return CellValue::Error(SpreadsheetError::Value); }
     let s = eval_text(engine, &args[0]);
-    let date = js_sys::Date::new(&s.into());
+    let date = crate::runtime::parse_date(&s);
     let day = date.get_day(); // 0=Sun
     CellValue::Number((day + 1) as f64) // 1=Sun, 7=Sat
 }
@@ -980,9 +979,9 @@ fn fn_weekday(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
 fn fn_weeknum(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     if args.is_empty() { return CellValue::Error(SpreadsheetError::Value); }
     let s = eval_text(engine, &args[0]);
-    let date = js_sys::Date::new(&s.into());
+    let date = crate::runtime::parse_date(&s);
     // Simple week number: day of year / 7
-    let jan1 = js_sys::Date::new_with_year_month_day(date.get_full_year(), 0, 1);
+    let jan1 = crate::runtime::Date::new_with_year_month_day(date.get_full_year(), 0, 1);
     let diff = date.get_time() - jan1.get_time();
     let day_of_year = (diff / 86_400_000.0).floor() + 1.0;
     CellValue::Number((day_of_year / 7.0).ceil())
@@ -992,7 +991,7 @@ fn fn_edate(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     if let Err(e) = require_args(args, 2) { return e; }
     let s = eval_text(engine, &args[0]);
     let months = match eval_num(engine, &args[1]) { Ok(n) => n as i32, Err(e) => return e };
-    let date = js_sys::Date::new(&s.into());
+    let date = crate::runtime::parse_date(&s);
     // Compute new year/month manually to avoid i32→u32 cast issues with negative months
     let cur_year = date.get_full_year() as i32;
     let cur_month = date.get_month() as i32;
@@ -1011,7 +1010,7 @@ fn fn_eomonth(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     if let Err(e) = require_args(args, 2) { return e; }
     let s = eval_text(engine, &args[0]);
     let months = match eval_num(engine, &args[1]) { Ok(n) => n as i32, Err(e) => return e };
-    let date = js_sys::Date::new(&s.into());
+    let date = crate::runtime::parse_date(&s);
     let cur_year = date.get_full_year() as i32;
     let cur_month = date.get_month() as i32;
     let total_months = cur_year * 12 + cur_month + months + 1;
@@ -1031,8 +1030,8 @@ fn fn_datedif(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     let start = eval_text(engine, &args[0]);
     let end = eval_text(engine, &args[1]);
     let unit = eval_text(engine, &args[2]).to_uppercase();
-    let d1 = js_sys::Date::new(&start.into());
-    let d2 = js_sys::Date::new(&end.into());
+    let d1 = crate::runtime::parse_date(&start);
+    let d2 = crate::runtime::parse_date(&end);
     let diff_ms = d2.get_time() - d1.get_time();
     let diff_days = (diff_ms / 86_400_000.0).floor();
     match unit.as_str() {
@@ -1047,8 +1046,8 @@ fn fn_days(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     if let Err(e) = require_args(args, 2) { return e; }
     let end = eval_text(engine, &args[0]);
     let start = eval_text(engine, &args[1]);
-    let d1 = js_sys::Date::new(&start.into());
-    let d2 = js_sys::Date::new(&end.into());
+    let d1 = crate::runtime::parse_date(&start);
+    let d2 = crate::runtime::parse_date(&end);
     CellValue::Number(((d2.get_time() - d1.get_time()) / 86_400_000.0).floor())
 }
 
@@ -1212,6 +1211,7 @@ fn fn_vlookup(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
 /// - both numeric → numeric compare
 /// - both boolean → boolean compare (FALSE < TRUE)
 /// - otherwise → case-insensitive text compare
+///
 /// Returns `None` if either side is an error.
 fn compare_lookup(cell: &CellValue, lookup: &CellValue) -> Option<std::cmp::Ordering> {
     if cell.is_error() || lookup.is_error() {
@@ -1249,19 +1249,48 @@ fn fn_hlookup(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
 }
 
 fn fn_index(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
-    if let Err(e) = require_args(args, 2) { return e; }
-    let row_idx = match eval_num(engine, &args[1]) { Ok(n) => (n as usize).saturating_sub(1), Err(e) => return e };
-    let col_idx = if args.len() > 2 {
-        match eval_num(engine, &args[2]) { Ok(n) => (n as usize).saturating_sub(1), Err(e) => return e }
-    } else { 0 };
+    if let Err(e) = require_args(args, 2) {
+        return e;
+    }
+    let row_number = match eval_num(engine, &args[1]) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let col_number = if args.len() > 2 {
+        match eval_num(engine, &args[2]) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    } else {
+        1.0
+    };
 
     let Expr::Range(ref range) = args[0] else {
         return CellValue::Error(SpreadsheetError::Value);
     };
 
-    let r = range.start.row.min(range.end.row) + row_idx;
-    let c = range.start.col.min(range.end.col) + col_idx;
-    engine.get_value((c, r)).clone()
+    let r1 = range.start.row.min(range.end.row);
+    let r2 = range.start.row.max(range.end.row);
+    let c1 = range.start.col.min(range.end.col);
+    let c2 = range.start.col.max(range.end.col);
+    // INDEX truncates fractional offsets, as before, but zero/negative,
+    // nonfinite and out-of-range offsets must never reach unrelated cells.
+    let offset = |number: f64, first: usize, last: usize| {
+        if !number.is_finite() || number < 1.0 {
+            return None;
+        }
+        let offset = number.trunc() - 1.0;
+        if offset > (last - first) as f64 {
+            return None;
+        }
+        first
+            .checked_add(offset as usize)
+            .filter(|&target| target <= last)
+    };
+    let (Some(row), Some(col)) = (offset(row_number, r1, r2), offset(col_number, c1, c2)) else {
+        return CellValue::Error(SpreadsheetError::Ref);
+    };
+    engine.get_value((col, row)).clone()
 }
 
 fn fn_match(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
@@ -1327,7 +1356,7 @@ fn fn_choose(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
 enum DatePart { Year, Month, Day }
 
 fn fn_today() -> CellValue {
-    let date = js_sys::Date::new_0();
+    let date = crate::runtime::Date::new_0();
     let y = date.get_full_year();
     let m = date.get_month() + 1;
     let d = date.get_date();
@@ -1429,9 +1458,9 @@ fn fn_transpose(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     let mut out: Vec<Vec<CellValue>> = (0..cols)
         .map(|_| Vec::with_capacity(rows))
         .collect();
-    for r in 0..rows {
-        for c in 0..cols {
-            out[c].push(src[r].get(c).cloned().unwrap_or(CellValue::Empty));
+    for row in &src {
+        for (c, output) in out.iter_mut().enumerate() {
+            output.push(row.get(c).cloned().unwrap_or(CellValue::Empty));
         }
     }
     CellValue::Array(out)
@@ -1604,7 +1633,7 @@ fn fn_unique(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     }
     let kept: Vec<Vec<CellValue>> = order
         .into_iter()
-        .zip(counts.into_iter())
+        .zip(counts)
         .filter_map(|(row, count)| {
             if exactly_once && count != 1 { None } else { Some(row.clone()) }
         })
@@ -1928,10 +1957,12 @@ fn fn_mdeterm(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
             det = -det;
         }
         det *= m[i][i];
-        for r in (i + 1)..n {
-            let factor = m[r][i] / m[i][i];
-            for c in i..n {
-                m[r][c] -= factor * m[i][c];
+        let (before, targets) = m.split_at_mut(i + 1);
+        let pivot_row = &before[i];
+        for row in targets {
+            let factor = row[i] / pivot_row[i];
+            for (value, pivot_value) in row[i..n].iter_mut().zip(&pivot_row[i..n]) {
+                *value -= factor * pivot_value;
             }
         }
     }
@@ -1967,19 +1998,20 @@ fn fn_minverse(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
         }
         aug.swap(i, pivot);
         let pv = aug[i][i];
-        for c in 0..2 * n { aug[i][c] /= pv; }
-        for r in 0..n {
-            if r == i { continue; }
-            let factor = aug[r][i];
-            for c in 0..2 * n {
-                aug[r][c] -= factor * aug[i][c];
+        let (before, pivot_and_after) = aug.split_at_mut(i);
+        let (pivot_row, after) = pivot_and_after.split_first_mut().expect("pivot row exists");
+        for value in &mut pivot_row[..2 * n] { *value /= pv; }
+        for row in before.iter_mut().chain(after.iter_mut()) {
+            let factor = row[i];
+            for (value, pivot_value) in row[..2 * n].iter_mut().zip(&pivot_row[..2 * n]) {
+                *value -= factor * pivot_value;
             }
         }
     }
     let mut out: Vec<Vec<CellValue>> = Vec::with_capacity(n);
-    for r in 0..n {
+    for row in &aug {
         out.push(
-            aug[r][n..2 * n]
+            row[n..2 * n]
                 .iter()
                 .map(|v| CellValue::Number(*v))
                 .collect(),
@@ -1997,9 +2029,9 @@ fn transpose_2d(src: &[Vec<CellValue>]) -> Vec<Vec<CellValue>> {
     let mut out: Vec<Vec<CellValue>> = (0..cols)
         .map(|_| Vec::with_capacity(rows))
         .collect();
-    for r in 0..rows {
-        for c in 0..cols {
-            out[c].push(src[r].get(c).cloned().unwrap_or(CellValue::Empty));
+    for row in src {
+        for (c, output) in out.iter_mut().enumerate() {
+            output.push(row.get(c).cloned().unwrap_or(CellValue::Empty));
         }
     }
     out
@@ -2994,11 +3026,11 @@ fn decode_weekend_mask(value: Option<&CellValue>) -> [bool; 7] {
     // [Mon, Tue, Wed, Thu, Fri, Sat, Sun]
     let mut m = [false, false, false, false, false, true, true];
     let v = match value { Some(v) => v, None => return m };
-    if let CellValue::Text(s) = v {
-        if s.len() == 7 && s.chars().all(|c| c == '0' || c == '1') {
-            for (i, c) in s.chars().enumerate() { m[i] = c == '1'; }
-            return m;
-        }
+    if let CellValue::Text(s) = v
+        && s.len() == 7 && s.chars().all(|c| c == '0' || c == '1') {
+        for (i, c) in s.chars().enumerate() { m[i] = c == '1'; }
+        return m;
+
     }
     if let Ok(n) = v.as_number() {
         // Excel codes: 1 (default Sat+Sun), 2 (Sun+Mon), 3 (Mon+Tue), …
@@ -3127,13 +3159,13 @@ fn fn_xlookup(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
             let target = needle.as_number().ok();
             let mut best: Option<(usize, f64)> = None;
             for (i, v) in haystack.iter().enumerate() {
-                if let (Some(t), Ok(n)) = (target, v.as_number()) {
-                    if n <= t {
-                        match best {
-                            Some((_, b)) if n <= b => {},
-                            _ => best = Some((i, n)),
-                        }
+                if let (Some(t), Ok(n)) = (target, v.as_number())
+                    && n <= t {
+                    match best {
+                        Some((_, b)) if n <= b => {},
+                        _ => best = Some((i, n)),
                     }
+
                 }
             }
             best.map(|(i, _)| i)
@@ -3142,13 +3174,13 @@ fn fn_xlookup(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
             let target = needle.as_number().ok();
             let mut best: Option<(usize, f64)> = None;
             for (i, v) in haystack.iter().enumerate() {
-                if let (Some(t), Ok(n)) = (target, v.as_number()) {
-                    if n >= t {
-                        match best {
-                            Some((_, b)) if n >= b => {},
-                            _ => best = Some((i, n)),
-                        }
+                if let (Some(t), Ok(n)) = (target, v.as_number())
+                    && n >= t {
+                    match best {
+                        Some((_, b)) if n >= b => {},
+                        _ => best = Some((i, n)),
                     }
+
                 }
             }
             best.map(|(i, _)| i)
@@ -3181,13 +3213,13 @@ fn fn_xmatch(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
             let target = needle.as_number().ok();
             let mut best: Option<(usize, f64)> = None;
             for (i, v) in haystack.iter().enumerate() {
-                if let (Some(t), Ok(n)) = (target, v.as_number()) {
-                    if n <= t {
-                        match best {
-                            Some((_, b)) if n <= b => {},
-                            _ => best = Some((i, n)),
-                        }
+                if let (Some(t), Ok(n)) = (target, v.as_number())
+                    && n <= t {
+                    match best {
+                        Some((_, b)) if n <= b => {},
+                        _ => best = Some((i, n)),
                     }
+
                 }
             }
             best.map(|(i, _)| i)
@@ -3196,13 +3228,13 @@ fn fn_xmatch(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
             let target = needle.as_number().ok();
             let mut best: Option<(usize, f64)> = None;
             for (i, v) in haystack.iter().enumerate() {
-                if let (Some(t), Ok(n)) = (target, v.as_number()) {
-                    if n >= t {
-                        match best {
-                            Some((_, b)) if n >= b => {},
-                            _ => best = Some((i, n)),
-                        }
+                if let (Some(t), Ok(n)) = (target, v.as_number())
+                    && n >= t {
+                    match best {
+                        Some((_, b)) if n >= b => {},
+                        _ => best = Some((i, n)),
                     }
+
                 }
             }
             best.map(|(i, _)| i)
@@ -3380,8 +3412,8 @@ fn fn_arabic(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     while i < chars.len() {
         let cur = match val(chars[i]) { Some(v) => v, None => return CellValue::Error(SpreadsheetError::Value) };
         let next = if i + 1 < chars.len() { val(chars[i + 1]) } else { None };
-        if let Some(nv) = next {
-            if cur < nv { total += nv - cur; i += 2; continue; }
+        if let Some(nv) = next
+            && cur < nv { total += nv - cur; i += 2; continue;
         }
         total += cur; i += 1;
     }
@@ -3592,7 +3624,7 @@ fn fn_median(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     if nums.is_empty() { return CellValue::Error(SpreadsheetError::Num); }
     nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = nums.len() / 2;
-    if nums.len() % 2 == 0 {
+    if nums.len().is_multiple_of(2) {
         CellValue::Number((nums[mid - 1] + nums[mid]) / 2.0)
     } else {
         CellValue::Number(nums[mid])
@@ -3600,7 +3632,9 @@ fn fn_median(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
 }
 
 fn percentile_of(nums: &mut [f64], k: f64) -> CellValue {
-    if nums.is_empty() || k < 0.0 || k > 1.0 { return CellValue::Error(SpreadsheetError::Num); }
+    // Preserve the existing NaN behavior: ordered comparisons reject neither
+    // bound for NaN, unlike a plain negated RangeInclusive::contains call.
+    if nums.is_empty() || !(k.is_nan() || (0.0..=1.0).contains(&k)) { return CellValue::Error(SpreadsheetError::Num); }
     nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = nums.len() as f64;
     let rank = k * (n - 1.0);
@@ -3842,7 +3876,7 @@ fn fn_t_test(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     let arr2 = engine.collect_numbers(&args[1]);
     let tails = match eval_num(engine, &args[2]) { Ok(v) => v as i64, Err(e) => return e };
     let ttype = match eval_num(engine, &args[3]) { Ok(v) => v as i64, Err(e) => return e };
-    if !matches!(tails, 1 | 2) || !matches!(ttype, 1 | 2 | 3) {
+    if !matches!(tails, 1 | 2) || !matches!(ttype, 1..=3) {
         return CellValue::Error(SpreadsheetError::Num);
     }
     if arr1.len() < 2 || arr2.len() < 2 {
@@ -3997,10 +4031,9 @@ fn fn_averageif(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     let avg_vals = if args.len() > 2 { engine.collect_values(&args[2]) } else { range_vals.clone() };
     let mut sum = 0.0; let mut count = 0usize;
     for (i, val) in range_vals.iter().enumerate() {
-        if matches_criteria(val, &criteria) {
-            if let Some(sv) = avg_vals.get(i) {
-                if let Ok(n) = sv.as_number() { sum += n; count += 1; }
-            }
+        if matches_criteria(val, &criteria)
+            && let Some(sv) = avg_vals.get(i)
+            && let Ok(n) = sv.as_number() { sum += n; count += 1;
         }
     }
     if count == 0 { CellValue::Error(SpreadsheetError::Div0) } else { CellValue::Number(sum / count as f64) }
@@ -4008,7 +4041,7 @@ fn fn_averageif(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
 
 fn fn_sumifs(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     // SUMIFS(sum_range, criteria_range1, criteria1, ...)
-    if args.len() < 3 || args.len() % 2 == 0 { return CellValue::Error(SpreadsheetError::Value); }
+    if args.len() < 3 || args.len().is_multiple_of(2) { return CellValue::Error(SpreadsheetError::Value); }
     let sum_vals = engine.collect_values(&args[0]);
     let mask = build_criteria_mask(args, engine, 1, sum_vals.len());
     let sum: f64 = sum_vals.iter().enumerate()
@@ -4019,46 +4052,46 @@ fn fn_sumifs(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
 }
 
 fn fn_countifs(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
-    if args.len() < 2 || args.len() % 2 != 0 { return CellValue::Error(SpreadsheetError::Value); }
+    if args.len() < 2 || !args.len().is_multiple_of(2) { return CellValue::Error(SpreadsheetError::Value); }
     let first_range = engine.collect_values(&args[0]);
     let mask = build_criteria_mask(args, engine, 0, first_range.len());
     CellValue::Number(mask.iter().filter(|&&m| m).count() as f64)
 }
 
 fn fn_averageifs(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
-    if args.len() < 3 || args.len() % 2 == 0 { return CellValue::Error(SpreadsheetError::Value); }
+    if args.len() < 3 || args.len().is_multiple_of(2) { return CellValue::Error(SpreadsheetError::Value); }
     let avg_vals = engine.collect_values(&args[0]);
     let mask = build_criteria_mask(args, engine, 1, avg_vals.len());
     let mut sum = 0.0; let mut count = 0usize;
     for (j, v) in avg_vals.iter().enumerate() {
-        if mask.get(j).copied().unwrap_or(false) {
-            if let Ok(n) = v.as_number() { sum += n; count += 1; }
+        if mask.get(j).copied().unwrap_or(false)
+            && let Ok(n) = v.as_number() { sum += n; count += 1;
         }
     }
     if count == 0 { CellValue::Error(SpreadsheetError::Div0) } else { CellValue::Number(sum / count as f64) }
 }
 
 fn fn_maxifs(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
-    if args.len() < 3 || args.len() % 2 == 0 { return CellValue::Error(SpreadsheetError::Value); }
+    if args.len() < 3 || args.len().is_multiple_of(2) { return CellValue::Error(SpreadsheetError::Value); }
     let max_vals = engine.collect_values(&args[0]);
     let mask = build_criteria_mask(args, engine, 1, max_vals.len());
     let mut max = f64::NEG_INFINITY; let mut found = false;
     for (j, v) in max_vals.iter().enumerate() {
-        if mask.get(j).copied().unwrap_or(false) {
-            if let Ok(n) = v.as_number() { max = max.max(n); found = true; }
+        if mask.get(j).copied().unwrap_or(false)
+            && let Ok(n) = v.as_number() { max = max.max(n); found = true;
         }
     }
     if found { CellValue::Number(max) } else { CellValue::Number(0.0) }
 }
 
 fn fn_minifs(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
-    if args.len() < 3 || args.len() % 2 == 0 { return CellValue::Error(SpreadsheetError::Value); }
+    if args.len() < 3 || args.len().is_multiple_of(2) { return CellValue::Error(SpreadsheetError::Value); }
     let min_vals = engine.collect_values(&args[0]);
     let mask = build_criteria_mask(args, engine, 1, min_vals.len());
     let mut min = f64::INFINITY; let mut found = false;
     for (j, v) in min_vals.iter().enumerate() {
-        if mask.get(j).copied().unwrap_or(false) {
-            if let Ok(n) = v.as_number() { min = min.min(n); found = true; }
+        if mask.get(j).copied().unwrap_or(false)
+            && let Ok(n) = v.as_number() { min = min.min(n); found = true;
         }
     }
     if found { CellValue::Number(min) } else { CellValue::Number(0.0) }
@@ -4239,7 +4272,7 @@ fn fn_ddb(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     let factor = if args.len() > 4 { eval_num(engine, &args[4]).unwrap_or(2.0) } else { 2.0 };
     let mut book_value = cost;
     let mut depreciation = 0.0;
-    for p in 1..=period {
+    for _ in 1..=period {
         depreciation = (book_value * factor / life).min(book_value - salvage).max(0.0);
         book_value -= depreciation;
     }
@@ -4844,7 +4877,7 @@ fn fn_bitlshift(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     if let Err(e) = require_args(args, 2) { return e; }
     let a = match eval_num(engine, &args[0]) { Ok(v) => v as i64, Err(e) => return e };
     let n = match eval_num(engine, &args[1]) { Ok(v) => v as i64, Err(e) => return e };
-    if a < 0 || a > BIT_MAX || n.abs() > 53 {
+    if !(0..=BIT_MAX).contains(&a) || n.abs() > 53 {
         return CellValue::Error(SpreadsheetError::Num);
     }
     // Shift in u64 + checked overflow. The combined `a ≤ 2^48 - 1`
@@ -4867,7 +4900,7 @@ fn fn_bitrshift(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
     if let Err(e) = require_args(args, 2) { return e; }
     let a = match eval_num(engine, &args[0]) { Ok(v) => v as i64, Err(e) => return e };
     let n = match eval_num(engine, &args[1]) { Ok(v) => v as i64, Err(e) => return e };
-    if a < 0 || a > BIT_MAX || n.abs() > 53 {
+    if !(0..=BIT_MAX).contains(&a) || n.abs() > 53 {
         return CellValue::Error(SpreadsheetError::Num);
     }
     // Mirror BITLSHIFT: a right-shift by negative `n` is a
@@ -4889,7 +4922,7 @@ fn fn_bitrshift(args: &[Expr], engine: &SpreadsheetEngine) -> CellValue {
 /// `len == 0` returns unchanged.
 fn pad_left_zeros(s: String, len: usize) -> String {
     if s.len() >= len || len == 0 { return s; }
-    let pad: String = std::iter::repeat('0').take(len - s.len()).collect();
+    let pad: String = "0".repeat(len - s.len());
     pad + &s
 }
 
@@ -4915,7 +4948,7 @@ fn dec_to_base(n: i64, radix: u32) -> String {
 
 fn places_arg(engine: &SpreadsheetEngine, args: &[Expr], idx: usize) -> Result<usize, CellValue> {
     if args.len() <= idx { return Ok(0); }
-    let v = eval_num(engine, &args[idx]).map_err(|e| e)?;
+    let v = eval_num(engine, &args[idx])?;
     if v < 1.0 { return Err(CellValue::Error(SpreadsheetError::Num)); }
     Ok(v as usize)
 }
@@ -5342,17 +5375,17 @@ fn db_cell_matches(cell: &CellValue, criterion: &CellValue) -> bool {
     // D-function filtering, so coercing via `as_number()` here would
     // produce wrong matches.
     let cell_is_numeric = matches!(cell, CellValue::Number(_) | CellValue::Bool(_));
-    if cell_is_numeric {
-        if let (Ok(cell_n), Ok(crit_n)) = (cell.as_number(), rest.parse::<f64>()) {
-            return match op {
-                ">" => cell_n > crit_n,
-                "<" => cell_n < crit_n,
-                ">=" => cell_n >= crit_n,
-                "<=" => cell_n <= crit_n,
-                "<>" => (cell_n - crit_n).abs() > f64::EPSILON,
-                _ => (cell_n - crit_n).abs() < f64::EPSILON,
-            };
-        }
+    if cell_is_numeric
+        && let (Ok(cell_n), Ok(crit_n)) = (cell.as_number(), rest.parse::<f64>()) {
+        return match op {
+            ">" => cell_n > crit_n,
+            "<" => cell_n < crit_n,
+            ">=" => cell_n >= crit_n,
+            "<=" => cell_n <= crit_n,
+            "<>" => (cell_n - crit_n).abs() > f64::EPSILON,
+            _ => (cell_n - crit_n).abs() < f64::EPSILON,
+        };
+
     }
     // Text comparison with wildcard support for the equality ops.
     let cell_t = cell.as_text();
@@ -5439,10 +5472,10 @@ fn db_filter(
                 }
             })
         });
-        if any_match {
-            if let Some(v) = row.get(field_idx) {
-                matched.push(v.clone());
-            }
+        if any_match
+            && let Some(v) = row.get(field_idx) {
+            matched.push(v.clone());
+
         }
     }
     matched
@@ -5884,10 +5917,8 @@ mod tests {
         assert_eq!(eval("=SEQUENCE(0)"), "#NUM!");
     }
 
-    // RANDARRAY relies on `js_sys::Math::random()` which is
-    // wasm-only — same constraint as RAND / RANDBETWEEN, none of
-    // which have native unit tests. The function logic is exercised
-    // by `cargo check --target wasm32-unknown-unknown`.
+    // RANDARRAY shares the target-specific random generator with RAND and
+    // RANDBETWEEN; browser behavior remains backed by JavaScript Math.random.
 
     #[test] fn mmult_2x2_identity_is_self() {
         // I = [[1,0],[0,1]]; A = [[3,5],[7,11]]; I × A = A.
@@ -7141,5 +7172,74 @@ mod tests {
         // COMBINA(5, 3): combinations with repetition C(n+k-1, k)
         //   = C(7,3) = 35. (Fn already exists pre-S1b but no test until now.)
         assert_eq!(eval("=COMBINA(5,3)"), "35");
+    }
+}
+
+#[cfg(test)]
+mod index_bounds_regressions {
+    use super::*;
+
+    #[test]
+    fn index_cannot_read_adjacent_cells_or_oversized_offsets() {
+        let mut engine = SpreadsheetEngine::new();
+        engine.set_cell((1, 0), "10");
+        engine.set_cell((1, 1), "99");
+        engine.set_cell((2, 0), "88");
+        for formula in [
+            "=INDEX(B1:B1,2)",
+            "=INDEX(B1:B1,1,2)",
+            "=INDEX(B1:B1,1000000)",
+            "=INDEX(B1:B1,1e300)",
+            "=INDEX(B1:B1,0)",
+            "=INDEX(B1:B1,-1)",
+        ] {
+            engine.set_cell((0, 0), formula);
+            assert_eq!(engine.get_display((0, 0)), "#REF!", "{formula}");
+        }
+        engine.set_cell((0, 0), "=INDEX(B1:C2,1,2)");
+        assert_eq!(engine.get_display((0, 0)), "88");
+        engine.set_cell((0, 0), "=INDEX(B1:C2,1.9,1)");
+        assert_eq!(engine.get_display((0, 0)), "10");
+    }
+
+    #[test]
+    fn index_rejects_nonfinite_arguments_before_converting_to_addresses() {
+        let mut engine = SpreadsheetEngine::new();
+        engine.set_cell((1, 0), "10");
+        for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let result = fn_index(
+                &[
+                    Expr::Range(super::super::parser::RangeRef {
+                        start: super::super::parser::CellRef::new(1, 0),
+                        end: super::super::parser::CellRef::new(1, 0),
+                    }),
+                    Expr::Number(number),
+                ],
+                &engine,
+            );
+            assert_eq!(result, CellValue::Error(SpreadsheetError::Ref));
+        }
+    }
+
+    #[test]
+    fn bounded_workbook_index_stays_inside_its_declared_dependency_range() {
+        use crate::embedded::{SheetData, engine_for_sheet};
+        use std::collections::BTreeMap;
+        let sheet = SheetData {
+            id: "sheet1".into(),
+            name: "Sheet1".into(),
+            rows: 12,
+            cols: 6,
+            cells: BTreeMap::from([
+                ((0, 0), "=INDEX(B1:B1,2)".into()),
+                ((1, 0), "10".into()),
+                ((1, 1), "99".into()),
+                ((0, 1), "=INDEX(B1:B1,1000000)".into()),
+            ]),
+            formats: BTreeMap::new(),
+        };
+        let engine = engine_for_sheet(&sheet, std::slice::from_ref(&sheet));
+        assert_eq!(engine.get_display((0, 0)), "#REF!");
+        assert_eq!(engine.get_display((0, 1)), "#REF!");
     }
 }

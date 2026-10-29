@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -106,6 +106,9 @@ pub struct EditorView {
     listeners: Vec<(&'static str, Closure<dyn Fn(web_sys::Event)>)>,
     /// selectionchange listener (attached to document, not container).
     selectionchange_closure: Option<Closure<dyn Fn(web_sys::Event)>>,
+    spreadsheet_islands: RefCell<std::collections::HashMap<String, super::blocks::spreadsheet::SpreadsheetIsland>>,
+    /// Native focusout during reconciliation must never persist a local draft.
+    rendering: Rc<Cell<bool>>,
 }
 
 impl EditorView {
@@ -182,6 +185,8 @@ impl EditorView {
             mention_paste_hook: Rc::new(on_mention_paste),
             listeners: Vec::new(),
             selectionchange_closure: None,
+            spreadsheet_islands: RefCell::new(std::collections::HashMap::new()),
+            rendering: Rc::new(Cell::new(false)),
         };
 
         view.render();
@@ -226,7 +231,7 @@ impl EditorView {
         let reveal = transaction.scroll_into_view;
         let state = self.state.borrow().apply(transaction);
         self.update_state(state.clone());
-        if reveal && !*self.composing.borrow() {
+        if reveal && !*self.composing.borrow() && !self.container.has_attribute("data-spreadsheet-active") {
             self.scroll_selection_into_view();
         }
         state
@@ -234,11 +239,21 @@ impl EditorView {
 
     /// Render the document model to DOM.
     fn render(&self) {
+        self.rendering.set(true);
+        let _render_guard = SpreadsheetRenderGuard(self.rendering.as_ref());
         let doc = web_sys::window()
             .and_then(|w| w.document())
             .expect("no document");
 
         let state = self.state.borrow();
+        let island_focus = doc.active_element()
+            .filter(|el| el.closest(".embedded-spreadsheet").ok().flatten().is_some())
+            .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
+            .map(|input| {
+                let start = input.selection_start().ok().flatten();
+                let end = input.selection_end().ok().flatten();
+                (input, start, end)
+            });
 
         let scroll_positions: std::collections::HashMap<_, _> =
             mermaid_scroll_panes(&self.container)
@@ -263,16 +278,50 @@ impl EditorView {
                 let _ = style.set_property_with_priority("overflow-anchor", "none", "important");
                 (scroller, value, priority)
             });
-        self.container.set_inner_html("");
-
+        // Reconcile the DOM in place. Stable block identities keep spreadsheet
+        // roots, input focus, drafts and scroll connected across prose/remote edits.
+        let desired = doc.create_element("div").expect("render container");
         if let Node::Element { content, .. } = &state.doc {
             for child in &content.children {
                 if let Some(dom_node) = render_node(&doc, child) {
-                    self.container
+                    desired
                         .append_child(&dom_node)
                         .unwrap_or_else(|_| dom_node.clone());
                 }
             }
+        }
+
+        let mut books = Vec::new();
+        collect_spreadsheets(&state.doc, &mut books);
+        if self.container.get_attribute("data-spreadsheet-active")
+            .is_some_and(|id| !books.iter().any(|book| book.block_id() == Some(id.as_str()))) {
+            self.container.remove_attribute("data-spreadsheet-active").ok();
+        }
+        let mut islands = self.spreadsheet_islands.borrow_mut();
+        islands.retain(|id, _| books.iter().any(|node| node.block_id() == Some(id.as_str())));
+        let readonly = self.container.class_list().contains("editor-content-readonly");
+        for book in books {
+            let Some(id) = book.block_id() else { continue };
+            if !islands.contains_key(id) {
+                // Find by identity without interpolating untrusted IDs into selectors.
+                if let Ok(nodes) = desired.query_selector_all(".embedded-spreadsheet") {
+                    for index in 0..nodes.length() {
+                        let Some(root) = nodes.item(index).and_then(|n| n.dyn_into::<HtmlElement>().ok()) else { continue };
+                        if root.get_attribute("data-block-id").as_deref() == Some(id) {
+                            islands.insert(id.to_owned(), super::blocks::spreadsheet::SpreadsheetIsland::new(root, self.state.clone(), self.dispatch.clone(), self.history.clone(), readonly, self.rendering.clone()));
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(island) = islands.get(id) { island.update(book); }
+        }
+        reconcile_children(self.container.as_ref(), desired.as_ref(), &islands);
+        drop(islands);
+        if let Some((input, start, end)) = island_focus
+            && input.is_connected() && doc.active_element().as_ref() != Some(input.as_ref()) {
+            input.focus().ok();
+            if let (Some(start), Some(end)) = (start, end) { input.set_selection_range(start, end).ok(); }
         }
 
         for (id, code) in mermaid_scroll_panes(&self.container) {
@@ -315,6 +364,8 @@ impl EditorView {
     /// Sync the model selection to the browser's DOM selection.
     /// Preserves direction (backward selections where anchor > head).
     fn sync_selection_to_dom(&self, selection: &Selection) {
+        if super::blocks::spreadsheet::focused_inside()
+            || self.container.has_attribute("data-spreadsheet-active") { return; }
         let Some(window) = web_sys::window() else {
             return;
         };
@@ -468,6 +519,15 @@ impl EditorView {
 
     /// Attach keyboard, input, and composition event listeners.
     fn attach_listeners(&mut self) {
+        let container_focus = self.container.clone();
+        self.add_listener("focusin", Closure::wrap(Box::new(move |event: web_sys::Event| {
+            let workbook = event.target().and_then(|target| target.dyn_into::<Element>().ok())
+                .and_then(|target| target.closest(".embedded-spreadsheet").ok().flatten())
+                .and_then(|root| root.get_attribute("data-block-id"));
+            if let Some(id) = workbook {
+                container_focus.set_attribute("data-spreadsheet-active", &id).ok();
+            } else { container_focus.remove_attribute("data-spreadsheet-active").ok(); }
+        }) as Box<dyn Fn(web_sys::Event)>));
         // Keydown -- dispatch to keymap for keyboard shortcuts
         let composing = Rc::clone(&self.composing);
         let state_kd = Rc::clone(&self.state);
@@ -477,6 +537,7 @@ impl EditorView {
         let container_kd = self.container.clone();
 
         let on_keydown = Closure::wrap(Box::new(move |event: web_sys::Event| {
+            if super::blocks::spreadsheet::event_inside(&event) { return; }
             if *composing.borrow() {
                 return;
             }
@@ -636,6 +697,7 @@ impl EditorView {
         let container2 = self.container.clone();
 
         let on_before_input = Closure::wrap(Box::new(move |event: web_sys::Event| {
+            if super::blocks::spreadsheet::event_inside(&event) { return; }
             if *composing2.borrow() {
                 return;
             }
@@ -973,7 +1035,8 @@ impl EditorView {
 
         // compositionstart
         let composing_start = Rc::clone(&self.composing);
-        let on_comp_start = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        let on_comp_start = Closure::wrap(Box::new(move |event: web_sys::Event| {
+            if super::blocks::spreadsheet::event_inside(&event) { return; }
             *composing_start.borrow_mut() = true;
         }) as Box<dyn Fn(web_sys::Event)>);
         self.add_listener("compositionstart", on_comp_start);
@@ -987,6 +1050,7 @@ impl EditorView {
         let pending_comp = Rc::clone(&self.pending_composition);
 
         let on_comp_end = Closure::wrap(Box::new(move |event: web_sys::Event| {
+            if super::blocks::spreadsheet::event_inside(&event) { return; }
             *composing_end.borrow_mut() = false;
 
             let Some(ce) = event.dyn_ref::<web_sys::CompositionEvent>() else {
@@ -1038,6 +1102,7 @@ impl EditorView {
         let state_copy = Rc::clone(&self.state);
         let container_copy = self.container.clone();
         let on_copy = Closure::wrap(Box::new(move |event: web_sys::Event| {
+            if super::blocks::spreadsheet::event_inside(&event) { return; }
             event.prevent_default();
             let Some(ce) = event.dyn_ref::<web_sys::ClipboardEvent>() else { return };
             let Some(clipboard_data) = ce.clipboard_data() else { return };
@@ -1065,6 +1130,7 @@ impl EditorView {
         let dispatch_cut = Rc::clone(&self.dispatch);
         let container_cut = self.container.clone();
         let on_cut = Closure::wrap(Box::new(move |event: web_sys::Event| {
+            if super::blocks::spreadsheet::event_inside(&event) { return; }
             event.prevent_default();
             let Some(ce) = event.dyn_ref::<web_sys::ClipboardEvent>() else { return };
             let Some(clipboard_data) = ce.clipboard_data() else { return };
@@ -1098,6 +1164,7 @@ impl EditorView {
         let container_paste = self.container.clone();
         let mention_paste_hook = Rc::clone(&self.mention_paste_hook);
         let on_paste = Closure::wrap(Box::new(move |event: web_sys::Event| {
+            if super::blocks::spreadsheet::event_inside(&event) { return; }
             event.prevent_default();
             let Some(ce) = event.dyn_ref::<web_sys::ClipboardEvent>() else { return };
             let Some(clipboard_data) = ce.clipboard_data() else { return };
@@ -1530,6 +1597,7 @@ impl EditorView {
         let composing_sel = Rc::clone(&self.composing);
 
         let on_selectionchange = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+            if super::blocks::spreadsheet::focused_inside() { return; }
             if *composing_sel.borrow() {
                 return;
             }
@@ -1582,6 +1650,8 @@ impl EditorView {
     /// Destroy the view, removing event listeners and clearing content.
     pub fn destroy(mut self) {
         self.remove_listeners();
+        // Release widget listeners before removing focused DOM controls.
+        self.spreadsheet_islands.borrow_mut().clear();
         self.container.set_inner_html("");
     }
 
@@ -1605,6 +1675,128 @@ impl EditorView {
                 )
                 .unwrap_or(());
             }
+        }
+    }
+}
+
+struct SpreadsheetRenderGuard<'a>(&'a Cell<bool>);
+impl Drop for SpreadsheetRenderGuard<'_> {
+    fn drop(&mut self) { self.0.set(false); }
+}
+
+fn collect_spreadsheets<'a>(node: &'a Node, out: &mut Vec<&'a Node>) {
+    if let Node::Element {
+        node_type, content, ..
+    } = node
+    {
+        if *node_type == NodeType::Spreadsheet {
+            out.push(node);
+        } else {
+            for child in &content.children {
+                collect_spreadsheets(child, out);
+            }
+        }
+    }
+}
+fn same_dom_identity(a: &DomNode, b: &DomNode) -> bool {
+    if a.node_type() != b.node_type() || a.node_name() != b.node_name() {
+        return false;
+    }
+    match (a.dyn_ref::<Element>(), b.dyn_ref::<Element>()) {
+        (Some(a), Some(b)) => a.get_attribute("data-block-id") == b.get_attribute("data-block-id"),
+        _ => true,
+    }
+}
+fn reconcile_children(
+    parent: &DomNode,
+    desired: &DomNode,
+    islands: &std::collections::HashMap<String, super::blocks::spreadsheet::SpreadsheetIsland>,
+) {
+    let wanted: Vec<_> = (0..desired.child_nodes().length())
+        .filter_map(|i| desired.child_nodes().item(i))
+        .collect();
+    // Remove deleted keyed siblings before placing retained roots. Moving a
+    // focused island ahead of an obsolete paragraph would otherwise blur it.
+    let wanted_keys: std::collections::HashSet<_> = wanted
+        .iter()
+        .filter_map(|node| {
+            node.dyn_ref::<Element>()
+                .and_then(|el| el.get_attribute("data-block-id"))
+        })
+        .collect();
+    let obsolete: Vec<_> = (0..parent.child_nodes().length())
+        .filter_map(|i| parent.child_nodes().item(i))
+        .filter(|node| {
+            node.dyn_ref::<Element>()
+                .and_then(|el| el.get_attribute("data-block-id"))
+                .is_some_and(|key| !wanted_keys.contains(&key))
+        })
+        .collect();
+    for node in obsolete {
+        parent.remove_child(&node).ok();
+    }
+    for (index, fresh) in wanted.iter().enumerate() {
+        let island = fresh
+            .dyn_ref::<Element>()
+            .filter(|el| el.class_list().contains("embedded-spreadsheet"))
+            .and_then(|el| el.get_attribute("data-block-id"))
+            .and_then(|id| islands.get(&id));
+        let current = parent.child_nodes().item(index as u32);
+        let existing = if let Some(island) = island {
+            Some(DomNode::from(island.root.clone()))
+        } else {
+            current
+                .clone()
+                .filter(|old| same_dom_identity(old, fresh))
+                .or_else(|| {
+                    (index as u32..parent.child_nodes().length())
+                        .filter_map(|i| parent.child_nodes().item(i))
+                        .find(|old| same_dom_identity(old, fresh))
+                })
+        };
+        let node = existing.unwrap_or_else(|| fresh.clone());
+        if current.as_ref() != Some(&node) {
+            parent.insert_before(&node, current.as_ref()).ok();
+        }
+        if island.is_some() {
+            continue;
+        }
+        if node != *fresh {
+            if let (Some(old), Some(new)) = (node.dyn_ref::<Element>(), fresh.dyn_ref::<Element>())
+            {
+                for name in old
+                    .get_attribute_names()
+                    .iter()
+                    .filter_map(|n| n.as_string())
+                {
+                    if !new.has_attribute(&name) {
+                        old.remove_attribute(&name).ok();
+                    }
+                }
+                for name in new
+                    .get_attribute_names()
+                    .iter()
+                    .filter_map(|n| n.as_string())
+                {
+                    if let Some(value) = new.get_attribute(&name)
+                        && old.get_attribute(&name).as_deref() != Some(&value) {
+                        old.set_attribute(&name, &value).ok();
+                    }
+                }
+                reconcile_children(&node, fresh, islands);
+            } else if node.node_value() != fresh.node_value() {
+                node.set_node_value(fresh.node_value().as_deref());
+            }
+        } else if node.dyn_ref::<Element>().is_some() {
+            // A new structural wrapper can contain an already-mounted island.
+            reconcile_children(&node, fresh, islands);
+        }
+    }
+    while parent.child_nodes().length() > wanted.len() as u32 {
+        if let Some(last) = parent.last_child() {
+            parent.remove_child(&last).ok();
+        } else {
+            break;
         }
     }
 }
@@ -2214,6 +2406,7 @@ fn node_type_to_tag(nt: NodeType) -> &'static str {
         NodeType::Kanban => "div", // overridden in render_node
         NodeType::KanbanColumn => "div", // overridden in render_node
         NodeType::KanbanCard => "div", // overridden in render_node
+        NodeType::Spreadsheet | NodeType::SpreadsheetSheet => "div", // block-owned islands
         // #148 slice 6 — mention chip. Attribute + inner text
         // emission handled by the renderer's per-node override
         // (added in PR-B); this base tag is `span` to match the
@@ -3104,6 +3297,83 @@ mod embed_render_tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn spreadsheet_islands_keep_focused_drafts_across_document_updates() {
+        use crate::editor::blocks::{LiveAppBlockInsert, spreadsheet::SpreadsheetInsert};
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container: HtmlElement = document.create_element("div").unwrap().dyn_into().unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        let first = SpreadsheetInsert.build_default_node();
+        let first_id = first.block_id().unwrap().to_owned();
+        let sheet_id = first.child(0).unwrap().block_id().unwrap().to_owned();
+        let second = SpreadsheetInsert.build_default_node();
+        let doc = Node::element_with_content(
+            NodeType::Doc,
+            Fragment::from(vec![
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("before")]),
+                ),
+                first,
+                second,
+                Node::element_with_content(
+                    NodeType::Paragraph,
+                    Fragment::from(vec![Node::text("after")]),
+                ),
+            ]),
+        );
+        let view = EditorView::new(
+            container.clone(),
+            EditorState::create_default(doc),
+            |_| {},
+            Rc::new(RefCell::new(super::super::plugins::HistoryPlugin::new())),
+            |_| {},
+        );
+        let roots = container
+            .query_selector_all(".embedded-spreadsheet")
+            .unwrap();
+        assert_eq!(roots.length(), 2);
+        let root = roots.item(0).unwrap().dyn_into::<HtmlElement>().unwrap();
+        let input = root
+            .query_selector("[data-sheet-action=raw]")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        input.focus().unwrap();
+        input.set_value("=SUM(A1:A9)+draft");
+        let event = web_sys::Event::new("input").unwrap();
+        // Event::new defaults to non-bubbling, so initialize it as browser input.
+        event.init_event_with_bubbles_and_cancelable("input", true, false);
+        input.dispatch_event(&event).unwrap();
+        // Deleting the paragraph before a focused island must retain its root.
+        let state = view.state();
+        let paragraph_size = state.doc.child(0).unwrap().node_size();
+        view.update_state(state.apply(state.transaction().delete(0, paragraph_size).unwrap()));
+        assert_eq!(document.active_element(), Some(input.clone().into()));
+        assert_eq!(input.value(), "=SUM(A1:A9)+draft");
+        // Model change in a different cell exercises the remote update path.
+        let state = view.state();
+        let txn = super::super::commands::embedded_spreadsheet::set_attribute(
+            &state,
+            &first_id,
+            &sheet_id,
+            "cell:1:1".into(),
+            "19".into(),
+        )
+        .unwrap();
+        view.update_state(state.apply(txn));
+        let after = container
+            .query_selector_all(".embedded-spreadsheet")
+            .unwrap();
+        assert_eq!(after.item(0).unwrap(), root.clone().into());
+        assert_eq!(document.active_element(), Some(input.clone().into()));
+        assert_eq!(input.value(), "=SUM(A1:A9)+draft");
+        assert_eq!(after.item(1), roots.item(1));
+        view.destroy();
+        container.remove();
+    }
 
     /// Regression: the YouTube/Vimeo embed wrapper must advertise
     /// `data-atom-size="1"` so the DOM↔model walkers treat the div+iframe

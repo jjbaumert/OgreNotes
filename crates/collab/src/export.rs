@@ -8,6 +8,102 @@ use yrs::{
 
 use crate::schema::NodeType;
 
+/// Rendered text deliberately includes grid separators and coordinates so the
+/// low-fidelity PDF path retains spreadsheet structure and distant sparse cells.
+fn embedded_spreadsheet_text<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef) -> String {
+    let mut output = el.get_attribute(txn, "title").unwrap_or_else(|| "Spreadsheet".into());
+    match crate::blocks::spreadsheet::display_workbook(txn, el) {
+        Ok(sheets) => {
+            for sheet in sheets {
+                output.push('\n');
+                output.push_str(&sheet.name);
+                for row in sheet.rows {
+                    output.push('\n');
+                    output.push_str(&row.join(" | "));
+                }
+                if let Some(note) = sheet.note {
+                    output.push('\n');
+                    output.push_str(&note);
+                }
+            }
+        }
+        Err(error) => output.push_str(&format!("\nInvalid spreadsheet: {error}")),
+    }
+    output
+}
+
+fn render_embedded_spreadsheet_html<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef, out: &mut String) {
+    out.push_str("<section class=\"spreadsheet-block\"><h3>");
+    out.push_str(&html_escape(&el.get_attribute(txn, "title").unwrap_or_else(|| "Spreadsheet".into())));
+    out.push_str("</h3>");
+    match crate::blocks::spreadsheet::display_workbook(txn, el) {
+        Ok(sheets) => {
+            for sheet in sheets {
+                out.push_str("<h4>");
+                out.push_str(&html_escape(&sheet.name));
+                out.push_str("</h4>");
+                if !sheet.rows.is_empty() {
+                    out.push_str("<table>");
+                    for (index, row) in sheet.rows.iter().enumerate() {
+                        out.push_str("<tr>");
+                        let tag = if index == 0 { "th" } else { "td" };
+                        for value in row {
+                            out.push_str(&format!("<{tag}>{}</{tag}>", html_escape(value).replace('\n', "<br>")));
+                        }
+                        out.push_str("</tr>");
+                    }
+                    out.push_str("</table>");
+                }
+                if let Some(note) = sheet.note {
+                    out.push_str("<p>"); out.push_str(&html_escape(&note)); out.push_str("</p>");
+                }
+            }
+        }
+        Err(error) => {
+            out.push_str("<p>Invalid spreadsheet: ");
+            out.push_str(&html_escape(&error.to_string()));
+            out.push_str("</p>");
+        }
+    }
+    out.push_str("</section>");
+}
+
+/// Literal table content must not create links, emphasis, or extra cells.
+fn embedded_markdown_literal(value: &str) -> String {
+    html_escape(value).replace('\\', "&#92;").replace('|', "&#124;")
+        .replace('`', "&#96;").replace('*', "&#42;").replace('_', "&#95;")
+        .replace('~', "&#126;").replace('[', "&#91;").replace(']', "&#93;")
+        .replace('\r', "").replace('\n', "<br>")
+}
+
+fn render_embedded_spreadsheet_markdown<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef, out: &mut String, depth: usize) {
+    out.push_str("**");
+    out.push_str(&embedded_markdown_literal(&el.get_attribute(txn, "title").unwrap_or_else(|| "Spreadsheet".into())));
+    out.push_str("**\n\n");
+    match crate::blocks::spreadsheet::display_workbook(txn, el) {
+        Ok(sheets) => {
+            for sheet in sheets {
+                out.push_str("**"); out.push_str(&embedded_markdown_literal(&sheet.name)); out.push_str("**\n\n");
+                let columns = sheet.rows.first().map_or(0, Vec::len);
+                for (index, row) in sheet.rows.iter().enumerate() {
+                    let values = row.iter().map(|value| embedded_markdown_literal(value)).collect::<Vec<_>>();
+                    push_md_table_row(out, &values, columns, depth);
+                    if index == 0 {
+                        push_md_table_row(out, &vec!["---".into(); columns], columns, depth);
+                    }
+                }
+                out.push('\n');
+                if let Some(note) = sheet.note {
+                    out.push_str(&note); out.push_str("\n\n");
+                }
+            }
+        }
+        Err(error) => {
+            out.push_str("Invalid spreadsheet: "); out.push_str(&embedded_markdown_literal(&error.to_string())); out.push_str("\n\n");
+        }
+    }
+}
+
 /// A comment thread flattened for export rendering (#59 T-6). The
 /// `collab` crate stays storage- and time-agnostic: the API layer resolves
 /// author display names and formats timestamps, mapping the stored
@@ -321,6 +417,10 @@ fn csv_encode_cell(cell: &str) -> String {
 
 /// Recursively extract plain text from a yrs XmlElement.
 fn extract_text<T: ReadTxn>(txn: &T, el: &yrs::XmlElementRef) -> String {
+    if el.tag().as_ref() == NodeType::Spreadsheet.tag_name() {
+        return embedded_spreadsheet_text(txn, el);
+    }
+
     // #7: bail out past the recursion cap so a deeply nested blob can't
     // overflow the stack.
     let Some(_depth) = DepthGuard::enter() else {
@@ -495,6 +595,34 @@ pub fn to_docx_with_comments(doc: &Doc, comments: &[ExportComment]) -> Vec<u8> {
         match node_type {
             NodeType::Table => {
                 docx = docx.add_table(build_docx_table(&txn, &el));
+            }
+            NodeType::Spreadsheet => {
+                docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text(
+                    el.get_attribute(&txn, "title").unwrap_or_else(|| "Spreadsheet".into()),
+                )));
+                match crate::blocks::spreadsheet::display_workbook(&txn, &el) {
+                    Ok(sheets) => {
+                        for sheet in sheets {
+                            docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text(&sheet.name)));
+                            if !sheet.rows.is_empty() {
+                                let rows = sheet.rows.into_iter().map(|row| {
+                                    docx_rs::TableRow::new(row.into_iter().map(|value| {
+                                        docx_rs::TableCell::new().add_paragraph(
+                                            Paragraph::new().add_run(Run::new().add_text(value)),
+                                        )
+                                    }).collect())
+                                }).collect();
+                                docx = docx.add_table(docx_rs::Table::new(rows));
+                            }
+                            if let Some(note) = sheet.note {
+                                docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text(note)));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text(format!("Invalid spreadsheet: {error}"))));
+                    }
+                }
             }
             NodeType::Heading => {
                 let level = el
@@ -1249,6 +1377,14 @@ fn render_node_html_with_context<T: ReadTxn>(
                 return;
             };
 
+            if node_type == NodeType::Spreadsheet {
+                render_embedded_spreadsheet_html(txn, el, out);
+                return;
+            }
+            if node_type == NodeType::SpreadsheetSheet {
+                return;
+            }
+
             // Compute the correct HTML tag (headings need dynamic tags)
             let html_tag = resolve_html_tag(txn, el, node_type);
             let attrs = render_html_attrs(txn, el, node_type);
@@ -1469,6 +1605,8 @@ fn render_node_markdown<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String, de
                     out.push_str("\n\n");
                 }
                 NodeType::Table => render_table_markdown(txn, el, out, depth),
+                NodeType::Spreadsheet => render_embedded_spreadsheet_markdown(txn, el, out, depth),
+                NodeType::SpreadsheetSheet => {},
                 NodeType::Heading => {
                     let level = el
                         .get_attribute(txn, "level")
@@ -2005,6 +2143,7 @@ fn node_type_to_html_tag(nt: NodeType) -> &'static str {
         NodeType::MathBlock => "div",
         NodeType::MathInline => "span",
         NodeType::Slide | NodeType::Frame => crate::blocks::presentation::html_tag(nt),
+        NodeType::Spreadsheet | NodeType::SpreadsheetSheet => "div",
     }
 }
 
@@ -5767,5 +5906,195 @@ mod tests {
         let md = to_markdown(&fixture_deck());
         assert!(md.contains("## Slide 1"), "got: {md}");
         assert!(!md.contains("## Slide 3"), "got: {md}");
+    }
+}
+
+#[cfg(test)]
+mod embedded_spreadsheet_tests {
+    use super::*;
+    use yrs::{WriteTxn, types::xml::{XmlElementPrelim, XmlTextPrelim}};
+
+    fn document() -> Doc {
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let fragment = txn.get_or_insert_xml_fragment("content");
+            let before = fragment.insert(&mut txn, 0, XmlElementPrelim::empty("paragraph"));
+            before.insert(&mut txn, 0, XmlTextPrelim::new("Before workbook"));
+            let workbook = fragment.insert(&mut txn, 1, XmlElementPrelim::empty("spreadsheet"));
+            for (key, value) in [("blockId", "workbook1"), ("version", "1"), ("title", "Budget <live>")] {
+                workbook.insert_attribute(&mut txn, key, value);
+            }
+            for (index, id, name, values) in [
+                (0, "sheet1", "Inputs", vec![("cell:0:0", "10"), ("format:0:0", "currency"), ("cell:0:1", "=A1*2"), ("cell:1:0", "<script>|[link](javascript:x)\nnext")]),
+                (1, "sheet2", "Totals", vec![("cell:0:0", "=Inputs!B1+5"), ("format:0:0", "currency")]),
+            ] {
+                let sheet = workbook.insert(&mut txn, index, XmlElementPrelim::empty("spreadsheet_sheet"));
+                for (key, value) in [("blockId", id), ("sheetName", name), ("gridRows", "12"), ("gridCols", "6")] {
+                    sheet.insert_attribute(&mut txn, key, value);
+                }
+                for (key, value) in values { sheet.insert_attribute(&mut txn, key, value); }
+            }
+            let after = fragment.insert(&mut txn, 2, XmlElementPrelim::empty("paragraph"));
+            after.insert(&mut txn, 0, XmlTextPrelim::new("After workbook"));
+        }
+        doc
+    }
+
+    #[test]
+    fn html_and_markdown_show_computed_formatted_sheets_between_prose() {
+        let doc = document();
+        for output in [to_html(&doc), to_markdown(&doc)] {
+            assert!(output.find("Before workbook").unwrap() < output.find("Inputs").unwrap());
+            assert!(output.find("Totals").unwrap() < output.find("After workbook").unwrap());
+            assert!(output.contains("$10.00"), "{output}");
+            assert!(output.contains("$25.00"), "{output}");
+            assert!(!output.contains("=Inputs!B1+5"));
+            assert!(!output.contains("<script>"));
+        }
+        let markdown = to_markdown(&doc);
+        assert!(markdown.contains("&#124;"));
+        assert!(markdown.contains("&#91;link&#93;"));
+        assert!(markdown.contains("<br>next"));
+        assert!(to_plain_text(&doc).contains("$25.00"));
+    }
+
+    #[test]
+    fn native_snapshot_retains_raw_formulas_and_number_formats() {
+        let doc = document();
+        let bytes = crate::snapshot::doc_to_bytes(&doc);
+        let restored = crate::document::OgreDoc::from_state_bytes(&bytes).unwrap();
+        let txn = restored.inner().transact();
+        let fragment = txn.get_xml_fragment("content").unwrap();
+        let Some(XmlOut::Element(workbook)) = fragment.get(&txn, 1) else { panic!("workbook lost") };
+        let Some(XmlOut::Element(sheet)) = workbook.get(&txn, 1) else { panic!("second sheet lost") };
+        assert_eq!(sheet.get_attribute(&txn, "cell:0:0").as_deref(), Some("=Inputs!B1+5"));
+        assert_eq!(sheet.get_attribute(&txn, "format:0:0").as_deref(), Some("currency"));
+        drop(txn);
+        assert!(to_html(restored.inner()).contains("$25.00"));
+    }
+
+    #[test]
+    fn sparse_far_cells_export_by_address_without_dense_materialization() {
+        let doc = document();
+        {
+            let mut txn = doc.transact_mut();
+            let fragment = txn.get_xml_fragment("content").unwrap();
+            let Some(XmlOut::Element(workbook)) = fragment.get(&txn, 1) else { unreachable!() };
+            let Some(XmlOut::Element(sheet)) = workbook.get(&txn, 0) else { unreachable!() };
+            sheet.insert_attribute(&mut txn, "gridRows", "1000");
+            sheet.insert_attribute(&mut txn, "gridCols", "256");
+            sheet.insert_attribute(&mut txn, "cell:999:255", "far corner");
+        }
+        let html = to_html(&doc);
+        assert!(html.contains("IV1000"));
+        assert!(html.contains("far corner"));
+        assert!(html.contains("Sparse sheet shown by cell address"));
+        assert!(html.len() < 10_000);
+    }
+
+    #[test]
+    fn invalid_sheet_shape_is_reported_instead_of_silently_dropped() {
+        let doc = document();
+        {
+            let mut txn = doc.transact_mut();
+            let fragment = txn.get_xml_fragment("content").unwrap();
+            let Some(XmlOut::Element(workbook)) = fragment.get(&txn, 1) else { unreachable!() };
+            let Some(XmlOut::Element(sheet)) = workbook.get(&txn, 0) else { unreachable!() };
+            sheet.insert(&mut txn, 0, XmlTextPrelim::new("invalid leaf content"));
+        }
+        assert!(to_html(&doc).contains("Invalid spreadsheet"));
+        assert!(!crate::blocks::walk_liveapp_violations(&doc).is_empty());
+    }
+
+    #[cfg(feature = "docx")]
+    #[test]
+    fn docx_contains_one_computed_table_per_sheet() {
+        use std::io::Read;
+        let bytes = to_docx(&document());
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut xml = String::new();
+        archive.by_name("word/document.xml").unwrap().read_to_string(&mut xml).unwrap();
+        assert_eq!(xml.matches("<w:tbl>").count(), 2);
+        assert!(xml.contains("$25.00"));
+        assert!(xml.contains("Inputs"));
+        assert!(xml.contains("Totals"));
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn pdf_contains_computed_sheet_rows() {
+        let bytes = to_pdf(&document());
+        let text = pdf_extract::extract_text_from_mem(&bytes).unwrap();
+        assert!(text.contains("Inputs"));
+        assert!(text.contains("Totals"));
+        assert!(text.contains("$25.00"));
+    }
+}
+
+#[cfg(test)]
+mod numeric_pattern_export_regressions {
+    use super::*;
+    use yrs::{WriteTxn, types::xml::XmlElementPrelim};
+
+    fn document() -> Doc {
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let fragment = txn.get_or_insert_xml_fragment("content");
+            let workbook = fragment.insert(&mut txn, 0, XmlElementPrelim::empty("spreadsheet"));
+            for (key, value) in [
+                ("blockId", "patterns"),
+                ("version", "1"),
+                ("title", "Numeric patterns"),
+            ] {
+                workbook.insert_attribute(&mut txn, key, value);
+            }
+            let sheet = workbook.insert(&mut txn, 0, XmlElementPrelim::empty("spreadsheet_sheet"));
+            for (key, value) in [
+                ("blockId", "sheet1"),
+                ("sheetName", "Sheet1"),
+                ("gridRows", "12"),
+                ("gridCols", "6"),
+                ("cell:0:0", "3"),
+                ("format:0:0", "0.00"),
+                ("cell:0:1", "=A1"),
+                ("format:0:1", "0.0"),
+            ] {
+                sheet.insert_attribute(&mut txn, key, value);
+            }
+        }
+        doc
+    }
+
+    #[test]
+    fn literal_number_patterns_are_applied_to_computed_exports() {
+        let doc = document();
+        let html = to_html(&doc);
+        assert!(html.contains("<td>3.00</td>"));
+        assert!(html.contains("<td>3.0</td>"));
+        assert!(to_markdown(&doc).contains("| 1 | 3.00 | 3.0 |"));
+    }
+
+    #[cfg(feature = "docx")]
+    #[test]
+    fn docx_applies_literal_number_patterns() {
+        use std::io::Read;
+        let bytes = to_docx(&document());
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut xml = String::new();
+        archive
+            .by_name("word/document.xml")
+            .unwrap()
+            .read_to_string(&mut xml)
+            .unwrap();
+        assert!(xml.contains("3.00"));
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn pdf_applies_literal_number_patterns() {
+        let text = pdf_extract::extract_text_from_mem(&to_pdf(&document())).unwrap();
+        assert!(text.contains("3.00"));
     }
 }

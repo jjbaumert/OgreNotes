@@ -27,6 +27,7 @@ pub mod kanban;
 pub mod math;
 pub mod mermaid;
 pub mod presentation;
+pub mod spreadsheet;
 pub mod validate_writes;
 
 pub use validate_writes::{
@@ -154,7 +155,7 @@ pub trait LiveAppBlock: Sync + 'static {
 /// a new block. The compile-time list is small enough that a
 /// linear scan by NodeType is fine.
 pub const BLOCKS: &[&(dyn LiveAppBlock + 'static)] =
-    &[&calendar::CALENDAR, &kanban::KANBAN, &mermaid::MERMAID, &math::MATH, &presentation::PRESENTATION];
+    &[&calendar::CALENDAR, &kanban::KANBAN, &mermaid::MERMAID, &math::MATH, &presentation::PRESENTATION, &spreadsheet::SPREADSHEET];
 
 /// Look up the block that owns a given NodeType, or `None` if the
 /// NodeType is a core editor type (paragraph, heading, embed, etc.)

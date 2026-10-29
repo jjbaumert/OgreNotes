@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::functions;
-use super::parser::{BinOp, CellRef, Expr, RangeRef, SpreadsheetError, parse_formula};
+use super::parser::{BinOp, Expr, RangeRef, SpreadsheetError, parse_formula};
 
 /// Snapshot of a foreign document, populated by the view layer
 /// after fetching `GET /documents/{id}/content`. Stored as
@@ -439,10 +439,10 @@ impl ConditionalCondition {
     /// Evaluate this condition against a cell value.
     pub fn matches(&self, val: &CellValue) -> bool {
         match self {
-            ConditionalCondition::GreaterThan(n) => val.as_number().map_or(false, |v| v > *n),
-            ConditionalCondition::LessThan(n) => val.as_number().map_or(false, |v| v < *n),
+            ConditionalCondition::GreaterThan(n) => val.as_number().is_ok_and( |v| v > *n),
+            ConditionalCondition::LessThan(n) => val.as_number().is_ok_and( |v| v < *n),
             ConditionalCondition::EqualTo(s) => val.as_text().to_uppercase() == s.to_uppercase(),
-            ConditionalCondition::Between(lo, hi) => val.as_number().map_or(false, |v| v >= *lo && v <= *hi),
+            ConditionalCondition::Between(lo, hi) => val.as_number().is_ok_and( |v| v >= *lo && v <= *hi),
             ConditionalCondition::TextContains(s) => val.as_text().to_uppercase().contains(&s.to_uppercase()),
             ConditionalCondition::IsEmpty => matches!(val, CellValue::Empty) || val.as_text().is_empty(),
             ConditionalCondition::IsNotEmpty => !matches!(val, CellValue::Empty) && !val.as_text().is_empty(),
@@ -645,6 +645,10 @@ pub struct SpreadsheetEngine {
     /// served from this snapshot.
     local_sheets: ForeignDocSnapshot,
 
+    // Typed, sparse snapshots are opt-in for inline workbooks. Standalone
+    // spreadsheet clients retain their existing display-text snapshot behavior.
+    embedded_values: Option<crate::embedded::WorkbookValues>,
+
     /// Name of the active sheet (matches the sheet whose state is
     /// loaded into `raw`/`values`). Used by sheet-qualified ref
     /// evaluation to decide whether to read from the engine or from
@@ -664,13 +668,19 @@ pub struct SpreadsheetEngine {
     /// via the dynamic-array spill machinery (`try_register_spill_block`),
     /// so the renderer treats it the same as any other spilled array.
     /// Source-cell edits trigger `recompute_pivots_for_source`.
-    pivots: HashMap<CellAddr, crate::spreadsheet::pivot::PivotTable>,
+    pivots: HashMap<CellAddr, crate::pivot::PivotTable>,
 
     /// Anchors currently mid-recompute. Acts as a re-entry guard
     /// when chained pivots feed into each other (pivot A spills
     /// into pivot B's source range): the second time the cascade
     /// reaches the same anchor, recompute_pivot short-circuits.
     pivot_recomputing: HashSet<CellAddr>,
+}
+
+impl Default for SpreadsheetEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SpreadsheetEngine {
@@ -695,6 +705,7 @@ impl SpreadsheetEngine {
             current_doc_id: None,
             foreign_docs: HashMap::new(),
             local_sheets: ForeignDocSnapshot::default(),
+            embedded_values: None,
             active_sheet_name: None,
             foreign_pending: RefCell::new(HashSet::new()),
             pivots: HashMap::new(),
@@ -806,18 +817,34 @@ impl SpreadsheetEngine {
         self.active_sheet_name = Some(name);
     }
 
+    pub(crate) fn set_embedded_values(&mut self, values: crate::embedded::WorkbookValues) {
+        self.embedded_values = Some(values);
+    }
+
+    // The inline loader preserves unsupported formulas verbatim while exposing
+    // a safe error value, rather than executing an unbounded expression.
+    pub(crate) fn set_embedded_error(&mut self, addr: CellAddr, raw: &str, error: SpreadsheetError) {
+        self.raw.insert(addr, raw.to_owned());
+        self.values.insert(addr, CellValue::Error(error));
+    }
+
     /// Resolve `<sheet>!<cell>` to a CellValue. Returns `#REF!` if
     /// the sheet name is unknown. Sheet-name matching is
     /// case-insensitive (Excel parity); the cell is decoded from
     /// the display-text matrix into a typed CellValue (numbers
     /// parse as f64, empty strings as Empty, everything else as
     /// Text).
-    fn resolve_sheet_cell(&self, sheet: &str, cell: &crate::spreadsheet::parser::CellRef) -> CellValue {
+    fn resolve_sheet_cell(&self, sheet: &str, cell: &crate::parser::CellRef) -> CellValue {
         // Active sheet — read from the in-memory state.
         if self.active_sheet_name.as_deref()
             .is_some_and(|n| n.eq_ignore_ascii_case(sheet))
         {
             return self.get_value((cell.col, cell.row)).clone();
+        }
+        if let Some(values) = &self.embedded_values {
+            return values.lock().unwrap_or_else(|poison| poison.into_inner()).get(&sheet.to_ascii_lowercase())
+                .map(|cells| cells.get(&(cell.col, cell.row)).cloned().unwrap_or(CellValue::Empty))
+                .unwrap_or(CellValue::Error(SpreadsheetError::Ref));
         }
         let Some(rows) = self.local_sheets.sheets.iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(sheet))
@@ -906,7 +933,7 @@ impl SpreadsheetEngine {
     fn try_register_spill_block(
         &mut self,
         anchor: CellAddr,
-        array: &Vec<Vec<CellValue>>,
+        array: &[Vec<CellValue>],
     ) -> Result<(), ()> {
         if array.is_empty() || array[0].is_empty() {
             return Ok(()); // 0-cell array, nothing to register
@@ -925,27 +952,26 @@ impl SpreadsheetEngine {
                 if self.formulas.contains_key(&target) {
                     return Err(());
                 }
-                if let Some(other_anchor) = self.spill_origins.get(&target) {
-                    if *other_anchor != anchor { return Err(()); }
+                if let Some(other_anchor) = self.spill_origins.get(&target)
+                    && *other_anchor != anchor { return Err(());
                 }
-                if let Some(v) = self.values.get(&target) {
-                    if !matches!(v, CellValue::Empty)
-                        && !self.spill_origins.get(&target).is_some_and(|a| *a == anchor)
-                    {
-                        return Err(());
-                    }
+                if let Some(v) = self.values.get(&target)
+                    && !matches!(v, CellValue::Empty)
+                        && self.spill_origins.get(&target).is_none_or(|a| *a != anchor) {
+                    return Err(());
+
                 }
             }
         }
 
         // Register: write the scalar at every filled cell + record the
         // anchor pointer.
-        for ri in 0..rows {
-            for ci in 0..cols {
+        for (ri, row) in array.iter().enumerate() {
+            for (ci, value) in row[..cols].iter().enumerate() {
                 if ri == 0 && ci == 0 { continue; }
                 let target = (a_col + ci, a_row + ri);
                 self.spill_origins.insert(target, anchor);
-                self.values.insert(target, array[ri][ci].clone());
+                self.values.insert(target, value.clone());
             }
         }
         Ok(())
@@ -1063,12 +1089,11 @@ impl SpreadsheetEngine {
     /// Get the display text for a cell (computed value, formatted per number format).
     pub fn get_display(&self, addr: CellAddr) -> String {
         let val = self.get_value(addr);
-        if let Some(style) = self.styles.get(&addr) {
-            if let Some(ref fmt) = style.number_format {
-                if let Ok(n) = val.as_number() {
-                    return format_number(n, fmt);
-                }
-            }
+        if let Some(style) = self.styles.get(&addr)
+            && let Some(ref fmt) = style.number_format
+            && let Ok(n) = val.as_number() {
+            return format_number(n, fmt);
+
         }
         val.as_text()
     }
@@ -1132,13 +1157,12 @@ impl SpreadsheetEngine {
                         // Bool/Empty cells silently coerce via as_number()
                         // but contributing them would compress or skew
                         // the visual scale (see `range_min_max`).
-                        if let CellValue::Number(v) = *val {
-                            if let Some((min, max)) = self.range_min_max(*tl, *br) {
-                                if (max - min).abs() > f64::EPSILON {
-                                    let t = ((v - min) / (max - min)).clamp(0.0, 1.0);
-                                    return Some(interpolate_color_scale(low, mid.as_deref(), high, t));
-                                }
-                            }
+                        if let CellValue::Number(v) = *val
+                            && let Some((min, max)) = self.range_min_max(*tl, *br)
+                            && (max - min).abs() > f64::EPSILON {
+                            let t = ((v - min) / (max - min)).clamp(0.0, 1.0);
+                            return Some(interpolate_color_scale(low, mid.as_deref(), high, t));
+
                         }
                     }
                     ConditionalFormat::DataBar { .. }
@@ -1169,11 +1193,11 @@ impl SpreadsheetEngine {
                     // rect with no numeric variation continues looking
                     // for a usable DataBar rule on a later rect — not
                     // bail out of the whole function.
-                    if let Some((_, max)) = self.range_min_max(*tl, *br) {
-                        if max > 0.0 {
-                            let ratio = (v / max).clamp(0.0, 1.0);
-                            return Some((color.clone(), ratio));
-                        }
+                    if let Some((_, max)) = self.range_min_max(*tl, *br)
+                        && max > 0.0 {
+                        let ratio = (v / max).clamp(0.0, 1.0);
+                        return Some((color.clone(), ratio));
+
                     }
                 }
             }
@@ -1196,11 +1220,11 @@ impl SpreadsheetEngine {
                     // `if let Some(...)` rather than `?` so a covered
                     // rect with no numeric variation continues looking
                     // for a usable IconSet rule on a later rect.
-                    if let Some((min, max)) = self.range_min_max(*tl, *br) {
-                        if (max - min).abs() >= f64::EPSILON {
-                            let t = ((v - min) / (max - min)).clamp(0.0, 1.0);
-                            return Some(kind.glyph_for(t));
-                        }
+                    if let Some((min, max)) = self.range_min_max(*tl, *br)
+                        && (max - min).abs() >= f64::EPSILON {
+                        let t = ((v - min) / (max - min)).clamp(0.0, 1.0);
+                        return Some(kind.glyph_for(t));
+
                     }
                 }
             }
@@ -1304,10 +1328,10 @@ impl SpreadsheetEngine {
     /// Check if a cell is hidden by a merge (not the top-left of the merge).
     pub fn is_merged_hidden(&self, col: usize, row: usize) -> bool {
         for &(c, r, cs, rs) in &self.merged_regions {
-            if col >= c && col < c + cs && row >= r && row < r + rs {
-                if col != c || row != r {
-                    return true;
-                }
+            if col >= c && col < c + cs && row >= r && row < r + rs
+                && (col != c || row != r) {
+                return true;
+
             }
         }
         false
@@ -1353,7 +1377,7 @@ impl SpreadsheetEngine {
     /// Add or replace a pivot at its anchor cell, then recompute it.
     /// Persistence layers call this once per restored pivot when
     /// hydrating engine state from a doc.
-    pub fn add_pivot(&mut self, pivot: crate::spreadsheet::pivot::PivotTable) {
+    pub fn add_pivot(&mut self, pivot: crate::pivot::PivotTable) {
         let anchor = pivot.anchor;
         self.pivots.insert(anchor, pivot);
         self.recompute_pivot(anchor);
@@ -1391,19 +1415,19 @@ impl SpreadsheetEngine {
     /// Get the pivot anchored at `anchor`, if any. Used by the
     /// editor sidebar to clone-mutate-replace an existing pivot
     /// without iterating `pivots_iter`.
-    pub fn get_pivot(&self, anchor: CellAddr) -> Option<&crate::spreadsheet::pivot::PivotTable> {
+    pub fn get_pivot(&self, anchor: CellAddr) -> Option<&crate::pivot::PivotTable> {
         self.pivots.get(&anchor)
     }
 
     /// Snapshot every pivot in this engine, keyed by anchor. Used
     /// by the persistence layer to write `ATTR_PIVOTS`.
-    pub fn pivots_iter(&self) -> impl Iterator<Item = (&CellAddr, &crate::spreadsheet::pivot::PivotTable)> {
+    pub fn pivots_iter(&self) -> impl Iterator<Item = (&CellAddr, &crate::pivot::PivotTable)> {
         self.pivots.iter()
     }
 
     /// Replace the pivot map wholesale and recompute each. Used by
     /// the persistence layer to hydrate engine state on load.
-    pub fn set_pivots(&mut self, pivots: Vec<crate::spreadsheet::pivot::PivotTable>) {
+    pub fn set_pivots(&mut self, pivots: Vec<crate::pivot::PivotTable>) {
         self.pivots.clear();
         for pivot in pivots {
             let anchor = pivot.anchor;
@@ -1429,7 +1453,7 @@ impl SpreadsheetEngine {
             return;
         };
         let source = self.resolve_pivot_source(&pivot);
-        let out = crate::spreadsheet::pivot::eval_pivot(&pivot, &source);
+        let out = crate::pivot::eval_pivot(&pivot, &source);
         self.clear_spill_block(anchor);
         if out.is_empty() {
             self.values.insert(anchor, CellValue::Empty);
@@ -1489,17 +1513,17 @@ impl SpreadsheetEngine {
     /// integration lands).
     fn resolve_pivot_source(
         &self,
-        pivot: &crate::spreadsheet::pivot::PivotTable,
+        pivot: &crate::pivot::PivotTable,
     ) -> Vec<Vec<CellValue>> {
-        use crate::spreadsheet::pivot::SourceRange;
+        use crate::pivot::SourceRange;
         match &pivot.source {
             SourceRange::Local { range_a1 } => {
-                match crate::spreadsheet::parser::parse_formula(range_a1) {
-                    Ok(crate::spreadsheet::parser::Expr::Range(_)) => {
+                match crate::parser::parse_formula(range_a1) {
+                    Ok(crate::parser::Expr::Range(_)) => {
                         // resolve_2d treats an `Expr::Range` as a 2D
                         // block of CellValues — exactly what
                         // eval_pivot expects.
-                        let expr = crate::spreadsheet::parser::parse_formula(range_a1).ok();
+                        let expr = crate::parser::parse_formula(range_a1).ok();
                         expr.map(|e| self.resolve_2d(&e)).unwrap_or_default()
                     }
                     _ => Vec::new(),
@@ -1513,7 +1537,7 @@ impl SpreadsheetEngine {
     pub fn is_checkbox(&self, addr: CellAddr) -> bool {
         self.styles.get(&addr)
             .and_then(|s| s.validation.as_ref())
-            .map_or(false, |v| matches!(v, ValidationRule::Checkbox))
+            .is_some_and(|v| matches!(v, ValidationRule::Checkbox))
     }
 
     /// Toggle a checkbox cell between TRUE and FALSE.
@@ -1669,7 +1693,7 @@ impl SpreadsheetEngine {
         let Some(_guard) = EvalDepthGuard::try_enter() else {
             return CellValue::Error(SpreadsheetError::Num);
         };
-        match expr {
+        let value = match expr {
             Expr::Number(n) => CellValue::Number(*n),
             Expr::Text(s) => CellValue::Text(s.clone()),
             Expr::Bool(b) => CellValue::Bool(*b),
@@ -1723,6 +1747,13 @@ impl SpreadsheetEngine {
             Expr::FuncCall { name, args } => {
                 functions::call_function(name, args, self)
             }
+        };
+        if self.embedded_values.is_some()
+            && matches!(&value, CellValue::Text(text) if text.len() > crate::embedded::MAX_CELL_CHARS)
+        {
+            CellValue::Error(SpreadsheetError::Num)
+        } else {
+            value
         }
     }
 
@@ -1834,7 +1865,7 @@ impl SpreadsheetEngine {
         let mut out = Vec::with_capacity((r2 - r1 + 1) * (c2 - c1 + 1));
         for r in r1..=r2 {
             for c in c1..=c2 {
-                let cell = crate::spreadsheet::parser::CellRef {
+                let cell = crate::parser::CellRef {
                     col: c, row: r, abs_col: false, abs_row: false,
                 };
                 out.push(self.resolve_sheet_cell(sheet, &cell));
@@ -1859,7 +1890,7 @@ impl SpreadsheetEngine {
         for r in r1..=r2 {
             let mut row = Vec::with_capacity(c2 - c1 + 1);
             for c in c1..=c2 {
-                let cell = crate::spreadsheet::parser::CellRef {
+                let cell = crate::parser::CellRef {
                     col: c, row: r, abs_col: false, abs_row: false,
                 };
                 row.push(self.resolve_sheet_cell(sheet, &cell));
@@ -1957,14 +1988,14 @@ impl SpreadsheetEngine {
 /// pivots check the parsed `RangeRef`; foreign pivots are never
 /// affected by local-cell edits, so always false.
 fn pivot_source_contains(
-    pivot: &crate::spreadsheet::pivot::PivotTable,
+    pivot: &crate::pivot::PivotTable,
     addr: CellAddr,
 ) -> bool {
-    use crate::spreadsheet::pivot::SourceRange;
+    use crate::pivot::SourceRange;
     match &pivot.source {
         SourceRange::Local { range_a1 } => {
-            let Ok(crate::spreadsheet::parser::Expr::Range(r)) =
-                crate::spreadsheet::parser::parse_formula(range_a1)
+            let Ok(crate::parser::Expr::Range(r)) =
+                crate::parser::parse_formula(range_a1)
             else { return false; };
             let (c, row) = addr;
             c >= r.start.col && c <= r.end.col
@@ -2058,8 +2089,65 @@ fn format_number(n: f64, fmt: &str) -> String {
             }
             result
         }
-        _ => format!("{n}"),
+        _ => format_numeric_pattern(n, fmt).unwrap_or_else(|| format!("{n}")),
     }
+}
+
+/// A bounded subset of common spreadsheet numeric patterns. Named formats
+/// above retain their existing behavior; unsupported patterns keep the raw
+/// display. Precision is capped before reaching Rust's dynamic formatter.
+fn format_numeric_pattern(n: f64, pattern: &str) -> Option<String> {
+    const MAX_PATTERN_BYTES: usize = 128;
+    const MAX_DECIMALS: usize = 12;
+    if pattern.len() > MAX_PATTERN_BYTES {
+        return None;
+    }
+    let (pattern, percent) = match pattern.strip_suffix('%') {
+        Some(pattern) => (pattern, true),
+        None => (pattern, false),
+    };
+    let (integer, decimals) = match pattern.split_once('.') {
+        Some((integer, fraction)) => {
+            if fraction.is_empty()
+                || fraction.len() > MAX_DECIMALS
+                || !fraction.bytes().all(|byte| byte == b'0')
+            {
+                return None;
+            }
+            (integer, fraction.len())
+        }
+        None => (pattern, 0),
+    };
+    let grouped = match integer {
+        "0" => false,
+        "#,##0" => true,
+        _ => return None,
+    };
+    let value = if percent { n * 100.0 } else { n };
+    let mut rendered = format!("{value:.decimals$}");
+    if grouped && value.is_finite() {
+        let (whole, fraction) = rendered.split_once('.').unwrap_or((&rendered, ""));
+        let (sign, digits) = whole
+            .strip_prefix('-')
+            .map_or(("", whole), |digits| ("-", digits));
+        let mut output = String::with_capacity(rendered.len() + digits.len() / 3);
+        output.push_str(sign);
+        for (index, byte) in digits.bytes().enumerate() {
+            if index > 0 && (digits.len() - index).is_multiple_of(3) {
+                output.push(',');
+            }
+            output.push(char::from(byte));
+        }
+        if decimals > 0 {
+            output.push('.');
+            output.push_str(fraction);
+        }
+        rendered = output;
+    }
+    if percent {
+        rendered.push('%');
+    }
+    Some(rendered)
 }
 
 #[cfg(test)]
@@ -2376,7 +2464,7 @@ mod tests {
 
     #[test]
     fn named_range_single_cell_resolves_to_value() {
-        use crate::spreadsheet::parser::{CellRef, RangeRef};
+        use crate::parser::{CellRef, RangeRef};
         let mut engine = SpreadsheetEngine::new();
         engine.set_cell((0, 0), "42");
         engine.set_named_range(
@@ -2392,7 +2480,7 @@ mod tests {
 
     #[test]
     fn named_range_multi_cell_standalone_yields_value_error() {
-        use crate::spreadsheet::parser::{CellRef, RangeRef};
+        use crate::parser::{CellRef, RangeRef};
         let mut engine = SpreadsheetEngine::new();
         engine.set_cell((0, 0), "1");
         engine.set_cell((0, 1), "2");
@@ -2410,7 +2498,7 @@ mod tests {
 
     #[test]
     fn named_range_in_function_argument_flattens_like_a_range() {
-        use crate::spreadsheet::parser::{CellRef, RangeRef};
+        use crate::parser::{CellRef, RangeRef};
         let mut engine = SpreadsheetEngine::new();
         engine.set_cell((0, 0), "1");
         engine.set_cell((0, 1), "2");
@@ -2435,7 +2523,7 @@ mod tests {
 
     #[test]
     fn named_range_lookup_is_case_insensitive() {
-        use crate::spreadsheet::parser::{CellRef, RangeRef};
+        use crate::parser::{CellRef, RangeRef};
         let mut engine = SpreadsheetEngine::new();
         engine.set_cell((0, 0), "7");
         engine.set_named_range(
@@ -2503,7 +2591,7 @@ mod tests {
         // Regression: clear() must wipe named_ranges. Without this,
         // sheet-switch (which calls clear() before loading the next
         // sheet's table) would leak names from the outgoing sheet.
-        use crate::spreadsheet::parser::{CellRef, RangeRef};
+        use crate::parser::{CellRef, RangeRef};
         let mut engine = SpreadsheetEngine::new();
         engine.set_named_range(
             "X",
@@ -2519,7 +2607,7 @@ mod tests {
 
     #[test]
     fn named_range_redefinition_recomputes_dependents() {
-        use crate::spreadsheet::parser::{CellRef, RangeRef};
+        use crate::parser::{CellRef, RangeRef};
         let mut engine = SpreadsheetEngine::new();
         engine.set_cell((0, 0), "10");
         engine.set_cell((0, 1), "99");
@@ -3339,5 +3427,44 @@ mod tests {
         engine.set_cell((0, 1), "9");
         assert_eq!(engine.get_display((2, 0)), "9", "C1 (spill-fill) must reflect new A2");
         assert_eq!(engine.get_display((5, 0)), "90", "F1 (depends on C1) must re-evaluate");
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+
+    #[test]
+    fn merged_rectangle_does_not_hide_cells_on_other_rows() {
+        let mut engine = SpreadsheetEngine::new();
+        engine.merge_cells(0, 0, 2, 2);
+        assert!(!engine.is_merged_hidden(2, 2));
+        assert!(!engine.is_merged_hidden(0, 2));
+        assert!(!engine.is_merged_hidden(2, 1));
+        assert!(engine.is_merged_hidden(1, 1));
+    }
+
+    #[test]
+    fn numeric_patterns_display_bounded_precision_grouping_and_percent() {
+        let mut engine = SpreadsheetEngine::new();
+        for (raw, pattern, expected) in [
+            ("3", "0.00", "3.00"),
+            ("3", "0.0", "3.0"),
+            ("3.6", "0", "4"),
+            ("1234.5", "#,##0.00", "1,234.50"),
+            ("-1234.5", "#,##0.0", "-1,234.5"),
+            ("0.125", "0.00%", "12.50%"),
+            ("3.6", "integer", "3"),
+            ("3.6", "unsupported", "3.6"),
+        ] {
+            engine.set_cell((0, 0), raw);
+            engine.style_mut((0, 0)).number_format = Some(pattern.into());
+            assert_eq!(engine.get_display((0, 0)), expected, "pattern {pattern}");
+        }
+        engine.set_cell((0, 0), "3");
+        engine.style_mut((0, 0)).number_format = Some(format!("0.{}", "0".repeat(10_000)));
+        assert_eq!(engine.get_display((0, 0)), "3");
+        engine.style_mut((0, 0)).number_format = Some("0.0000000000000".into());
+        assert_eq!(engine.get_display((0, 0)), "3");
     }
 }

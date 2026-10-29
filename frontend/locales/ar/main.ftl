@@ -1174,3 +1174,20 @@ menu-text-direction = اتجاه النص
 menu-direction-auto = تلقائي
 menu-direction-ltr = من اليسار إلى اليمين
 menu-direction-rtl = من اليمين إلى اليسار
+
+# Document-embedded spreadsheets
+insert-spreadsheet-label = إدراج جدول بيانات
+insert-spreadsheet-description = جدول بيانات قابل للتحرير داخل هذا المستند
+embedded-sheet-label = جدول بيانات
+embedded-sheet-name = اسم الورقة
+embedded-sheet-rename = إعادة تسمية
+embedded-sheet-formula = قيمة الخلية أو صيغتها
+embedded-sheet-format = تنسيق الأرقام (مثل percent، currency، 0.00)
+embedded-sheet-add = إضافة ورقة
+embedded-sheet-previous-rows = الصفوف السابقة
+embedded-sheet-next-rows = الصفوف التالية
+embedded-sheet-previous-columns = الأعمدة السابقة
+embedded-sheet-next-columns = الأعمدة التالية
+embedded-sheet-invalid = لا يمكن عرض جدول البيانات هذا.
+embedded-sheet-truncated = تم اقتطاع معاينة الجدول عند حد العرض.
+embedded-sheet-draft-invalid = تتجاوز هذه القيمة حدود الجدول. تم الاحتفاظ بالمسودة. اختصرها أو اضغط Escape للإلغاء.

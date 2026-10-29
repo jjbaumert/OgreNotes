@@ -6203,3 +6203,23 @@ tr:hover .folder-row-actions,
     outline: 2px solid var(--accent);
     outline-offset: 2px;
 }
+
+/* Document-embedded spreadsheet islands own their controls and scrolling. */
+.embedded-spreadsheet { margin: 1rem 0; padding: .65rem; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface); color: var(--color-text); font: 13px var(--font-ui); max-width: 100%; }
+.embedded-sheet-toolbar, .embedded-sheet-tabs, .embedded-sheet-pages { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; margin-bottom: .5rem; }
+.embedded-spreadsheet input, .embedded-spreadsheet button { color: inherit; background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-sm); padding: .35rem .5rem; font: inherit; }
+.embedded-spreadsheet input[data-sheet-action=name] { width: 8rem; }
+.embedded-spreadsheet input[data-sheet-action=raw] { flex: 1; min-width: 10rem; font-family: var(--font-mono); }
+.embedded-spreadsheet input[data-sheet-action=format] { width: 7rem; }
+.embedded-spreadsheet button { cursor: pointer; }
+.embedded-spreadsheet button:disabled { opacity: .5; cursor: default; }
+.embedded-spreadsheet :focus-visible { outline: 2px solid var(--color-primary); outline-offset: 1px; }
+.embedded-sheet-tabs [aria-pressed=true] { background: var(--color-bg-subtle); border-color: var(--color-primary); }
+.embedded-sheet-grid { max-height: 420px; overflow: auto; overscroll-behavior: contain; }
+.editor-content .embedded-sheet-grid table { border-collapse: collapse; table-layout: fixed; margin: 0; width: max-content; min-width: 100%; }
+.editor-content .embedded-sheet-grid td, .editor-content .embedded-sheet-grid th { border: 1px solid var(--color-border); padding: 0; min-width: 90px; height: 30px; }
+.editor-content .embedded-sheet-grid th { background: var(--color-bg-subtle); font-weight: 500; position: sticky; top: 0; z-index: 1; }
+.editor-content .embedded-sheet-grid th:first-child { min-width: 36px; width: 36px; }
+.embedded-sheet-grid button { display: block; border: 0; border-radius: 0; width: 100%; min-width: 90px; max-width: 220px; height: 30px; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.embedded-sheet-grid [aria-selected=true] { box-shadow: inset 0 0 0 2px var(--color-primary); background: var(--color-bg-subtle); }
+.embedded-sheet-pages { margin: .5rem 0 0; font-size: 11px; }

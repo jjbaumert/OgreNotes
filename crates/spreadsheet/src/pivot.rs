@@ -12,8 +12,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::spreadsheet::eval::CellValue;
-use crate::spreadsheet::parser::SpreadsheetError;
+use crate::eval::CellValue;
+use crate::parser::SpreadsheetError;
 
 // ─── Public types ─────────────────────────────────────────────────────
 
@@ -156,6 +156,7 @@ impl PivotTable {
 /// as a date fall through to `as_text()` (so a literal "Unknown" cell
 /// still groups together). `NumericBin` buckets numerics into `[start
 /// + n·width, start + (n+1)·width)` ranges with a "lo–hi" label;
+///
 /// non-numerics fall through to text.
 fn bucket_label(kind: &PivotGroupKind, v: &CellValue) -> String {
     match kind {
@@ -213,7 +214,7 @@ fn parse_date_text_to_serial(s: &str) -> Option<f64> {
     } else {
         return None;
     };
-    Some(ymd_to_serial(y, m, d)?)
+    ymd_to_serial(y, m, d)
 }
 
 fn ymd_to_serial(y: i32, m: u32, d: u32) -> Option<f64> {
@@ -443,8 +444,8 @@ pub fn eval_pivot(pt: &PivotTable, src: &[Vec<CellValue>]) -> Vec<Vec<CellValue>
             if !matches!(cell, CellValue::Empty) {
                 entry.non_empty += 1;
             }
-            if let CellValue::Number(n) = cell {
-                if !n.is_nan() { entry.nums.push(*n); }
+            if let CellValue::Number(n) = cell
+                && !n.is_nan() { entry.nums.push(*n);
             }
         }
     }
@@ -726,7 +727,7 @@ fn emit_subtotal_if(
     buckets: &BTreeMap<(Vec<String>, Vec<String>, usize), Bucket>,
     out: &mut Vec<Vec<CellValue>>,
     total_cols: usize,
-    value_cols_per_col_key: usize,
+    _value_cols_per_col_key: usize,
     pos: SubtotalsPos,
 ) {
     if pt.subtotals_position != pos { return; }

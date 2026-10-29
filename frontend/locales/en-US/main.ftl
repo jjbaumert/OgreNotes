@@ -1286,3 +1286,20 @@ menu-text-direction = Text direction
 menu-direction-auto = Automatic
 menu-direction-ltr = Left to right
 menu-direction-rtl = Right to left
+
+# Document-embedded spreadsheets
+insert-spreadsheet-label = Insert spreadsheet
+insert-spreadsheet-description = An editable spreadsheet inside this document
+embedded-sheet-label = Spreadsheet
+embedded-sheet-name = Sheet name
+embedded-sheet-rename = Rename
+embedded-sheet-formula = Cell value or formula
+embedded-sheet-format = Number format (e.g. percent, currency, 0.00)
+embedded-sheet-add = Add sheet
+embedded-sheet-previous-rows = Previous rows
+embedded-sheet-next-rows = Next rows
+embedded-sheet-previous-columns = Previous columns
+embedded-sheet-next-columns = Next columns
+embedded-sheet-invalid = This spreadsheet cannot be displayed.
+embedded-sheet-truncated = Spreadsheet preview truncated at the display limit.
+embedded-sheet-draft-invalid = This value exceeds the spreadsheet limits. Your draft is kept. Shorten it or press Escape to cancel.
