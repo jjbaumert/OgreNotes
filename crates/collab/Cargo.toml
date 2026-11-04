@@ -30,13 +30,13 @@ nanoid = { workspace = true }
 # (host is quip.com or a subdomain) vs external, and splits out the
 # thread id / section fragment.
 url = { workspace = true }
-calamine = { version = "0.35", optional = true }
+calamine = { version = "0.38", optional = true }
 rust_xlsxwriter = { version = "0.80", optional = true }
 # DOCX import — Phase 6 M-6.5 piece A. A .docx is a ZIP of OOXML; we
 # unzip `word/document.xml` (deflate only — no other compression in
 # the spec) and stream it through quick-xml. Reader-only; the docx
 # writer (piece B) is a separate dependency choice.
-zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 quick-xml = { workspace = true, optional = true }
 # DOCX export — Phase 6 M-6.5 piece B. docx-rs is the writer half (it
 # builds + packs the OOXML container); the reader side stays the
@@ -51,7 +51,7 @@ pdf-extract = { version = "0.12", optional = true }
 # plain-text output by hand. Reader stays pdf-extract above.
 printpdf = { version = "0.9", optional = true }
 # Markdown import — Phase 5 M-P5 piece A.
-pulldown-cmark = { version = "0.13.5", default-features = false, features = ["html"] }
+pulldown-cmark = { version = "0.13.6", default-features = false, features = ["html"] }
 # HTML import — Phase 5 M-P5 piece B. ammonia sanitizes BEFORE
 # html5ever sees the input; html5ever + markup5ever_rcdom build
 # a walkable DOM tree we map to NodeType variants.
