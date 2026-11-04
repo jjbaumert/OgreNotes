@@ -41,9 +41,9 @@ impl LiveAppBlockView for SpreadsheetView {
         root.set_attribute("data-block-id", attrs.get("blockId")?)
             .ok()?;
         root.set_attribute("role", "group").ok()?;
-        root.set_attribute("aria-label", &label("embedded-sheet-label"))
+        root.set_attribute("aria-label", &translate("embedded-sheet-label"))
             .ok()?;
-        root.set_text_content(Some(&label("embedded-sheet-label")));
+        root.set_text_content(Some(&translate("embedded-sheet-label")));
         Some(root.into())
     }
 }
@@ -65,13 +65,13 @@ impl LiveAppBlockInsert for SpreadsheetInsert {
             NodeType::Spreadsheet,
             HashMap::from([
                 ("version".into(), "1".into()),
-                ("title".into(), label("embedded-sheet-label")),
+                ("title".into(), translate("embedded-sheet-label")),
             ]),
             Fragment::from(vec![commands::new_sheet("Sheet1")]),
         )
     }
 }
-fn label(key: &str) -> String {
+fn translate(key: &str) -> String {
     crate::i18n::translate(key, None)
 }
 pub fn event_inside(event: &web_sys::Event) -> bool {
@@ -506,7 +506,7 @@ fn commit_raw(
         && let Some(error) = element(&doc, "div", "embedded-sheet-error")
     {
         error.set_attribute("role", "alert").ok();
-        error.set_text_content(Some(&label("embedded-sheet-draft-invalid")));
+        error.set_text_content(Some(&translate("embedded-sheet-draft-invalid")));
         root.append_child(&error).ok();
     }
     Err(())
@@ -605,7 +605,7 @@ fn refresh(root: &HtmlElement, local: &RefCell<Local>, force: bool, readonly: bo
     };
     let mut l = local.borrow_mut();
     let Some(sheet) = l.sheets.iter().find(|s| s.id == l.active).cloned() else {
-        root.set_text_content(Some(&label("embedded-sheet-invalid")));
+        root.set_text_content(Some(&translate("embedded-sheet-invalid")));
         return;
     };
     l.row_start = l.row_start.min((sheet.rows - 1) / 30 * 30);
@@ -634,8 +634,8 @@ fn refresh(root: &HtmlElement, local: &RefCell<Local>, force: bool, readonly: bo
                 return;
             };
             control.set_attribute("data-sheet-action", action).ok();
-            control.set_attribute("aria-label", &label(key)).ok();
-            control.set_attribute("placeholder", &label(key)).ok();
+            control.set_attribute("aria-label", &translate(key)).ok();
+            control.set_attribute("placeholder", &translate(key)).ok();
             control
                 .set_attribute("maxlength", if action == "raw" { "4096" } else { "128" })
                 .ok();
@@ -644,7 +644,7 @@ fn refresh(root: &HtmlElement, local: &RefCell<Local>, force: bool, readonly: bo
             }
             toolbar.append_child(&control).ok();
             if action == "name"
-                && let Some(b) = button(&doc, "rename", &label("embedded-sheet-rename"))
+                && let Some(b) = button(&doc, "rename", &translate("embedded-sheet-rename"))
             {
                 if readonly {
                     b.set_attribute("disabled", "").ok();
@@ -695,7 +695,7 @@ fn refresh(root: &HtmlElement, local: &RefCell<Local>, force: bool, readonly: bo
                 tabs.append_child(&tab).ok();
             }
         }
-        if let Some(add) = button(&doc, "add", &label("embedded-sheet-add")) {
+        if let Some(add) = button(&doc, "add", &translate("embedded-sheet-add")) {
             if readonly || l.sheets.len() >= embedded::MAX_SHEETS {
                 add.set_attribute("disabled", "").ok();
             }
@@ -809,7 +809,7 @@ fn refresh(root: &HtmlElement, local: &RefCell<Local>, force: bool, readonly: bo
                 l.col_start + 12 >= sheet.cols,
             ),
         ] {
-            if let Some(b) = button(&doc, action, &label(key)) {
+            if let Some(b) = button(&doc, action, &translate(key)) {
                 if disabled {
                     b.set_attribute("disabled", "").ok();
                 }
