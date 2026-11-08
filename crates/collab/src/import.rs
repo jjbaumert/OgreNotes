@@ -22,16 +22,18 @@
 //!
 //!   - paragraph
 //!   - heading h1-h6 with `level` attribute
-//!   - bullet list / ordered list / list item
+//!   - bullet list / ordered list / task list with checked state
 //!   - blockquote
 //!   - code block with `language` attribute (when fenced ``` lang)
 //!   - Mermaid fences as live diagram leaves where the schema permits them
 //!   - horizontal rule
 //!   - hard break
 //!
-//! Out of scope for v1: tables, images, task lists, footnotes.
+//! Out of scope for v1: tables, images, footnotes.
 
-use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+use std::collections::HashSet;
+
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use yrs::{
     Doc, Transact, WriteTxn, Xml, XmlElementRef,
     types::xml::{XmlElementPrelim, XmlFragment, XmlTextPrelim},
@@ -43,6 +45,7 @@ use crate::schema::NodeType;
 /// succeeds — Markdown is a permissive grammar, malformed-looking
 /// input produces a doc that's at worst awkward, not an error.
 pub fn from_markdown(md: &str) -> Doc {
+    let task_lists = markdown_task_lists(md);
     let doc = Doc::new();
     {
         let mut txn = doc.transact_mut();
@@ -67,7 +70,45 @@ pub fn from_markdown(md: &str) -> Doc {
         // on End to write the `language` attribute).
         let mut current_code_language: Option<String> = None;
 
-        for event in Parser::new(md) {
+        // Tight CommonMark lists omit paragraph events. The native schema
+        // still requires their text to live inside an editable paragraph.
+        let mut implicit_paragraph = false;
+        for (event_index, event) in Parser::new_ext(md, Options::ENABLE_TASKLISTS).enumerate() {
+            if implicit_paragraph
+                && matches!(
+                    &event,
+                    Event::Start(
+                        Tag::Paragraph
+                            | Tag::Heading { .. }
+                            | Tag::BlockQuote(_)
+                            | Tag::CodeBlock(_)
+                            | Tag::HtmlBlock
+                            | Tag::List(_)
+                            | Tag::Item
+                    ) | Event::End(TagEnd::Item)
+                        | Event::Rule
+                )
+            {
+                let paragraph = stack.pop().expect("implicit paragraph");
+                flush_text(&mut txn, &paragraph, &mut text_buf, false);
+                implicit_paragraph = false;
+            }
+            if !in_code_block
+                && matches!(
+                    &event,
+                    Event::Text(_) | Event::Code(_) | Event::SoftBreak | Event::HardBreak
+                )
+                && stack.last().is_some_and(|element| {
+                    matches!(
+                        NodeType::from_tag(element.tag()),
+                        Some(NodeType::ListItem | NodeType::TaskItem)
+                    )
+                })
+            {
+                let parent = current_parent(&fragment, &stack, &txn);
+                stack.push(insert_at_end(&mut txn, &parent, NodeType::Paragraph));
+                implicit_paragraph = true;
+            }
             match event {
                 Event::Start(tag) => match tag {
                     Tag::Paragraph => {
@@ -105,7 +146,9 @@ pub fn from_markdown(md: &str) -> Doc {
                     }
                     Tag::List(start) => {
                         let parent = current_parent(&fragment, &stack, &txn);
-                        let kind = if start.is_some() {
+                        let kind = if task_lists.contains(&event_index) {
+                            NodeType::TaskList
+                        } else if start.is_some() {
                             NodeType::OrderedList
                         } else {
                             NodeType::BulletList
@@ -115,7 +158,15 @@ pub fn from_markdown(md: &str) -> Doc {
                     }
                     Tag::Item => {
                         let parent = current_parent(&fragment, &stack, &txn);
-                        let el = insert_at_end(&mut txn, &parent, NodeType::ListItem);
+                        let kind = if parent_type(&parent) == NodeType::TaskList {
+                            NodeType::TaskItem
+                        } else {
+                            NodeType::ListItem
+                        };
+                        let el = insert_at_end(&mut txn, &parent, kind);
+                        if kind == NodeType::TaskItem {
+                            el.insert_attribute(&mut txn, "checked", "false");
+                        }
                         stack.push(el);
                     }
                     // Inline markers — v1 ignores the start/end markers
@@ -186,6 +237,17 @@ pub fn from_markdown(md: &str) -> Doc {
                     }
                     _ => {}
                 },
+                Event::TaskListMarker(checked) => {
+                    // In a loose list the marker is inside its paragraph;
+                    // in a tight list it is directly inside the item.
+                    if let Some(item) = stack
+                        .iter()
+                        .rev()
+                        .find(|element| element.tag().as_ref() == NodeType::TaskItem.tag_name())
+                    {
+                        item.insert_attribute(&mut txn, "checked", checked.to_string());
+                    }
+                }
                 Event::Text(t) => {
                     text_buf.push_str(t.as_ref());
                 }
@@ -238,6 +300,29 @@ pub fn from_markdown(md: &str) -> Doc {
     }
 
     doc
+}
+
+/// Classify lists before inserting their immutable native element tags.
+/// A nested task marker belongs only to its innermost list. Mixed lists
+/// become native task lists with unmarked items defaulting to unchecked.
+fn markdown_task_lists(md: &str) -> HashSet<usize> {
+    let mut lists = Vec::new();
+    let mut tasks = HashSet::new();
+    for (index, event) in Parser::new_ext(md, Options::ENABLE_TASKLISTS).enumerate() {
+        match event {
+            Event::Start(Tag::List(_)) => lists.push(index),
+            Event::End(TagEnd::List(_)) => {
+                lists.pop();
+            }
+            Event::TaskListMarker(_) => {
+                if let Some(index) = lists.last() {
+                    tasks.insert(*index);
+                }
+            }
+            _ => {}
+        }
+    }
+    tasks
 }
 
 /// Either the root XmlFragment or a nested XmlElement — the two

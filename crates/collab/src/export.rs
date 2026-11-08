@@ -1451,8 +1451,8 @@ fn render_fragment_markdown<T: ReadTxn>(
 
 fn render_node_markdown<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String, depth: usize) {
     // #7: stop descending past the recursion cap (stack-overflow guard).
-    // `depth` here is the list-indent level, which only grows on list
-    // nesting; this guard counts true recursion across all node types.
+    // `depth` controls Markdown indentation. Count true recursion across
+    // all node types, including lists rendered relative to their parent.
     let Some(_rdepth) = DepthGuard::enter() else {
         return;
     };
@@ -1483,6 +1483,11 @@ fn render_node_markdown<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String, de
                 NodeType::BulletList => {
                     render_list_items_markdown(txn, el, out, depth, "- ");
                 }
+                NodeType::TaskList => {
+                    // Different markers keep adjacent task and ordinary
+                    // bullet lists separate when Markdown is reimported.
+                    render_list_items_markdown(txn, el, out, depth, "* ");
+                }
                 NodeType::OrderedList => {
                     render_list_items_markdown(txn, el, out, depth, "1. ");
                 }
@@ -1490,8 +1495,14 @@ fn render_node_markdown<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut String, de
                     render_children_markdown(txn, el, out, depth);
                 }
                 NodeType::Blockquote => {
-                    out.push_str("> ");
-                    render_children_markdown(txn, el, out, depth);
+                    let mut body = String::new();
+                    render_children_markdown(txn, el, &mut body, depth);
+                    for line in body.trim_end_matches('\n').split('\n') {
+                        out.push_str("> ");
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                    out.push('\n');
                 }
                 NodeType::CodeBlock => {
                     let lang = el.get_attribute(txn, "language").unwrap_or_default();
@@ -1928,13 +1939,55 @@ fn render_list_items_markdown<T: ReadTxn>(
     prefix: &str,
 ) {
     let indent = "  ".repeat(depth);
-    let len = el.len(txn);
-    for i in 0..len {
-        if let Some(child) = el.get(txn, i) {
-            out.push_str(&format!("{indent}{prefix}"));
-            render_node_markdown(txn, &child, out, depth + 1);
-            out.push('\n');
+    // Continuation indentation follows the list marker, not the checkbox:
+    // `- ` needs two spaces, while `1. ` needs three.
+    let continuation = format!("{indent}{}", " ".repeat(prefix.len()));
+    for child in el.children(txn) {
+        let task = if let XmlOut::Element(item) = &child {
+            (item.tag().as_ref() == NodeType::TaskItem.tag_name()).then(|| {
+                item.get_attribute(txn, "checked")
+                    .is_some_and(|v| v == "true")
+            })
+        } else {
+            None
+        };
+        let mut body = String::new();
+        // Render relative to the item; its parent marker supplies the
+        // indentation for every continuation block, including nested lists.
+        render_node_markdown(txn, &child, &mut body, 0);
+        if task.is_some()
+            && matches!(&child, XmlOut::Element(item) if matches!(item.get(txn, 0),
+                Some(XmlOut::Element(block)) if block.tag().as_ref() != NodeType::Paragraph.tag_name()))
+        {
+            // A leading block must start below the task marker; putting
+            // its list marker or fence after the checkbox turns it into text.
+            body.insert(0, '\n');
         }
+        if task.is_none() {
+            let first_line = body.lines().next().unwrap_or_default();
+            let text = first_line.trim_start_matches([' ', '\t']);
+            if ["[ ]", "[x]", "[X]"].iter().any(|marker| {
+                text.strip_prefix(marker)
+                    .is_some_and(|tail| tail.chars().next().is_none_or(char::is_whitespace))
+            }) {
+                body.insert(first_line.len() - text.len(), '\\');
+            }
+        }
+        out.push_str(&indent);
+        out.push_str(prefix);
+        if let Some(checked) = task {
+            out.push_str(if checked { "[x] " } else { "[ ] " });
+        }
+        for (index, line) in body.trim_end_matches('\n').split('\n').enumerate() {
+            if index > 0 {
+                out.push('\n');
+                if !line.is_empty() {
+                    out.push_str(&continuation);
+                }
+            }
+            out.push_str(line);
+        }
+        out.push('\n');
     }
     if depth == 0 {
         out.push('\n');
