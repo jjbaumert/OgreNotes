@@ -1129,7 +1129,7 @@ async fn test_bulk_export_resolves_blob_ref_images_to_real_urls() {
     let cursor = std::io::Cursor::new(&body);
     let mut archive = zip::ZipArchive::new(cursor).expect("response is a zip");
     let md_name = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
         .find(|n| n.ends_with(".md"))
         .expect("archive must contain a markdown entry");
     let md = {
