@@ -135,7 +135,7 @@ async fn test_bulk_export_happy_path_zip_with_manifest() {
     let cursor = std::io::Cursor::new(&body);
     let mut archive = zip::ZipArchive::new(cursor).expect("response is a zip");
     let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
         .collect();
     assert!(
         names.contains(&"_manifest.json".to_string()),
@@ -180,7 +180,7 @@ fn archive_contents(bytes: &[u8]) -> BTreeMap<String, String> {
     let mut files = BTreeMap::new();
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).unwrap();
-        let name = file.name().to_owned();
+        let name = file.name().unwrap().into_owned();
         let mut text = String::new();
         file.read_to_string(&mut text).unwrap();
         assert!(
