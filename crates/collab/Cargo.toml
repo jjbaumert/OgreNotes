@@ -30,7 +30,7 @@ nanoid = { workspace = true }
 # thread id / section fragment.
 url = { workspace = true }
 calamine = { version = "0.38", optional = true }
-rust_xlsxwriter = { version = "0.80", optional = true }
+rust_xlsxwriter = { version = "0.102", optional = true }
 # DOCX import — Phase 6 M-6.5 piece A. A .docx is a ZIP of OOXML; we
 # unzip `word/document.xml` (deflate only — no other compression in
 # the spec) and stream it through quick-xml. Reader-only; the docx
