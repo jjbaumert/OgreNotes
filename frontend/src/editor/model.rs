@@ -221,6 +221,10 @@ pub enum NodeType {
     /// (`content` | `notes`). Mirrors the same-named variant in
     /// `crates/collab/src/schema.rs`.
     Frame,
+    /// Editable embedded workbook; contains attribute-only sheet children.
+    Spreadsheet,
+    /// Sparse sheet with independent raw-cell and number-format attributes.
+    SpreadsheetSheet,
 }
 
 impl NodeType {
@@ -233,7 +237,7 @@ impl NodeType {
         NodeType::Image, NodeType::Table, NodeType::TableRow, NodeType::TableCell,
         NodeType::TableHeader, NodeType::Embed, NodeType::Calendar, NodeType::CalendarEvent,
         NodeType::Kanban, NodeType::KanbanColumn, NodeType::KanbanCard, NodeType::Mention,
-        NodeType::DocMention, NodeType::Mermaid, NodeType::MathBlock, NodeType::MathInline, NodeType::Slide, NodeType::Frame,
+        NodeType::DocMention, NodeType::Mermaid, NodeType::MathBlock, NodeType::MathInline, NodeType::Slide, NodeType::Frame, NodeType::Spreadsheet, NodeType::SpreadsheetSheet,
     ];
 
     /// Whether this is a leaf node (no children).
@@ -251,6 +255,7 @@ impl NodeType {
                 | NodeType::Mermaid
                 | NodeType::MathBlock
                 | NodeType::MathInline
+                | NodeType::SpreadsheetSheet
         )
     }
 
@@ -282,6 +287,7 @@ impl NodeType {
                 | NodeType::Image
                 | NodeType::Embed
                 | NodeType::Calendar
+                | NodeType::Spreadsheet
                 | NodeType::CalendarEvent
                 | NodeType::Kanban
                 | NodeType::KanbanCard
@@ -290,6 +296,7 @@ impl NodeType {
                 | NodeType::Mermaid
                 | NodeType::MathBlock
                 | NodeType::MathInline
+                | NodeType::SpreadsheetSheet
         )
     }
 
@@ -321,7 +328,8 @@ impl NodeType {
             // A frame is the slide-level analogue of a table cell —
             // a positioned region a viewer can react to. The slide
             // itself is a layout container, not a comment target.
-            | NodeType::Frame => true,
+            | NodeType::Frame
+            | NodeType::Spreadsheet => true,
             NodeType::Doc
             | NodeType::BulletList
             | NodeType::OrderedList
@@ -338,7 +346,8 @@ impl NodeType {
             | NodeType::Mermaid
             | NodeType::MathBlock
             | NodeType::MathInline
-            | NodeType::Slide => false,
+            | NodeType::Slide
+            | NodeType::SpreadsheetSheet => false,
         }
     }
 
@@ -395,7 +404,9 @@ impl NodeType {
             // syncs and every edit degrades to a full subtree
             // rewrite (see the pathology note above).
             | NodeType::Slide
-            | NodeType::Frame => true,
+            | NodeType::Frame
+            | NodeType::Spreadsheet
+            | NodeType::SpreadsheetSheet => true,
         }
     }
 
@@ -412,6 +423,15 @@ impl NodeType {
     /// Default attributes for this node type.
     pub fn default_attrs(&self) -> HashMap<String, String> {
         match self {
+            NodeType::Spreadsheet => HashMap::from([
+                ("version".into(), "1".into()),
+                ("title".into(), "Spreadsheet".into()),
+            ]),
+            NodeType::SpreadsheetSheet => HashMap::from([
+                ("sheetName".into(), "Sheet1".into()),
+                ("gridRows".into(), "12".into()),
+                ("gridCols".into(), "6".into()),
+            ]),
             NodeType::Heading => {
                 let mut m = HashMap::new();
                 m.insert("level".to_string(), "1".to_string());

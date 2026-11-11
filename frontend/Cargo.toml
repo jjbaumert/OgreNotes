@@ -39,13 +39,6 @@ console_error_panic_hook = "0.1"
 urlencoding = "2"
 yrs = "0.21"
 pulldown-cmark = { version = "0.12", default-features = false }
-# `libm` provides pure-Rust implementations of `erf`, `lgamma`, etc.
-# that aren't on stable f64. Used by the spreadsheet's statistical
-# distribution library (M-S1c). ~20 KB compiled to wasm with no
-# transitive deps; preferred over `statrs` because that pulls in
-# `nalgebra` and bloats the bundle by orders of magnitude for what
-# is essentially a handful of formulas we hand-roll on top.
-libm = "0.2"
 # Phase 4 M-E3 piece E: render the TOTP provisioning URI as an SVG
 # QR code on the enrollment page. `default-features = false` keeps
 # the `image` PNG renderer out — we only need the SVG path.
@@ -76,6 +69,8 @@ ogrenotes-math = { path = "../crates/math" }
 # backend (crates/highlight) — server HTML export uses the same
 # tokenizer + palette, so editor and export always agree.
 ogrenotes-highlight = { path = "../crates/highlight" }
+# Formula evaluation is shared with native document exports.
+ogrenotes-spreadsheet = { path = "../crates/spreadsheet" }
 similar = { version = "2", default-features = false, features = ["wasm32_web_time"] }
 
 [dependencies.web-sys]

@@ -66,6 +66,7 @@
         "OrderedList",
         "Paragraph",
         "Slide",
+        "Spreadsheet",
         "Table",
         "TaskList"
       ],
@@ -97,6 +98,7 @@
         "Mermaid",
         "OrderedList",
         "Paragraph",
+        "Spreadsheet",
         "Table",
         "TaskList"
       ],
@@ -192,6 +194,18 @@
       ],
       "inline": false,
       "leaf": false
+    },
+    "Spreadsheet": {
+      "children": [
+        "SpreadsheetSheet"
+      ],
+      "inline": false,
+      "leaf": false
+    },
+    "SpreadsheetSheet": {
+      "children": [],
+      "inline": false,
+      "leaf": true
     },
     "Table": {
       "children": [

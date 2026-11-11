@@ -296,6 +296,7 @@ pub fn default_schema() -> Schema {
                 NodeType::Mermaid,
                 NodeType::MathBlock,
                 NodeType::Slide,
+                NodeType::Spreadsheet,
             ],
             inline_content: false,
             block: false,
@@ -901,6 +902,7 @@ pub fn default_schema() -> Schema {
                 NodeType::Kanban,
                 NodeType::Mermaid,
                 NodeType::MathBlock,
+                NodeType::Spreadsheet,
             ],
             inline_content: false,
             block: true,
@@ -910,6 +912,37 @@ pub fn default_schema() -> Schema {
             defining: false,
             isolating: true,
             default_attrs: HashMap::new(),
+            allowed_marks: Some(vec![]),
+        },
+    );
+
+    nodes.insert(
+        NodeType::Spreadsheet,
+        NodeSpec {
+            valid_children: vec![NodeType::SpreadsheetSheet],
+            inline_content: false,
+            block: true,
+            leaf: false,
+            code: false,
+            atom: true,
+            defining: false,
+            isolating: true,
+            default_attrs: NodeType::Spreadsheet.default_attrs(),
+            allowed_marks: Some(vec![]),
+        },
+    );
+    nodes.insert(
+        NodeType::SpreadsheetSheet,
+        NodeSpec {
+            valid_children: vec![],
+            inline_content: false,
+            block: true,
+            leaf: true,
+            code: false,
+            atom: true,
+            defining: false,
+            isolating: true,
+            default_attrs: NodeType::SpreadsheetSheet.default_attrs(),
             allowed_marks: Some(vec![]),
         },
     );

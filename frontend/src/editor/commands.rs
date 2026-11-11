@@ -1,5 +1,8 @@
 // Copyright (c) 2026 Joel Baumert. All Rights Reserved.
 
+#[path = "../commands/embedded_spreadsheet.rs"]
+pub mod embedded_spreadsheet;
+
 use std::collections::{BTreeMap, HashMap};
 
 use super::model::{Fragment, Mark, MarkType, Node, NodeType, Slice};

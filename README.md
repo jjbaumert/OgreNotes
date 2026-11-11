@@ -9,6 +9,7 @@ frontend/          Leptos 0.7 (Rust/WASM) — rich text editor, spreadsheet, fil
 crates/
   api/             Axum HTTP + WebSocket server, route handlers, Claude API client
   collab/          CRDT engine (yrs), real-time sync, Redis pub/sub, document export
+  spreadsheet/     Shared formula engine and bounded inline workbook evaluation
   search/          Tantivy BM25 full-text search index
   embeddings/      Vector embedding pipeline (Bedrock Titan + Qdrant)
   storage/         DynamoDB + S3 repositories, data models
@@ -26,6 +27,7 @@ crates/
 - Rich text editor with collaborative editing (yrs CRDT, WebSocket sync)
 - Spreadsheet editor with formula engine and charting
 - Document, spreadsheet, and chat types
+- Inline editable spreadsheet blocks inside documents, with formulas, number formats, and multiple sheets. [Storage and evaluation limits](crates/spreadsheet/README.md).
 - Folder hierarchy with system folders (Home, Trash)
 - OAuth2 authentication (GitHub + Google) with JWT sessions
 - Document sharing with access levels (Own, Edit, Comment, View)

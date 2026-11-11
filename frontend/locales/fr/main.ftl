@@ -1168,3 +1168,20 @@ menu-text-direction = Sens du texte
 menu-direction-auto = Automatique
 menu-direction-ltr = De gauche à droite
 menu-direction-rtl = De droite à gauche
+
+# Document-embedded spreadsheets
+insert-spreadsheet-label = Insérer une feuille de calcul
+insert-spreadsheet-description = Une feuille de calcul modifiable dans ce document
+embedded-sheet-label = Feuille de calcul
+embedded-sheet-name = Nom de la feuille
+embedded-sheet-rename = Renommer
+embedded-sheet-formula = Valeur ou formule de cellule
+embedded-sheet-format = Format numérique (ex. percent, currency, 0.00)
+embedded-sheet-add = Ajouter une feuille
+embedded-sheet-previous-rows = Lignes précédentes
+embedded-sheet-next-rows = Lignes suivantes
+embedded-sheet-previous-columns = Colonnes précédentes
+embedded-sheet-next-columns = Colonnes suivantes
+embedded-sheet-invalid = Cette feuille de calcul ne peut pas être affichée.
+embedded-sheet-truncated = Aperçu tronqué à la limite d’affichage.
+embedded-sheet-draft-invalid = Cette valeur dépasse les limites de la feuille. Votre brouillon est conservé. Raccourcissez-le ou appuyez sur Échap pour annuler.

@@ -1168,3 +1168,20 @@ menu-text-direction = Direzione del testo
 menu-direction-auto = Automatica
 menu-direction-ltr = Da sinistra a destra
 menu-direction-rtl = Da destra a sinistra
+
+# Document-embedded spreadsheets
+insert-spreadsheet-label = Inserisci foglio di calcolo
+insert-spreadsheet-description = Un foglio di calcolo modificabile in questo documento
+embedded-sheet-label = Foglio di calcolo
+embedded-sheet-name = Nome del foglio
+embedded-sheet-rename = Rinomina
+embedded-sheet-formula = Valore o formula della cella
+embedded-sheet-format = Formato numerico (es. percent, currency, 0.00)
+embedded-sheet-add = Aggiungi foglio
+embedded-sheet-previous-rows = Righe precedenti
+embedded-sheet-next-rows = Righe successive
+embedded-sheet-previous-columns = Colonne precedenti
+embedded-sheet-next-columns = Colonne successive
+embedded-sheet-invalid = Impossibile visualizzare questo foglio di calcolo.
+embedded-sheet-truncated = Anteprima troncata al limite di visualizzazione.
+embedded-sheet-draft-invalid = Questo valore supera i limiti del foglio. La bozza viene conservata. Abbreviala o premi Esc per annullare.
