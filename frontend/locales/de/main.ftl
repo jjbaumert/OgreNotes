@@ -1168,3 +1168,20 @@ menu-text-direction = Textrichtung
 menu-direction-auto = Automatisch
 menu-direction-ltr = Von links nach rechts
 menu-direction-rtl = Von rechts nach links
+
+# Document-embedded spreadsheets
+insert-spreadsheet-label = Tabelle einfügen
+insert-spreadsheet-description = Eine bearbeitbare Tabelle in diesem Dokument
+embedded-sheet-label = Tabelle
+embedded-sheet-name = Blattname
+embedded-sheet-rename = Umbenennen
+embedded-sheet-formula = Zellwert oder Formel
+embedded-sheet-format = Zahlenformat (z. B. percent, currency, 0.00)
+embedded-sheet-add = Blatt hinzufügen
+embedded-sheet-previous-rows = Vorherige Zeilen
+embedded-sheet-next-rows = Nächste Zeilen
+embedded-sheet-previous-columns = Vorherige Spalten
+embedded-sheet-next-columns = Nächste Spalten
+embedded-sheet-invalid = Diese Tabelle kann nicht angezeigt werden.
+embedded-sheet-truncated = Tabellenvorschau an der Anzeigegrenze gekürzt.
+embedded-sheet-draft-invalid = Dieser Wert überschreitet die Tabellengrenzen. Ihr Entwurf bleibt erhalten. Kürzen Sie ihn oder drücken Sie Escape zum Abbrechen.

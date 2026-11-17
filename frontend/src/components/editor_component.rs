@@ -2876,6 +2876,11 @@ pub fn EditorComponent(props: EditorProps) -> impl IntoView {
         let view = view_ref_cmd.borrow();
         let Some(view) = view.as_ref() else { return };
 
+        // Embedded grids own their selection. Toolbar prose actions must not
+        // mutate the last prose cursor while focus belongs to a grid.
+        if view.container().has_attribute("data-spreadsheet-active")
+            && !matches!(cmd, ToolbarCommand::Undo | ToolbarCommand::Redo) { return; }
+
         // Sync DOM selection to model before executing the command,
         // so toolbar actions see the user's actual selection, not a
         // stale cursor.

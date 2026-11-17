@@ -1285,6 +1285,90 @@ fn is_valid_child(parent_type: NodeType, child_type: NodeType) -> bool {
 
 // ─── HTML Rendering ─────────────────────────────────────────────
 
+/// Copy embeds as ordinary computed tables. Native document snapshots retain
+/// editable formulas; clipboard HTML is interoperable document content.
+fn spreadsheet_clipboard_rows(content: &Fragment) -> Vec<(String, Vec<Vec<String>>)> {
+    use ogrenotes_spreadsheet::embedded::{decode_sheet, engine_for_sheet, validate_workbook};
+    let Some(sheets) = content
+        .children
+        .iter()
+        .map(|node| {
+            let Node::Element {
+                node_type: NodeType::SpreadsheetSheet,
+                attrs,
+                ..
+            } = node
+            else {
+                return None;
+            };
+            decode_sheet(attrs).ok()
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return vec![(
+            crate::i18n::translate("embedded-sheet-invalid", None),
+            vec![],
+        )];
+    };
+    if validate_workbook(&sheets).is_err() {
+        return vec![(
+            crate::i18n::translate("embedded-sheet-invalid", None),
+            vec![],
+        )];
+    }
+    let mut budget = 10_000usize;
+    let mut text_budget = 1024 * 1024usize;
+    let mut result = Vec::new();
+    for sheet in &sheets {
+        let engine = engine_for_sheet(sheet, &sheets);
+        let occupied: std::collections::BTreeSet<_> = sheet
+            .cells
+            .keys()
+            .chain(sheet.formats.keys())
+            .map(|&(col, row)| (row, col))
+            .collect();
+        let rows = occupied.iter().map(|(row, _)| row + 1).max().unwrap_or(1);
+        let cols = occupied.iter().map(|(_, col)| col + 1).max().unwrap_or(1);
+        let mut rendered = Vec::new();
+        let mut value = |col, row| {
+            let text = engine.get_display((col, row));
+            let mut end = text.len().min(text_budget);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text_budget -= end;
+            text[..end].to_owned()
+        };
+        if rows.saturating_mul(cols) <= budget {
+            for row in 0..rows {
+                rendered.push((0..cols).map(|col| value(col, row)).collect());
+            }
+            budget -= rows * cols;
+        } else {
+            let count = occupied.len().min(budget / 2);
+            for &(row, col) in occupied.iter().take(count) {
+                rendered.push(vec![
+                    format!(
+                        "{}{}",
+                        ogrenotes_spreadsheet::parser::col_to_letters(col),
+                        row + 1
+                    ),
+                    value(col, row),
+                ]);
+                budget -= 2;
+            }
+            if count < occupied.len() {
+                rendered.push(vec![crate::i18n::translate(
+                    "embedded-sheet-truncated",
+                    None,
+                )]);
+            }
+        }
+        result.push((sheet.name.clone(), rendered));
+    }
+    result
+}
+
 fn render_node_html(node: &Node, out: &mut String) {
     match node {
         Node::Text { text, marks } => {
@@ -1309,6 +1393,18 @@ fn render_node_html(node: &Node, out: &mut String) {
             content,
             ..
         } => {
+            if *node_type == NodeType::Spreadsheet {
+                for (name, rows) in spreadsheet_clipboard_rows(content) {
+                    out.push_str("<p>"); out.push_str(&html_escape(&name)); out.push_str("</p><table>");
+                    for row in rows {
+                        out.push_str("<tr>");
+                        for value in row { out.push_str("<td>"); out.push_str(&html_escape(&value)); out.push_str("</td>"); }
+                        out.push_str("</tr>");
+                    }
+                    out.push_str("</table>");
+                }
+                return;
+            }
             let (open, close) = element_tags(*node_type, attrs);
             out.push_str(&open);
             for child in &content.children {
@@ -1546,6 +1642,7 @@ fn element_tags(
                 None,
             )
         }
+        NodeType::Spreadsheet | NodeType::SpreadsheetSheet => ("<div>".into(), Some("</div>".into())),
         NodeType::Calendar => {
             // #136 — clipboard emit is the same shape the server-
             // side HTML export uses (data-view / data-cursor /
@@ -1757,6 +1854,13 @@ fn collect_text(node: &Node, out: &mut String) {
             attrs,
             ..
         } => {
+            if *node_type == NodeType::Spreadsheet {
+                for (name, rows) in spreadsheet_clipboard_rows(content) {
+                    out.push_str(&name); out.push('\n');
+                    for row in rows { out.push_str(&row.join("\t")); out.push('\n'); }
+                }
+                return;
+            }
             if *node_type == NodeType::Mermaid {
                 if let Some(source) = attrs.get("source") {
                     out.push_str(source);
@@ -3302,5 +3406,32 @@ mod tests {
     fn strip_tags_self_closing() {
         assert_eq!(strip_tags("a<br/>b"), "ab");
         assert_eq!(strip_tags("a<hr />b"), "ab");
+    }
+}
+
+#[cfg(test)]
+mod embedded_spreadsheet_tests {
+    use super::*;
+    use std::collections::HashMap;
+    #[test]
+    fn clipboard_includes_computed_formatted_tables_and_surrounding_prose() {
+        let sheet = Node::element_with_attrs(NodeType::SpreadsheetSheet, HashMap::from([
+            ("sheetName".into(), "Budget".into()), ("gridRows".into(), "12".into()),
+            ("gridCols".into(), "6".into()), ("cell:0:0".into(), "=1+2".into()),
+            ("format:0:0".into(), "currency".into()),
+        ]), Fragment::empty());
+        let workbook = Node::element_with_attrs(NodeType::Spreadsheet, HashMap::new(), Fragment::from(vec![sheet]));
+        let slice = Slice::new(Fragment::from(vec![
+            Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text("Before")])),
+            workbook,
+            Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text("After")])),
+        ]),0,0);
+        let html = serialize_to_html(&slice);
+        assert!(html.contains("<p>Budget</p><table><tr><td>$3.00</td></tr></table>"));
+        assert!(html.starts_with("<p>Before</p>"));
+        assert!(html.ends_with("<p>After</p>"));
+        assert!(!html.contains("=1+2"));
+        let text = serialize_to_text(&slice);
+        assert!(text.contains("Budget\n$3.00\n"));
     }
 }

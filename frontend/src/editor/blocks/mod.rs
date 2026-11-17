@@ -22,6 +22,7 @@ use super::model::NodeType;
 pub mod calendar;
 pub mod kanban;
 pub mod math;
+pub mod spreadsheet;
 pub mod mermaid;
 
 /// Renders one live-app block node to a DOM subtree.
@@ -71,12 +72,12 @@ pub trait LiveAppBlockInsert: Sync + 'static {
 /// Every registered live-app block view. Add a line here when
 /// adding a new block.
 pub const BLOCK_VIEWS: &[&(dyn LiveAppBlockView + 'static)] =
-    &[&calendar::CalendarView, &kanban::KanbanView, &mermaid::MermaidView, &math::MathBlockView];
+    &[&calendar::CalendarView, &kanban::KanbanView, &mermaid::MermaidView, &math::MathBlockView, &spreadsheet::SpreadsheetView];
 
 /// Every registered live-app block insert entry. Read by every
 /// insert surface — new entries show up in all three at once.
 pub const BLOCK_INSERTS: &[&(dyn LiveAppBlockInsert + 'static)] =
-    &[&calendar::CalendarInsert, &kanban::KanbanInsert, &mermaid::MermaidInsert, &math::MathBlockInsert];
+    &[&calendar::CalendarInsert, &kanban::KanbanInsert, &mermaid::MermaidInsert, &math::MathBlockInsert, &spreadsheet::SpreadsheetInsert];
 
 /// Look up the view for a given NodeType. Returns `None` for core
 /// editor types with no live-app block owner.

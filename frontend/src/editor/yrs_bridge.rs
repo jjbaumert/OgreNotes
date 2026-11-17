@@ -7,9 +7,9 @@ use yrs::{
     Any, Doc, Map, Out, ReadTxn, Transact, WriteTxn,
     Update,
     updates::decoder::Decode,
-    types::Attrs,
+    types::{AsPrelim, Attrs},
     types::text::{Diff, YChange},
-    types::xml::{Xml, XmlElementPrelim, XmlFragment, XmlOut, XmlTextPrelim},
+    types::xml::{Xml, XmlElementPrelim, XmlFragment, XmlIn, XmlOut, XmlTextPrelim},
     types::{GetString, Text},
 };
 
@@ -524,6 +524,7 @@ fn find_match(
         node.node_type(),
         Some(
             NodeType::HorizontalRule
+                | NodeType::SpreadsheetSheet
                 | NodeType::HardBreak
                 | NodeType::Image
                 | NodeType::Embed
@@ -592,6 +593,10 @@ fn remove_unmatched<C: XmlFragment>(
         old_children.map(|old| old.iter().filter_map(|n| n.block_id()).collect());
     for i in (0..matched.len()).rev() {
         if matched[i] {
+            continue;
+        }
+        if yrs_blocks[i].tag.as_deref().is_some_and(|tag| tag_to_node_type(tag).is_none()) {
+            retained[i] = true;
             continue;
         }
         if let (Some(old_ids), Some(bid)) = (&old_ids, yrs_blocks[i].block_id.as_deref()) {
@@ -698,6 +703,13 @@ fn apply_actions<C: XmlFragment>(
         // already delivered before the reorder by merging into the live blocks
         // first; edits arriving concurrently with the reorder need a future
         // versioned representation that supports identity-preserving moves.
+        // Preserve native XML instead of decoding through the known schema:
+        // an older reader intentionally omits an unknown tag from its model,
+        // but must never erase that peer-owned subtree while reordering prose.
+        enum ReorderedNode {
+            Live(XmlIn),
+            Model(Node),
+        }
         let mut reordered = Vec::with_capacity(actions.len());
         for action in actions {
             match action {
@@ -708,28 +720,39 @@ fn apply_actions<C: XmlFragment>(
                         sync_block_content(txn, container, current_pos, node, baseline);
                     }
                     if let Some(out) = container.get(txn, current_pos) {
-                        reordered.extend(read_xml_out(txn, &out));
+                        reordered.push(ReorderedNode::Live(xml_out_prelim(txn, &out)));
                     }
                 }
-                SyncAction::Insert { node } => reordered.push((*node).clone()),
+                SyncAction::Insert { node } => reordered.push(ReorderedNode::Model((*node).clone())),
             }
         }
         let reused: std::collections::HashSet<_> = reused_indices.into_iter().collect();
         let mut peers: Vec<_> = old_to_new_pos.iter()
             .filter(|(index, _)| !reused.contains(index))
             .filter_map(|(_, pos)| container.get(txn, *pos)
-                .map(|out| (*pos as usize, read_xml_out(txn, &out))))
+                .map(|out| (*pos as usize, xml_out_prelim(txn, &out))))
             .collect();
         peers.sort_by_key(|(pos, _)| *pos);
-        for (pos, nodes) in peers {
+        for (pos, node) in peers {
             let at = pos.min(reordered.len());
-            reordered.splice(at..at, nodes);
+            reordered.insert(at, ReorderedNode::Live(node));
         }
         let remaining = container.len(txn);
         if remaining > 0 { container.remove_range(txn, 0, remaining); }
-        for (i, node) in reordered.iter().enumerate() {
-            write_node(txn, container, i as u32, node);
+        for (i, node) in reordered.into_iter().enumerate() {
+            match node {
+                ReorderedNode::Live(prelim) => { container.insert(txn, i as u32, prelim); }
+                ReorderedNode::Model(model) => write_node(txn, container, i as u32, &model),
+            }
         }
+    }
+}
+
+fn xml_out_prelim<T: ReadTxn>(txn: &T, out: &XmlOut) -> XmlIn {
+    match out {
+        XmlOut::Element(element) => XmlIn::Element(element.as_prelim(txn)),
+        XmlOut::Fragment(fragment) => XmlIn::Fragment(fragment.as_prelim(txn)),
+        XmlOut::Text(text) => XmlIn::Text(text.as_prelim(txn)),
     }
 }
 
@@ -820,7 +843,7 @@ fn sync_block_content<C: XmlFragment>(
         NodeType::Blockquote | NodeType::ListItem | NodeType::TaskItem |
         NodeType::Table | NodeType::TableRow | NodeType::TableCell | NodeType::TableHeader |
         NodeType::Calendar | NodeType::Kanban | NodeType::KanbanColumn |
-        NodeType::Slide | NodeType::Frame
+        NodeType::Slide | NodeType::Frame | NodeType::Spreadsheet
     );
 
     if is_container {
@@ -1391,6 +1414,8 @@ fn node_type_to_tag(nt: NodeType) -> &'static str {
         // `crates/collab/src/schema.rs::NodeType::Slide/Frame::tag_name`.
         NodeType::Slide => "slide",
         NodeType::Frame => "frame",
+        NodeType::Spreadsheet => "spreadsheet",
+        NodeType::SpreadsheetSheet => "spreadsheet_sheet",
     }
 }
 
@@ -1426,6 +1451,8 @@ fn tag_to_node_type(tag: &str) -> Option<NodeType> {
         "math_inline" => Some(NodeType::MathInline),
         "slide" => Some(NodeType::Slide),
         "frame" => Some(NodeType::Frame),
+        "spreadsheet" => Some(NodeType::Spreadsheet),
+        "spreadsheet_sheet" => Some(NodeType::SpreadsheetSheet),
         _ => None,
     }
 }
@@ -4965,5 +4992,144 @@ mod tests {
         let merged = read_doc_from_ydoc(&ydoc2).unwrap();
         assert_eq!(doc_text(&merged), "alHelloPeer");
         assert_eq!(merged.child_count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod embedded_spreadsheet_tests {
+    use super::*;
+
+    fn workbook_doc() -> Node {
+        let sheet = Node::element_with_attrs(NodeType::SpreadsheetSheet, HashMap::from([
+            ("blockId".into(), "sheet-a".into()), ("sheetName".into(), "Sheet1".into()),
+            ("gridRows".into(), "12".into()), ("gridCols".into(), "6".into()),
+            ("cell:0:0".into(), "10".into()), ("format:0:0".into(), "currency".into()),
+        ]), Fragment::empty());
+        let workbook = Node::element_with_attrs(NodeType::Spreadsheet, HashMap::from([
+            ("blockId".into(), "workbook-a".into()), ("version".into(), "1".into()),
+            ("title".into(), "Budget".into()),
+        ]), Fragment::from(vec![sheet]));
+        Node::element_with_content(NodeType::Doc, Fragment::from(vec![
+            Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text("Before")])),
+            workbook,
+            Node::element_with_content(NodeType::Paragraph, Fragment::from(vec![Node::text("After")])),
+        ]))
+    }
+
+    fn set_sheet_attr(doc: &Node, key: &str, value: &str) -> Node {
+        let mut doc = doc.clone();
+        if let Node::Element { content, .. } = &mut doc
+            && let Node::Element { content, .. } = &mut content.children[1]
+            && let Node::Element { attrs, .. } = &mut content.children[0]
+        {
+            attrs.insert(key.into(), value.into());
+        }
+        doc
+    }
+
+    fn fork(bytes: &[u8]) -> Doc {
+        let doc = Doc::new();
+        doc.transact_mut().apply_update(Update::decode_v1(bytes).unwrap()).unwrap();
+        doc
+    }
+
+    #[test]
+    fn embedded_workbook_native_roundtrip_preserves_formulas_formats_and_prose() {
+        let original = set_sheet_attr(&workbook_doc(), "cell:0:1", "=A1*2");
+        let bytes = doc_to_ydoc_bytes(&original);
+        assert_eq!(ydoc_bytes_to_doc(&bytes).unwrap(), original);
+    }
+
+    #[test]
+    fn large_inline_sheet_cell_edit_encodes_only_a_small_attribute_update() {
+        let mut original = workbook_doc();
+        if let Node::Element { content, .. } = &mut original
+            && let Node::Element { content, .. } = &mut content.children[1]
+            && let Node::Element { attrs, .. } = &mut content.children[0]
+        {
+            attrs.insert("gridRows".into(), "100".into());
+            attrs.insert("gridCols".into(), "100".into());
+            for row in 0..90 {
+                for col in 0..100 {
+                    attrs.insert(format!("cell:{row}:{col}"), "123".into());
+                }
+            }
+        }
+        let bytes = doc_to_ydoc_bytes(&original);
+        assert!(bytes.len() > 100_000, "large native baseline exercises real sparse persistence");
+        let doc = fork(&bytes);
+        let before = doc.transact().state_vector();
+        let edited = set_sheet_attr(&original, "cell:89:99", "changed");
+        sync_model_to_ydoc_diffed(&doc, &edited, Some(&original));
+        let update = doc.transact().encode_state_as_update_v1(&before);
+        assert!(update.len() < 256, "one cell must retain XML identities instead of replacing the workbook: {} bytes", update.len());
+        let peer = fork(&bytes);
+        peer.transact_mut().apply_update(Update::decode_v1(&update).unwrap()).unwrap();
+        assert_eq!(read_doc_from_ydoc(&peer).unwrap(), edited);
+    }
+
+    #[test]
+    fn concurrent_new_cells_and_format_registers_merge_and_survive_stale_sync() {
+        let original = workbook_doc();
+        let bytes = doc_to_ydoc_bytes(&original);
+        let a = fork(&bytes);
+        let b = fork(&bytes);
+        let local_a = set_sheet_attr(&original, "cell:0:1", "=A1*2");
+        let local_b = set_sheet_attr(&original, "cell:1:0", "30");
+        let baseline_a = sync_model_to_ydoc_diffed(&a, &local_a, Some(&original));
+        sync_model_to_ydoc_diffed(&b, &local_b, Some(&original));
+        let update_a = a.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        let update_b = b.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        a.transact_mut().apply_update(Update::decode_v1(&update_b).unwrap()).unwrap();
+        b.transact_mut().apply_update(Update::decode_v1(&update_a).unwrap()).unwrap();
+        // A has not read B into its model yet. A style edit must not delete B's
+        // newly materialized cell, even though it is absent from A's baseline.
+        let style_a = set_sheet_attr(&local_a, "format:0:1", "percent");
+        sync_model_to_ydoc_diffed(&a, &style_a, Some(&baseline_a));
+        let merged = read_doc_from_ydoc(&a).unwrap();
+        let sheet = merged.child(1).unwrap().child(0).unwrap();
+        assert_eq!(sheet.attrs().get("cell:0:1").map(String::as_str), Some("=A1*2"));
+        assert_eq!(sheet.attrs().get("cell:1:0").map(String::as_str), Some("30"));
+        assert_eq!(sheet.attrs().get("format:0:1").map(String::as_str), Some("percent"));
+        let remote = read_doc_from_ydoc(&b).unwrap();
+        assert_eq!(remote.child(1).unwrap().child(0).unwrap().attrs().get("cell:0:1").map(String::as_str), Some("=A1*2"));
+    }
+
+    #[test]
+    fn unknown_native_xml_survives_local_prose_reorder() {
+        let original = Node::element_with_content(NodeType::Doc, Fragment::from(vec![
+            Node::element_with_attrs(NodeType::Paragraph, HashMap::from([("blockId".into(), "p-a".into())]), Fragment::from(vec![Node::text("Alpha")])),
+            Node::element_with_attrs(NodeType::Paragraph, HashMap::from([("blockId".into(), "p-b".into())]), Fragment::from(vec![Node::text("Beta")])),
+        ]));
+        let doc = fork(&doc_to_ydoc_bytes(&original));
+        {
+            let mut txn = doc.transact_mut();
+            let fragment = txn.get_or_insert_xml_fragment("content");
+            let unknown = fragment.insert(&mut txn, 1, XmlElementPrelim::empty("future_widget"));
+            unknown.insert_attribute(&mut txn, "blockId", "future-a");
+            unknown.insert_attribute(&mut txn, "source", "preserve me");
+            let child = unknown.insert(&mut txn, 0, XmlElementPrelim::empty("future_child"));
+            child.insert_attribute(&mut txn, "cell:0:0", "=1+2");
+            let text = child.insert(&mut txn, 0, XmlTextPrelim::new("future rich text"));
+            text.format(&mut txn, 0, 6, [(Arc::<str>::from("bold"), Any::Bool(true))].into_iter().collect());
+        }
+        let baseline = read_doc_from_ydoc(&doc).unwrap();
+        assert_eq!(baseline.child_count(), 2, "unknown tag is opaque to this reader");
+        let reordered = Node::element_with_content(NodeType::Doc, Fragment::from(vec![
+            baseline.child(1).unwrap().clone(), baseline.child(0).unwrap().clone(),
+        ]));
+        sync_model_to_ydoc_diffed(&doc, &reordered, Some(&baseline));
+        let bytes = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        let restored = fork(&bytes);
+        let txn = restored.transact();
+        let fragment = txn.get_xml_fragment("content").unwrap();
+        assert_eq!(fragment.len(&txn), 3);
+        let unknown = (0..fragment.len(&txn)).filter_map(|index| fragment.get(&txn, index))
+            .find_map(|out| match out { XmlOut::Element(element) if element.tag().as_ref() == "future_widget" => Some(element), _ => None }).unwrap();
+        assert_eq!(unknown.get_attribute(&txn, "source").as_deref(), Some("preserve me"));
+        let Some(XmlOut::Element(child)) = unknown.get(&txn, 0) else { panic!("future child lost") };
+        assert_eq!(child.get_attribute(&txn, "cell:0:0").as_deref(), Some("=1+2"));
+        let Some(XmlOut::Text(text)) = child.get(&txn, 0) else { panic!("future text lost") };
+        assert!(text.diff(&txn, YChange::identity).iter().any(|chunk| chunk.attributes.as_deref().is_some_and(|attrs| attrs.get("bold") == Some(&Any::Bool(true)))));
     }
 }

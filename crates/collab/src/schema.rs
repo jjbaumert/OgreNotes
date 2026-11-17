@@ -102,6 +102,10 @@ pub enum NodeType {
     /// (normalized 0..1), `z` (stacking), `role`
     /// (`content` | `notes`).
     Frame,
+    /// Editable workbook embedded in prose; children are sparse sheets.
+    Spreadsheet,
+    /// Attribute-only sheet with independent cell and format registers.
+    SpreadsheetSheet,
 }
 
 impl NodeType {
@@ -138,6 +142,8 @@ impl NodeType {
             NodeType::MathInline => "math_inline",
             NodeType::Slide => "slide",
             NodeType::Frame => "frame",
+            NodeType::Spreadsheet => "spreadsheet",
+            NodeType::SpreadsheetSheet => "spreadsheet_sheet",
         }
     }
 
@@ -174,6 +180,8 @@ impl NodeType {
             "math_inline" => Some(NodeType::MathInline),
             "slide" => Some(NodeType::Slide),
             "frame" => Some(NodeType::Frame),
+            "spreadsheet" => Some(NodeType::Spreadsheet),
+            "spreadsheet_sheet" => Some(NodeType::SpreadsheetSheet),
             _ => None,
         }
     }
@@ -207,6 +215,8 @@ impl NodeType {
                 | NodeType::MathBlock
                 | NodeType::Slide
                 | NodeType::Frame
+                | NodeType::Spreadsheet
+                | NodeType::SpreadsheetSheet
         )
     }
 
@@ -233,6 +243,7 @@ impl NodeType {
                 | NodeType::Mermaid
                 | NodeType::MathBlock
                 | NodeType::MathInline
+                | NodeType::SpreadsheetSheet
         )
     }
 
@@ -261,6 +272,7 @@ impl NodeType {
                 NodeType::Mermaid,
                 NodeType::MathBlock,
                 NodeType::Slide,
+                NodeType::Spreadsheet,
             ],
             NodeType::BulletList => &[NodeType::ListItem],
             NodeType::OrderedList => &[NodeType::ListItem],
@@ -306,6 +318,7 @@ impl NodeType {
             NodeType::Calendar => &[NodeType::CalendarEvent],
             NodeType::Kanban => &[NodeType::KanbanColumn],
             NodeType::KanbanColumn => &[NodeType::KanbanCard],
+            NodeType::Spreadsheet => &[NodeType::SpreadsheetSheet],
             NodeType::Slide => &[NodeType::Frame],
             NodeType::Frame => &[
                 NodeType::Paragraph,
@@ -323,6 +336,7 @@ impl NodeType {
                 NodeType::Kanban,
                 NodeType::Mermaid,
                 NodeType::MathBlock,
+                NodeType::Spreadsheet,
             ],
             // Leaf/inline nodes and text containers have no element children
             NodeType::Paragraph
@@ -338,7 +352,8 @@ impl NodeType {
             | NodeType::DocMention
             | NodeType::Mermaid
             | NodeType::MathBlock
-            | NodeType::MathInline => &[],
+            | NodeType::MathInline
+            | NodeType::SpreadsheetSheet => &[],
         }
     }
 }
@@ -438,6 +453,8 @@ mod tests {
             NodeType::MathInline,
             NodeType::Slide,
             NodeType::Frame,
+            NodeType::Spreadsheet,
+            NodeType::SpreadsheetSheet,
         ];
 
         for nt in &types {
@@ -620,6 +637,8 @@ mod tests {
         NodeType::MathInline,
         NodeType::Slide,
         NodeType::Frame,
+        NodeType::Spreadsheet,
+        NodeType::SpreadsheetSheet,
     ];
 
     /// The schema-validated mark types. Must match the marks registered in
@@ -653,7 +672,7 @@ mod tests {
         // If this fails, a node type was added to or removed from the collab
         // schema without updating the expected set. Update ALL_NODE_TYPES and
         // the corresponding frontend/src/editor/model.rs NodeType enum.
-        assert_eq!(ALL_NODE_TYPES.len(), 30, "expected 30 node types");
+        assert_eq!(ALL_NODE_TYPES.len(), 32, "expected 32 node types");
     }
 
     #[test]
@@ -720,6 +739,8 @@ mod tests {
             ("math_inline", NodeType::MathInline),
             ("slide", NodeType::Slide),
             ("frame", NodeType::Frame),
+            ("spreadsheet", NodeType::Spreadsheet),
+            ("spreadsheet_sheet", NodeType::SpreadsheetSheet),
         ];
         for (tag, nt) in expected {
             assert_eq!(nt.tag_name(), *tag, "tag mismatch for {nt:?}");
@@ -769,6 +790,7 @@ mod tests {
             NodeType::Mermaid,
             NodeType::MathBlock,
             NodeType::MathInline,
+            NodeType::SpreadsheetSheet,
         ];
         for nt in ALL_NODE_TYPES {
             let is_leaf = expected_leaves.contains(nt);
@@ -799,7 +821,7 @@ mod tests {
                 NodeType::OrderedList, NodeType::TaskList, NodeType::Blockquote,
                 NodeType::CodeBlock, NodeType::HorizontalRule, NodeType::Image,
                 NodeType::Table, NodeType::Embed, NodeType::Calendar,
-                NodeType::Kanban, NodeType::Mermaid, NodeType::MathBlock, NodeType::Slide,
+                NodeType::Kanban, NodeType::Mermaid, NodeType::MathBlock, NodeType::Slide, NodeType::Spreadsheet,
             ]
         );
         // List containers:
@@ -872,6 +894,7 @@ mod tests {
             NodeType::Kanban,
             NodeType::Mermaid,
             NodeType::MathBlock,
+            NodeType::Spreadsheet,
         ];
         assert_eq!(NodeType::Frame.valid_children(), frame_children);
         // Text containers and leaves have no element children:
