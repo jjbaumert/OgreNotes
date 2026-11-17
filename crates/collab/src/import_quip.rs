@@ -37,8 +37,9 @@
 //!     discriminator — `data-section-style` — on the wrapping `<div>`.
 //!     See the vocabulary table above [`SECTION_STYLE_ORDERED`].
 //!   - [`checked_state`]  — checklist item checked/unchecked.
-//!     **STILL UNVERIFIED**: the staged corpus contains no checked
-//!     item, so no marker for one has ever been seen.
+//!     **RECONCILED**: a checked Quip item carries `class='checked'`;
+//!     its unchecked peers carry an empty class. See the authentic
+//!     `checked-unchecked.html` fixture and `tests/quip_checked_state.rs`.
 //!   - [`code_language`]  — code-block language tag
 //!   - [`section_id`]     — Quip section anchor id
 //!   - [`quip_thread_from_url`] — an `<a href>` being an intra-Quip
@@ -1948,39 +1949,24 @@ fn parse_row(handle: &markup5ever_rcdom::Handle) -> QuipRow {
     }
 }
 
-// ─── UNVERIFIED-MARKUP readers ───────────────────────────────────
+// ─── Quip feature readers ──────────────────────────────────────
 //
-// Each helper below encodes a guess about how Quip spells a feature.
-// They accept every plausible spelling rather than betting on one, and
-// they are the only places that need to change when a real `/2` HTML
-// sample lands.
+// Each helper distinguishes confirmed Quip markup from compatibility
+// spellings that remain unverified.
 
-/// **UNVERIFIED MARKUP — still unverified after the first real corpus.**
-/// Checked state of a checklist item. Accepts:
+/// Checked state of a checklist item.
 ///
-///   - `<li><input type="checkbox" checked>` (presence of the
-///     attribute means checked, per the HTML spec)
-///   - `<li class="checked">` / `<li class="unchecked">`, and the
-///     `-item` / `_item` suffixed variants
-///   - `<li data-checked="true|false">`
+/// **Verified Quip markup:** the user's neutral checked/unchecked note
+/// exports a `data-section-style='7'` wrapper with `class='checked'` on
+/// its checked `<li>` and empty classes on its unchecked peers. The exact
+/// HTML is pinned in `tests/fixtures/quip/authentic/checked-unchecked.html`.
 ///
-/// Returns `None` when the item carries no checklist signal at all —
-/// that's what makes an ordinary bullet stay an ordinary bullet.
+/// An empty class returns `None`; [`parse_list`] supplies `false` for
+/// those items because their wrapping section identifies a checklist.
+/// An ordinary bullet without any task signal therefore stays a bullet.
 ///
-/// Unlike [`list_is_task`], this one could **not** be reconciled against
-/// the 56 staged `/2` documents: the corpus holds exactly one checklist
-/// (`data-section-style='7'`) and every one of its four items is
-/// *unchecked*. A search of all 56 documents finds no `<input>` element,
-/// no `checked` attribute, and no `check`-ish class token anywhere. So
-/// how Quip spells a **checked** item remains unknown, and none of the
-/// three spellings above has been seen in the wild.
-///
-/// The consequence is deliberate: a real Quip checklist imports with
-/// every item unchecked, because [`parse_list`] defaults a
-/// section-marked checklist's items to `false`. Guessing a marker here
-/// would silently mis-import task state, which is worse than uniformly
-/// unchecked — do not add one without a sample that contains a ticked
-/// item.
+/// **Unverified compatibility spellings retained:** checkbox `<input>`
+/// elements, checked/unchecked class aliases, and `data-checked`.
 fn checked_state(li: &markup5ever_rcdom::Handle) -> Option<bool> {
     if let Some(v) = attr(li, "data-checked") {
         return Some(!matches!(
@@ -4170,9 +4156,9 @@ mod tests {
             "data-section-style='7' on the wrapping div means checklist: {b:?}"
         );
         assert_eq!(items.len(), 2, "{b:?}");
-        // Checked state stays uniformly false: no sample of a *checked*
-        // Quip item exists, so `checked_state` finds nothing and
-        // `parse_list` defaults a section-marked checklist to unchecked.
+        // This older corpus excerpt has empty item classes, so `parse_list`
+        // defaults both items to unchecked. The authentic checked-item
+        // fixture is covered separately in `tests/quip_checked_state.rs`.
         assert_eq!(items[0].checked, Some(false));
         assert_eq!(items[1].checked, Some(false));
     }

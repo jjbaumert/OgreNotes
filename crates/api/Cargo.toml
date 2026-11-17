@@ -73,7 +73,7 @@ flate2 = { workspace = true }
 # bzip2 / aes / deflate64 implementations we don't need; the
 # deflate-flate2 feature keeps DEFLATE compression on but routes
 # it through the same flate2 we already depend on.
-zip = { version = "2", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
 proptest = { workspace = true }

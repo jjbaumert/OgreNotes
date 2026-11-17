@@ -88,6 +88,7 @@ async fn assert_exports(app: &common::TestApp, token: &str, doc_id: &str, commen
         let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
         let name = archive
             .file_names()
+            .map(|name| name.expect("valid ZIP entry name").into_owned())
             .find(|n| n.ends_with(if format == "html" { ".html" } else { ".md" }))
             .unwrap()
             .to_owned();
