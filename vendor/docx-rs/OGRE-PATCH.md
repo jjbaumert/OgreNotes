@@ -1,0 +1,1 @@
+Based on crates.io docx-rs 0.4.22 (MIT). Only dependency change: zip 8.6 to patched zip 9, resolving RUSTSEC-2026-0429. Source is unchanged. Remove this patch when upstream publishes a compatible ZIP dependency.
